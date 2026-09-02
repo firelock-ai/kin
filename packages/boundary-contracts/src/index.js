@@ -29,7 +29,9 @@ const schemaFiles = {
   repoScopedSemanticToolResponse: 'repo-scoped-semantic-tool-response.schema.json',
   repoScopedSemanticToolError: 'repo-scoped-semantic-tool-error.schema.json',
   shadowGateReport: 'shadow-gate-report.schema.json',
-  hostedRepositoryTransfer: 'hosted-repository-transfer.schema.json'
+  hostedRepositoryTransfer: 'hosted-repository-transfer.schema.json',
+  graphExport: 'graph-export.schema.json',
+  graphEvent: 'graph-event.schema.json'
 };
 
 const schemaIdMap = {

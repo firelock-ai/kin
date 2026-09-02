@@ -13829,6 +13829,19 @@ def main() -> None:
         "classifyReleaseArchiveRoot(contentRoot, {",
     ):
         require(publish_job, policy, "sanctioned release archive shape at publish")
+    # The inventory is what an installed updater judges the release by, with its
+    # own frozen component list, and it refuses any other name. Every manifest
+    # from v0.5.45 to v0.6.3 named the three documentation members, and v0.6.2
+    # refused v0.6.3 on checksums-sha256.txt, the first of them. The classifier
+    # now keeps documentation out of `files`, and the publish job must both read
+    # the doc list from the shared module and refuse a manifest that names one by
+    # that defect's name rather than as a generic inventory mismatch.
+    for policy in (
+        "DOC_FILES,",
+        "names documentation the installed updater refuses",
+        "does not carry every documentation member",
+    ):
+        require(publish_job, policy, "documentation kept out of the provenance inventory")
     for forbidden in (
         "entries.every((entry) => entry.isFile())",
         ".filter((entry) => entry.isFile())",
@@ -16609,7 +16622,7 @@ jobs:
         "always()",
         "needs.publish.result == 'success'",
         "uses: ./.github/workflows/install-proof.yml",
-        "expected_vfs_commit: 2cab0e11e9b1ae0adc422ef8e0d09c24d296d370",
+        "expected_vfs_commit: ff59dfeb8fc9ad6a0b7f1e7d4505763e00792428",
     ):
         require(install_proof_job, policy, "mandatory public install proof")
 

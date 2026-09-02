@@ -523,7 +523,7 @@ jobs:
           repository: firelock-ai/kin-vfs
           path: kin-vfs
           # Release inputs must never move under an unchanged Kin tag.
-          ref: 2cab0e11e9b1ae0adc422ef8e0d09c24d296d370
+          ref: ff59dfeb8fc9ad6a0b7f1e7d4505763e00792428
           persist-credentials: false
 
       - name: Verify canonical release input bytes
@@ -1149,7 +1149,7 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           TARGET: ${{ matrix.target }}
           VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
-          EXPECTED_VFS_COMMIT: 2cab0e11e9b1ae0adc422ef8e0d09c24d296d370
+          EXPECTED_VFS_COMMIT: ff59dfeb8fc9ad6a0b7f1e7d4505763e00792428
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1215,12 +1215,16 @@ jobs:
             sha256: sha256(name),
             size_bytes: fs.statSync(name).size,
           });
-          // The content inventory covers the archive's component files. The macOS
-          // notification bundle is a sealed directory rather than a component, so
-          // it is classified and shape-checked here but stays out of the manifest:
-          // an installed updater refuses any inventory name outside its managed
-          // component list, and the bundle's bytes are already covered by the
-          // archive digest, its code signature, and its stapled notarization.
+          // The content inventory covers the archive's component files and nothing
+          // else. An installed updater refuses any inventory name outside its
+          // managed component list, so the macOS notification bundle, a sealed
+          // directory rather than a component, and the three documentation
+          // members are classified and shape-checked here but stay out of the
+          // manifest. v0.6.2 refused the v0.6.3 manifest on `checksums-sha256.txt`,
+          // the first documentation record in it, and no managed install could
+          // update across any release from v0.5.45 on. Their bytes are covered by
+          // the archive digest; the bundle's also by its code signature and
+          // stapled notarization, the docs' also by the in-archive checksum file.
           const contents = classifyReleaseArchiveRoot(artifact, { target })
             .files
             .map((name) => {
@@ -1437,7 +1441,7 @@ jobs:
         with:
           repository: firelock-ai/kin-vfs
           path: release-inputs/kin-vfs
-          ref: 2cab0e11e9b1ae0adc422ef8e0d09c24d296d370
+          ref: ff59dfeb8fc9ad6a0b7f1e7d4505763e00792428
           persist-credentials: false
 
       - name: Download all artifacts
@@ -1505,7 +1509,7 @@ jobs:
 
       - name: Verify and aggregate release provenance
         env:
-          EXPECTED_VFS_COMMIT: 2cab0e11e9b1ae0adc422ef8e0d09c24d296d370
+          EXPECTED_VFS_COMMIT: ff59dfeb8fc9ad6a0b7f1e7d4505763e00792428
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1516,6 +1520,7 @@ jobs:
           const path = require("path");
           const { readUpdateBuildIdentity } = require("./scripts/read-update-build-identity.cjs");
           const {
+            DOC_FILES,
             assertReleaseArchiveMemberPaths,
             classifyReleaseArchiveRoot,
           } = require("./scripts/release-archive-shape.cjs");
@@ -1672,11 +1677,22 @@ jobs:
             try {
               // Component files carry per-file provenance; the macOS notification
               // bundle is admitted as a sealed directory and is inventoried by the
-              // archive digest instead. Everything else is refused.
-              const actualNames = classifyReleaseArchiveRoot(contentRoot, {
+              // archive digest instead, and so are the documentation members. An
+              // installed updater judges the inventory with its own frozen
+              // component list and refuses any other name, so a manifest naming
+              // a doc file is not a fuller description of the archive, it is a
+              // release no managed install can update to: v0.6.2 refused v0.6.3
+              // on the first such record. Everything else is refused.
+              const classified = classifyReleaseArchiveRoot(contentRoot, {
                 target: spec.target,
-              }).files;
+              });
+              const actualNames = classified.files;
               const manifestNames = manifest.archive_contents.map((entry) => entry.name).sort();
+              const documented = manifestNames.filter((name) => DOC_FILES.includes(name));
+              fail(documented.length === 0,
+                `${manifestPath} names documentation the installed updater refuses: ${documented.join(", ")}`);
+              fail(JSON.stringify(classified.docs) === JSON.stringify([...DOC_FILES].sort()),
+                `${spec.archive} does not carry every documentation member`);
               fail(JSON.stringify(actualNames) === JSON.stringify(manifestNames),
                 `${manifestPath} content inventory does not match ${spec.archive}`);
               const records = new Map(manifest.archive_contents.map((entry) => [entry.name, entry]));
@@ -1867,7 +1883,7 @@ jobs:
     uses: ./.github/workflows/install-proof.yml
     with:
       release_tag: ${{ github.ref_name }}
-      expected_vfs_commit: 2cab0e11e9b1ae0adc422ef8e0d09c24d296d370
+      expected_vfs_commit: ff59dfeb8fc9ad6a0b7f1e7d4505763e00792428
     permissions:
       contents: read
       attestations: read

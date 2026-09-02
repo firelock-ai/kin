@@ -125,7 +125,7 @@ rustix = { version = "1", features = ["fs"] }
 # Testing
 tempfile = "3"
 pretty_assertions = "1"
-serial_test = "3"
+serial_test = "4"
 
 # Internal crates
 kin-model = { version = "=0.7.22", registry = "kin" }
@@ -159,7 +159,7 @@ kin-lsp = { version = "=0.7.12", registry = "kin" }
 # additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
 # binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
 kin-db = { version = "=0.7.81", registry = "kin", default-features = false }
-kin-vfs-core = { version = "=0.4.22", registry = "kin" }
+kin-vfs-core = { version = "=0.4.23", registry = "kin" }
 
 [profile.release]
 opt-level = 3

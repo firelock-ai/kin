@@ -45,114 +45,131 @@ impl LanguageAdapter for TypeScriptAdapter {
     }
 
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
-        let error_ranges = collect_error_ranges(tree);
-        let parse_state = if error_ranges.is_empty() {
-            ParseState::Valid
-        } else {
-            ParseState::Incomplete { error_ranges }
-        };
-
-        let mut entities = Vec::new();
-        let mut relations = Vec::new();
-        let mut imports = Vec::new();
-        let mut tests = Vec::new();
-        let mut owners = JsOwners::default();
-        let root = tree.root_node();
-        let mut cursor = root.walk();
-
-        // Read the file's property-defining helpers before walking it; a
-        // helper is not bound to its uses by declaration order.
-        let definers = collect_js_property_definers(&root, source);
-
-        for child in root.children(&mut cursor) {
-            extract_ts_node(
-                &child,
-                source,
-                file_id,
-                &mut entities,
-                &mut relations,
-                &mut owners,
-                &definers,
-            );
-            if let Some(import_like) = extract_ts_import_like(&child, source) {
-                imports.push(import_like);
-            }
-            // Extract CommonJS require() calls as imports
-            collect_js_require_imports(&child, source, &mut imports);
-            // Detect describe/it/test calls (Jest/Vitest/Mocha)
-            extract_js_tests(&child, source, &mut tests);
-        }
-
-        // Emitted after the walk and BEFORE `owners.finish`, and both halves of
-        // that are load-bearing.
-        //
-        // After the walk, because Python emits its module last and every
-        // consumer that looks an entity up by name depends on it: with the
-        // module first, a `.find(|e| leaf(e.name) == "caller")` over `caller.ts`
-        // returns the MODULE rather than the function, which is how the rename
-        // planner's TypeScript case lost its call edge.
-        //
-        // Before `owners.finish`, because that function's collision guard reads
-        // the entity list to decide whether a receiver's owner already exists.
-        // Run after it, the module is invisible to the guard, which then
-        // synthesizes a Class under the same name and leaves one file holding
-        // two entities called `router` that the linker's (file, name) index
-        // cannot tell apart. That is the exact outcome its own comment warns
-        // about.
-        // same helper JavaScript uses. The two adapters carried byte-identical
-        // copies of this rule and drifted anyway: the TypeScript index predicate
-        // never matched `index.d.ts`. Sharing the helper is what the header
-        // comment above already says the shared surface exists for.
-        let (module_name, is_package) = js_module_identity(&file_id.0, TS_SUFFIXES);
-        if !module_name.is_empty() {
-            entities.push(ExtractedEntity {
-                kind: EntityKind::Module,
-                name: module_name,
-                signature: if is_package {
-                    format!("package {}", file_id.0)
-                } else {
-                    format!("module {}", file_id.0)
-                },
-                visibility: Visibility::Public,
-                doc_summary: None,
-                fingerprint: compute_fingerprint(&root, source),
-                span: span_from_node(&root, file_id),
-            });
-        }
-
-        owners.finish(&mut entities);
-
-        // Build import lookup: local_name -> module_path
-        let import_map: std::collections::HashMap<&str, &str> = imports
-            .iter()
-            .flat_map(|imp| {
-                imp.specifiers
-                    .iter()
-                    .map(move |spec| (spec.local_name.as_str(), imp.module_path.as_str()))
-            })
-            .collect();
-
-        // Annotate Calls/References relations with import_source
-        for rel in &mut relations {
-            if matches!(
-                rel.kind,
-                kin_model::RelationKind::Calls | kin_model::RelationKind::References
-            ) {
-                if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
-                    rel.import_source = Some(module.to_string());
-                }
-            }
-        }
-
-        Ok(ParseOutput {
-            entities,
-            relations,
-            imports,
-            tests,
-            parse_state,
-            parsed_call_sites: None,
-        })
+        extract_typescript_tree(tree, source, file_id, TS_SUFFIXES)
     }
+}
+
+/// The TypeScript walk over `tree`, with `suffixes` naming the file extensions
+/// whose stem is the module's name.
+///
+/// `suffixes` is a parameter rather than a constant because the Flow path runs
+/// this walk over a `.js` file. `js_module_identity` returns no name for a path
+/// ending in a suffix it was not given, and a file with no module entity cannot
+/// source an entity-level import edge, so a Flow file walked with the TypeScript
+/// list would lose every import edge it owns.
+pub(super) fn extract_typescript_tree(
+    tree: &Tree,
+    source: &[u8],
+    file_id: &FilePathId,
+    suffixes: &[&str],
+) -> Result<ParseOutput> {
+    let error_ranges = collect_error_ranges(tree);
+    let parse_state = if error_ranges.is_empty() {
+        ParseState::Valid
+    } else {
+        ParseState::Incomplete { error_ranges }
+    };
+
+    let mut entities = Vec::new();
+    let mut relations = Vec::new();
+    let mut imports = Vec::new();
+    let mut tests = Vec::new();
+    let mut owners = JsOwners::default();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+
+    // Read the file's property-defining helpers before walking it; a
+    // helper is not bound to its uses by declaration order.
+    let definers = collect_js_property_definers(&root, source);
+
+    for child in root.children(&mut cursor) {
+        extract_ts_node(
+            &child,
+            source,
+            file_id,
+            &mut entities,
+            &mut relations,
+            &mut owners,
+            &definers,
+        );
+        if let Some(import_like) = extract_ts_import_like(&child, source) {
+            imports.push(import_like);
+        }
+        // Extract CommonJS require() calls as imports
+        collect_js_require_imports(&child, source, &mut imports);
+        // Detect describe/it/test calls (Jest/Vitest/Mocha)
+        extract_js_tests(&child, source, &mut tests);
+    }
+
+    // Emitted after the walk and BEFORE `owners.finish`, and both halves of
+    // that are load-bearing.
+    //
+    // After the walk, because Python emits its module last and every
+    // consumer that looks an entity up by name depends on it: with the
+    // module first, a `.find(|e| leaf(e.name) == "caller")` over `caller.ts`
+    // returns the MODULE rather than the function, which is how the rename
+    // planner's TypeScript case lost its call edge.
+    //
+    // Before `owners.finish`, because that function's collision guard reads
+    // the entity list to decide whether a receiver's owner already exists.
+    // Run after it, the module is invisible to the guard, which then
+    // synthesizes a Class under the same name and leaves one file holding
+    // two entities called `router` that the linker's (file, name) index
+    // cannot tell apart. That is the exact outcome its own comment warns
+    // about.
+    // same helper JavaScript uses. The two adapters carried byte-identical
+    // copies of this rule and drifted anyway: the TypeScript index predicate
+    // never matched `index.d.ts`. Sharing the helper is what the header
+    // comment above already says the shared surface exists for.
+    let (module_name, is_package) = js_module_identity(&file_id.0, suffixes);
+    if !module_name.is_empty() {
+        entities.push(ExtractedEntity {
+            kind: EntityKind::Module,
+            name: module_name,
+            signature: if is_package {
+                format!("package {}", file_id.0)
+            } else {
+                format!("module {}", file_id.0)
+            },
+            visibility: Visibility::Public,
+            doc_summary: None,
+            fingerprint: compute_fingerprint(&root, source),
+            span: span_from_node(&root, file_id),
+        });
+    }
+
+    owners.finish(&mut entities);
+
+    // Build import lookup: local_name -> module_path
+    let import_map: std::collections::HashMap<&str, &str> = imports
+        .iter()
+        .flat_map(|imp| {
+            imp.specifiers
+                .iter()
+                .map(move |spec| (spec.local_name.as_str(), imp.module_path.as_str()))
+        })
+        .collect();
+
+    // Annotate Calls/References relations with import_source
+    for rel in &mut relations {
+        if matches!(
+            rel.kind,
+            kin_model::RelationKind::Calls | kin_model::RelationKind::References
+        ) {
+            if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
+                rel.import_source = Some(module.to_string());
+            }
+        }
+    }
+
+    Ok(ParseOutput {
+        entities,
+        relations,
+        imports,
+        tests,
+        parse_state,
+        parsed_call_sites: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

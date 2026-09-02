@@ -762,3 +762,302 @@ test('the hosted transfer route is built from the contract, and refuses what it 
   assert.deepEqual(schema.definitions.refusal.required, ['error']);
   assert.equal(schema.definitions.refusal.properties.error.minLength, 1);
 });
+
+test('the graph feed schemas load', async () => {
+  const schemas = await loadAllSchemas();
+  assert.ok(schemas.graphExport);
+  assert.ok(schemas.graphEvent);
+});
+
+const minimalExport = {
+  root_hash: 'a1b2c3',
+  seq: 41,
+  entity_count: 2,
+  relation_count: 1,
+  unresolved_links: 0,
+  filtered_links: 0,
+  sampled: false,
+  nodes: [
+    { id: 'e1', name: 'alpha', kind: 'Function', file: 'src/a.rs', degree: 1 },
+    { id: 'e2', name: 'beta', kind: 'Class', file: null, degree: 1 }
+  ],
+  links: [{ source: 'e1', target: 'e2', kind: 'Calls' }]
+};
+
+test('a graph export states how much of the graph it is showing', async () => {
+  // The counts are the population, not the drawing. A payload that carried
+  // only its own size would read as the whole graph, which is exactly what a
+  // sampled export must never imply.
+  assert.equal((await validateContract('graphExport', minimalExport)).ok, true);
+
+  const { root_hash: _dropped, ...noRoot } = minimalExport;
+  assert.equal(
+    (await validateContract('graphExport', noRoot)).ok,
+    false,
+    'without a root hash a client cannot pair the export with the stream, so it is not an export'
+  );
+
+  const noCounts = { ...minimalExport };
+  delete noCounts.entity_count;
+  assert.equal(
+    (await validateContract('graphExport', noCounts)).ok,
+    false,
+    'a payload that does not say how many entities matched cannot be read as complete or as sampled'
+  );
+});
+
+test('optional export node fields are optional and unknown ones are refused', async () => {
+  const withExtras = structuredClone(minimalExport);
+  withExtras.nodes[0].line = 12;
+  withExtras.nodes[0].signature = 'fn alpha()';
+  assert.equal(
+    (await validateContract('graphExport', withExtras)).ok,
+    true,
+    'line and signature ride along when the caller asked for them'
+  );
+
+  const withUnknown = structuredClone(minimalExport);
+  withUnknown.nodes[0].embedding = [0.1, 0.2];
+  assert.equal(
+    (await validateContract('graphExport', withUnknown)).ok,
+    false,
+    'a field nobody agreed on is how the three copies of this shape drift apart'
+  );
+});
+
+test('a relation event names both endpoints and what happened to the edge', async () => {
+  assert.equal(
+    (
+      await validateContract('graphEvent', {
+        type: 'RelationChanged',
+        seq: 7,
+        source: 'e1',
+        target: 'e2',
+        kind: 'Calls',
+        change_type: 'created'
+      })
+    ).ok,
+    true
+  );
+
+  assert.equal(
+    (
+      await validateContract('graphEvent', {
+        type: 'RelationChanged',
+        seq: 7,
+        source: 'e1',
+        kind: 'Calls',
+        change_type: 'created'
+      })
+    ).ok,
+    false,
+    'an edge with one endpoint cannot be applied to a drawn graph'
+  );
+
+  assert.equal(
+    (
+      await validateContract('graphEvent', {
+        type: 'RelationChanged',
+        seq: 7,
+        source: 'e1',
+        target: 'e2',
+        kind: 'Calls',
+        change_type: 'added'
+      })
+    ).ok,
+    false,
+    'the change vocabulary is shared with entity events and is not per-event'
+  );
+});
+
+test('the connected frame carries the resync anchor', async () => {
+  assert.equal(
+    (
+      await validateContract('graphEvent', {
+        type: 'connected',
+        entity_count: 730,
+        root_hash: 'ab',
+        seq: 41
+      })
+    ).ok,
+    true
+  );
+  assert.equal(
+    (await validateContract('graphEvent', { type: 'connected', entity_count: 730, seq: 41 })).ok,
+    false,
+    'without a root hash a reconnecting client cannot tell whether to patch or re-export'
+  );
+  assert.equal(
+    (
+      await validateContract('graphEvent', {
+        type: 'connected',
+        entity_count: 730,
+        root_hash: 'ab'
+      })
+    ).ok,
+    false,
+    'and without a sequence it cannot tell what it missed between commits'
+  );
+});
+
+test('an entity event may carry the node it now describes', async () => {
+  assert.equal(
+    (
+      await validateContract('graphEvent', {
+        type: 'EntityChanged',
+        seq: 12,
+        entity_id: 'e1',
+        change_type: 'modified',
+        file_path: '/repo/src/a.rs',
+        session_id: null,
+        node: { name: 'alpha', kind: 'Function', file: 'src/a.rs', line: 12, degree: 3 }
+      })
+    ).ok,
+    true
+  );
+  assert.equal(
+    (
+      await validateContract('graphEvent', {
+        type: 'EntityChanged',
+        seq: 12,
+        entity_id: 'e1',
+        change_type: 'modified'
+      })
+    ).ok,
+    true,
+    'the summary is additive: a path that cannot cheaply produce one sends none'
+  );
+});
+
+test('a frame this contract does not describe fails validation rather than passing quietly', async () => {
+  // This is the one result a consumer must not act on as an error. The stream
+  // is additive and an older client will see types it has never heard of, so
+  // validation answers "is this a frame I know", not "is the stream broken".
+  assert.equal(
+    (await validateContract('graphEvent', { type: 'SomethingNewer', detail: 42 })).ok,
+    false,
+    'an unrecognized type is out of contract, and a consumer ignores it rather than failing'
+  );
+});
+
+test('the graph feed shape is one contract the Rust, the schema and the declarations agree on', async () => {
+  const [declarations, exportSource, stateSource, exportSchema, eventSchema] = await Promise.all([
+    fs.readFile(path.join(packageRoot, 'src/index.d.ts'), 'utf8'),
+    fs.readFile(
+      path.join(repositoryRoot, 'crates/kin-cli/src/commands/graph_export.rs'),
+      'utf8'
+    ),
+    fs.readFile(path.join(repositoryRoot, 'crates/kin-daemon/src/state.rs'), 'utf8'),
+    loadSchema('graphExport'),
+    loadSchema('graphEvent')
+  ]);
+
+  // The extractors must be shown to work before an empty result is read as
+  // agreement.
+  assert.equal(
+    rustStructFields(exportSource, 'GraphExportNotAStruct'),
+    null,
+    'the Rust extractor must miss a struct that does not exist'
+  );
+  assert.ok(
+    rustStructFields(exportSource, 'GraphExportNode').fields.includes('degree'),
+    'the Rust extractor must find a field the struct is known to declare'
+  );
+  assert.equal(
+    declaredInterfaceFields(declarations, 'GraphExportNotAnInterface'),
+    null,
+    'the TypeScript extractor must miss an interface that does not exist'
+  );
+
+  const pairs = [
+    ['GraphExportNode', rustStructFields(exportSource, 'GraphExportNode').fields, Object.keys(exportSchema.$defs.node.properties)],
+    ['GraphExportLink', rustStructFields(exportSource, 'GraphExportLink').fields, Object.keys(exportSchema.$defs.link.properties)],
+    ['GraphExport', rustStructFields(exportSource, 'GraphExportPayload').fields, Object.keys(exportSchema.properties)],
+    ['GraphNodeSummary', rustStructFields(stateSource, 'GraphNodeSummary').fields, Object.keys(eventSchema.$defs.nodeSummary.properties)]
+  ];
+
+  for (const [name, rustFields, schemaFields] of pairs) {
+    assert.deepEqual(
+      [...rustFields].sort(),
+      [...schemaFields].sort(),
+      `${name}: the Rust struct and the JSON Schema must carry the same fields`
+    );
+    const declared = declaredInterfaceFields(declarations, name);
+    assert.ok(declared, `${name} must be declared in index.d.ts`);
+    assert.deepEqual(
+      [...declared].sort(),
+      [...rustFields].sort(),
+      `${name}: the TypeScript declaration and the Rust struct must carry the same fields`
+    );
+  }
+});
+
+test('the pass boundary says what the whole reconcile did', async () => {
+  // A renderer lays out on this frame, not on each of the 26 entity events one
+  // appended function produces, so it has to say how much to apply.
+  assert.equal(
+    (
+      await validateContract('graphEvent', {
+        type: 'GraphDeltaApplied',
+        seq: 67,
+        nodes_added: 1,
+        nodes_modified: 25,
+        nodes_removed: 0,
+        relations_added: 3,
+        relations_removed: 1
+      })
+    ).ok,
+    true
+  );
+
+  assert.equal(
+    (
+      await validateContract('graphEvent', {
+        type: 'GraphDeltaApplied',
+        seq: 67,
+        nodes_added: 1,
+        nodes_modified: 25,
+        nodes_removed: 0
+      })
+    ).ok,
+    false,
+    'a boundary that counts only nodes leaves a consumer guessing about its edges'
+  );
+});
+
+test('a delta frame without a sequence is not a delta frame', async () => {
+  // The sequence is what a reconnecting client compares against its export.
+  // A frame that omits it cannot be placed, and between commits the root hash
+  // cannot place it either: a working-tree edit never advances the root.
+  assert.equal(
+    (
+      await validateContract('graphEvent', {
+        type: 'RelationChanged',
+        source: 'e1',
+        target: 'e2',
+        kind: 'Calls',
+        change_type: 'created'
+      })
+    ).ok,
+    false
+  );
+  assert.equal(
+    (
+      await validateContract('graphEvent', {
+        type: 'EntityChanged',
+        entity_id: 'e1',
+        change_type: 'modified'
+      })
+    ).ok,
+    false
+  );
+});
+
+test('a graph export names the sequence it was cut at', async () => {
+  const { seq: _dropped, ...noSeq } = minimalExport;
+  assert.equal(
+    (await validateContract('graphExport', noSeq)).ok,
+    false,
+    'without it a client cannot tell which events it already has'
+  );
+});

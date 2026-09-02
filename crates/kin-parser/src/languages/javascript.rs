@@ -26,16 +26,27 @@ impl LanguageAdapter for JavaScriptAdapter {
     }
 
     fn parse(&self, source: &[u8]) -> Result<Tree> {
-        let mut parser = make_parser(&tree_sitter_javascript::LANGUAGE)?;
-        parser
-            .parse(source, None)
-            .ok_or_else(|| crate::error::ParseError::ParseFailed {
-                file: String::new(),
-                reason: "tree-sitter returned None".into(),
-            })
+        parse_javascript_family(source)
     }
 
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
+        // A Flow file reaches here parsed by a TypeScript grammar, so it has to
+        // be walked by the TypeScript extractor: the walk below matches on node
+        // kinds the JavaScript grammar produces, and a `type_annotation` inside
+        // a declaration is not one of them.
+        //
+        // `JS_SUFFIXES` rather than the TypeScript list, because the file is
+        // still `.js`. `js_module_identity` returns no name for a path ending in
+        // a suffix it was not given, and a file with no module entity cannot
+        // source an entity-level import edge.
+        if tree_is_typescript_family(tree) {
+            tracing::debug!(
+                file = %file_id.0,
+                "javascript file extracted through the Flow path: parsed by a TypeScript grammar"
+            );
+            return super::typescript::extract_typescript_tree(tree, source, file_id, JS_SUFFIXES);
+        }
+
         let error_ranges = collect_error_ranges(tree);
         let parse_state = if error_ranges.is_empty() {
             ParseState::Valid
@@ -147,6 +158,211 @@ impl LanguageAdapter for JavaScriptAdapter {
             parsed_call_sites: None,
         })
     }
+}
+
+/// The share of a file's bytes the JavaScript grammar may leave unparsed before
+/// the file is treated as written in a dialect that grammar cannot read.
+///
+/// A file with a real syntax error loses a statement or two around the typo. A
+/// file whose whole annotation vocabulary the grammar lacks loses a large share
+/// of itself, because tree-sitter's error recovery swallows the declarations
+/// around every construct it cannot match. The two are far enough apart that
+/// the exact threshold is not delicate; it is set well above what a typo costs
+/// and well below what a missing dialect costs.
+const JS_GRAMMAR_MISMATCH_RATIO: f64 = 0.10;
+
+/// Parse a `.js`, `.jsx`, `.mjs` or `.cjs` file with the grammar that can read
+/// it.
+///
+/// Flow annotates plain JavaScript with types the JavaScript grammar has no rule
+/// for. `function workLoopConcurrent(nonIdle: boolean) {` is not a function
+/// declaration to that grammar, it is an ERROR node, and recovery takes the
+/// declarations around it with it. Measured on React's `ReactFiberWorkLoop.js`,
+/// which declares 125 top-level functions: the JavaScript grammar leaves 21.4%
+/// of the file unparsed and reaches 94 of them, and the TypeScript grammar
+/// leaves 0.13% and reaches all 125. So a file the JavaScript grammar cannot
+/// read is re-parsed with the TypeScript grammars, which accept Flow's
+/// annotation syntax.
+///
+/// The file keeps its JavaScript language id either way. The language it is
+/// written in has not changed; only the grammar that can read it has.
+///
+/// A clean JavaScript parse returns immediately, so a file with no Flow syntax
+/// pays nothing and its extraction is byte-for-byte what it was.
+pub fn parse_javascript_family(source: &[u8]) -> Result<Tree> {
+    let javascript = parse_with(&tree_sitter_javascript::LANGUAGE, source)?;
+    // `has_error` rather than a zero byte total, because the total exempts the
+    // root and a file whose only fault is an unlocalized top-level one would
+    // otherwise score zero and never be offered a second grammar.
+    if !javascript.root_node().has_error() {
+        return Ok(javascript);
+    }
+    let unparsed = unparsed_byte_total(&javascript);
+
+    // Two independent triggers, because neither alone is enough. The pragma is
+    // Flow's own declaration and catches a header-only file whose few
+    // annotations sit under the ratio. The ratio catches a Flow file that never
+    // wrote the pragma, which is most of a codebase once one `.flowconfig` at
+    // the root turns the checker on for every file under it.
+    let mismatched = declares_flow_pragma(source)
+        || unparsed as f64 >= source.len() as f64 * JS_GRAMMAR_MISMATCH_RATIO;
+    if !mismatched {
+        return Ok(javascript);
+    }
+
+    // TSX first, and a tie keeps the tree already in hand. Flow files carry JSX
+    // far more often than they carry a form only the non-JSX grammar accepts, so
+    // trying TSX first means the common case wins on the first comparison rather
+    // than on a tiebreak.
+    let mut best_unparsed = unparsed;
+    let mut best = javascript;
+    let tsx = tree_sitter_typescript::LANGUAGE_TSX;
+    let typescript = tree_sitter_typescript::LANGUAGE_TYPESCRIPT;
+    for language in [&tsx, &typescript] {
+        let candidate = parse_with(language, source)?;
+        let candidate_unparsed = unparsed_byte_total(&candidate);
+        if candidate_unparsed < best_unparsed {
+            best_unparsed = candidate_unparsed;
+            best = candidate;
+        }
+    }
+    Ok(best)
+}
+
+/// Whether `tree` came from one of the TypeScript-family grammars.
+///
+/// Asked of the tree rather than re-derived from the source, because
+/// [`parse_javascript_family`] chooses on a measurement of the parse itself that
+/// the source alone cannot reproduce. A second guess made in `extract` could
+/// disagree with the first and run the wrong walk over the tree in hand.
+///
+/// `type_annotation` is the node kind Flow support turns on and the JavaScript
+/// grammar has no rule producing it, so its presence in the grammar's kind table
+/// is the question being asked, stated directly. A grammar bump that renamed the
+/// kind would send every Flow file back to the JavaScript walk in silence, so
+/// `typescript_family_detection_is_grammar_backed` pins both halves of the
+/// answer in a test.
+pub fn tree_is_typescript_family(tree: &Tree) -> bool {
+    tree.language().id_for_node_kind("type_annotation", true) != 0
+}
+
+/// Whether the file's header declares Flow.
+///
+/// Flow's convention is a `@flow` pragma in the first comment block of the file,
+/// which is where React writes it. The scan stops at the first byte that is
+/// neither whitespace nor a comment, so a `@flow` inside a string literal or a
+/// doc comment further down cannot claim a plain JavaScript file. `@noflow` does
+/// not contain `@flow`, so it never matches; `@flowtype` is rejected by the
+/// trailing-byte check, while `@flow strict` and `@flow strict-local` pass.
+pub fn declares_flow_pragma(source: &[u8]) -> bool {
+    let mut i = 0usize;
+    // A shebang is a header line, not the first token of the program.
+    if source.starts_with(b"#!") {
+        i = line_end(source, 0);
+    }
+    while i < source.len() {
+        match source[i] {
+            b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c => i += 1,
+            b'/' if source.get(i + 1) == Some(&b'/') => {
+                let end = line_end(source, i);
+                if comment_has_flow_pragma(&source[i..end]) {
+                    return true;
+                }
+                i = end;
+            }
+            b'/' if source.get(i + 1) == Some(&b'*') => {
+                let end = match find_subslice(&source[i + 2..], b"*/") {
+                    Some(offset) => i + 2 + offset + 2,
+                    None => source.len(),
+                };
+                if comment_has_flow_pragma(&source[i..end]) {
+                    return true;
+                }
+                i = end;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// `@flow` as a whole pragma word inside one comment.
+fn comment_has_flow_pragma(comment: &[u8]) -> bool {
+    let mut from = 0usize;
+    while let Some(offset) = find_subslice(&comment[from..], b"@flow") {
+        let after = from + offset + b"@flow".len();
+        let trailing_is_word = comment
+            .get(after)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+        if !trailing_is_word {
+            return true;
+        }
+        from = after;
+    }
+    false
+}
+
+/// The index one past the newline ending the line `from` sits on, or the end of
+/// `source` when the line is unterminated.
+fn line_end(source: &[u8], from: usize) -> usize {
+    match source[from..].iter().position(|byte| *byte == b'\n') {
+        Some(offset) => from + offset + 1,
+        None => source.len(),
+    }
+}
+
+/// The first index at which `needle` occurs in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Bytes covered by the outermost ERROR and MISSING nodes in `tree`, not
+/// counting the root.
+///
+/// Outermost, which is why this does not reuse `collect_error_ranges`: that
+/// walker recurses through an ERROR node's own children, so a nested error is
+/// counted once per ancestor and the total can exceed the size of the file.
+/// This total is compared between grammars to pick one, so it has to mean the
+/// same thing in each of them.
+///
+/// The root is exempt, and that exemption is the whole measurement on the files
+/// this matters most for. Tree-sitter kinds the ROOT node ERROR whenever a file
+/// carries a top-level error it could not localize, however much of the file
+/// parsed: React's `ReactFiberHooks.js` has an ERROR root over 409 children, 400
+/// of which are clean import and declaration nodes. Counting the root's own span
+/// scores every such file as entirely unparsed under every grammar, which makes
+/// each of them look equally bad and leaves the file on the grammar that reads
+/// it worst.
+fn unparsed_byte_total(tree: &Tree) -> usize {
+    fn walk(node: &tree_sitter::Node, total: &mut usize) {
+        if node.is_error() || node.is_missing() {
+            *total += node.end_byte().saturating_sub(node.start_byte());
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk(&child, total);
+        }
+    }
+    let root = tree.root_node();
+    let mut total = 0;
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        walk(&child, &mut total);
+    }
+    total
+}
+
+/// Parse `source` with one grammar.
+fn parse_with(language: &tree_sitter_language::LanguageFn, source: &[u8]) -> Result<Tree> {
+    make_parser(language)?.parse(source, None).ok_or_else(|| {
+        crate::error::ParseError::ParseFailed {
+            file: String::new(),
+            reason: "tree-sitter returned None".into(),
+        }
+    })
 }
 
 /// Receivers that own member-assigned methods: `View.prototype.lookup = ...`,
@@ -2040,6 +2256,313 @@ mod tests {
             .filter(|e| e.kind != EntityKind::Module)
             .map(|e| (e.kind, e.name.as_str()))
             .collect()
+    }
+
+    /// A Flow file whose annotations the JavaScript grammar cannot read.
+    ///
+    /// Every construct here is one the grammar has no rule for and drops the
+    /// surrounding declaration over: a type import, an annotated parameter and
+    /// return type, a generic function, a nullable `?Type`, an `opaque type`,
+    /// and a class with annotated members.
+    const FLOW_SOURCE: &[u8] = br#"/**
+ * @flow strict-local
+ */
+
+import type {Fiber, Lanes} from './ReactInternalTypes';
+import {scheduleCallback} from './Scheduler';
+
+opaque type SuspendedReason = 0 | 1 | 2;
+
+export type WorkLoopState = {
+  current: Fiber | null,
+  lanes: Lanes,
+};
+
+function workLoopConcurrent(nonIdle: boolean) {
+  scheduleCallback(nonIdle);
+}
+
+export function performUnitOfWork(unitOfWork: Fiber): void {
+  workLoopConcurrent(true);
+}
+
+function dispatchSetState<S, A>(fiber: Fiber, action: A): S {
+  return (action: any);
+}
+
+function findParent(fiber: ?Fiber): ?Fiber {
+  return fiber;
+}
+
+class HookDispatcher {
+  reason: SuspendedReason;
+
+  resolve(lanes: Lanes): boolean {
+    return true;
+  }
+}
+"#;
+
+    /// The same Flow dialect in a file that also renders JSX, which only the
+    /// TSX grammar accepts.
+    const FLOW_JSX_SOURCE: &[u8] = br#"// @flow
+
+import type {Node} from 'react';
+
+function renderBadge(label: string, count: ?number): Node {
+  return <span className="badge">{label}</span>;
+}
+
+export function renderList(items: Array<string>): Node {
+  return (
+    <ul>
+      {items.map(item => (
+        <li key={item}>{renderBadge(item, null)}</li>
+      ))}
+    </ul>
+  );
+}
+"#;
+
+    fn extract_source(path: &str, source: &[u8]) -> ParseOutput {
+        let adapter = JavaScriptAdapter;
+        let tree = adapter.parse(source).unwrap();
+        adapter
+            .extract(&tree, source, &FilePathId(path.to_string()))
+            .unwrap()
+    }
+
+    fn named(output: &ParseOutput, kind: EntityKind, name: &str) -> bool {
+        output
+            .entities
+            .iter()
+            .any(|entity| entity.kind == kind && entity.name == name)
+    }
+
+    /// The defect: the JavaScript grammar drops a Flow file's declarations, and
+    /// the TypeScript grammar keeps them.
+    ///
+    /// Asserted against the JavaScript grammar's own answer in the same test, so
+    /// the numbers cannot both drift and keep the assertion true.
+    #[test]
+    fn flow_annotated_declarations_survive_the_typescript_grammar() {
+        let file_id = FilePathId("packages/react-reconciler/src/ReactFiberWorkLoop.js".to_string());
+
+        let javascript_only = parse_with(&tree_sitter_javascript::LANGUAGE, FLOW_SOURCE).unwrap();
+        assert!(
+            javascript_only.root_node().has_error(),
+            "the fixture must be unreadable to the JavaScript grammar, or this test proves nothing"
+        );
+
+        let output = extract_source(&file_id.0, FLOW_SOURCE);
+
+        for name in [
+            "workLoopConcurrent",
+            "performUnitOfWork",
+            "dispatchSetState",
+            "findParent",
+        ] {
+            assert!(
+                named(&output, EntityKind::Function, name),
+                "{name} missing from {:?}",
+                output
+                    .entities
+                    .iter()
+                    .map(|e| (e.kind, e.name.as_str()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(named(&output, EntityKind::Class, "HookDispatcher"));
+        assert!(named(&output, EntityKind::Method, "HookDispatcher.resolve"));
+        // The `opaque type` and the exported object type reach the graph as
+        // type aliases rather than being swallowed with the code around them.
+        assert!(named(&output, EntityKind::TypeAlias, "SuspendedReason"));
+        assert!(named(&output, EntityKind::TypeAlias, "WorkLoopState"));
+
+        // A control that must not hit: an absence has to be able to fail.
+        assert!(!named(&output, EntityKind::Function, "workLoopSync"));
+    }
+
+    /// The module entity a Flow file's import edges hang off.
+    ///
+    /// The TypeScript walk names a module by stripping a suffix from the path,
+    /// and the file is still `.js`. Handed the TypeScript suffix list it would
+    /// strip nothing, emit no module, and take every entity-level import edge in
+    /// the file down with it.
+    #[test]
+    fn a_flow_file_keeps_its_javascript_module_identity() {
+        let output = extract_source(
+            "packages/react-reconciler/src/ReactFiberWorkLoop.js",
+            FLOW_SOURCE,
+        );
+        assert!(named(&output, EntityKind::Module, "ReactFiberWorkLoop"));
+        assert!(
+            output
+                .imports
+                .iter()
+                .any(|import| import.module_path == "./Scheduler"),
+            "imports: {:?}",
+            output
+                .imports
+                .iter()
+                .map(|i| &i.module_path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// JSX in a Flow `.js` file, which only the TSX grammar reads.
+    #[test]
+    fn a_flow_file_carrying_jsx_is_read_by_the_tsx_grammar() {
+        let source = FLOW_JSX_SOURCE;
+        let typescript = parse_with(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT, source).unwrap();
+        assert!(
+            typescript.root_node().has_error(),
+            "the fixture must defeat the non-JSX TypeScript grammar, or TSX is not what is being tested"
+        );
+
+        let output = extract_source("src/renderList.js", source);
+        assert!(named(&output, EntityKind::Function, "renderBadge"));
+        assert!(named(&output, EntityKind::Function, "renderList"));
+    }
+
+    /// Plain JavaScript is untouched: it parses clean, so it never reaches the
+    /// second grammar and its extraction is the JavaScript walk's, byte for
+    /// byte.
+    #[test]
+    fn plain_javascript_still_takes_the_javascript_path() {
+        let source = b"function add(a, b) { return a + b; }\nclass Box { get() { return 1; } }\n";
+        let adapter = JavaScriptAdapter;
+        let tree = adapter.parse(source).unwrap();
+        assert!(!tree_is_typescript_family(&tree));
+        let output = adapter
+            .extract(&tree, source, &FilePathId("src/util.js".to_string()))
+            .unwrap();
+        assert!(matches!(output.parse_state, ParseState::Valid));
+        assert!(named(&output, EntityKind::Function, "add"));
+        assert!(named(&output, EntityKind::Class, "Box"));
+    }
+
+    /// The second trigger, on a Flow file that never wrote the pragma. One
+    /// `.flowconfig` at a repo root turns Flow on for every file under it, so
+    /// most Flow files carry no header of their own.
+    #[test]
+    fn a_pragma_less_flow_file_is_caught_by_the_error_ratio() {
+        let source: Vec<u8> = FLOW_SOURCE
+            .strip_prefix(b"/**\n * @flow strict-local\n */\n")
+            .expect("fixture header")
+            .to_vec();
+        assert!(
+            !declares_flow_pragma(&source),
+            "the pragma must be gone, or this test is the pragma test again"
+        );
+        let tree = JavaScriptAdapter.parse(&source).unwrap();
+        assert!(tree_is_typescript_family(&tree));
+    }
+
+    /// The pragma's own contribution, isolated from the error ratio.
+    ///
+    /// The file is mostly plain JavaScript, so its one Flow declaration leaves
+    /// the JavaScript parse at about 2% unparsed, well under
+    /// [`JS_GRAMMAR_MISMATCH_RATIO`]. The ratio trigger cannot fire and the
+    /// pragma is the only thing that can route the file, which is what makes
+    /// deleting the pragma check fail HERE rather than nowhere.
+    ///
+    /// The generic function is the shape that makes this possible, and it took
+    /// finding: a `?Type` parameter, an `import type`, a `type` alias and an
+    /// `opaque type` all leave the JavaScript grammar's recovery local enough
+    /// that the declaration beside them survives, so a fixture built from any of
+    /// those passes with the pragma check deleted and proves nothing. `<T>` is
+    /// read as a comparison and takes the whole declaration down with it.
+    #[test]
+    fn the_pragma_alone_routes_a_lightly_annotated_flow_file() {
+        let plain: String = (0..40)
+            .map(|i| format!("function plain{i}(a, b) {{\n  return a + b + {i};\n}}\n\n"))
+            .collect();
+        let text = format!(
+            "// @flow\n\n{plain}function pick<T>(items: Array<T>): T {{\n  return items[0];\n}}\n"
+        );
+        let source = text.as_bytes();
+
+        let javascript = parse_with(&tree_sitter_javascript::LANGUAGE, source).unwrap();
+        assert!(
+            javascript.root_node().has_error(),
+            "the generic declaration must defeat the JavaScript grammar"
+        );
+        let ratio = unparsed_byte_total(&javascript) as f64 / source.len() as f64;
+        assert!(
+            ratio < JS_GRAMMAR_MISMATCH_RATIO,
+            "the ratio trigger must NOT fire here or this stops being the pragma's test: {ratio}"
+        );
+        assert!(declares_flow_pragma(source));
+
+        let output = extract_source("src/pick.js", source);
+        assert!(
+            named(&output, EntityKind::Function, "pick"),
+            "entities: {:?}",
+            output
+                .entities
+                .iter()
+                .map(|e| (e.kind, e.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+        // The plain declarations the JavaScript grammar already read must all
+        // still be there, so a routing change can never trade them for `pick`.
+        assert_eq!(
+            output
+                .entities
+                .iter()
+                .filter(|e| e.name.starts_with("plain"))
+                .count(),
+            40
+        );
+    }
+
+    /// Both halves of the grammar question, so a grammar bump that renamed
+    /// `type_annotation` fails here rather than silently returning every Flow
+    /// file to the JavaScript walk.
+    #[test]
+    fn typescript_family_detection_is_grammar_backed() {
+        let source = b"const x = 1;\n";
+        let javascript = parse_with(&tree_sitter_javascript::LANGUAGE, source).unwrap();
+        let tsx = parse_with(&tree_sitter_typescript::LANGUAGE_TSX, source).unwrap();
+        let typescript = parse_with(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT, source).unwrap();
+        assert!(!tree_is_typescript_family(&javascript));
+        assert!(tree_is_typescript_family(&tsx));
+        assert!(tree_is_typescript_family(&typescript));
+    }
+
+    #[test]
+    fn flow_pragma_is_read_only_from_the_files_header() {
+        assert!(declares_flow_pragma(b"/**\n * @flow\n */\nconst a = 1;\n"));
+        assert!(declares_flow_pragma(b"// @flow\nconst a = 1;\n"));
+        assert!(declares_flow_pragma(b"/* @flow strict */\n"));
+        assert!(declares_flow_pragma(b"/* @flow strict-local */\n"));
+        assert!(declares_flow_pragma(b"#!/usr/bin/env node\n// @flow\n"));
+        assert!(declares_flow_pragma(b"\n\n  /* @flow */\n"));
+
+        assert!(!declares_flow_pragma(b"// @noflow\nconst a = 1;\n"));
+        assert!(!declares_flow_pragma(b"// @flowtype\nconst a = 1;\n"));
+        assert!(!declares_flow_pragma(b"const banner = '@flow';\n"));
+        // Below the first statement is not the header.
+        assert!(!declares_flow_pragma(b"const a = 1;\n// @flow\n"));
+        assert!(!declares_flow_pragma(b""));
+        // An unterminated block comment must not run off the end.
+        assert!(!declares_flow_pragma(b"/* unterminated"));
+    }
+
+    /// The root's exemption from the byte total, which is what lets a file whose
+    /// top-level error tree-sitter could not localize be compared at all.
+    #[test]
+    fn the_error_total_exempts_the_root() {
+        // `A => mixed` is a Flow function type no grammar here accepts, and it
+        // makes tree-sitter kind the whole root ERROR.
+        let source = b"type D = A => mixed;\nfunction good(a) { return a; }\n";
+        let tree = parse_with(&tree_sitter_javascript::LANGUAGE, source).unwrap();
+        assert!(tree.root_node().has_error());
+        assert!(
+            unparsed_byte_total(&tree) < source.len(),
+            "the root's own span must not be charged to the file"
+        );
     }
 
     #[test]

@@ -1426,6 +1426,7 @@ pub(crate) fn evict_enrichment_for_removed_paths(
         for id in cleanup.removed_entities {
             state.emit_event(DaemonEvent::EntityChanged {
                 entity_id: id,
+                node: None,
                 change_type: ChangeType::Deleted,
                 file_path: Some(file_id.0.clone()),
                 session_id: None,
@@ -2943,6 +2944,12 @@ pub async fn run_loop_armed(
         // staging view; there is no second mutable overlay authority.
         let mut reconciler = state.reconciler.write().await;
         let mut graph_changed = false;
+        // What this pass emitted, totalled so the pass can close with one
+        // boundary event. A renderer lays out once per pass on that boundary
+        // rather than once per event: measured, one appended function in
+        // hiredis net.c emits 26 entity events, 25 of them for entities the
+        // edit never touched.
+        let mut pass_delta = crate::state::PassDelta::default();
         // Events this tick admitted without deferring them back to the retry
         // queue. This is the reconcile pass's persisted-progress counter: a tick
         // that re-observes the same paths and defers every one of them scores
@@ -3149,6 +3156,7 @@ pub async fn run_loop_armed(
                                     for id in cleanup.removed_entities {
                                         state.emit_event(DaemonEvent::EntityChanged {
                                             entity_id: id,
+                                            node: None,
                                             change_type: ChangeType::Deleted,
                                             file_path: Some(file_id.0.clone()),
                                             session_id: None,
@@ -3219,6 +3227,7 @@ pub async fn run_loop_armed(
                             for id in cleanup.removed_entities {
                                 state.emit_event(DaemonEvent::EntityChanged {
                                     entity_id: id,
+                                    node: None,
                                     change_type: ChangeType::Deleted,
                                     file_path: Some(file_id.0.clone()),
                                     session_id: None,
@@ -3261,6 +3270,7 @@ pub async fn run_loop_armed(
                                 for id in cleanup.removed_entities {
                                     state.emit_event(DaemonEvent::EntityChanged {
                                         entity_id: id,
+                                        node: None,
                                         change_type: ChangeType::Deleted,
                                         file_path: Some(file_id.0.clone()),
                                         session_id: None,
@@ -3365,9 +3375,16 @@ pub async fn run_loop_armed(
                     } = &outcome
                     {
                         let file_path = path.to_string_lossy().to_string();
+                        pass_delta.nodes_added += added.len();
+                        pass_delta.nodes_modified += modified.len();
+                        pass_delta.nodes_removed += removed.len();
                         for id in added {
                             state.emit_event(DaemonEvent::EntityChanged {
                                 entity_id: *id,
+                                // Read from the graph the transaction just
+                                // applied, so a drawing consumer can place the
+                                // node without asking what it now is.
+                                node: crate::state::graph_node_summary(state.graph.as_ref(), id),
                                 change_type: ChangeType::Created,
                                 file_path: Some(file_path.clone()),
                                 // FS-reconcile loop: a raw filesystem change has
@@ -3378,6 +3395,10 @@ pub async fn run_loop_armed(
                         for id in modified {
                             state.emit_event(DaemonEvent::EntityChanged {
                                 entity_id: *id,
+                                // Read from the graph the transaction just
+                                // applied, so a drawing consumer can place the
+                                // node without asking what it now is.
+                                node: crate::state::graph_node_summary(state.graph.as_ref(), id),
                                 change_type: ChangeType::Modified,
                                 file_path: Some(file_path.clone()),
                                 // FS-reconcile loop: a raw filesystem change has
@@ -3388,6 +3409,7 @@ pub async fn run_loop_armed(
                         for id in removed {
                             state.emit_event(DaemonEvent::EntityChanged {
                                 entity_id: *id,
+                                node: None,
                                 change_type: ChangeType::Deleted,
                                 file_path: Some(file_path.clone()),
                                 // FS-reconcile loop: a raw filesystem change has
@@ -3413,20 +3435,44 @@ pub async fn run_loop_armed(
                         if !changed_ids.is_empty() {
                             lsp_changed.push((file_id.clone(), changed_ids));
                         }
+
+                        // Emitted after the entity events on purpose: an edge
+                        // event naming a node the consumer has not been told
+                        // about yet cannot be applied to a drawn graph.
+                        if should_apply {
+                            for event in crate::state::relation_change_events(
+                                &delta,
+                                Some(file_path.as_str()),
+                            ) {
+                                pass_delta.count(&event);
+                                state.emit_event(event);
+                            }
+                        }
                     } else if let ReconcileOutcome::FileRemoved {
                         removed, file_id, ..
                     } = &outcome
                     {
                         let file_path = path.to_string_lossy().to_string();
+                        pass_delta.nodes_removed += removed.len();
                         for id in removed {
                             state.emit_event(DaemonEvent::EntityChanged {
                                 entity_id: *id,
+                                node: None,
                                 change_type: ChangeType::Deleted,
                                 file_path: Some(file_path.clone()),
                                 // FS-reconcile loop: a raw filesystem change has
                                 // no owning agent, so attribution is honestly None.
                                 session_id: None,
                             });
+                        }
+                        if should_apply {
+                            for event in crate::state::relation_change_events(
+                                &delta,
+                                Some(file_path.as_str()),
+                            ) {
+                                pass_delta.count(&event);
+                                state.emit_event(event);
+                            }
                         }
                         match clear_incompatible_facets(&state, file_id, EnrichmentFacet::None) {
                             Ok(_) => {
@@ -3519,6 +3565,14 @@ pub async fn run_loop_armed(
             if let Err(e) = projection_result {
                 error!(error = %e, "failed to refresh projection after reconciliation");
             }
+        }
+
+        // The pass boundary, after every event this pass produced. A consumer
+        // that has been buffering since the last boundary applies the batch and
+        // lays out once. Silent when the pass emitted nothing, because a
+        // boundary with no delta is not news.
+        if let Some(boundary) = pass_delta.into_event() {
+            state.emit_event(boundary);
         }
 
         pass.advanced(admitted_events, Instant::now());
@@ -8325,6 +8379,7 @@ async fn sync_filesystem_with_graph_publishing_inner(
                                 for id in cleanup.removed_entities {
                                     state.emit_event(DaemonEvent::EntityChanged {
                                         entity_id: id,
+                                        node: None,
                                         change_type: ChangeType::Deleted,
                                         file_path: Some(file_id.0.clone()),
                                         session_id: None,
@@ -8376,6 +8431,7 @@ async fn sync_filesystem_with_graph_publishing_inner(
                         for id in cleanup.removed_entities {
                             state.emit_event(DaemonEvent::EntityChanged {
                                 entity_id: id,
+                                node: None,
                                 change_type: ChangeType::Deleted,
                                 file_path: Some(file_id.0.clone()),
                                 session_id: None,
@@ -8412,6 +8468,7 @@ async fn sync_filesystem_with_graph_publishing_inner(
                             for id in cleanup.removed_entities {
                                 state.emit_event(DaemonEvent::EntityChanged {
                                     entity_id: id,
+                                    node: None,
                                     change_type: ChangeType::Deleted,
                                     file_path: Some(file_id.0.clone()),
                                     session_id: None,
@@ -8499,6 +8556,7 @@ async fn sync_filesystem_with_graph_publishing_inner(
                         for id in removed {
                             state.emit_event(DaemonEvent::EntityChanged {
                                 entity_id: *id,
+                                node: None,
                                 change_type: ChangeType::Deleted,
                                 file_path: Some(file_id.0.clone()),
                                 // FS-reconcile loop: anonymous, no owning session.

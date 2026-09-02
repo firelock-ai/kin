@@ -1953,6 +1953,8 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/verify", post(command_verify))
         .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
+        .route("/graph/export", get(graph_export))
+        .route("/graph/events", get(graph_events))
         .route("/graph/mutations", post(graph_mutations))
         .route("/commands/status", post(command_status))
         .route("/commands/resources", post(command_resources))
@@ -6801,6 +6803,204 @@ async fn graph_bootstrap(
     let bytes = export_graph_snapshot_bytes(graph).await?;
 
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes))
+}
+
+/// Query parameters for `GET /graph/export`.
+#[derive(Debug, Deserialize)]
+struct GraphExportParams {
+    /// Node cap. `0` asks for the whole graph; absent uses the default cap.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Comma-separated entity kinds to keep.
+    #[serde(default)]
+    kinds: Option<String>,
+    /// Repository path prefix a node's file must start with.
+    #[serde(default)]
+    path: Option<String>,
+    /// Comma-separated optional node fields: `signature`, `line`.
+    #[serde(default)]
+    include: Option<String>,
+}
+
+/// GET /graph/export: the drawable projection of the daemon's live graph.
+///
+/// `/graph/bootstrap` already exports this graph, but as the whole binary
+/// snapshot: measured on a 730-entity repository it is 3.6 MiB against the
+/// 271 KiB a renderer actually draws, and nothing in it is shaped for a
+/// consumer. This is the same graph, projected to nodes and links, capped and
+/// sampled server side so every consumer draws the same picture.
+///
+/// Same session-scope resolution as `graph_bootstrap`: a session holding a
+/// temporal scope exports the graph that scope names.
+async fn graph_export(
+    headers: axum::http::HeaderMap,
+    Query(params): Query<GraphExportParams>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use kin_cli::commands::graph_export as export;
+
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+
+    let options = export::ExportOptions {
+        limit: match params.limit {
+            // An explicit 0 is the request for every entity. Absent is a
+            // request for a drawable default, which is a different question.
+            Some(0) => None,
+            Some(limit) => Some(limit),
+            None => Some(export::DEFAULT_NODE_LIMIT),
+        },
+        kinds: params
+            .kinds
+            .as_deref()
+            .map(export::parse_kinds)
+            .unwrap_or_default(),
+        path_prefix: params.path.filter(|prefix| !prefix.is_empty()),
+        include: params
+            .include
+            .as_deref()
+            .map(export::IncludeFields::parse)
+            .unwrap_or_default(),
+    };
+
+    // Read BEFORE the payload is built. A client keeps every event above this
+    // number, so reading first can only make it re-apply something the export
+    // already contains, which for an upsert is a no-op. Reading after would let
+    // an event emitted during the build fall into neither, and that one is lost.
+    let seq = state.current_event_seq();
+
+    // Off the request thread. Reading every entity and each one's relations is
+    // real CPU work at repository scale, and doing it inline would stall every
+    // other request this runtime is serving.
+    tokio::task::spawn_blocking(move || {
+        let root_hash = hex::encode(graph.compute_root_hash());
+        let (node_meta, all_entity_ids, edges) = export::read_graph(graph.as_ref())?;
+        Ok::<_, anyhow::Error>(export::assemble_payload(
+            root_hash,
+            seq,
+            node_meta,
+            &all_entity_ids,
+            edges,
+            &options,
+        ))
+    })
+    .await
+    .map_err(internal_error)?
+    .map(Json)
+    .map_err(internal_error)
+}
+
+/// Query parameters for `GET /graph/events`.
+#[derive(Debug, Deserialize)]
+struct GraphEventsParams {
+    /// Comma-separated event type names to keep, e.g.
+    /// `EntityChanged,RelationChanged`. Absent means every type.
+    #[serde(default)]
+    types: Option<String>,
+}
+
+/// GET /graph/events: the graph-facing view of the daemon event bus.
+///
+/// The same broadcast channel `/vfs/subscribe` serves, which is left exactly as
+/// it was because the VFS daemon and the spine depend on its frames. What this
+/// adds is the two things a graph consumer needs and that one does not carry: a
+/// `types` filter, so a renderer is not woken by coordination traffic it will
+/// throw away, and a first frame naming the current `root_hash`, so a client
+/// reconnecting after a gap can tell whether its drawn graph is still the one
+/// the daemon holds or has to be re-exported.
+async fn graph_events(
+    Query(params): Query<GraphEventsParams>,
+    State(state): State<Arc<DaemonState>>,
+) -> impl IntoResponse {
+    let wanted: Option<std::collections::HashSet<String>> = params
+        .types
+        .as_deref()
+        .map(|raw| {
+            raw.split(',')
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect::<std::collections::HashSet<String>>()
+        })
+        .filter(|names| !names.is_empty());
+
+    let mut rx = state.event_tx.subscribe();
+    let root_hash = hex::encode(state.graph.compute_root_hash());
+    let entity_count = state.graph.entity_count();
+    let seq = state.current_event_seq();
+
+    let stream = async_stream::stream! {
+        // The resync anchor. `seq` is the one that works between commits: a
+        // working-tree edit changes the graph without advancing the root, so a
+        // client reconnecting mid-session cannot learn anything from the hash
+        // alone. It exports, reads the export's `seq`, subscribes, and discards
+        // every event at or below it.
+        let connected = json!({
+            "type": "connected",
+            "entity_count": entity_count,
+            "root_hash": root_hash,
+            "seq": seq,
+        });
+        yield Ok::<_, std::convert::Infallible>(format!("data: {connected}\n\n"));
+
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+        heartbeat.tick().await; // Skip first immediate tick
+
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    match event {
+                        Ok(sequenced) => {
+                            let keep = wanted
+                                .as_ref()
+                                .is_none_or(|names| names.contains(sequenced.event.type_name()));
+                            if keep {
+                                // The sequence is merged into the event object
+                                // rather than wrapping it, so a consumer reads
+                                // one flat frame and an older one that ignores
+                                // the field still parses exactly what it did.
+                                if let Ok(mut value) = serde_json::to_value(&sequenced.event) {
+                                    if let Some(object) = value.as_object_mut() {
+                                        object.insert("seq".to_string(), json!(sequenced.seq));
+                                    }
+                                    yield Ok(format!("data: {value}\n\n"));
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // Never filtered. A gap is not a graph event, it is
+                            // the news that this client's view is now wrong,
+                            // and a filter that swallowed it would leave a
+                            // consumer patching a graph it has already lost.
+                            yield Ok(format!("data: {{\"type\":\"lagged\",\"missed\":{n}}}\n\n"));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    yield Ok(": heartbeat\n\n".to_string());
+                }
+            }
+        }
+    };
+
+    let mut response = (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONNECTION, "keep-alive"),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response();
+    // Prevent nginx from buffering the SSE stream in GKE deployments.
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-accel-buffering"),
+        axum::http::HeaderValue::from_static("no"),
+    );
+    response
 }
 
 /// POST /locate — run locate against the daemon-resident graph and return the
@@ -15556,8 +15756,12 @@ async fn vfs_subscribe(State(state): State<Arc<DaemonState>>) -> impl IntoRespon
             tokio::select! {
                 event = rx.recv() => {
                     match event {
-                        Ok(daemon_event) => {
-                            if let Ok(json) = serde_json::to_string(&daemon_event) {
+                        // The bare event, without the sequence envelope. The VFS
+                        // daemon and the spine read these exact frames, so this
+                        // stream stays byte-identical; the sequence is a graph
+                        // consumer's concern and rides `/graph/events`.
+                        Ok(sequenced) => {
+                            if let Ok(json) = serde_json::to_string(&sequenced.event) {
                                 yield Ok(format!("data: {json}\n\n"));
                             }
                         }
@@ -27685,7 +27889,7 @@ mod tests {
         assert!(created.operation_id.is_some());
         assert_eq!(state.graph.compute_root_hash(), graph_root_before);
         assert!(matches!(
-            events.recv().await.unwrap(),
+            events.recv().await.unwrap().event,
             DaemonEvent::RepositoryAuthorityChanged {
                 previous_generation,
                 new_generation,
@@ -35656,6 +35860,266 @@ mod tests {
         let _snapshot = kin_db::GraphSnapshot::from_bytes(&body).unwrap();
     }
 
+    /// Ask `/graph/export` and read its payload back.
+    async fn export_payload(
+        state: Arc<DaemonState>,
+        query: &str,
+    ) -> kin_cli::commands::graph_export::GraphExportPayload {
+        let uri = if query.is_empty() {
+            "/graph/export".to_string()
+        } else {
+            format!("/graph/export?{query}")
+        };
+        let response = router(state)
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+        let body = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The export answers from the live graph the daemon already holds, in the
+    /// shape a renderer draws.
+    ///
+    /// `/graph/bootstrap` already exports this graph, but as the whole binary
+    /// snapshot: 119.6 MiB against 1.0 MiB on a 23,098-entity repository. This
+    /// is the same truth, projected.
+    #[tokio::test]
+    async fn graph_export_projects_the_live_graph_to_nodes_and_links() {
+        let state = test_state();
+        let caller = test_entity("caller", "src/a.py");
+        let callee = test_entity("callee", "src/b.py");
+        state.graph.upsert_entity(&caller).unwrap();
+        state.graph.upsert_entity(&callee).unwrap();
+        link(&state, &caller, &callee, RelationKind::Calls);
+
+        let payload = export_payload(Arc::clone(&state), "").await;
+
+        assert_eq!(payload.nodes.len(), 2);
+        assert_eq!(payload.links.len(), 1);
+        assert_eq!(payload.entity_count, 2);
+        assert_eq!(payload.relation_count, 1);
+        assert!(!payload.sampled);
+        assert!(
+            !payload.root_hash.is_empty(),
+            "without a root hash a client cannot pair this with the event stream"
+        );
+        assert_eq!(payload.links[0].kind, "Calls");
+        for node in &payload.nodes {
+            assert_eq!(
+                node.degree, 1,
+                "both endpoints of the one edge have degree 1"
+            );
+        }
+    }
+
+    /// A capped export says how much it left out, rather than reading as the
+    /// whole graph.
+    #[tokio::test]
+    async fn a_capped_export_reports_the_population_it_sampled_from() {
+        let state = test_state();
+        for index in 0..6 {
+            let entity = test_entity(&format!("fn{index}"), &format!("src/m{index}.py"));
+            state.graph.upsert_entity(&entity).unwrap();
+        }
+
+        let payload = export_payload(Arc::clone(&state), "limit=2").await;
+
+        assert_eq!(payload.nodes.len(), 2);
+        assert!(payload.sampled);
+        assert_eq!(
+            payload.entity_count, 6,
+            "the count is the population, not the drawing"
+        );
+        assert_eq!(payload.limit, Some(2));
+    }
+
+    /// An explicit `limit=0` asks for every entity, which is a different
+    /// request from naming no cap at all.
+    #[tokio::test]
+    async fn an_explicit_zero_limit_exports_the_whole_graph() {
+        let state = test_state();
+        for index in 0..4 {
+            let entity = test_entity(&format!("fn{index}"), &format!("src/m{index}.py"));
+            state.graph.upsert_entity(&entity).unwrap();
+        }
+
+        let payload = export_payload(Arc::clone(&state), "limit=0").await;
+        assert_eq!(payload.nodes.len(), 4);
+        assert!(!payload.sampled);
+        assert_eq!(payload.limit, None);
+    }
+
+    /// The default payload is exactly what the current renderers read; the
+    /// bigger fields ride along only when asked for.
+    #[tokio::test]
+    async fn line_and_signature_are_opt_in() {
+        let state = test_state();
+        let entity = test_entity("handler", "src/a.py");
+        state.graph.upsert_entity(&entity).unwrap();
+
+        let plain = export_payload(Arc::clone(&state), "").await;
+        assert_eq!(plain.nodes[0].line, None);
+        assert_eq!(plain.nodes[0].signature, None);
+
+        let rich = export_payload(Arc::clone(&state), "include=line,signature").await;
+        assert_eq!(
+            rich.nodes[0].line,
+            Some(2),
+            "the graph's 0-based span row is reported as a 1-based editor line"
+        );
+        assert_eq!(rich.nodes[0].signature.as_deref(), Some("def handler()"));
+    }
+
+    /// A filter that excludes an endpoint withholds its edge, and says which
+    /// kind of withholding it was.
+    #[tokio::test]
+    async fn a_path_filter_reports_its_dropped_edges_apart_from_unresolved_ones() {
+        let state = test_state();
+        let inside = test_entity("inside", "src/a.py");
+        let outside = test_entity("outside", "vendor/b.py");
+        state.graph.upsert_entity(&inside).unwrap();
+        state.graph.upsert_entity(&outside).unwrap();
+        link(&state, &inside, &outside, RelationKind::Calls);
+
+        let payload = export_payload(Arc::clone(&state), "path=src/").await;
+
+        assert_eq!(payload.nodes.len(), 1);
+        assert_eq!(payload.filtered_links, 1, "this request dropped the edge");
+        assert_eq!(
+            payload.unresolved_links, 0,
+            "both endpoints are entities, so nothing here is unresolved"
+        );
+    }
+
+    /// The export names the position it was cut at, and events after the cut
+    /// sort above it.
+    ///
+    /// This is the pair a client resyncs on. The root hash cannot do it: a
+    /// working-tree edit changes the graph and never advances the root, so
+    /// between commits the two hashes match while the picture is stale.
+    #[tokio::test]
+    async fn an_export_is_cut_before_the_events_that_follow_it() {
+        let state = test_state();
+        let entity = test_entity("handler", "src/a.py");
+        state.graph.upsert_entity(&entity).unwrap();
+
+        let first = export_payload(Arc::clone(&state), "").await;
+
+        let mut rx = state.event_tx.subscribe();
+        state.emit_event(crate::state::DaemonEvent::EntityChanged {
+            entity_id: entity.id,
+            node: None,
+            change_type: crate::state::ChangeType::Modified,
+            file_path: Some("src/a.py".to_string()),
+            session_id: None,
+        });
+        let emitted = rx.try_recv().expect("the event reached the bus");
+        assert!(
+            emitted.seq > first.seq,
+            "an event emitted after the cut must sort above it: cut={} event={}",
+            first.seq,
+            emitted.seq
+        );
+
+        let second = export_payload(Arc::clone(&state), "").await;
+        assert!(
+            second.seq >= emitted.seq,
+            "an export taken after the event must include it in its cut"
+        );
+    }
+
+    /// Every frame on the graph stream carries its position.
+    #[tokio::test]
+    async fn graph_events_stamps_a_sequence_on_every_frame() {
+        let state = test_state();
+        let entity = test_entity("handler", "src/a.py");
+        state.graph.upsert_entity(&entity).unwrap();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(Request::get("/graph/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+
+        let read_frame = |chunk: axum::body::Bytes| -> serde_json::Value {
+            let text = String::from_utf8(chunk.to_vec()).unwrap();
+            serde_json::from_str(text.trim_start_matches("data: ").trim()).unwrap()
+        };
+
+        let connected = read_frame(
+            futures_util::StreamExt::next(&mut body)
+                .await
+                .expect("connected frame")
+                .unwrap(),
+        );
+        assert_eq!(connected["type"], json!("connected"));
+        let cut = connected["seq"].as_u64().expect("connected carries a seq");
+
+        // Emitted after the subscription exists, so the stream must deliver it.
+        state.emit_event(crate::state::DaemonEvent::RelationChanged {
+            source: entity.id,
+            target: entity.id,
+            kind: "Calls".to_string(),
+            change_type: crate::state::ChangeType::Created,
+            file_path: Some("src/a.py".to_string()),
+        });
+
+        let frame = read_frame(
+            futures_util::StreamExt::next(&mut body)
+                .await
+                .expect("the emitted event reaches the stream")
+                .unwrap(),
+        );
+        assert_eq!(frame["type"], json!("RelationChanged"));
+        assert!(
+            frame["seq"].as_u64().expect("every frame carries a seq") > cut,
+            "a frame emitted after the connected cut must sort above it: {frame}"
+        );
+        // The sequence is merged into the event object, not wrapped around it,
+        // so an older consumer reads exactly the fields it always did.
+        assert_eq!(frame["kind"], json!("Calls"));
+    }
+
+    /// The stream's first frame is the resync anchor.
+    #[tokio::test]
+    async fn graph_events_opens_with_the_current_root_hash() {
+        let state = test_state();
+        let expected = hex::encode(state.graph.compute_root_hash());
+        let response = router(Arc::clone(&state))
+            .oneshot(Request::get("/graph/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        let first = futures_util::StreamExt::next(&mut body)
+            .await
+            .expect("the connected frame is sent before anything happens")
+            .unwrap();
+        let text = String::from_utf8(first.to_vec()).unwrap();
+        let payload = text.trim_start_matches("data: ").trim();
+        let frame: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(frame["type"], json!("connected"));
+        assert_eq!(
+            frame["root_hash"],
+            json!(expected),
+            "a reconnecting client compares this with the export it drew"
+        );
+    }
+
     #[tokio::test]
     async fn mcp_tools_call_semantic_search_uses_live_graph() {
         let state = test_state();
@@ -39947,7 +40411,7 @@ mod tests {
 
         // Neither handler may broadcast a GraphRootChanged for a read.
         loop {
-            match events.try_recv() {
+            match events.try_recv().map(|sequenced| sequenced.event) {
                 Ok(DaemonEvent::GraphRootChanged { new_root_hash, .. }) => panic!(
                     "warm blame/history must not emit GraphRootChanged, got new_root_hash={new_root_hash:?}"
                 ),

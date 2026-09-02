@@ -981,3 +981,145 @@ export interface RepoImportedWorkSummary {
   highlightedStatus: string | null;
   highlightedMilestone: string | null;
 }
+
+/**
+ * The drawable projection of a Kin repository graph.
+ *
+ * Served by `GET /graph/export` on the daemon and by `kin graph export`. The
+ * counts describe the population the sample was drawn from, not what was
+ * drawn, so a consumer can say how much of the graph it is showing.
+ */
+export interface GraphExportNode {
+  /** Entity UUID. */
+  id: string;
+  name: string;
+  /** Entity kind in the graph's own spelling, e.g. Function, Class, TraitDef. */
+  kind: string;
+  /** Repository-relative path, or null for an entity the graph placed in no file. */
+  file?: string | null;
+  /**
+   * Distinct undirected (neighbour, kind) pairs across the whole matched
+   * population, not recomputed for the sampled subgraph.
+   */
+  degree: number;
+  /** 1-based start line. Present only when the request asked for include=line. */
+  line?: number;
+  /** Present only when the request asked for include=signature. */
+  signature?: string;
+}
+
+export interface GraphExportLink {
+  /** Entity UUID, always present in nodes. */
+  source: string;
+  /** Entity UUID, always present in nodes. */
+  target: string;
+  /** Relation kind in the graph's own spelling, e.g. Calls, Contains. */
+  kind: string;
+}
+
+export interface GraphExport {
+  /**
+   * Hex Merkle root of the graph this payload came from. Pair it with the
+   * root_hash on the /graph/events connected frame: a mismatch means
+   * re-export rather than patch.
+   */
+  root_hash: string;
+  /**
+   * Position in the delta stream this payload was cut at. The resync key:
+   * subscribe to /graph/events, discard every event whose seq is at or below
+   * this one, and apply the rest. root_hash cannot do this alone, because a
+   * working-tree edit changes the graph without advancing the root.
+   */
+  seq: number;
+  /** Entities matching the kinds and path filters, before the node cap. */
+  entity_count: number;
+  /**
+   * Distinct drawable links among those entities, before the node cap. Links
+   * are undirected (source, target, kind) keys, so two relations between the
+   * same pair in the same kind count once and draw one line.
+   */
+  relation_count: number;
+  /**
+   * Distinct links withheld because an endpoint is not an entity in this graph
+   * at all. A property of the graph, not of the request.
+   */
+  unresolved_links: number;
+  /**
+   * Distinct links withheld because an endpoint was excluded by the kinds or
+   * path filter or by the node cap. A property of the request, not of the
+   * graph.
+   */
+  filtered_links: number;
+  /** Whether the node cap dropped anything. */
+  sampled: boolean;
+  /** The cap actually applied. Absent when the caller asked for no cap. */
+  limit?: number;
+  nodes: GraphExportNode[];
+  links: GraphExportLink[];
+}
+
+/** Change vocabulary shared by entity and relation events. */
+export type GraphChangeType = "created" | "modified" | "deleted";
+
+/**
+ * What an entity now is, carried alongside a change so a consumer can patch a
+ * drawn node without a round trip.
+ */
+export interface GraphNodeSummary {
+  name: string;
+  kind: string;
+  file?: string;
+  line?: number;
+  degree: number;
+}
+
+/**
+ * One frame of the graph delta stream, from `GET /graph/events` or
+ * `kin graph watch --json`.
+ *
+ * The stream may carry types this union does not list. A consumer must ignore
+ * an unrecognized type rather than fail: new variants are added additively and
+ * an older client is expected to keep working.
+ */
+export type GraphEvent =
+  | { type: "connected"; entity_count: number; root_hash: string; seq: number }
+  /**
+   * The subscriber fell behind and events were dropped. Carries no seq: the
+   * events it reports were never delivered, so there is no position to name.
+   * Re-export on receipt.
+   */
+  | { type: "lagged"; missed: number }
+  | {
+      type: "EntityChanged";
+      seq: number;
+      entity_id: string;
+      change_type: GraphChangeType;
+      file_path?: string | null;
+      session_id?: string | null;
+      node?: GraphNodeSummary;
+    }
+  | {
+      type: "RelationChanged";
+      seq: number;
+      source: string;
+      target: string;
+      kind: string;
+      change_type: GraphChangeType;
+      file_path?: string;
+    }
+  | { type: "TreeChanged"; seq: number; paths_added: string[]; paths_removed: string[] }
+  | { type: "GraphRootChanged"; seq: number; old_root_hash?: string | null; new_root_hash: string }
+  /**
+   * One reconcile pass finished. Emitted after the last entity and relation
+   * frame of that pass, so a renderer lays out once per pass rather than once
+   * per event. Counts are of frames emitted since the previous boundary.
+   */
+  | {
+      type: "GraphDeltaApplied";
+      seq: number;
+      nodes_added: number;
+      nodes_modified: number;
+      nodes_removed: number;
+      relations_added: number;
+      relations_removed: number;
+    };

@@ -4673,13 +4673,108 @@ pub fn detach_from_caller(cmd: &mut std::process::Command) {
     }
     #[cfg(windows)]
     {
-        let _ = cmd;
         release_caller_standard_handles();
+        apply_windows_job_breakaway(cmd);
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = cmd;
     }
+}
+
+/// `JOB_OBJECT_LIMIT_BREAKAWAY_OK`: children may leave this job when they ask.
+#[cfg(any(windows, test))]
+const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
+/// `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`: children leave this job without asking.
+#[cfg(any(windows, test))]
+const JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK: u32 = 0x0000_1000;
+/// `CREATE_BREAKAWAY_FROM_JOB`, the request the flag above permits.
+#[cfg(any(windows, test))]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+/// The creation flags a spawn needs to outlive the job object it inherits.
+///
+/// `CREATE_BREAKAWAY_FROM_JOB` is not free to pass. `CreateProcess` fails the
+/// whole spawn with `ERROR_ACCESS_DENIED` when the current job does not carry
+/// `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, so asking unconditionally trades a daemon
+/// that dies with its session for one that never starts. Silent breakaway needs
+/// no request at all, and a process in no job has nothing to leave.
+///
+/// Kept separate from the call that reads the job so the rule is provable on a
+/// host that has neither jobs nor `CreateProcess`.
+#[cfg(any(windows, test))]
+fn job_breakaway_creation_flags(in_job: bool, limit_flags: Option<u32>) -> u32 {
+    if !in_job {
+        return 0;
+    }
+    match limit_flags {
+        // Already automatic. Asking as well is redundant, and the request is
+        // what fails when the permission is later tightened.
+        Some(flags) if flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK != 0 => 0,
+        Some(flags) if flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK != 0 => CREATE_BREAKAWAY_FROM_JOB,
+        // Denied, or unreadable. Both mean the request would be refused or
+        // cannot be shown to be allowed, and a spawn that runs beats one that
+        // does not.
+        _ => 0,
+    }
+}
+
+/// Let a spawned daemon outlive the session that started it.
+///
+/// Measured on the in-house Windows 11 ARM64 guest on 2026-09-01: an OpenSSH
+/// session runs inside a job object whose limit flags are `0x00002800`, which is
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` together with
+/// `JOB_OBJECT_LIMIT_BREAKAWAY_OK`. Kill-on-close is why every daemon started
+/// over SSH there died the moment the connection dropped, and breakaway-ok is
+/// the permission that lets one decline to be killed. The Unix arm of
+/// [`detach_from_caller`] has always done the equivalent with `setsid`.
+#[cfg(windows)]
+fn apply_windows_job_breakaway(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt as _;
+
+    let (in_job, limit_flags) = current_job_breakaway_state();
+    let flags = job_breakaway_creation_flags(in_job, limit_flags);
+    if flags != 0 {
+        cmd.creation_flags(flags);
+    }
+}
+
+/// Whether this process is in a job object, and that job's limit flags.
+///
+/// `None` limit flags is indeterminate rather than permissive: a job this
+/// process may not query is one whose breakaway permission is unknown.
+#[cfg(windows)]
+fn current_job_breakaway_state() -> (bool, Option<u32>) {
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::System::JobObjects::{
+        IsProcessInJob, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut in_job: BOOL = 0;
+    let queried = unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) };
+    if queried == 0 || in_job == 0 {
+        return (false, None);
+    }
+    let mut info = unsafe { std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+    let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+    // A null job handle asks about the job this process is already in, which is
+    // the only one a spawn can be held by and the only one it may query without
+    // a handle nobody gave it.
+    let read = unsafe {
+        QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            &mut info as *mut _ as *mut _,
+            size,
+            std::ptr::null_mut(),
+        )
+    };
+    if read == 0 {
+        return (true, None);
+    }
+    (true, Some(info.BasicLimitInformation.LimitFlags))
 }
 
 /// Stop a spawned daemon from holding the caller's standard handles open.
@@ -9617,4 +9712,56 @@ Shared_Dirty:          0 kB\n";
             "this very process is running"
         );
     }
+
+    // ── A daemon must outlive the session that started it ────────────
+    //
+    // FIR-3055's second half. On the in-house Windows guest every daemon died
+    // when its SSH connection dropped, so every command there started a fresh
+    // supervisor and left a fresh endpoint behind. Measured on 2026-09-01, the
+    // session's job object reports limit flags 0x00002800: kill-on-job-close,
+    // which is the death, together with breakaway-ok, which is the permission
+    // to decline it. The rule below is what turns the second into an escape
+    // from the first without turning a job that forbids breakaway into a spawn
+    // that cannot start at all.
+
+    #[test]
+    fn a_spawn_asks_to_leave_a_job_only_when_that_job_permits_it() {
+        // The measured OpenSSH session: kill-on-close plus breakaway-ok.
+        assert_eq!(
+            job_breakaway_creation_flags(true, Some(0x0000_2800)),
+            CREATE_BREAKAWAY_FROM_JOB,
+            "a job that permits breakaway must be left, or the daemon dies with the session"
+        );
+    }
+
+    #[test]
+    fn a_spawn_never_asks_to_leave_a_job_that_would_refuse() {
+        // CreateProcess fails the whole spawn with ERROR_ACCESS_DENIED when the
+        // job does not carry BREAKAWAY_OK, so asking here trades a daemon that
+        // dies with its session for one that never starts.
+        assert_eq!(
+            job_breakaway_creation_flags(true, Some(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE_FOR_TEST)),
+            0,
+            "a job that forbids breakaway must not be asked"
+        );
+        assert_eq!(
+            job_breakaway_creation_flags(true, None),
+            0,
+            "a job whose limits could not be read is not thereby permissive"
+        );
+        assert_eq!(
+            job_breakaway_creation_flags(false, None),
+            0,
+            "a process in no job has nothing to break away from"
+        );
+        assert_eq!(
+            job_breakaway_creation_flags(true, Some(JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)),
+            0,
+            "silent breakaway is automatic, so the request is redundant"
+        );
+    }
+
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, named here only so the case above
+    /// reads as the job shape it describes rather than as a bare number.
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE_FOR_TEST: u32 = 0x0000_2000;
 }
