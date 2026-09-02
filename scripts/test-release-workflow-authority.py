@@ -851,6 +851,18 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/registry-index-migrate.yml": {
         "migrate": None,
     },
+    # The automatic candidate selection and the hosted half of its proof. Every
+    # trigger resolves from protected main and none of its jobs runs on a
+    # pull_request or merge_group event, so none can claim a required context;
+    # it is registered here because this census is what would otherwise let a
+    # new workflow's job NAME appear unreviewed.
+    ".github/workflows/release-cut.yml": {
+        "select": "Select the release candidate",
+        "arm": "Arm the release candidate",
+        "preflight": "Preflight ${{ matrix.artifact }}",
+        "publish": "Publish the candidate's preflight record",
+        "report": "Report the cut's decision",
+    },
     ".github/workflows/release-recovery.yml": {
         "reconcile": "Reconcile failed release",
     },
@@ -930,6 +942,10 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
         ".github/workflows/rc-build.yml",
         "capability",
     ): "3e7512c3b44ab447531be464599f6237bff7efe798d54728c012676a7c3aed23",
+    (
+        ".github/workflows/release-cut.yml",
+        "preflight",
+    ): "f86f3c6f46bcacba012e93cd28dab5aaa2d711a66078007e4a4fbeb21e6629e7",
     (
         ".github/workflows/release.yml",
         "build",

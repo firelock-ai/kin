@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""Resolve one product acceptance suite from the tree under test, and prove it.
+
+kin owns the acceptance suites. `kin/scripts/acceptance/magic_repro.py` and
+`brownfield_repro.py` are the only copies, and every umbrella caller executes
+one of them rather than a duplicate of its own. This tool is what turns "the
+tree under test" into an absolute path, prints that path with its sha256 and the
+sha and branch it came from, and refuses when the copy it resolved is a stranger.
+
+Why it exists. The umbrella carried its own copies for a while, and within two
+days of the port they had drifted six checks apart: kin's magic suite ran 0
+through 20 while the umbrella ran 0 through 9 and 12 through 16, and the
+umbrella's check 15 was the pre-fix flaky version, `time.sleep(3)` plus one
+retry where kin had already moved to `read_until_enriched`. Nothing detected
+either, because a second copy is only ever wrong in a way that looks like a
+passing run. The byte-consistency rule that was supposed to hold the two
+together was a rule for a human to remember, which is a rule doing a tool's job.
+
+Two ways to resolve, decided by what the caller is testing.
+
+    --checkout DIR    the tree under test IS a kin checkout, so the suite comes
+                      out of its own working tree. This is bin/kin-parity: it
+                      builds that checkout's bytes, so it runs that checkout's
+                      checks, and a lane that adds a check has it exercised by
+                      the same command that builds the binary it guards.
+
+    --kin-repo DIR --ref REF
+                      the tree under test carries no suite and cannot. A release
+                      archive holds kin, kin-daemon, kin-vfs, the shim, README
+                      and INSTALL and no scripts directory; the npm package
+                      ships `bin/`, `lib/` and `README.md`. Those callers pin to
+                      the kin checkout they already resolve, at a named ref, and
+                      never to a third copy: bin/kin-release-preflight at its
+                      existing KIN_REPO @ KIN_REF, bin/kin-shipped-gate at the
+                      tag whose bytes npm served.
+
+The drift tripwire runs either way and is the point of the tool. It compares the
+resolved bytes against `origin/main:scripts/acceptance/<suite>.py` in the kin
+checkout and reports one of four verdicts:
+
+    none        byte-identical to kin origin/main
+    tracked     differs, and is exactly the committed blob at the ref the caller
+                named. A lane branch that adds a check, or a release tag whose
+                suite is older than main, both land here. This is the ordinary
+                case for work in flight and it passes.
+    worktree    differs, and is an uncommitted edit to that tracked path inside
+                the checkout under test. Also passes, loudly, because testing
+                what you are holding is what --checkout is for.
+    unexplained matches none of the above, which means the bytes came from
+                somewhere that is not the tree under test and is not kin. That
+                is the class this tool exists to end, so it fails the run.
+
+`KIN_ACCEPTANCE_ALLOW_DRIFT="<reason>"` turns an unexplained verdict into a
+loud allowance. The reason is required and it prints on every run, the same
+contract kin's own `scripts/acceptance/gate.py` puts on `--allow-unreadable`,
+because an allowance nobody can see is an allowance nobody removes.
+
+A reference that cannot be read fails too. If `origin/main:<path>` is missing or
+unreadable the tripwire has no baseline, so it cannot fire, and a check that
+cannot fail is not evidence: it refuses instead of passing quietly.
+
+There is a third way in, and it is the one that lets the tripwire fire at all.
+Every caller keeps an environment override so its behavioral suite can inject a
+stub, and an override is also exactly how a stale copy gets executed for real.
+`--verify PATH` judges a file the caller already holds instead of resolving one,
+so an override is graded rather than trusted. Without it the tool would only
+ever grade bytes it had just extracted itself, which can differ from the ref
+they came from in no way at all: a guard that cannot reach its own failing case
+is not a guard.
+
+Usage:
+    bin/kin-acceptance-suite <magic|brownfield> --checkout DIR
+    bin/kin-acceptance-suite <magic|brownfield> --kin-repo DIR --ref REF --dest PATH
+    bin/kin-acceptance-suite <magic|brownfield> --verify PATH --kin-repo DIR [--ref REF]
+
+Options:
+    --checkout DIR    kin checkout that is the tree under test
+    --kin-repo DIR    kin checkout to read the suite out of by ref
+    --ref REF         ref to read from --kin-repo (required with it)
+    --dest PATH       write the resolved suite here, executable, and print that
+                      path instead of the in-tree one. Required with --kin-repo,
+                      optional with --checkout.
+    --verify PATH     grade this file instead of resolving one, against the tree
+                      named by --checkout or --kin-repo
+    --label TEXT      prefix for the printed lines (default: the suite name)
+    --no-fetch        do not fetch origin/main before reading the baseline
+    --json PATH       write the resolution and its verdict here
+
+Exit status:
+    0   resolved, and the tripwire passed or its allowance was named
+    1   the tripwire failed
+    3   the suite could not be resolved at all
+    64  usage
+"""
+
+from __future__ import print_function
+
+import argparse
+import functools
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+print = functools.partial(print, flush=True)
+
+SUITES = {
+    "magic": "scripts/acceptance/magic_repro.py",
+    "brownfield": "scripts/acceptance/brownfield_repro.py",
+}
+
+BASELINE_REF = "origin/main"
+ALLOW_ENV = "KIN_ACCEPTANCE_ALLOW_DRIFT"
+
+
+def git(args, cwd=None, timeout=120):
+    try:
+        proc = subprocess.run(["git"] + list(args), cwd=cwd, timeout=timeout,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, "", str(exc)
+    return (proc.returncode,
+            proc.stdout.decode("utf-8", "replace").strip(),
+            proc.stderr.decode("utf-8", "replace").strip())
+
+
+def sha256_of(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(65536), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def blob_of(path):
+    """git's own hash of the file, so a comparison against a ref is exact.
+
+    Computed with `git hash-object`, which needs no repository, so a suite
+    already extracted into a scratch directory hashes the same way the tree it
+    came from hashes it.
+    """
+    rc, out, _err = git(["hash-object", "--", path])
+    return out if rc == 0 else ""
+
+
+def blob_at(repo, ref, rel):
+    rc, out, _err = git(["rev-parse", "--verify", "--quiet", "%s:%s" % (ref, rel)], cwd=repo)
+    return out if rc == 0 else ""
+
+
+def describe(repo, ref):
+    """The sha and branch behind a resolution, printed so it can be disbelieved."""
+    if ref:
+        rc, sha, _err = git(["rev-parse", "--verify", "--quiet", ref], cwd=repo)
+        return (sha if rc == 0 else ""), ref
+    rc, sha, _err = git(["rev-parse", "HEAD"], cwd=repo)
+    _rc, branch, _e = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo)
+    return (sha if rc == 0 else ""), (branch or "(detached)")
+
+
+def umbrella_kin():
+    """The umbrella's own kin checkout, found through git rather than by path.
+
+    Not `dirname(dirname(__file__))/kin`. These tools are meant to run from a
+    lane worktree, and there that path is the worktree, which has no kin
+    checkout inside it, so the default silently pointed at nothing. git's
+    common-dir is the same for a worktree and for the main checkout, which is
+    the property this needs, and bin/kin-parity resolves its own primary the
+    same way for the same reason.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for args in (["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                 ["rev-parse", "--git-common-dir"]):
+        rc, out, _err = git(args, cwd=here)
+        if rc != 0 or not out:
+            continue
+        common = out if os.path.isabs(out) else os.path.abspath(os.path.join(here, out))
+        candidate = os.path.join(os.path.dirname(common), "kin")
+        if os.path.isdir(candidate):
+            return candidate
+    fallback = os.path.join(os.path.dirname(here), "kin")
+    return fallback if os.path.isdir(fallback) else ""
+
+
+def is_kin_checkout(path):
+    return os.path.isfile(os.path.join(path, "crates", "kin-cli", "Cargo.toml"))
+
+
+def write_executable(dest, data):
+    """Write the extracted suite and leave it executable.
+
+    The mode is set explicitly and read back. A freshly created file takes the
+    process umask, so 0755 asked for is not 0755 granted, and a suite that lands
+    at 0644 dies at exec with no output and an empty diff, which is a failure
+    that looks like nothing at all.
+    """
+    parent = os.path.dirname(os.path.abspath(dest))
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent)
+    with open(dest, "wb") as handle:
+        handle.write(data)
+    os.chmod(dest, 0o755)
+    if not os.access(dest, os.X_OK):
+        return "wrote %s but it is not executable afterwards" % dest
+    return None
+
+
+def resolve(opts):
+    """(path, repo, ref, error). `ref` is None when the working tree answered."""
+    rel = SUITES[opts.suite]
+    if opts.verify:
+        path = os.path.abspath(opts.verify)
+        if not os.path.isfile(path):
+            return None, None, None, "--verify %s does not exist" % path
+        tree = os.path.abspath(opts.checkout or opts.kin_repo)
+        if not os.path.isdir(tree):
+            return None, None, None, "%s is not a directory" % tree
+        rc, _out, err = git(["rev-parse", "--show-toplevel"], cwd=tree)
+        if rc != 0:
+            return None, None, None, "%s is not a git checkout (%s)" % (tree, err)
+        return path, tree, opts.ref, None
+    if opts.checkout:
+        checkout = os.path.abspath(opts.checkout)
+        if not os.path.isdir(checkout):
+            return None, None, None, "--checkout %s is not a directory" % checkout
+        if not is_kin_checkout(checkout):
+            return None, None, None, (
+                "--checkout %s is not a kin checkout: it carries no "
+                "crates/kin-cli/Cargo.toml" % checkout)
+        path = os.path.join(checkout, rel)
+        if not os.path.isfile(path):
+            return None, None, None, (
+                "%s carries no %s. That tree predates the in-repo acceptance "
+                "suites; pass --kin-repo with a --ref that has them rather than "
+                "running a copy from anywhere else." % (checkout, rel))
+        if opts.dest:
+            with open(path, "rb") as handle:
+                problem = write_executable(opts.dest, handle.read())
+            if problem:
+                return None, None, None, problem
+            return os.path.abspath(opts.dest), checkout, None, None
+        return path, checkout, None, None
+
+    repo = os.path.abspath(opts.kin_repo)
+    if not os.path.isdir(repo):
+        return None, None, None, "--kin-repo %s is not a directory" % repo
+    rc, _out, err = git(["rev-parse", "--show-toplevel"], cwd=repo)
+    if rc != 0:
+        return None, None, None, "--kin-repo %s is not a git checkout (%s)" % (repo, err)
+    if not blob_at(repo, opts.ref, rel) and not opts.no_fetch:
+        # A release tag is the ordinary ref here and a checkout that has not
+        # fetched since the cut simply does not have it. One bounded fetch is
+        # the difference between "that tag has no suite" and "this clone has
+        # not heard of that tag", and those are different answers.
+        git(["fetch", "-q", "--tags", "origin"], cwd=repo, timeout=180)
+    if not blob_at(repo, opts.ref, rel):
+        return None, None, None, (
+            "%s has no %s at %s. A tag older than the in-repo suites cannot "
+            "supply one, and no other copy may stand in for it; pass --ref with "
+            "a ref that carries the suite." % (repo, rel, opts.ref))
+    proc = subprocess.run(["git", "-C", repo, "show", "%s:%s" % (opts.ref, rel)],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        return None, None, None, ("could not read %s:%s out of %s (%s)"
+                                  % (opts.ref, rel, repo,
+                                     proc.stderr.decode("utf-8", "replace").strip()))
+    problem = write_executable(opts.dest, proc.stdout)
+    if problem:
+        return None, None, None, problem
+    return os.path.abspath(opts.dest), repo, opts.ref, None
+
+
+def tripwire(path, repo, ref, rel, fetch):
+    """(verdict, detail, ok). The one guard that can fail in this tool."""
+    if fetch:
+        git(["fetch", "-q", "origin", "main"], cwd=repo, timeout=90)
+    baseline = blob_at(repo, BASELINE_REF, rel)
+    local = blob_of(path)
+    if not local:
+        return "unreadable", "git could not hash the resolved suite at %s" % path, False
+    if not baseline:
+        return ("unreadable",
+                "no baseline: %s:%s could not be read in %s, so the tripwire had "
+                "nothing to compare against and could not have failed"
+                % (BASELINE_REF, rel, repo), False)
+    if local == baseline:
+        return "none", "byte-identical to %s:%s" % (BASELINE_REF, rel), True
+    pinned = blob_at(repo, ref or "HEAD", rel)
+    if pinned and local == pinned:
+        return ("tracked",
+                "differs from %s and is exactly %s:%s (blob %s)"
+                % (BASELINE_REF, ref or "HEAD", rel, pinned[:12]), True)
+    # The worktree verdict is only available to bytes that ARE the tree's own
+    # copy of that path. A file merely sitting near the tree, or handed in by an
+    # override, has no claim on "this is what the checkout is holding", and
+    # letting it borrow one would forgive exactly the case the tool is for.
+    in_tree = os.path.realpath(path) == os.path.realpath(os.path.join(repo, rel))
+    if ref is None and in_tree:
+        rc, status, _err = git(["status", "--porcelain", "--", rel], cwd=repo)
+        if rc == 0 and status:
+            return ("worktree",
+                    "differs from %s and from HEAD, and is an uncommitted edit "
+                    "to %s in the checkout under test (%s)"
+                    % (BASELINE_REF, rel, status.splitlines()[0].strip()), True)
+    pin_ref = ref or "HEAD"
+    if pin_ref == BASELINE_REF:
+        against = "%s:%s (blob %s)" % (BASELINE_REF, rel, baseline[:12])
+    else:
+        against = ("%s:%s (blob %s) nor %s:%s (blob %s)"
+                   % (BASELINE_REF, rel, baseline[:12], pin_ref, rel,
+                      pinned[:12] if pinned else "absent"))
+    return ("unexplained",
+            "the executed suite matches neither %s, nor any edit tracked in %s, "
+            "so it came from outside the tree under test" % (against, repo), False)
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(add_help=True, description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("suite", choices=sorted(SUITES))
+    parser.add_argument("--checkout")
+    parser.add_argument("--kin-repo", dest="kin_repo")
+    parser.add_argument("--ref")
+    parser.add_argument("--dest")
+    parser.add_argument("--verify")
+    parser.add_argument("--label", default="")
+    parser.add_argument("--no-fetch", action="store_true")
+    parser.add_argument("--json", dest="json_out")
+    opts = parser.parse_args(argv[1:])
+
+    tag = "kin-acceptance-suite: %s" % (opts.label or opts.suite)
+    if opts.checkout and opts.kin_repo:
+        print("%s --checkout and --kin-repo name two different trees; pass one"
+              % tag, file=sys.stderr)
+        return 64
+    if not opts.checkout and not opts.kin_repo:
+        # No tree named, so take the umbrella's own kin checkout at origin/main.
+        # That clone is a standing one nothing keeps current, so its working
+        # tree is not trusted and the ref is, which is the same call
+        # bin/kin-release-preflight already makes for install.sh.
+        opts.kin_repo = umbrella_kin()
+        if not opts.kin_repo:
+            print("%s no tree named and no kin checkout found beside this "
+                  "repository; pass --checkout or --kin-repo" % tag, file=sys.stderr)
+            return 64
+        opts.ref = opts.ref or BASELINE_REF
+    if opts.verify and opts.dest:
+        print("%s --verify grades a file in place, so it takes no --dest" % tag, file=sys.stderr)
+        return 64
+    if not opts.verify and opts.kin_repo and not opts.ref:
+        print("%s --kin-repo needs --ref" % tag, file=sys.stderr)
+        return 64
+    if not opts.verify and opts.kin_repo and not opts.dest:
+        print("%s --kin-repo needs --dest to write the resolved suite to" % tag, file=sys.stderr)
+        return 64
+
+    rel = SUITES[opts.suite]
+    path, repo, ref, error = resolve(opts)
+    if error:
+        print("%s UNRESOLVED %s" % (tag, error), file=sys.stderr)
+        return 3
+
+    sha, branch = describe(repo, ref)
+    verdict, detail, ok = tripwire(path, repo, ref, rel, not opts.no_fetch)
+    allowance = (os.environ.get(ALLOW_ENV) or "").strip()
+    allowed = False
+    if not ok and allowance:
+        allowed = True
+        ok = True
+
+    print("%s source %s" % (tag, path), file=sys.stderr)
+    print("%s sha256 %s" % (tag, sha256_of(path)), file=sys.stderr)
+    print("%s tree %s ref %s sha %s branch %s"
+          % (tag, repo, ref or "(working tree)", sha or "(unknown)", branch),
+          file=sys.stderr)
+    print("%s drift %s: %s" % (tag, verdict, detail), file=sys.stderr)
+    if allowed:
+        # Printed on every run, never once at the point it was granted, because
+        # the whole failure mode here is an exception nobody sees again.
+        print("%s ALLOWANCE %s=%s admits the drift above" % (tag, ALLOW_ENV, allowance),
+              file=sys.stderr)
+
+    if opts.json_out:
+        parent = os.path.dirname(os.path.abspath(opts.json_out))
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent)
+        with open(opts.json_out, "w") as handle:
+            json.dump({"suite": opts.suite, "path": path, "relative": rel,
+                       "sha256": sha256_of(path), "tree": repo,
+                       "ref": ref, "tree_sha": sha, "branch": branch,
+                       "drift": verdict, "detail": detail,
+                       "allowance": allowance if allowed else "",
+                       "ok": bool(ok)}, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+
+    if not ok:
+        print("%s REFUSING: set %s=\"<reason>\" to run anyway, and the reason "
+              "prints on every run" % (tag, ALLOW_ENV), file=sys.stderr)
+        return 1
+    print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1112,7 +1112,10 @@ jobs:
         run: |
           bash scripts/release-policy-gate.sh <<'RELEASE_POLICY'
           python3 scripts/test-release-workflow-authority.py
+          python3 scripts/test-select-release-candidate.py
           node --test \
+            scripts/release-proof/merge-preflight-records.test.mjs \
+            scripts/release-proof/vendored.test.mjs \
             scripts/check-glibc-floor.test.mjs \
             scripts/check-kin-vfs-compat.test.mjs \
             scripts/check-rc-build-drift.test.mjs \
@@ -1680,7 +1683,10 @@ jobs:
         run: |
           bash scripts/release-policy-gate.sh <<'RELEASE_POLICY'
           python3 scripts/test-release-workflow-authority.py
+          python3 scripts/test-select-release-candidate.py
           node --test \
+            scripts/release-proof/merge-preflight-records.test.mjs \
+            scripts/release-proof/vendored.test.mjs \
             scripts/check-glibc-floor.test.mjs \
             scripts/check-kin-vfs-compat.test.mjs \
             scripts/check-rc-build-drift.test.mjs \
