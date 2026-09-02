@@ -69,6 +69,13 @@ UNREADABLE = "UNREADABLE"
 
 AUTO_EMBED_OPT_OUT_LINE = "background embedding deferred by operator opt-out"
 
+# The sampling label a status reading carries when it answers as of an earlier
+# instant, and the literal check 14's third arm requires the served
+# `kin_graph_status` description to name. A constant because
+# `scripts/acceptance/mcp_surface_contract.py` asserts the same sentence per
+# pull request and the two must be one string.
+AS_OF_EARLIER_SAMPLING = "last_settled_selected_graph"
+
 SPINE_REASON = re.compile(r"cross_repo|spine", re.I)
 EDGE_GAP_REASON = re.compile(
     r"cross_file_edges_absent|edge_coverage|cross-file|cross_file|enrichment", re.I
@@ -1540,6 +1547,44 @@ def check_5(suite):
     return res
 
 
+def trace_shape_knob(tools):
+    """The shape knob check 6 reads off the served `trace_data_flow`.
+
+    Module level and pure so `scripts/acceptance/mcp_surface_contract.py` can
+    assert the same property per pull request through this exact reader. Both
+    graders reading one function is what stops the per-pull-request gate and
+    this suite from drifting apart, which is the whole reason that job exists.
+
+    Returns `(knob, sorted_property_names)`. The knob is `None` when the tool
+    advertises neither name, and the property list is `None` when the tool is
+    absent from the listing altogether: an absence and a trim are different
+    findings and must not read alike.
+    """
+    schema = None
+    for tool in tools.get("tools") or []:
+        if tool.get("name") == "trace_data_flow":
+            schema = (tool.get("inputSchema") or {}).get("properties") or {}
+    if schema is None:
+        return None, None
+    for candidate in ("include_body", "compact"):
+        if candidate in schema:
+            return candidate, sorted(schema.keys())
+    return None, sorted(schema.keys())
+
+
+def graph_status_description(tools):
+    """The served `kin_graph_status` description check 14's third arm reads.
+
+    Module level for the same reason [`trace_shape_knob`] is. Returns the empty
+    string when the tool is absent or carries no description, which the caller
+    reports as unreadable rather than as a trimmed sentence.
+    """
+    for tool in tools.get("tools") or []:
+        if tool.get("name") == "kin_graph_status":
+            return tool.get("description") or ""
+    return ""
+
+
 def check_6(suite):
     """FIR-2361: a shape query must be cheap, and truncation must say where."""
     res = Result("6", "FIR-2361", "trace_data_flow compact mode and localized truncation")
@@ -1549,21 +1594,13 @@ def check_6(suite):
     except McpError as exc:
         res.unknown("tools/list unreadable: %s" % exc)
         return res
-    schema = None
-    for tool in tools.get("tools") or []:
-        if tool.get("name") == "trace_data_flow":
-            schema = (tool.get("inputSchema") or {}).get("properties") or {}
-    if schema is None:
+    knob, schema_keys = trace_shape_knob(tools)
+    if schema_keys is None:
         res.unknown("trace_data_flow absent from tools/list")
         return res
-    knob = None
-    for candidate in ("include_body", "compact"):
-        if candidate in schema:
-            knob = candidate
-            break
     if knob is None:
         res.bad("trace_data_flow declares no compact/include_body parameter: %s"
-                % sorted(schema.keys()))
+                % schema_keys)
     else:
         res.ok("trace_data_flow declares %r" % knob)
     base_args = {"focal": "run_all", "direction": "calls", "depth": 3,
@@ -2437,15 +2474,11 @@ def check_14(suite):
     except McpError as error:
         res.unknown("tools/list: %s" % error)
         return res
-    description = ""
-    for tool in (tools.get("tools") or []):
-        if tool.get("name") == "kin_graph_status":
-            description = tool.get("description") or ""
-            break
+    description = graph_status_description(tools)
     if not description:
         res.unknown("tools/list carries no kin_graph_status description")
         return res
-    if "last_settled_selected_graph" not in description:
+    if AS_OF_EARLIER_SAMPLING not in description:
         res.bad("the kin_graph_status description does not tell a caller a reading as of an "
                 "earlier instant is possible, so an agent cannot know to read `stale`")
     else:
