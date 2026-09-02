@@ -68,6 +68,56 @@ pub struct PublishedChange {
 /// inference: it moves when and only when a transaction publishes into history,
 /// so an operation that left it standing published nothing, whatever its ref and
 /// head look like.
+/// The whole commit receipt for `operation_id`, rejoined with the operation
+/// record it names.
+///
+/// A persisted receipt stopped repeating its operation record in kin-db 0.7.89:
+/// the log and the receipt held the same record and together they were 41.8
+/// percent of a full VS Code store (FIR-3064). Everything above storage still
+/// wants a whole `RepositoryCommitReceipt`, so this is the one place that puts
+/// the two halves back together.
+///
+/// One place rather than one per crate, because the alternative was fifteen
+/// copies of the same pairing across kin-core, kin-cli, kin-remote and
+/// kin-daemon, and a second copy of a rule is only ever wrong in a way that
+/// looks like a passing run.
+///
+/// `None` when no receipt names that operation, when the log holds no entry for
+/// it, or when the two do not validate as a pair. The last is a defect rather
+/// than a state and is logged: a receipt reunited with the wrong operation is
+/// worse than one that cannot be found.
+pub fn rejoined_receipt(
+    metadata: &kin_db::PersistedRepositoryAuthority,
+    operation_id: kin_model::OperationId,
+) -> Option<kin_model::RepositoryCommitReceipt> {
+    let persisted = metadata
+        .receipts
+        .iter()
+        .find(|receipt| receipt.operation_id == operation_id)?;
+    let Some(record) = metadata
+        .operation_log
+        .iter()
+        .find(|record| record.operation_id == operation_id)
+    else {
+        tracing::error!(
+            operation_id = %operation_id,
+            "a durable receipt names an operation the log does not hold"
+        );
+        return None;
+    };
+    match persisted.rejoin(record) {
+        Ok(receipt) => Some(receipt),
+        Err(error) => {
+            tracing::error!(
+                operation_id = %operation_id,
+                error = %error,
+                "a durable receipt does not match the operation it names"
+            );
+            None
+        }
+    }
+}
+
 pub fn published_change(record: &RepositoryOperationRecord) -> Option<PublishedChange> {
     if record.roots_before.history == record.roots_after.history {
         return None;

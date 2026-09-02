@@ -256,12 +256,12 @@ fn plan_and_commit(
     };
     let actor = request.actor.clone();
     let reason = checkout_reason(&selected, &target_change_id);
-    let existing_receipt = lease
-        .metadata()
-        .receipts
-        .iter()
-        .find(|receipt| receipt.operation_id == request.operation_id)
-        .cloned();
+    // Whole rather than as persisted: a persisted receipt names its operation
+    // record rather than repeating it (kin-db 0.7.89, FIR-3064), and the replay
+    // below needs that record's workspace mutation. `rejoined_receipt`
+    // revalidates the pair, so the `validate` this used to call is already done
+    // by the time it returns.
+    let existing_receipt = kin_core::rejoined_receipt(lease.metadata(), request.operation_id);
     // Materialized only on the planning path. A replay returns before the
     // authority transition is planned, so demanding a workspace authority
     // graph there would fail a recovery that can otherwise complete.
@@ -299,9 +299,6 @@ fn plan_and_commit(
     let target_tree = target_state.tree.clone();
 
     if let Some(receipt) = existing_receipt {
-        receipt
-            .validate()
-            .context("validate persisted checkout receipt")?;
         let replay_transaction = RepositoryTransaction {
             schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
             operation_id: request.operation_id,

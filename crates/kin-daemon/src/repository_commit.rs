@@ -395,19 +395,17 @@ pub(crate) fn plan_session_workspace_admission(
     let recovered_receipt = if exact_base_is_current {
         None
     } else {
-        let receipt = lease
-            .metadata()
-            .receipts
-            .iter()
-            .find(|receipt| receipt.operation_id == base.reconcile_operation_id)
-            .cloned()
+        // Whole rather than as persisted, and already validated against the
+        // operation it names: a persisted receipt stopped repeating that record
+        // in kin-db 0.7.89 (FIR-3064), and `rejoined_receipt` does the pairing
+        // and the validation the `validate` here used to do.
+        let receipt = kin_core::rejoined_receipt(lease.metadata(), base.reconcile_operation_id)
             .ok_or_else(|| {
                 invalid(
                     "repository authority moved after session materialization; exact reconcile \
                      does not silently rebase",
                 )
             })?;
-        receipt.validate()?;
         if receipt.transaction_hash != transaction_hash || current_workspace.tree != *desired_tree {
             return Err(invalid(
                 "session operation already names a different authority transition",
@@ -1134,13 +1132,7 @@ pub(crate) fn recover_native_commit(
 ) -> Result<Option<NativeCommitResult>> {
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let lease = authority.read_authority();
-    let Some(receipt) = lease
-        .metadata()
-        .receipts
-        .iter()
-        .find(|receipt| receipt.operation_id == operation_id)
-        .cloned()
-    else {
+    let Some(receipt) = kin_core::rejoined_receipt(lease.metadata(), operation_id) else {
         return Ok(None);
     };
     // Reading the record's two shapes belongs to kin-core, because the CLI's own

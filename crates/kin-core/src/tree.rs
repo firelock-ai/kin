@@ -3556,19 +3556,39 @@ fn installed_repository_receipt(
     operation_id: OperationId,
     transaction_hash: Hash256,
 ) -> Option<RepositoryCommitReceipt> {
-    authority
-        .read_authority()
-        .metadata()
-        .receipts
+    let lease = authority.read_authority();
+    let metadata = lease.metadata();
+    let persisted = metadata.receipts.iter().find(|receipt| {
+        receipt.operation_id == operation_id && receipt.transaction_hash == transaction_hash
+    })?;
+    // A persisted receipt names its operation record rather than repeating it
+    // (kin-db 0.7.89, FIR-3064), so it is rejoined here with the log entry it
+    // names. `rejoin` revalidates the pair, so a receipt reunited with the
+    // wrong operation is refused rather than returned as if it were whole.
+    let operation = metadata
+        .operation_log
         .iter()
-        .find(|receipt| {
-            receipt.operation_id == operation_id && receipt.transaction_hash == transaction_hash
-        })
-        .cloned()
-        .map(|mut receipt| {
-            receipt.outcome = RepositoryCommitOutcome::IdempotentReplay;
-            receipt
-        })
+        .find(|operation| operation.operation_id == persisted.operation_id)
+        .or_else(|| {
+            tracing::error!(
+                operation_id = %persisted.operation_id,
+                "a durable receipt names an operation the log does not hold"
+            );
+            None
+        })?;
+    let mut receipt = match persisted.rejoin(operation) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            tracing::error!(
+                operation_id = %persisted.operation_id,
+                error = %error,
+                "a durable receipt does not match the operation it names"
+            );
+            return None;
+        }
+    };
+    receipt.outcome = RepositoryCommitOutcome::IdempotentReplay;
+    Some(receipt)
 }
 
 fn repository_commit_error_is_definitely_prepublication(error: &kin_db::KinDbError) -> bool {

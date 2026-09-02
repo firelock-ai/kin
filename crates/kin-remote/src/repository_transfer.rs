@@ -1311,21 +1311,42 @@ where
     let transaction = transfer_transaction(pack, actor)?;
     let transaction_hash = transaction.transaction_hash().map_err(model)?;
     let lease = authority.read_authority();
-    if let Some(receipt) = lease
+    if let Some(persisted) = lease
         .authority_metadata()
         .receipts
         .iter()
         .find(|receipt| receipt.operation_id == pack.operation_id)
     {
-        if receipt.transaction_hash != transaction_hash {
+        if persisted.transaction_hash != transaction_hash {
             return Err(RepositoryTransferError::Conflict(format!(
                 "operation {} was already committed with a different exact transaction",
                 pack.operation_id
             )));
         }
+        // A persisted receipt names its operation record rather than repeating
+        // it (kin-db 0.7.89, FIR-3064), so it is rejoined with the log entry it
+        // names. `rejoin` revalidates the pair, so a receipt reunited with the
+        // wrong operation is refused here rather than replayed as a whole one.
+        let operation = lease
+            .authority_metadata()
+            .operation_log
+            .iter()
+            .find(|operation| operation.operation_id == persisted.operation_id)
+            .ok_or_else(|| {
+                RepositoryTransferError::Conflict(format!(
+                    "operation {} has a durable receipt and no log entry",
+                    persisted.operation_id
+                ))
+            })?;
+        let receipt = persisted.rejoin(operation).map_err(|error| {
+            RepositoryTransferError::Conflict(format!(
+                "durable receipt for operation {} does not match the operation it names: {error}",
+                persisted.operation_id
+            ))
+        })?;
         return Ok(transfer_receipt(
             pack,
-            receipt.clone(),
+            receipt,
             RepositoryTransferApplyOutcome::IdempotentReplay,
         ));
     }

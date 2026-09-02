@@ -509,11 +509,22 @@ fn landed_commit_for_operation(
     else {
         return Ok(None);
     };
+    // A persisted receipt names its operation record rather than repeating it
+    // (kin-db 0.7.89, FIR-3064), so the record comes from the log the same
+    // envelope holds.
+    let Some(operation) = lease
+        .metadata()
+        .operation_log
+        .iter()
+        .find(|operation| operation.operation_id == receipt.operation_id)
+    else {
+        return Ok(None);
+    };
     // The daemon's own recovery asks this of the same record, so the rule lives
     // in kin-core rather than once in each crate. A second copy is only ever
     // wrong in a way that looks like a passing run: both suites stay green while
     // one side writes a shape the other stopped reading.
-    let Some(published) = kin_core::published_change(&receipt.operation) else {
+    let Some(published) = kin_core::published_change(operation) else {
         return Ok(None);
     };
     let (branch, change_id) = (
