@@ -2759,6 +2759,11 @@ pub fn is_process_alive(pid: u32) -> bool {
 /// whose file stem begins with `kin` is treated as possibly ours, which admits
 /// the supervisor, the CLI, and any development or test build named after them,
 /// and excludes the `msedgewebview2.exe` that inherited PID 8468 in FIR-3055.
+///
+/// Compiled only where it is reachable. Its one caller outside the tests is the
+/// `#[cfg(windows)]` arm of [`pid_runs_a_foreign_image`], so on every other
+/// platform the non-test build carries a function nothing calls.
+#[cfg(any(windows, test))]
 fn image_path_could_be_kin(image: &str) -> bool {
     let file_name = image.rsplit(['/', '\\']).next().unwrap_or(image);
     // An empty stem means the only dot is a leading one, so the whole name is
