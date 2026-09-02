@@ -125,6 +125,11 @@ pub struct ContextResponse {
     /// human rendering says the same thing on the same run.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub budget_elisions: BTreeMap<String, ContextElision>,
+    /// Set when the query resolved to no entity, so a caller reading the exit
+    /// code is not handed guidance as though it were a pack (FIR-3071). The same
+    /// text stays in `lines` for a client that predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// What one pack section lost to the token budget.
@@ -173,8 +178,15 @@ pub async fn run(
                 "the running daemon does not support structured context packs; restart it with the current Kin build"
             );
         }
+        if let Some(error) = response.error {
+            anyhow::bail!(error);
+        }
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
+        // Refuse before printing, so a miss leaves stdout empty.
+        if let Some(error) = response.error {
+            anyhow::bail!(error);
+        }
         for line in response.lines {
             println!("{line}");
         }
@@ -218,8 +230,10 @@ pub fn build_context_response(
             });
 
     let Some(target) = resolve_context_target(graph, &request.entity)? else {
+        let lines = context_not_found_guidance(&request.entity);
         return Ok(ContextResponse {
-            lines: context_not_found_guidance(&request.entity),
+            error: Some(lines.join("\n")),
+            lines,
             // Stamped even here: an unresolved entity is an answer, and leaving
             // this empty would report it as a daemon too old to answer at all.
             schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
@@ -376,6 +390,7 @@ pub fn build_context_response(
             same_file_dropped: selection.same_file_dropped(),
         }),
         budget_elisions: elisions,
+        error: None,
         pack: Some(pack),
     })
 }
@@ -603,6 +618,50 @@ mod tests {
             "offers search: {joined}"
         );
         assert!(joined.contains("kin locate"), "offers locate: {joined}");
+    }
+
+    /// A miss has to be readable as a miss by a caller that only checks the exit
+    /// code. The prose stays in `lines` for an older client; the discriminator
+    /// beside it is what makes `kin context` refuse (FIR-3071).
+    #[test]
+    fn context_miss_carries_the_discriminator_and_not_just_the_prose() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph.upsert_entity(&test_entity("checkout")).unwrap();
+
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "definitelyMissingEntity".to_string(),
+                budget: "8k".to_string(),
+                assistant: None,
+            },
+        )
+        .unwrap();
+
+        let joined = response.lines.join("\n");
+        assert!(joined.contains("not found"), "{joined}");
+        assert_eq!(response.error.as_deref(), Some(joined.as_str()));
+        assert!(response.pack.is_none());
+    }
+
+    /// The other side of the same rule: a resolved context must not carry the
+    /// discriminator, or every answer would refuse.
+    #[test]
+    fn a_resolved_context_carries_no_error_discriminator() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph.upsert_entity(&test_entity("checkout")).unwrap();
+
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "checkout".to_string(),
+                budget: "8k".to_string(),
+                assistant: None,
+            },
+        )
+        .unwrap();
+
+        assert!(response.error.is_none(), "{:?}", response.error);
     }
 
     fn test_entity(name: &str) -> Entity {

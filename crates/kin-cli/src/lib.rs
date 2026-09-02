@@ -14,6 +14,7 @@ pub mod daemon_client;
 pub mod daemon_death;
 pub mod daemon_error;
 pub mod embed_model;
+pub mod entity_identity;
 pub mod model_residency;
 pub mod output_style;
 pub mod profile;

@@ -58,6 +58,22 @@ pub struct TraceRequest {
     pub max_lines: usize,
     pub nearby_limit: usize,
     pub transitive_limit: usize,
+    /// Exact repo-relative file qualifier, as `kin impact` spells it.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Exact entity-kind qualifier, as `kin impact` spells it.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+impl TraceRequest {
+    fn qualifiers(&self) -> crate::entity_identity::IdentityQualifiers {
+        crate::entity_identity::IdentityQualifiers {
+            file: self.file.clone(),
+            kind: self.kind.clone(),
+            signature: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +82,37 @@ pub struct TraceResponse {
     pub lines: Vec<String>,
     #[serde(default)]
     pub entities: Vec<TraceJsonEntity>,
+    /// Set when the query resolved to no entity. A trace that found nothing is
+    /// not a trace, and a caller that reads only the exit code has no other way
+    /// to tell: the guidance used to arrive as ordinary output lines with a
+    /// success code, and a demo came within one guard of pasting "Entity ... not
+    /// found" into a model prompt as repository material (FIR-3071).
+    ///
+    /// The same text stays in `lines` so a daemon serving an older `kin` keeps
+    /// printing what it printed before. A `kin` new enough to read this field
+    /// refuses before it prints anything.
+    #[serde(default)]
+    pub error: Option<String>,
 }
+
+/// A trace whose query resolved to no entity.
+///
+/// Carried as an error rather than as output so that every seam between the
+/// graph and the caller has to handle it: the in-process builder, the daemon
+/// route, and the exit code. The guidance travels with it, because a miss should
+/// still say what to try next.
+#[derive(Debug)]
+pub struct TraceMiss {
+    pub lines: Vec<String>,
+}
+
+impl std::fmt::Display for TraceMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.lines.join("\n"))
+    }
+}
+
+impl std::error::Error for TraceMiss {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceJsonEntity {
@@ -77,6 +123,7 @@ pub struct TraceJsonEntity {
     pub signature: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     entity: String,
     compact: bool,
@@ -85,6 +132,8 @@ pub async fn run(
     max_lines: usize,
     nearby_limit: usize,
     transitive_limit: usize,
+    file: Option<String>,
+    kind: Option<String>,
 ) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "trace").await?;
@@ -99,9 +148,16 @@ pub async fn run(
             max_lines,
             nearby_limit,
             transitive_limit,
+            file,
+            kind,
         },
     )
     .await?;
+    // Refuse before printing, not after: a miss must leave stdout empty so a
+    // caller piping this into a prompt gets nothing rather than an apology.
+    if let Some(error) = response.error {
+        anyhow::bail!(error);
+    }
     for line in response.lines {
         println!("{line}");
     }
@@ -132,25 +188,48 @@ pub fn build_trace_response(
     envelope: &kin_mcp::Envelope,
 ) -> Result<TraceResponse> {
     if request.json {
-        return build_trace_json_response(layout, graph, &request.entity);
+        return build_trace_json_response(layout, graph, request);
     }
 
-    Ok(TraceResponse {
-        lines: build_trace_lines(
-            layout,
-            binding,
-            graph,
-            &request.entity,
-            request.compact,
-            &request.budget,
-            request.assistant.as_deref(),
-            request.max_lines,
-            request.nearby_limit,
-            request.transitive_limit,
-            envelope,
-        )?,
-        entities: Vec::new(),
-    })
+    let built = build_trace_lines(
+        layout,
+        binding,
+        graph,
+        request,
+        request.compact,
+        &request.budget,
+        request.assistant.as_deref(),
+        request.max_lines,
+        request.nearby_limit,
+        request.transitive_limit,
+        envelope,
+    );
+    match built {
+        Ok(lines) => Ok(TraceResponse {
+            lines,
+            entities: Vec::new(),
+            error: None,
+        }),
+        Err(error) => Ok(trace_miss_response(error)?),
+    }
+}
+
+/// Turn a resolution miss into the response shape both eras of client read, and
+/// leave every other error alone.
+///
+/// The guidance goes into `lines` for a `kin` that predates the `error` field
+/// and into `error` for one that does not, so the same daemon serves both and
+/// only the newer one refuses. Anything that is not a miss is a real failure and
+/// keeps propagating.
+fn trace_miss_response(error: anyhow::Error) -> Result<TraceResponse> {
+    match error.downcast::<TraceMiss>() {
+        Ok(miss) => Ok(TraceResponse {
+            lines: miss.lines.clone(),
+            entities: Vec::new(),
+            error: Some(miss.to_string()),
+        }),
+        Err(other) => Err(other),
+    }
 }
 
 /// The absence qualifier for a pack whose dependency walk came back empty.
@@ -194,25 +273,25 @@ fn trace_absence_qualifier(
 pub fn build_trace_json_response(
     layout: &kin_core::KinLayout,
     graph: &impl GraphStore,
-    entity: &str,
+    request: &TraceRequest,
 ) -> Result<TraceResponse> {
+    let entity = request.entity.as_str();
     if looks_like_file_path(entity) {
         return Ok(TraceResponse {
             lines: Vec::new(),
             entities: Vec::new(),
+            error: None,
         });
     }
 
-    let matches = query_trace_matches(graph, entity)?;
-    let mut matches = if matches.is_empty() {
-        fallback_leaf_trace_matches(graph, entity)?
-    } else {
-        matches
+    let resolution = match resolve_trace_target(graph, request) {
+        Ok(resolution) => resolution,
+        Err(error) => return trace_miss_response(error),
     };
+    let mut matches = resolution.candidates;
 
-    if let Some(best_id) = select_best_match_with_layout(entity, &matches).map(|e| e.id) {
-        matches.sort_by_key(|candidate| (candidate.id != best_id, candidate.name.len()));
-    }
+    let best_id = resolution.target.id;
+    matches.sort_by_key(|candidate| (candidate.id != best_id, candidate.name.len()));
 
     let entities = matches
         .iter()
@@ -232,6 +311,7 @@ pub fn build_trace_json_response(
     Ok(TraceResponse {
         lines: Vec::new(),
         entities,
+        error: None,
     })
 }
 
@@ -240,7 +320,7 @@ fn build_trace_lines(
     layout: &kin_core::KinLayout,
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &impl GraphStore,
-    entity: &str,
+    request: &TraceRequest,
     compact: bool,
     budget: &str,
     assistant: Option<&str>,
@@ -251,15 +331,15 @@ fn build_trace_lines(
 ) -> Result<Vec<String>> {
     // Agents sometimes pass file paths instead of entity names; resolve those to
     // the graph-owned entities declared in that file rather than a raw file read.
-    if looks_like_file_path(entity) {
-        return Ok(render_file_path_trace_lines(layout, graph, entity));
+    if looks_like_file_path(&request.entity) {
+        return Ok(render_file_path_trace_lines(layout, graph, &request.entity));
     }
 
     build_trace_lines_with_graph(
         layout,
         binding,
         graph,
-        entity,
+        request,
         compact,
         budget,
         assistant,
@@ -270,6 +350,7 @@ fn build_trace_lines(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_json(
     entity: String,
     _compact: bool,
@@ -278,6 +359,8 @@ pub async fn run_json(
     _max_lines: usize,
     _nearby_limit: usize,
     _transitive_limit: usize,
+    file: Option<String>,
+    kind: Option<String>,
 ) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "trace --json").await?;
@@ -292,9 +375,16 @@ pub async fn run_json(
             max_lines: _max_lines,
             nearby_limit: _nearby_limit,
             transitive_limit: _transitive_limit,
+            file,
+            kind,
         },
     )
     .await?;
+    // An empty array is a lie for a query that resolved nothing, and it is the
+    // shape an editor integration is most likely to trust silently.
+    if let Some(error) = response.error {
+        anyhow::bail!(error);
+    }
     println!("{}", serde_json::to_string(&response.entities)?);
     Ok(())
 }
@@ -304,7 +394,7 @@ fn build_trace_lines_with_graph(
     layout: &kin_core::KinLayout,
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &impl GraphStore,
-    entity: &str,
+    request: &TraceRequest,
     compact: bool,
     budget: &str,
     assistant: Option<&str>,
@@ -313,6 +403,7 @@ fn build_trace_lines_with_graph(
     transitive_limit: usize,
     envelope: &kin_mcp::Envelope,
 ) -> Result<Vec<String>> {
+    let entity = request.entity.trim();
     let token_budget = parse_budget(budget)?;
     let focal_max_lines = if compact {
         max_lines.min(12)
@@ -332,21 +423,8 @@ fn build_trace_lines_with_graph(
         _ => None,
     });
 
-    let matches = query_trace_matches(graph, entity)?;
-    let matches = if matches.is_empty() {
-        fallback_leaf_trace_matches(graph, entity)?
-    } else {
-        matches
-    };
-
-    if matches.is_empty() {
-        return Ok(trace_not_found_guidance(entity));
-    }
-
-    let target = match select_best_match_with_layout(entity, &matches) {
-        Some(target) => target,
-        None => return Ok(trace_not_found_guidance(entity)),
-    };
+    let resolution = resolve_trace_target(graph, request)?;
+    let target = &resolution.target;
 
     let opts = kin_context::ContextOptions {
         budget: token_budget,
@@ -378,6 +456,18 @@ fn build_trace_lines_with_graph(
             "Budget: {}/{} tokens",
             pack.actual_tokens,
             token_budget.max_tokens()
+        ));
+    }
+
+    // Say that a choice was made and what the alternatives are, in both
+    // renderings. The compact one is the rendering an agent reads, and it is the
+    // one that put a header's declaration beside a source file's definition in a
+    // single prompt with nothing marking the difference (FIR-3071).
+    if !resolution.addressed_by_id {
+        lines.extend(crate::entity_identity::twin_note(
+            entity,
+            target,
+            &resolution.candidates,
         ));
     }
 
@@ -845,6 +935,145 @@ fn extract_textual_followups(text: &str) -> Vec<String> {
     out
 }
 
+/// What a trace query resolved to.
+#[derive(Debug)]
+struct TraceResolution {
+    /// The entity the trace describes.
+    target: Entity,
+    /// Every candidate the query reached, after the qualifiers narrowed them.
+    candidates: Vec<Entity>,
+    /// Whether the caller addressed an id. An id names one entity, so there was
+    /// no choice to report.
+    addressed_by_id: bool,
+}
+
+/// Resolve the entity a trace is about, by id or by name, then narrow by the
+/// identity qualifiers.
+///
+/// The id branch is what `kin trace --help` has always promised and never did:
+/// its argument is documented as "Entity name or ID", but resolution went
+/// through the name index alone, so a uuid `kin search --json` had just returned
+/// was matched as a name pattern and reported absent while `kin context`
+/// accepted the same uuid (FIR-3071).
+///
+/// The name branch keeps the qualified-name retry `kin trace` already had, so
+/// `Router::route` still reaches `Router<S>::route` and `cfg.run` still reaches
+/// `run`, and applies the qualifiers to what that found. Every miss leaves as a
+/// [`TraceMiss`], so no caller downstream can mistake one for an answer.
+fn resolve_trace_target(
+    graph: &impl GraphStore,
+    request: &TraceRequest,
+) -> Result<TraceResolution> {
+    let entity = request.entity.trim();
+    let qualifiers = request.qualifiers();
+
+    if let Ok(uuid) = uuid::Uuid::parse_str(entity) {
+        let Some(found) = graph.get_entity(&kin_model::EntityId(uuid))? else {
+            return Err(anyhow::Error::new(TraceMiss {
+                lines: trace_id_not_found_guidance(entity),
+            }));
+        };
+        return Ok(TraceResolution {
+            target: found.clone(),
+            candidates: vec![found],
+            addressed_by_id: true,
+        });
+    }
+
+    let matches = query_trace_matches(graph, entity)?;
+    let matches = if matches.is_empty() {
+        fallback_leaf_trace_matches(graph, entity)?
+    } else {
+        matches
+    };
+    if matches.is_empty() {
+        return Err(anyhow::Error::new(TraceMiss {
+            lines: trace_not_found_guidance(entity),
+        }));
+    }
+
+    let name_candidates = matches.clone();
+    let mut candidates = matches;
+    crate::entity_identity::apply_qualifiers(&mut candidates, &qualifiers);
+    if candidates.is_empty() {
+        return Err(anyhow::Error::new(TraceMiss {
+            lines: trace_qualifier_miss_guidance(entity, &qualifiers.labels(), &name_candidates),
+        }));
+    }
+
+    let Some(target) = select_best_match_with_layout(entity, &candidates).cloned() else {
+        return Err(anyhow::Error::new(TraceMiss {
+            lines: trace_not_found_guidance(entity),
+        }));
+    };
+    Ok(TraceResolution {
+        target,
+        candidates,
+        addressed_by_id: false,
+    })
+}
+
+/// Guidance when the caller addressed an id this graph does not hold.
+///
+/// Kept apart from the name miss because the next step differs: an id is either
+/// stale or from another store, and re-running the search that produced it is
+/// what fixes that, while a name miss wants discovery.
+fn trace_id_not_found_guidance(entity: &str) -> Vec<String> {
+    vec![
+        format!("Entity id '{entity}' is not in this repo's graph."),
+        "hint: ids are per store. Re-run `kin search <name> --json` against this repository and use the id it returns."
+            .to_string(),
+    ]
+}
+
+/// Guidance when the name resolves but the qualifiers exclude every match.
+///
+/// The entity is in the graph, so saying it is absent would be false, and it is
+/// the answer a caller gets by following Kin's own advice to disambiguate by
+/// file. Report the miss as a filter miss and name what the name alone reaches,
+/// so the next command is a copy of one of these lines. Same shape `kin impact`
+/// already uses for the same case.
+fn trace_qualifier_miss_guidance(
+    entity: &str,
+    qualifiers: &[String],
+    candidates: &[Entity],
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "No entity named '{}' matches {}.",
+        entity,
+        qualifiers.join(" ")
+    )];
+    lines.push(format!(
+        "'{}' resolves in this repo's graph to {} entit{}:",
+        entity,
+        candidates.len(),
+        if candidates.len() == 1 { "y" } else { "ies" }
+    ));
+    for candidate in candidates
+        .iter()
+        .take(crate::commands::declaration_neighbors::MAX_LISTED)
+    {
+        lines.push(format!(
+            "  {} ({}) @ {}",
+            candidate.name,
+            kin_review::StableEntityIdentity::from_entity(candidate).kind,
+            crate::entity_identity::entity_location(candidate)
+        ));
+    }
+    if let Some(more) = crate::commands::declaration_neighbors::and_more_suffix(
+        crate::commands::declaration_neighbors::MAX_LISTED,
+        candidates.len(),
+    ) {
+        lines.push(format!("  {more}"));
+    }
+    lines.push(
+        "hint: qualify with one of the identities above, or drop the qualifier to trace the \
+         preferred match."
+            .to_string(),
+    );
+    lines
+}
+
 /// Actionable guidance when `kin trace <symbol>` resolves nothing — not as a
 /// graph entity and not via the source-symbol fallback. Keep the not-found
 /// signal, then point at discovery commands rather than dead-ending. Honest by
@@ -891,6 +1120,222 @@ mod tests {
             WorkspaceId::new(),
             Arc::new(LocalFileBackend::new(layout.kindb_dir())),
         )
+    }
+
+    /// A request that carries nothing but the entity, so a test naming one
+    /// concern does not restate nine defaults.
+    fn trace_request(entity: &str) -> super::TraceRequest {
+        super::TraceRequest {
+            entity: entity.to_string(),
+            json: false,
+            compact: false,
+            budget: "8k".to_string(),
+            assistant: None,
+            max_lines: 20,
+            nearby_limit: 3,
+            transitive_limit: 0,
+            file: None,
+            kind: None,
+        }
+    }
+
+    /// The FIR-3071 fixture: `buffer_grow` declared in a header and defined in a
+    /// source file, spelled the way the C parser writes each. The declaration
+    /// keeps the terminator its statement ended with; the definition's signature
+    /// stops where its body starts.
+    fn buffer_grow_twin(file: &str, signature: &str, line: u32) -> Entity {
+        let file_id = kin_model::FilePathId::new(file);
+        let mut entity = make_entity("buffer_grow");
+        entity.id = EntityId::from_content(&file_id.0, "buffer_grow", "Function", line);
+        entity.language = LanguageId::C;
+        entity.signature = signature.to_string();
+        entity.span = Some(kin_model::SourceSpan {
+            file: file_id.clone(),
+            start_byte: 0,
+            end_byte: 200,
+            start_line: line,
+            start_col: 0,
+            end_line: line,
+            end_col: 0,
+        });
+        entity.file_origin = Some(file_id);
+        entity
+    }
+
+    fn buffer_grow_declaration() -> Entity {
+        buffer_grow_twin("src/buffer.h", "int buffer_grow(buf_t *b, size_t need);", 5)
+    }
+
+    fn buffer_grow_definition() -> Entity {
+        buffer_grow_twin("src/buffer.c", "int buffer_grow(buf_t *b, size_t need)", 5)
+    }
+
+    /// A store that lists the twins in the given order, which is the only thing
+    /// the six preserved stores differed by.
+    fn twin_store(order: [Entity; 2]) -> InMemoryGraph {
+        let graph = InMemoryGraph::new();
+        for entity in order {
+            graph.upsert_entity(&entity).unwrap();
+        }
+        graph
+    }
+
+    /// The defect itself: six stores built from one tree with differing commit
+    /// dates listed these two entities three ways one way and three the other,
+    /// and `kin trace buffer_grow` answered about whichever came first. The
+    /// choice has to be the same in both listings, and it has to be the
+    /// definition.
+    #[test]
+    fn resolution_does_not_move_with_the_order_the_store_lists_twins_in() {
+        let forward = twin_store([buffer_grow_definition(), buffer_grow_declaration()]);
+        let reversed = twin_store([buffer_grow_declaration(), buffer_grow_definition()]);
+
+        let first = super::resolve_trace_target(&forward, &trace_request("buffer_grow")).unwrap();
+        let second = super::resolve_trace_target(&reversed, &trace_request("buffer_grow")).unwrap();
+
+        assert_eq!(
+            first.target.id, second.target.id,
+            "the traced entity moved with the listing order"
+        );
+        assert_eq!(
+            first.target.file_origin.as_ref().map(|f| f.0.as_str()),
+            Some("src/buffer.c"),
+            "a body should beat a declaration"
+        );
+        assert_eq!(first.candidates.len(), 2, "both twins stay listed");
+        assert!(!first.addressed_by_id);
+    }
+
+    /// What `kin trace --help` has always promised. A uuid used to go through
+    /// the name index and come back absent while `kin context` accepted it.
+    #[test]
+    fn resolution_accepts_an_entity_id_the_way_context_does() {
+        let declaration = buffer_grow_declaration();
+        let graph = twin_store([buffer_grow_definition(), declaration.clone()]);
+
+        let resolved =
+            super::resolve_trace_target(&graph, &trace_request(&declaration.id.to_string()))
+                .unwrap();
+
+        assert_eq!(resolved.target.id, declaration.id);
+        assert!(
+            resolved.addressed_by_id,
+            "an id names one entity, so nothing was chosen"
+        );
+    }
+
+    #[test]
+    fn resolution_refuses_an_entity_id_this_graph_does_not_hold() {
+        let graph = twin_store([buffer_grow_definition(), buffer_grow_declaration()]);
+        let absent = EntityId::new().to_string();
+
+        let error = super::resolve_trace_target(&graph, &trace_request(&absent)).unwrap_err();
+        let miss = error.downcast::<super::TraceMiss>().expect("a trace miss");
+
+        assert!(miss.to_string().contains("is not in this repo's graph"));
+    }
+
+    /// The caller that knows which twin it means can now say so, and the
+    /// qualifier wins over the definition preference.
+    #[test]
+    fn a_file_qualifier_pins_the_declaration_over_the_preferred_definition() {
+        let graph = twin_store([buffer_grow_definition(), buffer_grow_declaration()]);
+        let mut request = trace_request("buffer_grow");
+        request.file = Some("src/buffer.h".to_string());
+        request.kind = Some("function".to_string());
+
+        let resolved = super::resolve_trace_target(&graph, &request).unwrap();
+
+        assert_eq!(
+            resolved.target.file_origin.as_ref().map(|f| f.0.as_str()),
+            Some("src/buffer.h"),
+            "the qualifier must decide"
+        );
+        assert_eq!(resolved.candidates.len(), 1);
+    }
+
+    /// A qualifier that excludes everything is a filter miss, not an absent
+    /// entity, and saying otherwise about an entity the name had just found is
+    /// the mistake `kin impact` already paid for.
+    #[test]
+    fn a_qualifier_that_matches_nothing_reports_a_filter_miss() {
+        let graph = twin_store([buffer_grow_definition(), buffer_grow_declaration()]);
+        let mut request = trace_request("buffer_grow");
+        request.file = Some("src/nowhere.c".to_string());
+
+        let error = super::resolve_trace_target(&graph, &request).unwrap_err();
+        let miss = error.downcast::<super::TraceMiss>().expect("a trace miss");
+        let text = miss.to_string();
+
+        assert!(text.contains("matches --file src/nowhere.c"), "{text}");
+        assert!(
+            text.contains("resolves in this repo's graph to 2"),
+            "{text}"
+        );
+        assert!(text.contains("src/buffer.c"), "{text}");
+        assert!(
+            !text.contains("not found"),
+            "a filter miss is not a miss: {text}"
+        );
+    }
+
+    /// The miss discriminator, on a test that cannot skip.
+    ///
+    /// `trace_graph_miss_returns_guidance_without_disk_fallback` below returns
+    /// early when `KinLayout::discover` finds no repository, so under `cargo
+    /// test` from a checkout without a `.kin` it passes having asserted nothing:
+    /// setting `error: None` in `trace_miss_response` left it green. This builds
+    /// its own layout, so the only way it passes is by the response being right.
+    #[test]
+    fn a_trace_miss_response_carries_the_discriminator_beside_the_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let binding = absent_binding(&layout);
+        let graph = twin_store([buffer_grow_definition(), buffer_grow_declaration()]);
+
+        let response = super::build_trace_response(
+            &layout,
+            &binding,
+            &graph,
+            &trace_request("definitelyMissingEntity"),
+            &healthy_trace_envelope(),
+        )
+        .expect("a miss is an answer, not a failure of the builder");
+
+        let joined = response.lines.join("\n");
+        assert!(joined.contains("not found"), "{joined}");
+        assert_eq!(
+            response.error.as_deref(),
+            Some(joined.as_str()),
+            "the guidance must travel in both fields, or the CLI cannot refuse"
+        );
+        assert!(response.entities.is_empty());
+    }
+
+    /// The other side of it: a resolved query must carry no discriminator, or
+    /// every trace would refuse.
+    ///
+    /// Asserted on the `--json` builder rather than the rendered one. The
+    /// rendered path reads the focal's source through the repository authority,
+    /// which this test's binding does not hold, so it would fail for a reason it
+    /// is not about. The `--json` path runs the same resolution and is the
+    /// surface an editor integration reads.
+    #[test]
+    fn a_resolved_trace_carries_no_error_discriminator() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let graph = twin_store([buffer_grow_definition(), buffer_grow_declaration()]);
+
+        let response =
+            super::build_trace_json_response(&layout, &graph, &trace_request("buffer_grow"))
+                .expect("trace json response");
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(response.entities.len(), 2, "both twins are listed");
+        assert_eq!(
+            response.entities[0].file, "src/buffer.c",
+            "the definition must be ranked first, not the header's declaration"
+        );
     }
 
     #[test]
@@ -1103,16 +1548,7 @@ issues.map((iss) => util.finalizeItem(iss, ctx, core.config()));
             &layout,
             &binding,
             &graph,
-            &super::TraceRequest {
-                entity: "definitelyMissingEntity".to_string(),
-                json: false,
-                compact: false,
-                budget: "8k".to_string(),
-                assistant: None,
-                max_lines: 20,
-                nearby_limit: 3,
-                transitive_limit: 0,
-            },
+            &trace_request("definitelyMissingEntity"),
             &healthy_trace_envelope(),
         )
         .unwrap();
@@ -1124,6 +1560,13 @@ issues.map((iss) => util.finalizeItem(iss, ctx, core.config()));
         assert!(
             joined.contains("kin search definitelyMissingEntity"),
             "offers search instead of disk fallback: {joined}"
+        );
+        // The guidance still travels in `lines` for an older client, and the
+        // discriminator beside it is what makes the CLI refuse (FIR-3071).
+        assert_eq!(
+            response.error.as_deref(),
+            Some(joined.as_str()),
+            "a miss must carry the discriminator, not just the prose"
         );
     }
 }

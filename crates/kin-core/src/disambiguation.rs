@@ -60,6 +60,65 @@ pub fn query_trace_matches(graph: &impl GraphStore, query: &str) -> Result<Vec<E
     Ok(matches)
 }
 
+/// Whether an entity's own record shows it carries a body, rather than only
+/// declaring one.
+///
+/// The parser writes `signature` by clamping the declaration where its body
+/// begins: `kin_parser::adapter::declaration_signature` stops at the `body`
+/// field, at a `function_body` or `class_body` child, and at the first comment,
+/// then trims a trailing `{` or `:`. A definition therefore stores a signature
+/// that ends where its body starts, while a declaration stores its whole
+/// statement, terminator included. The terminator is the tell: a signature that
+/// still ends in `;` is the entire declaration, because the language closed the
+/// statement instead of opening a body.
+///
+/// This holds wherever a language spells a declaration as a terminated
+/// statement, which is every language Kin parses that has the distinction at
+/// all: a C prototype, a Rust trait method without a default, a TypeScript
+/// `declare` or interface member. A definition's signature ends at its
+/// parameter list or return type and never at a terminator.
+///
+/// Read off the entity alone, so it answers the same way for a store built
+/// today and one built from the same tree six commits ago, and nothing here
+/// consults the filesystem.
+pub fn carries_body(entity: &Entity) -> bool {
+    !entity.signature.trim_end().ends_with(';')
+}
+
+/// The order two entities sharing a name are chosen in when nothing the caller
+/// passed pins one.
+///
+/// Every term is read off the entity record, so the order is a property of the
+/// entities and never of the order a store happened to list them in. That is
+/// the whole point. `buffer_grow` declared in `buffer.h` and defined in
+/// `buffer.c` is one name over two entities; six stores built from one tree
+/// with differing commit dates listed the pair one way three times and the
+/// other way three times, while twenty consecutive reads of any single store
+/// agreed with themselves. A picker that stopped at the first match therefore
+/// traced the declaration on half the stores and the definition on the other
+/// half, with nothing in the answer saying which (FIR-3071).
+///
+/// Lower sorts first: a body beats a declaration, then the file path, then the
+/// start line, then the id, which `EntityId::from_content` derives from file,
+/// name, kind and line and which is therefore stable across rebuilds of the
+/// same tree rather than freshly random per store.
+pub fn definition_identity_key(entity: &Entity) -> (bool, String, u32, kin_model::EntityId) {
+    (
+        !carries_body(entity),
+        entity
+            .file_origin
+            .as_ref()
+            .map(|origin| origin.0.clone())
+            .unwrap_or_default(),
+        entity
+            .span
+            .as_ref()
+            .map(|span| span.start_line)
+            .unwrap_or(0),
+        entity.id,
+    )
+}
+
 /// Whether the name index rules out every resolver match for `query`.
 ///
 /// `find_references` and `trace_data_flow` both resolve a caller's name through

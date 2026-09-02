@@ -17,6 +17,16 @@ use kin_model::Entity;
 /// 4. Method-style hint (both query and name use `::` or neither does)
 /// 5. Has file origin (prefer entities with known source locations)
 /// 6. Shorter name (prefer less-qualified names as more specific)
+/// 7. Definition identity: a body beats a declaration, then file, line, id
+///
+/// Criterion 7 exists so the answer is a property of the candidates rather than
+/// of the order the store listed them in. Everything above it can tie exactly:
+/// two entities sharing one name, one kind and one length tie on all six, and
+/// `min_by_key` then keeps whichever the store happened to yield first. Six
+/// stores built from one tree with differing commit dates split three and three
+/// on which of `buffer_grow`'s two entities came first, so `kin trace` answered
+/// about the header's declaration on half of them (FIR-3071). The tail terms
+/// are read off the entity record, so they cannot vary that way.
 ///
 /// The `qualifier_checker` callback is used to check whether an entity
 /// matches a qualifier hint. This allows the caller to provide file-based
@@ -66,6 +76,7 @@ where
             !method_hint,
             !file_rank,
             e.name.len(),
+            crate::disambiguation::definition_identity_key(e),
         )
     })
 }
