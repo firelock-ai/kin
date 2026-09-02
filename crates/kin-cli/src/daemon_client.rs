@@ -2743,6 +2743,100 @@ pub fn is_process_alive(pid: u32) -> bool {
     process_liveness(pid).may_be_alive()
 }
 
+/// Whether an executable image path could be a Kin process.
+///
+/// The last discriminator available for an endpoint whose publisher recorded no
+/// process identity. A PID is a lookup key the kernel reissues, so a legacy
+/// endpoint naming a PID some unrelated program now holds is indistinguishable
+/// from a live supervisor by liveness alone. The image behind the PID does
+/// distinguish them, and it is the only component of identity such an endpoint
+/// can still be checked against.
+///
+/// Deliberately a prefix test rather than an exact `kin-daemon` match. The cost
+/// of the two errors is not symmetric: refusing to retire a stale endpoint
+/// wastes a startup budget, while retiring a live one loses the singleton and
+/// leaves the repository owned by a daemon nothing can reach. So every image
+/// whose file stem begins with `kin` is treated as possibly ours, which admits
+/// the supervisor, the CLI, and any development or test build named after them,
+/// and excludes the `msedgewebview2.exe` that inherited PID 8468 in FIR-3055.
+fn image_path_could_be_kin(image: &str) -> bool {
+    let file_name = image.rsplit(['/', '\\']).next().unwrap_or(image);
+    // An empty stem means the only dot is a leading one, so the whole name is
+    // the stem. Splitting there would leave nothing to compare and read as
+    // foreign, which is the one direction this test must never fail in.
+    let stem = match file_name.rsplit_once('.') {
+        Some((stem, _extension)) if !stem.is_empty() => stem,
+        _ => file_name,
+    };
+    stem.trim_start_matches('.')
+        .to_ascii_lowercase()
+        .starts_with("kin")
+}
+
+/// The executable image running at `pid`, or `None` when it cannot be read.
+///
+/// `None` is indeterminate and never authorizes cleanup: a process this session
+/// may not query is not thereby a dead one.
+#[cfg(windows)]
+fn process_image_path(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    // A Windows path can reach 32767 characters, which is too much to put on a
+    // stack frame this deep in a startup path.
+    let mut buffer = vec![0u16; 32768];
+    let mut len = buffer.len() as u32;
+    let queried =
+        unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut len) } != 0;
+    let _ = unsafe { CloseHandle(process) };
+    if !queried {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buffer[..len as usize]))
+}
+
+/// Whether the process at `pid` is affirmatively not a Kin process.
+///
+/// Only an image this session actually read and recognized as foreign returns
+/// `true`. Every failure to read one is indeterminate and returns `false`, so a
+/// probe that cannot see keeps the endpoint published.
+fn pid_runs_a_foreign_image(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        return match process_image_path(pid) {
+            Some(image) => !image_path_could_be_kin(&image),
+            None => false,
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        // Unix endpoints carry a recorded process identity whenever the
+        // publisher was current, and the legacy fallback there has not been
+        // observed to misfire. Adding a second, weaker discriminator only for
+        // this platform would widen the retirement authority without evidence.
+        let _ = pid;
+        false
+    }
+}
+
+/// Whether a PID recorded by a publisher that left no process identity may be
+/// retired.
+///
+/// Affirmative death is the primary authority and is unchanged. The image test
+/// is the second reader, and it exists because the first one cannot see the
+/// failure this function is named for: a reused PID reports `Alive`, which is
+/// true of the process now holding it and false of the supervisor the endpoint
+/// claims.
+fn legacy_supervisor_pid_authorizes_cleanup(pid: u32) -> bool {
+    process_liveness(pid).authorizes_cleanup() || pid_runs_a_foreign_image(pid)
+}
+
 /// Whether a TCP port on localhost is accepting connections. Distinguishes a
 /// daemon that is alive and serving from one whose process exists but whose
 /// port is not (yet) bound.
@@ -3708,22 +3802,7 @@ pub fn remove_stale_supervisor_files() {
         }
     };
     let recorded = supervisor_endpoint_snapshot(&dir);
-    let owner_is_gone = match (recorded.pid, recorded.owner.as_ref()) {
-        (Some(pid), Some(owner)) if owner.identity().pid() == pid => {
-            matches!(process_identity_is_current(owner.identity()), Ok(false))
-        }
-        (Some(pid), None) if !recorded.owner_exists => {
-            // Mixed-version compatibility: old supervisors did not publish an
-            // owner record, so affirmative PID death is still enough to retire
-            // their stale endpoint. Stop paths never signal from this fallback.
-            process_liveness(pid).authorizes_cleanup()
-        }
-        (None, Some(owner)) if !recorded.pid_exists => {
-            matches!(process_identity_is_current(owner.identity()), Ok(false))
-        }
-        (None, None) if !recorded.pid_exists && !recorded.owner_exists => true,
-        _ => false,
-    };
+    let owner_is_gone = supervisor_endpoint_owner_is_gone(&recorded);
     match recorded.pid {
         Some(_) if owner_is_gone => {
             let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded, &startup_authority);
@@ -3768,6 +3847,39 @@ struct SupervisorEndpointSnapshot {
     pid_exists: bool,
     port_exists: bool,
     owner_exists: bool,
+}
+
+/// Whether the published endpoint's owner is affirmatively gone.
+///
+/// One predicate, because the two callers that ask it are the stale-endpoint
+/// sweep and the startup probe, and they disagreed. The sweep consulted the
+/// recorded process identity; the probe asked only whether something was alive
+/// at the PID. So an endpoint the sweep would retire could still wedge startup,
+/// which is FIR-3055: a supervisor endpoint written on 2026-08-05 named PID
+/// 8468, `msedgewebview2.exe` held that number by the time it was read, the
+/// probe called that owner live, and every daemon-backed command then waited
+/// out its whole readiness budget on health that no supervisor was serving.
+///
+/// Every arm fails closed. An owner record naming a different PID than the PID
+/// file, or an identity this host cannot resolve, preserves the endpoint rather
+/// than retiring authority it could not inspect.
+fn supervisor_endpoint_owner_is_gone(recorded: &SupervisorEndpointSnapshot) -> bool {
+    match (recorded.pid, recorded.owner.as_ref()) {
+        (Some(pid), Some(owner)) if owner.identity().pid() == pid => {
+            matches!(process_identity_is_current(owner.identity()), Ok(false))
+        }
+        (Some(pid), None) if !recorded.owner_exists => {
+            // Mixed-version compatibility: old supervisors did not publish an
+            // owner record, so affirmative PID death is still enough to retire
+            // their stale endpoint. Stop paths never signal from this fallback.
+            legacy_supervisor_pid_authorizes_cleanup(pid)
+        }
+        (None, Some(owner)) if !recorded.pid_exists => {
+            matches!(process_identity_is_current(owner.identity()), Ok(false))
+        }
+        (None, None) if !recorded.pid_exists && !recorded.owner_exists => true,
+        _ => false,
+    }
 }
 
 fn supervisor_endpoint_snapshot(dir: &Path) -> SupervisorEndpointSnapshot {
@@ -6665,7 +6777,65 @@ enum ExistingSupervisor {
     NeedsStartupAuthority,
     SpawnAuthorized,
     Starting(String),
+    /// A published endpoint whose owner could not be ruled out, serving health
+    /// that did not answer.
+    ///
+    /// Separate from [`Self::Starting`] because the two want different budgets.
+    /// A supervisor still publishing is making progress no observer can rush,
+    /// so it earns the whole readiness timeout. An endpoint that has published a
+    /// port and cannot serve health is either seconds from ready or not a
+    /// supervisor at all, and `owner_confirmed` is what separates those: with a
+    /// recorded process identity behind it the wait is warranted, and without
+    /// one there is nothing to wait for beyond a short grace.
+    HealthUnavailable {
+        pid: u32,
+        port: u16,
+        owner_confirmed: bool,
+        detail: String,
+    },
     LiveNotReady(String),
+}
+
+/// How long an unconfirmed owner's unreachable health is waited out.
+///
+/// Sized against publication, not against readiness: a supervisor writes its
+/// port only once it is bound, so health follows within a small number of
+/// seconds or it is not coming. The budget it replaces for this case was
+/// [`daemon_ready_timeout_secs`], 300 seconds, polled every 50 ms, which is what
+/// FIR-3055 reported as "retries forever".
+const SUPERVISOR_UNCONFIRMED_HEALTH_BUDGET: Duration = Duration::from_secs(15);
+
+/// Attempt ceiling paired with [`SUPERVISOR_UNCONFIRMED_HEALTH_BUDGET`].
+///
+/// A deadline alone cannot bound a loop whose clock a suspended VM can move, and
+/// an attempt count alone cannot bound one whose probes block. Both, and
+/// whichever is reached first ends the wait.
+const SUPERVISOR_UNCONFIRMED_HEALTH_ATTEMPTS: u32 = 60;
+
+/// Poll interval while health is unavailable.
+///
+/// Each iteration opens a TCP connection. At the 50 ms interval the publication
+/// wait uses, an unreachable endpoint was probed twenty times a second for the
+/// whole budget and logged a warning on every one of them.
+const SUPERVISOR_HEALTH_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// What an operator does about an endpoint kin refused to retire.
+///
+/// The refusal is the honest outcome when identity is indeterminate, but a
+/// refusal that does not say which files carry the claim leaves the reader with
+/// the wedge and no lever. This names them.
+fn stale_supervisor_endpoint_remedy(dir: &Path, pid: u32, port: u16, attempts: u32) -> String {
+    format!(
+        "kin supervisor endpoint {} names pid {pid} on port {port}, nothing there answered health \
+         after {attempts} attempts over {}s, and the endpoint records no process identity kin \
+         could check that pid against, so kin left it published rather than retiring an owner it \
+         cannot identify. If pid {pid} is not a kin supervisor, its number was reused after the \
+         endpoint was written: delete {} and {} and run the command again.",
+        dir.display(),
+        SUPERVISOR_UNCONFIRMED_HEALTH_BUDGET.as_secs(),
+        dir.join(SUPERVISOR_PID_FILE).display(),
+        dir.join(SUPERVISOR_PORT_FILE).display(),
+    )
 }
 
 async fn probe_existing_supervisor() -> ExistingSupervisor {
@@ -6733,7 +6903,10 @@ where
         };
     };
 
-    if process_liveness(pid).authorizes_cleanup() {
+    // Identity, not liveness. Something being alive at this PID says nothing
+    // about whether it is the supervisor the endpoint names; see
+    // [`supervisor_endpoint_owner_is_gone`].
+    if supervisor_endpoint_owner_is_gone(&recorded) {
         let Some(startup_authority) = startup_authority else {
             return ExistingSupervisor::NeedsStartupAuthority;
         };
@@ -6759,6 +6932,10 @@ where
              published a usable port yet"
         ));
     };
+    let owner_confirmed = recorded
+        .owner
+        .as_ref()
+        .is_some_and(|owner| owner.identity().pid() == pid);
     let existing = LiveDaemonEndpoint { pid, port };
     match validate_supervisor_endpoint(existing).await {
         Ok(base_url) => ExistingSupervisor::Connected(base_url),
@@ -6766,15 +6943,21 @@ where
             warn!(
                 pid = existing.pid,
                 port = existing.port,
+                owner_confirmed,
                 error = %err,
                 "supervisor owner is live or indeterminate but health is unavailable; \
                  preserving endpoint and refusing replacement"
             );
-            ExistingSupervisor::Starting(format!(
-                "kin supervisor (pid {}, port {}) may still own the per-user control plane but \
-                 has not passed health yet: {err}",
-                existing.pid, existing.port
-            ))
+            ExistingSupervisor::HealthUnavailable {
+                pid: existing.pid,
+                port: existing.port,
+                owner_confirmed,
+                detail: format!(
+                    "kin supervisor (pid {}, port {}) may still own the per-user control plane \
+                     but has not passed health yet: {err}",
+                    existing.pid, existing.port
+                ),
+            }
         }
     }
 }
@@ -6785,6 +6968,8 @@ async fn follow_existing_supervisor_publication(
     timeout: Duration,
 ) -> ExistingSupervisor {
     let deadline = Instant::now() + timeout;
+    let unconfirmed_deadline = Instant::now() + SUPERVISOR_UNCONFIRMED_HEALTH_BUDGET;
+    let mut health_attempts: u32 = 0;
     loop {
         match wait_for_existing_supervisor_in_dir(dir, Some(startup_authority)).await {
             ExistingSupervisor::Starting(_detail) if Instant::now() < deadline => {
@@ -6797,6 +6982,39 @@ async fn follow_existing_supervisor_publication(
                      KIN_DAEMON_READY_TIMEOUT_SECS to wait longer",
                     timeout.as_secs()
                 ));
+            }
+            ExistingSupervisor::HealthUnavailable {
+                pid,
+                port,
+                owner_confirmed,
+                detail,
+            } => {
+                health_attempts = health_attempts.saturating_add(1);
+                let budget_spent = !owner_confirmed
+                    && (Instant::now() >= unconfirmed_deadline
+                        || health_attempts >= SUPERVISOR_UNCONFIRMED_HEALTH_ATTEMPTS);
+                if budget_spent {
+                    let remedy = stale_supervisor_endpoint_remedy(dir, pid, port, health_attempts);
+                    warn!(
+                        pid,
+                        port,
+                        attempts = health_attempts,
+                        dir = %dir.display(),
+                        "supervisor endpoint health stayed unavailable for an owner with no \
+                         recorded process identity; kin stopped waiting and left the endpoint \
+                         published"
+                    );
+                    return ExistingSupervisor::LiveNotReady(format!("{remedy} ({detail})"));
+                }
+                if Instant::now() >= deadline {
+                    return ExistingSupervisor::LiveNotReady(format!(
+                        "kin supervisor startup is serialized but endpoint publication did not \
+                         complete within {}s: {detail}. Kin will not start a second supervisor; \
+                         raise KIN_DAEMON_READY_TIMEOUT_SECS to wait longer",
+                        timeout.as_secs()
+                    ));
+                }
+                tokio::time::sleep(SUPERVISOR_HEALTH_RETRY_INTERVAL).await;
             }
             resolved => return resolved,
         }
@@ -6933,7 +7151,12 @@ pub async fn ensure_supervisor_running() -> Result<String> {
     match probe_existing_supervisor().await {
         ExistingSupervisor::Connected(base_url) => return Ok(base_url),
         ExistingSupervisor::LiveNotReady(message) => bail!(message),
-        ExistingSupervisor::NeedsStartupAuthority | ExistingSupervisor::Starting(_) => {}
+        // The read-only probe never decides an unreachable endpoint's fate. It
+        // reports what it saw and lets the authority-holding pass below apply
+        // the bounded budget.
+        ExistingSupervisor::NeedsStartupAuthority
+        | ExistingSupervisor::Starting(_)
+        | ExistingSupervisor::HealthUnavailable { .. } => {}
         ExistingSupervisor::SpawnAuthorized => {
             bail!("supervisor probe authorized a spawn without startup protocol authority")
         }
@@ -6978,6 +7201,9 @@ pub async fn ensure_supervisor_running() -> Result<String> {
         ExistingSupervisor::Starting(message) | ExistingSupervisor::LiveNotReady(message) => {
             bail!(message)
         }
+        // Unreachable: the loop above converts every unavailable-health outcome
+        // into one of the resolved variants before returning.
+        ExistingSupervisor::HealthUnavailable { detail, .. } => bail!(detail),
         ExistingSupervisor::SpawnAuthorized => {}
         ExistingSupervisor::NeedsStartupAuthority => {
             bail!("supervisor startup authority was lost before the spawn decision")
@@ -9866,7 +10092,10 @@ mod tests {
         std::fs::rename(port_tmp, dir.path().join(SUPERVISOR_PORT_FILE)).unwrap();
         let unready_fast_path = wait_for_existing_supervisor_in_dir(dir.path(), None).await;
         assert!(
-            matches!(unready_fast_path, ExistingSupervisor::Starting(_)),
+            matches!(
+                unready_fast_path,
+                ExistingSupervisor::HealthUnavailable { .. }
+            ),
             "the public fast path must follow a complete endpoint until health is served: \
              {unready_fast_path:?}"
         );
@@ -10000,7 +10229,7 @@ mod tests {
             wait_for_existing_supervisor_in_dir(dir.path(), Some(&current_startup_authority)).await;
 
         assert!(
-            matches!(final_decision, ExistingSupervisor::Starting(_)),
+            matches!(final_decision, ExistingSupervisor::HealthUnavailable { .. }),
             "the final serialized check must follow/preserve the live legacy owner and forbid a \
              second spawn: {final_decision:?}"
         );
@@ -10644,7 +10873,7 @@ mod tests {
 
         let verdict = wait_for_existing_supervisor_in_dir(dir.path(), None).await;
         assert!(
-            matches!(verdict, ExistingSupervisor::Starting(_)),
+            matches!(verdict, ExistingSupervisor::HealthUnavailable { .. }),
             "a health hiccup from a live owner must forbid spawning: {verdict:?}"
         );
         assert!(dir.path().join(SUPERVISOR_PID_FILE).exists());
@@ -10672,6 +10901,158 @@ mod tests {
             "a supervisor holding its lifetime singleton before publication must still forbid a \
              second spawn: {unpublished_owner:?}"
         );
+    }
+
+    // ── A supervisor endpoint is identity, not a PID ──────────────────────
+    //
+    // FIR-3055. A supervisor endpoint written on 2026-08-05 named PID 8468. By
+    // the time it was read, on Windows, `msedgewebview2.exe` held that number.
+    // The startup probe asked only whether something was alive there, called
+    // the owner live, and every daemon-backed command then spent its whole
+    // readiness budget probing health no supervisor was serving. The sweep that
+    // retires stale endpoints already judged owners by recorded identity; the
+    // probe did not, so the two could disagree about the same endpoint.
+
+    /// An owner record for this process, with its incarnation altered so it
+    /// names a PID that is alive and an incarnation that is gone.
+    fn recycled_supervisor_owner() -> EndpointOwnerRecord {
+        let current = current_process_identity().expect("read this process's identity");
+        EndpointOwnerRecord::for_identity(ProcessIdentity {
+            birth_token: format!("{}-recycled", current.birth_token),
+            ..current
+        })
+    }
+
+    #[test]
+    fn only_a_kin_image_can_be_a_supervisor() {
+        for foreign in [
+            // The image that actually held the reused PID in FIR-3055.
+            r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\msedgewebview2.exe",
+            r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe",
+            r"C:\Windows\explorer.exe",
+            "/usr/bin/python3",
+            "sshd",
+        ] {
+            assert!(
+                !image_path_could_be_kin(foreign),
+                "{foreign} must not be mistaken for a supervisor"
+            );
+        }
+        for ours in [
+            r"C:\Users\kin\.kin\bin\kin-daemon.exe",
+            r"D:\kin\target\release\kin-daemon.exe",
+            "/usr/local/bin/kin-daemon",
+            // Case is not identity on Windows, and a development or test build
+            // named after the crate is still plausibly ours.
+            r"C:\Users\kin\.kin\bin\KIN-DAEMON.EXE",
+            "/tmp/kin_cli-9f2c1a.exe",
+            "kin.exe",
+            // A name whose only dot leads it still has to read as ours: the
+            // stem split would otherwise leave nothing to compare.
+            "/opt/.kin-daemon",
+            "kin-daemon",
+        ] {
+            assert!(
+                image_path_could_be_kin(ours),
+                "{ours} could be a supervisor and must never be retired on image alone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recycled_pid_does_not_keep_a_dead_supervisors_endpoint_alive() {
+        let owner = recycled_supervisor_owner();
+        let pid = owner.identity().pid();
+        // The bare-PID probe the startup path used: this PID is running, which
+        // is exactly why liveness alone could never end the wedge.
+        assert_eq!(process_liveness(pid), ProcessLiveness::Alive);
+
+        let recorded = SupervisorEndpointSnapshot {
+            pid: Some(pid),
+            port: Some(51_001),
+            owner: Some(owner),
+            pid_exists: true,
+            port_exists: true,
+            owner_exists: true,
+        };
+        assert!(
+            supervisor_endpoint_owner_is_gone(&recorded),
+            "an endpoint attributed to an incarnation that is gone must be retirable"
+        );
+    }
+
+    #[test]
+    fn a_live_supervisors_endpoint_is_never_retired() {
+        let owner = EndpointOwnerRecord::for_identity(current_process_identity().unwrap());
+        let recorded = SupervisorEndpointSnapshot {
+            pid: Some(owner.identity().pid()),
+            port: Some(51_002),
+            owner: Some(owner),
+            pid_exists: true,
+            port_exists: true,
+            owner_exists: true,
+        };
+        assert!(
+            !supervisor_endpoint_owner_is_gone(&recorded),
+            "the incarnation that published this endpoint is still running"
+        );
+    }
+
+    #[test]
+    fn a_torn_supervisor_endpoint_is_preserved_rather_than_guessed_at() {
+        // An owner record naming a different PID than the PID file is a state
+        // no publisher produces. Preserving is the only safe reading: the
+        // alternative retires authority on evidence that does not describe it.
+        let owner = recycled_supervisor_owner();
+        let recorded = SupervisorEndpointSnapshot {
+            pid: Some(owner.identity().pid().wrapping_add(1)),
+            port: Some(51_003),
+            owner: Some(owner),
+            pid_exists: true,
+            port_exists: true,
+            owner_exists: true,
+        };
+        assert!(
+            !supervisor_endpoint_owner_is_gone(&recorded),
+            "a mismatched owner record is not evidence about the PID the endpoint names"
+        );
+    }
+
+    #[test]
+    fn a_legacy_endpoint_naming_a_live_kin_process_is_preserved() {
+        // No owner record, the pre-2026-08 shape. This process's own image is
+        // `kin_cli-<hash>`, which could be ours, so nothing here authorizes
+        // retirement on any platform.
+        let recorded = SupervisorEndpointSnapshot {
+            pid: Some(std::process::id()),
+            port: Some(51_004),
+            owner: None,
+            pid_exists: true,
+            port_exists: false,
+            owner_exists: false,
+        };
+        assert!(
+            !supervisor_endpoint_owner_is_gone(&recorded),
+            "a live PID running a kin-named image must keep its endpoint published"
+        );
+    }
+
+    #[test]
+    fn a_stale_supervisor_endpoint_remedy_names_the_files_to_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let remedy = stale_supervisor_endpoint_remedy(dir.path(), 8468, 51_005, 60);
+        let expectations = [
+            dir.path().join(SUPERVISOR_PID_FILE).display().to_string(),
+            dir.path().join(SUPERVISOR_PORT_FILE).display().to_string(),
+            "8468".to_string(),
+            "51005".to_string(),
+        ];
+        for expected in &expectations {
+            assert!(
+                remedy.contains(expected),
+                "the refusal must name {expected} so a reader can act on it: {remedy}"
+            );
+        }
     }
 
     #[tokio::test]
