@@ -16260,6 +16260,10 @@ async fn publication_control_acquire_rollout(
         token: pending.token.clone(),
         fence: pending.fence,
     };
+    // The fence advance writes Firestore under this proof before any guard
+    // owns it; bind it so a transient retry inside the store re-reads it.
+    let _bound =
+        control.bind_mutation_lease(crate::publication_lease::LeaseKind::Rollout, proof.clone());
     let fence = control
         .spine_rollout_fence(&proof)
         .map_err(publication_control_error)?;

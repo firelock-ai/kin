@@ -29,6 +29,16 @@
 # arm depends on it, so a seeding failure names itself instead of arriving later
 # disguised as a broken endpoint lever.
 #
+# Arm 1a is FIR-3059's acceptance on these same bytes. The daemon arm 1 starts
+# bootstraps the GCS publication-control record before it serves, and the lease
+# in that record is the window its first hosted rollout runs under. On
+# 2026-09-02 that window was 300 s and nothing renewed it, so production's first
+# Firestore rollout died with every write done and none of the credit kept. The
+# arm reads the record back out of the emulator, the way a real record is read,
+# and grades the window against the value the daemon owns; the grader is
+# falsified first against the pre-fix shape, so a grader that accepts anything
+# cannot pass.
+#
 # Usage: scripts/test-gcs-emulator-endpoint.sh <image-ref>
 
 set -uo pipefail
@@ -192,6 +202,72 @@ code="$(docker exec "${KIN_CID}" sh -c \
 [ -n "${code}" ] && [ "${code}" != "000" ] \
   || { dump_kin; fail "daemon reached listening but /readiness did not answer"; }
 echo "==> [serves] OK (listening, redirect logged, /readiness http ${code})"
+
+# ---------------------------------------------------------------------------
+# 1a. The startup rollout lease these bytes mint (FIR-3059). See the header.
+#     The grader is a function so it can be run against fixtures before it is
+#     run against the record; a grader that only ever sees the live record
+#     cannot show it would have refused the shape that failed production.
+# ---------------------------------------------------------------------------
+# grade_lease_window <record-json>: prints one PASS, FAIL or UNREADABLE line;
+# exits 0 on PASS, 1 on FAIL, 2 when the record carries no readable lease.
+grade_lease_window() {
+  python3 - "$1" <<'PY'
+import json
+import re
+import sys
+from datetime import datetime
+
+EXPECTED_SECONDS = 1800
+
+
+def parse(stamp):
+    # chrono writes nanoseconds; Python's parser wants at most six digits.
+    stamp = re.sub(r"(\.\d{1,6})\d*", r"\1", stamp).replace("Z", "+00:00")
+    return datetime.fromisoformat(stamp)
+
+
+try:
+    lease = json.loads(sys.argv[1])["active_lease"]
+    window = int((parse(lease["expires_at"]) - parse(lease["acquired_at"])).total_seconds())
+    holder = lease.get("holder")
+    fence = lease.get("fence")
+except (ValueError, KeyError, TypeError) as err:
+    print(f"UNREADABLE the control record carries no readable startup lease: {err!r}")
+    sys.exit(2)
+if window != EXPECTED_SECONDS:
+    print(f"FAIL startup rollout lease window is {window} s, expected {EXPECTED_SECONDS} s (holder {holder}, fence {fence})")
+    sys.exit(1)
+print(f"PASS startup rollout lease window is {window} s (holder {holder}, fence {fence})")
+PY
+}
+
+echo "==> [lease-window/self-test] the grader must refuse the pre-fix window and accept the fixed one"
+prefix_record='{"active_lease":{"holder":"kin-daemon-startup-bootstrap","fence":1,"acquired_at":"2026-09-02T08:20:00.712345678Z","expires_at":"2026-09-02T08:25:00.712345678Z"}}'
+grade_lease_window "${prefix_record}" >/dev/null 2>&1
+rc=$?
+[ "${rc}" -eq 1 ] || fail "lease-window self-test: the grader answered ${rc} to the pre-fix 300 s window instead of failing it, so it grades nothing"
+fixed_record='{"active_lease":{"holder":"kin-daemon-startup-bootstrap","fence":1,"acquired_at":"2026-09-02T08:20:00.712345678Z","expires_at":"2026-09-02T08:50:00.712345678Z"}}'
+grade_lease_window "${fixed_record}" >/dev/null 2>&1
+rc=$?
+[ "${rc}" -eq 0 ] || fail "lease-window self-test: the grader refused an 1800 s window (rc ${rc})"
+grade_lease_window '{"active_lease":null}' >/dev/null 2>&1
+rc=$?
+[ "${rc}" -eq 2 ] || fail "lease-window self-test: a record with no lease must be unreadable, not a pass or a fail (rc ${rc})"
+echo "==> [lease-window/self-test] OK"
+
+echo "==> [lease-window] read the publication-control record the daemon bootstrapped"
+# No KIN_GCS_PREFIX is passed above, so the record sits at the bucket root
+# under the name ObjectStorePublicationControlStore writes.
+record_object=".kin-graph-publication-control.json"
+record="$(docker run --rm --network "${NET}" --entrypoint curl "${IMAGE}" -sS -f \
+  "http://fake-gcs:4443/storage/v1/b/${BUCKET}/o/${record_object}?alt=media" 2>/dev/null || true)"
+[ -n "${record}" ] \
+  || { dump_kin; fail "lease-window: the daemon served but no publication-control record exists at ${BUCKET}/${record_object}; the startup bootstrap wrote nothing to grade"; }
+verdict="$(grade_lease_window "${record}")"
+rc=$?
+echo "==> [lease-window] ${verdict}"
+[ "${rc}" -eq 0 ] || { dump_kin; fail "lease-window: ${verdict}"; }
 docker rm -f "${KIN_CID}" >/dev/null 2>&1; KIN_CID=""
 
 # ---------------------------------------------------------------------------

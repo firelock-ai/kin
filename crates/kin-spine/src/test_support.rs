@@ -157,6 +157,11 @@ pub struct FakeSpineStore {
             Vec<RepoPublicationHead>,
         )>,
     >,
+    /// Runs at the start of every publication preparation with the repo id.
+    /// A consumer under a test clock uses it to charge each publication the
+    /// time a real Firestore staging costs, so a lease that has to outlive a
+    /// whole fleet's publication can be proved to, without sleeping for it.
+    pub prepare_hook: Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>,
 }
 
 #[derive(Default)]
@@ -252,6 +257,7 @@ impl Default for FakeSpineStore {
             disable_cleanup: AtomicBool::new(false),
             cleanup_calls: AtomicUsize::new(0),
             legacy_migration_seal: Mutex::new(None),
+            prepare_hook: Mutex::new(None),
         }
     }
 }
@@ -512,6 +518,9 @@ impl SpineStore for FakeSpineStore {
             return Err(SpineError::Backend(
                 "injected atomic publication unavailable".to_string(),
             ));
+        }
+        if let Some(hook) = self.prepare_hook.lock().unwrap().as_ref() {
+            hook(&publication.repo_id);
         }
         let rollout_fence = self.load_rollout_fence()?.ok_or_else(|| {
             SpineError::Backend("fake active rollout fence is missing".to_string())

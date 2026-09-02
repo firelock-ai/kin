@@ -36,9 +36,9 @@ pub use backend::{
     SpinePublicationBackendId,
 };
 pub use federation::{federated_impact, FederatedEdge, FederatedImpact, FederatedNode};
-pub use firestore::FirestoreSpineBackend;
 #[cfg(feature = "firestore")]
 pub use firestore::FirestoreStore;
+pub use firestore::{FirestoreEndpoint, FirestoreSpineBackend, TransientRetryGate};
 pub use index::{
     AuthorityRootState, CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry, SpineIndex,
     SpineXrefAuthorityAnchor, SpineXrefDecodeError, SpineXrefResponse,

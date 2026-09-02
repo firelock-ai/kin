@@ -302,47 +302,18 @@ fn create_state(
                 Arc::clone(&publication_control),
             )?;
             let spine_startup = if let Some(pending) = bootstrap {
-                (|| -> std::result::Result<(), String> {
-                    let proof = kin_daemon::publication_lease::LeaseProof {
-                        scope: publication_control.scope().to_string(),
-                        token: pending.token,
-                        fence: pending.fence,
-                    };
-                    let fence = publication_control
-                        .spine_rollout_fence(&proof)
-                        .map_err(|error| error.to_string())?;
-                    let evidence =
-                        runtime.block_on(state.advance_hosted_spine_rollout_fence(fence))?;
-                    publication_control
-                        .checkpoint_spine_rollout_fence(&proof, &evidence)
-                        .map_err(|error| error.to_string())?;
-                    publication_control
-                        .complete_rollout_acquisition(&proof)
-                        .map_err(|error| error.to_string())?;
-                    let legacy_writer_drain_proof_sha256 =
-                        env::var("KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL")
-                            .ok()
-                            .map(|digest| digest.trim().to_string())
-                            .filter(|digest| !digest.is_empty());
-                    let admission = kin_daemon::publication_lease::AdmitReaderRequest {
-                        lease: proof.clone(),
-                        repositories: publication_control.fleet_repositories().to_vec(),
-                        reader: kin_daemon::publication_lease::ReaderAdmissionInput {
-                            identity: publication_control.runtime_reader_identity().to_string(),
-                            min_snapshot_schema: kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
-                            max_snapshot_schema: kin_db::GraphSnapshot::CURRENT_VERSION,
-                            valid_for_seconds:
-                                kin_daemon::publication_lease::MAX_READER_ADMISSION_SECONDS,
-                        },
-                        legacy_writer_drain_proof_sha256,
-                    };
-                    runtime.block_on(state.prepare_hosted_spine_rollout(&admission))?;
-                    runtime.block_on(state.admit_hosted_spine_rollout_fence(admission))?;
-                    runtime.block_on(state.release_hosted_spine_rollout(
-                        kin_daemon::publication_lease::ReleaseRolloutLeaseRequest { lease: proof },
-                    ))?;
-                    Ok(())
-                })()
+                let legacy_writer_drain_proof_sha256 =
+                    env::var("KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL")
+                        .ok()
+                        .map(|digest| digest.trim().to_string())
+                        .filter(|digest| !digest.is_empty());
+                // The sequence itself lives on the state so the same bytes run
+                // under a test clock; see `complete_hosted_startup_rollout`.
+                runtime.block_on(state.complete_hosted_startup_rollout(
+                    &publication_control,
+                    pending,
+                    legacy_writer_drain_proof_sha256,
+                ))
             } else {
                 match publication_control.runtime_spine_authority() {
                     Ok(kin_daemon::publication_lease::RuntimeSpineAuthority::Completed(
