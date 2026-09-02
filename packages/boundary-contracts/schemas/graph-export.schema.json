@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/graph-export",
+  "description": "The drawable projection of a Kin repository graph, as served by GET /graph/export on the daemon and by `kin graph export`. Nodes and links are what a renderer draws; the counts describe the population the sample was drawn from, so a consumer can say how much of the graph it is showing.",
+  "type": "object",
+  "required": [
+    "root_hash",
+    "seq",
+    "entity_count",
+    "relation_count",
+    "unresolved_links",
+    "filtered_links",
+    "sampled",
+    "nodes",
+    "links"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "root_hash": {
+      "type": "string",
+      "description": "Hex Merkle root of the graph this payload was built from. Pair it with the root_hash on the /graph/events connected frame: a mismatch means re-export rather than patch.",
+      "pattern": "^[0-9a-f]*$"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Position in the delta stream this payload was cut at. The resync key: subscribe to /graph/events, discard every event whose seq is at or below this one, and apply the rest. root_hash cannot do this alone, because a working-tree edit changes the graph without advancing the root."
+    },
+    "entity_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Entities matching the request's kinds and path filters, before the node cap. Not the number of nodes drawn."
+    },
+    "relation_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Distinct drawable links among those entities, before the node cap. Links are undirected (source, target, kind) keys, so two relations between the same pair in the same kind count once and draw one line."
+    },
+    "unresolved_links": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Distinct links withheld because an endpoint is not an entity in this graph at all, such as an import of an external crate. A property of the graph, not of this request."
+    },
+    "filtered_links": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Distinct links withheld because an endpoint was excluded by the kinds or path filter or by the node cap. A property of this request, not of the graph."
+    },
+    "sampled": {
+      "type": "boolean",
+      "description": "Whether the node cap dropped anything. False means nodes holds every entity that matched."
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The node cap actually applied. Absent when the caller asked for no cap."
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/node"
+      }
+    },
+    "links": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/link"
+      }
+    }
+  },
+  "$defs": {
+    "node": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "kind",
+        "degree"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Entity UUID."
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "description": "Entity kind in the graph's own spelling, e.g. Function, Class, TraitDef."
+        },
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Repository-relative path, or null for an entity the graph placed in no file."
+        },
+        "degree": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Distinct undirected (neighbour, kind) pairs across the whole matched population, not recomputed for the sampled subgraph."
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based presentation start line. Present only when the request asked for include=line and the entity carries a span."
+        },
+        "signature": {
+          "type": "string",
+          "description": "Present only when the request asked for include=signature."
+        }
+      }
+    },
+    "link": {
+      "type": "object",
+      "required": [
+        "source",
+        "target",
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "Entity UUID, always present in nodes."
+        },
+        "target": {
+          "type": "string",
+          "description": "Entity UUID, always present in nodes."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Relation kind in the graph's own spelling, e.g. Calls, Contains, UsesMacro."
+        }
+      }
+    }
+  }
+}

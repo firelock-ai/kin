@@ -1,0 +1,299 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/graph-event",
+  "description": "One frame of the Kin daemon graph delta stream, as served by GET /graph/events and printed by `kin graph watch --json`. Frames are internally tagged on `type` and carry a monotonic `seq`. The stream may carry types this schema does not list: a consumer must ignore an unrecognized type rather than fail, so validating against this schema is how a consumer decides whether a frame is one it knows, not whether the stream is well formed.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/connected"
+    },
+    {
+      "$ref": "#/$defs/lagged"
+    },
+    {
+      "$ref": "#/$defs/entityChanged"
+    },
+    {
+      "$ref": "#/$defs/relationChanged"
+    },
+    {
+      "$ref": "#/$defs/treeChanged"
+    },
+    {
+      "$ref": "#/$defs/graphRootChanged"
+    },
+    {
+      "$ref": "#/$defs/graphDeltaApplied"
+    }
+  ],
+  "$defs": {
+    "changeType": {
+      "type": "string",
+      "enum": [
+        "created",
+        "modified",
+        "deleted"
+      ]
+    },
+    "nodeSummary": {
+      "type": "object",
+      "description": "What the entity now is, so a consumer can patch a drawn node without a round trip. The same fields a graph-export node carries, minus the id, which the event already names.",
+      "required": [
+        "name",
+        "kind",
+        "degree"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "degree": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "connected": {
+      "type": "object",
+      "description": "The first frame on every subscription. Its root_hash is the resync anchor: pair it with the root_hash on the export you drew, and re-export on a mismatch.",
+      "required": [
+        "type",
+        "entity_count",
+        "root_hash",
+        "seq"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "connected"
+        },
+        "entity_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "root_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]*$"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic position in the delta stream. Compare against the seq your export was cut at."
+        }
+      }
+    },
+    "lagged": {
+      "type": "object",
+      "description": "The subscriber fell behind the broadcast channel and missed events. Never filtered out by the types parameter, because it is the news that this client's view is now wrong. Re-export on receipt. Carries no seq: the events it reports were dropped before this subscriber saw them, so there is no position to name. Re-export on receipt.",
+      "required": [
+        "type",
+        "missed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "lagged"
+        },
+        "missed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "entityChanged": {
+      "type": "object",
+      "required": [
+        "type",
+        "entity_id",
+        "change_type",
+        "seq"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "EntityChanged"
+        },
+        "entity_id": {
+          "type": "string"
+        },
+        "change_type": {
+          "$ref": "#/$defs/changeType"
+        },
+        "file_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The session that caused the change, or null for a filesystem reconcile, which has no owning agent."
+        },
+        "node": {
+          "$ref": "#/$defs/nodeSummary"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic position in the delta stream. Compare against the seq your export was cut at."
+        }
+      }
+    },
+    "relationChanged": {
+      "type": "object",
+      "description": "An edge appeared, changed, or went away. Emitted after the EntityChanged frames of the same reconcile, so an edge never names a node the consumer has not been told about yet. Both endpoints are entity ids; an edge to an artifact or an external symbol is not drawable and produces no frame.",
+      "required": [
+        "type",
+        "source",
+        "target",
+        "kind",
+        "change_type",
+        "seq"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "RelationChanged"
+        },
+        "source": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "change_type": {
+          "$ref": "#/$defs/changeType"
+        },
+        "file_path": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic position in the delta stream. Compare against the seq your export was cut at."
+        }
+      }
+    },
+    "treeChanged": {
+      "type": "object",
+      "required": [
+        "type",
+        "paths_added",
+        "paths_removed",
+        "seq"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "TreeChanged"
+        },
+        "paths_added": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "paths_removed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic position in the delta stream. Compare against the seq your export was cut at."
+        }
+      }
+    },
+    "graphRootChanged": {
+      "type": "object",
+      "description": "The graph root advanced. A drawn graph built at old_root_hash is now stale; re-export.",
+      "required": [
+        "type",
+        "new_root_hash",
+        "seq"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "GraphRootChanged"
+        },
+        "old_root_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "new_root_hash": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic position in the delta stream. Compare against the seq your export was cut at."
+        }
+      }
+    },
+    "graphDeltaApplied": {
+      "type": "object",
+      "description": "One reconcile pass finished. Emitted after the last entity and relation frame of that pass, so a renderer lays out once per pass instead of once per event. The counts are of frames emitted since the previous boundary. A modified edge counts as added, because the edge that now exists is the one a consumer upserts.",
+      "required": [
+        "type",
+        "seq",
+        "nodes_added",
+        "nodes_modified",
+        "nodes_removed",
+        "relations_added",
+        "relations_removed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "GraphDeltaApplied"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic position in the delta stream. Compare against the seq your export was cut at."
+        },
+        "nodes_added": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "nodes_modified": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "nodes_removed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "relations_added": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "relations_removed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}
