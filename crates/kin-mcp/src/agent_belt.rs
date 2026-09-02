@@ -26,6 +26,24 @@
 //! profile sets `additionalProperties: false`, and the handlers read arguments
 //! by name, so a caller that knows a withheld property can still pass it and the
 //! `full` profile still advertises every one.
+//!
+//! # Adding a tool to `agent-default`
+//!
+//! If you added a name to [`crate::tools::agent_default_tool_names`] and
+//! `kin-mcp` went red on `every_agent_default_tool_has_a_short_description`,
+//! that is this module asking for two entries, not a defect:
+//!
+//! 1. [`short_descriptions`]: one or two sentences saying when to call the tool
+//!    and what comes back, under [`AGENT_DEFAULT_DESCRIPTION_BUDGET`]
+//!    characters. Where another tool is easy to confuse with yours, name it, and
+//!    add the pointer back in its entry.
+//! 2. [`schema_keep_lists`]: the input properties that change WHICH entities
+//!    come back. Leave out the ones that only reshape the response, since the
+//!    profile picks those itself.
+//!
+//! The guard is deliberate. Without it a tool joins the belt carrying its full
+//! registered description, which is the several-thousand-character form this
+//! module exists to replace, and nothing says so.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -171,8 +189,17 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
             "Walk the call chain out from one entity and get the whole path back in one call, as \
              an ordered list of steps. Call it when you name ONE thing and ask what it reaches or \
              what reaches it: give it a focal entity_id, a direction and a depth. It walks call \
-             and import edges, so it does not follow a value through a variable. Prefer it over \
-             looping find_references by hand.",
+             and import edges, so it does not follow a value through a variable. When your question \
+             names TWO things and asks how one reaches the other, call trace_path instead.",
+        ),
+        (
+            crate::handlers::path::TOOL_NAME,
+            "Find how one entity reaches another and get the routes back as ordered hops. Call it \
+             when your question names TWO things: how does A reach B. Takes `from` and `to`, each an \
+             exact name, an entity id, or name@file to pin a twin. Every hop carries id, name, kind, \
+             file, line and the relation into the next. Read `found` and `gap` before concluding A \
+             never reaches B; a class stands for its members. For one endpoint, call \
+             trace_data_flow.",
         ),
         (
             "find_references",
@@ -309,6 +336,18 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
             &["focal", "target", "direction", "depth"] as &[&str],
         ),
         (
+            crate::handlers::path::TOOL_NAME,
+            &[
+                "from",
+                "to",
+                "from_file",
+                "to_file",
+                "direction",
+                "max_depth",
+                "limit",
+            ] as &[&str],
+        ),
+        (
             "graph_neighborhood",
             &["entity_id", "depth", "direction", "limit"] as &[&str],
         ),
@@ -384,7 +423,12 @@ mod tests {
             .collect();
         assert!(
             missing.is_empty(),
-            "these agent-default tools have no short description: {missing:?}"
+            "these agent-default tools have no short description: {missing:?}; add an entry for \
+             each in short_descriptions() and schema_keep_lists() in \
+             crates/kin-mcp/src/agent_belt.rs, at most {AGENT_DEFAULT_DESCRIPTION_BUDGET} \
+             characters per description. Without one the tool joins the belt carrying its full \
+             registered description, which is the several-thousand-character form this module \
+             exists to replace."
         );
     }
 
@@ -403,7 +447,9 @@ mod tests {
             .collect();
         assert!(
             orphans.is_empty(),
-            "short forms for unserved tools: {orphans:?}"
+            "short_descriptions() in crates/kin-mcp/src/agent_belt.rs has entries for tools the \
+             profile no longer serves: {orphans:?}; remove them, or put the names back in \
+             agent_default_tool_names() if the removal was accidental"
         );
     }
 
@@ -670,6 +716,16 @@ mod tests {
                 "{hop} must point a chain question at trace_data_flow"
             );
         }
+        // The two-endpoint question has its own tool now, so the one-endpoint
+        // walker must hand it over rather than leaving a small model to guess.
+        assert!(
+            descriptions["trace_data_flow"].contains(crate::handlers::path::TOOL_NAME),
+            "trace_data_flow must name trace_path for the two-endpoint question"
+        );
+        assert!(
+            descriptions[crate::handlers::path::TOOL_NAME].contains("trace_data_flow"),
+            "and trace_path must name it back for the one-endpoint question"
+        );
         assert!(
             descriptions["trace_data_flow"].contains("call chain"),
             "trace_data_flow's short form must say what it walks; its registered \
@@ -735,7 +791,13 @@ mod tests {
                 .tools
                 .iter()
                 .find(|t| t.name == name)
-                .unwrap_or_else(|| panic!("keep-list names an unregistered tool: {name}"));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "schema_keep_lists() in crates/kin-mcp/src/agent_belt.rs names '{name}', \
+                         which tool_definitions() does not register; fix the spelling or drop \
+                         the entry"
+                    )
+                });
             let properties = tool.input_schema["properties"]
                 .as_object()
                 .unwrap_or_else(|| panic!("{name} has no properties object"));
