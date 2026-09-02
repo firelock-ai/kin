@@ -538,6 +538,22 @@ def judge(snapshot: dict[str, Any]) -> Verdict:
     if problem is not None:
         return Verdict(REFUSE, problem, number, head)
 
+    # A wave whose pins a lane already carried onto main (kin#1384 landed
+    # =0.7.88 by hand while #1360 carried the same delta) has nothing to
+    # merge: an empty squash is never a landing, and the receiver's next
+    # refresh reconciles the pull. It is a final wait, not a failure.
+    on_main = snapshot.get("pins_on_main")
+    if not isinstance(on_main, dict) or not isinstance(on_main.get("changed"), list):
+        return Verdict(REFUSE, "pin comparison against main is unreadable", number, head)
+    if not on_main["changed"]:
+        return Verdict(
+            WAIT,
+            f"the wave's pins are already on main at {on_main.get('tip')}; nothing to "
+            "merge, and the receiver's next refresh reconciles the pull",
+            number,
+            head,
+        )
+
     files = snapshot.get("files")
     if not isinstance(files, list):
         return Verdict(REFUSE, "pull file listing is not an array", number, head)
@@ -691,6 +707,32 @@ def _branch_tip(repository: str) -> str | None:
     return _sha(ref_object.get("sha")) if isinstance(ref_object, dict) else None
 
 
+def pins_on_main(workspace: Path, head: str) -> dict[str, Any]:
+    """The allowed paths the head still changes against the judged main tip."""
+
+    tip = guard.git(workspace, "rev-parse", "HEAD").decode("ascii").strip()
+    if _sha(tip) is None:
+        raise LandingError("workspace HEAD is not a commit")
+    changed = sorted(
+        guard._paths(
+            guard.git(
+                workspace,
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                tip,
+                head,
+                "--",
+                *sorted(ALLOWED_PATHS),
+            )
+        )
+    )
+    return {"tip": tip, "changed": changed}
+
+
 def _attestation_state(
     workspace: Path,
     repository: str,
@@ -699,7 +741,6 @@ def _attestation_state(
     base: str,
 ) -> str:
     try:
-        guard.ensure_pull_head(workspace, number, head)
         guard.verify_attestation(
             workspace,
             repository,
@@ -726,6 +767,7 @@ def gather(repository: str, workspace: Path, freeze: str) -> dict[str, Any]:
         "commits": [],
         "files": [],
         "check_run_pages": [],
+        "pins_on_main": None,
         "attestation": ATTESTATION_PENDING,
     }
     open_pulls = snapshot["open_pulls"]
@@ -774,6 +816,11 @@ def gather(repository: str, workspace: Path, freeze: str) -> dict[str, Any]:
             ]
         )
     )
+    try:
+        guard.ensure_pull_head(workspace, number, head)
+        snapshot["pins_on_main"] = pins_on_main(workspace, head)
+    except guard.AdmissionError as exc:
+        raise LandingError(f"pull head {head} could not be read: {exc}") from exc
     snapshot["attestation"] = _attestation_state(workspace, repository, number, head, base)
     return snapshot
 

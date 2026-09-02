@@ -420,7 +420,9 @@ mergeability, a re-pushed head), so one trigger outlasts the checks it waits
 on. Only then does the land job mint the App token, squash-merge with the pull
 title and body and never the marker line, and prove the squash is on `main`.
 A failed check, a foreign commit, an off-scope file or an unreadable listing
-refuses loudly; everything transient and an open hold wait quietly. GitHub's
+refuses loudly; everything transient and an open hold wait quietly. A wave
+whose pins a lane already carried onto main has nothing to merge and is left
+for the receiver's next refresh, never squashed as an empty diff. GitHub's
 own auto-merge is not the mechanism, because it merges on the six ruleset
 contexts alone and the admission chain refuses any server-owned landing state
 on the wave.

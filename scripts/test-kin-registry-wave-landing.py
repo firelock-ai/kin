@@ -453,6 +453,7 @@ def green_snapshot(**overrides: Any) -> dict[str, Any]:
         "commits": [bot_commit()],
         "files": [wave_file("Cargo.toml"), wave_file("Cargo.lock")],
         "check_run_pages": pages(green_runs()),
+        "pins_on_main": {"tip": BASE, "changed": ["Cargo.lock", "Cargo.toml"]},
         "attestation": landing.ATTESTATION_VERIFIED,
     }
     snapshot.update(overrides)
@@ -713,6 +714,38 @@ class WaveJudgeTests(unittest.TestCase):
         for reason, pull in cases.items():
             with self.subTest(reason=reason):
                 self.assertVerdict(green_snapshot(pull=pull), landing.REFUSE, re.escape(reason))
+
+    def test_pins_already_on_main_are_a_final_no_op(self) -> None:
+        # kin#1384 landed =0.7.88 by hand at 16:28Z while #1360 carried the same
+        # delta: nothing to merge, never an empty squash, never a red run.
+        verdict = self.assertVerdict(
+            green_snapshot(pins_on_main={"tip": OTHER, "changed": []}),
+            landing.WAIT,
+            f"pins are already on main at {OTHER}; nothing to merge",
+        )
+        self.assertFalse(verdict.transient)
+        self.assertEqual((verdict.pull, verdict.head), (1360, HEAD))
+        self.assertVerdict(
+            green_snapshot(pins_on_main=None), landing.REFUSE, "pin comparison against main is unreadable"
+        )
+        self.assertVerdict(
+            green_snapshot(pins_on_main={"tip": OTHER, "changed": ["Cargo.lock"]}),
+            landing.LAND,
+            "concluded green",
+        )
+
+    def test_pins_on_main_reads_the_workspace_tip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            base = initialize_repo(repo)
+            head = commit_wave(repo)
+            run_git(repo, "switch", "-q", "--detach", base)
+            self.assertEqual(
+                landing.pins_on_main(repo, head),
+                {"tip": base, "changed": ["Cargo.lock", "Cargo.toml"]},
+            )
+            run_git(repo, "switch", "-q", "--detach", head)
+            self.assertEqual(landing.pins_on_main(repo, head), {"tip": head, "changed": []})
 
     def test_transient_and_final_waits_are_told_apart(self) -> None:
         transient = (
