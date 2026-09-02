@@ -4,8 +4,11 @@ This repository (`kin`) is part of the Kin ecosystem. The canonical source of tr
 thesis, boundaries, lane arbitration and commit hygiene is the umbrella workspace's
 **`kin-ecosystem/AGENTS.md`** (also symlinked as `kin-ecosystem/CLAUDE.md`), and it is loaded
 automatically when you work inside the umbrella. Read it before making architectural or process
-decisions. `CLAUDE.md` at this repo's root is a symlink to this file, because Claude Code reads
-`CLAUDE.md` and not `AGENTS.md`, so a standalone checkout still loads this note.
+decisions. `CLAUDE.md` at this repo's root is a regular file that imports this one, because Claude Code reads
+that filename and this repository's source is archived into kin-infra's promotion bundle, whose
+validator refuses any non-regular entry; a symlink there failed production image promotion of
+v0.6.4 after the release was already public. Edit this file, never that one, and keep every
+tracked path in this repository a regular file.
 
 ## This repo's role
 
