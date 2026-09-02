@@ -12,13 +12,16 @@
 //! how they learned the first one had worked; a caller keying on the exit
 //! code would have retried or rolled back instead.
 //!
-//! Three arms, each driving `kin` and `kin-daemon`. The change lands and the
-//! reader is gone by the summary: exit 0 and the change in `kin log`. The
-//! commit is refused and nobody reads either stream: exit 1, not 0 and not
-//! 101, because a refusal is the caller's news whether or not it was
-//! delivered. The reader leaves while the daemon is still starting: the commit
-//! never reached authority, nothing is recorded, and the exit is 141 rather
-//! than a 0 that would claim a change that does not exist.
+//! Three arms, each driving `kin` and `kin-daemon`, and one doctrine under all
+//! of them: the exit status reports the commit, never the pipe, so a recorded
+//! change is never reported as a failure and a change that was not recorded
+//! is never reported as a success. The change lands and the reader is gone by
+//! the summary: exit 0 and the change in `kin log`. The commit is refused and
+//! nobody reads either stream: exit 1, not 0 and not 101, because a refusal
+//! is the caller's news whether or not it was delivered. The reader leaves
+//! after one line while the daemon is still starting, `2>&1 | head -1` on a
+//! cold daemon: the commit keeps going, the change is in `kin log`, and the
+//! exit is 0.
 
 use serde_json::Value;
 use std::fs;
@@ -138,9 +141,9 @@ fn gone_pipe() -> std::io::PipeWriter {
 /// stderr goes to a file so the arm can also say there was no panic, which the
 /// stranger could not see because their stderr was the same closed pipe.
 ///
-/// Falsify by removing `install_exit_hook()` from `main`: the status reads
-/// 101 with `failed printing to stdout` on stderr, and the change is in the
-/// log all the same.
+/// Falsify by making the sink raise std's own panic on a closed pipe instead
+/// of marking the stream gone: the status reads 101 with `failed printing to
+/// stdout` on stderr, and the change is in the log all the same.
 #[test]
 fn a_commit_recorded_before_its_reader_left_exits_zero() {
     let root = tempdir().expect("temp root");
@@ -188,9 +191,9 @@ fn a_commit_recorded_before_its_reader_left_exits_zero() {
 /// how `main` ends on an error when stderr is gone: exit 1, the refusal's own
 /// status, and neither the 101 of a second print panic nor a 0.
 ///
-/// Falsify by returning the error from `main` again instead of ending on it:
-/// std prints the refusal through `eprintln!`, the closed pipe turns that into
-/// a print panic, and the status reads 101.
+/// Falsify by rendering the refusal through std's `eprintln!` instead of the
+/// sink: the closed pipe turns that print into a panic, and the status reads
+/// 101.
 #[test]
 fn a_refused_commit_exits_one_even_when_nobody_reads_it() {
     let root = tempdir().expect("temp root");
@@ -241,18 +244,25 @@ fn a_refused_commit_exits_one_even_when_nobody_reads_it() {
     );
 }
 
-/// The stranger's arm on a cold daemon: `2>&1 | head -N` with `head` leaving
-/// while the daemon is still starting.
+/// The stranger's arm on a cold daemon, as `2>&1 | head -1`: both streams one
+/// pipe, and the reader leaves after the first line, while the daemon this
+/// commit has to start is still starting.
 ///
-/// Both streams share one pipe. The test reads until the daemon-start notice
-/// and then leaves, exactly as `head` does once it has its lines. The next
-/// progress line has nowhere to go, the commit request has not been sent, and
-/// the exit has to say the command was cut off rather than claim a change.
+/// Every write after that first line meets a closed pipe: the startup ticks,
+/// the ready line, any warning, and the summary. None of them may decide
+/// anything. The doctrine, asserted first, is that the exit status and the log
+/// agree: a 0 over a log that gained nothing would claim a change that does
+/// not exist, and a non-zero over a log that gained one would report a landed
+/// commit as a failure, which is FIR-2846 itself. What this design then
+/// delivers is the first of the two agreeing shapes: the commit runs to its
+/// end, the change is in `kin log`, and the status is 0.
 ///
-/// Falsify by giving a closed stderr the same status as a closed stdout: the
-/// status then reads 0 over a log that gained nothing.
+/// Falsify by ending the process on the first closed-pipe write with the
+/// status the old hook gave a closed stderr, 141: the log gains nothing and
+/// the design assertion reads 141 over an unchanged log. Falsify the doctrine
+/// assertion by ending it with 0 instead: a 0 over a log that gained nothing.
 #[test]
-fn a_commit_cut_off_while_its_daemon_starts_records_nothing_and_does_not_exit_zero() {
+fn a_commit_whose_reader_leaves_after_one_line_still_records_its_change_and_exits_zero() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
     let runtime = IsolatedDaemonRuntime::new(&repo);
@@ -273,34 +283,47 @@ fn a_commit_cut_off_while_its_daemon_starts_records_nothing_and_does_not_exit_ze
         .stderr(Stdio::from(stderr))
         .spawn_owned()
         .expect("spawn kin commit");
+    // `head -1`: one line, then gone.
     let mut lines = BufReader::new(reader);
-    let mut seen = String::new();
-    loop {
-        let mut line = String::new();
-        let read = lines.read_line(&mut line).expect("read the shared pipe");
-        assert_ne!(
-            read, 0,
-            "the commit must announce the daemon it starts before it ends; it said: {seen}"
-        );
-        seen.push_str(&line);
-        if line.contains("starting the kin daemon") {
-            break;
-        }
-    }
+    let mut first = String::new();
+    let read = lines
+        .read_line(&mut first)
+        .expect("read the first line of the shared pipe");
+    assert_ne!(
+        read, 0,
+        "the commit must say something before it ends, and on a cold daemon it says it is \
+         starting one"
+    );
     drop(lines);
-    let status = child.wait().expect("wait for kin commit");
+    let status: ExitStatus = child.wait().expect("wait for kin commit");
 
     let after = log_entries(&runtime, &repo);
-    assert_eq!(
-        after.len(),
-        before.len(),
-        "a commit cut off before it reached authority records nothing"
+    let recorded = match after.len().checked_sub(before.len()) {
+        Some(0) => false,
+        Some(1) => true,
+        _ => panic!(
+            "one commit moves the log by at most one entry: {} before, {} after",
+            before.len(),
+            after.len()
+        ),
+    };
+    assert!(
+        (status.code() == Some(0)) == recorded,
+        "the exit status and the log must agree, and they do not: status {status:?}, change \
+         recorded {recorded}. A 0 over a log that gained nothing claims a change that does not \
+         exist, and a failure over a log that gained one reports a landed commit as failed. The \
+         first line it wrote was: {first}"
     );
-    assert_eq!(newest_change(&after), newest_change(&before));
+    assert!(
+        recorded,
+        "a reader leaving after one line is no reason to stop the commit, and this one recorded \
+         nothing; status {status:?}; the first line it wrote was: {first}"
+    );
+    assert_ne!(newest_change(&after), newest_change(&before));
     assert_eq!(
         status.code(),
-        Some(kin_cli::broken_pipe::CUT_OFF_STATUS),
-        "a commit cut off before it ran must say so and never exit 0, not {status:?}; \
-         it said: {seen}"
+        Some(0),
+        "a commit that recorded its change exits 0 whether or not anyone read its summary, not \
+         {status:?}"
     );
 }

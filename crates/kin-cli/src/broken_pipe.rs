@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! How the CLI ends when the process reading its output has gone away.
+//! What the CLI does when the process reading its output has gone away.
 //!
 //! Rust starts every binary with `SIGPIPE` ignored, so a write into a pipe
 //! whose reader has closed comes back as `EPIPE` instead of ending the process,
-//! and the `print!` family turns that error into a panic. `kin diff HEAD
+//! and std's `print!` family turns that error into a panic. `kin diff HEAD
 //! WORKSPACE | head -5` therefore ended in `thread 'main' panicked at ...
 //! failed printing to stdout: Broken pipe` and exit 101 on every command that
 //! writes more than its reader takes, and a `kin commit ... 2>&1 | head -3`
@@ -15,24 +15,42 @@
 //! write: eleven of twelve commands exited 101, and only `--help` survived,
 //! because clap discards its write errors.
 //!
-//! The CLI has over a thousand print sites, so this is handled once, at the
-//! two places a failed write can leave the process: the panic hook, for the
-//! `print!` family, and the top of `main`, for an `io::Error` that came back
-//! through `?`. This module decides; `main.rs`, the process boundary, holds
-//! the hook and performs the exits.
+//! The rule is that a reader going away changes what a command prints and
+//! never what it does. The CLI has over a thousand print sites, so the four
+//! macros are redefined once for the whole crate, here, and `main.rs` imports
+//! the same definitions. Each one writes through [`print_stdout`] or
+//! [`print_stderr`]: the first write that meets a closed pipe marks that
+//! stream gone, every later write to it is skipped before it reaches the OS,
+//! and the command runs to its end and exits with the status its work earned.
+//! On Unix the first `EPIPE` also points the descriptor at `/dev/null`, so a
+//! print in a crate this one calls into, a library writing its own
+//! diagnostics, or a child process that inherits the stream finds a sink where
+//! the pipe was instead of the same `EPIPE`. A write that fails for any other
+//! reason is still the panic std would have raised, with std's own message, so
+//! a full disk under `kin log > file` is reported exactly as before.
 //!
-//! Which stream broke decides the status. stdout carries a command's result
-//! and is written once the work is done, so a reader that stopped taking it
-//! has everything it wanted and the command exits 0. stderr carries progress
-//! and warnings while the work is still running, so a reader gone there cut
-//! the command off before its result, and the exit says so with the status a
-//! shell reports for a process `SIGPIPE` ended. `kin commit 2>&1 | head -3`
-//! shows why the two must differ. On a cold daemon, head closes after the
-//! startup lines and the next progress write fails before the commit request
-//! is sent, so nothing was recorded; on a warm daemon the same pipeline fails
-//! on the summary line, after the change is in authority. Both exited 101
-//! before. Now the first exits 141 and the second exits 0, and a caller keying
-//! on the code reads each one right.
+//! `kin init 2>&1 | head -1` is the case that fixed the design. Both streams
+//! are one pipe that closes after one line, and init's contract, pinned in
+//! `tests/init_non_tty_output.rs`, is that its status reports the admission
+//! and not the pipe: progress is advisory, the admission is not. An earlier
+//! shape of this module ended the process from a panic hook on the first
+//! failed print, 0 for stdout and 141 for stderr. That stopped init at a
+//! progress line with its store half written and reported 141 for an
+//! admission that had every right to finish, and because the hook ran before
+//! the unwind it also defeated the task boundary init keeps around its own
+//! advisory writes. A cut reader is never a reason to report a failed
+//! admission, and never a reason to report a successful one that did not
+//! happen; the only way to satisfy both is to keep working.
+//!
+//! One write can still end a command early: an `io::Error` of kind
+//! `BrokenPipe` that reached `main` through `?` from a write this module did
+//! not make. [`exit_status`] answers that with [`CUT_OFF_STATUS`], 141, the
+//! status a shell reports for a process `SIGPIPE` ended and the status this
+//! process would have had under the default disposition, and prints nothing,
+//! because the command stopped at that write and everything after it did not
+//! run. 141 cannot be read as success of work that never happened, which is
+//! what makes ending early acceptable there; 0 could be, which is why this
+//! module's own writes never end anything.
 //!
 //! Resetting `SIGPIPE` to its default disposition would have been one line and
 //! was rejected. The daemon transport is a socket, std sets `SO_NOSIGPIPE`
@@ -41,7 +59,9 @@
 //! instead of returning the error `kin commit` reads to find out whether its
 //! change landed anyway.
 
+use std::fmt;
 use std::io::{self, Write as _};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The status a shell reports for a process that `SIGPIPE` ended, 128 + 13,
 /// and the status this process would have had under the default disposition.
@@ -49,159 +69,335 @@ use std::io::{self, Write as _};
 /// command failed", which is exactly the news.
 pub const CUT_OFF_STATUS: i32 = 141;
 
-#[cfg(unix)]
-const BROKEN_PIPE_OS_ERRORS: &[i32] = &[libc::EPIPE];
-/// `ERROR_BROKEN_PIPE` and `ERROR_NO_DATA`: the two codes a write into a pipe
-/// the other side has closed comes back with, and the two std decodes to
-/// `ErrorKind::BrokenPipe`.
-#[cfg(windows)]
-const BROKEN_PIPE_OS_ERRORS: &[i32] = &[109, 232];
+/// Set by the first write to meet a closed pipe on each stream, and read
+/// before every write after it.
+static STDOUT_GONE: AtomicBool = AtomicBool::new(false);
+static STDERR_GONE: AtomicBool = AtomicBool::new(false);
 
-/// The status a panic earns when it is a std print into a closed pipe, for
-/// the hook `main` installs; `None` for every other panic, which the hook
-/// hands on to the one that was installed before it, so a real panic still
-/// prints its message and still exits 101.
-pub fn exit_status_for_panic(info: &std::panic::PanicHookInfo<'_>) -> Option<i32> {
-    let payload = info.payload();
-    let message = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())?;
-    exit_status_for_print_failure(message)
+/// `print!` for this crate: std's arguments, written through [`print_stdout`].
+///
+/// `#[macro_export]` places the four macros at the crate root so `main.rs`
+/// imports them by name, and `#[macro_use]` on this module in `lib.rs` puts
+/// them in textual scope for every module declared after it, which is why the
+/// module is declared first there. A print site in this crate that reached
+/// std's macro instead would panic on a closed pipe exactly as before.
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::broken_pipe::print_stdout(::std::format_args!($($arg)*))
+    };
 }
 
-/// The status a failed std print earns, when the failure is a closed pipe.
+/// `println!` for this crate; see [`print!`].
+#[macro_export]
+macro_rules! println {
+    () => {
+        $crate::broken_pipe::print_stdout(::std::format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::broken_pipe::print_stdout(::std::format_args!(
+            "{}\n",
+            ::std::format_args!($($arg)*)
+        ))
+    };
+}
+
+/// `eprint!` for this crate; see [`print!`].
+#[macro_export]
+macro_rules! eprint {
+    ($($arg:tt)*) => {
+        $crate::broken_pipe::print_stderr(::std::format_args!($($arg)*))
+    };
+}
+
+/// `eprintln!` for this crate; see [`print!`].
+#[macro_export]
+macro_rules! eprintln {
+    () => {
+        $crate::broken_pipe::print_stderr(::std::format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::broken_pipe::print_stderr(::std::format_args!(
+            "{}\n",
+            ::std::format_args!($($arg)*)
+        ))
+    };
+}
+
+/// Write one formatted print to stdout, tolerating a reader that has gone.
 ///
-/// std's `print_to` panics with `failed printing to {stream}: {error}` and
-/// nothing else carries the stream, so the message is the evidence. The error
-/// half is compared against what the OS itself says for a broken pipe, built
-/// here rather than written down, so the check holds on every platform and in
-/// every locale the process runs in. A print that failed for any other reason
-/// is still a panic.
-pub fn exit_status_for_print_failure(message: &str) -> Option<i32> {
-    let descriptions = broken_pipe_descriptions();
-    for (stream, status) in [("stdout", 0), ("stderr", CUT_OFF_STATUS)] {
-        let Some(error) = message.strip_prefix(&format!("failed printing to {stream}: ")) else {
-            continue;
-        };
-        if descriptions.iter().any(|description| description == error) {
-            return Some(status);
-        }
+/// Under this crate's own unit tests the write goes to std's macro instead, so
+/// libtest's per-test capture keeps working; the sink is exercised through the
+/// fake streams in this module's tests and through the real binary in
+/// `tests/cli_broken_pipe.rs` and `tests/commit_broken_pipe_exit.rs`. The
+/// switch is a runtime `cfg!` rather than a `#[cfg]` so both arms compile in
+/// every build and the test build carries no unreferenced sink.
+#[doc(hidden)]
+pub fn print_stdout(args: fmt::Arguments<'_>) {
+    if cfg!(test) {
+        std::print!("{args}");
+        return;
     }
-    None
+    write_through(
+        &STDOUT_GONE,
+        "stdout",
+        || io::stdout().lock(),
+        |out| out.write_fmt(args),
+        stdout_reader_gone,
+    );
 }
 
-fn broken_pipe_descriptions() -> Vec<String> {
-    BROKEN_PIPE_OS_ERRORS
-        .iter()
-        .map(|code| io::Error::from_raw_os_error(*code).to_string())
-        .collect()
+/// Write one formatted print to stderr, tolerating a reader that has gone.
+#[doc(hidden)]
+pub fn print_stderr(args: fmt::Arguments<'_>) {
+    if cfg!(test) {
+        std::eprint!("{args}");
+        return;
+    }
+    write_through(
+        &STDERR_GONE,
+        "stderr",
+        || io::stderr().lock(),
+        |err| err.write_fmt(args),
+        stderr_reader_gone,
+    );
 }
 
-/// The status an error that reached `main` earns when it is a closed pipe.
+/// Write a result that was rendered whole to stdout, tolerating a reader that
+/// has gone.
 ///
-/// `Some(0)` for an `io::Error` of kind `BrokenPipe` that is the error itself,
-/// under however many layers of context were added on the way up: that is
-/// what a write to stdout returns through `?`, and the CLI's stderr writes go
-/// through `eprint!`, which panics rather than returns. The error's source
-/// chain is deliberately not walked. A daemon request that failed carries an
-/// io error underneath its transport error, and a commit whose reply was lost
-/// must stay an error the caller can read, never a quiet success.
-pub fn broken_pipe_exit_status(error: &anyhow::Error) -> Option<i32> {
+/// For a command whose output is its work, such as `kin completions`: a reader
+/// that took one line of it and left has what it wanted, and the command ends
+/// as it would have had the reader stayed.
+pub fn write_stdout(bytes: &[u8]) {
+    write_through(
+        &STDOUT_GONE,
+        "stdout",
+        || io::stdout().lock(),
+        |out| out.write_all(bytes).and_then(|()| out.flush()),
+        stdout_reader_gone,
+    );
+}
+
+/// Perform one write to a stream this module guards.
+///
+/// The stream is skipped outright once its reader is known to be gone. The
+/// first write to meet a closed pipe marks it so and runs `on_gone` exactly
+/// once, and the caller carries on as if the write had landed. Any other
+/// failure is the panic std raises for a failed print, with std's own message,
+/// so nothing about a full disk or a bad descriptor changes here.
+///
+/// Generic over the writer, and handed the flag and the redirect as arguments,
+/// so the unit tests below drive every arm against a fake stream without
+/// touching the process's own.
+fn write_through<W: io::Write>(
+    gone: &AtomicBool,
+    label: &str,
+    open: impl FnOnce() -> W,
+    write: impl FnOnce(&mut W) -> io::Result<()>,
+    on_gone: impl FnOnce(),
+) {
+    if gone.load(Ordering::Acquire) {
+        return;
+    }
+    let mut writer = open();
+    match write(&mut writer) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+            if !gone.swap(true, Ordering::AcqRel) {
+                on_gone();
+            }
+        }
+        Err(error) => panic!("failed printing to {label}: {error}"),
+    }
+}
+
+/// What happens to stdout once its reader is known to be gone.
+fn stdout_reader_gone() {
+    #[cfg(unix)]
+    redirect_to_dev_null(libc::STDOUT_FILENO);
+}
+
+/// What happens to stderr once its reader is known to be gone.
+fn stderr_reader_gone() {
+    #[cfg(unix)]
+    redirect_to_dev_null(libc::STDERR_FILENO);
+}
+
+/// Point a standard stream whose reader has gone at `/dev/null`.
+///
+/// This module's own writes already stop at the flag. The redirect is for
+/// everything else that writes the same descriptor: a `println!` in a crate
+/// this one calls into, a library that writes its own diagnostics, and a child
+/// process that inherits the stream and would otherwise die of `SIGPIPE` or
+/// meet the same `EPIPE`. A failure leaves the descriptor as it was, which is
+/// no worse than before this ran.
+#[cfg(unix)]
+fn redirect_to_dev_null(fd: libc::c_int) {
+    // SAFETY: plain libc calls on descriptors this process owns. `open`
+    // returns a fresh descriptor or -1, `dup2` replaces one of the two
+    // standard descriptors with it, and the fresh one is closed again. The
+    // path is a NUL-terminated literal and no pointer outlives the call.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if null < 0 {
+            return;
+        }
+        libc::dup2(null, fd);
+        libc::close(null);
+    }
+}
+
+/// The status `main` ends with when the command returned an error, and the
+/// report that goes with it.
+///
+/// An `io::Error` of kind `BrokenPipe` that is the error itself, under however
+/// many layers of context were added on the way up, is a write this module did
+/// not make meeting a reader that had gone. The command stopped at that write,
+/// so the status is [`CUT_OFF_STATUS`] and nothing is printed: the one stream
+/// that might still be open would only be told that the other one closed. The
+/// error's source chain is deliberately not walked. A daemon request that
+/// failed carries an io error underneath its transport error, and a commit
+/// whose reply was lost must stay an error the caller can read, never a cut
+/// reader.
+///
+/// Every other error is rendered the way std renders a `main` that returns
+/// `Err`, `Error: {err:?}`, through [`print_stderr`], so a refusal nobody
+/// reads any more still exits 1 rather than becoming a second broken-pipe
+/// panic.
+pub fn exit_status(error: &anyhow::Error) -> i32 {
+    if is_cut_off(error) {
+        return CUT_OFF_STATUS;
+    }
+    print_stderr(format_args!("Error: {error:?}\n"));
+    1
+}
+
+fn is_cut_off(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<io::Error>()
-        .filter(|error| error.kind() == io::ErrorKind::BrokenPipe)
-        .map(|_| 0)
-}
-
-/// Report the error a `main` is about to exit 1 on, the way std would have.
-///
-/// A `main` that returns `Err` prints `Error: {err:?}` through `eprintln!`, so
-/// a refusal whose stderr nobody reads any more was a second broken-pipe
-/// panic and exit 101 in place of exit 1. The rendering here is the same and
-/// the write's failure is dropped, so the exit status stays the refusal's own.
-pub fn report_error(error: &anyhow::Error) {
-    let _ = writeln!(io::stderr().lock(), "Error: {error:?}");
+        .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
-    /// Exactly what std's `print_to` formats for a broken pipe on this host.
-    fn print_failure(stream: &str) -> String {
-        format!(
-            "failed printing to {stream}: {}",
-            io::Error::from_raw_os_error(BROKEN_PIPE_OS_ERRORS[0])
-        )
+    /// A stream whose reader has gone: every write is `EPIPE`.
+    struct ClosedPipe;
+
+    impl io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
-    #[test]
-    fn every_listed_os_error_decodes_to_a_broken_pipe() {
-        for code in BROKEN_PIPE_OS_ERRORS {
-            assert_eq!(
-                io::Error::from_raw_os_error(*code).kind(),
-                io::ErrorKind::BrokenPipe,
-                "os error {code}"
-            );
+    /// A stream that fails for a reason that is not the reader leaving.
+    struct FullDisk;
+
+    impl io::Write for FullDisk {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("the disk is full"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
     #[test]
-    fn a_print_into_a_closed_stdout_is_a_clean_exit() {
-        assert_eq!(
-            exit_status_for_print_failure(&print_failure("stdout")),
-            Some(0)
+    fn the_first_write_into_a_closed_pipe_marks_the_stream_gone_and_redirects_once() {
+        let gone = AtomicBool::new(false);
+        let redirects = Cell::new(0);
+        let opened = Cell::new(0);
+        let open = || {
+            opened.set(opened.get() + 1);
+            ClosedPipe
+        };
+
+        write_through(
+            &gone,
+            "stdout",
+            open,
+            |out| out.write_all(b"first"),
+            || redirects.set(redirects.get() + 1),
         );
+        assert!(
+            gone.load(Ordering::Acquire),
+            "the write that met the closed pipe must mark the stream gone"
+        );
+        assert_eq!(redirects.get(), 1, "the redirect runs on that first write");
+        assert_eq!(opened.get(), 1);
+
+        // The reader is known to be gone, so the stream is not even opened.
+        write_through(
+            &gone,
+            "stdout",
+            open,
+            |out| out.write_all(b"second"),
+            || redirects.set(redirects.get() + 1),
+        );
+        assert_eq!(opened.get(), 1, "a later write skips the stream entirely");
+        assert_eq!(redirects.get(), 1, "and the redirect runs once per stream");
     }
 
     #[test]
-    fn a_print_into_a_closed_stderr_is_the_cut_off_status() {
-        assert_eq!(
-            exit_status_for_print_failure(&print_failure("stderr")),
-            Some(CUT_OFF_STATUS)
+    fn a_write_that_landed_leaves_the_stream_in_use() {
+        let gone = AtomicBool::new(false);
+        let mut sink = Vec::new();
+        let redirected = Cell::new(false);
+        write_through(
+            &gone,
+            "stdout",
+            || &mut sink,
+            |out| out.write_all(b"the result\n"),
+            || redirected.set(true),
         );
+        assert_eq!(sink, b"the result\n");
+        assert!(!gone.load(Ordering::Acquire));
+        assert!(!redirected.get());
     }
 
     #[test]
-    fn a_print_that_failed_for_any_other_reason_stays_a_panic() {
-        // Code 2 is ENOENT on Unix and ERROR_FILE_NOT_FOUND on Windows, so this
-        // is a real OS message on both and a broken pipe on neither.
-        let other = format!(
-            "failed printing to stdout: {}",
-            io::Error::from_raw_os_error(2)
+    fn a_write_that_failed_for_any_other_reason_is_still_a_panic() {
+        let gone = AtomicBool::new(false);
+        let redirected = Cell::new(false);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_through(
+                &gone,
+                "stdout",
+                || FullDisk,
+                |out| out.write_all(b"the result\n"),
+                || redirected.set(true),
+            );
+        }));
+        let payload = outcome.expect_err("a full disk is still a failed print");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("the panic carries std's own message");
+        assert_eq!(message, "failed printing to stdout: the disk is full");
+        assert!(
+            !gone.load(Ordering::Acquire),
+            "only a closed pipe marks a stream gone"
         );
-        assert_eq!(exit_status_for_print_failure(&other), None);
-        // The kind's own description, which std never prints for a stdout
-        // write, is not accepted in place of the OS message.
-        assert_eq!(
-            exit_status_for_print_failure("failed printing to stdout: broken pipe"),
-            None
-        );
-        assert_eq!(
-            exit_status_for_print_failure("index out of bounds: the len is 1 but the index is 1"),
-            None
-        );
-        // A library's own write panic carries the stream nowhere and is not
-        // read as one either; the completions arm renders into memory for
-        // exactly this reason.
-        let foreign = format!(
-            "failed to write completion file: {:?}",
-            io::Error::from_raw_os_error(BROKEN_PIPE_OS_ERRORS[0])
-        );
-        assert_eq!(exit_status_for_print_failure(&foreign), None);
+        assert!(!redirected.get());
     }
 
     #[test]
-    fn a_broken_pipe_that_reached_main_as_itself_is_a_clean_exit() {
+    fn a_broken_pipe_that_reached_main_as_itself_is_cut_off_not_a_success() {
         let bare: anyhow::Error = io::Error::from(io::ErrorKind::BrokenPipe).into();
-        assert_eq!(broken_pipe_exit_status(&bare), Some(0));
+        assert_eq!(exit_status(&bare), CUT_OFF_STATUS);
         let wrapped = anyhow::Error::from(io::Error::from(io::ErrorKind::BrokenPipe))
             .context("write the change log")
             .context("kin log");
-        assert_eq!(broken_pipe_exit_status(&wrapped), Some(0));
+        assert_eq!(exit_status(&wrapped), CUT_OFF_STATUS);
         let other: anyhow::Error = io::Error::from(io::ErrorKind::NotFound).into();
-        assert_eq!(broken_pipe_exit_status(&other), None);
+        assert_eq!(exit_status(&other), 1);
     }
 
     /// A transport error shaped like reqwest's: its own message, with the io
@@ -229,9 +425,9 @@ mod tests {
             source: io::Error::from(io::ErrorKind::BrokenPipe),
         })
         .context("send daemon-owned native commit request");
-        assert_eq!(broken_pipe_exit_status(&error), None);
+        assert_eq!(exit_status(&error), 1);
         // The control: the chain does carry the broken pipe, so a walk down
-        // it would have answered 0, and this test would then be passing on
+        // it would have answered 141, and this test would then be passing on
         // an error that never had one.
         assert!(error.chain().any(|cause| cause
             .downcast_ref::<io::Error>()

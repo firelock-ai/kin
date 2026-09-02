@@ -8,12 +8,13 @@
 //! `thread 'main' panicked at ... failed printing to stdout: Broken pipe (os
 //! error 32)` and exit 101, while the same command into a file exited 0 with
 //! all 135 lines, so the output was right and only the exit was wrong. The
-//! panic is std's, the CLI has over a thousand print sites, and the fix lives
-//! at the process boundary, so these drive the binary itself through a pipe
-//! whose reader is gone: once with no store at all, for the two exit paths the
-//! boundary handles, and once against a daemon for the commands the report
-//! named. Every pipe arm has the file arm beside it as the control that the
-//! output still flows when the reader stays.
+//! panic is std's, the CLI has over a thousand print sites, and the fix is the
+//! crate's own `print!` family, which marks a stream gone on its first
+//! closed-pipe write and skips it after, so these drive the binary itself
+//! through a pipe whose reader is gone: once with no store at all, for the
+//! print path and for a result written whole, and once against a daemon for
+//! the commands the report named. Every pipe arm has the file arm beside it as
+//! the control that the output still flows when the reader stays.
 
 use serde_json::Value;
 use std::fs;
@@ -127,8 +128,9 @@ fn assert_full_output(args: &[&str], output: &Output) {
 /// through `println!`, so its first write is the one that meets the closed
 /// pipe and std's print panic is the thing under test.
 ///
-/// Falsify by removing `install_exit_hook()` from `main`: the pipe arm then
-/// exits 101 with `panicked at` on stderr, and the file arm stays green.
+/// Falsify by making the sink raise std's own panic on a closed pipe instead
+/// of marking the stream gone: the pipe arm then exits 101 with `panicked at`
+/// on stderr, and the file arm stays green.
 #[test]
 fn a_print_into_a_pipe_nobody_reads_exits_zero_without_a_panic() {
     let root = tempdir().expect("temp root");
@@ -144,18 +146,18 @@ fn a_print_into_a_pipe_nobody_reads_exits_zero_without_a_panic() {
     assert_full_output(&args, &run_into_files(&runtime, &repo, &args));
 }
 
-/// The `?` path: a reader that takes one line of a script larger than the pipe
-/// can hold, which is `| head -1` exactly.
+/// A result written whole: a reader that takes one line of a script larger
+/// than the pipe can hold, which is `| head -1` exactly.
 ///
 /// `kin completions zsh` is thousands of lines, so once the reader has its
 /// line and leaves, the child is blocked in a write the kernel then fails.
-/// The completion script is written through `io::Write`, whose error comes
-/// back through `?` to the top of `main`, so this is the other exit path.
+/// The script is rendered into memory and written through the crate's own
+/// tolerant write rather than by clap_complete, so this is the path a whole
+/// result takes.
 ///
 /// Falsify by handing `clap_complete::generate` stdout directly again: its own
-/// `failed to write completion file` panic names no stream, the hook lets it
-/// through, and the arm reads 101. Or by returning the error from `main`
-/// instead of ending on it: the arm then reads exit 1 and an `Error:` line.
+/// `failed to write completion file` panic is a panic like any other, and the
+/// arm reads 101.
 #[test]
 fn a_reader_that_leaves_after_one_line_of_completions_gets_a_clean_exit() {
     let root = tempdir().expect("temp root");
@@ -231,8 +233,8 @@ fn initialize(runtime: &IsolatedDaemonRuntime, repo: &Path) {
 /// One store and one daemon for all of them, because the pipe is the subject
 /// and the store is only there so every command has something to print.
 ///
-/// Falsify by removing `install_exit_hook()` from `main`: every pipe arm then
-/// reads 101, and every file arm stays green.
+/// Falsify by making the sink raise std's own panic on a closed pipe: every
+/// pipe arm then reads 101, and every file arm stays green.
 #[test]
 fn every_repository_command_survives_a_reader_that_is_gone() {
     let root = tempdir().expect("temp root");

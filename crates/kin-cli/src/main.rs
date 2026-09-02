@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{self, Shell};
 use kin_cli::commands;
+use kin_cli::{eprintln, println};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tracing::Instrument;
@@ -2590,34 +2591,23 @@ fn parse_cli_or_report_retired_command() -> Cli {
     }
 }
 
-/// The process entry. The closed-pipe exit is installed before anything can
-/// print, and the outcome of [`run`] becomes an exit status in one place, so a
-/// refusal is reported the same way whether or not anyone still reads stderr.
-/// `kin_cli::broken_pipe` decides every status here; this is the process
-/// boundary, so it is where the exits happen.
+/// The process entry. The outcome of [`run`] becomes an exit status in one
+/// place, so a refusal is reported the same way whether or not anyone still
+/// reads stderr, and the `println!` and `eprintln!` this file imports from
+/// `kin_cli` are the ones that tolerate a reader going away, so nothing here
+/// ends early because a pipe closed. Two cases, told apart by the status. A
+/// command that ran to its end exits 0, or its own error status, whatever
+/// happened to its streams on the way, because its work is done and the
+/// status reports the work. A command that stopped at a write outside those
+/// macros, an `io::Error` of kind `BrokenPipe` that came back through `?`,
+/// exits 141: its work after that write never ran, and 141 is a status nobody
+/// can read as success of work that never happened. `kin_cli::broken_pipe`
+/// decides the status; this is the process boundary, so it is where the exit
+/// happens.
 fn main() {
-    install_exit_on_broken_pipe();
     if let Err(error) = run() {
-        let status = kin_cli::broken_pipe::broken_pipe_exit_status(&error).unwrap_or_else(|| {
-            kin_cli::broken_pipe::report_error(&error);
-            1
-        });
-        std::process::exit(status);
+        std::process::exit(kin_cli::broken_pipe::exit_status(&error));
     }
-}
-
-/// Install the hook that turns a print into a closed pipe into an exit.
-///
-/// Every other panic reaches the hook that was installed before this one, so
-/// a real panic still prints its message and still exits 101.
-fn install_exit_on_broken_pipe() {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if let Some(status) = kin_cli::broken_pipe::exit_status_for_panic(info) {
-            std::process::exit(status);
-        }
-        previous(info);
-    }));
 }
 
 fn run() -> Result<()> {
@@ -3756,15 +3746,13 @@ fn run() -> Result<()> {
                     // Rendered into memory and written from here. clap_complete
                     // writes straight into the sink it is handed and turns a
                     // failed write into a panic of its own, `failed to write
-                    // completion file`, which names no stream and so cannot be
-                    // read as a closed pipe by the exit hook. The write below
-                    // is the one that meets the pipe, and its error comes back
-                    // as the io error the top of `main` ends on.
+                    // completion file`, so the write that can meet a closed
+                    // pipe has to be one this crate makes: a reader that takes
+                    // one line of the script and leaves gets the same clean
+                    // exit as one that takes it all.
                     let mut script = Vec::new();
                     clap_complete::generate(shell, &mut Cli::command(), "kin", &mut script);
-                    let mut stdout = std::io::stdout().lock();
-                    std::io::Write::write_all(&mut stdout, &script)?;
-                    std::io::Write::flush(&mut stdout)?;
+                    kin_cli::broken_pipe::write_stdout(&script);
                     Ok(())
                 }
                 Command::Update {
