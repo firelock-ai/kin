@@ -18,6 +18,14 @@
 //! and `context-bench` profiles, whose payload bytes are part of a citable
 //! result and must not move because a description was rewritten.
 //!
+//! Measured the same way afterwards, with the acceptance exception below in
+//! place, the served profile is 33,464 bytes over 21 tools: 6,188 characters of
+//! description and 27,276 bytes of input schema. The descriptions are where the
+//! win is, 6,188 against 47,739. The schemas keep most of their bytes on
+//! purpose, because a property the shipped proofs or the acceptance suite grade
+//! has to stay advertised; [`schema_keep_lists`] names that exception and the
+//! checks that own it.
+//!
 //! Every short form answers two questions in one or two sentences: when to call
 //! this, and what comes back. Where two tools are easy to confuse, the one a
 //! caller reaches for by mistake names the other.
