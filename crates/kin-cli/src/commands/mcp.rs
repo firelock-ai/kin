@@ -83,6 +83,7 @@ pub async fn start(
                 .collect::<HashSet<_>>(),
         );
     }
+    config.compact_tool_descriptions = resolved_profile.profile.wants_compact_descriptions();
 
     let startup = kin_mcp::StartupDaemonBinding::new();
 
@@ -262,6 +263,17 @@ impl McpToolProfile {
             Self::ContextBench => Some(kin_mcp::context_bench_tool_names()),
             Self::Full => None,
         }
+    }
+
+    /// Whether this profile serves the short descriptions and trimmed input
+    /// schemas rather than the registered long forms.
+    ///
+    /// `agent-default` only. `full` is the whole documented surface by
+    /// definition. `benchmark` and `context-bench` keep the long forms because
+    /// their `tools/list` bytes are an input to a citable result, and a
+    /// benchmark number must not move because a description was rewritten.
+    pub(crate) fn wants_compact_descriptions(self) -> bool {
+        matches!(self, Self::AgentDefault)
     }
 
     pub(crate) fn token(self) -> &'static str {

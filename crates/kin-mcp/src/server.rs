@@ -35,6 +35,14 @@ pub struct McpServerConfig {
     /// Product daemon mode dispatches inside the daemon and supplies its own
     /// retained binding; it never populates this stdio-side field.
     pub repository_authority: Option<RequestRepositoryAuthority>,
+    /// Serve the short `agent-default` descriptions and trimmed schemas rather
+    /// than the registered long forms.
+    ///
+    /// Separate from `allowed_tools` because three profiles filter and only one
+    /// of them wants this. `benchmark` and `context-bench` keep the long forms
+    /// deliberately: their `tools/list` bytes are an input to a citable result,
+    /// and a benchmark number must not move because a description was rewritten.
+    pub compact_tool_descriptions: bool,
 }
 
 /// How the stdio server should present session authority.
@@ -65,6 +73,7 @@ impl Default for McpServerConfig {
             session_authority_mode: SessionAuthorityMode::DaemonRequired,
             snapshot_path: None,
             repository_authority: None,
+            compact_tool_descriptions: false,
         }
     }
 }
@@ -1125,6 +1134,14 @@ fn handle_tools_list(id: Option<serde_json::Value>, config: &McpServerConfig) ->
         // is the one place the served set is known.
         crate::tools::annotate_unserved_cross_references(&mut tools, &registered, allowed);
     }
+    // After the filter and the annotation, so the short forms are the last word
+    // and cannot be re-lengthened by a note computed from the long ones. The
+    // annotation is a no-op on this profile anyway, because a short form names
+    // only tools the profile serves, but the ORDER is what guarantees that
+    // rather than the current wording.
+    if config.compact_tool_descriptions {
+        crate::agent_belt::compact_for_agent_default(&mut tools);
+    }
     JsonRpcResponse::success(id, serde_json::to_value(&tools).unwrap_or_default())
 }
 
@@ -1135,12 +1152,19 @@ async fn handle_tools_call<G: PersistableMcpStore>(
     sessions: &SessionRegistry,
     config: &McpServerConfig,
 ) -> JsonRpcResponse {
-    let call_params: ToolCallParams = match serde_json::from_value(params.clone()) {
+    let mut call_params: ToolCallParams = match serde_json::from_value(params.clone()) {
         Ok(p) => p,
         Err(e) => {
             return JsonRpcResponse::error(id, -32602, format!("Invalid params: {}", e));
         }
     };
+    // Resolve the served name to the registered one here, once, before anything
+    // keyed on a tool name reads it: the profile filter below, the dispatcher,
+    // the response-budget shape, the negative-evidence spec and the envelope.
+    // `agent-default` serves the declaration filter as `find_declarations`
+    // because `semantic_search` does not search semantically; everything
+    // internal stays keyed on the registered name.
+    crate::agent_belt::canonicalize_tool_name(&mut call_params.name);
     let budget = ResponseBudget::from_arguments(&call_params.arguments);
 
     if let Some(allowed) = &config.allowed_tools {
@@ -1232,12 +1256,19 @@ async fn handle_tools_call_daemon(
     params: &serde_json::Value,
     config: &McpServerConfig,
 ) -> JsonRpcResponse {
-    let call_params: ToolCallParams = match serde_json::from_value(params.clone()) {
+    let mut call_params: ToolCallParams = match serde_json::from_value(params.clone()) {
         Ok(p) => p,
         Err(e) => {
             return JsonRpcResponse::error(id, -32602, format!("Invalid params: {}", e));
         }
     };
+    // Resolve the served name to the registered one here, once, before anything
+    // keyed on a tool name reads it: the profile filter below, the dispatcher,
+    // the response-budget shape, the negative-evidence spec and the envelope.
+    // `agent-default` serves the declaration filter as `find_declarations`
+    // because `semantic_search` does not search semantically; everything
+    // internal stays keyed on the registered name.
+    crate::agent_belt::canonicalize_tool_name(&mut call_params.name);
     let budget = ResponseBudget::from_arguments(&call_params.arguments);
 
     if let Some(allowed) = &config.allowed_tools {
