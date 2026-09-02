@@ -1038,7 +1038,12 @@ class HeadAdmissionTests(unittest.TestCase):
                     require_open=True,
                 )
 
-    def test_rejects_attested_base_that_is_not_the_current_pull_base(self) -> None:
+    def test_accepts_a_descendant_pull_base_and_rejects_an_unrelated_one(self) -> None:
+        # The pull base is main's tip at the pull's last push, so it moves past
+        # the attested base whenever a lane lands between the receiver's
+        # checkout and its push. Protected main at or after the attested base
+        # is what the attestation needs; a base the attested base does not
+        # reach descends from something else.
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             base = initialize_repo(repo)
@@ -1048,8 +1053,27 @@ class HeadAdmissionTests(unittest.TestCase):
             (repo / "README.md").write_text("advanced\n", encoding="utf-8")
             run_git(repo, "add", "README.md")
             run_git(repo, "commit", "-q", "-m", "advance main")
-            current_base = run_git(repo, "rev-parse", "HEAD")
-            with self.assertRaisesRegex(head_guard.AdmissionError, "not current"):
+            advanced_base = run_git(repo, "rev-parse", "HEAD")
+            evidence = head_guard.validate_attestation(
+                repo,
+                head_guard.EXPECTED_REPOSITORY,
+                77,
+                head,
+                reviews,
+                comments,
+                expected_base=advanced_base,
+            )
+            self.assertEqual(evidence.base, base)
+            run_git(repo, "switch", "-q", "--orphan", "unrelated")
+            (repo / "Cargo.toml").write_text(manifest(), encoding="utf-8")
+            (repo / "Cargo.lock").write_text(
+                "version = 4\nkin-db 0.7.67\n", encoding="utf-8"
+            )
+            (repo / "README.md").write_text("unrelated\n", encoding="utf-8")
+            run_git(repo, "add", "-A")
+            run_git(repo, "commit", "-q", "-m", "unrelated root")
+            unrelated_base = run_git(repo, "rev-parse", "HEAD")
+            with self.assertRaisesRegex(head_guard.AdmissionError, "not an ancestor"):
                 head_guard.validate_attestation(
                     repo,
                     head_guard.EXPECTED_REPOSITORY,
@@ -1057,7 +1081,7 @@ class HeadAdmissionTests(unittest.TestCase):
                     head,
                     reviews,
                     comments,
-                    expected_base=current_base,
+                    expected_base=unrelated_base,
                 )
 
     def test_rejects_server_side_auto_merge(self) -> None:
@@ -1519,6 +1543,76 @@ class PostCompletionAttesterTests(unittest.TestCase):
                 workflow_run=workflow_run_document(base),
             )
             self.assertEqual(evidence.head, head)
+
+    def test_attestation_survives_main_advancing_and_refuses_a_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _, result_file, base, head = self._changed(directory)
+            run = workflow_run_document(base)
+            event_file = Path(directory) / "event.json"
+            event_file.write_text(
+                json.dumps({"action": "completed", "workflow_run": run}),
+                encoding="utf-8",
+            )
+            pull = pull_document(head, base)
+            reviews, comments = attestation_documents(repo, base, head)
+            tip = "9" * 40
+
+            def fake(relation: str):
+                compare = {
+                    "status": relation,
+                    "ahead_by": 2 if relation == "ahead" else 1,
+                    "behind_by": 0 if relation == "ahead" else 1,
+                    "merge_base_commit": {"sha": base},
+                }
+
+                def answer(arguments: list[str]) -> object:
+                    endpoint = next(
+                        (item for item in arguments if item.startswith("repos/")), ""
+                    )
+                    if "/actions/runs/331/attempts/2" in endpoint:
+                        return run
+                    if endpoint.endswith("/git/ref/heads/main"):
+                        return {"object": {"sha": tip}}
+                    if endpoint.endswith(f"/compare/{base}...{tip}"):
+                        return compare
+                    if endpoint == f"repos/{head_guard.EXPECTED_REPOSITORY}/pulls/77":
+                        return pull
+                    if endpoint.endswith("/reviews?per_page=100"):
+                        return [reviews]
+                    if endpoint.endswith("/comments?per_page=100"):
+                        return [comments]
+                    raise AssertionError(f"unexpected mocked GitHub request: {arguments}")
+
+                return answer
+
+            with mock.patch.object(
+                attester, "gh_json", side_effect=fake("ahead")
+            ), mock.patch.object(
+                attester.guard, "gh_json", return_value=workflow_run_document(base)
+            ), self._live_graphql(head):
+                result = attester.validate_for_attestation(
+                    event_file=event_file,
+                    admission_file=result_file,
+                    workspace=repo,
+                    repository=attester.EXPECTED_REPOSITORY,
+                )
+            self.assertIs(result["changed"], True)
+            self.assertIs(result["needs_attestation"], False)
+
+            with mock.patch.object(
+                attester, "gh_json", side_effect=fake("diverged")
+            ), mock.patch.object(
+                attester.guard, "gh_json", return_value=workflow_run_document(base)
+            ), self._live_graphql(head):
+                with self.assertRaisesRegex(
+                    attester.AttesterError, "not protected main history"
+                ):
+                    attester.validate_for_attestation(
+                        event_file=event_file,
+                        admission_file=result_file,
+                        workspace=repo,
+                        repository=attester.EXPECTED_REPOSITORY,
+                    )
 
     def test_recheck_filters_irrelevant_same_sha_runs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2290,7 +2384,7 @@ class WorkflowContractTests(unittest.TestCase):
             "Clear inherited landing state before candidate handling",
             "Download the compiled data-only candidate",
             "Revalidate and apply only the admitted manifest bytes",
-            "Refuse protected-main movement before repository mutation",
+            "Refuse protected-main rewrite before repository mutation",
             "Open or update the dependency bump PR",
             "Clear and verify landing state on the generated PR",
             "Verify exact first-party generated PR",
@@ -2309,18 +2403,24 @@ class WorkflowContractTests(unittest.TestCase):
         resolve = step_block(self.workflow, "Bind preparation to the queued workflow policy")
         checkout = step_block(self.workflow, "Checkout exact queued protected main")
         mutation_fence = step_block(
-            self.workflow, "Refuse protected-main movement immediately before token mint"
+            self.workflow, "Refuse protected-main rewrite immediately before token mint"
         )
         admission = step_block(
             self.workflow, "Revalidate and apply only the admitted manifest bytes"
         )
         writer = step_block(self.workflow, "Open or update the dependency bump PR")
         verifier = step_block(self.workflow, "Verify exact first-party generated PR")
-        self.assertIn("base_sha=", resolve)
-        self.assertIn('!= "$GITHUB_SHA"', early_resolve)
-        self.assertIn('!= "$GITHUB_SHA"', resolve)
+        # Bound to github.sha and proven protected main history rather than
+        # equal to the live tip; scripts/test-kin-registry-wave-landing.py
+        # pins the proof itself.
+        self.assertIn("base_sha=$GITHUB_SHA", resolve)
+        history_call = "python3 scripts/verify-protected-main-history.py"
+        for block in (early_resolve, resolve):
+            self.assertIn(history_call, block)
+            self.assertIn('--policy-sha "$GITHUB_SHA"', block)
         self.assertIn("ref: ${{ github.sha }}", checkout)
-        self.assertIn('!= "$GITHUB_SHA"', mutation_fence)
+        self.assertIn(history_call, mutation_fence)
+        self.assertIn('--policy-sha "$ADMITTED_BASE"', mutation_fence)
         self.assertIn("kin-registry-wave-artifact.py apply", admission)
         self.assertIn("branch: ${{ env.WAVE_BRANCH }}", writer)
         self.assertIn("base: ${{ env.BASE_BRANCH }}", writer)

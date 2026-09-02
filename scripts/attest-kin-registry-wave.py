@@ -51,6 +51,10 @@ landing = _load(
     "kin_registry_wave_attester_landing",
     SCRIPT_DIR / "ensure-kin-registry-wave-no-automerge.py",
 )
+history = _load(
+    "kin_registry_wave_attester_history",
+    SCRIPT_DIR / "verify-protected-main-history.py",
+)
 
 
 def run_gh(arguments: Sequence[str]) -> str:
@@ -72,6 +76,47 @@ def gh_json(arguments: Sequence[str]) -> Any:
         return json.loads(run_gh(arguments))
     except json.JSONDecodeError as exc:
         raise AttesterError("GitHub returned malformed JSON") from exc
+
+
+def _history_fetch(endpoint: str) -> Any:
+    return gh_json(["api", endpoint])
+
+
+def _require_protected_history(repository: str, policy_sha: str) -> None:
+    """Refuse unless the receiver's policy sha is still protected main history.
+
+    Equality with the live tip was the old test, and it refused every
+    attestation that arrived while lanes were landing. What the attestation
+    needs is that the policy which produced the admission was main's own
+    history and has not been rewritten: an ancestor of the current tip.
+    """
+    try:
+        history.require_protected_history(
+            repository,
+            policy_sha,
+            branch=guard.EXPECTED_BASE,
+            fetch=_history_fetch,
+        )
+    except history.HistoryError as exc:
+        raise AttesterError(
+            f"receiver policy is not protected main history: {exc}"
+        ) from exc
+
+
+def _require_descendant_base(repository: str, admitted_base: str, pull_base: str) -> None:
+    """Refuse unless a pull base is protected main at or after the admitted base."""
+    try:
+        history.require_descendant(
+            repository,
+            admitted_base,
+            pull_base,
+            branch=guard.EXPECTED_BASE,
+            fetch=_history_fetch,
+        )
+    except history.HistoryError as exc:
+        raise AttesterError(
+            f"pull base is not protected main at or after the admitted base: {exc}"
+        ) from exc
 
 
 def _event(path: Path) -> dict[str, Any]:
@@ -310,12 +355,7 @@ def validate_live_admission(
     pull_number = int(admission["pull"])
     head = str(admission["head"])
     policy_sha = str(admission["policy_sha"])
-    current_ref = gh_json(
-        ["api", f"repos/{repository}/git/ref/heads/{guard.EXPECTED_BASE}"]
-    )
-    ref_object = current_ref.get("object") if isinstance(current_ref, dict) else None
-    if not isinstance(ref_object, dict) or ref_object.get("sha") != policy_sha:
-        raise AttesterError("protected main moved after the completed receiver")
+    _require_protected_history(repository, policy_sha)
 
     pull = gh_json(["api", f"repos/{repository}/pulls/{pull_number}"])
     try:
@@ -327,8 +367,7 @@ def validate_live_admission(
         )
     except guard.AdmissionError as exc:
         raise AttesterError(str(exc)) from exc
-    if pull_evidence.base != admission["base"]:
-        raise AttesterError("live pull base differs from the completed admission")
+    _require_descendant_base(repository, str(admission["base"]), pull_evidence.base)
 
     graphql_pull = landing._graphql_pull(repository, pull_number)
     try:
@@ -675,7 +714,7 @@ def _validate_recheck_pull(
         or head_repo.get("url") != repository_url
         or not isinstance(base, dict)
         or base.get("ref") != guard.EXPECTED_BASE
-        or base.get("sha") != admission["base"]
+        or not isinstance(base.get("sha"), str)
         or not isinstance(base_repo, dict)
         or base_repo.get("name") != repository_name
         or base_repo.get("url") != repository_url
@@ -683,6 +722,7 @@ def _validate_recheck_pull(
         raise AttesterError(
             "post-attestation CI run is not bound to the exact admitted pull"
         )
+    _require_descendant_base(repository, str(admission["base"]), str(base["sha"]))
 
 
 def _validate_recheck_job(
@@ -979,10 +1019,11 @@ def _exact_pull_state(
         or not isinstance(head.get("repo"), dict)
         or head["repo"].get("full_name") != repository
         or not isinstance(base, dict)
-        or base.get("sha") != admission["base"]
+        or not isinstance(base.get("sha"), str)
         or base.get("ref") != guard.EXPECTED_BASE
     ):
         raise AttesterError(f"pull {state} response differs from the exact admission")
+    _require_descendant_base(repository, str(admission["base"]), str(base["sha"]))
 
 
 def _reopen_pull(
