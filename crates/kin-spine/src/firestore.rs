@@ -88,6 +88,156 @@ const CLEANUP_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 #[cfg(feature = "firestore")]
 const FIRESTORE_MAX_WRITES_PER_COMMIT: usize = 100;
 
+/// Consulted before every transient retry of a Firestore request. The hosted
+/// daemon binds the lease its in-flight mutation runs under and re-reads it
+/// here, so a request that stalled long enough for the lease to expire or
+/// change hands is never retried under it. `Err` names the refusal and ends
+/// the retry with it.
+pub type TransientRetryGate = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// Where the Firestore REST calls go. `GoogleApis` is production. `Emulator`
+/// is a plain-HTTP base such as `http://127.0.0.1:8080`, the shape Google's
+/// own `FIRESTORE_EMULATOR_HOST` clients use: no metadata token is fetched and
+/// the fixed bearer `owner` is sent, which the emulator accepts and a real
+/// endpoint would reject. It is also what lets a test drive the real request
+/// paths against a scripted local server.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FirestoreEndpoint {
+    GoogleApis,
+    Emulator { base_url: String },
+}
+
+/// Attempts a transient Firestore failure gets in total, first try included,
+/// and the backoff before the first retry; each later retry doubles it. Named
+/// once here: 4 attempts, 250 ms, 500 ms, 1 s. A first hosted rollout is
+/// several hundred requests wide, and on 2026-09-02 one transport error on one
+/// read of `spine_repo_heads_v2` ended a rollout that had 96 s of lease left.
+#[cfg(feature = "firestore")]
+const FIRESTORE_TRANSIENT_ATTEMPTS: u32 = 4;
+#[cfg(feature = "firestore")]
+const FIRESTORE_TRANSIENT_BACKOFF_BASE: Duration = Duration::from_millis(250);
+
+/// One failed Firestore request, classified for retry.
+#[cfg(feature = "firestore")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FirestoreRequestFailure {
+    /// No response arrived: connect, reset, timeout, closed mid-message.
+    Transport(String),
+    /// A response with a non-success status and whatever body came with it.
+    Status { status: u16, body: String },
+    /// The retry gate refused; `after` is the failure it would have retried.
+    RetryRefused {
+        refusal: String,
+        after: Box<FirestoreRequestFailure>,
+    },
+}
+
+#[cfg(feature = "firestore")]
+impl FirestoreRequestFailure {
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::Transport(_) => true,
+            Self::Status { status, body } => transient_firestore_status(*status, body),
+            Self::RetryRefused { .. } => false,
+        }
+    }
+}
+
+#[cfg(feature = "firestore")]
+impl std::fmt::Display for FirestoreRequestFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(formatter, "failed: {error}"),
+            Self::Status { status, body } => {
+                let reason = reqwest::StatusCode::from_u16(*status)
+                    .ok()
+                    .and_then(|status| status.canonical_reason())
+                    .unwrap_or("");
+                write!(formatter, "failed ({status} {reason}): {body}")
+            }
+            Self::RetryRefused { refusal, after } => write!(
+                formatter,
+                "{after}; retry refused because the hosted lease could not be reasserted: {refusal}"
+            ),
+        }
+    }
+}
+
+/// Firestore names the gRPC code in the body's `error.status`, and that name
+/// is the classification: the HTTP status alone conflates ABORTED, which is
+/// contention and safe to retry, with ALREADY_EXISTS, which is a precondition
+/// verdict on a write that must not be repeated (both are 409). Only when the
+/// body carries no name does the HTTP status decide, and then 5xx and 429 are
+/// transient and everything else, 409 included, is not.
+#[cfg(feature = "firestore")]
+fn transient_firestore_status(status: u16, body: &str) -> bool {
+    match firestore_error_status(body) {
+        Some(code) => matches!(
+            code.as_str(),
+            "UNAVAILABLE"
+                | "DEADLINE_EXCEEDED"
+                | "ABORTED"
+                | "RESOURCE_EXHAUSTED"
+                | "INTERNAL"
+                | "UNKNOWN"
+        ),
+        None => (500..600).contains(&status) || status == 429,
+    }
+}
+
+#[cfg(feature = "firestore")]
+fn firestore_error_status(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .pointer("/error/status")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Run one Firestore request with the bounded transient policy. `attempt`
+/// performs the request; a transient failure is retried after the gate passes
+/// and the backoff elapses, up to `FIRESTORE_TRANSIENT_ATTEMPTS` in total, and
+/// every other failure returns at once. The last failure is returned when the
+/// budget runs out. `sleep` is a parameter so the policy can be exercised
+/// without waiting for it.
+#[cfg(feature = "firestore")]
+fn retry_transient<T>(
+    describe: &str,
+    gate: Option<&TransientRetryGate>,
+    mut sleep: impl FnMut(Duration),
+    mut attempt: impl FnMut() -> Result<T, FirestoreRequestFailure>,
+) -> Result<T, FirestoreRequestFailure> {
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let failure = match attempt() {
+            Ok(value) => return Ok(value),
+            Err(failure) if failure.is_transient() && attempts < FIRESTORE_TRANSIENT_ATTEMPTS => {
+                failure
+            }
+            Err(failure) => return Err(failure),
+        };
+        if let Some(gate) = gate {
+            if let Err(refusal) = gate() {
+                return Err(FirestoreRequestFailure::RetryRefused {
+                    refusal,
+                    after: Box::new(failure),
+                });
+            }
+        }
+        let backoff = FIRESTORE_TRANSIENT_BACKOFF_BASE * 2u32.pow(attempts - 1);
+        warn!(
+            request = describe,
+            attempt = attempts,
+            budget = FIRESTORE_TRANSIENT_ATTEMPTS,
+            backoff_ms = backoff.as_millis() as u64,
+            failure = %failure,
+            "transient Firestore failure; retrying after the hosted lease reasserted"
+        );
+        sleep(backoff);
+    }
+}
+
 #[cfg(feature = "firestore")]
 const FIRESTORE_MAX_COMMIT_JSON_BYTES: usize = 8 * 1024 * 1024;
 
@@ -550,7 +700,25 @@ impl FirestoreSpineBackend {
     /// `database_id`: Firestore database (typically "(default)").
     #[cfg(feature = "firestore")]
     pub fn new(project_id: String, database_id: Option<String>) -> Self {
-        Self::with_store(Arc::new(FirestoreStore::new(project_id, database_id)))
+        Self::new_with_endpoint(project_id, database_id, FirestoreEndpoint::GoogleApis, None)
+    }
+
+    /// Create a Firestore-backed spine backend against an explicit endpoint,
+    /// with the gate the store consults before every transient retry. The
+    /// hosted daemon passes its lease gate here; a store nobody bound a lease
+    /// to retries transient failures with no gate at all.
+    #[cfg(feature = "firestore")]
+    pub fn new_with_endpoint(
+        project_id: String,
+        database_id: Option<String>,
+        endpoint: FirestoreEndpoint,
+        transient_retry_gate: Option<TransientRetryGate>,
+    ) -> Self {
+        let mut store = FirestoreStore::with_endpoint(project_id, database_id, endpoint);
+        if let Some(gate) = transient_retry_gate {
+            store = store.with_transient_retry_gate(gate);
+        }
+        Self::with_store(Arc::new(store))
     }
 
     /// Create a backend over an arbitrary durable store.
@@ -1306,12 +1474,26 @@ pub struct FirestoreStore {
     client: reqwest::Client,
     /// Cached access token + expiry.
     token: parking_lot::RwLock<Option<(String, std::time::Instant)>>,
+    /// Production Google APIs, or an emulator-shaped plain-HTTP base.
+    endpoint: FirestoreEndpoint,
+    /// Re-reads the hosted lease before every transient retry; see
+    /// [`TransientRetryGate`]. Absent for a store nobody bound a lease to.
+    transient_retry_gate: Option<TransientRetryGate>,
 }
 
 #[cfg(feature = "firestore")]
 impl FirestoreStore {
-    /// Create a new Firestore store.
+    /// Create a new Firestore store against Google APIs.
     pub fn new(project_id: String, database_id: Option<String>) -> Self {
+        Self::with_endpoint(project_id, database_id, FirestoreEndpoint::GoogleApis)
+    }
+
+    /// Create a store against an explicit endpoint.
+    pub fn with_endpoint(
+        project_id: String,
+        database_id: Option<String>,
+        endpoint: FirestoreEndpoint,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
@@ -1322,15 +1504,88 @@ impl FirestoreStore {
             database_id: database_id.unwrap_or_else(|| "(default)".to_string()),
             client,
             token: parking_lot::RwLock::new(None),
+            endpoint,
+            transient_retry_gate: None,
         }
+    }
+
+    /// Install the gate consulted before every transient retry.
+    pub fn with_transient_retry_gate(mut self, gate: TransientRetryGate) -> Self {
+        self.transient_retry_gate = Some(gate);
+        self
     }
 
     /// Base URL for the Firestore REST API documents endpoint.
     fn base_url(&self) -> String {
+        let host = match &self.endpoint {
+            FirestoreEndpoint::GoogleApis => "https://firestore.googleapis.com",
+            FirestoreEndpoint::Emulator { base_url } => base_url.trim_end_matches('/'),
+        };
         format!(
-            "https://firestore.googleapis.com/v1/projects/{}/databases/{}/documents",
+            "{host}/v1/projects/{}/databases/{}/documents",
             self.project_id, self.database_id
         )
+    }
+
+    /// Send one Firestore request under the transient policy and hand back
+    /// whatever response finally arrived, success or not, so each call site
+    /// keeps its own reading of the status. A transport failure that outlasts
+    /// the budget, and a retry the gate refused, surface as the error the
+    /// site would have raised for that failure on its first attempt.
+    fn send_with_transient_retry(
+        &self,
+        describe: &str,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<(reqwest::StatusCode, String), SpineError> {
+        enum Attempt {
+            Response(reqwest::StatusCode, String),
+            Transport(String),
+        }
+        let outcome = retry_transient(
+            describe,
+            self.transient_retry_gate.as_ref(),
+            std::thread::sleep,
+            || {
+                let attempt = self.run_async(async {
+                    let response = match build().send().await {
+                        Ok(response) => response,
+                        Err(error) => return Ok(Attempt::Transport(error.to_string())),
+                    };
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    Ok(Attempt::Response(status, body))
+                });
+                match attempt {
+                    Ok(Attempt::Response(status, body)) if status.is_success() => {
+                        Ok(Ok((status, body)))
+                    }
+                    Ok(Attempt::Response(status, body)) => Err(FirestoreRequestFailure::Status {
+                        status: status.as_u16(),
+                        body,
+                    }),
+                    Ok(Attempt::Transport(error)) => Err(FirestoreRequestFailure::Transport(error)),
+                    // The runtime could not run the request at all; that is
+                    // not a Firestore answer and is never retried.
+                    Err(error) => Ok(Err(error)),
+                }
+            },
+        );
+        match outcome {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(runtime_error)) => Err(runtime_error),
+            Err(FirestoreRequestFailure::Status { status, body }) => Ok((
+                reqwest::StatusCode::from_u16(status).map_err(|error| {
+                    SpineError::Http(format!("{describe} failed with status {status}: {error}"))
+                })?,
+                body,
+            )),
+            Err(failure @ FirestoreRequestFailure::Transport(_)) => {
+                Err(SpineError::Http(format!("{describe} {failure}")))
+            }
+            Err(failure @ FirestoreRequestFailure::RetryRefused { .. }) => {
+                Err(SpineError::Backend(format!("{describe} {failure}")))
+            }
+        }
     }
 
     fn document_name(&self, collection: &str, document_id: &str) -> String {
@@ -1381,6 +1636,9 @@ impl FirestoreStore {
     /// Get an access token from the GCE metadata server.
     /// Caches the token for its lifetime minus a 60-second buffer.
     fn get_access_token(&self) -> Result<String, SpineError> {
+        if matches!(self.endpoint, FirestoreEndpoint::Emulator { .. }) {
+            return Ok("owner".to_string());
+        }
         {
             let cached = self.token.read();
             if let Some((ref token, ref expiry)) = *cached {
@@ -1431,49 +1689,41 @@ impl FirestoreStore {
     /// List every document in a collection, following pagination.
     fn list_all_documents(&self, collection: &str) -> Result<Vec<serde_json::Value>, SpineError> {
         let token = self.get_access_token()?;
-        self.run_async(async {
-            let mut documents = Vec::new();
-            let mut page_token: Option<String> = None;
+        let mut documents = Vec::new();
+        let mut page_token: Option<String> = None;
 
-            loop {
-                let mut url = format!("{}/{}?pageSize=300", self.base_url(), collection);
-                if let Some(ref pt) = page_token {
-                    url.push_str("&pageToken=");
-                    url.push_str(pt);
-                }
-
-                let resp = self
-                    .client
-                    .get(&url)
-                    .bearer_auth(&token)
-                    .send()
-                    .await
-                    .map_err(|e| SpineError::Http(format!("list {collection} failed: {e}")))?;
-
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(SpineError::Http(format!(
-                        "list {collection} failed ({status}): {body}"
-                    )));
-                }
-
-                let body: serde_json::Value = resp.json().await.map_err(|e| {
-                    SpineError::Serialization(format!("failed to parse {collection} list: {e}"))
-                })?;
-
-                if let Some(docs) = body.get("documents").and_then(|d| d.as_array()) {
-                    documents.extend(docs.iter().cloned());
-                }
-
-                match body.get("nextPageToken").and_then(|t| t.as_str()) {
-                    Some(next) if !next.is_empty() => page_token = Some(next.to_string()),
-                    _ => break,
-                }
+        loop {
+            let mut url = format!("{}/{}?pageSize=300", self.base_url(), collection);
+            if let Some(ref pt) = page_token {
+                url.push_str("&pageToken=");
+                url.push_str(pt);
             }
 
-            Ok(documents)
-        })
+            let (status, body) = self
+                .send_with_transient_retry(&format!("list {collection}"), || {
+                    self.client.get(&url).bearer_auth(&token)
+                })?;
+            if !status.is_success() {
+                return Err(SpineError::Http(format!(
+                    "list {collection} failed ({status}): {body}"
+                )));
+            }
+
+            let body: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                SpineError::Serialization(format!("failed to parse {collection} list: {e}"))
+            })?;
+
+            if let Some(docs) = body.get("documents").and_then(|d| d.as_array()) {
+                documents.extend(docs.iter().cloned());
+            }
+
+            match body.get("nextPageToken").and_then(|t| t.as_str()) {
+                Some(next) if !next.is_empty() => page_token = Some(next.to_string()),
+                _ => break,
+            }
+        }
+
+        Ok(documents)
     }
 
     /// Read one document and retain Firestore's server revision for a later
@@ -1485,31 +1735,22 @@ impl FirestoreStore {
     ) -> Result<Option<serde_json::Value>, SpineError> {
         let token = self.get_access_token()?;
         let url = self.document_url(collection, document_id);
-        self.run_async(async {
-            let response = self
-                .client
-                .get(&url)
-                .bearer_auth(&token)
-                .send()
-                .await
-                .map_err(|error| {
-                    SpineError::Http(format!("read {collection}/{document_id} failed: {error}"))
-                })?;
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
-                return Ok(None);
-            }
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                return Err(SpineError::Http(format!(
-                    "read {collection}/{document_id} failed ({status}): {body}"
-                )));
-            }
-            response.json().await.map(Some).map_err(|error| {
-                SpineError::Serialization(format!(
-                    "failed to parse {collection}/{document_id}: {error}"
-                ))
-            })
+        let (status, body) = self
+            .send_with_transient_retry(&format!("read {collection}/{document_id}"), || {
+                self.client.get(&url).bearer_auth(&token)
+            })?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(SpineError::Http(format!(
+                "read {collection}/{document_id} failed ({status}): {body}"
+            )));
+        }
+        serde_json::from_str(&body).map(Some).map_err(|error| {
+            SpineError::Serialization(format!(
+                "failed to parse {collection}/{document_id}: {error}"
+            ))
         })
     }
 
@@ -1538,30 +1779,22 @@ impl FirestoreStore {
             structured_query["limit"] = serde_json::json!(limit);
         }
         let query = serde_json::json!({ "structuredQuery": structured_query });
-        self.run_async(async {
-            let response = self
-                .client
-                .post(&url)
-                .bearer_auth(&token)
-                .json(&query)
-                .send()
-                .await
-                .map_err(|error| SpineError::Http(format!("query {collection} failed: {error}")))?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                return Err(SpineError::Http(format!(
-                    "query {collection} failed ({status}): {body}"
-                )));
-            }
-            let results: Vec<serde_json::Value> = response.json().await.map_err(|error| {
-                SpineError::Serialization(format!("failed to parse {collection} query: {error}"))
+        let (status, body) = self
+            .send_with_transient_retry(&format!("query {collection}"), || {
+                self.client.post(&url).bearer_auth(&token).json(&query)
             })?;
-            Ok(results
-                .into_iter()
-                .filter_map(|result| result.get("document").cloned())
-                .collect())
-        })
+        if !status.is_success() {
+            return Err(SpineError::Http(format!(
+                "query {collection} failed ({status}): {body}"
+            )));
+        }
+        let results: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|error| {
+            SpineError::Serialization(format!("failed to parse {collection} query: {error}"))
+        })?;
+        Ok(results
+            .into_iter()
+            .filter_map(|result| result.get("document").cloned())
+            .collect())
     }
 
     /// Commit staged row writes or bounded cleanup deletes in batches limited
@@ -1626,28 +1859,23 @@ impl FirestoreStore {
         operation: &str,
     ) -> Result<(), SpineError> {
         let body = serde_json::json!({ "writes": writes });
-        self.run_async(async {
-            let response = self
-                .client
-                .post(url)
-                .bearer_auth(token)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|error| SpineError::Http(format!("{operation} commit failed: {error}")))?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let response_body = response.text().await.unwrap_or_default();
-                return Err(SpineError::Http(format!(
-                    "{operation} commit failed ({status}): {response_body}"
-                )));
-            }
-            // A successful Firestore Commit is atomic for every write in the
-            // request. Do not turn an acknowledged commit into an ambiguous
-            // local error merely because its informational response body was
-            // truncated or could not be decoded.
-            Ok(())
-        })
+        let (status, response_body) = self
+            .send_with_transient_retry(&format!("{operation} commit"), || {
+                self.client.post(url).bearer_auth(token).json(&body)
+            })?;
+        if !status.is_success() {
+            return Err(SpineError::Http(format!(
+                "{operation} commit failed ({status}): {response_body}"
+            )));
+        }
+        // A successful Firestore Commit is atomic for every write in the
+        // request. Do not turn an acknowledged commit into an ambiguous
+        // local error merely because its informational response body was
+        // truncated or could not be decoded. A retried commit whose first
+        // attempt was applied but never answered fails its preconditions on
+        // the second, which is a permanent status and reaches the caller's
+        // own reconciliation exactly as the lost answer would have.
+        Ok(())
     }
 
     fn read_repo_head(
@@ -2582,24 +2810,16 @@ impl FirestoreStore {
         let body = serde_json::json!({ "writes": writes });
         let token = self.get_access_token()?;
         let url = format!("{}:commit", self.base_url());
-        let response = self.run_async(async {
-            let response = self
-                .client
-                .post(&url)
-                .bearer_auth(&token)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|error| SpineError::Http(format!("head CAS failed: {error}")))?;
-            let status = response.status();
-            if status.is_success() {
-                Ok((status, None))
-            } else {
-                Ok((status, Some(response.text().await.unwrap_or_default())))
-            }
+        // The CAS is retried on a transient failure like every other send,
+        // and its preconditions make a repeat of an applied commit fail with
+        // a permanent status; reconciliation below reads the durable head
+        // either way, so a retry can only turn an indeterminate outcome into
+        // a decided one.
+        let response = self.send_with_transient_retry("head CAS", || {
+            self.client.post(&url).bearer_auth(&token).json(&body)
         });
         let (status, response_body) = match response {
-            Ok(response) => response,
+            Ok((status, body)) => (status, (!status.is_success()).then_some(body)),
             Err(error) => {
                 return self.reconcile_ambiguous_head(prepared, error.to_string());
             }
@@ -6766,5 +6986,502 @@ mod tests {
         assert!(store.delete_repo_entities("repo").is_err());
         assert!(store.write_edge(&edge).is_err());
         assert!(store.delete_repo_edges("repo").is_err());
+    }
+}
+
+/// The transient policy, the gate, and the five request paths that carry them.
+///
+/// The classification and the loop are exercised on their own with scripted
+/// attempts and a recording sleeper. The request paths are then driven over a
+/// real socket against a scripted local server through the emulator endpoint,
+/// because a policy that is correct in isolation and wired to nothing would
+/// pass every test here and retry nothing in production.
+#[cfg(all(test, feature = "firestore"))]
+mod transient_retry_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    fn status_body(code: &str) -> String {
+        serde_json::json!({ "error": { "code": 0, "message": "scripted", "status": code } })
+            .to_string()
+    }
+
+    fn transient(status: u16, code: &str) -> FirestoreRequestFailure {
+        FirestoreRequestFailure::Status {
+            status,
+            body: status_body(code),
+        }
+    }
+
+    #[test]
+    fn transient_status_is_named_by_the_body_and_only_then_by_the_code() {
+        for code in [
+            "UNAVAILABLE",
+            "DEADLINE_EXCEEDED",
+            "ABORTED",
+            "RESOURCE_EXHAUSTED",
+            "INTERNAL",
+            "UNKNOWN",
+        ] {
+            assert!(
+                transient_firestore_status(400, &status_body(code)),
+                "{code} is transient whatever HTTP code carries it"
+            );
+        }
+        for code in [
+            "PERMISSION_DENIED",
+            "UNAUTHENTICATED",
+            "FAILED_PRECONDITION",
+            "ALREADY_EXISTS",
+            "NOT_FOUND",
+            "INVALID_ARGUMENT",
+        ] {
+            assert!(
+                !transient_firestore_status(503, &status_body(code)),
+                "{code} is permanent whatever HTTP code carries it"
+            );
+        }
+        // No named status: the HTTP code decides, and 409 stays permanent
+        // because ALREADY_EXISTS shares it with ABORTED.
+        assert!(transient_firestore_status(503, "<html>upstream</html>"));
+        assert!(transient_firestore_status(500, ""));
+        assert!(transient_firestore_status(429, ""));
+        assert!(!transient_firestore_status(409, ""));
+        assert!(!transient_firestore_status(404, ""));
+        assert!(!transient_firestore_status(403, ""));
+        assert!(!transient_firestore_status(400, "{\"error\":{}}"));
+        assert!(FirestoreRequestFailure::Transport("reset".to_string()).is_transient());
+    }
+
+    /// Drive the loop with scripted outcomes; returns what it produced, how
+    /// many attempts ran, the gate calls, and the sleeps it asked for.
+    fn drive(
+        script: Vec<Result<u32, FirestoreRequestFailure>>,
+        gate: Option<TransientRetryGate>,
+    ) -> (
+        Result<u32, FirestoreRequestFailure>,
+        usize,
+        usize,
+        Vec<Duration>,
+    ) {
+        let script = Mutex::new(script.into_iter());
+        let attempts = AtomicUsize::new(0);
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let counted_gate: Option<TransientRetryGate> = gate.map(|gate| {
+            let gate_calls = Arc::clone(&gate_calls);
+            Arc::new(move || {
+                gate_calls.fetch_add(1, Ordering::SeqCst);
+                gate()
+            }) as TransientRetryGate
+        });
+        let mut sleeps = Vec::new();
+        let outcome = retry_transient(
+            "scripted",
+            counted_gate.as_ref(),
+            |backoff| sleeps.push(backoff),
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                script
+                    .lock()
+                    .unwrap()
+                    .next()
+                    .expect("the script ran out before the loop stopped")
+            },
+        );
+        (
+            outcome,
+            attempts.load(Ordering::SeqCst),
+            gate_calls.load(Ordering::SeqCst),
+            sleeps,
+        )
+    }
+
+    #[test]
+    fn retry_transient_returns_after_one_transient_failure() {
+        let (outcome, attempts, gate_calls, sleeps) = drive(
+            vec![
+                Err(FirestoreRequestFailure::Transport("reset".to_string())),
+                Ok(7),
+            ],
+            Some(Arc::new(|| Ok(()))),
+        );
+        assert_eq!(outcome, Ok(7));
+        assert_eq!(attempts, 2);
+        assert_eq!(gate_calls, 1, "the lease is reasserted before the retry");
+        assert_eq!(sleeps, vec![FIRESTORE_TRANSIENT_BACKOFF_BASE]);
+    }
+
+    #[test]
+    fn retry_transient_fails_fast_on_a_permanent_failure() {
+        let (outcome, attempts, gate_calls, sleeps) = drive(
+            vec![Err(transient(403, "PERMISSION_DENIED")), Ok(7)],
+            Some(Arc::new(|| Ok(()))),
+        );
+        assert_eq!(outcome, Err(transient(403, "PERMISSION_DENIED")));
+        assert_eq!(attempts, 1, "a permanent failure is never retried");
+        assert_eq!(gate_calls, 0);
+        assert!(sleeps.is_empty());
+    }
+
+    #[test]
+    fn retry_transient_spends_exactly_its_named_budget() {
+        let budget = FIRESTORE_TRANSIENT_ATTEMPTS as usize;
+        let script = (0..budget + 2)
+            .map(|_| Err(transient(503, "UNAVAILABLE")))
+            .collect();
+        let (outcome, attempts, gate_calls, sleeps) = drive(script, Some(Arc::new(|| Ok(()))));
+        assert_eq!(outcome, Err(transient(503, "UNAVAILABLE")));
+        assert_eq!(attempts, budget);
+        assert_eq!(gate_calls, budget - 1);
+        assert_eq!(
+            sleeps,
+            vec![
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_millis(1000)
+            ],
+            "the backoff doubles from the named base"
+        );
+    }
+
+    #[test]
+    fn retry_transient_stops_when_the_gate_refuses() {
+        let (outcome, attempts, gate_calls, sleeps) = drive(
+            vec![
+                Err(FirestoreRequestFailure::Transport("timed out".to_string())),
+                Ok(7),
+            ],
+            Some(Arc::new(|| {
+                Err("lease fence 3 expired at 2026-09-02T08:25:00+00:00".to_string())
+            })),
+        );
+        assert_eq!(
+            outcome,
+            Err(FirestoreRequestFailure::RetryRefused {
+                refusal: "lease fence 3 expired at 2026-09-02T08:25:00+00:00".to_string(),
+                after: Box::new(FirestoreRequestFailure::Transport("timed out".to_string())),
+            })
+        );
+        assert_eq!(
+            attempts, 1,
+            "a refused gate ends the retry before the next attempt"
+        );
+        assert_eq!(gate_calls, 1);
+        assert!(
+            sleeps.is_empty(),
+            "no backoff is spent on a retry that will not run"
+        );
+        let rendered = outcome.unwrap_err().to_string();
+        assert!(rendered.contains("retry refused"), "{rendered}");
+        assert!(rendered.contains("lease fence 3 expired"), "{rendered}");
+        assert!(rendered.contains("timed out"), "{rendered}");
+    }
+
+    /// What one scripted connection does after reading its request.
+    #[derive(Clone)]
+    enum Scripted {
+        Respond {
+            status: u16,
+            body: String,
+        },
+        /// Close without answering: the transport error the rehearsal saw.
+        Drop,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            let Some(end) = find(&buffer, b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buffer[..end]).to_string();
+            let content_length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            let mut body = buffer[end + 4..].to_vec();
+            while body.len() < content_length {
+                let read = stream.read(&mut chunk).ok()?;
+                if read == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..read]);
+            }
+            let mut parts = head.lines().next()?.split_whitespace();
+            return Some(RecordedRequest {
+                method: parts.next()?.to_string(),
+                path: parts.next()?.to_string(),
+                body: String::from_utf8_lossy(&body).to_string(),
+            });
+        }
+    }
+
+    struct ScriptedServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    }
+
+    impl ScriptedServer {
+        /// One connection per scripted step, answered in order. Every answer
+        /// closes its connection, so the client opens a fresh one per attempt
+        /// and the recorded request count is the attempt count.
+        fn serve(script: Vec<Scripted>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+            std::thread::spawn(move || {
+                for step in script {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    if let Some(request) = read_request(&mut stream) {
+                        recorded.lock().unwrap().push(request);
+                    }
+                    match step {
+                        Scripted::Respond { status, body } => {
+                            let reason = reqwest::StatusCode::from_u16(status)
+                                .ok()
+                                .and_then(|status| status.canonical_reason())
+                                .unwrap_or("Scripted");
+                            let response = format!(
+                                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                        }
+                        Scripted::Drop => drop(stream),
+                    }
+                }
+            });
+            Self { base_url, requests }
+        }
+
+        fn requests(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn store_against(server: &ScriptedServer) -> FirestoreStore {
+        FirestoreStore::with_endpoint(
+            "fixture-project".to_string(),
+            None,
+            FirestoreEndpoint::Emulator {
+                base_url: server.base_url.clone(),
+            },
+        )
+    }
+
+    fn respond(status: u16, body: &str) -> Scripted {
+        Scripted::Respond {
+            status,
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn emulator_endpoint_shapes_the_base_url_and_skips_the_metadata_token() {
+        let store = FirestoreStore::with_endpoint(
+            "p".to_string(),
+            Some("d".to_string()),
+            FirestoreEndpoint::Emulator {
+                base_url: "http://127.0.0.1:8080/".to_string(),
+            },
+        );
+        assert_eq!(
+            store.base_url(),
+            "http://127.0.0.1:8080/v1/projects/p/databases/d/documents"
+        );
+        assert_eq!(store.get_access_token().unwrap(), "owner");
+        let production = FirestoreStore::new("p".to_string(), None);
+        assert_eq!(
+            production.base_url(),
+            "https://firestore.googleapis.com/v1/projects/p/databases/(default)/documents"
+        );
+    }
+
+    #[test]
+    fn get_document_retries_a_transient_status_over_the_wire() {
+        let document = serde_json::json!({
+            "name": "projects/fixture-project/databases/(default)/documents/spine_repo_heads_v2/abc",
+            "fields": { "payload": { "stringValue": "{}" } },
+            "updateTime": "2026-09-02T08:23:11.000000Z"
+        });
+        let server = ScriptedServer::serve(vec![
+            respond(503, &status_body("UNAVAILABLE")),
+            respond(200, &document.to_string()),
+        ]);
+        let store = store_against(&server);
+        let loaded = store
+            .get_document("spine_repo_heads_v2", "abc")
+            .expect("the second attempt answers");
+        assert_eq!(loaded, Some(document));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests
+            .iter()
+            .all(|request| request.method == "GET"
+                && request.path.ends_with("/spine_repo_heads_v2/abc")));
+    }
+
+    #[test]
+    fn get_document_fails_fast_on_permission_denied_over_the_wire() {
+        let server = ScriptedServer::serve(vec![
+            respond(403, &status_body("PERMISSION_DENIED")),
+            respond(200, "{}"),
+        ]);
+        let store = store_against(&server);
+        let error = store
+            .get_document("spine_repo_heads_v2", "abc")
+            .expect_err("a permission refusal is not retried");
+        let rendered = error.to_string();
+        assert!(rendered.contains("403"), "{rendered}");
+        assert!(rendered.contains("PERMISSION_DENIED"), "{rendered}");
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn get_document_reports_a_missing_document_without_retrying() {
+        let server = ScriptedServer::serve(vec![
+            respond(404, &status_body("NOT_FOUND")),
+            respond(200, "{}"),
+        ]);
+        let store = store_against(&server);
+        assert_eq!(
+            store.get_document("spine_repo_heads_v2", "abc").unwrap(),
+            None
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn commit_write_batch_retries_a_dropped_connection_then_commits() {
+        let server = ScriptedServer::serve(vec![Scripted::Drop, respond(200, "{}")]);
+        let store = store_against(&server);
+        let writes = vec![serde_json::json!({
+            "update": { "name": "projects/fixture-project/databases/(default)/documents/spine_entities_v2/x", "fields": {} },
+            "currentDocument": { "exists": false }
+        })];
+        store
+            .commit_write_batch(
+                "owner",
+                &format!("{}:commit", store.base_url()),
+                &writes,
+                "stage immutable spine publication rows",
+            )
+            .expect("the retried commit is acknowledged");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests.iter().all(|request| request.method == "POST"));
+        assert!(requests
+            .iter()
+            .all(|request| request.path.ends_with("/documents:commit")));
+        assert_eq!(
+            requests[0].body, requests[1].body,
+            "the retry sends the same writes under the same preconditions"
+        );
+        assert!(requests[0].body.contains("\"exists\":false"));
+    }
+
+    #[test]
+    fn commit_write_batch_does_not_retry_a_failed_precondition() {
+        let server = ScriptedServer::serve(vec![
+            respond(400, &status_body("FAILED_PRECONDITION")),
+            respond(200, "{}"),
+        ]);
+        let store = store_against(&server);
+        let error = store
+            .commit_write_batch(
+                "owner",
+                &format!("{}:commit", store.base_url()),
+                &[serde_json::json!({ "delete": "x" })],
+                "cleanup",
+            )
+            .expect_err("a precondition verdict is final");
+        assert!(error.to_string().contains("FAILED_PRECONDITION"), "{error}");
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn a_refused_gate_ends_the_retry_over_the_wire() {
+        let server = ScriptedServer::serve(vec![
+            respond(503, &status_body("UNAVAILABLE")),
+            respond(200, "{}"),
+        ]);
+        let store = store_against(&server).with_transient_retry_gate(Arc::new(|| {
+            Err("graph publication lease is stale or fenced: lease fence 4 expired".to_string())
+        }));
+        let error = store
+            .get_document("spine_repo_heads_v2", "abc")
+            .expect_err("a lease that cannot be reasserted refuses the retry");
+        let rendered = error.to_string();
+        assert!(rendered.contains("retry refused"), "{rendered}");
+        assert!(rendered.contains("lease fence 4 expired"), "{rendered}");
+        assert!(rendered.contains("UNAVAILABLE"), "{rendered}");
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "no request goes out under a refused lease"
+        );
+    }
+
+    #[test]
+    fn a_passing_gate_is_consulted_once_per_retry_over_the_wire() {
+        let server = ScriptedServer::serve(vec![
+            Scripted::Drop,
+            respond(503, &status_body("UNAVAILABLE")),
+            respond(200, "{}"),
+        ]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = store_against(&server).with_transient_retry_gate(Arc::new({
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }));
+        store
+            .commit_write_batch(
+                "owner",
+                &format!("{}:commit", store.base_url()),
+                &[serde_json::json!({ "delete": "x" })],
+                "cleanup",
+            )
+            .expect("the third attempt commits");
+        assert_eq!(server.requests().len(), 3);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one gate call before each retry"
+        );
     }
 }
