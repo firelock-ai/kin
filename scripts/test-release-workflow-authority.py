@@ -881,6 +881,7 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
         "hold-alarm": "Report a held rail",
     },
     ".github/workflows/release.yml": {
+        "duplicate_guard": "Refuse a duplicate release run",
         "config": "Resolve release config",
         "build_daemon_image": "Build immutable daemon image",
         "attest_daemon_image": "Attest immutable daemon image",

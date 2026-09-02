@@ -30,6 +30,59 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Refuse a run whose tag another run already released.
+  #
+  # On 2026-09-02 tag v0.6.4 produced two Release runs, 147 and 148, seven
+  # seconds apart. This repository pushed once: release-tag.yml holds a single
+  # `POST /git/refs` call, refs/tags/v0.6.4 still reads as a lightweight tag at
+  # the sha the mint wrote, and the trigger above is a single `push: tags`
+  # entry. The two runs carry different check suites, so GitHub delivered one
+  # tag-creation push twice, and no change here can suppress that delivery.
+  #
+  # The concurrency group above serializes rather than cancels, so a duplicate
+  # does not go away on its own: run 148 sat pending for over forty minutes and
+  # would then have re-run publish, npm publish, promotion and the completion
+  # marker against an already released tag. This job is where the duplicate
+  # stops instead.
+  #
+  # Every other job reaches `config`, and `config` needs this one, so a
+  # `duplicate=true` verdict skips the whole release. The jobs guarded by
+  # `always()` skip with it, because each also requires a named dependency's
+  # result to equal 'success' and a skipped dependency's result is 'skipped'.
+  duplicate_guard:
+    name: Refuse a duplicate release run
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      duplicate: ${{ steps.verdict.outputs.duplicate }}
+    steps:
+      - name: Checkout release policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Judge this run against earlier runs for the tag
+        id: verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 scripts/guard-duplicate-release-run.py \
+            --repo "$REPO" \
+            --tag "$TAG" \
+            --run-id "$RUN_ID" \
+            --run-number "$RUN_NUMBER" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --workflow .github/workflows/release.yml \
+            >> "$GITHUB_OUTPUT"
+
   # Resolve a single effective "notarize on Linux" flag for the whole run. The
   # macOS legs still build + codesign natively; only the Apple Notary submission
   # moves to a 1x Linux runner (macOS minutes bill 10x) when this is on.
@@ -41,6 +94,13 @@ jobs:
   config:
     name: Resolve release config
     runs-on: ubuntu-latest
+    # The root of the job graph, so this pair is what turns one duplicate
+    # verdict into a skipped release. A failing guard is deliberately NOT the
+    # same as a duplicate: the run goes red on the guard rather than skipping
+    # the release quietly, because a silent no-release is the one outcome
+    # nobody would be paged for.
+    needs: duplicate_guard
+    if: needs.duplicate_guard.outputs.duplicate != 'true'
     outputs:
       notarize_on_linux: ${{ steps.flags.outputs.notarize_on_linux }}
       release_channel: ${{ steps.release_order.outputs.release_channel }}
