@@ -47,8 +47,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # `toolchain: stable` is not optional here, and it is not decoration.
+      # The local action resolves the channel from `rust-toolchain.toml` and
+      # REFUSES rather than defaulting when neither that file nor this input is
+      # present, which is the right refusal: a wrong toolchain installed quietly
+      # becomes a compile error attributed to the code under test. kin-search
+      # keeps no `rust-toolchain.toml`, so with no input this step exited 1 in
+      # 34 ms on both runners and every Cache Seed run on main failed that way
+      # from 2026-08-19 to 2026-09-02. Nothing noticed, because CI does not run
+      # on main here and a cold cache is not a red gate. `stable` is the same
+      # value `ci.yml` passes; the two have to keep agreeing, or the seed warms
+      # a toolchain no build restores.
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
 
       # Paths, key and restore-keys are copied verbatim from the `Check & Test`
       # job in `ci.yml` and have to stay identical to it. A seed written under
