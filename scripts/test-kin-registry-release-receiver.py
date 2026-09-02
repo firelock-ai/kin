@@ -1545,17 +1545,36 @@ class PostCompletionAttesterTests(unittest.TestCase):
             self.assertEqual(evidence.head, head)
 
     def test_attestation_survives_main_advancing_and_refuses_a_rewrite(self) -> None:
+        # Main advances after the receiver's checkout and the pull-request
+        # action rebases the wave onto the new tip, so the live head's parent
+        # and the pull base are the tip, not the admitted base. The admission
+        # still names the admitted base and tree; the attester has to accept
+        # the rebased head and refuse a rewritten main.
         with tempfile.TemporaryDirectory() as directory:
-            repo, _, result_file, base, head = self._changed(directory)
+            repo, _, result_file, base, admitted_head = self._changed(directory)
             run = workflow_run_document(base)
             event_file = Path(directory) / "event.json"
             event_file.write_text(
                 json.dumps({"action": "completed", "workflow_run": run}),
                 encoding="utf-8",
             )
-            pull = pull_document(head, base)
-            reviews, comments = attestation_documents(repo, base, head)
-            tip = "9" * 40
+            run_git(repo, "switch", "-q", "--detach", base)
+            (repo / "README.md").write_text("advanced\n", encoding="utf-8")
+            run_git(repo, "add", "README.md")
+            run_git(repo, "commit", "-q", "-m", "advance main")
+            tip = run_git(repo, "rev-parse", "HEAD")
+            run_git(repo, "cherry-pick", admitted_head)
+            head = run_git(repo, "rev-parse", "HEAD")
+            admission = json.loads(result_file.read_text(encoding="utf-8"))
+            admission["head"] = head
+            result_file.write_text(json.dumps(admission, sort_keys=True), encoding="utf-8")
+            pull = pull_document(head, tip)
+            reviews, comments = attestation_documents(repo, base, admitted_head)
+            for comment in comments:
+                comment["body"] = comment["body"].replace(f"head={admitted_head}", f"head={head}")
+            for review in reviews:
+                review["commit_id"] = head
+                review["body"] = review["body"].replace(f"head={admitted_head}", f"head={head}")
 
             def fake(relation: str):
                 compare = {
@@ -2431,7 +2450,12 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn(".base.sha", verifier)
         self.assertIn(".auto_merge == null", verifier)
         self.assertIn("api_tree", verifier)
-        self.assertIn('!= "$EXPECTED_TREE"', verifier)
+        # The head's tree equals the admitted tree only while main stood still;
+        # the guard proves the admitted delta on whatever parent the action
+        # rebased onto, and the API's tree has to agree with the fetched head.
+        self.assertIn("verify-generated-head", verifier)
+        self.assertIn('--expected-tree "$EXPECTED_TREE"', verifier)
+        self.assertIn('!= "$api_tree"', verifier)
 
     def test_fixed_pr_landing_state_is_cleared_before_and_after_write(self) -> None:
         early = step_block(

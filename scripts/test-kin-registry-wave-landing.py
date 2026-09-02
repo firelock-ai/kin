@@ -63,6 +63,63 @@ def load_module(name: str, path: Path):
 
 history = load_module("kin_wave_history_tests", HISTORY_PATH)
 landing = load_module("kin_wave_landing_tests", LANDING_PATH)
+head_guard = load_module("kin_wave_head_guard_tests", HEAD_GUARD_PATH)
+
+
+def run_git(repo: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+
+
+def manifest(dependency: str = "=0.7.67") -> str:
+    return (
+        "[workspace]\nmembers = []\n\n[workspace.package]\nversion = \"0.6.1\"\n\n"
+        "[workspace.dependencies]\n"
+        f'kin-db = {{ version = "{dependency}", registry = "kin" }}\n'
+    )
+
+
+def initialize_repo(repo: Path) -> str:
+    run_git(repo, "init", "-q", "-b", "main")
+    run_git(repo, "config", "user.name", "Kin Test")
+    run_git(repo, "config", "user.email", "kin-test@example.com")
+    run_git(repo, "config", "commit.gpgsign", "false")
+    run_git(repo, "config", "core.hooksPath", "/dev/null")
+    (repo / "Cargo.toml").write_text(manifest(), encoding="utf-8")
+    (repo / "Cargo.lock").write_text("version = 4\nkin-db 0.7.67\n", encoding="utf-8")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-q", "-m", "base")
+    return run_git(repo, "rev-parse", "HEAD")
+
+
+def write_pins(repo: Path, dependency: str, lock_version: str) -> None:
+    (repo / "Cargo.toml").write_text(manifest(dependency), encoding="utf-8")
+    (repo / "Cargo.lock").write_text(
+        f"version = 4\nkin-db {lock_version}\n", encoding="utf-8"
+    )
+
+
+def commit_wave(repo: Path, dependency: str = "=0.7.69", lock_version: str = "0.7.69") -> str:
+    write_pins(repo, dependency, lock_version)
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-q", "-m", f"dependency wave\n\n{head_guard.COMMIT_MARKER}")
+    return run_git(repo, "rev-parse", "HEAD")
+
+
+def advance_main(repo: Path, base: str, *, touch_lock: bool = False) -> str:
+    run_git(repo, "switch", "-q", "--detach", base)
+    (repo / "README.md").write_text("advanced\n", encoding="utf-8")
+    if touch_lock:
+        (repo / "Cargo.lock").write_text("version = 4\nkin-db 0.7.67\nextra\n", encoding="utf-8")
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-q", "-m", "advance main")
+    return run_git(repo, "rev-parse", "HEAD")
 
 
 def job_block(workflow: str, job_id: str) -> str:
@@ -396,6 +453,7 @@ def green_snapshot(**overrides: Any) -> dict[str, Any]:
         "commits": [bot_commit()],
         "files": [wave_file("Cargo.toml"), wave_file("Cargo.lock")],
         "check_run_pages": pages(green_runs()),
+        "pins_on_main": {"tip": BASE, "changed": ["Cargo.lock", "Cargo.toml"]},
         "attestation": landing.ATTESTATION_VERIFIED,
     }
     snapshot.update(overrides)
@@ -434,7 +492,7 @@ class WaveJudgeTests(unittest.TestCase):
             r"checks failed: cargo-fuzz \(parse_adapter\)=failure",
         )
         self.assertEqual(verdict.pull, 1360)
-        for conclusion in ("cancelled", "timed_out", "action_required", "stale"):
+        for conclusion in ("timed_out", "action_required", "stale", "startup_failure"):
             with self.subTest(conclusion=conclusion):
                 runs = green_runs() + [check_run("Linux Daemon Smoke", conclusion)]
                 self.assertVerdict(
@@ -442,6 +500,32 @@ class WaveJudgeTests(unittest.TestCase):
                     landing.REFUSE,
                     f"checks failed: Linux Daemon Smoke={conclusion}",
                 )
+
+    def test_cancelled_by_a_repush_waits_instead_of_failing(self) -> None:
+        # The receiver's re-push cancels the superseded suite and the attester's
+        # reopen retrigger does the same; on 2026-09-02 a judgment read
+        # "Fast gate lint and policy=cancelled" and painted the workflow red for
+        # a check nothing could have kept green. It is a wait, and transient.
+        runs = green_runs() + [check_run("Fast gate lint and policy", "cancelled", started="2026-09-02T09:40:00Z")]
+        verdict = self.assertVerdict(
+            green_snapshot(check_run_pages=pages(runs)),
+            landing.WAIT,
+            "checks cancelled, awaiting the rerun a re-push or reopen triggers: Fast gate lint and policy",
+        )
+        self.assertTrue(verdict.transient)
+        self.assertEqual(verdict.details["cancelled"], ["Fast gate lint and policy"])
+
+    def test_a_repushed_head_waits_for_the_next_pass(self) -> None:
+        verdict = self.assertVerdict(
+            green_snapshot(branch_tip=OTHER),
+            landing.WAIT,
+            f"the wave moved: origin/{landing.WAVE_BRANCH} is at {OTHER}, not the pull head {HEAD}",
+        )
+        self.assertTrue(verdict.transient)
+        verdict = self.assertVerdict(
+            green_snapshot(branch_tip=None), landing.WAIT, "no readable"
+        )
+        self.assertTrue(verdict.transient)
 
     def test_one_pending_waits(self) -> None:
         runs = green_runs() + [check_run("Linux Daemon Smoke", None, status="in_progress")]
@@ -631,13 +715,53 @@ class WaveJudgeTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertVerdict(green_snapshot(pull=pull), landing.REFUSE, re.escape(reason))
 
-    def test_branch_tip_must_be_the_judged_head(self) -> None:
+    def test_pins_already_on_main_are_a_final_no_op(self) -> None:
+        # kin#1384 landed =0.7.88 by hand at 16:28Z while #1360 carried the same
+        # delta: nothing to merge, never an empty squash, never a red run.
+        verdict = self.assertVerdict(
+            green_snapshot(pins_on_main={"tip": OTHER, "changed": []}),
+            landing.WAIT,
+            f"pins are already on main at {OTHER}; nothing to merge",
+        )
+        self.assertFalse(verdict.transient)
+        self.assertEqual((verdict.pull, verdict.head), (1360, HEAD))
         self.assertVerdict(
-            green_snapshot(branch_tip=OTHER), landing.REFUSE, "not the pull head"
+            green_snapshot(pins_on_main=None), landing.REFUSE, "pin comparison against main is unreadable"
         )
         self.assertVerdict(
-            green_snapshot(branch_tip=None), landing.REFUSE, "no readable"
+            green_snapshot(pins_on_main={"tip": OTHER, "changed": ["Cargo.lock"]}),
+            landing.LAND,
+            "concluded green",
         )
+
+    def test_pins_on_main_reads_the_workspace_tip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            base = initialize_repo(repo)
+            head = commit_wave(repo)
+            run_git(repo, "switch", "-q", "--detach", base)
+            self.assertEqual(
+                landing.pins_on_main(repo, head),
+                {"tip": base, "changed": ["Cargo.lock", "Cargo.toml"]},
+            )
+            run_git(repo, "switch", "-q", "--detach", head)
+            self.assertEqual(landing.pins_on_main(repo, head), {"tip": head, "changed": []})
+
+    def test_transient_and_final_waits_are_told_apart(self) -> None:
+        transient = (
+            green_snapshot(check_run_pages=pages(green_runs() + [check_run("x", None, status="queued")])),
+            green_snapshot(pull=wave_pull(mergeable_state="unknown")),
+            green_snapshot(attestation=landing.ATTESTATION_PENDING),
+            green_snapshot(check_run_pages=pages([run for run in green_runs() if run["name"] != "cargo-deny"])),
+        )
+        for snapshot in transient:
+            verdict = landing.judge(snapshot)
+            self.assertEqual(verdict.decision, landing.WAIT, verdict.reason)
+            self.assertTrue(verdict.transient, verdict.reason)
+        for snapshot in (green_snapshot(freeze="hold"), green_snapshot(open_pulls=[])):
+            verdict = landing.judge(snapshot)
+            self.assertEqual(verdict.decision, landing.WAIT, verdict.reason)
+            self.assertFalse(verdict.transient, verdict.reason)
 
     def test_conflict_refuses_and_a_settling_state_waits(self) -> None:
         self.assertVerdict(
@@ -834,6 +958,274 @@ class WaveJudgeTests(unittest.TestCase):
         self.assertEqual(written, set(landing.ALLOWED_PATHS))
 
 
+class WaitLoopTests(unittest.TestCase):
+    def _loop(self, snapshots: list[dict[str, Any]], budget: int) -> tuple[Any, list[float], int]:
+        supplied = list(snapshots)
+        gathers = 0
+        slept: list[float] = []
+        clock = {"now": 0.0}
+
+        def fake_gather(repository: str, workspace: Path, freeze: str) -> dict[str, Any]:
+            nonlocal gathers
+            gathers += 1
+            return supplied.pop(0) if len(supplied) > 1 else supplied[0]
+
+        def fake_sleep(seconds: float) -> None:
+            slept.append(seconds)
+            clock["now"] += seconds
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            verdict, _ = landing.judge_with_wait(
+                REPO,
+                Path("."),
+                "",
+                wait_seconds=budget,
+                gather_snapshot=fake_gather,
+                sleep=fake_sleep,
+                clock=lambda: clock["now"],
+            )
+        return verdict, slept, gathers
+
+    def test_a_transient_wait_is_re_read_until_it_lands(self) -> None:
+        pending = green_snapshot(check_run_pages=pages(green_runs() + [check_run("x", None, status="queued")]))
+        verdict, slept, gathers = self._loop([pending, pending, green_snapshot()], 600)
+        self.assertEqual(verdict.decision, landing.LAND)
+        self.assertEqual(gathers, 3)
+        self.assertEqual(slept, [30.0, 30.0])
+        self.assertEqual(verdict.details["passes"], 3)
+
+    def test_the_budget_bounds_the_wait(self) -> None:
+        pending = green_snapshot(check_run_pages=pages(green_runs() + [check_run("x", None, status="queued")]))
+        verdict, slept, gathers = self._loop([pending], 45)
+        self.assertEqual(verdict.decision, landing.WAIT)
+        self.assertEqual(slept, [30.0, 15.0])
+        self.assertEqual(gathers, 3)
+        verdict, slept, gathers = self._loop([pending], 0)
+        self.assertEqual((verdict.decision, slept, gathers), (landing.WAIT, [], 1))
+
+    def test_a_hold_and_a_refusal_return_at_once(self) -> None:
+        verdict, slept, gathers = self._loop([green_snapshot(freeze="hold")], 600)
+        self.assertEqual((verdict.decision, slept, gathers), (landing.WAIT, [], 1))
+        red = green_snapshot(check_run_pages=pages(green_runs() + [check_run("cargo-deny", "failure")]))
+        verdict, slept, gathers = self._loop([red], 600)
+        self.assertEqual((verdict.decision, slept, gathers), (landing.REFUSE, [], 1))
+
+    def test_a_repush_during_the_wait_is_judged_on_the_new_head(self) -> None:
+        moved = green_snapshot(branch_tip=OTHER)
+        verdict, slept, gathers = self._loop([moved, green_snapshot()], 600)
+        self.assertEqual(verdict.decision, landing.LAND)
+        self.assertEqual(gathers, 2)
+
+
+def trigger_context(**overrides: Any) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "event_name": "repository_dispatch",
+        "event_action": landing.KICK_ACTION,
+        "actor": "troyjr4103",
+        "repository": REPO,
+        "default_branch": "main",
+        "ref": "refs/heads/main",
+        "workflow_sha": POLICY,
+        "event": {"action": landing.KICK_ACTION, "client_payload": {"reason": "captain kick"}},
+    }
+    context.update(overrides)
+    return context
+
+
+def completion_event(**overrides: Any) -> dict[str, Any]:
+    run: dict[str, Any] = {
+        "name": "CI",
+        "status": "completed",
+        "conclusion": "success",
+        "head_branch": landing.WAVE_BRANCH,
+        "head_sha": HEAD,
+        "head_repository": {"full_name": REPO},
+    }
+    run.update(overrides)
+    return {"action": "completed", "workflow_run": run}
+
+
+class TriggerValidationTests(unittest.TestCase):
+    def test_kick_from_each_allowed_actor_is_admitted(self) -> None:
+        for actor in sorted(landing.KICK_ACTORS):
+            with self.subTest(actor=actor):
+                verdict = landing.validate_trigger(**trigger_context(actor=actor))
+                self.assertEqual(verdict["trigger"], landing.TRIGGER_KICK)
+                self.assertEqual(verdict["reason"], "captain kick")
+        bare = landing.validate_trigger(**trigger_context(event={"action": landing.KICK_ACTION}))
+        self.assertEqual(bare["reason"], "")
+
+    def test_kick_refusals(self) -> None:
+        cases = {
+            "may not kick": trigger_context(actor="outsider"),
+            "event action must be": trigger_context(event_action="release_tag", event={"action": "release_tag"}),
+            "differs from the trigger context": trigger_context(event={"action": "other"}),
+            "workflow ref must be": trigger_context(ref="refs/heads/feature"),
+            "default branch must be": trigger_context(default_branch="develop"),
+            "repository must be": trigger_context(repository="fork/kin"),
+            "workflow sha must be": trigger_context(workflow_sha="abc"),
+            "a reason and nothing else": trigger_context(
+                event={"action": landing.KICK_ACTION, "client_payload": {"reason": "x", "sha": POLICY}}
+            ),
+            "at most 200 characters": trigger_context(
+                event={"action": landing.KICK_ACTION, "client_payload": {"reason": "r" * 201}}
+            ),
+        }
+        for message, context in cases.items():
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(landing.LandingError, message):
+                    landing.validate_trigger(**context)
+
+    def test_wave_completion_is_admitted_and_others_refused(self) -> None:
+        verdict = landing.validate_trigger(
+            **trigger_context(event_name="workflow_run", event_action="completed", actor="anyone", event=completion_event())
+        )
+        self.assertEqual(verdict["trigger"], landing.TRIGGER_COMPLETION)
+        self.assertEqual(verdict["workflow"], "CI")
+        cases = {
+            "is not the wave": completion_event(head_branch="main"),
+            "not first-party": completion_event(head_repository={"full_name": "fork/kin"}),
+            "is not completed": completion_event(status="in_progress"),
+            "omitted its run": {"action": "completed"},
+        }
+        for message, event in cases.items():
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(landing.LandingError, message):
+                    landing.validate_trigger(
+                        **trigger_context(event_name="workflow_run", event_action="completed", actor="anyone", event=event)
+                    )
+        with self.assertRaisesRegex(landing.LandingError, "must be 'completed'"):
+            landing.validate_trigger(
+                **trigger_context(event_name="workflow_run", event_action="requested", actor="anyone", event=completion_event())
+            )
+
+    def test_sweep_and_unknown_events(self) -> None:
+        verdict = landing.validate_trigger(
+            **trigger_context(event_name="schedule", event_action="", actor="anyone", event={"schedule": "5,20,35,50 * * * *"})
+        )
+        self.assertEqual(verdict["trigger"], landing.TRIGGER_SWEEP)
+        with self.assertRaisesRegex(landing.LandingError, "scheduled event action must be empty"):
+            landing.validate_trigger(
+                **trigger_context(event_name="schedule", event_action="x", actor="anyone", event={})
+            )
+        with self.assertRaisesRegex(landing.LandingError, "event name must be"):
+            landing.validate_trigger(**trigger_context(event_name="workflow_dispatch", event={}))
+
+    def test_cli_exit_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            event_path = Path(directory) / "event.json"
+            event_path.write_text(json.dumps({"action": landing.KICK_ACTION}), encoding="utf-8")
+            base = [
+                sys.executable, str(LANDING_PATH), "validate-trigger",
+                "--event-file", str(event_path), "--event-name", "repository_dispatch",
+                "--event-action", landing.KICK_ACTION, "--repository", REPO,
+                "--default-branch", "main", "--ref", "refs/heads/main", "--workflow-sha", POLICY,
+            ]
+            ok = subprocess.run(base + ["--actor", "kin-release-bot[bot]"], text=True, capture_output=True, check=False)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertEqual(json.loads(ok.stdout)["trigger"], landing.TRIGGER_KICK)
+            refused = subprocess.run(base + ["--actor", "outsider"], text=True, capture_output=True, check=False)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("::error title=Kin registry wave trigger refused::", refused.stderr)
+
+
+class AdmittedHeadTests(unittest.TestCase):
+    def test_unmoved_main_is_the_old_equality(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            base = initialize_repo(repo)
+            head = commit_wave(repo)
+            admitted = head_guard.validate_delta(repo, base, head, require_marker=True)
+            evidence = head_guard.validate_admitted_head(repo, base, admitted.tree, head, require_marker=True)
+            self.assertEqual((evidence.base, evidence.admitted_base, evidence.tree), (base, base, admitted.tree))
+            self.assertEqual(evidence.delta_sha256, admitted.delta_sha256)
+            with self.assertRaisesRegex(head_guard.AdmissionError, "not the admitted"):
+                head_guard.validate_admitted_head(repo, base, "0" * 40, head, require_marker=True)
+
+    def test_a_head_rebased_onto_a_moved_main_carries_the_admitted_delta(self) -> None:
+        # The pull-request action rebases the wave onto main's tip. kin#1360's
+        # head a45f85aae had parent a6852aa04, not the writing run's policy
+        # eeae72729, and the tree comparison refused it after the push.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            base = initialize_repo(repo)
+            admitted_head = commit_wave(repo)
+            admitted = head_guard.validate_delta(repo, base, admitted_head, require_marker=True)
+            tip = advance_main(repo, base)
+            run_git(repo, "cherry-pick", admitted_head)
+            rebased = run_git(repo, "rev-parse", "HEAD")
+            self.assertEqual(head_guard.first_parent(repo, rebased), tip)
+            self.assertNotEqual(run_git(repo, "rev-parse", f"{rebased}^{{tree}}"), admitted.tree)
+            evidence = head_guard.validate_admitted_head(repo, base, admitted.tree, rebased, require_marker=True)
+            self.assertEqual((evidence.base, evidence.admitted_base, evidence.head), (tip, base, rebased))
+            self.assertEqual(evidence.delta_sha256, admitted.delta_sha256)
+            self.assertEqual(evidence.paths, head_guard.ALLOWED_PATHS)
+            with self.assertRaisesRegex(head_guard.AdmissionError, "does not descend"):
+                head_guard.validate_admitted_head(repo, admitted_head, admitted.tree, rebased, require_marker=True)
+
+    def test_main_touching_the_pin_files_refuses_the_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            base = initialize_repo(repo)
+            admitted_head = commit_wave(repo)
+            admitted = head_guard.validate_delta(repo, base, admitted_head, require_marker=True)
+            advance_main(repo, base, touch_lock=True)
+            rebuilt = commit_wave(repo)
+            with self.assertRaisesRegex(head_guard.AdmissionError, "changed admitted dependency paths"):
+                head_guard.validate_admitted_head(repo, base, admitted.tree, rebuilt, require_marker=True)
+
+    def test_a_different_delta_on_the_moved_main_is_not_the_admitted_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            base = initialize_repo(repo)
+            admitted_head = commit_wave(repo)
+            admitted = head_guard.validate_delta(repo, base, admitted_head, require_marker=True)
+            advance_main(repo, base)
+            other = commit_wave(repo, dependency="=0.7.70", lock_version="0.7.70")
+            with self.assertRaisesRegex(head_guard.AdmissionError, "not the admitted"):
+                head_guard.validate_admitted_head(repo, base, admitted.tree, other, require_marker=True)
+
+    def test_a_foreign_parent_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            base = initialize_repo(repo)
+            admitted_head = commit_wave(repo)
+            admitted = head_guard.validate_delta(repo, base, admitted_head, require_marker=True)
+            run_git(repo, "switch", "-q", "--orphan", "unrelated")
+            (repo / "Cargo.toml").write_text(manifest(), encoding="utf-8")
+            (repo / "Cargo.lock").write_text("version = 4\nkin-db 0.7.67\n", encoding="utf-8")
+            (repo / "README.md").write_text("unrelated\n", encoding="utf-8")
+            run_git(repo, "add", "-A")
+            run_git(repo, "commit", "-q", "-m", "unrelated root")
+            foreign = commit_wave(repo)
+            with self.assertRaisesRegex(head_guard.AdmissionError, "does not descend"):
+                head_guard.validate_admitted_head(repo, base, admitted.tree, foreign, require_marker=True)
+
+    def test_generated_head_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            base = initialize_repo(repo)
+            admitted_head = commit_wave(repo)
+            admitted = head_guard.validate_delta(repo, base, admitted_head, require_marker=True)
+            tip = advance_main(repo, base)
+            run_git(repo, "cherry-pick", admitted_head)
+            rebased = run_git(repo, "rev-parse", "HEAD")
+            command = [
+                sys.executable, str(HEAD_GUARD_PATH), "verify-generated-head",
+                "--workspace", str(repo), "--pull", "77", "--head", rebased,
+                "--admitted-base", base, "--expected-tree", admitted.tree,
+            ]
+            ok = subprocess.run(command, text=True, capture_output=True, check=False)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            document = json.loads(ok.stdout)
+            self.assertEqual((document["parent"], document["admitted_base"]), (tip, base))
+            self.assertEqual(document["tree"], run_git(repo, "rev-parse", f"{rebased}^{{tree}}"))
+            command[-1] = "0" * 40
+            refused = subprocess.run(command, text=True, capture_output=True, check=False)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("not the admitted delta", refused.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Workflow contracts.
 # ---------------------------------------------------------------------------
@@ -905,6 +1297,31 @@ class ReceiverBindingContractTests(unittest.TestCase):
         self.assertIn('--descendant "$(jq -r .base.sha <<<"$pull")"', verifier)
         self.assertNotIn('.base.sha <<<"$pull")" != "$ADMITTED_BASE"', verifier)
 
+    def test_generated_head_is_proven_locally_not_compared_by_tree(self) -> None:
+        verifier = step_block(self.workflow, "Verify exact first-party generated PR")
+        self.assertIn("verify-kin-registry-wave-head.py verify-generated-head", verifier)
+        self.assertIn('--admitted-base "$ADMITTED_BASE"', verifier)
+        self.assertIn('--expected-tree "$EXPECTED_TREE"', verifier)
+        self.assertIn('--head "$api_head"', verifier)
+        self.assertIn('--pull "$PR"', verifier)
+        self.assertIn('[ "$(jq -r .tree <<<"$verified")" != "$api_tree" ]', verifier)
+        self.assertNotIn('[ "$api_tree" != "$EXPECTED_TREE" ]', verifier)
+
+    def test_receiver_kicks_the_judge_once_after_writing(self) -> None:
+        kick = step_block(self.workflow, "Kick the wave landing judge once")
+        self.assertIn("if: needs.prepare-wave.outputs.changed == 'true'", kick)
+        self.assertIn("GH_TOKEN: ${{ steps.app-token.outputs.token }}", kick)
+        self.assertIn("-f event_type=kin-registry-wave-land", kick)
+        self.assertIn("client_payload[reason]=receiver run", kick)
+        self.assertEqual(
+            self.mutation_job.rfind("- name:"),
+            self.mutation_job.index("- name: Kick the wave landing judge once"),
+        )
+        self.assertLess(
+            self.mutation_job.index("- name: Upload exact result for the post-completion attester"),
+            self.mutation_job.index("- name: Kick the wave landing judge once"),
+        )
+
     def test_attester_and_gate_accept_a_descendant_base(self) -> None:
         attester = ATTESTER_PATH.read_text(encoding="utf-8")
         self.assertIn('SCRIPT_DIR / "verify-protected-main-history.py"', attester)
@@ -926,16 +1343,52 @@ class LandingWorkflowContractTests(unittest.TestCase):
         cls.judge_job = job_block(cls.workflow, "judge-wave")
         cls.land_job = job_block(cls.workflow, "land-wave")
 
-    def test_triggers_are_completions_and_a_sweep_with_no_dispatch(self) -> None:
+    def test_triggers_are_the_wave_ci_the_kick_and_the_sweep(self) -> None:
         trigger = self.workflow.split("\njobs:", 1)[0]
         self.assertIn("workflow_run:", trigger)
+        self.assertIn("workflows: [CI]", trigger)
         self.assertIn("types: [completed]", trigger)
-        for workflow in ("CI", "SAST", "Secret Scan", "DCO", "PR Text Hygiene", "CodeQL"):
-            self.assertIn(f"      - {workflow}\n", trigger)
+        self.assertIn("branches: [automation/kin-registry-dependency-wave]", trigger)
+        for workflow in ("SAST", "Secret Scan", "DCO", "PR Text Hygiene", "CodeQL", "Fuzz"):
+            self.assertNotIn(f"- {workflow}\n", trigger)
+        self.assertIn("repository_dispatch:", trigger)
+        self.assertIn("types: [kin-registry-wave-land]", trigger)
         self.assertIn('cron: "5,20,35,50 * * * *"', trigger)
         self.assertNotIn("workflow_dispatch", self.workflow)
         self.assertNotIn("pull_request", trigger)
         self.assertRegex(trigger, r"(?m)^permissions:\n  contents: read$")
+
+    def test_trigger_is_validated_before_anything_reads_the_wave(self) -> None:
+        validate = step_block(self.workflow, "Validate the landing trigger")
+        self.assertIn("land-kin-registry-wave.py validate-trigger", validate)
+        for argument in (
+            '--event-file "$GITHUB_EVENT_PATH"',
+            '--event-name "$GITHUB_EVENT_NAME"',
+            '--event-action "$EVENT_ACTION"',
+            '--actor "$GITHUB_ACTOR"',
+            '--default-branch "$DEFAULT_BRANCH"',
+            '--ref "$GITHUB_REF"',
+            '--workflow-sha "$GITHUB_SHA"',
+        ):
+            self.assertIn(argument, validate)
+        self.assertNotIn("GH_TOKEN", validate)
+        self.assertIn("github.event_name == 'repository_dispatch'", self.judge_job)
+        order = [
+            self.judge_job.index(f"- name: {name}")
+            for name in (
+                "Checkout the queued landing policy",
+                "Validate the landing trigger",
+                "Bind the judgment to protected main history",
+                "Judge the wave against its full check set",
+            )
+        ]
+        self.assertEqual(order, sorted(order))
+        judge = step_block(self.workflow, "Judge the wave against its full check set")
+        self.assertIn("--wait-seconds 1500", judge)
+        self.assertIn("timeout-minutes: 40", self.judge_job)
+        source = LANDING_PATH.read_text(encoding="utf-8")
+        self.assertIn('KICK_ACTION = "kin-registry-wave-land"', source)
+        self.assertIn('KICK_ACTORS = frozenset({"troyjr4103", "kin-release-bot[bot]"})', source)
 
     def test_judge_reads_only_the_wave_and_binds_to_protected_history(self) -> None:
         self.assertIn(
@@ -965,10 +1418,6 @@ class LandingWorkflowContractTests(unittest.TestCase):
         self.assertIn("ref: ${{ github.sha }}", checkout)
         self.assertIn("persist-credentials: false", checkout)
         self.assertIn("fetch-depth: 0", checkout)
-        self.assertLess(self.judge_job.index("- name: Checkout the queued landing policy"),
-                        self.judge_job.index("- name: Bind the judgment"))
-        self.assertLess(self.judge_job.index("- name: Bind the judgment"),
-                        self.judge_job.index("- name: Judge the wave"))
         self.assertIn("decision: ${{ steps.judge.outputs.decision || 'wait' }}", self.judge_job)
 
     def test_land_runs_only_on_a_land_verdict_through_the_release_app(self) -> None:

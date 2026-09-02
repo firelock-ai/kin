@@ -3,40 +3,43 @@
 
 name: Kin Registry Wave Landing
 
-# Lands the receiver's dependency-wave pull request by itself, the moment every
-# check-run on its head has concluded green. Two arms: every completion of a
-# check-producing workflow on the wave branch, and a sweep four times an hour
-# for producers that are not workflows of this repository (CodeQL's default
-# setup) or that concluded while a judgment was already running. Both events
-# resolve this workflow from the default branch, and the judge proves
-# github.sha is protected main history before reading it as policy.
+# Lands the receiver's dependency-wave pull request by itself once every
+# check-run on its head has concluded green. Three triggers, each resolved
+# from the default branch, and the judge proves github.sha is protected main
+# history before reading it as policy:
 #
-# The judgment is scripts/land-kin-registry-wave.py, whose rule is the fleet's
-# landing rule: the FULL check-run set on the head, read by name with
-# per_page=100 and the listed length asserted against total_count, every run
-# concluded, none failed, skipped and neutral green, the six ruleset contexts
-# present, one bot commit carrying the reserved marker, a diff inside the
-# receiver's write set, and the release-App attestation verified. GitHub's own
-# auto-merge is not the mechanism: it merges on the six ruleset contexts alone,
-# and the admission chain refuses any server-owned landing state on the wave.
-# There is no manual dispatch arm, because this workflow reaches a
-# release-capable secret.
+#   - the wave branch's own CI completion (workflow_run filtered to that
+#     branch, so a completion on main or a lane never spawns a run: the
+#     first shape of this workflow listened to twelve workflows on every
+#     branch and produced a hundred skipped runs and a burst of nine
+#     cancellations in ninety seconds on one main push);
+#   - a typed repository_dispatch kick, the manual arm GitHub's cron cannot
+#     stall, admitted from the captain and the release App only, which the
+#     receiver sends once after every wave it writes;
+#   - the scheduled sweep, as a fallback.
+#
+# One judgment can outlast the checks it waits on: the judge re-reads the
+# whole snapshot for a bounded budget while the verdict is a transient wait
+# (checks running, a cancelled suite awaiting its rerun, an attestation on
+# its way, GitHub still computing mergeability, a re-pushed head), so a
+# single trigger is enough and the concurrency groups queue at most one
+# pending run behind it. The rule itself is scripts/land-kin-registry-wave.py:
+# the FULL check-run set on the head read by name with per_page=100 and the
+# listed length asserted against total_count, every run concluded, none
+# failed, skipped and neutral green, the six ruleset contexts present, one
+# bot commit carrying the reserved marker, a diff inside the receiver's write
+# set, and the release-App attestation verified. GitHub's own auto-merge is
+# not the mechanism: it merges on the six ruleset contexts alone, and the
+# admission chain refuses any server-owned landing state on the wave. There
+# is no manual dispatch arm, because this workflow reaches a release-capable
+# secret; the kick is a repository_dispatch, which cannot select a branch.
 on:
   workflow_run:
-    workflows:
-      - CI
-      - SAST
-      - Secret Scan
-      - DCO
-      - PR Text Hygiene
-      - Daemon Smoke
-      - Docker
-      - Fuzz
-      - Acceptance
-      - Install Proof Canary
-      - Link Check
-      - CodeQL
+    workflows: [CI]
     types: [completed]
+    branches: [automation/kin-registry-dependency-wave]
+  repository_dispatch:
+    types: [kin-registry-wave-land]
   schedule:
     - cron: "5,20,35,50 * * * *"
 
@@ -50,17 +53,19 @@ env:
 jobs:
   judge-wave:
     name: Judge the open Kin registry wave
-    # A completion on any other branch is not news about the wave, and a head
-    # repository other than this one is never the wave.
+    # The branch filter above already keeps foreign completions out; this is
+    # the same fact asserted where a reader of the job can see it.
     if: >-
       github.event_name == 'schedule' ||
-      (github.event.workflow_run.head_branch == 'automation/kin-registry-dependency-wave' &&
+      github.event_name == 'repository_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.head_branch == 'automation/kin-registry-dependency-wave' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     concurrency:
       group: kin-registry-wave-judge-${{ github.repository }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
     permissions:
       actions: read
       checks: read
@@ -79,40 +84,33 @@ jobs:
       # value holds every wave landing and is reported in the judgment.
       KIN_MAIN_FROZEN: ${{ vars.KIN_MAIN_FROZEN }}
     steps:
-      - name: Find the open dependency wave
-        id: find
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          count="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
-            -f state=open \
-            -f "head=${GITHUB_REPOSITORY_OWNER}:${WAVE_BRANCH}" \
-            -f "base=${BASE_BRANCH}" \
-            -f per_page=100 \
-            --jq 'length')"
-          if [[ ! "$count" =~ ^[0-9]+$ ]]; then
-            echo "::error::open wave listing did not answer with a count: $count"
-            exit 1
-          fi
-          echo "open=$count" >> "$GITHUB_OUTPUT"
-          if [ "$count" = 0 ]; then
-            echo "::notice::no open pull request from ${WAVE_BRANCH}; nothing to judge"
-          fi
-
       # The literal trusted context value: see the same checkout in
       # kin-registry-release.yml. The binding step below proves github.sha is
       # protected main's history before the judgment reads it as policy.
       - name: Checkout the queued landing policy
-        if: steps.find.outputs.open != '0'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Validate the landing trigger
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          python3 scripts/land-kin-registry-wave.py validate-trigger \
+            --event-file "$GITHUB_EVENT_PATH" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --event-action "$EVENT_ACTION" \
+            --actor "$GITHUB_ACTOR" \
+            --repository "$GITHUB_REPOSITORY" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --ref "$GITHUB_REF" \
+            --workflow-sha "$GITHUB_SHA"
+
       - name: Bind the judgment to protected main history
-        if: steps.find.outputs.open != '0'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -124,7 +122,6 @@ jobs:
 
       - name: Judge the wave against its full check set
         id: judge
-        if: steps.find.outputs.open != '0'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -132,7 +129,8 @@ jobs:
           verdict="$(python3 scripts/land-kin-registry-wave.py judge \
             --repository "$GITHUB_REPOSITORY" \
             --workspace "$GITHUB_WORKSPACE" \
-            --freeze "$KIN_MAIN_FROZEN")"
+            --freeze "$KIN_MAIN_FROZEN" \
+            --wait-seconds 1500)"
           printf '%s\n' "$verdict"
           {
             echo "decision=$(jq -r .decision <<<"$verdict")"
