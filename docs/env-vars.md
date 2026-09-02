@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (513 total, 343 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (519 total, 349 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -402,6 +402,12 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_EXPLAIN_DEF_TOPK` | usize | 0 | correctness | locate tuning knob: explain def topk |
 | `KIN_LOCATE_EXPLICIT_PHASE_MISMATCH_PENALTY` | float>=0 | 0.22 | correctness | locate tuning knob: explicit phase mismatch penalty |
 | `KIN_LOCATE_FALLBACK_TERM_LIMIT` | usize | 6 | correctness | locate tuning knob: fallback term limit |
+| `KIN_LOCATE_FILE_ANCHORS` | bool | true | correctness | locate tuning knob: file anchors |
+| `KIN_LOCATE_FILE_ANCHOR_FILES` | usize | 5 | correctness | locate tuning knob: file anchor files |
+| `KIN_LOCATE_FILE_ANCHOR_PROBE` | usize | 256 | correctness | locate tuning knob: file anchor probe |
+| `KIN_LOCATE_FILE_ANCHOR_SCORE` | float>=0 | 100.0 | correctness | locate tuning knob: file anchor score |
+| `KIN_LOCATE_FILE_ANCHOR_SHARE` | float>=0 | 0.9 | correctness | locate tuning knob: file anchor share |
+| `KIN_LOCATE_FILE_ANCHOR_TOPK` | usize | 2 | correctness | locate tuning knob: file anchor topk |
 | `KIN_LOCATE_FLOOR_PRECOMP` | bool | true | correctness | locate tuning knob: floor precomp |
 | `KIN_LOCATE_FORCE_LOCAL` | bool | false | correctness | locate tuning knob: force local |
 | `KIN_LOCATE_FRAMEWORK_NOISE_PENALTY` | float>=0 | 0.03 | correctness | locate tuning knob: framework noise penalty |

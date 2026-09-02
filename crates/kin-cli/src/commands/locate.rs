@@ -779,6 +779,20 @@ pub fn name_match_is_prose_word_collision(query: &str, name: &str) -> bool {
     locate_env_bool("KIN_LOCATE_PROSE_NAME_DEMOTION", true) && is_prose_word_collision(query, name)
 }
 
+/// Whether a locate query reads as a symbol LOOKUP rather than a question.
+///
+/// The negation of [`query_is_prose`], stated once so the file-anchor admission
+/// and the exact-name tier read the SAME rule about the same query. A lookup is
+/// short or carries no English scaffolding: under four tokens, which is the
+/// longest symbol path the tokenizer routinely produces (`crate::Type::method`),
+/// or fewer than two stopwords, which a question essentially never is.
+///
+/// This is why the twelve control lookups the ranking lane pinned stay
+/// byte-identical with anchors on: every one of them is refused here.
+fn locate_query_is_symbol_lookup(query: &str) -> bool {
+    !query_is_prose(query)
+}
+
 /// Classify one located entity against the query.
 ///
 /// Falls back on the resolution origin only when the name did not match, so a
@@ -964,6 +978,12 @@ pub struct LocateProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cosine: Option<f32>,
 }
+
+/// Resolution origin recorded on a row admitted as a ranked file's graph
+/// anchor rather than resolved from a query token. Always serialized, unlike
+/// the seed origins, so an anchor row can be told from a projected one on the
+/// surface an agent reads.
+pub const FILE_ANCHOR_ORIGIN: &str = "file_anchor";
 
 /// Default count of top ranked entities returned per `kin locate` page. Kept
 /// small (top-few high-confidence) so the agent sees the answer, not a file
@@ -17714,6 +17734,9 @@ pub fn build_entity_view(
     // (file_rank, LocateEntity) so global ranking can tie-break on file order.
     let mut ranked: Vec<(usize, LocateEntity)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // (file_rank, file score, file path, entity) for each anchor a ranked file
+    // offered.
+    let mut anchor_candidates: Vec<(usize, f32, String, kin_model::Entity)> = Vec::new();
     // Canonical-definition signal for exact-name ties (FIR-2337): owner graph
     // mass per name-hit entity id, computed for at most this many name hits so
     // a hundred-way `new` collision cannot turn projection into a graph walk.
@@ -17726,6 +17749,33 @@ pub fn build_entity_view(
     // and fall through to the file-order tie-break unchanged.
     let mut name_owner_mass: FxHashMap<String, usize> = FxHashMap::default();
     let owner_mass_limit = locate_env_usize("KIN_LOCATE_NAME_TIE_OWNER_MASS_LIMIT", 16);
+    // File-anchor admission (FIR-3079). The entity surface is a projection of
+    // the FILE ranking through the symbols a query token happened to name, so a
+    // file can rank first for a question and contribute nothing: measured on
+    // 2026-09-02, React's `ReactFiberWorkLoop.js` ranked FIRST for "what happens
+    // between a component asking for an update and that update appearing on
+    // screen" and contributed one row at rank 97 of 136, while six rows named
+    // `Component` took the page on the word "component". For a prose query the
+    // top ranked files also contribute their graph anchors, the definitions the
+    // rest of the repository depends on, so the surface can carry an answer the
+    // question never spelled. A lookup is left byte-identical.
+    let anchors_enabled =
+        locate_env_bool("KIN_LOCATE_FILE_ANCHORS", true) && !locate_query_is_symbol_lookup(query);
+    let anchor_files = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_FILES", 5);
+    let anchor_topk = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_TOPK", 2);
+    let anchor_probe = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_PROBE", 256);
+    // An anchor is a second opinion, never better evidence than the best thing
+    // retrieval actually found, so it is scored as a SHARE of this ranking's own
+    // top row rather than on an absolute constant. Measured 2026-09-02: an
+    // absolute 1500 handed rank one to `Extractor` from ripgrep's fifth-best
+    // file and pushed hiredis's right answer off rank one, which is the same
+    // failure a name-multiplier cap produced for kin#1367. A share is scale-free,
+    // so it behaves the same on a store whose text arm tops out at 280 and one
+    // where it reaches 1152.
+    let anchor_share = locate_env_f32("KIN_LOCATE_FILE_ANCHOR_SHARE", 0.9);
+    // Used only when a ranking has no scored row to take a share of, which is
+    // the docs-and-config repo whose files carry no entities at all.
+    let anchor_base = locate_env_f32("KIN_LOCATE_FILE_ANCHOR_SCORE", 100.0);
     // Built once on the first ranked file that resolves to no entity, because
     // it walks every tracked artifact and most rankings never need it.
     let mut tracked_artifacts: Option<HashSet<String>> = None;
@@ -17740,7 +17790,10 @@ pub fn build_entity_view(
             file_path: Some(kin_model::FilePathId::new(&file.path)),
             ..Default::default()
         };
-        let entities = if file.symbols.is_empty() {
+        // An anchor file is read whether or not a seed landed on it: "this file
+        // has no symbol a query token named" is the case anchors exist for.
+        let in_anchor_window = anchors_enabled && anchor_topk > 0 && file_rank < anchor_files;
+        let entities = if file.symbols.is_empty() && !in_anchor_window {
             Vec::new()
         } else {
             graph.query_entities(&filter)?
@@ -17827,11 +17880,111 @@ pub fn build_entity_view(
                 },
             ));
         }
+
+        if in_anchor_window {
+            for anchor in kin_ranking::entity_ranking::file_anchor_entities(
+                graph,
+                &entities,
+                anchor_topk,
+                anchor_probe,
+            )? {
+                if let Some(entity) = entities.iter().find(|candidate| candidate.id == anchor.id) {
+                    // Collected, not pushed: the score they take is a share of a
+                    // ranking that does not exist yet, and `seen` is deliberately
+                    // NOT claimed here so a later file's real evidence for the
+                    // same entity still wins the row.
+                    anchor_candidates.push((
+                        file_rank,
+                        file.score,
+                        file.path.clone(),
+                        entity.clone(),
+                    ));
+                }
+            }
+        }
     }
 
     // Surface penalty before the ordering, because it moves the composite score
     // the ordering then reads ([`apply_entity_surface_penalty`]).
     apply_entity_surface_penalty(&mut ranked, query);
+
+    // The anchors, beneath every row retrieval scored. The reference is this
+    // ranking's own top score, so the admission adapts to the store's scale
+    // instead of imposing one, and the share is strictly below 1.0 so an anchor
+    // can never take rank one from a row that carries real evidence. The decay
+    // keeps the file arm's order among the anchors themselves.
+    if !anchor_candidates.is_empty() {
+        let top = ranked
+            .iter()
+            .map(|(_, entity)| entity.score)
+            .fold(0.0_f32, f32::max);
+        let reference = if top > 0.0 {
+            top * anchor_share
+        } else {
+            anchor_base
+        };
+        // The file arm's own fused score carries the weight, normalized against
+        // the best file so it is a share like the reference is. A file the arm
+        // scored within a percent of its best contributes an anchor within a
+        // percent of the reference, which is the honest reading of "the file arm
+        // ranked these two nearly equally". Rank is the fallback for a ranking
+        // whose file scores are unusable.
+        let top_file = anchor_candidates
+            .iter()
+            .map(|(_, score, _, _)| *score)
+            .fold(0.0_f32, f32::max);
+        let mut admitted: Vec<(usize, LocateEntity)> = Vec::new();
+        for (file_rank, file_score, file_path, entity) in anchor_candidates {
+            let file_weight = if top_file > 0.0 && file_score > 0.0 {
+                file_score / top_file
+            } else {
+                1.0 / (1.0 + file_rank as f32)
+            };
+            let entity_id = entity.id.to_string();
+            if !seen.insert(entity_id.clone()) {
+                continue;
+            }
+            let file_origin = entity
+                .file_origin
+                .as_ref()
+                .map(|origin| origin.0.clone())
+                .or_else(|| Some(file_path.clone()));
+            // The match kind stays a fact: an anchor the query happens to name
+            // reports `name`, and one it does not reports the weaker claim,
+            // exactly as a projected symbol does.
+            let match_kind = classify_locate_match(query, &entity.name, FILE_ANCHOR_ORIGIN, None);
+            admitted.push((
+                file_rank,
+                LocateEntity {
+                    entity_id,
+                    id_space: LocateIdSpace::Entity,
+                    artifact_path: None,
+                    kind: format!("{:?}", entity.kind).to_lowercase(),
+                    name: entity.name.clone(),
+                    signature: entity.signature.clone(),
+                    score: reference
+                        * file_weight
+                        * entity_projection_role_penalty(&file_path, test_query),
+                    definition: true,
+                    span: entity_span_pair(&entity).into_iter().next(),
+                    // Bodies belong to the symbols the retrieval resolved; an
+                    // anchor carries coordinates and a signature, which is what
+                    // a focal needs to be opened.
+                    body: None,
+                    match_kind: Some(match_kind),
+                    provenance: LocateProvenance {
+                        file: file_origin,
+                        origin: FILE_ANCHOR_ORIGIN.to_string(),
+                        cosine: None,
+                    },
+                    matched_queries: Vec::new(),
+                },
+            ));
+        }
+        apply_entity_surface_penalty(&mut admitted, query);
+        ranked.extend(admitted);
+    }
+
     let owner_mass_of = |entity: &LocateEntity| {
         name_owner_mass
             .get(entity.identity_key())
@@ -21922,6 +22075,533 @@ mod tests {
                 .contains("tie_break=owner_graph_mass:0"),
             "an unbroken tie still discloses the signal it consulted, got {:?}",
             flat.entities[0].provenance.origin
+        );
+    }
+
+    /// FIR-3079, the measured shape as a fixture: locate ranks the right FILE
+    /// first and the entity surface carries nothing from it, because the
+    /// surface is a projection of the symbols a query token happened to name.
+    ///
+    /// On React the file holding `scheduleUpdateOnFiber`, `performWorkOnRoot`
+    /// and `commitRoot` ranked FIRST for "what happens between a component
+    /// asking for an update and that update appearing on screen" and put one
+    /// row at rank 97 of 136. Here the same shape is two files: the right one
+    /// ranks first and its symbols are a helper nobody asked for, while a lower
+    /// file carries a high-scoring lexical row. Rank one must become the top
+    /// file's anchor.
+    #[test]
+    fn a_prose_question_gets_the_top_ranked_files_own_anchor() {
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let file = |path: &str, score: f32, symbols: Vec<LocateSymbol>| LocateFileEntry {
+            path: path.to_string(),
+            score,
+            signals: vec![],
+            spans: vec![],
+            symbols,
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        };
+        let symbol = |name: &str, score: f32| LocateSymbol {
+            name: name.to_string(),
+            span: Some([10, 20]),
+            score,
+            kind: "function".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        };
+        let graph = kin_db::InMemoryGraph::new();
+
+        // The right file. Its anchor is what the rest of the repository calls;
+        // the symbol the retrieval resolved on it is a helper.
+        let anchor = test_entity(
+            "scheduleUpdateOnFiber",
+            "packages/react-reconciler/src/ReactFiberWorkLoop.js",
+            900,
+            980,
+        );
+        graph.upsert_entity(&anchor).unwrap();
+        for _ in 0..9 {
+            let caller = test_entity(
+                "caller",
+                "packages/react-reconciler/src/ReactFiberHooks.js",
+                1,
+                2,
+            );
+            graph.upsert_entity(&caller).unwrap();
+            graph
+                .upsert_relation(&relation(RelationKind::Calls, caller.id, anchor.id))
+                .unwrap();
+        }
+        let helper = test_entity(
+            "shouldRemainOnPreviousScreen",
+            "packages/react-reconciler/src/ReactFiberWorkLoop.js",
+            10,
+            20,
+        );
+        graph.upsert_entity(&helper).unwrap();
+
+        // The lower file, carrying the kind of high-scoring lexical row that
+        // takes the page today.
+        let lexical = test_entity(
+            "updateDehydratedSuspenseComponent",
+            "packages/react-reconciler/src/ReactFiberBeginWork.js",
+            10,
+            20,
+        );
+        graph.upsert_entity(&lexical).unwrap();
+        // The second file has an anchor of its own, so the decay is pinned: it
+        // must sort below the first file's anchor even though its mass is
+        // higher. Without a decay the file arm's order would be lost here.
+        let second_anchor = test_entity(
+            "beginWork",
+            "packages/react-reconciler/src/ReactFiberBeginWork.js",
+            100,
+            400,
+        );
+        graph.upsert_entity(&second_anchor).unwrap();
+        for _ in 0..30 {
+            let caller = test_entity(
+                "beginWorkCaller",
+                "packages/react-reconciler/src/ReactFiberHooks.js",
+                1,
+                2,
+            );
+            graph.upsert_entity(&caller).unwrap();
+            graph
+                .upsert_relation(&relation(RelationKind::Calls, caller.id, second_anchor.id))
+                .unwrap();
+        }
+
+        let question = "what happens between a component asking for an update \
+                        and that update appearing on screen";
+        let build = |anchors: &str| {
+            let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHORS", anchors);
+            let mut result = LocateResult {
+                files: vec![
+                    file(
+                        "packages/react-reconciler/src/ReactFiberWorkLoop.js",
+                        0.14,
+                        vec![symbol("shouldRemainOnPreviousScreen", 95.7)],
+                    ),
+                    file(
+                        "packages/react-reconciler/src/ReactFiberBeginWork.js",
+                        0.13,
+                        vec![symbol("updateDehydratedSuspenseComponent", 852.2)],
+                    ),
+                ],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                question,
+                false,
+            )
+            .unwrap();
+            result
+        };
+
+        // Control first: this is the defect, and the test cannot pass by
+        // accident on a fixture where the anchor was already reachable.
+        let shipped = build("0");
+        let shipped_names: Vec<&str> = shipped
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert_eq!(
+            shipped_names,
+            vec![
+                "updateDehydratedSuspenseComponent",
+                "shouldRemainOnPreviousScreen"
+            ],
+            "control: without anchors the right file contributes only its helper"
+        );
+
+        let fixed = build("1");
+        let names: Vec<&str> = fixed
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "updateDehydratedSuspenseComponent",
+                "scheduleUpdateOnFiber",
+                "beginWork",
+                "shouldRemainOnPreviousScreen"
+            ],
+            "the anchor of the FIRST file is admitted beneath the row retrieval \
+             scored, above the second file's anchor, got {:?}",
+            fixed
+                .entities
+                .iter()
+                .map(|e| (&e.name, e.score))
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            fixed.entities[0].provenance.origin, FILE_ANCHOR_ORIGIN,
+            "an anchor never takes rank one from a row that carries evidence"
+        );
+        assert_eq!(
+            fixed.entities[1].provenance.origin, FILE_ANCHOR_ORIGIN,
+            "and an anchor row says on the surface why it is there"
+        );
+        assert!(
+            fixed.entities[1].score < fixed.entities[0].score,
+            "the share is strictly below the ranking's own top score"
+        );
+        assert!(
+            fixed.entities[1].score > fixed.entities[2].score,
+            "and the decay separates the two anchors rather than tying them: {} vs {}",
+            fixed.entities[1].score,
+            fixed.entities[2].score
+        );
+    }
+
+    /// A query that IS an identifier must be answered exactly as it was before
+    /// anchors existed. The control is the same fixture under a question, which
+    /// must differ: a rule that admitted nothing anywhere would pass the first
+    /// assertion alone.
+    #[test]
+    fn a_symbol_lookup_ranking_is_byte_identical_with_anchors_on() {
+        let file = |path: &str, symbols: Vec<LocateSymbol>| LocateFileEntry {
+            path: path.to_string(),
+            score: 0.2,
+            signals: vec![],
+            spans: vec![],
+            symbols,
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        };
+        let graph = kin_db::InMemoryGraph::new();
+        let mut widget = test_entity(
+            "CodeEditorWidget",
+            "src/vs/editor/browser/widget/codeEditorWidget.ts",
+            60,
+            900,
+        );
+        widget.kind = EntityKind::Class;
+        graph.upsert_entity(&widget).unwrap();
+        let other = test_entity(
+            "createTextModel",
+            "src/vs/editor/browser/widget/codeEditorWidget.ts",
+            10,
+            20,
+        );
+        graph.upsert_entity(&other).unwrap();
+
+        let build = |query: &str, anchors: &str| {
+            let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHORS", anchors);
+            let mut result = LocateResult {
+                files: vec![file(
+                    "src/vs/editor/browser/widget/codeEditorWidget.ts",
+                    vec![LocateSymbol {
+                        name: "createTextModel".to_string(),
+                        span: Some([10, 20]),
+                        score: 450.0,
+                        kind: "function".to_string(),
+                        definition: true,
+                        origin: "text".to_string(),
+                        cosine: None,
+                        snippet: None,
+                    }],
+                )],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                query,
+                false,
+            )
+            .unwrap();
+            result
+                .entities
+                .iter()
+                .map(|entity| entity.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            build("createTextModel", "1"),
+            build("createTextModel", "0"),
+            "a lookup is answered exactly as before"
+        );
+        assert_ne!(
+            build(
+                "how does a typed character reach the model behind the editor",
+                "1"
+            ),
+            build(
+                "how does a typed character reach the model behind the editor",
+                "0"
+            ),
+            "control: the same fixture under a question must differ, or the \
+             lookup assertion above proves nothing"
+        );
+    }
+
+    /// The lookup gate is the negation of kin#1367's `query_is_prose`, and this
+    /// pins both of its floors from both sides. An off-by-one in either constant
+    /// shows up here as a named case rather than as a ranking that quietly moved.
+    #[test]
+    fn the_lookup_shape_rule_reads_both_of_its_floors() {
+        // Every control the ranking lane holds byte-identical is a lookup here.
+        for control in [
+            "redisReaderGetReply",
+            "redisFormatCommand",
+            "send",
+            "socket",
+            "redisReader::redisReaderGetReply",
+            "Gitignore",
+            "SearchWorker::search",
+            "WalkParallel",
+            "walk",
+            "search",
+            "end",
+            "Match::end",
+            "TextModel",
+            "CodeEditorWidget",
+        ] {
+            assert!(
+                locate_query_is_symbol_lookup(control),
+                "{control} must be answered as a lookup"
+            );
+        }
+        // The token floor, both sides. Three words is the longest symbol path
+        // the tokenizer produces.
+        assert!(locate_query_is_symbol_lookup("is it the"));
+        assert!(!locate_query_is_symbol_lookup("is it the walk"));
+        // The stopword floor, both sides.
+        assert!(locate_query_is_symbol_lookup(
+            "walk the parse_request handler"
+        ));
+        assert!(!locate_query_is_symbol_lookup(
+            "walk the parse_request in handler"
+        ));
+        // A question that NAMES an identifier is still prose, so anchors are
+        // admitted beneath it; the exact-name tier is what keeps the named hit
+        // at rank one, and that rule lives in kin#1367 rather than here.
+        assert!(!locate_query_is_symbol_lookup(
+            "where is prune_orphaned_vectors decided in this repository"
+        ));
+        // The measured questions, all prose.
+        assert!(!locate_query_is_symbol_lookup(
+            "When I type a character in the editor, how does it end up in the \
+             document? Walk me through the path."
+        ));
+        assert!(!locate_query_is_symbol_lookup(
+            "How does ripgrep decide which files to look at, and how does it \
+             honour the ignore rules a project sets?"
+        ));
+    }
+
+    /// A method's anchor is its owning type. Without the kind rule a
+    /// widely-called method takes both anchor slots its file has, which is the
+    /// same failure by another route: the surface fills with one type's
+    /// internals and never names the type.
+    #[test]
+    fn a_widely_called_method_never_takes_an_anchor_slot() {
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let graph = kin_db::InMemoryGraph::new();
+        let path = "src/vs/editor/browser/widget/codeEditorWidget.ts";
+        let mut method = test_entity("CodeEditorWidget.trigger", path, 700, 760);
+        method.kind = EntityKind::Method;
+        graph.upsert_entity(&method).unwrap();
+        for _ in 0..40 {
+            let caller = test_entity(
+                "caller",
+                "src/vs/editor/contrib/find/findController.ts",
+                1,
+                2,
+            );
+            graph.upsert_entity(&caller).unwrap();
+            graph
+                .upsert_relation(&relation(RelationKind::Calls, caller.id, method.id))
+                .unwrap();
+        }
+        let mut widget = test_entity("CodeEditorWidget", path, 60, 900);
+        widget.kind = EntityKind::Class;
+        graph.upsert_entity(&widget).unwrap();
+
+        let mut result = LocateResult {
+            files: vec![LocateFileEntry {
+                path: path.to_string(),
+                score: 0.25,
+                signals: vec![],
+                spans: vec![],
+                symbols: vec![],
+                explain: vec![],
+                provenance: None,
+                signal_scores: None,
+                score_breakdown: None,
+                matched_queries: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut result,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "how does a typed character reach the model behind the editor",
+            false,
+        )
+        .unwrap();
+        let names: Vec<&str> = result
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["CodeEditorWidget"],
+            "the class is the anchor even though the method carries forty times its mass"
+        );
+    }
+
+    /// The decay is the protection, and it is measured: on ripgrep the file
+    /// holding `Walk` ranked FIFTH while rank one was a genuinely right answer
+    /// the query named. An anchor from a fifth-ranked file must not take that
+    /// rank away.
+    #[test]
+    fn an_anchor_from_a_low_ranked_file_does_not_outrank_a_named_hit() {
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let graph = kin_db::InMemoryGraph::new();
+        let named = test_entity("WalkBuilder::ignore", "crates/ignore/src/walk.rs", 890, 900);
+        graph.upsert_entity(&named).unwrap();
+        let mut deep = test_entity("Walk", "crates/ignore/src/walk.rs", 1117, 1200);
+        deep.kind = EntityKind::Class;
+        graph.upsert_entity(&deep).unwrap();
+        for _ in 0..60 {
+            let caller = test_entity("caller", "crates/core/search.rs", 1, 2);
+            graph.upsert_entity(&caller).unwrap();
+            graph
+                .upsert_relation(&relation(RelationKind::Calls, caller.id, deep.id))
+                .unwrap();
+        }
+
+        let spacer = |path: &str, score: f32| LocateFileEntry {
+            path: path.to_string(),
+            score,
+            signals: vec![],
+            spans: vec![],
+            symbols: vec![],
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        };
+        // File order is the measured one: walk.rs ranked FIFTH and still
+        // produced the entity ranking's rank one, so the anchor decay is what
+        // has to protect it. At rank five that anchor scores 300 against the
+        // named hit's 1052, which is a score decision and not a tier one, so
+        // this stays true whatever the exact-name tier is later ruled to do.
+        let mut result = LocateResult {
+            files: vec![
+                spacer("crates/regex/src/literal.rs", 0.231),
+                spacer("crates/core/flags/defs.rs", 0.227),
+                spacer("crates/ignore/src/incremental.rs", 0.226),
+                spacer("crates/ignore/src/dir.rs", 0.226),
+                LocateFileEntry {
+                    path: "crates/ignore/src/walk.rs".to_string(),
+                    score: 0.223,
+                    signals: vec![],
+                    spans: vec![],
+                    symbols: vec![LocateSymbol {
+                        name: "WalkBuilder::ignore".to_string(),
+                        span: Some([890, 900]),
+                        score: 1052.0,
+                        kind: "method".to_string(),
+                        definition: true,
+                        origin: "text".to_string(),
+                        cosine: None,
+                        snippet: None,
+                    }],
+                    explain: vec![],
+                    provenance: None,
+                    signal_scores: None,
+                    score_breakdown: None,
+                    matched_queries: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut result,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "how does ripgrep decide which files to look at and honour the ignore rules",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            result.entities[0].name,
+            "WalkBuilder::ignore",
+            "a hit the query named keeps rank one, got {:?}",
+            result
+                .entities
+                .iter()
+                .map(|e| (&e.name, e.score))
+                .collect::<Vec<_>>()
+        );
+        let walk = result
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Walk")
+            .expect("the anchor the question was actually about is now on the page");
+        assert_eq!(walk.provenance.origin, FILE_ANCHOR_ORIGIN);
+        assert!(
+            walk.score < result.entities[0].score,
+            "and it is admitted beneath the evidence, not above it: {} vs {}",
+            walk.score,
+            result.entities[0].score
         );
     }
 
