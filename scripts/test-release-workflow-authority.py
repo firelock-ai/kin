@@ -700,6 +700,15 @@ CI_JOB_DISPLAY_NAMES = {
     "fast-gate-lint": "Fast gate lint and policy",
     "fast-gate-tests": "Fast gate test shard",
     "fast-gate-tests-aggregate": "Fast gate build and tests",
+    # The served MCP surface, graded on the pull request that moves it. Five
+    # assertions read that surface and all five run only on main's push, so a
+    # profile change that moved a served name and trimmed three schema knobs and
+    # a description sentence was `skipped` across 44 of 44 check runs on its own
+    # pull request and red on main for four landings. This job publishes no
+    # required context and claims none: `bin/kin-lane merge land` refuses on any
+    # check that is not green by name, and ruleset 19746451 is what would make it
+    # additionally block a merge through GitHub's own UI.
+    "mcp-surface-contract": "MCP surface contract",
     # The inert pull-request producer of the two expanded `Check & Test` names.
     # It covered documentation-only diffs alone until FIR-2815 moved the ubuntu
     # and macOS suites off the pull-request path; it now covers every pull

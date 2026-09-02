@@ -730,6 +730,15 @@ def main(argv):
     results = run_checks(suite, opts.verbose)
     for res in results:
         print("CHECK %s %s %s %s" % (res.id, res.source, res.status, res.detail))
+    # A run that graded fewer checks than this file declares reported a green
+    # summary for coverage it never had, which is the shape every check in here
+    # exists to refuse. It is its own outcome rather than a pass with a warning.
+    if len(results) != len(CHECK_TITLES):
+        print(
+            "mcp surface contract: graded %d of %d checks, so this run says nothing "
+            "about the ones it skipped" % (len(results), len(CHECK_TITLES))
+        )
+        return 2
     failed = [res for res in results if res.status == FAIL]
     unread = [res for res in results if res.status == UNREADABLE]
     print(
