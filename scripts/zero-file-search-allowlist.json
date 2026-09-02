@@ -190,7 +190,7 @@
       "allow_match": [
         {
           "expr": "std::process::",
-          "count": 58
+          "count": 59
         },
         {
           "expr": "tokio::process::",
@@ -199,6 +199,10 @@
         {
           "expr": "std::os::unix::process::",
           "count": 5
+        },
+        {
+          "expr": "std::os::windows::process::",
+          "count": 1
         },
         {
           "expr": "Command::new(&self.executable)",
