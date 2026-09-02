@@ -816,7 +816,14 @@ pub fn count_repository_transfer_packs<B: StorageBackend + ?Sized + 'static>(
 
 /// Everything one coherent authority lease contributes to a pack.
 struct TransferSourceContext {
-    all_changes: std::collections::HashMap<SemanticChangeId, SemanticChange>,
+    /// Held as `ChangeMap` rather than the `HashMap` it derefs to, so a
+    /// converted store's history stays on disk. The map decodes on first use
+    /// and its clone shares the encoded source, so building this context costs
+    /// a pointer; converting to the inner `HashMap` here would force the whole
+    /// history into memory for every transfer, including the ones whose
+    /// closure touches a handful of changes. Every read below reaches the map
+    /// through `Deref`, so the sites are unchanged.
+    all_changes: kin_db::storage::ChangeMap,
     source_head: SemanticChangeId,
     source_git_authority_hash: Option<Hash256>,
     /// The authority this transfer will ESTABLISH, present only when the
