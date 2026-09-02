@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 pub mod backend;
+pub mod broken_pipe;
 pub mod capability;
 pub mod commands;
 pub mod daemon_client;
