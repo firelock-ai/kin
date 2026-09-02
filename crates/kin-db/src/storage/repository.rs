@@ -61,8 +61,27 @@ use crate::storage::format::{
 use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
 use crate::types::ResolvedGraphState;
 
-/// Persisted repository-envelope schema.
-pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;
+/// Persisted repository-envelope schema this binary WRITES.
+///
+/// Moved 3 to 4 when commit receipts stopped repeating their operation records
+/// (FIR-3064). The snapshot version ladder is what refuses an older BINARY at
+/// the frame header, before it decodes anything; this constant is what a new
+/// envelope declares, and what makes [`HISTORY_VALIDATION_VERSION`] refuse
+/// every durable validation proof minted against the shape that came before,
+/// so an already-written store revalidates in full on its first open here.
+pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 4;
+
+/// The oldest persisted envelope schema this binary READS.
+///
+/// Reading has to be a range and writing a point, and conflating them is a
+/// migration nobody asked for. A schema-3 envelope differs from a schema-4 one
+/// only in that its receipts still carry the operation record the log already
+/// holds, which the receipt's own trailing `serde(default)` reads either way
+/// and which `validate_against` still checks against the log. Refusing it would
+/// have made every store on disk unopenable by this binary; an equality check
+/// here did exactly that, and the daemon-attribution run is what caught it:
+/// `unsupported repository authority schema 3; expected 4` on a real store.
+pub const MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;
 
 /// Revision of what `open`'s full validation path accepts and rejects.
 ///
@@ -101,7 +120,7 @@ pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;
 /// minting this revision, records from the earlier binary are honored by the
 /// later one, so the two must land in the order that keeps each value
 /// unambiguous, or the revision must move to separate them.
-const HISTORY_VALIDATION_COVERAGE_REVISION: u32 = 2;
+const HISTORY_VALIDATION_COVERAGE_REVISION: u32 = 3;
 
 /// Version of the complete open-time validation a durable history-validation
 /// record stands for.
@@ -527,6 +546,133 @@ pub struct WorkspaceAdmissionSnapshot {
     pub matcher: ResolvedAdmissionMatcher,
 }
 
+/// One durable commit receipt, as this repository persists it.
+///
+/// Everything [`RepositoryCommitReceipt`] carries except the operation record,
+/// which `operation_log` already holds under the same `operation_id`. The
+/// repository wrote both, and they are the same record: measured on a full VS
+/// Code tree, `operation_log[0]` is 800,755,477 bytes and `receipts[0]` is
+/// 800,756,236, together 41.8 percent of a 3,859,076,152-byte store, and the
+/// envelope holding them decodes to 4,854,246,200 bytes in memory, 125.8
+/// percent of the whole store on disk (FIR-3064).
+///
+/// So the receipt names its operation rather than repeating it. Every check the
+/// pairing rested on still runs: a receipt's own `operation_id`,
+/// `repository_id`, `transaction_hash`, `roots_before` and `roots_after` are
+/// still compared against the log entry it names, which is exactly what
+/// `RepositoryCommitReceipt::validate` compared them against when the record
+/// was embedded. What is gone is the comparison of a copy against its original,
+/// which has no meaning once there is one record.
+///
+/// `operation` is `Some` only in a store written before this change. rmp_serde
+/// writes a struct as a positional array, and this field is last, so an
+/// eight-element receipt from an older store decodes with it present and a
+/// seven-element one takes the default. Those older stores are still validated
+/// against their embedded copy, and the open drops it once that check passes,
+/// so a legacy store pays the duplicate as a transient rather than as resident
+/// memory, and stops paying it entirely at its next commit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistedCommitReceipt {
+    pub operation_id: OperationId,
+    pub repository_id: RepositoryId,
+    pub transaction_hash: Hash256,
+    pub outcome: RepositoryCommitOutcome,
+    pub generation: u64,
+    pub roots_before: RootBundle,
+    pub roots_after: RootBundle,
+    /// The embedded operation record a pre-v15 store carries. Never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<RepositoryOperationRecord>,
+}
+
+impl PersistedCommitReceipt {
+    /// The receipt without its operation record.
+    pub fn trimmed(receipt: &RepositoryCommitReceipt) -> Self {
+        Self {
+            operation_id: receipt.operation_id,
+            repository_id: receipt.repository_id.clone(),
+            transaction_hash: receipt.transaction_hash,
+            outcome: receipt.outcome,
+            generation: receipt.generation,
+            roots_before: receipt.roots_before.clone(),
+            roots_after: receipt.roots_after.clone(),
+            operation: None,
+        }
+    }
+
+    /// The whole receipt again, with the operation this one names.
+    ///
+    /// The caller supplies the record from the operation log. Refuses a record
+    /// that is not the one this receipt names, because a receipt reunited with
+    /// the wrong operation is worse than one with none.
+    pub fn rejoin(
+        &self,
+        operation: &RepositoryOperationRecord,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        if operation.operation_id != self.operation_id {
+            return Err(storage(format!(
+                "receipt {} cannot be rejoined with operation {}",
+                self.operation_id, operation.operation_id
+            )));
+        }
+        let receipt = RepositoryCommitReceipt {
+            operation_id: self.operation_id,
+            repository_id: self.repository_id.clone(),
+            transaction_hash: self.transaction_hash,
+            outcome: self.outcome,
+            generation: self.generation,
+            roots_before: self.roots_before.clone(),
+            roots_after: self.roots_after.clone(),
+            operation: operation.clone(),
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    /// The checks `RepositoryCommitReceipt::validate` made, against the log
+    /// entry this receipt names rather than against an embedded copy of it.
+    ///
+    /// This is where the duplication paid for itself and where it stops needing
+    /// to: every field compared here was compared before, and the record on the
+    /// other side of the comparison is now the log's rather than the receipt's
+    /// own copy of the log's.
+    pub fn validate_against(
+        &self,
+        operation: &RepositoryOperationRecord,
+    ) -> Result<(), KinDbError> {
+        if self.operation_id != operation.operation_id
+            || self.repository_id != operation.repository_id
+            || self.transaction_hash != operation.transaction_hash
+            || self.roots_before != operation.roots_before
+            || self.roots_after != operation.roots_after
+        {
+            return Err(storage(format!(
+                "receipt {} does not match its committed operation",
+                self.operation_id
+            )));
+        }
+        if self.generation != self.roots_after.generation {
+            return Err(storage(format!(
+                "repository receipt generation {} does not match roots-after generation {}",
+                self.generation, self.roots_after.generation
+            )));
+        }
+        // A pre-v15 store still carries its embedded copy, and while it is here
+        // it is still checked. Dropping the check with the field would retire a
+        // guarantee for stores that have not been rewritten yet.
+        if let Some(embedded) = &self.operation {
+            if embedded != operation {
+                return Err(storage(format!(
+                    "receipt {} embeds an operation record that is not the one the log holds",
+                    self.operation_id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Complete repository-authority metadata stored inside one graph snapshot.
 ///
 /// Every vector with set semantics is kept in canonical sorted order.
@@ -545,7 +691,7 @@ pub struct PersistedRepositoryAuthority {
     pub workspaces: Vec<WorkspaceState>,
     pub admission_policies: Vec<ChangeAdmissionPolicy>,
     pub local_overlays: Vec<FrozenLocalOverlay>,
-    pub receipts: Vec<RepositoryCommitReceipt>,
+    pub receipts: Vec<PersistedCommitReceipt>,
     /// Durable merge state, at most one record per workspace.
     ///
     /// Deliberately last, and omitted when empty. The envelope is persisted
@@ -596,10 +742,16 @@ impl PersistedRepositoryAuthority {
         admitted: &AdmittedChangeMap<'_>,
     ) -> Result<(), KinDbError> {
         let mut timer = PublicationPhaseTimer::start();
-        if self.schema_version != REPOSITORY_AUTHORITY_SCHEMA_VERSION {
+        if !(MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION..=REPOSITORY_AUTHORITY_SCHEMA_VERSION)
+            .contains(&self.schema_version)
+        {
             return Err(storage(format!(
-                "unsupported repository authority schema {}; expected {}",
-                self.schema_version, REPOSITORY_AUTHORITY_SCHEMA_VERSION
+                "unsupported repository authority schema {}; this binary reads {} through {} \
+                 and writes {}",
+                self.schema_version,
+                MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION,
+                REPOSITORY_AUTHORITY_SCHEMA_VERSION,
+                REPOSITORY_AUTHORITY_SCHEMA_VERSION
             )));
         }
         self.roots.validate()?;
@@ -701,7 +853,7 @@ impl PersistedRepositoryAuthority {
                 self.receipts.len()
             )));
         }
-        let receipts: BTreeMap<OperationId, &RepositoryCommitReceipt> = self
+        let receipts: BTreeMap<OperationId, &PersistedCommitReceipt> = self
             .receipts
             .iter()
             .map(|receipt| (receipt.operation_id, receipt))
@@ -727,12 +879,10 @@ impl PersistedRepositoryAuthority {
                     operation.operation_id
                 ))
             })?;
-            receipt.validate()?;
-            if receipt.outcome != RepositoryCommitOutcome::Committed
-                || receipt.operation != *operation
-            {
+            receipt.validate_against(operation)?;
+            if receipt.outcome != RepositoryCommitOutcome::Committed {
                 return Err(storage(format!(
-                    "receipt {} does not match its committed operation",
+                    "receipt {} does not record a committed operation",
                     operation.operation_id
                 )));
             }
@@ -3281,7 +3431,19 @@ fn prepare_repository_commit_decision_from<B: StorageBackend + ?Sized>(
             ))
             .into());
         }
-        let mut replay = receipt.clone();
+        // The receipt names its operation rather than carrying it, so the
+        // replay reads that record from the log this same envelope holds.
+        let operation = metadata
+            .operation_log
+            .iter()
+            .find(|operation| operation.operation_id == receipt.operation_id)
+            .ok_or_else(|| {
+                storage(format!(
+                    "operation {} has a receipt and no log entry",
+                    receipt.operation_id
+                ))
+            })?;
+        let mut replay = receipt.rejoin(operation)?;
         replay.outcome = RepositoryCommitOutcome::IdempotentReplay;
         return Ok(AuthorityCommitDecision::IdempotentReplay { output: replay });
     }
@@ -3490,13 +3652,6 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     let roots_ms = timer.lap_ms();
     drop(lap);
 
-    // A publish carries whatever section its base already had, or none, and
-    // never writes one: see the note in `apply_workspace`. The version still
-    // has to follow the contents, because a successor built from a base that
-    // carried a section is itself a v14 snapshot and `to_bytes` refuses any
-    // snapshot whose declared version disagrees with what it holds.
-    snapshot.version = snapshot.wire_version();
-
     let lap = tracing::info_span!("kindb.prepare.storage_admission").entered();
     operation.roots_after = metadata.roots.clone();
     *metadata
@@ -3515,11 +3670,28 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         operation,
     };
     receipt.validate()?;
-    metadata.receipts.push(receipt.clone());
+    // Trimmed, because `metadata.operation_log` already holds this exact
+    // record: the two together were 41.8 percent of a full VS Code store and
+    // 2.43 GB of the envelope's 4.85 GB in memory (FIR-3064).
+    metadata
+        .receipts
+        .push(PersistedCommitReceipt::trimmed(&receipt));
     metadata
         .receipts
         .sort_by_key(|persisted| persisted.operation_id);
     snapshot.repository_authority = Some(metadata);
+    // A publish carries whatever section its base already had, or none, and
+    // never writes one: see the note in `apply_workspace`. The version still
+    // has to follow the contents, because a successor built from a base that
+    // carried a section is itself a v14 snapshot and `to_bytes` refuses any
+    // snapshot whose declared version disagrees with what it holds.
+    //
+    // AFTER the authority is put back, not before. The version now reads two
+    // facts, and the second of them is whether the receipts name their
+    // operations, which is not knowable until the receipt written above is in
+    // the snapshot. Setting it earlier declared v13 on a body that serializes
+    // as v15 and `to_bytes` refused every publish.
+    snapshot.version = snapshot.wire_version();
     // Every input to the Git projection tree replay is final by the time
     // `apply_git_authority` proves it above: `snapshot.changes` after
     // `admit_changes`, the external objects after `admit_external_objects`, the
@@ -15397,8 +15569,8 @@ mod tests {
         // HISTORY_VALIDATION_COVERAGE_REVISION and update this expectation
         // together; if nothing about coverage moved, leave both alone.
         assert_eq!(
-            HISTORY_VALIDATION_VERSION, 1_302,
-            "envelope schema 3 and coverage revision 2 compose to 1302"
+            HISTORY_VALIDATION_VERSION, 1_403,
+            "envelope schema 4 and coverage revision 3 compose to 1403"
         );
         // That literal is the whole test. The rest of this comment exists so
         // nobody reads the test as stronger than it is, or pads it with
@@ -15635,6 +15807,18 @@ mod tests {
         chain_source: EntityId,
         chain_target: EntityId,
     }
+
+    /// Documentation bytes the receipt guard puts in its one modified entity,
+    /// so the operation record it commits has mass worth not repeating.
+    const RECEIPT_GUARD_PAYLOAD_BYTES: usize = 64 * 1024;
+
+    /// How much smaller than the operation log the receipts index has to be.
+    ///
+    /// Repeating the record makes the two the same size, so anything above one
+    /// fails the regression. Ten leaves room for the receipt's own seven fields
+    /// on a fixture whose log is only 64 KB, and shrinks toward nothing as the
+    /// log grows, which is the direction that matters.
+    const RECEIPT_INDEX_SHARE_DIVISOR: usize = 10;
 
     fn build_synthetic_history_store(
         add_changes: usize,
@@ -17646,6 +17830,181 @@ mod tests {
         assert_eq!(
             advanced_base_changes, 0,
             "the two bases this mutation resolved carried {advanced_base_changes} changes              between them out of the repository's {history_changes}"
+        );
+    }
+
+    /// A store written before the receipts were trimmed still opens.
+    ///
+    /// This is the migration this change must not require, and an equality
+    /// check on the envelope schema silently created one: every store on disk
+    /// declares schema 3, and a binary that accepted only 4 refused all of
+    /// them with `unsupported repository authority schema 3; expected 4`. The
+    /// PR body said no migration was needed while the code required one, and
+    /// nothing in the suite disagreed, because every fixture writes the schema
+    /// the binary writes.
+    ///
+    /// So the fixture is aged deliberately: a real committed store, put back to
+    /// the shape it had before, with its receipt carrying the operation record
+    /// again and its envelope declaring schema 3. Reading has to be a range and
+    /// writing a point.
+    #[test]
+    fn a_store_from_before_the_receipts_were_trimmed_still_opens() {
+        let store = build_synthetic_history_store(2, 4, 1, 2);
+        let lease = store.manager.read_authority();
+        let mut snapshot = lease.snapshot().clone();
+        drop(lease);
+
+        let metadata = snapshot
+            .repository_authority
+            .as_mut()
+            .expect("the committed store carries an envelope");
+        assert_eq!(
+            metadata.schema_version, REPOSITORY_AUTHORITY_SCHEMA_VERSION,
+            "the fixture must start at the schema this binary writes"
+        );
+        assert!(
+            metadata
+                .receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_none()),
+            "the fixture must start trimmed, or ageing it below proves nothing"
+        );
+
+        // Age it: every receipt carries its operation record again, and the
+        // envelope declares the schema that shape was written under.
+        let log: std::collections::BTreeMap<_, _> = metadata
+            .operation_log
+            .iter()
+            .map(|operation| (operation.operation_id, operation.clone()))
+            .collect();
+        for receipt in &mut metadata.receipts {
+            receipt.operation = Some(
+                log.get(&receipt.operation_id)
+                    .expect("every receipt names a logged operation")
+                    .clone(),
+            );
+        }
+        metadata.schema_version = MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION;
+        snapshot.version = snapshot.wire_version();
+
+        // The aged store round-trips through the persisted format and validates
+        // on the way back, which is what an open does.
+        let bytes = snapshot.to_bytes().expect("the aged snapshot serializes");
+        let reopened = GraphSnapshot::from_bytes(&bytes).expect("the aged snapshot decodes");
+        let aged = reopened
+            .repository_authority
+            .as_ref()
+            .expect("the aged envelope survives the round trip");
+        assert_eq!(aged.schema_version, MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION);
+        assert!(
+            aged.receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_some()),
+            "the aged receipts must still carry their operation records"
+        );
+        for operation in &aged.operation_log {
+            let receipt = aged
+                .receipts
+                .iter()
+                .find(|receipt| receipt.operation_id == operation.operation_id)
+                .expect("every aged operation has a receipt");
+            receipt
+                .validate_against(operation)
+                .expect("an aged receipt is still checked against its embedded copy");
+        }
+
+        // The negative controls, so the range is a range and not an acceptance
+        // of anything.
+        let mut too_old = reopened.clone();
+        too_old
+            .repository_authority
+            .as_mut()
+            .expect("envelope")
+            .schema_version = MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION - 1;
+        assert!(
+            too_old.validate_storage_admission().is_err(),
+            "a schema below the readable range must be refused"
+        );
+        let mut too_new = reopened.clone();
+        too_new
+            .repository_authority
+            .as_mut()
+            .expect("envelope")
+            .schema_version = REPOSITORY_AUTHORITY_SCHEMA_VERSION + 1;
+        assert!(
+            too_new.validate_storage_admission().is_err(),
+            "a schema above the readable range must be refused"
+        );
+    }
+
+    /// A persisted receipt names its operation record rather than repeating it.
+    ///
+    /// The two were the same record and the store held both. Measured on a full
+    /// VS Code tree, `operation_log[0]` is 800,755,477 bytes and `receipts[0]`
+    /// is 800,756,236, together 41.8 percent of a 3,859,076,152-byte store, and
+    /// the envelope decodes to 4,854,246,200 bytes in memory, of which half is
+    /// the copy (FIR-3064).
+    ///
+    /// Asserted on the store's shape rather than on a resident-set number,
+    /// because the shape is what changed: the envelope in memory is decoded
+    /// from these bytes, so a receipts index that no longer carries the
+    /// mutation cannot decode into a second copy of it.
+    #[test]
+    fn a_persisted_receipt_names_its_operation_rather_than_repeating_it() {
+        let store = build_synthetic_history_store(2, 4, 1, 2);
+        let old = materialize_synthetic(&store)
+            .entities
+            .get(&store.modified_entity)
+            .expect("modified entity resolves in the workspace graph")
+            .clone();
+        let mut new = old.clone();
+        // Mass, so the operation record is worth not repeating. Without it both
+        // sides of the comparison below are small and their ratio says nothing,
+        // which the log-size assertion is the control for.
+        new.doc_summary = Some("fir3064 ".repeat(RECEIPT_GUARD_PAYLOAD_BYTES / 8));
+        let delta =
+            WorkspaceSemanticDelta::new(vec![EntityDelta::Modified { old, new }], Vec::new())
+                .expect("the fat semantic delta is well formed");
+        let transaction = semantic_workspace_transaction(&store.manager, 0xfa_3064_0001, delta);
+        store
+            .manager
+            .commit_repository_transaction(transaction)
+            .expect("the workspace transaction commits");
+
+        let lease = store.manager.read_authority();
+        let metadata = lease.metadata();
+        assert!(
+            !metadata.receipts.is_empty(),
+            "the commit must have written a receipt, or this asserts nothing"
+        );
+        assert!(
+            metadata
+                .receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_none()),
+            "a receipt this binary wrote must name its operation, not carry it"
+        );
+
+        let log_bytes = encoded_len(&metadata.operation_log);
+        let receipt_bytes = encoded_len(&metadata.receipts);
+        // The positive control on the comparison. A log with no mass would make
+        // the ratio below hold for a store that still repeated everything.
+        assert!(
+            log_bytes > RECEIPT_GUARD_PAYLOAD_BYTES,
+            "the operation log must carry the fixture's mass, got {log_bytes} bytes"
+        );
+        assert!(
+            receipt_bytes * RECEIPT_INDEX_SHARE_DIVISOR < log_bytes,
+            "the receipts index is {receipt_bytes} bytes against a {log_bytes}-byte operation \
+             log, so it is still repeating what the log already holds"
+        );
+
+        // The body says so at its header, which is what makes an older binary
+        // refuse it rather than fail inside the envelope.
+        assert!(
+            lease.snapshot().wire_version() >= GraphSnapshot::TRIMMED_RECEIPT_VERSION,
+            "a body with trimmed receipts must declare a version that says so, got v{}",
+            lease.snapshot().wire_version()
         );
     }
 

@@ -590,8 +590,14 @@ impl AuthorityFrame {
             ))
         })?;
         envelope.roots = operation.roots_after.clone();
+        // Trimmed, for the reason the commit path trims: the log entry pushed
+        // on the line above IS this receipt's operation record (FIR-3064).
+        envelope
+            .receipts
+            .push(crate::storage::repository::PersistedCommitReceipt::trimmed(
+                &receipt,
+            ));
         envelope.operation_log.push(operation);
-        envelope.receipts.push(receipt);
         envelope
             .receipts
             .sort_by_key(|receipt| receipt.operation_id);

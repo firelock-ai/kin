@@ -874,43 +874,100 @@ impl GraphSnapshot {
     /// The newest version this binary can write.
     ///
     /// A snapshot is NOT written at this version merely because the binary
-    /// knows it. The version a body is written at is derived from what the
-    /// body carries, by [`wire_version`](Self::wire_version): 13 without a
-    /// materialized graph section, 14 with one. So a store becomes v14 exactly
-    /// when it gains something a v13 reader could not represent, and a store
-    /// that never gains one stays readable by every shipped binary.
+    /// knows it. The version a body is written at is derived from what the body
+    /// carries, by [`wire_version`](Self::wire_version).
     ///
-    /// This constant moved from 13 to 14 in the change that started WRITING
-    /// sections. Before that the binary read v14 and never produced one, which
-    /// is why the reader landed first.
-    pub const CURRENT_VERSION: u32 = 14;
+    /// There are two independent facts to encode and four versions to encode
+    /// them in, which is deliberate. The first is whether the body carries a
+    /// materialized graph section, which decides its top-level element count.
+    /// The second is whether its commit receipts name their operation records
+    /// or repeat them, which decides whether an older reader can decode the
+    /// envelope at all (FIR-3064).
+    ///
+    /// ```text
+    ///        section   receipts        top-level elements
+    ///  v13    no        embedded        35
+    ///  v14    yes       embedded        36
+    ///  v15    no        trimmed         35
+    ///  v16    yes       trimmed         36
+    /// ```
+    ///
+    /// Folding the second fact onto the first would have made version and width
+    /// stop being a function of each other, and the reader's width check would
+    /// have had to accept two answers for one version. Four versions keeps that
+    /// check exact.
+    ///
+    /// v15 and v16 are the first that are not additive. They REMOVE an element
+    /// from each persisted receipt, so a v14 binary reading one would fail deep
+    /// inside the envelope with serde reporting an array of the wrong length.
+    /// Declaring the version turns that into a refusal at the frame header,
+    /// through
+    /// [`snapshot_schema_too_new`](crate::error::KinDbError::snapshot_schema_too_new),
+    /// which names the versions the binary can read.
+    pub const CURRENT_VERSION: u32 = 16;
+
+    /// A section, and receipts that still embed their operation records.
+    pub const SECTION_VERSION: u32 = 14;
+
+    /// No section, and receipts that name their operation records.
+    pub const TRIMMED_RECEIPT_VERSION: u32 = 15;
 
     /// The oldest on-disk format version this binary opens.
     pub const MIN_SUPPORTED_VERSION: u32 = 13;
 
     /// The on-disk version these exact contents serialize as.
     ///
-    /// Derived from the contents rather than from the binary. Version, width
-    /// and the section's presence are three readings of one fact and this is
-    /// where they are tied together: v13 is 35 elements with no section, v14 is
-    /// 36 with one. Both partial decoders below use that as their
-    /// discriminator, and `to_bytes` refuses any snapshot whose declared
-    /// version disagrees with this.
-    pub const fn wire_version(&self) -> u32 {
-        if self.materialized_graph.is_some() {
-            Self::CURRENT_VERSION
-        } else {
-            Self::MIN_SUPPORTED_VERSION
+    /// Derived from the contents rather than from the binary, over the two
+    /// facts the version ladder encodes. `to_bytes` refuses any snapshot whose
+    /// declared version disagrees with this.
+    ///
+    /// One trimmed receipt is enough to move the receipt axis: a pre-v15 binary
+    /// decodes receipts positionally, so the first seven-element one refuses
+    /// the whole envelope whether the rest are trimmed or not.
+    pub fn wire_version(&self) -> u32 {
+        match (
+            self.materialized_graph.is_some(),
+            self.persists_a_trimmed_receipt(),
+        ) {
+            (true, true) => Self::CURRENT_VERSION,
+            (false, true) => Self::TRIMMED_RECEIPT_VERSION,
+            (true, false) => Self::SECTION_VERSION,
+            (false, false) => Self::MIN_SUPPORTED_VERSION,
         }
+    }
+
+    /// Whether any persisted receipt names its operation rather than carrying
+    /// it, which is what a pre-v15 reader cannot decode.
+    fn persists_a_trimmed_receipt(&self) -> bool {
+        self.repository_authority.as_ref().is_some_and(|authority| {
+            authority
+                .receipts
+                .iter()
+                .any(|receipt| receipt.operation.is_none())
+        })
+    }
+
+    /// Whether a body at this version carries the materialized graph section
+    /// element, and therefore the wider top-level array.
+    ///
+    /// The one place the version-to-width mapping lives. It used to be an
+    /// equality against `MAX_SUPPORTED_VERSION`, which was correct while there
+    /// were two versions and would have silently demanded the narrow width from
+    /// a v14 body the moment a third arrived.
+    pub(crate) const fn version_carries_a_section(version: u32) -> bool {
+        matches!(version, Self::SECTION_VERSION | Self::CURRENT_VERSION)
     }
 
     /// The newest on-disk format version this binary READS.
     ///
     /// v14 APPENDS one element to the positional body, `materialized_graph`,
     /// and moves nothing, so a v13 body is a v14 body with its last element
-    /// missing and the field's `serde(default)` supplies it. One decoder reads
-    /// both widths and no second copy of the field list exists to drift.
-    pub const MAX_SUPPORTED_VERSION: u32 = 14;
+    /// missing and the field's `serde(default)` supplies it. v15 and v16 leave
+    /// the top level alone and change only what each persisted receipt carries,
+    /// which the receipt's own trailing `serde(default)` reads either way. One
+    /// decoder reads all four and no second copy of the field list exists to
+    /// drift.
+    pub const MAX_SUPPORTED_VERSION: u32 = 16;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -1140,11 +1197,14 @@ impl GraphSnapshot {
         if self.version != wire_version {
             return Err(crate::error::KinDbError::StorageError(format!(
                 "refusing to serialize a snapshot whose body declares v{} while its contents \
-                 serialize as v{}; a materialized graph section makes a body v{}, and its \
-                 absence makes it v{}",
+                 serialize as v{}; a section with trimmed receipts makes a body v{}, trimmed \
+                 receipts alone make it v{}, a section alone makes it v{}, and neither makes \
+                 it v{}",
                 self.version,
                 wire_version,
                 Self::CURRENT_VERSION,
+                Self::TRIMMED_RECEIPT_VERSION,
+                Self::SECTION_VERSION,
                 Self::MIN_SUPPORTED_VERSION
             )));
         }
@@ -1294,7 +1354,7 @@ impl GraphSnapshot {
             let _span = tracing::info_span!("kindb.snapshot.walk_body_elements").entered();
             top_level_element_ranges(frame.body)?
         };
-        let expected_width = if frame.version == Self::MAX_SUPPORTED_VERSION {
+        let expected_width = if Self::version_carries_a_section(frame.version) {
             GRAPH_SNAPSHOT_FIELD_COUNT
         } else {
             GRAPH_SNAPSHOT_V13_FIELD_COUNT
@@ -2117,9 +2177,9 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     });
                 }
 
-                // The canonical body is 35 elements at v13 and 36 at v14; the
-                // appended element is the materialized graph, which locate does
-                // not read. This used to be a bare `35`, which would have made
+                // The canonical body is 35 elements at v13 and v15 and 36 at
+                // v14 and v16; the appended element is the materialized graph,
+                // which locate does not read. This used to be a bare `35`, which would have made
                 // every v14 store fail here with `invalid_length` while the
                 // named constant one screen up said 36.
                 let width = match seq.size_hint() {
@@ -2339,9 +2399,11 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
                 // carries no envelope at all, so it is refused by name here
                 // rather than silently decoding as an absent authority.
                 // Width is the format discriminator and it is a function of
-                // the snapshot version alone: v13 bodies are 35 elements, v14
-                // bodies are 36, and nothing is skipped on serialize so the
-                // width never varies within a version. The eleven-field locate
+                // the snapshot version alone: v13 and v15 bodies are 35
+                // elements, v14 and v16 are 36, and nothing is skipped on
+                // serialize so the width never varies within a version. The
+                // ladder has four rungs because it encodes two independent
+                // bits, and keeping width a function of version is exactly why. The eleven-field locate
                 // projection carries no envelope at all, so it is refused by
                 // width here rather than silently decoding as an absent
                 // authority.
@@ -2363,7 +2425,7 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
                 // made them agree. Requiring them to agree here is what stops a
                 // body that claims v13 while carrying a section, or claims v14
                 // while carrying none, from decoding as either.
-                let expected_width = if version == GraphSnapshot::MAX_SUPPORTED_VERSION {
+                let expected_width = if GraphSnapshot::version_carries_a_section(version) {
                     GRAPH_SNAPSHOT_FIELD_COUNT
                 } else {
                     GRAPH_SNAPSHOT_V13_FIELD_COUNT
@@ -4276,7 +4338,7 @@ mod tests {
     fn a_v14_snapshot(entity_name: &str) -> GraphSnapshot {
         let mut snapshot = GraphSnapshot::empty();
         snapshot.materialized_graph = Some(Arc::new(a_section(a_change_id(0x11), entity_name)));
-        snapshot.version = GraphSnapshot::MAX_SUPPORTED_VERSION;
+        snapshot.version = GraphSnapshot::SECTION_VERSION;
         snapshot
     }
 
@@ -4302,7 +4364,7 @@ mod tests {
             snapshot.materialized_graph.is_some(),
             "a v14 body is one that carries a section"
         );
-        assert_eq!(snapshot.version, GraphSnapshot::MAX_SUPPORTED_VERSION);
+        assert_eq!(snapshot.version, GraphSnapshot::SECTION_VERSION);
         let body = rmp_serde::to_vec(snapshot).expect("a snapshot serializes");
         assert_eq!(
             encoded_field_count(&body),
@@ -4311,7 +4373,7 @@ mod tests {
         );
         let mut frame = Vec::new();
         frame.extend_from_slice(&GraphSnapshot::MAGIC);
-        frame.extend_from_slice(&GraphSnapshot::MAX_SUPPORTED_VERSION.to_le_bytes());
+        frame.extend_from_slice(&GraphSnapshot::SECTION_VERSION.to_le_bytes());
         frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
         frame.extend_from_slice(&body);
         let checksum: [u8; 32] = Sha256::digest(&body).into();
@@ -4363,10 +4425,7 @@ mod tests {
         let with = a_v14_snapshot("served");
         assert_eq!(
             frame_shape(&with.to_bytes_pre_validated().expect("serializes")),
-            (
-                GraphSnapshot::MAX_SUPPORTED_VERSION,
-                GRAPH_SNAPSHOT_FIELD_COUNT
-            ),
+            (GraphSnapshot::SECTION_VERSION, GRAPH_SNAPSHOT_FIELD_COUNT),
             "a section means v14 and 36 elements"
         );
 
@@ -4376,7 +4435,7 @@ mod tests {
         lying_low.version = GraphSnapshot::MIN_SUPPORTED_VERSION;
         assert!(lying_low.to_bytes_pre_validated().is_err());
         let mut lying_high = GraphSnapshot::empty();
-        lying_high.version = GraphSnapshot::MAX_SUPPORTED_VERSION;
+        lying_high.version = GraphSnapshot::SECTION_VERSION;
         assert!(lying_high.to_bytes().is_err());
     }
 
@@ -4405,7 +4464,7 @@ mod tests {
     fn a_v14_store_round_trips_its_section() {
         let bytes = v14_frame(&a_v14_snapshot("served"));
         let decoded = GraphSnapshot::from_bytes(&bytes).expect("a v14 body decodes");
-        assert_eq!(decoded.version, GraphSnapshot::MAX_SUPPORTED_VERSION);
+        assert_eq!(decoded.version, GraphSnapshot::SECTION_VERSION);
         let section = decoded
             .materialized_graph
             .as_ref()
@@ -4425,7 +4484,7 @@ mod tests {
 
         let v14 = v14_frame(&a_v14_snapshot("served"));
         let envelope = AuthorityEnvelopeSnapshot::from_bytes(&v14).expect("v14 decodes");
-        assert_eq!(envelope.version, GraphSnapshot::MAX_SUPPORTED_VERSION);
+        assert_eq!(envelope.version, GraphSnapshot::SECTION_VERSION);
         assert!(envelope.materialized_graph.is_some());
     }
 
@@ -4439,7 +4498,7 @@ mod tests {
         // Patching the header instead would prove nothing here: the envelope
         // decoder never sees it.
         let mut narrow = GraphSnapshot::empty();
-        narrow.version = GraphSnapshot::MAX_SUPPORTED_VERSION;
+        narrow.version = GraphSnapshot::SECTION_VERSION;
         let narrow_body = rmp_serde::to_vec(&narrow).expect("serializes");
         assert_eq!(
             encoded_field_count(&narrow_body),
@@ -4573,7 +4632,7 @@ mod tests {
         let mut frame = Vec::new();
         frame.extend_from_slice(&GraphSnapshot::MAGIC);
         // The header says v14 while the body says v13.
-        frame.extend_from_slice(&GraphSnapshot::MAX_SUPPORTED_VERSION.to_le_bytes());
+        frame.extend_from_slice(&GraphSnapshot::SECTION_VERSION.to_le_bytes());
         frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
         frame.extend_from_slice(&body);
         let checksum: [u8; 32] = Sha256::digest(&body).into();
@@ -4643,11 +4702,21 @@ mod tests {
             GRAPH_SNAPSHOT_FIELD_COUNT - 1,
             "v14 appends exactly one element to v13"
         );
+        // Four contiguous rungs encoding two independent bits, and the
+        // width is a function of the version rather than a second opinion
+        // about it. Asserted rather than described, because the reader's
+        // width check reads the version and would silently demand the wrong
+        // element count if a rung were added without updating it.
         assert_eq!(
-            GraphSnapshot::MIN_SUPPORTED_VERSION + 1,
-            GraphSnapshot::MAX_SUPPORTED_VERSION,
-            "the two supported versions are adjacent, which is what makes one \
-             decoder with one defaulted field enough"
+            [
+                GraphSnapshot::MIN_SUPPORTED_VERSION,
+                GraphSnapshot::SECTION_VERSION,
+                GraphSnapshot::TRIMMED_RECEIPT_VERSION,
+                GraphSnapshot::CURRENT_VERSION,
+            ],
+            [13, 14, 15, 16],
+            "the ladder is contiguous, which is what lets one decoder read every \
+             rung with defaulted trailing fields"
         );
         assert_eq!(
             GraphSnapshot::CURRENT_VERSION,
@@ -4656,6 +4725,18 @@ mod tests {
              is the newest it can read; which version a given body gets is \
              decided by `wire_version` from its contents, not by this constant"
         );
+        for (version, wide) in [
+            (GraphSnapshot::MIN_SUPPORTED_VERSION, false),
+            (GraphSnapshot::SECTION_VERSION, true),
+            (GraphSnapshot::TRIMMED_RECEIPT_VERSION, false),
+            (GraphSnapshot::CURRENT_VERSION, true),
+        ] {
+            assert_eq!(
+                GraphSnapshot::version_carries_a_section(version),
+                wide,
+                "v{version} disagrees with the ladder about whether it carries a section"
+            );
+        }
     }
 
     // FIR-3064: an open leaves the change map on disk.
@@ -4800,7 +4881,7 @@ mod tests {
         }
         let frame = encode_snapshot_without_admission_validation(&with_section);
         let (lazy, visited) = decode_lazily(&frame, memory_source(&frame));
-        assert_eq!(lazy.version, GraphSnapshot::MAX_SUPPORTED_VERSION);
+        assert_eq!(lazy.version, GraphSnapshot::SECTION_VERSION);
         assert!(lazy.materialized_graph.is_some(), "the section rides along");
         assert_eq!(visited.len(), 2);
         assert!(!lazy.changes.is_decoded());
