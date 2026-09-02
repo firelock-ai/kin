@@ -6692,7 +6692,12 @@ impl InMemoryGraph {
     ///   index was flushed at-or-after that content and is retained; a head
     ///   whose current head revision has no vector predates the entity's
     ///   current content and is retired for re-embed. An entity with no
-    ///   revision chain has no drift signal and is retained as-is.
+    ///   revision chain has no drift signal and is retained as-is. That
+    ///   inference needs an index a pass FINISHED: on one a pass is still
+    ///   filling there are no revision vectors at all yet, the absence proves
+    ///   nothing, and every head is retired for want of evidence it could not
+    ///   have. So an index holding no revision vector anywhere retires no heads
+    ///   (FIR-3096).
     /// - `Artifact` keys are id-stable across content edits and artifacts mint
     ///   no embedded revision keys, so drift leaves no per-key proof at all:
     ///   every artifact vector is retired and re-derived from the current
@@ -6717,10 +6722,46 @@ impl InMemoryGraph {
             None => return VectorSalvageStats::default(),
         };
 
+        // Sampled BEFORE the prune on purpose. The question this answers is
+        // "did an embed pass ever reach its revision tier on this index", and
+        // the prune drops superseded revision vectors, which are evidence that
+        // it did. Reading it after the prune would misread a store whose only
+        // revision vector was superseded as an index no pass had got to, and
+        // would then retain the stale head that store exists to retire.
+        let index_holds_no_revision_proof = !vi
+            .retrievable_keys()
+            .iter()
+            .any(|key| matches!(key, RetrievalKey::EntityRevision(_)));
+
         // Full generation eviction first: drops every key outside current
         // truth (the sidecar load marked a full reconcile pending).
         let evicted_orphans = self.prune_orphaned_vectors();
 
+        // FIR-3096. The head test below reads the ABSENCE of a revision vector
+        // as proof that a head vector predates the entity's current content.
+        // That inference needs the index to be one an embed pass finished. It
+        // is not sound on an index a pass is still filling: `embed_sort_key_for`
+        // ranks every live entity tier ahead of `embed_tier::REVISION`, so a
+        // pass embeds all live entities first and revision keys last, and
+        // between those two phases the index holds entity vectors and no
+        // revision vectors at all. Every head then fails a test it could not
+        // pass, and the salvage retires the entire pass.
+        //
+        // An index with no revision vectors anywhere therefore carries no
+        // evidence either way, and of the two readings available, retiring is
+        // the strictly worse one. Measured before this guard existed: a mid-pass
+        // reopen retired 940 and then 5,555 vectors on a live React store, and a
+        // hiredis run performed 1,677 embeds to fill a 1,485-vector store.
+        //
+        // The bounded cost of the other reading, stated plainly: in that window
+        // a head whose content genuinely changed since its vector was written is
+        // retained rather than retired, and stays slightly stale until the pass
+        // reaches it. That is bounded by one pass; the loss it replaces was
+        // total and unbounded.
+        //
+        // This is deliberately the narrow reading. It does NOT weaken the test
+        // for an index that holds revision vectors, where the absence of one
+        // head's revision really is evidence about that head.
         let mut retire: Vec<RetrievalKey> = Vec::new();
         {
             let ent = self.entities.read();
@@ -6736,6 +6777,9 @@ impl InMemoryGraph {
                         retire.push(key);
                     }
                     RetrievalKey::Entity(id) => {
+                        if index_holds_no_revision_proof {
+                            continue;
+                        }
                         if let Some(head) = head_by_entity.get(&id) {
                             if !vi.contains_retrievable(&RetrievalKey::EntityRevision(*head)) {
                                 retire.push(key);
@@ -18604,6 +18648,120 @@ mod tests {
     /// admitted every generation) kept BOTH vectors and `semantic_locate`
     /// returned the entity twice with two distinct cosine scores. Discriminating:
     /// FAILS on the old all-revisions truth (evicts 0), PASSES on head-only truth.
+    /// FIR-3096. A salvage that runs while an embed pass is only partway
+    /// through must not discard the vectors that pass has already produced.
+    ///
+    /// `reconcile_salvaged_vector_index` retains an `Entity(E)` key only when
+    /// `EntityRevision(head_of_E)` is also in the index, on the premise that a
+    /// content edit always mints a new head revision, so a head without one
+    /// predates the entity's current content. That premise does not hold DURING
+    /// a pass. `embed_sort_key_for` ranks every live entity tier ahead of
+    /// `embed_tier::REVISION`, so a pass embeds all live entities first and
+    /// revision keys last; midway the index holds entity vectors and no revision
+    /// vectors at all. The rule reads that expected drain order as staleness and
+    /// retires every one.
+    ///
+    /// Measured cost before this test existed: a mid-pass reopen retired 940 and
+    /// then 5,555 vectors on the demo's React store, and a hiredis run performed
+    /// 1,677 embeds to fill a 1,485-vector store. The index is not stale here,
+    /// it is young, and the two are not the same thing.
+    ///
+    /// Discriminating: today this retains 0 of 2 and both assertions fail.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn salvage_keeps_entity_vectors_from_a_pass_that_has_not_reached_revisions() {
+        let graph = InMemoryGraph::new();
+        let a = test_entity_with_id(0xd0, "drained_first");
+        let b = test_entity_with_id(0xd1, "drained_second");
+        apply_init_change(&graph, 0x01, &[a.clone(), b.clone()]);
+
+        // Exactly the state a pass reaches after its entity tiers and before its
+        // revision tier: both live entities embedded, no revision key yet.
+        let vi = VectorIndex::new(2).unwrap();
+        vi.upsert_retrievable(RetrievalKey::Entity(a.id), &[1.0f32, 0.0])
+            .unwrap();
+        vi.upsert_retrievable(RetrievalKey::Entity(b.id), &[0.0f32, 1.0])
+            .unwrap();
+        *graph.vector_index.lock() = Some(Arc::new(vi));
+
+        // Control: the chains exist, so the rule's lookup is exercised rather
+        // than skipped by an entity that simply has no revision history.
+        {
+            let ent = graph.entities.read();
+            for id in [a.id, b.id] {
+                assert!(
+                    ent.entity_revisions
+                        .get(&id)
+                        .is_some_and(|revs| !revs.is_empty()),
+                    "the test state must give each entity a revision chain"
+                );
+            }
+        }
+
+        let stats = graph.reconcile_salvaged_vector_index();
+
+        assert_eq!(
+            stats.retired_stale_entity_heads, 0,
+            "a pass that has not reached its revision tier has produced no \
+             staleness signal; retiring its entity vectors discards good work"
+        );
+        assert_eq!(
+            stats.retained, 2,
+            "both entity vectors must survive a salvage that runs mid-pass"
+        );
+    }
+
+    /// The control on the guard above: once an index holds revision vectors, the
+    /// presence test is evidence again and must still retire a head whose own
+    /// head revision has none. Without this, the FIR-3096 guard could be widened
+    /// to "never retire a head" and nothing would notice.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn salvage_still_retires_a_stale_head_once_the_index_holds_revision_proof() {
+        let graph = InMemoryGraph::new();
+        let proven = test_entity_with_id(0xd2, "proven");
+        let stale = test_entity_with_id(0xd3, "stale");
+        apply_init_change(&graph, 0x01, &[proven.clone(), stale.clone()]);
+
+        let (proven_head, stale_head) = {
+            let ent = graph.entities.read();
+            let head = |id: &EntityId| ent.entity_revisions.get(id).expect("chain")[0].revision_id;
+            (head(&proven.id), head(&stale.id))
+        };
+
+        // A finished-pass index: both heads, but only one head revision. The
+        // index therefore HOLDS revision proof, so the test is informative and
+        // `stale` must be retired while `proven` survives.
+        let vi = VectorIndex::new(2).unwrap();
+        vi.upsert_retrievable(RetrievalKey::Entity(proven.id), &[1.0f32, 0.0])
+            .unwrap();
+        vi.upsert_retrievable(RetrievalKey::Entity(stale.id), &[0.0f32, 1.0])
+            .unwrap();
+        vi.upsert_retrievable(RetrievalKey::EntityRevision(proven_head), &[1.0f32, 0.0])
+            .unwrap();
+        *graph.vector_index.lock() = Some(Arc::new(vi));
+        assert_ne!(
+            proven_head, stale_head,
+            "the two heads must be distinct keys"
+        );
+
+        let stats = graph.reconcile_salvaged_vector_index();
+
+        assert_eq!(
+            stats.retired_stale_entity_heads, 1,
+            "a head with no revision proof must still be retired when the index has proof to give"
+        );
+        let vi = graph.vector_index.lock().clone().expect("index");
+        assert!(
+            vi.contains_retrievable(&RetrievalKey::Entity(proven.id)),
+            "the proven head must survive"
+        );
+        assert!(
+            !vi.contains_retrievable(&RetrievalKey::Entity(stale.id)),
+            "the unproven head must be retired"
+        );
+    }
+
     #[cfg(feature = "vector")]
     #[test]
     fn live_reembed_retires_superseded_revision_vector() {
