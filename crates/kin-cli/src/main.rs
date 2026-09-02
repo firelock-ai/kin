@@ -277,6 +277,43 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         transitive: usize,
     },
+    /// Find the shortest routes from one entity to another over the graph's
+    /// call, instantiation, reference, import and include edges.
+    ///
+    /// Each end is an entity name, an entity id, or `name@file` to pin one of
+    /// two same-named entities. A class stands for its members, so a route
+    /// between two classes runs through the methods that carry it. Exits 3 when
+    /// the graph holds no route inside the depth bound, with the gap on stderr.
+    Path {
+        /// Source entity: name, id, or name@file
+        from: String,
+        /// Target entity: name, id, or name@file
+        to: String,
+        /// Pin the source to the entity of that name in this file (path or path suffix)
+        #[arg(long = "from-file", value_name = "FILE")]
+        from_file: Option<String>,
+        /// Pin the target the same way
+        #[arg(long = "to-file", value_name = "FILE")]
+        to_file: Option<String>,
+        /// Hops walked between the two ends (default 6, ceiling 12); containment hops are not counted
+        #[arg(long = "max-depth", value_name = "N")]
+        max_depth: Option<usize>,
+        /// Routes printed, shortest first (default 3, ceiling 25)
+        #[arg(long, value_name = "K")]
+        limit: Option<usize>,
+        /// `forward` (from reaches to), `reverse` (to reaches from), or `either` (default; forward first, reports which held)
+        #[arg(long, value_name = "DIR")]
+        direction: Option<String>,
+        /// Walk through type-annotation edges too
+        #[arg(long = "include-type-edges", default_value_t = false)]
+        include_type_edges: bool,
+        /// Output machine-readable JSON, `_kin` envelope included
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// One line per hop and nothing else, sized for a prompt
+        #[arg(long, default_value_t = false)]
+        compact: bool,
+    },
     /// Search entities in the graph
     Search {
         /// Search pattern (use '|' for OR, e.g. "save|load|persist")
@@ -2822,6 +2859,38 @@ fn run() -> Result<()> {
                     json,
                     debug,
                 } => commands::contextbench_locate::run(task_file, json, debug).await,
+                Command::Path {
+                    from,
+                    to,
+                    from_file,
+                    to_file,
+                    max_depth,
+                    limit,
+                    direction,
+                    include_type_edges,
+                    json,
+                    compact,
+                } => {
+                    // No route is an answer, not an error, and it travels in
+                    // the exit code the way a parked merge does.
+                    let code = commands::path::run(
+                        from,
+                        to,
+                        from_file,
+                        to_file,
+                        max_depth,
+                        limit,
+                        direction,
+                        include_type_edges,
+                        json,
+                        compact,
+                    )
+                    .await?;
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
+                }
                 Command::Trace {
                     entity,
                     file,

@@ -1963,6 +1963,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/dead-code", post(command_dead_code))
         .route("/commands/dead-code-seeded", post(command_dead_code_seeded))
         .route("/commands/trace-data-flow", post(command_trace_data_flow))
+        .route("/commands/path", post(command_path))
         .route("/commands/refs", post(command_refs))
         .route("/commands/bulk-refs", post(command_bulk_refs))
         .route("/commands/xref", post(command_xref))
@@ -4967,6 +4968,95 @@ async fn run_trace_data_flow_off_runtime(
 struct CancelOnDrop(kin_cli::commands::trace_data_flow::TraceCancel);
 
 impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// POST /commands/path: the shortest routes from one entity to another over the
+/// relation graph, the query `kin path` and the `trace_path` MCP tool share.
+///
+/// Reads no bodies, so it opens no repository authority: every hop is identity
+/// and location, and the walk runs off the runtime under the same cancel-on-drop
+/// seam as trace-data-flow. The answer carries the `_kin` envelope and its
+/// negative, so a client that prints `found: false` prints the verdict beside it
+/// and the CLI's JSON is byte-for-byte the MCP tool's payload.
+async fn command_path(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_mcp::handlers::path::PathRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let cancel = kin_mcp::handlers::path::PathCancel::new();
+    let _abandon = PathCancelOnDrop(cancel.clone());
+    let budget = kin_mcp::handlers::path::PathBudget::cancellable(cancel);
+    let outcome = tokio::task::spawn_blocking(move || {
+        kin_mcp::handlers::path::build_path_response_within(graph.as_ref(), &request, budget)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("path worker failed: {error}"),
+        )
+    })?;
+    let response = match outcome {
+        Ok(response) => response,
+        Err(error) => return Err(path_refusal(error)),
+    };
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
+    let text = serde_json::to_string(&response)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let finalized = kin_mcp::finalize_with_envelope(
+        kin_mcp::ToolCallResult::text(text),
+        envelope,
+        kin_mcp::handlers::path::TOOL_NAME,
+    );
+    let payload = finalized
+        .content
+        .into_iter()
+        .find_map(|block| {
+            let kin_mcp::ContentBlock::Text { text } = block;
+            serde_json::from_str::<serde_json::Value>(&text).ok()
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "path response could not be annotated".to_string(),
+            )
+        })?;
+    Ok(Json(payload))
+}
+
+/// An end that did not resolve is the caller's to fix, and says so with 422
+/// rather than hiding behind a 500 the client would retry.
+fn path_refusal(error: kin_mcp::handlers::path::PathError) -> (StatusCode, String) {
+    use kin_mcp::handlers::path::PathError;
+    let status = match &error {
+        PathError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        PathError::EndpointNotFound { .. } | PathError::EndpointAmbiguous { .. } => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        PathError::Graph(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, error.to_string())
+}
+
+/// Cancels the route walk when the request future is dropped, for the reason
+/// [`CancelOnDrop`] does the same for a trace.
+struct PathCancelOnDrop(kin_mcp::handlers::path::PathCancel);
+
+impl Drop for PathCancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
     }

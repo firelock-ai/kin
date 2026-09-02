@@ -11,6 +11,7 @@ pub mod common;
 pub mod bench;
 pub mod entities;
 pub mod file_entities;
+pub mod path;
 pub mod provenance;
 pub(crate) mod repository_authority;
 pub mod review;
@@ -66,6 +67,7 @@ pub async fn handle_tool_call<G: GraphStore>(
             entities::handle_trace_computation(arguments, store, sessions, repository_authority)
         }
         "trace_data_flow" => entities::handle_trace_data_flow(arguments, store),
+        path::TOOL_NAME => path::handle_trace_path(arguments, store),
         "find_references" => {
             entities::handle_find_references(arguments, store, repository_authority).await
         }

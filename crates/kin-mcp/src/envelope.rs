@@ -1476,6 +1476,10 @@ fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
             payload.get("total_upstream").and_then(Value::as_u64)?,
         ),
         "trace_data_flow" => ("steps", payload.get("total_steps").and_then(Value::as_u64)?),
+        crate::handlers::path::TOOL_NAME => (
+            "shortest_routes",
+            payload.get("routes_total").and_then(Value::as_u64)?,
+        ),
         "bulk_check_references" => (
             "entities",
             payload
@@ -1489,7 +1493,11 @@ fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
     // A response that says it stopped early is a floor whatever its substrate
     // looked like, so the payload's own truncation flag outranks the class
     // verdict for this field.
-    let truncated = payload.get("truncated").and_then(Value::as_bool) == Some(true);
+    // The route query spells its cut `routes_truncated`, because `truncated`
+    // on a walk means the walk stopped early and a route set cut to `limit`
+    // did not.
+    let truncated = payload.get("truncated").and_then(Value::as_bool) == Some(true)
+        || payload.get("routes_truncated").and_then(Value::as_bool) == Some(true);
     // FIR-1552: same rule, other cause. An answer that held same-name candidates
     // out of its headline reports a number some of those candidates may belong
     // in, so the number is a floor and this object has to say so with the count
