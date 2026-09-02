@@ -648,19 +648,33 @@ mod tests {
         );
     }
 
-    /// The wording and the guard are one string, checked to be one string.
+    /// The failure wording is a cross-surface contract, so it is pinned to a
+    /// literal rather than to the constant.
     ///
-    /// The line-scanning arm of `admission_failure` keys on the prefix the
-    /// summary prints. If the summary's wording ever drifts and the guard's copy
-    /// does not, that arm silently stops recognizing a failure it is printing,
-    /// which is the exact defect shape it was added to close.
+    /// This asserted `summary_lines(..).starts_with(ADMIT_FAILURE_PREFIX)` and
+    /// survived the mutation written to break it, because after the refactor one
+    /// constant feeds both the producer and the assertion: changing it moves the
+    /// two together and the comparison stays true for any value. A test that
+    /// cannot fail is not evidence.
+    ///
+    /// What the drift would actually break is a reader that cannot see this
+    /// constant. `scripts/acceptance/scratch_file_commit_repro.py` carries its
+    /// own copy of this string and grades a run as failed only when it appears,
+    /// so a silent rewording here would leave that suite reporting a refused
+    /// admission as a clean one. Pinning the literal is what makes changing the
+    /// wording a deliberate act that updates both surfaces.
     #[test]
-    fn the_summary_uses_the_prefix_the_exit_guard_keys_on() {
+    fn the_failure_prefix_is_the_wording_the_acceptance_grader_matches() {
+        const WIRE: &str = "Complete exact-tree admission failed: ";
+        assert_eq!(
+            ADMIT_FAILURE_PREFIX, WIRE,
+            "scripts/acceptance/scratch_file_commit_repro.py matches this literal"
+        );
         let first = summary_lines(&report(false))
             .first()
             .cloned()
             .expect("a failed pass renders a cause line first");
-        assert!(first.starts_with(ADMIT_FAILURE_PREFIX), "{first}");
+        assert!(first.starts_with(WIRE), "{first}");
     }
 
     /// FIR-2961. The stranger edited one tracked file, ran `kin admit`, and was
