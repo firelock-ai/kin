@@ -189,6 +189,9 @@ const JS_GRAMMAR_MISMATCH_RATIO: f64 = 0.10;
 ///
 /// A clean JavaScript parse returns immediately, so a file with no Flow syntax
 /// pays nothing and its extraction is byte-for-byte what it was.
+///
+/// TypeScript does not accept every Flow annotation, so when the winning grammar
+/// still cannot read the file, [`repair_flow_function_types`] is given a turn.
 pub fn parse_javascript_family(source: &[u8]) -> Result<Tree> {
     let javascript = parse_with(&tree_sitter_javascript::LANGUAGE, source)?;
     // `has_error` rather than a zero byte total, because the total exempts the
@@ -218,13 +221,38 @@ pub fn parse_javascript_family(source: &[u8]) -> Result<Tree> {
     let mut best = javascript;
     let tsx = tree_sitter_typescript::LANGUAGE_TSX;
     let typescript = tree_sitter_typescript::LANGUAGE_TYPESCRIPT;
+    // Tracked apart from `best`, because the repair below is a TypeScript
+    // repair and the tree winning on bytes may still be the JavaScript one.
+    // That is not the rare case: it is exactly what happens on the files the
+    // repair exists for.
+    let mut repair_language = &tsx;
+    let mut repair_unparsed = usize::MAX;
     for language in [&tsx, &typescript] {
         let candidate = parse_with(language, source)?;
         let candidate_unparsed = unparsed_byte_total(&candidate);
+        if candidate_unparsed < repair_unparsed {
+            repair_unparsed = candidate_unparsed;
+            repair_language = language;
+        }
         if candidate_unparsed < best_unparsed {
             best_unparsed = candidate_unparsed;
             best = candidate;
         }
+    }
+    // Nothing left to win. A zero total is either a grammar that read the whole
+    // file or the root exemption hiding an error it could not localize, and in
+    // both cases no repaired tree can score below it, so the work is skipped
+    // rather than done and thrown away.
+    if best_unparsed == 0 {
+        return Ok(best);
+    }
+
+    // The repaired tree replaces the winner only on the same measurement the
+    // winner was chosen by, so this cannot make the answer worse by the rule
+    // that produced it, and a tie still keeps the tree already in hand.
+    let repaired = repair_flow_function_types(repair_language, source)?;
+    if unparsed_byte_total(&repaired) < best_unparsed {
+        return Ok(repaired);
     }
     Ok(best)
 }
@@ -336,21 +364,262 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// each of them look equally bad and leaves the file on the grammar that reads
 /// it worst.
 fn unparsed_byte_total(tree: &Tree) -> usize {
-    fn walk(node: &tree_sitter::Node, total: &mut usize) {
+    outermost_error_ranges(tree)
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start))
+        .sum()
+}
+
+/// The outermost ERROR and MISSING spans in `tree`, root exempt.
+///
+/// The repair below reads the same set [`unparsed_byte_total`] sums, so the two
+/// share this walk rather than each keeping their own. A repair that looked at a
+/// different set of errors than the total it is judged on could improve the one
+/// it was measured by while leaving the one it was aimed at untouched.
+fn outermost_error_ranges(tree: &Tree) -> Vec<(usize, usize)> {
+    fn walk(node: &tree_sitter::Node, out: &mut Vec<(usize, usize)>) {
         if node.is_error() || node.is_missing() {
-            *total += node.end_byte().saturating_sub(node.start_byte());
+            out.push((node.start_byte(), node.end_byte()));
             return;
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            walk(&child, total);
+            walk(&child, out);
         }
     }
     let root = tree.root_node();
-    let mut total = 0;
+    let mut out = Vec::new();
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        walk(&child, &mut total);
+        walk(&child, &mut out);
+    }
+    out
+}
+
+/// Rounds of blank-and-reparse the Flow repair will run before it gives up.
+///
+/// Each round blanks every site the current tree reports at once, so the count
+/// bounds a pathological file rather than the ordinary one. React's
+/// `ReactFiberHooks.js`, the file this was written for, converges in one.
+const FLOW_REPAIR_MAX_ROUNDS: usize = 8;
+
+/// Bytes either side of a reported error the repair will look in for the arrow
+/// that caused it.
+///
+/// Tree-sitter does not always fault the offending token itself: on
+/// `dispatch: (A => mixed) | null` it reports the `)` after the arrow, not the
+/// arrow. A little slack finds it. The window stays small on purpose, because
+/// every byte of it is a byte the repair is willing to touch outside a span the
+/// grammar actually complained about, and it stops growing where the recovery
+/// does. Measured over React's 3,873 `.js` files on this crate's own grammars
+/// and runtime, the top-level declarations recovered go 30, 36, 36, 180, 381,
+/// 382 at windows 0, 2, 4, 8, 16 and 32. Sixteen is the knee: doubling it again
+/// buys one declaration, and halving it costs 201, because
+/// `ReactFlightClient.js` and `ReactFlightReplyServer.js` both need it. A window
+/// of 0 is worse than not looking outside the error at all, losing one
+/// declaration on top of recovering 351 fewer.
+///
+/// The measurement belongs to the runtime and has to be redone on a bump rather
+/// than carried over: under tree-sitter 0.25 the same sweep peaks at 8, because
+/// recovery there fragments a file differently. No unit test pins this number.
+/// The corpus is what pins it.
+const FLOW_REPAIR_WINDOW: usize = 16;
+
+/// Read a Flow file the TypeScript grammar stumbled on, by blanking the one
+/// Flow form that grammar has no rule for and parsing again.
+///
+/// TypeScript writes a function type as `(a: A) => B`. Flow also allows the
+/// parameter to be a bare type, `A => B`, and React uses that form freely: in a
+/// type alias (`type Dispatch<A> = A => void`), in an object type
+/// (`dispatch: (A => mixed) | null`), and in a parameter annotation
+/// (`init?: I => S`, `subscribe: (() => void) => () => void`). TypeScript has no
+/// rule for it, and one occurrence takes tree-sitter's recovery down with
+/// everything around it. On `ReactFiberHooks.js` that costs the whole file: the
+/// TypeScript tree leaves 65% of it unparsed against the JavaScript grammar's
+/// 46%, so the byte comparison keeps the JavaScript tree, whose top level holds
+/// 7 of the file's 110 declarations.
+///
+/// The parameter and its arrow are blanked to spaces in a COPY of the source.
+/// Byte length and line structure are preserved, so every span the tree carries
+/// still points at the original bytes and `extract` still reads names and
+/// signatures from source this never touched. What the parse loses is the
+/// parameter type of a function type, which no extractor here reads.
+///
+/// Two guards keep a repair from costing more than it recovers. Only bytes at or
+/// beside a span the grammar already reported as an error are considered, so a
+/// file the grammar reads cleanly is never rewritten. And a round is kept only
+/// when it lowers the unparsed total AND does not lower the number of
+/// declarations a top-level walk can reach, so a blank that trades a real
+/// declaration for a smaller byte count is refused and the tree comes back
+/// exactly as it was.
+fn repair_flow_function_types(
+    language: &tree_sitter_language::LanguageFn,
+    source: &[u8],
+) -> Result<Tree> {
+    let mut buffer = source.to_vec();
+    let mut tree = parse_with(language, &buffer)?;
+    let mut unparsed = unparsed_byte_total(&tree);
+    let mut declarations = top_level_declaration_count(&tree);
+
+    for _ in 0..FLOW_REPAIR_MAX_ROUNDS {
+        if unparsed == 0 {
+            break;
+        }
+        let sites = shorthand_function_type_sites(&tree, &buffer);
+        if sites.is_empty() {
+            break;
+        }
+        let mut candidate = buffer.clone();
+        for (start, end) in sites {
+            for byte in &mut candidate[start..end] {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+        }
+        let next = parse_with(language, &candidate)?;
+        let next_unparsed = unparsed_byte_total(&next);
+        let next_declarations = top_level_declaration_count(&next);
+        if next_unparsed >= unparsed || next_declarations < declarations {
+            break;
+        }
+        buffer = candidate;
+        tree = next;
+        unparsed = next_unparsed;
+        declarations = next_declarations;
+    }
+    Ok(tree)
+}
+
+/// The byte spans of Flow shorthand function-type parameters, arrow included,
+/// that sit at or beside an error the grammar reported.
+///
+/// Returned sorted and non-overlapping, because the caller blanks them in one
+/// pass over the buffer.
+fn shorthand_function_type_sites(tree: &Tree, source: &[u8]) -> Vec<(usize, usize)> {
+    let mut sites = Vec::new();
+    for (error_start, error_end) in outermost_error_ranges(tree) {
+        let from = error_start.saturating_sub(FLOW_REPAIR_WINDOW);
+        let to = error_end
+            .saturating_add(FLOW_REPAIR_WINDOW)
+            .min(source.len());
+        let mut at = from;
+        while at < to && at + 2 <= source.len() {
+            if &source[at..at + 2] == b"=>" {
+                if let Some(start) = shorthand_parameter_start(source, at) {
+                    sites.push((start, at + 2));
+                }
+                at += 2;
+            } else {
+                at += 1;
+            }
+        }
+    }
+    sites.sort_unstable();
+    sites.dedup();
+    let mut kept: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in sites {
+        if kept.last().is_some_and(|(_, last_end)| start < *last_end) {
+            continue;
+        }
+        kept.push((start, end));
+    }
+    kept
+}
+
+/// The first byte of the shorthand parameter whose arrow starts at `arrow`, or
+/// `None` when what sits left of the arrow is not one.
+///
+/// A parenthesised group is taken whole, which is what reaches the inner arrow
+/// of `subscribe: (() => void) => () => void`. Otherwise the scan walks back
+/// over one type name, carrying its type arguments and any array suffix, so
+/// `Array<T>[] =>` is taken from the `A` rather than from the `]`.
+fn shorthand_parameter_start(source: &[u8], arrow: usize) -> Option<usize> {
+    let mut at = arrow as isize - 1;
+    while at >= 0 && source[at as usize].is_ascii_whitespace() {
+        at -= 1;
+    }
+    if at < 0 {
+        return None;
+    }
+    if source[at as usize] == b')' {
+        return balanced_open(source, at, b')', b'(').map(|open| open as usize);
+    }
+    if !matches!(source[at as usize], b'>' | b']') && !is_type_name_byte(source[at as usize]) {
+        return None;
+    }
+    while at >= 0 {
+        match source[at as usize] {
+            b'>' => at = balanced_open(source, at, b'>', b'<')? - 1,
+            b']' => at = balanced_open(source, at, b']', b'[')? - 1,
+            byte if is_type_name_byte(byte) || byte == b'.' => at -= 1,
+            _ => break,
+        }
+    }
+    Some((at + 1) as usize)
+}
+
+/// Whether `byte` can appear in a bare type name.
+fn is_type_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+}
+
+/// The index of the `open` byte matching the `close` byte at `from`, scanning
+/// left, or `None` when the group runs off the start of the file.
+fn balanced_open(source: &[u8], from: isize, close: u8, open: u8) -> Option<isize> {
+    let mut depth = 0i32;
+    let mut at = from;
+    while at >= 0 {
+        let byte = source[at as usize];
+        if byte == close {
+            depth += 1;
+        } else if byte == open {
+            depth -= 1;
+            if depth == 0 {
+                return Some(at);
+            }
+        }
+        at -= 1;
+    }
+    None
+}
+
+/// Declarations a top-level walk can reach in `tree`.
+///
+/// Both extractors here walk `root.children()` and dispatch on the child's kind,
+/// so this is the population a repair is allowed to change and the one it must
+/// never shrink. Counted rather than named, because the guard only has to notice
+/// that a declaration went missing, and counting keeps it cheap enough to run on
+/// every round.
+fn top_level_declaration_count(tree: &Tree) -> usize {
+    fn is_declaration(kind: &str) -> bool {
+        matches!(
+            kind,
+            "function_declaration"
+                | "generator_function_declaration"
+                | "function_signature"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "lexical_declaration"
+                | "variable_declaration"
+                | "type_alias_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+        )
+    }
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut total = 0;
+    for child in root.children(&mut cursor) {
+        if child.kind() == "export_statement" {
+            let mut exported = child.walk();
+            total += child
+                .named_children(&mut exported)
+                .filter(|node| is_declaration(node.kind()))
+                .count();
+        } else if is_declaration(child.kind()) {
+            total += 1;
+        }
     }
     total
 }
@@ -2563,6 +2832,246 @@ export function renderList(items: Array<string>): Node {
             unparsed_byte_total(&tree) < source.len(),
             "the root's own span must not be charged to the file"
         );
+    }
+
+    /// A Flow file shaped like React's `ReactFiberHooks.js`, carrying one of
+    /// each site where that file writes Flow's shorthand function type: a bare
+    /// identifier in a type alias, a parenthesised bare type in a union, an
+    /// object-type property, an optional parameter annotation, and a
+    /// parenthesised function type as a parameter.
+    ///
+    /// Everything after the first of them is what the TypeScript grammar's
+    /// recovery swallows, which is why the declarations here sit below the
+    /// types rather than above them.
+    const FLOW_SHORTHAND_SOURCE: &[u8] = br#"/**
+ * @flow
+ */
+
+import type {Fiber, Lanes} from './ReactInternalTypes';
+
+export type Update<S, A> = {
+  lane: Lanes,
+  action: A,
+  next: Update<S, A>,
+};
+
+export type UpdateQueue<S, A> = {
+  pending: Update<S, A> | null,
+  dispatch: (A => mixed) | null,
+  lastRenderedReducer: ((S, A) => S) | null,
+};
+
+type BasicStateAction<S> = (S => S) | S;
+
+type Dispatch<A> = A => void;
+
+function areHookInputsEqual(nextDeps: Array<mixed>, prevDeps: Array<mixed> | null): boolean {
+  return nextDeps === prevDeps;
+}
+
+export function updateWorkInProgressHook(): Update<mixed, mixed> {
+  return currentHook;
+}
+
+function updateReducer<S, I, A>(
+  reducer: (S, A) => S,
+  initialArg: I,
+  init?: I => S,
+): [S, Dispatch<A>] {
+  return updateReducerImpl(reducer, initialArg, init);
+}
+
+function mountSyncExternalStore<T>(
+  subscribe: (() => void) => () => void,
+  getSnapshot: () => T,
+): T {
+  return getSnapshot();
+}
+
+function dispatchSetState<S, A>(fiber: Fiber, queue: UpdateQueue<S, A>, action: A): void {
+  dispatchSetStateInternal(fiber, queue, action);
+}
+
+function isRenderPhaseUpdate(fiber: Fiber): boolean {
+  return fiber.alternate !== null;
+}
+
+export function updateState<S>(initialState: (() => S) | S): [S, Dispatch<BasicStateAction<S>>] {
+  return updateReducer(basicStateReducer, initialState);
+}
+"#;
+
+    /// The declarations React's hooks file lost, on a fixture that writes every
+    /// site it loses them at.
+    ///
+    /// Named one by one rather than counted, because the file this stands for
+    /// lost 128 of 135 names and a count would pass on the wrong seven.
+    #[test]
+    fn flow_shorthand_function_types_no_longer_swallow_the_file() {
+        let output = extract_source("src/ReactFiberHooks.js", FLOW_SHORTHAND_SOURCE);
+        for name in [
+            "areHookInputsEqual",
+            "updateWorkInProgressHook",
+            "updateReducer",
+            "mountSyncExternalStore",
+            "dispatchSetState",
+            "isRenderPhaseUpdate",
+            "updateState",
+        ] {
+            assert!(
+                named(&output, EntityKind::Function, name),
+                "{name} is missing; entities: {:?}",
+                entities_besides_the_files_own_module(&output.entities)
+            );
+        }
+    }
+
+    /// The grammar's own answer, so a change that recovered the declarations by
+    /// some other route still has to leave the parse readable.
+    ///
+    /// The unrepaired TypeScript parse of this fixture leaves most of it
+    /// unparsed; the repaired one leaves none of it. Both halves are asserted,
+    /// because a repair that merely moved the errors would pass the entity test
+    /// above on a tree nothing else can trust.
+    #[test]
+    fn the_repair_leaves_the_shorthand_fixture_fully_parsed() {
+        let unrepaired =
+            parse_with(&tree_sitter_typescript::LANGUAGE_TSX, FLOW_SHORTHAND_SOURCE).unwrap();
+        let before = unparsed_byte_total(&unrepaired);
+        assert!(
+            before > FLOW_SHORTHAND_SOURCE.len() / 2,
+            "the fixture must actually defeat the TypeScript grammar: {before} of {}",
+            FLOW_SHORTHAND_SOURCE.len()
+        );
+
+        let repaired = JavaScriptAdapter.parse(FLOW_SHORTHAND_SOURCE).unwrap();
+        assert!(tree_is_typescript_family(&repaired));
+        assert_eq!(
+            unparsed_byte_total(&repaired),
+            0,
+            "the repaired parse must read the whole fixture"
+        );
+    }
+
+    /// The guard that keeps the repair from paying for a smaller byte count with
+    /// a declaration.
+    ///
+    /// React's own compiler fixtures use the `match` expression proposal, whose
+    /// arms are written `['high', true] => 'high_active'`. Left of the arrow is a
+    /// bracketed group, which is exactly the shape a shorthand parameter has, so
+    /// blanking the arms lowers the byte total enough for the repaired tree to
+    /// win the grammar comparison, and it takes both of the file's declarations
+    /// with it. The declaration count is what tells the two apart. Measured over
+    /// React, this is the only file in 3,873 where the guard fires, and without
+    /// it that file goes from 2 declarations to 0.
+    ///
+    /// The fixture is React's `match-expression-with-tuple-and-early-return.js`
+    /// verbatim rather than a reduction of it, and that is not laziness. A
+    /// two-arm reduction does not regress: it loses its function under
+    /// tree-sitter 0.25 and keeps it under the 0.26 this crate pins, so a test
+    /// built on the small version passes with the guard deleted and proves
+    /// nothing. How far recovery spreads is what decides this, so the file stays
+    /// whole, comment and all.
+    #[test]
+    fn the_repair_refuses_a_round_that_costs_a_declaration() {
+        let source: &[u8] = br#"// @flow
+import {useState} from 'react';
+
+/**
+ * Test that match expressions with tuple patterns don't produce overly
+ * conservative mutation effects on the matched values. Without the fix
+ * for ModuleLocal global type resolution, Array.isArray inside the match
+ * IIFE body would not get its signature resolved, causing
+ * MutateTransitiveConditionally on the match argument and wider mutable
+ * ranges that prevent fine-grained memoization.
+ */
+function useFoo(data: {status: string, priority: string}) {
+  const [count] = useState(0);
+  const active = count > 0;
+
+  if (data.status === 'closed') {
+    return active ? 'closed_active' : 'closed';
+  }
+
+  return match ([data.priority, active]) {
+    ['high', true] => 'high_active',
+    ['high', false] => 'high_inactive',
+    ['medium', true] => 'medium_active',
+    ['medium', false] => 'medium_inactive',
+    ['low', true] => 'low_active',
+    ['low', false] => 'low_inactive',
+    [_, true] => 'other_active',
+    [_, false] => 'other_inactive',
+  };
+}
+
+export const FIXTURE_ENTRYPOINT = {
+  fn: useFoo,
+  params: [{status: 'open', priority: 'high'}],
+};
+"#;
+        let plain = parse_with(&tree_sitter_typescript::LANGUAGE_TSX, source).unwrap();
+        assert!(
+            !shorthand_function_type_sites(&plain, source).is_empty(),
+            "the match arms must look like shorthand parameters, or this guards nothing"
+        );
+
+        // Asserted through the adapter rather than through the repair alone,
+        // because the guard's job is to stop a repaired tree WINNING the grammar
+        // comparison, and that decision only exists here.
+        let tree = JavaScriptAdapter.parse(source).unwrap();
+        assert_eq!(
+            top_level_declaration_count(&tree),
+            2,
+            "both declarations must survive; the repair must not trade one away for a smaller byte total"
+        );
+        let output = extract_source("src/useFoo.js", source);
+        assert!(
+            named(&output, EntityKind::Function, "useFoo"),
+            "entities: {:?}",
+            entities_besides_the_files_own_module(&output.entities)
+        );
+    }
+
+    /// A tree with nothing to complain about offers the repair nothing to do, so
+    /// a file the grammar reads is never rewritten.
+    #[test]
+    fn the_repair_touches_nothing_the_grammar_read() {
+        let source = b"type Handler = (event: Event) => void;
+const run = (a) => a + 1;
+";
+        let tree = parse_with(&tree_sitter_typescript::LANGUAGE_TSX, source).unwrap();
+        assert_eq!(unparsed_byte_total(&tree), 0);
+        assert!(
+            shorthand_function_type_sites(&tree, source).is_empty(),
+            "an arrow the grammar accepted is not a site"
+        );
+    }
+
+    /// Where each shorthand parameter starts, one shape per line, because the
+    /// scan walks backwards and an off-by-one here blanks a byte of the
+    /// declaration beside it rather than of the type.
+    #[test]
+    fn a_shorthand_parameter_is_taken_whole() {
+        fn first(source: &str) -> Option<usize> {
+            shorthand_parameter_start(source.as_bytes(), source.find("=>").expect("fixture arrow"))
+        }
+        fn last(source: &str) -> Option<usize> {
+            shorthand_parameter_start(
+                source.as_bytes(),
+                source.rfind("=>").expect("fixture arrow"),
+            )
+        }
+        // A bare type name.
+        assert_eq!(first("type D = A => void;"), Some(9));
+        // A type name carrying its type arguments.
+        assert_eq!(first("type D = Array<T> => void;"), Some(9));
+        // The outer arrow of a parenthesised function type takes the group
+        // whole, from its opening paren rather than from its closing one.
+        assert_eq!(last("subscribe: (() => void) => void"), Some(11));
+        // Nothing usable to the left is not a site.
+        assert_eq!(first("=> void"), None);
+        assert_eq!(first("{ => void"), None);
     }
 
     #[test]
