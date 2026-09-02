@@ -88,7 +88,7 @@
         "seq": {
           "type": "integer",
           "minimum": 0,
-          "description": "Monotonic position in the delta stream. Compare against the seq your export was cut at."
+          "description": "Monotonic position in the delta stream, assigned when the event is emitted rather than when it is delivered. Compare against the seq your export was cut at. A stream narrowed by the types parameter has gaps, so consecutive numbers are not proof that nothing was missed."
         }
       }
     },
@@ -148,7 +148,7 @@
         "seq": {
           "type": "integer",
           "minimum": 0,
-          "description": "Monotonic position in the delta stream. Compare against the seq your export was cut at."
+          "description": "Monotonic position in the delta stream, assigned when the event is emitted rather than when it is delivered. Compare against the seq your export was cut at. A stream narrowed by the types parameter has gaps, so consecutive numbers are not proof that nothing was missed."
         }
       }
     },
@@ -186,7 +186,7 @@
         "seq": {
           "type": "integer",
           "minimum": 0,
-          "description": "Monotonic position in the delta stream. Compare against the seq your export was cut at."
+          "description": "Monotonic position in the delta stream, assigned when the event is emitted rather than when it is delivered. Compare against the seq your export was cut at. A stream narrowed by the types parameter has gaps, so consecutive numbers are not proof that nothing was missed."
         }
       }
     },
@@ -218,7 +218,7 @@
         "seq": {
           "type": "integer",
           "minimum": 0,
-          "description": "Monotonic position in the delta stream. Compare against the seq your export was cut at."
+          "description": "Monotonic position in the delta stream, assigned when the event is emitted rather than when it is delivered. Compare against the seq your export was cut at. A stream narrowed by the types parameter has gaps, so consecutive numbers are not proof that nothing was missed."
         }
       }
     },
@@ -247,7 +247,7 @@
         "seq": {
           "type": "integer",
           "minimum": 0,
-          "description": "Monotonic position in the delta stream. Compare against the seq your export was cut at."
+          "description": "Monotonic position in the delta stream, assigned when the event is emitted rather than when it is delivered. Compare against the seq your export was cut at. A stream narrowed by the types parameter has gaps, so consecutive numbers are not proof that nothing was missed."
         }
       }
     },
@@ -271,7 +271,7 @@
         "seq": {
           "type": "integer",
           "minimum": 0,
-          "description": "Monotonic position in the delta stream. Compare against the seq your export was cut at."
+          "description": "Monotonic position in the delta stream, assigned when the event is emitted rather than when it is delivered. Compare against the seq your export was cut at. A stream narrowed by the types parameter has gaps, so consecutive numbers are not proof that nothing was missed."
         },
         "nodes_added": {
           "type": "integer",

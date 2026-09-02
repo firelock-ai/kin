@@ -102,6 +102,15 @@ Server-sent events, one JSON payload per `data:` line, a comment heartbeat every
 30 seconds. The `types` parameter keeps only the named event types. Frames are
 `graph-event.schema.json` in `packages/boundary-contracts`.
 
+A filtered stream has gaps in `seq`, and that is expected: the sequence is
+assigned when an event is emitted, not when it is delivered, so numbers are
+missing for the frames the filter dropped. Measured on hiredis, `--types
+RelationChanged` over an edit that produced 27 entity frames delivered two
+relation frames at seq 62 and 63 behind a connected frame at seq 33. Never read
+consecutive sequence numbers as proof that nothing was missed. What `seq` is for
+is ordering against an export's cut, and it does that whether or not a filter is
+on.
+
 Every frame carries a monotonic `seq`. The first frame is always `connected`,
 carrying `entity_count`, `root_hash` and the `seq` the stream has reached.
 `EntityChanged` carries the entity id, the change type, the file, the session
