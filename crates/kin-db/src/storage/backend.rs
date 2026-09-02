@@ -9055,16 +9055,110 @@ mod tests {
         files
     }
 
+    /// Whether a message is the backend refusing to serve a namespace that is
+    /// not the one it retained.
+    ///
+    /// Three wordings, because the refusal has three shapes and which one a
+    /// caller gets is not always its choice. A replacement under the SAME id
+    /// reads as the namespace having changed. The retained inode reached under
+    /// a SECOND id reads as an identity collision, which is what
+    /// `LocalFileBackend::list_repos` reports when it walks the renamed
+    /// directory before the replacement one.
+    ///
+    /// That order is the filesystem's, not the test's, and it is stable on
+    /// neither: on 2026-09-02 the same commit passed on macOS and failed twice
+    /// on Linux with the collision wording, on a branch whose only change was a
+    /// new test file. Accepting one wording and not the other made a correct
+    /// refusal look like a defect once the directory hashed the other way.
+    ///
+    /// Deliberately still narrow. A generic IO failure names none of these, so
+    /// a test that stopped reaching the backend at all still fails here rather
+    /// than passing on any error at all.
+    #[cfg(unix)]
+    fn is_repository_namespace_refusal(message: &str) -> bool {
+        let names_the_namespace = message.contains("repository namespace")
+            || message.contains("repository surface")
+            || message.contains("retained storage namespace");
+        let names_the_refusal = message.contains("changed")
+            || message.contains("detached")
+            || message.contains("resolve to the same");
+        names_the_namespace && names_the_refusal
+    }
+
     #[cfg(unix)]
     fn assert_repository_namespace_rejected<T: std::fmt::Debug>(result: Result<T, KinDbError>) {
         let error = result.expect_err("a retained backend must reject a replacement repository");
         assert!(
-            (error.to_string().contains("repository namespace")
-                || error.to_string().contains("repository surface"))
-                && (error.to_string().contains("changed")
-                    || error.to_string().contains("detached")),
+            is_repository_namespace_refusal(&error.to_string()),
             "unexpected descendant-namespace error: {error}"
         );
+    }
+
+    /// The refusal predicate accepts every wording the backend actually emits
+    /// and refuses an unrelated failure.
+    ///
+    /// Both accepted strings are copied from the two sites that build them, so
+    /// this fails if either message is reworded without this being updated,
+    /// which is the point: the predicate is only as good as its agreement with
+    /// the code it reads.
+    #[cfg(unix)]
+    #[test]
+    fn the_namespace_refusal_predicate_accepts_both_wordings_and_nothing_else() {
+        assert!(is_repository_namespace_refusal(
+            "local repository namespace /tmp/x/repo-a changed while listing repositories"
+        ));
+        assert!(is_repository_namespace_refusal(
+            "repository ids \"repo-a-detached\" and \"repo-a\" resolve to the same retained \
+             storage namespace"
+        ));
+        assert!(is_repository_namespace_refusal(
+            "retained repository surface /tmp/x/repo-a/snapshots detached from its namespace"
+        ));
+        // The negative control. Without it this predicate could be widened to
+        // `true` and every caller would still pass.
+        assert!(!is_repository_namespace_refusal(
+            "failed to read /tmp/x/repo-a/authority.json: No such file or directory"
+        ));
+        assert!(!is_repository_namespace_refusal(
+            "generation mismatch for repo repo-a: expected 1, found 2"
+        ));
+    }
+
+    /// The retained inode, reached under a second name, is refused by identity.
+    ///
+    /// This is the branch `list_repos` takes when the filesystem hands it the
+    /// renamed directory first, and until this test existed it was reachable
+    /// only by that accident. Naming it directly makes it run on every platform
+    /// on every commit rather than when a directory happens to hash that way.
+    #[cfg(unix)]
+    #[test]
+    fn the_retained_namespace_is_refused_under_a_second_repository_id() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+            .unwrap();
+
+        // Rename the directory the backend retained. Its inode is now reachable
+        // only under a second name, which is the state a listing walks into
+        // after a replacement swap.
+        std::fs::rename(
+            directory.path().join("repo-a"),
+            directory.path().join("repo-a-detached"),
+        )
+        .unwrap();
+
+        let error = backend
+            .repository_capability("repo-a-detached", false)
+            .expect_err("the retained namespace must not be servable under a second id");
+        assert!(
+            error
+                .to_string()
+                .contains("resolve to the same retained storage namespace"),
+            "the refusal must name the identity collision: {error}"
+        );
+        assert_repository_namespace_rejected::<()>(Err(error));
     }
 
     struct RecoveryFixtureBackend {
