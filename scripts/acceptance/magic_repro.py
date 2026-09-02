@@ -1603,17 +1603,38 @@ def check_6(suite):
                 % schema_keys)
     else:
         res.ok("trace_data_flow declares %r" % knob)
+    # Both sides of the comparison name the shape they want AND the ceiling they
+    # answer under. The invariant is that asking for the shape of a chain costs
+    # less than asking for its bodies, and that is a claim about two explicit
+    # requests measured under one ceiling.
+    #
+    # Neither had been explicit, and each cost a run. A profile owns its own
+    # defaults for response-shaping knobs: when `agent-default` began defaulting
+    # `include_body` to false, the baseline stopped being the bodies-on side and
+    # the check measured the shape query against itself. Naming the shape fixed
+    # that and exposed the second one: under a 12,000-character profile ceiling
+    # the bodies-on answer is CUT to fit and comes back at 10,504 characters,
+    # SMALLER than the 11,156 of the uncut shape answer, so the comparison
+    # measured the budget rather than the flag. A ceiling both sides name, large
+    # enough to cut neither, is what makes this about `include_body` alone.
+    TRACE_COMPARISON_MAX_CHARS = 45000
     base_args = {"focal": "run_all", "direction": "calls", "depth": 3,
-                 "limit_per_step": 25}
+                 "limit_per_step": 25,
+                 "max_chars": TRACE_COMPARISON_MAX_CHARS}
+    BODIES_ON = {"include_body": True, "compact": False}
+    BODIES_OFF = {"include_body": False, "compact": True}
+    full_args = dict(base_args)
+    if knob:
+        full_args[knob] = BODIES_ON[knob]
     try:
-        full, full_size = suite.mcp(repo, "trace_data_flow", dict(base_args))
+        full, full_size = suite.mcp(repo, "trace_data_flow", dict(full_args))
         if not (full.get("chain") or []):
             # Same settle race find_references has: enrichment from the fixture's
             # last commit lands asynchronously, so a trace fired immediately can
             # walk a graph that has not linked the focal yet. Bounded, and an
             # empty chain after it still reports vacuous rather than passing.
             time.sleep(3)
-            full, full_size = suite.mcp(repo, "trace_data_flow", dict(base_args))
+            full, full_size = suite.mcp(repo, "trace_data_flow", dict(full_args))
     except McpError as exc:
         res.unknown("trace_data_flow (full) unreadable: %s" % exc)
         return res
@@ -1625,7 +1646,7 @@ def check_6(suite):
                     "comparison is vacuous" % base_args["focal"])
     elif knob:
         args = dict(base_args)
-        args[knob] = False if knob == "include_body" else True
+        args[knob] = BODIES_OFF[knob]
         try:
             compact, compact_size = suite.mcp(repo, "trace_data_flow", args)
         except McpError as exc:
@@ -1634,7 +1655,27 @@ def check_6(suite):
         bodies = [step for step in compact.get("chain") or []
                   if (step.get("entity") or {}).get("body")]
         budget = compact.get("max_response_chars")
-        if bodies:
+
+        def budget_cut(payload):
+            """The response-budget disclosure, if this answer was truncated.
+
+            A truncated answer and a small answer are the same number of bytes
+            apart from each other, and only this block tells them apart. Without
+            it a cut bodies-on side reads as "the flag saved nothing", which
+            convicts `include_body` of a defect the budget caused.
+            """
+            for entry in (payload.get("degradations") or []):
+                if isinstance(entry, dict) and entry.get("component") == "response_budget":
+                    return entry
+            return None
+
+        cut = budget_cut(full) or budget_cut(compact)
+        if cut:
+            res.unknown("a side of the shape comparison was cut by the response "
+                        "budget at %s chars (%s), so the two sizes measure the "
+                        "budget rather than %s"
+                        % (cut.get("max_chars"), cut.get("reason"), knob))
+        elif bodies:
             res.bad("%s honored nothing: %d step(s) still inline a body"
                     % (knob, len(bodies)))
         elif compact_size >= full_size:
@@ -1650,7 +1691,7 @@ def check_6(suite):
             # contract actually asks is that a shape query carries no bodies and
             # stays inside the budget the tool publishes, both of which are
             # properties of the tool rather than of the fixture.
-            res.ok("%s response carries no bodies, %d chars against %d full%s"
+            res.ok("%s response carries no bodies, %d chars against %d bodies-on%s"
                    % (knob, compact_size, full_size,
                       "" if budget is None else " and a %d budget" % budget))
     cut_args = {"focal": "run_all", "direction": "calls", "depth": 3,
