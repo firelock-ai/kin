@@ -232,7 +232,9 @@ impl SqliteBackend {
             )));
         }
         Ok(Some(SnapshotAuthority {
-            snapshot_bytes,
+            // A SQLite row is not a file this process can map, so its bytes
+            // stay owned exactly as before.
+            snapshot_bytes: snapshot_bytes.into(),
             snapshot_source: None,
             snapshot_generation,
             head_generation,
@@ -288,9 +290,12 @@ impl StorageBackend for SqliteBackend {
     }
 
     fn load_snapshot(&self, repo_id: &str) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
-        Ok(self
-            .load_snapshot_authority(repo_id)?
-            .map(|authority| (authority.snapshot_bytes, authority.snapshot_generation)))
+        Ok(self.load_snapshot_authority(repo_id)?.map(|authority| {
+            (
+                authority.snapshot_bytes.to_vec(),
+                authority.snapshot_generation,
+            )
+        }))
     }
 
     fn load_snapshot_authority(

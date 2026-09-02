@@ -1498,7 +1498,7 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
                     self.repository_id
                 )))
             }
-            Some(authority) if authority.snapshot_bytes == bytes => {
+            Some(authority) if *authority.snapshot_bytes == bytes[..] => {
                 let installed_cursor = authority.cursor();
                 if installed_cursor == state.cursor {
                     return PersistOutcome::Indeterminate(storage(format!(
@@ -14689,7 +14689,8 @@ mod tests {
             .load_snapshot_authority(repository_id().as_str())
             .unwrap()
             .expect("the exact candidate was installed")
-            .snapshot_bytes;
+            .snapshot_bytes
+            .to_vec();
 
         let reopened_backend = Arc::new(LocalFileBackend::new(directory.path()));
         let reopened =
@@ -14711,7 +14712,8 @@ mod tests {
                 .load_snapshot_authority(repository_id().as_str())
                 .unwrap()
                 .unwrap()
-                .snapshot_bytes,
+                .snapshot_bytes
+                .to_vec(),
             installed_bytes,
             "retry must confirm the installed candidate, not rebuild it"
         );

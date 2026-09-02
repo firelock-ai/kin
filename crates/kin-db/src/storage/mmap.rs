@@ -1713,44 +1713,46 @@ pub(crate) fn read_regular_file_at(
     Ok(bytes)
 }
 
-/// [`read_regular_file_at`], keeping the handle the bytes were read through.
+/// [`read_regular_file_at`], mapped rather than copied, keeping the handle.
 ///
-/// The handle is what lets a caller drop the bytes and read part of them
-/// again later: on every platform this crate builds for, a file stays
-/// readable through an open handle after its name is removed, so a snapshot
-/// generation the backend has since superseded is still the same bytes to
-/// whoever opened it. Positional reads only, so the handle can be shared.
-pub(crate) fn read_regular_file_keeping_handle_at(
+/// The reader that leaves the change map on disk needs the handle; the reader
+/// that decodes the rest of the body needs only a slice. Neither needs the
+/// bytes on the heap. An authority open hashes the whole snapshot and decodes
+/// it, and both read a slice, so copying the file into a `Vec` first put a
+/// second copy of the store beside the decode for exactly as long as the decode
+/// ran, which is the moment the open is at its highest.
+///
+/// A mapping costs no anonymous memory, and the pages it does touch are clean
+/// and file-backed, so the kernel can drop them under pressure instead of
+/// swapping them. The handle is returned beside it exactly as the copying
+/// reader returns it, so a superseded generation stays readable after its name
+/// is removed.
+///
+/// Opened `nofollow` through the same capability the copying reader uses, so
+/// the symlink and directory refusals are unchanged. The map is read-only.
+pub(crate) fn map_regular_file_keeping_handle_at(
     directory: &cap_std::fs::Dir,
     relative: &Path,
     display_root: &Path,
     role: &str,
-) -> Result<(Vec<u8>, File, PathBuf), KinDbError> {
+) -> Result<(Mmap, File, PathBuf), KinDbError> {
     let display = capability_display_path(display_root, relative);
-    let mut file = open_regular_nofollow_at(directory, relative, display_root, role)?;
-    let len = file
-        .metadata()
-        .map_err(|error| {
+    let file = open_regular_nofollow_at(directory, relative, display_root, role)?;
+    // SAFETY: the file is opened read-only through the retained capability and
+    // a published snapshot leaf is immutable: a writer stages a new file and
+    // renames it into place, so the inode behind this mapping is never
+    // rewritten underneath it. That is the same contract `MmapReader` already
+    // maps snapshots under, and the same one that makes the retained handle
+    // beside this mapping safe to read from later.
+    let mapping = unsafe {
+        Mmap::map(&file).map_err(|error| {
             KinDbError::StorageError(format!(
-                "failed to inspect {role} {}: {error}",
+                "failed to map {role} {}: {error}",
                 display.display()
             ))
         })?
-        .len();
-    let capacity = usize::try_from(len).map_err(|_| {
-        KinDbError::StorageError(format!(
-            "{role} {} length does not fit in memory",
-            display.display()
-        ))
-    })?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.read_to_end(&mut bytes).map_err(|error| {
-        KinDbError::StorageError(format!(
-            "failed to read {role} {}: {error}",
-            display.display()
-        ))
-    })?;
-    Ok((bytes, file, display))
+    };
+    Ok((mapping, file, display))
 }
 
 /// Sync the parent directory selected beneath a retained repository

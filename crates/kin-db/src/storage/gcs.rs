@@ -525,7 +525,9 @@ impl GcsBackend {
         })?;
         let snapshot_bytes = Self::decode_full_snapshot_authority(&bytes)?;
         Ok(Some(SnapshotAuthority {
-            snapshot_bytes,
+            // A GCS object is not a file this process can map, so its bytes
+            // stay owned exactly as before.
+            snapshot_bytes: snapshot_bytes.into(),
             snapshot_source: None,
             snapshot_generation: generation,
             head_generation: generation,
@@ -707,7 +709,7 @@ impl GcsBackend {
         if current_generation == expected_gen {
             return Ok(None);
         }
-        if authority.snapshot_bytes == data {
+        if *authority.snapshot_bytes == *data {
             return Ok(Some(current_generation));
         }
         Err(KinDbError::StorageError(format!(
@@ -741,9 +743,12 @@ impl StorageBackend for GcsBackend {
     }
 
     fn load_snapshot(&self, repo_id: &str) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
-        Ok(self
-            .load_snapshot_authority(repo_id)?
-            .map(|authority| (authority.snapshot_bytes, authority.snapshot_generation)))
+        Ok(self.load_snapshot_authority(repo_id)?.map(|authority| {
+            (
+                authority.snapshot_bytes.to_vec(),
+                authority.snapshot_generation,
+            )
+        }))
     }
 
     fn supports_vector_artifacts(&self) -> bool {
@@ -3015,7 +3020,7 @@ pub(crate) mod tests {
             .unwrap()
             .expect("the provider installed the exact candidate");
         assert_eq!(installed.head_generation, 100);
-        let installed_bytes = installed.snapshot_bytes;
+        let installed_bytes = installed.snapshot_bytes.to_vec();
 
         let reopened_backend = Arc::new(GcsBackend::from_store(
             Box::new(Arc::clone(&store)),
@@ -3039,7 +3044,8 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(final_authority.head_generation, 100);
         assert_eq!(
-            final_authority.snapshot_bytes, installed_bytes,
+            final_authority.snapshot_bytes.to_vec(),
+            installed_bytes,
             "reconciliation must not emit a timestamp-rebuilt successor"
         );
     }

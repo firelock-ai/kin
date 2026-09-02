@@ -1969,10 +1969,76 @@ pub struct SnapshotFileSource {
     pub(crate) display: String,
 }
 
+/// The persisted snapshot bytes one recovery selected.
+///
+/// Recovery hashes these bytes and decodes the elements it needs from them, and
+/// both read a slice while the bytes stay whole. On a converted repository that
+/// is the highest moment of an authority open, so putting the bytes on the heap
+/// first stands a second copy of the store beside the decode it feeds.
+///
+/// A backend holding the snapshot in a file hands back a mapping, which costs
+/// no anonymous memory and leaves clean file pages the kernel may drop under
+/// pressure rather than swap. A backend with no file to map, or one that
+/// already has the bytes in hand, owns them exactly as before. Every reader
+/// sees `[u8]`.
+///
+/// Independent of [`SnapshotFileSource`] beside it, which exists so a reader
+/// can come back for one element after these bytes are gone. This is about how
+/// the bytes are held while they are here.
+pub enum SnapshotPayload {
+    /// Bytes this process allocated, for a backend with nothing to map.
+    Owned(Vec<u8>),
+    /// A read-only mapping of the persisted snapshot leaf.
+    Mapped(memmap2::Mmap),
+}
+
+impl std::fmt::Debug for SnapshotPayload {
+    /// Its length and its shape, never its bytes: a converted repository's
+    /// snapshot is gigabytes, and a derived `Debug` puts all of it in one log
+    /// line the moment anything above formats the authority.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (shape, len) = match self {
+            Self::Owned(bytes) => ("owned", bytes.len()),
+            Self::Mapped(mapping) => ("mapped", mapping.len()),
+        };
+        formatter
+            .debug_struct("SnapshotPayload")
+            .field("shape", &shape)
+            .field("len", &len)
+            .finish()
+    }
+}
+
+impl std::ops::Deref for SnapshotPayload {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(mapping) => mapping,
+        }
+    }
+}
+
+impl From<Vec<u8>> for SnapshotPayload {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Owned(bytes)
+    }
+}
+
+/// Required, and not merely convenient: `Sha256::digest(&payload)` resolves
+/// through `AsRef<[u8]>` rather than through `Deref`, so recovery cannot hash
+/// the snapshot without it. A grep for `.as_ref()` does not see that call.
+impl AsRef<[u8]> for SnapshotPayload {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
 /// Atomic persistence authority for a snapshot plus its acknowledged journal.
 #[derive(Debug)]
 pub struct SnapshotAuthority {
-    pub snapshot_bytes: Vec<u8>,
+    pub snapshot_bytes: SnapshotPayload,
     /// Where `snapshot_bytes` can be read again, when the backend has a file
     /// to hand back. `None` means every decode of this authority is whole.
     pub snapshot_source: Option<SnapshotFileSource>,
@@ -2615,7 +2681,7 @@ pub trait StorageBackend: Send + Sync {
         Ok(self
             .load_snapshot(repo_id)?
             .map(|(snapshot_bytes, generation)| SnapshotAuthority {
-                snapshot_bytes,
+                snapshot_bytes: snapshot_bytes.into(),
                 snapshot_source: None,
                 snapshot_generation: generation,
                 head_generation: generation,
@@ -3959,22 +4025,27 @@ impl LocalSurfaceCapability {
         mmap::read_regular_file_at(&self.directory, leaf, &self.display_path, role)
     }
 
-    /// [`read_regular`](Self::read_regular), also returning the open handle
-    /// the bytes came through, so part of them can be read again later.
-    fn read_regular_keeping_handle(
+    /// [`read_regular`](Self::read_regular), mapped rather than copied, also
+    /// returning the open handle so part of the bytes can be read again later.
+    ///
+    /// This replaced a copying twin rather than sitting beside it. Everything
+    /// that reads a persisted snapshot either hashes it or decodes elements out
+    /// of it, and both take a slice, so the copy served no reader and cost a
+    /// whole store while the decode it fed was running.
+    fn map_regular_keeping_handle(
         &self,
         leaf: &Path,
         role: &str,
-    ) -> Result<(Vec<u8>, SnapshotFileSource), KinDbError> {
+    ) -> Result<(memmap2::Mmap, SnapshotFileSource), KinDbError> {
         Self::require_leaf(leaf)?;
-        let (bytes, file, display) = mmap::read_regular_file_keeping_handle_at(
+        let (mapping, file, display) = mmap::map_regular_file_keeping_handle_at(
             &self.directory,
             leaf,
             &self.display_path,
             role,
         )?;
         Ok((
-            bytes,
+            mapping,
             SnapshotFileSource {
                 file: std::sync::Arc::new(file),
                 display: display.display().to_string(),
@@ -6805,7 +6876,7 @@ impl LocalFileBackend {
         &self,
         namespace: &LocalRepositoryCapability,
         record: &LocalAuthorityRecord,
-    ) -> Result<(Vec<u8>, SnapshotFileSource), KinDbError> {
+    ) -> Result<(SnapshotPayload, SnapshotFileSource), KinDbError> {
         let repo_id = &namespace.repo_id;
         let snapshots = namespace
             .surface(Self::snapshots_surface_name(), false)?
@@ -6815,8 +6886,13 @@ impl LocalFileBackend {
                 ))
             })?;
         let leaf = Path::new(&record.snapshot_file);
+        // Mapped rather than read: everything above this hashes the bytes or
+        // decodes elements out of them, and both take a slice. Copying them
+        // onto the heap first stood a whole second copy of the store beside the
+        // decode it feeds, which is where an authority open peaks.
         let (snapshot_bytes, source) =
-            snapshots.read_regular_keeping_handle(leaf, "authoritative snapshot")?;
+            snapshots.map_regular_keeping_handle(leaf, "authoritative snapshot")?;
+        let snapshot_bytes = SnapshotPayload::Mapped(snapshot_bytes);
         let digest = Self::snapshot_digest(&snapshot_bytes);
         if digest != record.snapshot_sha256 {
             return Err(KinDbError::StorageError(format!(
@@ -7419,7 +7495,7 @@ impl LocalFileBackend {
         )?;
         let cursor = SnapshotCursor::from_backend_generation(generation);
         let authority = SnapshotAuthority {
-            snapshot_bytes: data.to_vec(),
+            snapshot_bytes: data.to_vec().into(),
             snapshot_source: None,
             snapshot_generation: generation,
             head_generation: generation,
@@ -7757,9 +7833,12 @@ impl StorageBackend for LocalFileBackend {
     }
 
     fn load_snapshot(&self, repo_id: &str) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
-        Ok(self
-            .load_snapshot_authority(repo_id)?
-            .map(|authority| (authority.snapshot_bytes, authority.snapshot_generation)))
+        Ok(self.load_snapshot_authority(repo_id)?.map(|authority| {
+            (
+                authority.snapshot_bytes.to_vec(),
+                authority.snapshot_generation,
+            )
+        }))
     }
 
     fn save_source_blob(
@@ -8761,7 +8840,7 @@ mod tests {
         fn load_recovery_state(&self, _repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
             Ok((
                 Some(SnapshotAuthority {
-                    snapshot_bytes: self.snapshot_bytes.clone(),
+                    snapshot_bytes: self.snapshot_bytes.clone().into(),
                     snapshot_source: None,
                     snapshot_generation: self.snapshot_generation,
                     head_generation: self.head_generation,
@@ -8837,7 +8916,7 @@ mod tests {
     #[test]
     fn default_snapshot_cursor_probe_uses_the_coherent_recovery_read() {
         let backend = RecoveryFixtureBackend {
-            snapshot_bytes: GraphSnapshot::empty().to_bytes().unwrap(),
+            snapshot_bytes: GraphSnapshot::empty().to_bytes().unwrap().into(),
             snapshot_generation: 9,
             head_generation: 9,
             deltas: Vec::new(),
@@ -8849,7 +8928,7 @@ mod tests {
         );
 
         let malformed = RecoveryFixtureBackend {
-            snapshot_bytes: GraphSnapshot::empty().to_bytes().unwrap(),
+            snapshot_bytes: GraphSnapshot::empty().to_bytes().unwrap().into(),
             snapshot_generation: 7,
             head_generation: 9,
             deltas: Vec::new(),
@@ -8908,7 +8987,7 @@ mod tests {
             (
                 "wrong-base",
                 RecoveryFixtureBackend {
-                    snapshot_bytes: snapshot_bytes.clone(),
+                    snapshot_bytes: snapshot_bytes.clone().into(),
                     snapshot_generation: 1,
                     head_generation: 2,
                     deltas: vec![(wrong_base, 2)],
@@ -8918,7 +8997,7 @@ mod tests {
             (
                 "duplicate",
                 RecoveryFixtureBackend {
-                    snapshot_bytes: snapshot_bytes.clone(),
+                    snapshot_bytes: snapshot_bytes.clone().into(),
                     snapshot_generation: 1,
                     head_generation: 3,
                     deltas: vec![(valid.clone(), 2), (valid.clone(), 2)],

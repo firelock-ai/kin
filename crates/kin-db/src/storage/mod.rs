@@ -39,11 +39,11 @@ pub use backend::{
     load_recovered_snapshot, AuthorityPayloadStats, Generation, LocalFileBackend,
     LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta, PersistedVectorArtifact,
     PreparedWorkspaceGraphArtifact, RecoveredSnapshot, SnapshotAuthority, SnapshotCursor,
-    SnapshotRecoveryState, SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch,
-    StorageBackend, VectorArtifact, VectorArtifactBinding, VectorArtifactCursor,
-    VectorArtifactLoadOutcome, VectorArtifactSaveOutcome, VectorRepositoryIdentity,
-    VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
-    MAX_VECTOR_ARTIFACT_BYTES, MAX_VECTOR_ARTIFACT_METADATA_BYTES,
+    SnapshotPayload, SnapshotRecoveryState, SnapshotSaveOutcome, SourceBlobValidationRequest,
+    SourceBlobWriteBatch, StorageBackend, VectorArtifact, VectorArtifactBinding,
+    VectorArtifactCursor, VectorArtifactLoadOutcome, VectorArtifactSaveOutcome,
+    VectorRepositoryIdentity, VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT,
+    MAX_SOURCE_BLOB_BYTES, MAX_VECTOR_ARTIFACT_BYTES, MAX_VECTOR_ARTIFACT_METADATA_BYTES,
 };
 pub use change_map::{ChangeMap, ChangeMapInner};
 pub use delta::{
