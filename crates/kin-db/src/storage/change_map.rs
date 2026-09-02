@@ -309,35 +309,6 @@ impl ChangeMap {
             .expect("the change map was set under the decode gate"))
     }
 
-    /// Read the entries without keeping them.
-    ///
-    /// [`Deref`] memoizes: the first read leaves the whole history decoded for
-    /// the life of the snapshot, which is right for a reader that will come
-    /// back and wrong for one that folds the map into a digest and keeps
-    /// nothing. That second reader runs on every graph build, so on a converted
-    /// store it was the reason a map the open left on disk did not stay there.
-    ///
-    /// A map already in memory is handed the memoized one and nothing is
-    /// decoded. A map on disk is decoded into a temporary that is dropped when
-    /// this returns, so the cost is the same decode the caller already paid and
-    /// the difference is only whether it is still resident afterwards.
-    ///
-    /// Panics on a decode failure exactly as `Deref` does, and for the same
-    /// reason: the callers that can carry an error use
-    /// [`decoded`](Self::decoded).
-    pub(crate) fn with_entries<R>(&self, read: impl FnOnce(&ChangeMapInner) -> R) -> R {
-        if let Some(decoded) = self.decoded.get() {
-            return read(decoded);
-        }
-        match &self.encoded {
-            Some(encoded) => match encoded.decode() {
-                Ok(transient) => read(&transient),
-                Err(error) => panic!("{error}"),
-            },
-            None => read(&ChangeMapInner::new()),
-        }
-    }
-
     fn force(&self) -> &ChangeMapInner {
         match self.decoded() {
             Ok(decoded) => decoded,

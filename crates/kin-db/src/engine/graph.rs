@@ -3440,7 +3440,9 @@ impl InMemoryGraph {
         persist_additional: impl FnOnce([u8; 32]) -> Result<T, KinDbError>,
     ) -> Result<bool, KinDbError> {
         let ent = self.entities.read();
-        let chg = self.changes.read();
+        // Held for coherence with the domains below, not read: the retrieval
+        // authority no longer covers the history.
+        let _chg = self.changes.read();
         let _wrk = self.work.read();
         let _rev = self.reviews.read();
         let _ver = self.verification.read();
@@ -3453,7 +3455,6 @@ impl InMemoryGraph {
             current_root_hash,
             &ent.entities,
             &ent.relations,
-            &chg.changes,
             &ent.entity_revisions,
             &ent.external_references,
             &ent.resolved_tree,
@@ -3922,7 +3923,6 @@ impl InMemoryGraph {
             graph_root_hash,
             &ent.entities,
             &ent.relations,
-            &chg.changes,
             &ent.entity_revisions,
             &ent.external_references,
             &ent.resolved_tree,
@@ -4006,14 +4006,12 @@ impl InMemoryGraph {
     #[cfg(any(feature = "vector", test))]
     pub(crate) fn retrieval_authority_hash(&self) -> [u8; 32] {
         let ent = self.entities.read();
-        let chg = self.changes.read();
         self.flush_merkle(&ent);
         let graph_root_hash = self.merkle.read().root_hash();
         compute_live_retrieval_authority_hash(
             graph_root_hash,
             &ent.entities,
             &ent.relations,
-            &chg.changes,
             &ent.entity_revisions,
             &ent.external_references,
             &ent.resolved_tree,

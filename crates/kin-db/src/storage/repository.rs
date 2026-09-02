@@ -20608,13 +20608,14 @@ mod tests {
         base
     }
 
-    /// The currency digest folds the whole history in, and that fold is what
-    /// used to decode a map the open had left on disk. It now reads the
-    /// entries transiently, so the digest has to be proved unmoved: this is a
-    /// memory change, not a format change, and a digest that shifted would
-    /// invalidate every persisted text index and vector sidecar in the field.
+    /// The currency digest no longer reads the history at all.
+    ///
+    /// It used to fold the whole change map in, which decoded a map the open
+    /// had left on disk. Two things are asserted over a real store's base: the
+    /// digest does not depend on whether the history is resident, and taking it
+    /// does not decode a history that is not.
     #[test]
-    fn folding_the_history_into_the_currency_digest_moves_no_byte_and_keeps_nothing() {
+    fn taking_the_currency_digest_does_not_read_the_history() {
         let directory = TempDir::new().unwrap();
         committed_local_repository_with_an_entity(&directory);
         persist_a_materialized_graph_section(&directory);
@@ -20623,11 +20624,14 @@ mod tests {
         let lease = reopened.read_authority();
         let mut base = on_disk_history_base(&lease);
 
+        let decodes_before = decoded_on_this_thread();
         let from_disk = crate::storage::merkle::compute_retrieval_authority_hash(&base);
-        assert!(
-            !base.changes.is_decoded(),
-            "folding the history into the digest must not have kept it"
+        assert_eq!(
+            decoded_on_this_thread(),
+            decodes_before,
+            "taking the currency digest must not read the history at all"
         );
+        assert!(!base.changes.is_decoded(), "and it must not have kept one");
 
         // Decode it deliberately, and take the same digest over the same map in
         // memory. Byte equality between the two is the whole claim.

@@ -687,9 +687,9 @@ pub(crate) mod root_hash_passes {
 /// It is therefore not a safe sidecar identity for exact repository-tree or
 /// artifact enrichment changes. This digest binds those domains as well while
 /// remaining substantially cheaper than cloning and hashing a full snapshot.
-pub const RETRIEVAL_AUTHORITY_HASH_VERSION: u32 = 2;
+pub const RETRIEVAL_AUTHORITY_HASH_VERSION: u32 = 3;
 
-const RETRIEVAL_AUTHORITY_DOMAIN: &[u8] = b"kin-retrieval-authority-v2:";
+const RETRIEVAL_AUTHORITY_DOMAIN: &[u8] = b"kin-retrieval-authority-v3:";
 
 /// Compute the retrieval-sidecar authority for an owned snapshot.
 pub fn compute_retrieval_authority_hash(snapshot: &GraphSnapshot) -> MerkleHash {
@@ -700,14 +700,6 @@ pub fn compute_retrieval_authority_hash(snapshot: &GraphSnapshot) -> MerkleHash 
 
     hash_map_domain(&mut hasher, "retrieval_entities", &snapshot.entities);
     hash_map_domain(&mut hasher, "retrieval_relations", &snapshot.relations);
-    // Read through `with_entries` rather than by deref. This fold is the only
-    // thing on a daemon's open path that looks at the whole history, and it
-    // keeps nothing, so memoizing the decode here left a converted store's
-    // entire history resident for the life of the process to produce one
-    // digest. The bytes folded in are identical either way.
-    snapshot
-        .changes
-        .with_entries(|changes| hash_map_domain(&mut hasher, "retrieval_changes", changes));
     hash_map_domain(
         &mut hasher,
         "retrieval_external_references",
@@ -772,11 +764,6 @@ pub(crate) fn compute_locate_retrieval_authority_hash(
     );
     hash_domain_elements(
         &mut hasher,
-        "retrieval_changes",
-        &snapshot.changes.iter().collect::<Vec<_>>(),
-    );
-    hash_domain_elements(
-        &mut hasher,
         "retrieval_external_references",
         &snapshot.external_references.iter().collect::<Vec<_>>(),
     );
@@ -825,7 +812,6 @@ pub(crate) fn compute_live_retrieval_authority_hash(
     graph_root_hash: MerkleHash,
     entities: &hashbrown::HashMap<EntityId, Entity>,
     relations: &hashbrown::HashMap<RelationId, Relation>,
-    changes: &HashMap<SemanticChangeId, SemanticChange>,
     entity_revisions: &hashbrown::HashMap<EntityId, Vec<EntityRevision>>,
     external_references: &hashbrown::HashMap<ExternalReferenceId, ExternalReference>,
     resolved_tree: &ResolvedTree,
@@ -848,11 +834,6 @@ pub(crate) fn compute_live_retrieval_authority_hash(
         &mut hasher,
         "retrieval_relations",
         &relations.iter().collect::<Vec<_>>(),
-    );
-    hash_domain_elements(
-        &mut hasher,
-        "retrieval_changes",
-        &changes.iter().collect::<Vec<_>>(),
     );
     hash_domain_elements(
         &mut hasher,
@@ -2500,6 +2481,45 @@ mod tests {
         );
     }
 
+    /// The whole point of taking history out of the digest.
+    ///
+    /// A commit whose resolved graph is identical used to move the retrieval
+    /// authority, which invalidated the persisted text index and the vector
+    /// sidecar and forced a rebuild and a re-embed for a repository nothing
+    /// about retrieval had changed in. The digest is now a function of what is
+    /// actually indexed.
+    #[test]
+    fn a_commit_that_leaves_the_resolved_graph_identical_no_longer_moves_the_digest() {
+        let mut indexed = GraphSnapshot::empty();
+        let entity = test_entity("already_indexed");
+        indexed.entities.insert(entity.id, entity);
+        let before = compute_retrieval_authority_hash(&indexed);
+
+        let mut with_history = indexed.clone();
+        let change = test_change(0x41, "a commit that changes no indexed thing", Vec::new());
+        with_history.changes.insert(change.id, change);
+        assert!(
+            !with_history.changes.is_empty(),
+            "the control: the second snapshot really does carry a history the first does not"
+        );
+        assert_eq!(
+            before,
+            compute_retrieval_authority_hash(&with_history),
+            "a commit that leaves the resolved graph identical must not invalidate the index"
+        );
+
+        // The control, so the digest has not simply gone blind: something the
+        // index DOES cover still moves it.
+        let mut with_entity = indexed.clone();
+        let other = test_entity("newly_indexed");
+        with_entity.entities.insert(other.id, other);
+        assert_ne!(
+            before,
+            compute_retrieval_authority_hash(&with_entity),
+            "an entity the index covers must still invalidate it"
+        );
+    }
+
     #[test]
     fn retrieval_authority_changes_when_exact_tree_or_artifact_facets_change() {
         let empty = GraphSnapshot::empty();
@@ -2604,11 +2624,6 @@ mod tests {
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();
-        let changes = snapshot
-            .changes
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
         let revisions = snapshot
             .entity_revisions
             .iter()
@@ -2645,7 +2660,6 @@ mod tests {
                 graph_root_hash,
                 &entities,
                 &relations,
-                &changes,
                 &revisions,
                 &external_references,
                 &snapshot.resolved_tree,
