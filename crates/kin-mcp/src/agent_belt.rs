@@ -426,10 +426,144 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
     ])
 }
 
-/// Rewrite one served tool list for the `agent-default` profile: short
-/// descriptions and trimmed schemas. Tool names are left exactly as
-/// registered, because two proofs that run only on `main` read `tools/list` and
-/// assert a name literally.
+/// The most characters one `agent-default` PROPERTY description may carry.
+///
+/// The tool descriptions were the visible half of the belt's cost and 1353 cut
+/// them from 47,739 characters to 6,188. Measured on 2026-09-02 against
+/// `google/gemma-4-e4b`, the model the demo actually runs, that left the served
+/// list at 7,747 tokens of which 6,380 are input schema and only 1,367 are
+/// description. The schemas are where the budget goes now, and inside them the
+/// bytes are property prose: thirteen property descriptions ran past 200
+/// characters, and one of them, `max_chars`, carried the same 649 characters on
+/// seven different tools.
+///
+/// 200 is one plain clause. A property description exists to tell a model what
+/// to pass, and the shape, bounds and default are already machine-readable
+/// beside it in `type`, `enum`, `minimum`, `maximum` and `default`, so prose
+/// that restates them is paid for twice.
+/// `no_agent_default_property_description_exceeds_its_budget` fails on any
+/// property over it.
+pub const AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET: usize = 200;
+
+/// The tools whose schemas this module does not rewrite at all.
+///
+/// 1353 left the nested transaction contracts whole, and they stay whole: a
+/// staged mutation's shape is the thing a caller gets wrong, and it is the one
+/// place on this belt where the schema IS the documentation. They cost 11,245
+/// bytes and 2,423 tokens between them, which is 31 percent of every token in
+/// the served list, and that number belongs in a product decision about which
+/// tools a read-only agent is served rather than in a prose trim.
+const PROSE_EXEMPT_TOOLS: [&str; 2] = ["kin_transaction_stage", "kin_transaction_commit"];
+
+/// Short property descriptions that read the same on every tool carrying them.
+///
+/// Keyed by property name alone, because these properties mean one thing across
+/// the belt and the long forms said that one thing seven times.
+/// [`tool_property_descriptions`] overrides this per tool where the meaning
+/// genuinely differs.
+fn shared_property_descriptions() -> BTreeMap<&'static str, &'static str> {
+    BTreeMap::from([
+        (
+            "max_chars",
+            "Serialized characters this response may occupy. What the budget cut is named under \
+             `elisions` and `_kin.response`, and a list it cut keeps one entry, so an empty list \
+             means none were found.",
+        ),
+        (
+            "max_response_chars",
+            "Serialized characters this response may occupy. `max_chars` is the same parameter \
+             under the other retrieval tools' name. A cut chain keeps one step and reports the \
+             rest under `elisions.chain`.",
+        ),
+        (
+            "cursor",
+            "Opaque token from a prior result's `next_cursor`, returning the next page of the \
+             same collection. Pass it back unedited, and omit it for a fresh query.",
+        ),
+    ])
+}
+
+/// Short property descriptions for one tool's property, overriding
+/// [`shared_property_descriptions`] where a name means different things.
+///
+/// Keyed by `(tool, property)`. `direction` is the reason this table exists: it
+/// walks callees on `trace_data_flow` and dependencies on `graph_neighborhood`,
+/// and one clause cannot honestly say both.
+fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'static str> {
+    BTreeMap::from([
+        (
+            ("semantic_locate", "include_tests"),
+            "Rank test-role entities alongside source. Off by default unless your query itself \
+             reads as being about tests; what it withheld is counted under \
+             `semantic_coverage.graph_bodies`.",
+        ),
+        (
+            ("list_file_entities", "path"),
+            "Repository-relative path of the file to enumerate, such as \"lib/express.js\". No \
+             leading slash, no \"..\", no Kin or Git control component. Optional only when \
+             `cursor` names the file.",
+        ),
+        (
+            ("trace_data_flow", "target"),
+            "A symbol you are trying to reach, by exact name or UUID. Neighbours it stays \
+             reachable from survive the per-step cap first. Optional; one resolving to nothing \
+             is reported in degradations.",
+        ),
+        (
+            ("trace_data_flow", "include_body"),
+            "Inline each step's source body. Pass false for the SHAPE of the chain, which is a \
+             fraction of the size and is what you want unless you mean to read the code.",
+        ),
+        (
+            ("trace_data_flow", "direction"),
+            "Which way to walk: `calls` for callees, `callers` for callers, `both` merges.",
+        ),
+        (
+            ("graph_neighborhood", "direction"),
+            "Which way to walk: `out` for what the focal depends on, `in` for what depends on it \
+             (blast radius), `both` merges.",
+        ),
+    ])
+}
+
+/// Replace one tool's top-level property descriptions with their short forms.
+///
+/// Top-level only. A nested schema below a property belongs to whatever
+/// contract that property describes, and on this belt the only deep ones are
+/// the transaction mutations that [`PROSE_EXEMPT_TOOLS`] keeps whole anyway.
+fn shorten_property_descriptions(tool: &str, schema: &mut serde_json::Value) {
+    if PROSE_EXEMPT_TOOLS.contains(&tool) {
+        return;
+    }
+    let shared = shared_property_descriptions();
+    let per_tool = tool_property_descriptions();
+    let Some(properties) = schema
+        .get_mut("properties")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    for (name, property) in properties.iter_mut() {
+        let short = per_tool
+            .get(&(tool, name.as_str()))
+            .or_else(|| shared.get(name.as_str()));
+        let (Some(short), Some(property)) = (short, property.as_object_mut()) else {
+            continue;
+        };
+        if property.contains_key("description") {
+            property.insert(
+                "description".to_string(),
+                serde_json::Value::String((*short).to_string()),
+            );
+        }
+    }
+}
+
+/// Rewrite one served tool list for the `agent-default` profile: short tool
+/// descriptions, trimmed schemas, and short property descriptions inside the
+/// schemas that survive. Tool names are left exactly as registered, because two
+/// proofs that run only on `main` read `tools/list` and assert a name
+/// literally.
 ///
 /// A tool with no short form keeps its registered description, so adding a tool
 /// to the profile is never silently a tool with no description. The
@@ -445,6 +579,7 @@ pub fn compact_for_agent_default(list: &mut ToolsListResult) {
         if let Some(keep) = keeps.get(tool.name.as_str()) {
             trim_schema(&mut tool.input_schema, keep);
         }
+        shorten_property_descriptions(&tool.name, &mut tool.input_schema);
     }
     // No name is rewritten here, so the name order `tools::tool_definitions`
     // built survives untouched. A client caches the prompt it builds from
