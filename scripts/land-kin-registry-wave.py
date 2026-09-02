@@ -55,10 +55,11 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 EXPECTED_REPOSITORY = "firelock-ai/kin"
@@ -90,6 +91,20 @@ WAIT = "wait"
 REFUSE = "refuse"
 ATTESTATION_VERIFIED = "verified"
 ATTESTATION_PENDING = "pending"
+# A cancelled check is what the receiver's re-push and the attester's reopen
+# retrigger leave behind on a superseded suite; it is news about the clock, not
+# about the tree, so it waits for the rerun instead of refusing.
+CANCELLED_CONCLUSIONS = frozenset({"cancelled"})
+# The typed manual kick and who may send it, mirroring release-tag.yml's
+# break-glass shape: a repository_dispatch always runs this workflow from the
+# default branch, and the actor is pinned to the captain and the release App.
+KICK_ACTION = "kin-registry-wave-land"
+KICK_ACTORS = frozenset({"troyjr4103", "kin-release-bot[bot]"})
+KICK_REASON_LIMIT = 200
+TRIGGER_KICK = "kick"
+TRIGGER_COMPLETION = "completion"
+TRIGGER_SWEEP = "sweep"
+WAIT_POLL_SECONDS = 30.0
 
 
 class LandingError(RuntimeError):
@@ -130,6 +145,11 @@ class Verdict:
     pull: int | None = None
     head: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    # A transient wait resolves by itself (checks running, an attestation on
+    # its way, a rerun after a cancel, GitHub still computing mergeability);
+    # a judge given a wait budget re-reads until it does. A hold or an empty
+    # branch is not transient, and returns at once.
+    transient: bool = False
 
     def document(self) -> dict[str, Any]:
         return {
@@ -138,7 +158,86 @@ class Verdict:
             "pull": self.pull,
             "head": self.head,
             "details": self.details,
+            "transient": self.transient,
         }
+
+
+def validate_trigger(
+    *,
+    event_name: str,
+    event_action: str,
+    actor: str,
+    repository: str,
+    default_branch: str,
+    ref: str,
+    workflow_sha: str,
+    event: Any,
+) -> dict[str, Any]:
+    """Validate GitHub-owned trigger context before anything reads the wave.
+
+    Three shapes are admitted: the wave branch's own CI completion, the typed
+    manual kick from an allowlisted actor, and the scheduled sweep. Everything
+    is read from the trigger context GitHub owns, never from the payload a
+    sender controls, and every shape has to come from protected main.
+    """
+
+    if repository != EXPECTED_REPOSITORY:
+        raise LandingError(f"repository must be {EXPECTED_REPOSITORY!r}, got {repository!r}")
+    if default_branch != BASE_BRANCH:
+        raise LandingError(f"default branch must be {BASE_BRANCH!r}, got {default_branch!r}")
+    if ref != f"refs/heads/{BASE_BRANCH}":
+        raise LandingError(f"workflow ref must be refs/heads/{BASE_BRANCH}, got {ref!r}")
+    if _sha(workflow_sha) is None:
+        raise LandingError(f"workflow sha must be 40-character lowercase hex, got {workflow_sha!r}")
+    if not isinstance(event, dict):
+        raise LandingError("event document must be an object")
+    if event_name == "repository_dispatch":
+        if event_action != KICK_ACTION:
+            raise LandingError(f"event action must be {KICK_ACTION!r}, got {event_action!r}")
+        if event.get("action") != event_action:
+            raise LandingError("event document action differs from the trigger context")
+        if actor not in KICK_ACTORS:
+            raise LandingError(f"actor {actor!r} may not kick the wave landing")
+        payload = event.get("client_payload")
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict) or set(payload) - {"reason"}:
+            raise LandingError("kick payload may carry a reason and nothing else")
+        reason = payload.get("reason", "")
+        if not isinstance(reason, str) or len(reason) > KICK_REASON_LIMIT:
+            raise LandingError("kick reason must be text of at most 200 characters")
+        return {"trigger": TRIGGER_KICK, "actor": actor, "reason": reason}
+    if event_name == "workflow_run":
+        if event_action != "completed":
+            raise LandingError(f"workflow_run action must be 'completed', got {event_action!r}")
+        run = event.get("workflow_run")
+        if not isinstance(run, dict):
+            raise LandingError("workflow_run event omitted its run")
+        head_repository = run.get("head_repository")
+        if run.get("head_branch") != WAVE_BRANCH:
+            raise LandingError(
+                f"workflow_run head branch {run.get('head_branch')!r} is not the wave"
+            )
+        if (
+            not isinstance(head_repository, dict)
+            or head_repository.get("full_name") != repository
+        ):
+            raise LandingError("workflow_run head repository is not first-party")
+        if run.get("status") != "completed":
+            raise LandingError("workflow_run is not completed")
+        return {
+            "trigger": TRIGGER_COMPLETION,
+            "workflow": run.get("name"),
+            "conclusion": run.get("conclusion"),
+            "head_sha": run.get("head_sha"),
+        }
+    if event_name == "schedule":
+        if event_action != "":
+            raise LandingError(f"scheduled event action must be empty, got {event_action!r}")
+        return {"trigger": TRIGGER_SWEEP}
+    raise LandingError(
+        f"event name must be workflow_run, repository_dispatch or schedule, got {event_name!r}"
+    )
 
 
 def run_gh(arguments: Sequence[str], *, token: str | None = None) -> str:
@@ -256,11 +355,14 @@ def judge_check_runs(pages: Any) -> dict[str, Any]:
 
     pending: list[str] = []
     failed: list[str] = []
+    cancelled: list[str] = []
     for name in sorted(newest):
         run = newest[name]
         conclusion = run.get("conclusion")
         if conclusion is None or conclusion == "":
             pending.append(name)
+        elif conclusion in CANCELLED_CONCLUSIONS:
+            cancelled.append(name)
         elif conclusion not in GREEN_CONCLUSIONS:
             failed.append(f"{name}={conclusion}")
     missing = [name for name in RULESET_REQUIRED_CONTEXTS if name not in newest]
@@ -268,6 +370,7 @@ def judge_check_runs(pages: Any) -> dict[str, Any]:
         "total": total,
         "distinct": len(newest),
         "pending": pending,
+        "cancelled": cancelled,
         "failed": failed,
         "missing_required": missing,
     }
@@ -400,13 +503,24 @@ def judge(snapshot: dict[str, Any]) -> Verdict:
 
     branch_tip = snapshot.get("branch_tip")
     if _sha(branch_tip) is None:
-        return Verdict(REFUSE, f"origin carries no readable {WAVE_BRANCH} tip", number, head)
-    if branch_tip != head:
         return Verdict(
-            REFUSE,
-            f"origin/{WAVE_BRANCH} is at {branch_tip}, not the pull head {head}",
+            WAIT,
+            f"origin carries no readable {WAVE_BRANCH} tip yet",
             number,
             head,
+            transient=True,
+        )
+    if branch_tip != head:
+        # The receiver re-pushed: the pull request's head is about to move to
+        # the branch tip, and every check on the old head is superseded. The
+        # next pass judges the new head.
+        return Verdict(
+            WAIT,
+            f"the wave moved: origin/{WAVE_BRANCH} is at {branch_tip}, not the "
+            f"pull head {head}; the next pass judges the new head",
+            number,
+            head,
+            transient=True,
         )
 
     commits = snapshot.get("commits")
@@ -473,6 +587,17 @@ def judge(snapshot: dict[str, Any]) -> Verdict:
             number,
             head,
             checks,
+            transient=True,
+        )
+    if checks["cancelled"]:
+        return Verdict(
+            WAIT,
+            "checks cancelled, awaiting the rerun a re-push or reopen triggers: "
+            + ", ".join(checks["cancelled"]),
+            number,
+            head,
+            checks,
+            transient=True,
         )
     if checks["missing_required"]:
         return Verdict(
@@ -482,6 +607,7 @@ def judge(snapshot: dict[str, Any]) -> Verdict:
             number,
             head,
             checks,
+            transient=True,
         )
 
     state = pull.get("mergeable_state")
@@ -500,12 +626,18 @@ def judge(snapshot: dict[str, Any]) -> Verdict:
             number,
             head,
             checks,
+            transient=True,
         )
 
     attestation = snapshot.get("attestation")
     if attestation == ATTESTATION_PENDING:
         return Verdict(
-            WAIT, "release-App attestation for this head has not arrived", number, head, checks
+            WAIT,
+            "release-App attestation for this head has not arrived",
+            number,
+            head,
+            checks,
+            transient=True,
         )
     if attestation != ATTESTATION_VERIFIED:
         return Verdict(REFUSE, f"attestation: {attestation}", number, head, checks)
@@ -646,6 +778,51 @@ def gather(repository: str, workspace: Path, freeze: str) -> dict[str, Any]:
     return snapshot
 
 
+def judge_with_wait(
+    repository: str,
+    workspace: Path,
+    freeze: str,
+    *,
+    wait_seconds: int,
+    gather_snapshot: Callable[[str, Path, str], dict[str, Any]] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[Verdict, dict[str, Any]]:
+    """Judge, and keep re-reading while the verdict is a transient wait.
+
+    A cron GitHub does not fire and a completion event that arrives before the
+    last check does are both real, so a judgment triggered once has to be able
+    to outlast the checks it is waiting on. The budget is bounded and every
+    pass re-reads the whole snapshot, so a wave the receiver re-pushes during
+    the wait is judged on its new head.
+    """
+
+    if wait_seconds < 0:
+        raise LandingError("wait budget cannot be negative")
+    # Resolved at call time, not bound at definition time, so a replaced
+    # module-level gather (a test's, or a future fixture reader's) is honoured.
+    if gather_snapshot is None:
+        gather_snapshot = gather
+    deadline = clock() + wait_seconds
+    passes = 0
+    while True:
+        snapshot = gather_snapshot(repository, workspace, freeze)
+        verdict = judge(snapshot)
+        passes += 1
+        remaining = deadline - clock()
+        if verdict.decision != WAIT or not verdict.transient or remaining <= 0:
+            return Verdict(
+                verdict.decision,
+                verdict.reason,
+                verdict.pull,
+                verdict.head,
+                {**verdict.details, "passes": passes},
+                verdict.transient,
+            ), snapshot
+        print(f"::notice::wave landing waits ({int(remaining)}s left): {verdict.reason}", file=sys.stderr)
+        sleep(min(WAIT_POLL_SECONDS, remaining))
+
+
 def squash(
     repository: str,
     pull: dict[str, Any],
@@ -709,11 +886,26 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
     fixture = subparsers.add_parser("judge-fixture", help="judge one snapshot document")
     fixture.add_argument("--fixture", type=Path, required=True)
+    trigger = subparsers.add_parser("validate-trigger", help="validate the run's trigger")
+    trigger.add_argument("--event-file", type=Path, required=True)
+    trigger.add_argument("--event-name", required=True)
+    trigger.add_argument("--event-action", default="")
+    trigger.add_argument("--actor", required=True)
+    trigger.add_argument("--repository", required=True)
+    trigger.add_argument("--default-branch", required=True)
+    trigger.add_argument("--ref", required=True)
+    trigger.add_argument("--workflow-sha", required=True)
     for name in ("judge", "land"):
         command = subparsers.add_parser(name)
         command.add_argument("--repository", required=True)
         command.add_argument("--workspace", type=Path, required=True)
         command.add_argument("--freeze", default="")
+        command.add_argument(
+            "--wait-seconds",
+            type=int,
+            default=0,
+            help="keep re-reading while the verdict is a transient wait, up to this budget",
+        )
         if name == "land":
             command.add_argument("--pull", type=int, required=True)
             command.add_argument("--head", required=True)
@@ -745,10 +937,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not isinstance(snapshot, dict):
                 raise LandingError("fixture is not an object")
             return _emit(judge(snapshot))
+        if args.command == "validate-trigger":
+            with args.event_file.open(encoding="utf-8") as stream:
+                event = json.load(stream)
+            trigger = validate_trigger(
+                event_name=args.event_name,
+                event_action=args.event_action,
+                actor=args.actor,
+                repository=args.repository,
+                default_branch=args.default_branch,
+                ref=args.ref,
+                workflow_sha=args.workflow_sha,
+                event=event,
+            )
+            print(json.dumps(trigger, sort_keys=True))
+            return 0
         if args.repository != EXPECTED_REPOSITORY:
             raise LandingError(f"repository must be {EXPECTED_REPOSITORY}")
-        snapshot = gather(args.repository, args.workspace, args.freeze)
-        verdict = judge(snapshot)
+        verdict, snapshot = judge_with_wait(
+            args.repository,
+            args.workspace,
+            args.freeze,
+            wait_seconds=args.wait_seconds,
+        )
         if args.command == "judge" or verdict.decision != LAND:
             return _emit(verdict)
         if verdict.pull != args.pull or verdict.head != args.head:
@@ -775,6 +986,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
     except (LandingError, OSError, json.JSONDecodeError) as exc:
+        if args.command == "validate-trigger":
+            print(f"::error title=Kin registry wave trigger refused::{exc}", file=sys.stderr)
+            return 1
         return _emit(Verdict(REFUSE, str(exc)))
 
 

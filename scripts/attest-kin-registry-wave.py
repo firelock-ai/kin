@@ -384,18 +384,23 @@ def validate_live_admission(
     if auto_armed or queue_armed:
         raise AttesterError("live dependency pull still has server-owned landing state")
 
+    # The pull-request action rebases the wave onto main's tip, so the head's
+    # tree equals the admitted tree only while main stood still. The proof is
+    # the admitted delta on a parent that is protected main at or after the
+    # admitted base, with the head's pin files transplanting onto that base to
+    # the admitted tree; the guard owns it.
     try:
         guard.ensure_pull_head(workspace, pull_number, head)
-        evidence = guard.validate_delta(
+        evidence = guard.validate_admitted_head(
             workspace,
             str(admission["base"]),
+            str(admission["tree"]),
             head,
             require_marker=True,
         )
     except guard.AdmissionError as exc:
         raise AttesterError(str(exc)) from exc
     observed = {
-        "tree": evidence.tree,
         "delta_sha256": evidence.delta_sha256,
         "package_version": evidence.package_version,
         "workspace_version": evidence.workspace_version,

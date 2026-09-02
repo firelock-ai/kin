@@ -392,22 +392,46 @@ and the CI gate alike.
 `.github/workflows/kin-registry-release-attest.yml` then binds the exact wave
 head to a release-App attestation that the required CI gate revalidates.
 
-`.github/workflows/kin-registry-wave-land.yml` lands the wave. It runs when a
-check-producing workflow completes on the wave branch and on a sweep four times
-an hour, and `scripts/land-kin-registry-wave.py` decides `land`, `wait` or
-`refuse`: one open first-party wave opened by the release App with no
-auto-merge armed, one bot commit carrying the reserved marker, a diff inside
-`Cargo.toml` and `Cargo.lock`, every check-run on the head concluded and none
-failed over the full set (`per_page=100`, the listed length asserted against
-`total_count`, the newest run per check name, skipped and neutral green, the
-six ruleset contexts present), the pull mergeable, and the attestation
-verified. Only then does the land job mint the App token, squash-merge with the
-pull title and body and never the marker line, and prove the squash is on
-`main`. A failed check, a foreign commit, an off-scope file or an unreadable
-listing refuses loudly; checks still running, a missing attestation or an open
-hold wait quietly. GitHub's own auto-merge is not the mechanism, because it
-merges on the six ruleset contexts alone and the admission chain refuses any
-server-owned landing state on the wave.
+The pull-request action rebases the wave onto main's current tip, so once
+main has moved the head's tree is tip plus delta rather than policy plus
+delta. The receiver's post-write check, the attester and the CI gate therefore
+prove the head carries exactly the admitted delta instead of comparing trees:
+its parent is protected main at or after the admitted base, main did not touch
+the pin files in between, the delta read against that parent passes every
+admission rule, and transplanting the head's pin files onto the admitted base
+reproduces the admitted tree. With an unmoved main every clause is the old
+equality.
+
+`.github/workflows/kin-registry-wave-land.yml` lands the wave. It runs on the
+wave branch's own CI completion, on a typed `kin-registry-wave-land`
+repository dispatch (the manual kick, admitted from the captain and the
+release App, which the receiver sends once after every wave it writes), and on
+a sweep four times an hour as a fallback. `scripts/land-kin-registry-wave.py`
+decides `land`, `wait` or `refuse`: one open first-party wave opened by the
+release App with no auto-merge armed, one bot commit carrying the reserved
+marker, a diff inside `Cargo.toml` and `Cargo.lock`, every check-run on the
+head concluded and none failed over the full set (`per_page=100`, the listed
+length asserted against `total_count`, the newest run per check name, skipped
+and neutral green, the six ruleset contexts present), the pull mergeable, and
+the attestation verified. A judgment re-reads the whole snapshot for a bounded
+budget while the verdict is a transient wait (checks running, a cancelled
+suite awaiting its rerun, an attestation on its way, GitHub still computing
+mergeability, a re-pushed head), so one trigger outlasts the checks it waits
+on. Only then does the land job mint the App token, squash-merge with the pull
+title and body and never the marker line, and prove the squash is on `main`.
+A failed check, a foreign commit, an off-scope file or an unreadable listing
+refuses loudly; everything transient and an open hold wait quietly. GitHub's
+own auto-merge is not the mechanism, because it merges on the six ruleset
+contexts alone and the admission chain refuses any server-owned landing state
+on the wave.
+
+Kick one judgment by hand with:
+
+```sh
+gh api --method POST repos/firelock-ai/kin/dispatches \
+  -f event_type=kin-registry-wave-land \
+  -f 'client_payload[reason]=<why>'
+```
 
 The hold is the repository variable `KIN_MAIN_FROZEN`, the wave's equivalent
 of the fleet's `kin_main_frozen` gate. Set it with
