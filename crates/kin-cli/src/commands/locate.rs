@@ -781,34 +781,16 @@ pub fn name_match_is_prose_word_collision(query: &str, name: &str) -> bool {
 
 /// Whether a locate query reads as a symbol LOOKUP rather than a question.
 ///
-/// A lookup is short, or it carries a token shaped like an identifier. Both
-/// halves are needed and both are measured: three tokens is the longest symbol
-/// path the query tokenizer routinely produces (`crate::Type::method`), so a
-/// query under four tokens is a lookup whatever its words look like, and a
-/// longer query that still carries `prune_orphaned_vectors` is a caller naming
-/// what they want. Everything else is prose, and prose is where the file-anchor
-/// admission applies.
+/// The negation of [`query_is_prose`], stated once so the file-anchor admission
+/// and the exact-name tier read the SAME rule about the same query. A lookup is
+/// short or carries no English scaffolding: under four tokens, which is the
+/// longest symbol path the tokenizer routinely produces (`crate::Type::method`),
+/// or fewer than two stopwords, which a question essentially never is.
 ///
-/// This exists so a lookup's ranking is byte-identical with the admission on.
-/// A caller who types `TextModel` gets exactly the page they got before; a
-/// caller who asks how a character reaches the document gets the definitions
-/// their question is about.
-///
-/// kin#1367 introduces `query_is_prose`, which adds a stopword floor to the
-/// same two tests. When it lands this should call it rather than keep a second
-/// vocabulary; the token floor here is deliberately the same 4.
+/// This is why the twelve control lookups the ranking lane pinned stay
+/// byte-identical with anchors on: every one of them is refused here.
 fn locate_query_is_symbol_lookup(query: &str) -> bool {
-    let mut tokens = 0usize;
-    for token in query.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-        if token.is_empty() {
-            continue;
-        }
-        if is_symbolic_search_term(token) {
-            return true;
-        }
-        tokens += 1;
-    }
-    tokens < 4
+    !query_is_prose(query)
 }
 
 /// Classify one located entity against the query.
@@ -17752,6 +17734,9 @@ pub fn build_entity_view(
     // (file_rank, LocateEntity) so global ranking can tie-break on file order.
     let mut ranked: Vec<(usize, LocateEntity)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // (file_rank, file score, file path, entity) for each anchor a ranked file
+    // offered.
+    let mut anchor_candidates: Vec<(usize, f32, String, kin_model::Entity)> = Vec::new();
     // Canonical-definition signal for exact-name ties (FIR-2337): owner graph
     // mass per name-hit entity id, computed for at most this many name hits so
     // a hundred-way `new` collision cannot turn projection into a graph walk.
@@ -17779,7 +17764,18 @@ pub fn build_entity_view(
     let anchor_files = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_FILES", 5);
     let anchor_topk = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_TOPK", 2);
     let anchor_probe = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_PROBE", 256);
-    let anchor_base = locate_env_f32("KIN_LOCATE_FILE_ANCHOR_SCORE", 1500.0);
+    // An anchor is a second opinion, never better evidence than the best thing
+    // retrieval actually found, so it is scored as a SHARE of this ranking's own
+    // top row rather than on an absolute constant. Measured 2026-09-02: an
+    // absolute 1500 handed rank one to `Extractor` from ripgrep's fifth-best
+    // file and pushed hiredis's right answer off rank one, which is the same
+    // failure a name-multiplier cap produced for kin#1367. A share is scale-free,
+    // so it behaves the same on a store whose text arm tops out at 280 and one
+    // where it reaches 1152.
+    let anchor_share = locate_env_f32("KIN_LOCATE_FILE_ANCHOR_SHARE", 0.9);
+    // Used only when a ranking has no scored row to take a share of, which is
+    // the docs-and-config repo whose files carry no entities at all.
+    let anchor_base = locate_env_f32("KIN_LOCATE_FILE_ANCHOR_SCORE", 100.0);
     // Built once on the first ranked file that resolves to no entity, because
     // it walks every tracked artifact and most rankings never need it.
     let mut tracked_artifacts: Option<HashSet<String>> = None;
@@ -17886,62 +17882,24 @@ pub fn build_entity_view(
         }
 
         if in_anchor_window {
-            // Scored from the file's own rank, because that rank is the only
-            // thing an anchor is admitted on: the file arm fused every signal
-            // retrieval has, while a name seed's fixed product reflects one word
-            // the question happened to share with a symbol. The decay keeps the
-            // file order among anchors and puts the fifth file's anchor below an
-            // exact-name hit, so a strong lexical answer still leads its page.
-            let anchor_score = anchor_base / (1.0 + file_rank as f32);
             for anchor in kin_ranking::entity_ranking::file_anchor_entities(
                 graph,
                 &entities,
                 anchor_topk,
                 anchor_probe,
             )? {
-                let Some(entity) = entities.iter().find(|candidate| candidate.id == anchor.id)
-                else {
-                    continue;
-                };
-                let entity_id = entity.id.to_string();
-                if !seen.insert(entity_id.clone()) {
-                    continue;
+                if let Some(entity) = entities.iter().find(|candidate| candidate.id == anchor.id) {
+                    // Collected, not pushed: the score they take is a share of a
+                    // ranking that does not exist yet, and `seen` is deliberately
+                    // NOT claimed here so a later file's real evidence for the
+                    // same entity still wins the row.
+                    anchor_candidates.push((
+                        file_rank,
+                        file.score,
+                        file.path.clone(),
+                        entity.clone(),
+                    ));
                 }
-                let file_origin = entity
-                    .file_origin
-                    .as_ref()
-                    .map(|origin| origin.0.clone())
-                    .or_else(|| Some(file.path.clone()));
-                // The match kind stays a fact: an anchor the query happens to
-                // name reports `name`, and one it does not reports the weaker
-                // claim, exactly as a projected symbol does.
-                let match_kind =
-                    classify_locate_match(query, &entity.name, FILE_ANCHOR_ORIGIN, None);
-                ranked.push((
-                    file_rank,
-                    LocateEntity {
-                        entity_id,
-                        id_space: LocateIdSpace::Entity,
-                        artifact_path: None,
-                        kind: format!("{:?}", entity.kind).to_lowercase(),
-                        name: entity.name.clone(),
-                        signature: entity.signature.clone(),
-                        score: anchor_score * entity_path_penalty,
-                        definition: true,
-                        span: entity_span_pair(entity).into_iter().next(),
-                        // Bodies belong to the symbols the retrieval resolved;
-                        // an anchor carries coordinates and a signature, which
-                        // is what a focal needs to be opened.
-                        body: None,
-                        match_kind: Some(match_kind),
-                        provenance: LocateProvenance {
-                            file: file_origin,
-                            origin: FILE_ANCHOR_ORIGIN.to_string(),
-                            cosine: None,
-                        },
-                        matched_queries: Vec::new(),
-                    },
-                ));
             }
         }
     }
@@ -17949,6 +17907,84 @@ pub fn build_entity_view(
     // Surface penalty before the ordering, because it moves the composite score
     // the ordering then reads ([`apply_entity_surface_penalty`]).
     apply_entity_surface_penalty(&mut ranked, query);
+
+    // The anchors, beneath every row retrieval scored. The reference is this
+    // ranking's own top score, so the admission adapts to the store's scale
+    // instead of imposing one, and the share is strictly below 1.0 so an anchor
+    // can never take rank one from a row that carries real evidence. The decay
+    // keeps the file arm's order among the anchors themselves.
+    if !anchor_candidates.is_empty() {
+        let top = ranked
+            .iter()
+            .map(|(_, entity)| entity.score)
+            .fold(0.0_f32, f32::max);
+        let reference = if top > 0.0 {
+            top * anchor_share
+        } else {
+            anchor_base
+        };
+        // The file arm's own fused score carries the weight, normalized against
+        // the best file so it is a share like the reference is. A file the arm
+        // scored within a percent of its best contributes an anchor within a
+        // percent of the reference, which is the honest reading of "the file arm
+        // ranked these two nearly equally". Rank is the fallback for a ranking
+        // whose file scores are unusable.
+        let top_file = anchor_candidates
+            .iter()
+            .map(|(_, score, _, _)| *score)
+            .fold(0.0_f32, f32::max);
+        let mut admitted: Vec<(usize, LocateEntity)> = Vec::new();
+        for (file_rank, file_score, file_path, entity) in anchor_candidates {
+            let file_weight = if top_file > 0.0 && file_score > 0.0 {
+                file_score / top_file
+            } else {
+                1.0 / (1.0 + file_rank as f32)
+            };
+            let entity_id = entity.id.to_string();
+            if !seen.insert(entity_id.clone()) {
+                continue;
+            }
+            let file_origin = entity
+                .file_origin
+                .as_ref()
+                .map(|origin| origin.0.clone())
+                .or_else(|| Some(file_path.clone()));
+            // The match kind stays a fact: an anchor the query happens to name
+            // reports `name`, and one it does not reports the weaker claim,
+            // exactly as a projected symbol does.
+            let match_kind = classify_locate_match(query, &entity.name, FILE_ANCHOR_ORIGIN, None);
+            admitted.push((
+                file_rank,
+                LocateEntity {
+                    entity_id,
+                    id_space: LocateIdSpace::Entity,
+                    artifact_path: None,
+                    kind: format!("{:?}", entity.kind).to_lowercase(),
+                    name: entity.name.clone(),
+                    signature: entity.signature.clone(),
+                    score: reference
+                        * file_weight
+                        * entity_projection_role_penalty(&file_path, test_query),
+                    definition: true,
+                    span: entity_span_pair(&entity).into_iter().next(),
+                    // Bodies belong to the symbols the retrieval resolved; an
+                    // anchor carries coordinates and a signature, which is what
+                    // a focal needs to be opened.
+                    body: None,
+                    match_kind: Some(match_kind),
+                    provenance: LocateProvenance {
+                        file: file_origin,
+                        origin: FILE_ANCHOR_ORIGIN.to_string(),
+                        cosine: None,
+                    },
+                    matched_queries: Vec::new(),
+                },
+            ));
+        }
+        apply_entity_surface_penalty(&mut admitted, query);
+        ranked.extend(admitted);
+    }
+
     let owner_mass_of = |entity: &LocateEntity| {
         name_owner_mass
             .get(entity.identity_key())
@@ -22128,6 +22164,28 @@ mod tests {
             20,
         );
         graph.upsert_entity(&lexical).unwrap();
+        // The second file has an anchor of its own, so the decay is pinned: it
+        // must sort below the first file's anchor even though its mass is
+        // higher. Without a decay the file arm's order would be lost here.
+        let second_anchor = test_entity(
+            "beginWork",
+            "packages/react-reconciler/src/ReactFiberBeginWork.js",
+            100,
+            400,
+        );
+        graph.upsert_entity(&second_anchor).unwrap();
+        for _ in 0..30 {
+            let caller = test_entity(
+                "beginWorkCaller",
+                "packages/react-reconciler/src/ReactFiberHooks.js",
+                1,
+                2,
+            );
+            graph.upsert_entity(&caller).unwrap();
+            graph
+                .upsert_relation(&relation(RelationKind::Calls, caller.id, second_anchor.id))
+                .unwrap();
+        }
 
         let question = "what happens between a component asking for an update \
                         and that update appearing on screen";
@@ -22178,26 +22236,44 @@ mod tests {
         );
 
         let fixed = build("1");
+        let names: Vec<&str> = fixed
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
         assert_eq!(
-            fixed.entities[0].name,
-            "scheduleUpdateOnFiber",
-            "the first ranked file's anchor leads, got {:?}",
+            names,
+            vec![
+                "updateDehydratedSuspenseComponent",
+                "scheduleUpdateOnFiber",
+                "beginWork",
+                "shouldRemainOnPreviousScreen"
+            ],
+            "the anchor of the FIRST file is admitted beneath the row retrieval \
+             scored, above the second file's anchor, got {:?}",
             fixed
                 .entities
                 .iter()
                 .map(|e| (&e.name, e.score))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(
+        assert_ne!(
             fixed.entities[0].provenance.origin, FILE_ANCHOR_ORIGIN,
-            "an anchor row says on the surface why it is there"
+            "an anchor never takes rank one from a row that carries evidence"
+        );
+        assert_eq!(
+            fixed.entities[1].provenance.origin, FILE_ANCHOR_ORIGIN,
+            "and an anchor row says on the surface why it is there"
         );
         assert!(
-            fixed
-                .entities
-                .iter()
-                .any(|e| e.name == "updateDehydratedSuspenseComponent"),
-            "admission adds rows, it never drops the ones retrieval found"
+            fixed.entities[1].score < fixed.entities[0].score,
+            "the share is strictly below the ranking's own top score"
+        );
+        assert!(
+            fixed.entities[1].score > fixed.entities[2].score,
+            "and the decay separates the two anchors rather than tying them: {} vs {}",
+            fixed.entities[1].score,
+            fixed.entities[2].score
         );
     }
 
@@ -22289,23 +22365,50 @@ mod tests {
         );
     }
 
-    /// Both floors of the lookup rule, from both sides. An off-by-one in either
-    /// one shows up here as a named case rather than as a ranking that quietly
-    /// moved.
+    /// The lookup gate is the negation of kin#1367's `query_is_prose`, and this
+    /// pins both of its floors from both sides. An off-by-one in either constant
+    /// shows up here as a named case rather than as a ranking that quietly moved.
     #[test]
     fn the_lookup_shape_rule_reads_both_of_its_floors() {
-        // Symbolic token: a lookup at any length.
-        assert!(locate_query_is_symbol_lookup("prune_orphaned_vectors"));
-        assert!(locate_query_is_symbol_lookup(
-            "where is prune_orphaned_vectors decided in this repository"
-        ));
-        assert!(locate_query_is_symbol_lookup("CodeEditorWidget"));
-        assert!(locate_query_is_symbol_lookup("Match::end"));
-        // Token floor: three words is the longest symbol path the tokenizer
-        // produces, four is a question.
-        assert!(locate_query_is_symbol_lookup("walk"));
+        // Every control the ranking lane holds byte-identical is a lookup here.
+        for control in [
+            "redisReaderGetReply",
+            "redisFormatCommand",
+            "send",
+            "socket",
+            "redisReader::redisReaderGetReply",
+            "Gitignore",
+            "SearchWorker::search",
+            "WalkParallel",
+            "walk",
+            "search",
+            "end",
+            "Match::end",
+            "TextModel",
+            "CodeEditorWidget",
+        ] {
+            assert!(
+                locate_query_is_symbol_lookup(control),
+                "{control} must be answered as a lookup"
+            );
+        }
+        // The token floor, both sides. Three words is the longest symbol path
+        // the tokenizer produces.
         assert!(locate_query_is_symbol_lookup("is it the"));
         assert!(!locate_query_is_symbol_lookup("is it the walk"));
+        // The stopword floor, both sides.
+        assert!(locate_query_is_symbol_lookup(
+            "walk the parse_request handler"
+        ));
+        assert!(!locate_query_is_symbol_lookup(
+            "walk the parse_request in handler"
+        ));
+        // A question that NAMES an identifier is still prose, so anchors are
+        // admitted beneath it; the exact-name tier is what keeps the named hit
+        // at rank one, and that rule lives in kin#1367 rather than here.
+        assert!(!locate_query_is_symbol_lookup(
+            "where is prune_orphaned_vectors decided in this repository"
+        ));
         // The measured questions, all prose.
         assert!(!locate_query_is_symbol_lookup(
             "When I type a character in the editor, how does it end up in the \
@@ -22488,9 +22591,17 @@ mod tests {
                 .map(|e| (&e.name, e.score))
                 .collect::<Vec<_>>()
         );
+        let walk = result
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Walk")
+            .expect("the anchor the question was actually about is now on the page");
+        assert_eq!(walk.provenance.origin, FILE_ANCHOR_ORIGIN);
         assert!(
-            result.entities.iter().any(|entity| entity.name == "Walk"),
-            "and the anchor the question was actually about is now on the page"
+            walk.score < result.entities[0].score,
+            "and it is admitted beneath the evidence, not above it: {} vs {}",
+            walk.score,
+            result.entities[0].score
         );
     }
 
