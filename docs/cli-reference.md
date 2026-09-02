@@ -8,7 +8,7 @@ Kin is pre-1.0 and the command surface moves. Where this page and your build dis
 
 Descriptions are the command's own help text. A `--json` flag switches that command to machine-readable output. Angle brackets mark a required argument, square brackets an optional one, and a trailing `...` an argument that takes the rest of the line.
 
-83 commands are documented below. 4 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `semantic-only-guard`) are hidden from `kin --help` because they exist for benchmark and internal orchestration, and they are not part of the supported surface.
+84 commands are documented below. 4 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `semantic-only-guard`) are hidden from `kin --help` because they exist for benchmark and internal orchestration, and they are not part of the supported surface.
 
 `kin capabilities` prints the readiness matrix for the Git-replacement command set, and `kin capabilities --json` gives the same inventory to a machine. Reach for it before scripting against a command you have not used.
 
@@ -30,7 +30,7 @@ Every command also shares one rule for a reader that goes away. When the process
 ## Contents
 
 - [Start here](#start-here): `init`, `clone`, `status`, `commit`, `log`, `diff`
-- [Ask the graph](#ask-the-graph): `locate`, `search`, `trace`, `impact`, `refs`, `context`
+- [Ask the graph](#ask-the-graph): `locate`, `search`, `trace`, `path`, `impact`, `refs`, `context`
 - [More graph queries](#more-graph-queries): `history`, `blame`, `overview`, `deps`, `xref`, `dead-code`, `trace-data-flow`, `security`, `languages`, `scope`, `locate-debug`
 - [Branches, merges, and exact trees](#branches-merges-and-exact-trees): `branch`, `checkout`, `merge`, `conflicts`, `resolve`, `stash`, `rollback`, `tag`, `semver`, `purge-ignored`, `admit`, `reconcile`, `migrate`, `eject`, `git`
 - [Review and verification](#review-and-verification): `review`, `approvals`, `verify`, `spec`, `audit`, `rename`
@@ -253,6 +253,32 @@ empty. That holds for the name form, for an id this repository's graph does not 
 qualifier that excludes every match, which reports what the name alone does reach rather than
 claiming the entity is absent. `kin context`, `kin refs`, `kin xref` and `kin impact` refuse the
 same way.
+
+### `kin path`
+
+Find the shortest routes from one entity to another over the graph's call, instantiation, reference, import and include edges. Each end is an entity name, an entity id, or `name@file` to pin one of two same-named entities. A class stands for its members, so a route between two classes runs through the methods that carry it. Exits 3 when the graph holds no route inside the depth bound, with the gap on stderr.
+
+```
+kin path <from> <to> [options]
+```
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `<from>` | yes | Source entity: name, id, or name@file |
+| `<to>` | yes | Target entity: name, id, or name@file |
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--from-file <file>` |  | Pin the source to the entity of that name in this file (path or path suffix) |
+| `--to-file <file>` |  | Pin the target the same way |
+| `--max-depth <n>` |  | Hops walked between the two ends (default 6, ceiling 12); containment hops are not counted |
+| `--limit <k>` |  | Routes printed, shortest first (default 3, ceiling 25) |
+| `--direction <dir>` |  | `forward` (from reaches to), `reverse` (to reaches from), or `either` (default; forward first, reports which held) |
+| `--include-type-edges` |  | Walk through type-annotation edges too |
+| `--json` |  | Output machine-readable JSON, `_kin` envelope included |
+| `--compact` |  | One line per hop and nothing else, sized for a prompt |
+
+Every hop names the entity, its kind, its file and line, the relation that joins it to the next hop and the 1-based lines of the syntax that produced that edge (or, when the graph recorded no site, why under `site_lines_absent_reason`). The answer says which sense held (`direction`), how many shortest routes exist (`routes_total`), what each walk explored and why it stopped (`explored`), and how each end resolved, including how many entities carry the same exact name (`same_name_candidates`). A qualified name (`Worker::search`) that names no entity resolves to its bare leaf when exactly one entity carries it, and is refused with the candidates listed when several do, so a twin is never chosen silently under a qualifier. A no-route answer is explicit: `found: false`, an empty `routes`, and a `gap` naming what stopped the walk (`frontier_exhausted`, `depth_bound`, `edge_ceiling`, `time_budget`) with the remedy, and the `_kin.verdict` beside it says whether that absence can be trusted. The same query is served to agents as the `trace_path` MCP tool.
 
 ### `kin impact`
 

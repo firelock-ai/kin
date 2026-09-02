@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Tool Surface Reference
 
-The Kin MCP server exposes 65 semantic tools to AI assistants (Claude, Cursor, Gemini,
+The Kin MCP server exposes 66 semantic tools to AI assistants (Claude, Cursor, Gemini,
 Codex, etc.). These tools bridge the gap between traditional file-first navigation and
 Kin's graph-first semantic substrate: instead of issuing raw shell commands or reading raw
 files, an assistant interacts with the codebase through entity-level primitives.
@@ -197,10 +197,11 @@ reported rather than served as a confident answer.
 ---
 
 ## 2. Tracing & References
-*Tools:* `trace_computation`, `trace_data_flow`, `find_references`, `bulk_check_references`, `entity_history`
+*Tools:* `trace_computation`, `trace_data_flow`, `trace_path`, `find_references`, `bulk_check_references`, `entity_history`
 
 - **`trace_computation`**: Get a focal entity together with its control-/data-flow neighborhood in one structured response (a flat snapshot, not an ordered walk). The response carries its body plus callers, callees, and imports.
 - **`trace_data_flow`**: Walk the directional call/data-flow chain rooted at a focal entity and return it as an ordered list of steps (the path-walk counterpart to `trace_computation`'s flat neighborhood).
+- **`trace_path`**: The route between two named entities, for the question "how does A reach B" that no single-rooted walk answers. It resolves both ends (by exact name, entity id, or `name@file` to pin a twin; a qualified name that matches nothing takes its bare leaf when that is unique and is refused with the candidates listed when it is not), searches breadth-first over call, instantiation, reference, import and include edges, and returns up to `limit` shortest routes, every hop carrying its kind, file, line, the relation into the next hop and the syntax lines that produced it. A class stands for its members, so a route between two classes runs through the methods that carry it, and those containment hops are shown. `direction` defaults to `either`: forward (A reaches B) is tried first and the answer says which sense held. No route is explicit rather than plausible: `found: false`, `routes: []`, a `gap` naming what stopped the walk and how much of the graph it explored, and the same-name twin count on each end; the `negative` and `_kin.verdict` beside it say whether the absence can be trusted. In the `agent-default` profile.
 - **`find_references`**: Find all entities that import, call, or reference a target symbol. One row is one referencing entity, so two callers in one file are two rows, and `total_upstream` counts those entities, the same unit `kin refs` prints. The `counts` object names the unit and adds the file and reference-site totals beside it. A row's `reference_lines` gives the lines inside that caller which reference the target, and names why under `reference_lines_absent_reason` when the graph does not carry them. Rows omit the caller's body by default; pass `include_snippets=true` for it.
 - **`bulk_check_references`**: Classify many entities by reachability in one call.
 - **`entity_history`**: Retrieve version changes scoped to a specific entity.

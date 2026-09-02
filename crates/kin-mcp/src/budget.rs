@@ -782,6 +782,18 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             bulk_keys: &[],
             narrow_param: "depth",
         },
+        // The route query carries no bodies at all: a hop is identity, location
+        // and the edge into the next hop, so the only layer the ladder can
+        // shed is a whole route, and `limit` is what a caller narrows.
+        crate::handlers::path::TOOL_NAME => ResponseShape {
+            collections: &["routes"],
+            body_keys: &[],
+            explain_keys: &[],
+            top_explain_keys: &[],
+            duplicate_keys: &[],
+            bulk_keys: &[],
+            narrow_param: "limit",
+        },
         "get_context_pack" | "trace_computation" => ResponseShape {
             // `dependents` sheds beside `dependencies`: it is the same section
             // split by direction, and a group the budget cannot trim is a group

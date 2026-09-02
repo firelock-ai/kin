@@ -676,6 +676,31 @@ fn registered_tools() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: crate::handlers::path::TOOL_NAME.into(),
+                description: crate::handlers::path::TRACE_PATH_DESC.into(),
+                annotations: read_only("Trace path"),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string", "description": "Source end: entity UUID, exact name, or name@file to pin one of two same-named entities." },
+                        "to": { "type": "string", "description": "Target end, in the same forms." },
+                        "from_file": { "type": "string", "description": "Pin `from` to the entity of that name in the file this path or path suffix names. Same request as the name@file spelling." },
+                        "to_file": { "type": "string", "description": "Pin `to` the same way." },
+                        "max_depth": { "type": "integer", "description": "Hops walked between the two ends (default 6, ceiling 12). Containment hops joining a class to its members are not counted.", "default": 6, "minimum": 1, "maximum": 12 },
+                        "limit": { "type": "integer", "description": "Routes returned, shortest first (default 3, ceiling 25). `routes_total` says how many shortest routes exist.", "default": 3, "minimum": 1, "maximum": 25 },
+                        "direction": {
+                            "type": "string",
+                            "enum": ["either", "forward", "reverse"],
+                            "description": "'forward' means from reaches to, 'reverse' means to reaches from, 'either' (default) tries forward first and says which sense held.",
+                            "default": "either"
+                        },
+                        "include_type_edges": { "type": "boolean", "description": "Walk through UsesType edges too (default false).", "default": false },
+                        "max_chars": max_chars_property()
+                    },
+                    "required": ["from", "to"]
+                }),
+            },
+            ToolDefinition {
                 name: "find_references".into(),
                 description: crate::handlers::entities::FIND_REFERENCES_DESC.into(),
                 annotations: read_only("Find references"),
@@ -1549,6 +1574,10 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         // that turns an id into the exact graph-owned body.
         "get_entity_source",
         "trace_data_flow",
+        // The route between two named things is the ordinary shape of a code
+        // question, and no single-rooted walk can answer it (FIR-3070). It is
+        // one call where the locate-then-trace loop cost five.
+        crate::handlers::path::TOOL_NAME,
         "find_references",
         "graph_neighborhood",
         // The enumeration half of discovery. Every other retrieval tool in this
@@ -2251,8 +2280,8 @@ mod tests {
         let list = tool_definitions();
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
         // + 1 get_entity_sources + 2 exact artifact tools
-        // + 1 list_file_entities = 65
-        assert_eq!(list.tools.len(), 65);
+        // + 1 list_file_entities + 1 trace_path = 66
+        assert_eq!(list.tools.len(), 66);
     }
 
     /// The reference lists each category's members on a line opening with this
@@ -2480,8 +2509,11 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
             list.tools.iter().map(|t| t.name.as_str()).collect();
         let profile = agent_default_tool_names();
 
+        // 21 since trace_path joined: a route query between two entities is the
+        // question the wedge is asked most, and it was the one tool the belt
+        // could not answer with fewer than five calls.
         assert!(
-            profile.len() >= 10 && profile.len() <= 20,
+            profile.len() >= 10 && profile.len() <= 21,
             "agent-default should be small but cover the wedge; got {}",
             profile.len()
         );
@@ -2514,6 +2546,9 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
             // change affects cannot do the thing Kin is described as doing, and
             // the CLI answering it is no help to the agent surface.
             "impact_analysis",
+            // The route question. Without it an agent asked "how does A reach
+            // B" spends five calls on single-rooted walks (FIR-3070).
+            crate::handlers::path::TOOL_NAME,
         ] {
             assert!(
                 profile.contains(&required),
