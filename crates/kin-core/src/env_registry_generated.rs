@@ -183,6 +183,7 @@ pub const GENERATED_KNOBS: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_PRIVATE_ACCESS_TEST_MIN_TERMS", kind: Kind::Usize, default: "2", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: private access test min terms" },
     EnvVarSpec { name: "KIN_LOCATE_PRIVATE_ACCESS_TEST_SEED_LIMIT", kind: Kind::Usize, default: "24", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: private access test seed limit" },
     EnvVarSpec { name: "KIN_LOCATE_PRIVATE_ACCESS_TEST_TERM_BONUS", kind: Kind::NonNegF32, default: "18.0", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: private access test term bonus" },
+    EnvVarSpec { name: "KIN_LOCATE_PROSE_NAME_DEMOTION", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: prose name demotion" },
     EnvVarSpec { name: "KIN_LOCATE_PUBLIC_API_IMPL_PENALTY", kind: Kind::NonNegF32, default: "0.3", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: public api impl penalty" },
     EnvVarSpec { name: "KIN_LOCATE_QUERY_IDENTIFIER_LIMIT", kind: Kind::Usize, default: "10", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: query identifier limit" },
     EnvVarSpec { name: "KIN_LOCATE_QUERY_PRIORITY_RETAIN_LIMIT", kind: Kind::Usize, default: "3", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: query priority retain limit" },

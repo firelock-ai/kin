@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (512 total, 342 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (513 total, 343 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -494,6 +494,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_PRIVATE_ACCESS_TEST_SEED_LIMIT` | usize | 24 | correctness | locate tuning knob: private access test seed limit |
 | `KIN_LOCATE_PRIVATE_ACCESS_TEST_TERM_BONUS` | float>=0 | 18.0 | correctness | locate tuning knob: private access test term bonus |
 | `KIN_LOCATE_PROFILE` | enum | *(unset)* | correctness | locate capability profile; unset auto-detects from cores/RAM |
+| `KIN_LOCATE_PROSE_NAME_DEMOTION` | bool | true | correctness | locate tuning knob: prose name demotion |
 | `KIN_LOCATE_PUBLIC_API_IMPL_PENALTY` | float>=0 | 0.3 | correctness | locate tuning knob: public api impl penalty |
 | `KIN_LOCATE_QUERY_IDENTIFIER_LIMIT` | usize | 10 | correctness | locate tuning knob: query identifier limit |
 | `KIN_LOCATE_QUERY_PRIORITY_RETAIN_LIMIT` | usize | 3 | correctness | locate tuning knob: query priority retain limit |
