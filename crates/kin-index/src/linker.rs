@@ -485,6 +485,11 @@ struct LinkContext<'a> {
     /// a test entity while a production candidate of the same name exists, so
     /// the same-name fan-out tiers need role in hand at resolution time.
     entity_role_by_id: HashMap<EntityId, EntityRole>,
+    /// Every C/C++ function entity that only declares itself: a header prototype
+    /// whose body lives in another file. It carries the same name as the
+    /// definition, so name resolution offers both, and the prototype can take the
+    /// call. The fan-out tiers need this in hand to prefer the definition.
+    declaration_ids: HashSet<EntityId>,
     entity_count_by_file: HashMap<&'a str, usize>,
     known_files: HashSet<&'a str>,
     import_map: HashMap<&'a str, HashMap<&'a str, (&'a str, &'a str)>>,
@@ -587,6 +592,7 @@ fn build_link_context<'a>(
         entity_language_by_id,
         entity_arity_by_id,
         entity_role_by_id,
+        declaration_ids,
         entity_count_by_file,
         known_files,
     ) = {
@@ -602,6 +608,7 @@ fn build_link_context<'a>(
         let mut entity_language_by_id: HashMap<EntityId, LanguageId> = HashMap::new();
         let mut entity_arity_by_id: HashMap<EntityId, ArityBounds> = HashMap::new();
         let mut entity_role_by_id: HashMap<EntityId, EntityRole> = HashMap::new();
+        let mut declaration_ids: HashSet<EntityId> = HashSet::new();
         let mut entity_count_by_file: HashMap<&str, usize> = HashMap::new();
         let mut known_files: HashSet<&str> = HashSet::new();
 
@@ -637,6 +644,9 @@ fn build_link_context<'a>(
             if let Some(bounds) = callee_arity_bounds(entity) {
                 entity_arity_by_id.insert(entity.id, bounds);
             }
+            if callee_is_declaration(entity) {
+                declaration_ids.insert(entity.id);
+            }
         }
 
         for file in files {
@@ -651,6 +661,7 @@ fn build_link_context<'a>(
             entity_language_by_id,
             entity_arity_by_id,
             entity_role_by_id,
+            declaration_ids,
             entity_count_by_file,
             known_files,
         )
@@ -721,6 +732,7 @@ fn build_link_context<'a>(
         entity_language_by_id,
         entity_arity_by_id,
         entity_role_by_id,
+        declaration_ids,
         entity_count_by_file,
         known_files,
         import_map,
@@ -990,6 +1002,8 @@ fn resolve_one_file(
                 prune_ids_by_arity(cross_file_twins, call_arity, &ctx.entity_arity_by_id);
             let cross_file_twins =
                 narrow_candidates_by_role(src_id, cross_file_twins, &ctx.entity_role_by_id);
+            let cross_file_twins =
+                narrow_candidates_by_definition(cross_file_twins, &ctx.declaration_ids);
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
                 for cross_id in sorted_fanout_targets(cross_file_twins) {
                     accumulate_relation(
@@ -1290,6 +1304,8 @@ fn resolve_one_file(
             prune_pairs_by_arity(other_file_candidates, call_arity, &ctx.entity_arity_by_id);
         let other_file_candidates =
             narrow_pairs_by_role(src_id, other_file_candidates, &ctx.entity_role_by_id);
+        let other_file_candidates =
+            narrow_pairs_by_definition(other_file_candidates, &ctx.declaration_ids);
 
         // A call through an object never reaches a module-level function, and
         // the exact-name bucket holds exactly those: a method is indexed under
@@ -1366,6 +1382,7 @@ fn resolve_one_file(
                 .collect();
             let candidates = prune_pairs_by_arity(candidates, call_arity, &ctx.entity_arity_by_id);
             let candidates = narrow_pairs_by_role(src_id, candidates, &ctx.entity_role_by_id);
+            let candidates = narrow_pairs_by_definition(candidates, &ctx.declaration_ids);
             let candidates = if receiver_is_object {
                 let owner_bound = owner_bound_targets(
                     dst_lookup,
@@ -1472,6 +1489,7 @@ fn resolve_one_file(
                 let candidates =
                     prune_pairs_by_arity(candidates, call_arity, &ctx.entity_arity_by_id);
                 let candidates = narrow_pairs_by_role(src_id, candidates, &ctx.entity_role_by_id);
+                let candidates = narrow_pairs_by_definition(candidates, &ctx.declaration_ids);
                 let distinct: HashSet<EntityId> =
                     candidates.into_iter().map(|(_, id)| id).collect();
                 if distinct.len() == 1 {
@@ -2278,6 +2296,24 @@ impl ArityBounds {
 /// their candidates are ever pruned), and their signatures share one parameter
 /// grammar. Every other language yields `None`, leaving its callees arity-blind
 /// exactly as before.
+/// Whether a C/C++ function entity only declares itself.
+///
+/// `declaration_signature` cuts a definition off at its body, so a definition's
+/// stored signature ends at the parameter list while a prototype keeps the `;` that
+/// ended its statement. That trailing semicolon is the whole discriminator, read off
+/// the same stored signature [`parse_signature_arity`] already parses. A language
+/// whose declarations are not spelled this way is left alone, so nothing outside
+/// C and C++ can be pruned by it.
+fn callee_is_declaration(entity: &Entity) -> bool {
+    if !matches!(entity.language, LanguageId::Cpp | LanguageId::C) {
+        return false;
+    }
+    if !matches!(entity.kind, EntityKind::Function | EntityKind::Method) {
+        return false;
+    }
+    entity.signature.trim_end().ends_with(';')
+}
+
 fn callee_arity_bounds(entity: &Entity) -> Option<ArityBounds> {
     if !matches!(entity.language, LanguageId::Cpp | LanguageId::C) {
         return None;
@@ -3781,6 +3817,41 @@ fn narrow_candidates_by_role(
     targets
         .into_iter()
         .filter(|id| roles.get(id) != Some(&EntityRole::Test))
+        .collect()
+}
+
+/// Drop declaration candidates when a definition of the same name is among them.
+///
+/// A header prototype and the `.c` file's definition carry one name, so resolving a
+/// call by name offers both and the prototype can take it. Answering "who calls this
+/// function" with a one-line declaration hides the implementation the caller actually
+/// reaches, so a definition wins whenever one is on the table. With no definition
+/// among the candidates the declaration is the best answer there is, and an opaque
+/// API declared here and defined outside the repository keeps its edge.
+fn narrow_candidates_by_definition(
+    targets: HashSet<EntityId>,
+    declarations: &HashSet<EntityId>,
+) -> HashSet<EntityId> {
+    if !targets.iter().any(|id| !declarations.contains(id)) {
+        return targets;
+    }
+    targets
+        .into_iter()
+        .filter(|id| !declarations.contains(id))
+        .collect()
+}
+
+/// The `(file, id)` form of [`narrow_candidates_by_definition`].
+fn narrow_pairs_by_definition<'a>(
+    candidates: Vec<(&'a str, EntityId)>,
+    declarations: &HashSet<EntityId>,
+) -> Vec<(&'a str, EntityId)> {
+    if !candidates.iter().any(|(_, id)| !declarations.contains(id)) {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|(_, id)| !declarations.contains(id))
         .collect()
 }
 
@@ -5574,6 +5645,10 @@ pub struct IncrementalLinker {
     /// `entity_role_by_id`; backs the production-over-test tiebreak on the
     /// live-edit path.
     pub entity_role_by_id: HashMap<EntityId, EntityRole>,
+    /// Every C/C++ function entity that only declares itself. The incremental
+    /// mirror of the batch linker's `declaration_ids`; backs the
+    /// definition-over-declaration tiebreak on the live-edit path.
+    pub declaration_ids: HashSet<EntityId>,
     /// Set of all known files
     pub known_files: HashSet<String>,
     /// file_path -> Vec<(EntityId, Visibility)>
@@ -5615,6 +5690,7 @@ pub struct IncrementalLinkerCheckpointV1 {
     entity_language_by_id: Vec<(EntityId, LanguageId)>,
     entity_arity_by_id: Vec<(EntityId, ArityBounds)>,
     entity_role_by_id: Vec<(EntityId, EntityRole)>,
+    declaration_ids: Vec<EntityId>,
     known_files: Vec<String>,
     entities_by_file: Vec<(String, Vec<(EntityId, Visibility)>)>,
     include_targets_by_file: Vec<(String, Vec<String>)>,
@@ -5622,7 +5698,7 @@ pub struct IncrementalLinkerCheckpointV1 {
 }
 
 /// Bump whenever [`IncrementalLinkerCheckpointV1`] or linker semantics change.
-pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 6;
+pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 7;
 
 /// Build-time kin-index identity included in the composite hydration
 /// checkpoint version key.
@@ -5677,6 +5753,7 @@ impl IncrementalLinker {
             entity_language_by_id: HashMap::new(),
             entity_arity_by_id: HashMap::new(),
             entity_role_by_id: HashMap::new(),
+            declaration_ids: HashSet::new(),
             known_files: HashSet::new(),
             entities_by_file: HashMap::new(),
             include_targets_by_file: HashMap::new(),
@@ -5695,6 +5772,7 @@ impl IncrementalLinker {
             entity_language_by_id,
             entity_arity_by_id,
             entity_role_by_id,
+            declaration_ids,
             known_files,
             entities_by_file,
             include_targets_by_file,
@@ -5756,6 +5834,9 @@ impl IncrementalLinker {
             .collect();
         entity_role_by_id.sort_by_key(|(id, _)| *id);
 
+        let mut declaration_ids: Vec<_> = declaration_ids.iter().copied().collect();
+        declaration_ids.sort();
+
         let mut known_files: Vec<_> = known_files.iter().cloned().collect();
         known_files.sort();
 
@@ -5786,6 +5867,7 @@ impl IncrementalLinker {
             entity_language_by_id,
             entity_arity_by_id,
             entity_role_by_id,
+            declaration_ids,
             known_files,
             entities_by_file,
             include_targets_by_file,
@@ -5804,6 +5886,7 @@ impl IncrementalLinker {
             entity_language_by_id,
             entity_arity_by_id,
             entity_role_by_id,
+            declaration_ids,
             known_files,
             entities_by_file,
             include_targets_by_file,
@@ -5865,6 +5948,7 @@ impl IncrementalLinker {
             entity_language_by_id,
             entity_arity_by_id: checkpoint_hash_map(entity_arity_by_id, "entity_arity_by_id")?,
             entity_role_by_id: checkpoint_hash_map(entity_role_by_id, "entity_role_by_id")?,
+            declaration_ids: checkpoint_hash_set(declaration_ids, "declaration_ids")?,
             known_files,
             entities_by_file: checkpoint_hash_map(entities_by_file, "entities_by_file")?,
             include_targets_by_file: checkpoint_hash_map(
@@ -5886,6 +5970,7 @@ impl IncrementalLinker {
                 self.entity_language_by_id.remove(&entity_id);
                 self.entity_arity_by_id.remove(&entity_id);
                 self.entity_role_by_id.remove(&entity_id);
+                self.declaration_ids.remove(&entity_id);
                 if let Some(candidates) = self.entity_by_name.get_mut(&entity_name) {
                     candidates.retain(|(fp, _)| fp != file_path);
                     if candidates.is_empty() {
@@ -5972,6 +6057,9 @@ impl IncrementalLinker {
             self.entity_role_by_id.insert(entity.id, entity.role);
             if let Some(bounds) = callee_arity_bounds(entity) {
                 self.entity_arity_by_id.insert(entity.id, bounds);
+            }
+            if callee_is_declaration(entity) {
+                self.declaration_ids.insert(entity.id);
             }
 
             self.entity_by_name
@@ -6360,6 +6448,8 @@ fn resolve_one_file_incremental(
                 prune_ids_by_arity(cross_file_twins, call_arity, &linker.entity_arity_by_id);
             let cross_file_twins =
                 narrow_candidates_by_role(src_id, cross_file_twins, &linker.entity_role_by_id);
+            let cross_file_twins =
+                narrow_candidates_by_definition(cross_file_twins, &linker.declaration_ids);
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
                 for cross_id in sorted_fanout_targets(cross_file_twins) {
                     accumulate_relation(
@@ -6631,6 +6721,8 @@ fn resolve_one_file_incremental(
         );
         let other_file_candidates =
             narrow_pairs_by_role(src_id, other_file_candidates, &linker.entity_role_by_id);
+        let other_file_candidates =
+            narrow_pairs_by_definition(other_file_candidates, &linker.declaration_ids);
 
         // (c) Global name-match fallback. Mirrors the batch linker: a bucket
         // several cross-file entities share, with no signal to separate them,
@@ -6719,6 +6811,7 @@ fn resolve_one_file_incremental(
                     prune_pairs_by_arity(candidates, call_arity, &linker.entity_arity_by_id);
                 let candidates =
                     narrow_pairs_by_role(src_id, candidates, &linker.entity_role_by_id);
+                let candidates = narrow_pairs_by_definition(candidates, &linker.declaration_ids);
                 let candidates = if receiver_is_object {
                     let owner_bound = owner_bound_targets(
                         dst_lookup,
@@ -6814,6 +6907,7 @@ fn resolve_one_file_incremental(
                     prune_pairs_by_arity(candidates, call_arity, &linker.entity_arity_by_id);
                 let candidates =
                     narrow_pairs_by_role(src_id, candidates, &linker.entity_role_by_id);
+                let candidates = narrow_pairs_by_definition(candidates, &linker.declaration_ids);
                 let distinct: HashSet<EntityId> =
                     candidates.into_iter().map(|(_, id)| id).collect();
                 if distinct.len() == 1 {
@@ -13337,5 +13431,266 @@ void f();
 
         let result = link_cross_file_incremental(&files, &linker);
         assert!(all_override_edges(&result).is_empty());
+    }
+
+    /// A C function entity. `declaration_signature` cuts a definition off at its
+    /// body, so a definition's stored signature ends at the parameter list while a
+    /// prototype keeps its `;`. That is the only difference between the two here,
+    /// exactly as it is in a real store.
+    fn c_function(name: &str, file_path: &str, declaration: bool) -> Entity {
+        let mut entity = make_entity(name, file_path);
+        entity.language = LanguageId::C;
+        entity.signature = if declaration {
+            format!("int {name}(int a);")
+        } else {
+            format!("int {name}(int a) ")
+        };
+        entity
+    }
+
+    fn c_call(file_path: &str, src: &str, dst: &str, entities: Vec<Entity>) -> FileParseData {
+        FileParseData {
+            file_path: file_path.to_string(),
+            entities,
+            relations: vec![ExtractedRelation {
+                site: None,
+                receiver: None,
+                call_shape: None,
+                kind: RelationKind::Calls,
+                src_name: src.to_string(),
+                dst_name: dst.to_string(),
+                import_source: None,
+            }],
+            imports: vec![],
+        }
+    }
+
+    #[test]
+    fn a_c_call_reaches_the_definition_and_not_the_header_prototype() {
+        let caller = c_function("redisGetReplyFromReader", "hiredis.c", false);
+        let prototype = c_function("redisReaderGetReply", "read.h", true);
+        let definition = c_function("redisReaderGetReply", "read.c", false);
+
+        let files = vec![
+            c_call(
+                "hiredis.c",
+                "redisGetReplyFromReader",
+                "redisReaderGetReply",
+                vec![caller.clone()],
+            ),
+            FileParseData {
+                file_path: "read.h".to_string(),
+                entities: vec![prototype.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "read.c".to_string(),
+                entities: vec![definition.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            find_calls_edge(&result, &caller, &definition).is_some(),
+            "the call should reach read.c's definition"
+        );
+        assert!(
+            find_calls_edge(&result, &caller, &prototype).is_none(),
+            "the call must not reach read.h's prototype while a definition exists"
+        );
+    }
+
+    #[test]
+    fn a_cross_file_twin_set_of_only_declarations_keeps_its_edges() {
+        // The same-file definition takes the call at full confidence and the header
+        // that declares it is a cross-file twin. Nothing among those twins is a
+        // definition, so there is no better target to prefer and the twin edge must
+        // stand exactly as it did before this rule existed. This is the set-shaped
+        // half of the guard; the pairs-shaped half is the test below it.
+        let caller = c_function("caller", "app.c", false);
+        let local = c_function("work", "app.c", false);
+        let prototype = c_function("work", "work.h", true);
+
+        let files = vec![
+            c_call(
+                "app.c",
+                "caller",
+                "work",
+                vec![caller.clone(), local.clone()],
+            ),
+            FileParseData {
+                file_path: "work.h".to_string(),
+                entities: vec![prototype.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            find_calls_edge(&result, &caller, &local).is_some(),
+            "the same-file definition should still take the call"
+        );
+        assert!(
+            find_calls_edge(&result, &caller, &prototype).is_some(),
+            "a twin set holding only declarations must keep its fan-out edge"
+        );
+    }
+
+    #[test]
+    fn a_c_call_still_reaches_a_declaration_when_nothing_defines_it() {
+        // An opaque API declared here and implemented outside the repository. The
+        // declaration is the best answer there is, so it keeps its edge.
+        let caller = c_function("use_ssl", "app.c", false);
+        let prototype = c_function("SSL_new", "openssl.h", true);
+
+        let files = vec![
+            c_call("app.c", "use_ssl", "SSL_new", vec![caller.clone()]),
+            FileParseData {
+                file_path: "openssl.h".to_string(),
+                entities: vec![prototype.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            find_calls_edge(&result, &caller, &prototype).is_some(),
+            "with no definition anywhere, the declaration must keep its edge"
+        );
+    }
+
+    #[test]
+    fn only_a_c_or_cpp_function_signature_ending_in_a_semicolon_is_a_declaration() {
+        let mut prototype = make_entity("redisReaderGetReply", "read.h");
+        prototype.language = LanguageId::C;
+        prototype.signature = "int redisReaderGetReply(redisReader *r, void **reply);".to_string();
+        assert!(callee_is_declaration(&prototype));
+
+        let mut definition = make_entity("redisReaderGetReply", "read.c");
+        definition.language = LanguageId::C;
+        definition.signature = "int redisReaderGetReply(redisReader *r, void **reply)".to_string();
+        assert!(!callee_is_declaration(&definition));
+
+        // A signature can end in a semicolon in other languages without being the
+        // kind of declaration this rule prunes, so the gate keeps it inside C and
+        // C++ rather than letting one punctuation mark speak for every grammar.
+        let mut elsewhere = make_entity("handler", "src/b.ts");
+        elsewhere.signature = "function handler(): void;".to_string();
+        assert_eq!(elsewhere.language, LanguageId::TypeScript);
+        assert!(!callee_is_declaration(&elsewhere));
+
+        // Only functions and methods are call targets; a forward-declared record
+        // is FIR-3088's problem, not this rule's.
+        let mut record = make_entity("redisContext", "hiredis.h");
+        record.language = LanguageId::C;
+        record.kind = EntityKind::Class;
+        record.signature = "struct redisContext;".to_string();
+        assert!(!callee_is_declaration(&record));
+    }
+
+    #[test]
+    fn a_prototype_and_its_definition_stop_being_an_unresolvable_ambiguity() {
+        // Two same-name cross-file candidates with no scope signal are left
+        // unlinked on purpose (`linker.rs`: "same-name bucket unresolvable without
+        // scope signal"). A header prototype beside its definition is exactly that
+        // shape, so dropping the declaration does not only pick the better of two
+        // targets: it turns a call that resolved to nothing into a resolved edge.
+        let caller = c_function("caller", "app.c", false);
+        let prototype = c_function("work", "work.h", true);
+        let definition = c_function("work", "work.c", false);
+
+        let files = vec![
+            c_call("app.c", "caller", "work", vec![caller.clone()]),
+            FileParseData {
+                file_path: "work.h".to_string(),
+                entities: vec![prototype.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "work.c".to_string(),
+                entities: vec![definition.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            find_calls_edge(&result, &caller, &definition).is_some(),
+            "the ambiguity should collapse onto the definition"
+        );
+    }
+
+    #[test]
+    fn the_incremental_linker_prefers_the_definition_too() {
+        let caller = c_function("redisGetReplyFromReader", "hiredis.c", false);
+        let prototype = c_function("redisReaderGetReply", "read.h", true);
+        let definition = c_function("redisReaderGetReply", "read.c", false);
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file(
+            "hiredis.c",
+            admitted_artifact_id("hiredis.c"),
+            std::slice::from_ref(&caller),
+        );
+        linker.add_file(
+            "read.h",
+            admitted_artifact_id("read.h"),
+            std::slice::from_ref(&prototype),
+        );
+        linker.add_file(
+            "read.c",
+            admitted_artifact_id("read.c"),
+            std::slice::from_ref(&definition),
+        );
+
+        let files = vec![c_call(
+            "hiredis.c",
+            "redisGetReplyFromReader",
+            "redisReaderGetReply",
+            vec![caller.clone()],
+        )];
+        let result = link_cross_file_incremental(&files, &linker);
+        assert!(
+            find_calls_edge(&result, &caller, &definition).is_some(),
+            "the incremental linker should reach the definition"
+        );
+        assert!(
+            find_calls_edge(&result, &caller, &prototype).is_none(),
+            "the incremental linker must not reach the prototype either"
+        );
+    }
+
+    #[test]
+    fn a_declaration_survives_a_checkpoint_round_trip() {
+        let prototype = c_function("redisReaderGetReply", "read.h", true);
+        let definition = c_function("redisReaderGetReply", "read.c", false);
+        let mut linker = IncrementalLinker::new();
+        linker.add_file(
+            "read.h",
+            admitted_artifact_id("read.h"),
+            std::slice::from_ref(&prototype),
+        );
+        linker.add_file(
+            "read.c",
+            admitted_artifact_id("read.c"),
+            std::slice::from_ref(&definition),
+        );
+        assert!(linker.declaration_ids.contains(&prototype.id));
+
+        let restored = IncrementalLinker::from_checkpoint_v1(linker.to_checkpoint_v1())
+            .expect("checkpoint round trip");
+        assert!(
+            restored.declaration_ids.contains(&prototype.id),
+            "the declaration set must survive a checkpoint, or a reopened store \
+             silently loses the preference"
+        );
+        assert!(!restored.declaration_ids.contains(&definition.id));
     }
 }
