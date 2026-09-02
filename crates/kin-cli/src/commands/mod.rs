@@ -35,6 +35,7 @@ pub mod eject;
 pub mod embed;
 pub mod git;
 pub mod graph;
+pub mod graph_export;
 pub mod graph_health;
 pub mod graph_viz;
 pub mod health;

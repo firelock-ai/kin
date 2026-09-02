@@ -1250,6 +1250,186 @@ impl CoordinationEventLog {
     }
 }
 
+/// What an entity is, carried alongside a change so a consumer can patch a
+/// drawn graph without a round trip.
+///
+/// The same fields a `/graph/export` node carries, minus the id, which the
+/// event already names. Kept deliberately small: this rides every entity
+/// change on a broadcast channel, and a signature or a body would make a
+/// one-file edit a megabyte of stream.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphNodeSummary {
+    pub name: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// 1-based presentation start line, absent when the entity carries no span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub degree: usize,
+}
+
+/// What one reconcile pass emitted, totalled as it goes.
+///
+/// Kept separate from the event it becomes so the counting can be graded
+/// without a reconcile loop, and so a pass that emitted nothing can say so by
+/// producing no event at all rather than a boundary full of zeroes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PassDelta {
+    pub nodes_added: usize,
+    pub nodes_modified: usize,
+    pub nodes_removed: usize,
+    pub relations_added: usize,
+    pub relations_removed: usize,
+}
+
+impl PassDelta {
+    /// Fold one already-built relation event into the totals.
+    ///
+    /// Counting the event rather than the delta it came from is deliberate: the
+    /// boundary's job is to tell a consumer how much it should have applied, and
+    /// what it applied is what was emitted. A relation delta that named a
+    /// non-entity endpoint produced no event, so it must not appear here either.
+    ///
+    /// A `Modified` edge counts as added: the edge that now exists is the one a
+    /// consumer upserts, and splitting out a fourth counter for it would report
+    /// a distinction no renderer acts on.
+    pub fn count(&mut self, event: &DaemonEvent) {
+        if let DaemonEvent::RelationChanged { change_type, .. } = event {
+            match change_type {
+                ChangeType::Created | ChangeType::Modified => self.relations_added += 1,
+                ChangeType::Deleted => self.relations_removed += 1,
+            }
+        }
+    }
+
+    /// True when this pass emitted nothing at all.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The boundary event for this pass, or `None` when there was no delta.
+    pub fn into_event(self) -> Option<DaemonEvent> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(DaemonEvent::GraphDeltaApplied {
+            nodes_added: self.nodes_added,
+            nodes_modified: self.nodes_modified,
+            nodes_removed: self.nodes_removed,
+            relations_added: self.relations_added,
+            relations_removed: self.relations_removed,
+        })
+    }
+}
+
+/// Read one entity's node summary out of the live graph.
+///
+/// `None` when the entity is not in the graph, which is the honest answer for
+/// a deletion: there is nothing left to describe. The degree counts distinct
+/// undirected (neighbour, kind) pairs, which is the same quantity an unfiltered
+/// `/graph/export` node reports, so a consumer drawing a whole-repository graph
+/// can use the two interchangeably. An export narrowed by `kinds` or `path`
+/// counts degree within that narrower population and will read lower; the
+/// stream cannot know which narrowing a given consumer asked for. Counting raw
+/// relations here instead would make the two disagree even on the whole graph.
+pub fn graph_node_summary(
+    graph: &kin_db::InMemoryGraph,
+    id: &EntityId,
+) -> Option<GraphNodeSummary> {
+    use kin_model::EntityStore as _;
+
+    let entity = graph.get_entity(id).ok().flatten()?;
+    let degree = graph
+        .get_all_relations_for_entity(id)
+        .map(|relations| {
+            let mut seen: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+            for relation in relations {
+                let other = match (&relation.src, &relation.dst) {
+                    (kin_model::GraphNodeId::Entity(src), kin_model::GraphNodeId::Entity(dst)) => {
+                        if src == id {
+                            *dst
+                        } else {
+                            *src
+                        }
+                    }
+                    // An edge to an artifact or an external symbol is not a
+                    // drawable edge, so it is not part of a drawable degree.
+                    _ => continue,
+                };
+                seen.insert((other.to_string(), format!("{:?}", relation.kind)));
+            }
+            seen.len()
+        })
+        .unwrap_or(0);
+
+    Some(GraphNodeSummary {
+        name: entity.name.clone(),
+        kind: format!("{:?}", entity.kind),
+        file: entity.file_origin.as_ref().map(|f| f.0.clone()),
+        line: entity
+            .span
+            .as_ref()
+            .map(|span| span.start_line.saturating_add(1)),
+        degree,
+    })
+}
+
+/// Turn the relation deltas of one applied transaction into stream events.
+///
+/// Only entity-to-entity edges become events: an edge whose endpoint is an
+/// artifact or an external symbol is not a drawable edge, and a consumer
+/// patching a graph cannot place it. A `Modified` delta reports the new state,
+/// because that is the edge that now exists.
+pub fn relation_change_events(
+    delta: &kin_model::TransactionDelta,
+    file_path: Option<&str>,
+) -> Vec<DaemonEvent> {
+    let mut events = Vec::new();
+    for relation_delta in &delta.relation_deltas {
+        let (relation, change_type) = match relation_delta {
+            kin_model::RelationDelta::Added { new } => (new, ChangeType::Created),
+            kin_model::RelationDelta::Modified { new, .. } => (new, ChangeType::Modified),
+            kin_model::RelationDelta::Removed { old } => (old, ChangeType::Deleted),
+        };
+        let (kin_model::GraphNodeId::Entity(source), kin_model::GraphNodeId::Entity(target)) =
+            (&relation.src, &relation.dst)
+        else {
+            continue;
+        };
+        events.push(DaemonEvent::RelationChanged {
+            source: *source,
+            target: *target,
+            kind: format!("{:?}", relation.kind),
+            change_type,
+            file_path: file_path.map(str::to_string),
+        });
+    }
+    events
+}
+
+/// One event and the position in the stream it was emitted at.
+///
+/// The sequence is what makes a reconnect safe. A working-tree edit changes the
+/// graph without advancing the graph root: measured on hiredis, one appended
+/// function produced 26 entity events and zero `GraphRootChanged`. So a client
+/// that reconnects between commits cannot use the root hash to work out what it
+/// missed, because the root it holds is still current and its picture is still
+/// wrong. A monotonic sequence answers that question exactly: export, subscribe,
+/// discard everything at or below the sequence the export was cut at, apply the
+/// rest.
+///
+/// It rides the envelope rather than each variant so every event carries one
+/// without any variant having to remember to, and so `/vfs/subscribe` can keep
+/// serializing the bare event and stay byte-identical for the VFS daemon and
+/// the spine.
+#[derive(Debug, Clone)]
+pub struct SequencedEvent {
+    pub seq: u64,
+    pub event: DaemonEvent,
+}
+
 /// SSE invalidation events pushed to subscribers (VFS daemon, spine, KinLab).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
@@ -1265,6 +1445,31 @@ pub enum DaemonEvent {
         /// default keeps existing payloads and consumers working unchanged.
         #[serde(default)]
         session_id: Option<String>,
+        /// What the entity now is, when the emitting path knew.
+        ///
+        /// Without it this event is an id and a path, and a consumer drawing
+        /// the graph has to ask the daemon what changed before it can redraw
+        /// one node. Additive and optional: `serde` default keeps every
+        /// existing payload and consumer working unchanged, and a path that
+        /// cannot cheaply answer sends `None` rather than a guess.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<GraphNodeSummary>,
+    },
+    /// A relation between two entities was added, changed, or removed.
+    ///
+    /// The one thing the stream never reported. `EntityChanged` says a node
+    /// moved; nothing said an edge appeared or vanished, so a drawn graph could
+    /// only be refreshed wholesale. Both endpoints are entity ids, because an
+    /// edge to a non-entity is not a drawable edge.
+    RelationChanged {
+        source: EntityId,
+        target: EntityId,
+        /// The relation kind, in the graph's own spelling (`Calls`, `Contains`).
+        kind: String,
+        change_type: ChangeType,
+        /// The file whose reconcile produced this edge, when there was one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_path: Option<String>,
     },
     /// Files were added or removed from the tracked tree.
     TreeChanged {
@@ -1286,6 +1491,44 @@ pub enum DaemonEvent {
     },
     /// Durable coordination lifecycle event, appended before broadcast.
     Coordination { event: CoordinationEventEnvelope },
+    /// One reconcile pass finished, and this is what it did in total.
+    ///
+    /// Emitted after the last entity and relation event of the pass, so a
+    /// renderer can lay out once per pass instead of once per event. The
+    /// measurement that asked for it: one appended function in hiredis `net.c`
+    /// produced 26 `EntityChanged` events, 25 of them for entities the edit
+    /// never touched, because a reconcile re-emits every entity in the file it
+    /// reparsed. A consumer patching per event would relayout 26 times for one
+    /// keystroke.
+    ///
+    /// The counts are of emitted events, so they are what a consumer should
+    /// have applied since the previous boundary.
+    GraphDeltaApplied {
+        nodes_added: usize,
+        nodes_modified: usize,
+        nodes_removed: usize,
+        relations_added: usize,
+        relations_removed: usize,
+    },
+}
+
+impl DaemonEvent {
+    /// The `type` this event serializes as.
+    ///
+    /// Read from the variant rather than from a serialized payload, so the
+    /// `/graph/events` type filter costs nothing on an event it drops and
+    /// cannot disagree with what the wire actually says.
+    pub const fn type_name(&self) -> &'static str {
+        match self {
+            Self::EntityChanged { .. } => "EntityChanged",
+            Self::RelationChanged { .. } => "RelationChanged",
+            Self::TreeChanged { .. } => "TreeChanged",
+            Self::GraphRootChanged { .. } => "GraphRootChanged",
+            Self::RepositoryAuthorityChanged { .. } => "RepositoryAuthorityChanged",
+            Self::Coordination { .. } => "Coordination",
+            Self::GraphDeltaApplied { .. } => "GraphDeltaApplied",
+        }
+    }
 }
 
 /// Authority owning the graph selected for a daemon request.
@@ -2651,7 +2894,10 @@ pub struct DaemonState {
     pub vfs_version: AtomicU64,
     /// Broadcast channel for SSE invalidation events.
     /// Subscribers (VFS daemon, spine, KinLab) receive real-time notifications.
-    pub event_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
+    pub event_tx: tokio::sync::broadcast::Sender<SequencedEvent>,
+    /// Position of the last event emitted. Read by `/graph/export` before it
+    /// cuts a payload, stamped onto every event by [`DaemonState::emit_event`].
+    pub event_seq: std::sync::atomic::AtomicU64,
     /// Per-session temporal scopes. When a session has an active scope,
     /// all queries see the cached historical graph instead of the live graph.
     /// Max MAX_CONCURRENT_SCOPES sessions can have active scopes simultaneously.
@@ -4912,6 +5158,7 @@ impl DaemonState {
             repository_command_enrich_after_authority_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
             event_tx: tokio::sync::broadcast::channel(256).0,
+            event_seq: std::sync::atomic::AtomicU64::new(0),
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
             spine_initialization_failure: Mutex::new(None),
@@ -5279,6 +5526,7 @@ impl DaemonState {
             repository_command_enrich_after_authority_once: AtomicBool::new(false),
             vfs_version: AtomicU64::new(persisted_vfs_version),
             event_tx: tokio::sync::broadcast::channel(256).0,
+            event_seq: std::sync::atomic::AtomicU64::new(0),
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
             spine_initialization_failure: Mutex::new(None),
@@ -8443,12 +8691,30 @@ impl DaemonState {
 
     /// Emit an SSE event to all subscribers. Non-blocking — if no subscribers, the event is dropped.
     pub fn emit_event(&self, event: DaemonEvent) {
-        match self.event_tx.send(event) {
+        // Stamped here, not at the subscriber, because subscribers see the
+        // stream at different points and a number derived per subscriber would
+        // not be the same number twice.
+        let seq = self
+            .event_seq
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        match self.event_tx.send(SequencedEvent { seq, event }) {
             Ok(_) => {}
             Err(_) => {
                 debug!("broadcast event dropped, no active subscribers");
             }
         }
+    }
+
+    /// The position the stream has reached.
+    ///
+    /// Read BEFORE a payload is built, never after. A client keeps every event
+    /// above the sequence its export was cut at, so reading first can only make
+    /// it re-apply an event the export already contains, which for an upsert is
+    /// a no-op. Reading after would let an event emitted during the build fall
+    /// into neither the export nor the kept range, and that one is lost.
+    pub fn current_event_seq(&self) -> u64 {
+        self.event_seq.load(Ordering::SeqCst)
     }
 
     /// Save the current graph via the storage backend (CAS write).
@@ -12553,6 +12819,7 @@ mod tests {
         // so Mission Control can render "<session> -> entity <id>".
         let event = DaemonEvent::EntityChanged {
             entity_id: kin_model::EntityId::new(),
+            node: None,
             change_type: ChangeType::Modified,
             file_path: Some("crates/kin-daemon/src/api.rs".to_string()),
             session_id: Some("mission-ctl-7".to_string()),
@@ -12722,6 +12989,7 @@ mod tests {
         // Mission Control reads as "unattributed" (never a fabricated guess).
         let event = DaemonEvent::EntityChanged {
             entity_id: kin_model::EntityId::new(),
+            node: None,
             change_type: ChangeType::Created,
             file_path: Some("src/lib.rs".to_string()),
             session_id: None,
@@ -12737,6 +13005,7 @@ mod tests {
         // `#[serde(default)]` additive contract the change relies on.
         let mut payload = serde_json::to_value(DaemonEvent::EntityChanged {
             entity_id: kin_model::EntityId::new(),
+            node: None,
             change_type: ChangeType::Modified,
             file_path: Some("api.rs".to_string()),
             session_id: Some("dropme".to_string()),
@@ -12750,6 +13019,281 @@ mod tests {
         }
     }
 
+    /// Build a relation between two entities.
+    fn relation_between(
+        source: kin_model::EntityId,
+        target: kin_model::EntityId,
+        kind: kin_model::RelationKind,
+    ) -> kin_model::Relation {
+        kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(source),
+            dst: kin_model::GraphNodeId::Entity(target),
+            confidence: 1.0,
+            origin: kin_model::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    /// A reconcile that learned an edge reports both of its endpoints.
+    ///
+    /// This is the thing the stream never said. `EntityChanged` reports that a
+    /// node moved; nothing reported that an edge appeared, so a drawn graph
+    /// could only be refreshed wholesale. Measured before this existed: one
+    /// appended function in hiredis `net.c` produced 26 `EntityChanged` events
+    /// and zero relation events, while the graph gained a `Calls` edge.
+    #[test]
+    fn an_applied_relation_delta_becomes_an_event_naming_both_endpoints() {
+        let caller = kin_model::EntityId::new();
+        let callee = kin_model::EntityId::new();
+        let gone = kin_model::EntityId::new();
+
+        let delta = kin_model::TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: vec![
+                kin_model::RelationDelta::Added {
+                    new: relation_between(caller, callee, kin_model::RelationKind::Calls),
+                },
+                kin_model::RelationDelta::Removed {
+                    old: relation_between(caller, gone, kin_model::RelationKind::Calls),
+                },
+            ],
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        };
+
+        let events = relation_change_events(&delta, Some("src/net.c"));
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            DaemonEvent::RelationChanged {
+                source,
+                target,
+                kind,
+                change_type,
+                file_path,
+            } => {
+                assert_eq!(*source, caller);
+                assert_eq!(*target, callee);
+                assert_eq!(kind, "Calls");
+                assert!(matches!(change_type, ChangeType::Created));
+                assert_eq!(file_path.as_deref(), Some("src/net.c"));
+            }
+            other => panic!("expected RelationChanged, got {other:?}"),
+        }
+        match &events[1] {
+            DaemonEvent::RelationChanged {
+                target,
+                change_type,
+                ..
+            } => {
+                assert_eq!(*target, gone);
+                assert!(matches!(change_type, ChangeType::Deleted));
+            }
+            other => panic!("expected RelationChanged, got {other:?}"),
+        }
+    }
+
+    /// An edge to something that is not an entity produces no event.
+    ///
+    /// A consumer patching a drawn graph cannot place an endpoint that is no
+    /// node, and the export withholds those edges for the same reason. Sending
+    /// one would make the two surfaces disagree about what an edge is.
+    #[test]
+    fn an_edge_to_a_non_entity_produces_no_event() {
+        let entity = kin_model::EntityId::new();
+        let mut relation = relation_between(entity, entity, kin_model::RelationKind::Calls);
+        relation.dst = kin_model::GraphNodeId::Artifact(kin_model::ArtifactId::new());
+
+        let delta = kin_model::TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: vec![kin_model::RelationDelta::Added { new: relation }],
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        };
+
+        assert!(
+            relation_change_events(&delta, None).is_empty(),
+            "an artifact endpoint is not drawable and must produce no frame"
+        );
+    }
+
+    /// A pass that changed nothing says nothing.
+    ///
+    /// The reconcile loop ticks whether or not anything happened, and a
+    /// boundary full of zeroes on every tick would wake every subscribed
+    /// renderer for no reason.
+    #[test]
+    fn a_pass_that_changed_nothing_emits_no_boundary() {
+        assert!(PassDelta::default().is_empty());
+        assert!(PassDelta::default().into_event().is_none());
+    }
+
+    /// The boundary counts the frames the pass emitted, so a consumer knows how
+    /// much it should have applied since the last one.
+    #[test]
+    fn the_boundary_counts_the_frames_the_pass_emitted() {
+        let mut delta = PassDelta {
+            nodes_added: 1,
+            nodes_modified: 25,
+            ..Default::default()
+        };
+        let source = kin_model::EntityId::new();
+        let target = kin_model::EntityId::new();
+        let relation = |change_type| DaemonEvent::RelationChanged {
+            source,
+            target,
+            kind: "Calls".to_string(),
+            change_type,
+            file_path: None,
+        };
+        delta.count(&relation(ChangeType::Created));
+        // A modified edge is the edge that now exists, so a consumer upserts it
+        // exactly as it would an added one.
+        delta.count(&relation(ChangeType::Modified));
+        delta.count(&relation(ChangeType::Deleted));
+        // An entity event is already counted from the reconcile outcome, and
+        // counting it again here would double every node in the boundary.
+        delta.count(&DaemonEvent::EntityChanged {
+            entity_id: source,
+            node: None,
+            change_type: ChangeType::Created,
+            file_path: None,
+            session_id: None,
+        });
+
+        assert!(!delta.is_empty());
+        match delta
+            .into_event()
+            .expect("a pass with a delta has a boundary")
+        {
+            DaemonEvent::GraphDeltaApplied {
+                nodes_added,
+                nodes_modified,
+                nodes_removed,
+                relations_added,
+                relations_removed,
+            } => {
+                assert_eq!(nodes_added, 1);
+                assert_eq!(nodes_modified, 25);
+                assert_eq!(nodes_removed, 0);
+                assert_eq!(relations_added, 2, "created and modified both upsert");
+                assert_eq!(relations_removed, 1);
+            }
+            other => panic!("expected GraphDeltaApplied, got {other:?}"),
+        }
+    }
+
+    /// Every emitted event gets a position, and the positions only go up.
+    ///
+    /// This is what a reconnecting client compares against its export. A
+    /// working-tree edit never advances the graph root, so without this the
+    /// client has nothing to compare at all.
+    #[test]
+    fn every_emitted_event_carries_a_sequence_that_only_advances() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let mut rx = state.event_tx.subscribe();
+
+        let cut = state.current_event_seq();
+        for _ in 0..3 {
+            state.emit_event(DaemonEvent::EntityChanged {
+                entity_id: kin_model::EntityId::new(),
+                node: None,
+                change_type: ChangeType::Modified,
+                file_path: None,
+                session_id: None,
+            });
+        }
+
+        let mut seen = Vec::new();
+        while let Ok(sequenced) = rx.try_recv() {
+            seen.push(sequenced.seq);
+        }
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.iter().all(|seq| *seq > cut),
+            "an event emitted after the cut must sort above it: cut={cut} seen={seen:?}"
+        );
+        assert!(
+            seen.windows(2).all(|pair| pair[1] > pair[0]),
+            "sequences must strictly increase: {seen:?}"
+        );
+        assert_eq!(state.current_event_seq(), *seen.last().unwrap());
+    }
+
+    /// A relation event reaches a subscriber through the real bus.
+    #[test]
+    fn a_relation_event_reaches_an_sse_subscriber() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let mut rx = state.event_tx.subscribe();
+        let source = kin_model::EntityId::new();
+        let target = kin_model::EntityId::new();
+        state.emit_event(DaemonEvent::RelationChanged {
+            source,
+            target,
+            kind: "Calls".to_string(),
+            change_type: ChangeType::Created,
+            file_path: Some("src/net.c".to_string()),
+        });
+        match rx
+            .try_recv()
+            .expect("event delivered to SSE subscriber")
+            .event
+        {
+            DaemonEvent::RelationChanged {
+                source: got_source,
+                target: got_target,
+                ..
+            } => {
+                assert_eq!(got_source, source);
+                assert_eq!(got_target, target);
+            }
+            other => panic!("expected RelationChanged, got {other:?}"),
+        }
+    }
+
+    /// The type filter reads the variant, and every variant has a name.
+    #[test]
+    fn every_event_variant_names_itself_on_the_wire() {
+        let event = DaemonEvent::RelationChanged {
+            source: kin_model::EntityId::new(),
+            target: kin_model::EntityId::new(),
+            kind: "Calls".to_string(),
+            change_type: ChangeType::Created,
+            file_path: None,
+        };
+        // The name the filter matches on has to be the name the wire carries,
+        // or `--types RelationChanged` silently drops every relation event.
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["type"], serde_json::json!(event.type_name()));
+        assert_eq!(event.type_name(), "RelationChanged");
+    }
+
+    /// A node summary is absent from the wire when the emitting path had none.
+    #[test]
+    fn an_absent_node_summary_is_absent_from_the_payload() {
+        let payload = serde_json::to_value(DaemonEvent::EntityChanged {
+            entity_id: kin_model::EntityId::new(),
+            node: None,
+            change_type: ChangeType::Modified,
+            file_path: None,
+            session_id: None,
+        })
+        .unwrap();
+        assert!(
+            payload.get("node").is_none(),
+            "an optional summary nobody filled must not appear as null: {payload}"
+        );
+    }
+
     #[test]
     fn emit_event_delivers_session_attribution_to_subscriber() {
         // The real /events emit path: emit_event -> broadcast -> SSE subscriber.
@@ -12760,11 +13304,16 @@ mod tests {
         let mut rx = state.event_tx.subscribe();
         state.emit_event(DaemonEvent::EntityChanged {
             entity_id: kin_model::EntityId::new(),
+            node: None,
             change_type: ChangeType::Modified,
             file_path: Some("crates/kin-daemon/src/api.rs".to_string()),
             session_id: Some("mission-ctl-7".to_string()),
         });
-        match rx.try_recv().expect("event delivered to SSE subscriber") {
+        match rx
+            .try_recv()
+            .expect("event delivered to SSE subscriber")
+            .event
+        {
             DaemonEvent::EntityChanged { session_id, .. } => {
                 assert_eq!(session_id.as_deref(), Some("mission-ctl-7"));
             }
