@@ -2590,6 +2590,24 @@ impl InMemoryGraph {
         Self::from_snapshot_without_text_index(snapshot)
     }
 
+    /// Whether this graph is holding its history in memory.
+    ///
+    /// The instrument behind "a graph built over a base whose history is on
+    /// disk leaves it there". The currency digest folds the whole map in, and
+    /// doing that through `Deref` used to leave it resident for the life of the
+    /// graph, which on a converted store is most of what a daemon holds.
+    #[cfg(test)]
+    pub(crate) fn history_is_decoded(&self) -> bool {
+        self.changes.read().changes.is_decoded()
+    }
+
+    /// How many changes this graph's history holds, read from the map header
+    /// when the history is still on disk.
+    #[cfg(test)]
+    pub(crate) fn history_len(&self) -> usize {
+        self.changes.read().changes.len()
+    }
+
     /// Restore a graph from a snapshot with a persistent text index at the
     /// given directory path.
     pub fn from_snapshot_with_text_index(

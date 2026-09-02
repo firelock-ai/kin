@@ -1650,7 +1650,20 @@ impl GraphSnapshot {
         envelope: AuthorityEnvelope,
     ) -> Result<(), crate::error::KinDbError> {
         let mut timer = crate::storage::repository::PublicationPhaseTimer::start();
-        let admitted = AdmittedChangeMap::admit(&self.changes, "snapshot")?;
+        // A change map that is still on disk was left there by a recovery that
+        // a durable validation record licensed, and that record is this
+        // validator's verdict on those exact bytes, this pass included. Running
+        // the pass would decode the whole history to reach the conclusion the
+        // record already carries, and then hold it: on a converted store that
+        // is most of what a serving daemon retains, for a history nothing on
+        // the serving path reads. `AdmittedChangeMap::on_disk` returns `None`
+        // for a map in memory, which carries no such record, so every other
+        // snapshot takes the pass exactly as before.
+        let on_disk = AdmittedChangeMap::on_disk(&self.changes);
+        let admitted = match on_disk {
+            Some(admitted) => admitted,
+            None => AdmittedChangeMap::admit(&self.changes, "snapshot")?,
+        };
         let changes_ms = timer.lap_ms();
         self.validate_storage_admission_after_changes(
             replay, &admitted, envelope, changes_ms, timer,

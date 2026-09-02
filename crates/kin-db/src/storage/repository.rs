@@ -20509,6 +20509,293 @@ mod tests {
         assert_eq!(decoded_on_this_thread(), decodes_before + 1);
     }
 
+    /// A committed store whose history carries one entity.
+    ///
+    /// [`committed_local_repository`] commits files and no entities, so the
+    /// graph resolved at its base has no entity revisions and a graph build
+    /// over it DERIVES them across the whole history, which reads the change
+    /// map by definition. A daemon's store is not that shape: its materialized
+    /// section carries the revisions, so the derivation is skipped. Every
+    /// assertion about what a build reads needs this shape or it grades the
+    /// derivation instead of the code under test.
+    fn committed_local_repository_with_an_entity(directory: &TempDir) {
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager = RepositoryAuthorityManager::open(repository_id(), backend).unwrap();
+        let mut transaction = arbitrary_repository_transaction(&manager);
+        let entity = Entity {
+            id: EntityId::from_content("src/lib.rs", "kin", "function", 1),
+            kind: EntityKind::Function,
+            name: "kin".to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0x11; 32]),
+                signature_hash: Hash256::from_bytes([0x12; 32]),
+                behavior_hash: Hash256::from_bytes([0x13; 32]),
+                equivalence_hash: Hash256::from_bytes([0x14; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("src/lib.rs")),
+            span: None,
+            signature: "pub fn kin()".to_string(),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+        let change = transaction.changes.first_mut().unwrap();
+        change.entity_deltas.push(EntityDelta::Added {
+            new: entity.clone(),
+        });
+        change.id = compute_semantic_change_id(change).unwrap();
+        let change_id = change.id;
+        transaction.ref_mutations[0].new_target = Some(RefTarget::change(change_id));
+        let workspace_mutation = transaction.workspace_mutation.as_mut().unwrap();
+        workspace_mutation.new_base_target = Some(RefTarget::change(change_id));
+        workspace_mutation.semantic_delta =
+            WorkspaceSemanticDelta::new(vec![EntityDelta::Added { new: entity }], Vec::new())
+                .unwrap();
+        manager
+            .commit_repository_transaction(transaction)
+            .expect("the fixture transaction commits");
+    }
+
+    /// Give the fixture store the shape a daemon's store has.
+    ///
+    /// A base folded from history reads the change map by definition, so a
+    /// fixture with no materialized graph section cannot grade any of the
+    /// assertions below: they would be red for a reason that has nothing to do
+    /// with the code under test.
+    fn persist_a_materialized_graph_section(directory: &TempDir) {
+        let seeding = reopen(directory);
+        let workspace_id = seeding.read_authority().metadata().workspaces[0].workspace_id;
+        let outcome = seeding
+            .materialize_workspace_base_graph_section(&repository_id(), &workspace_id)
+            .unwrap()
+            .expect("the fixture workspace exists");
+        let MaterializedGraphSectionOutcome::Persisted { .. } = outcome else {
+            panic!("the first explicit materialization must persist a section")
+        };
+    }
+
+    /// A base resolved from a proven open, with its history still on disk.
+    fn on_disk_history_base(
+        lease: &AuthorityReadLease<RepositoryAuthorityState>,
+    ) -> crate::storage::format::GraphSnapshot {
+        let workspace_id = lease.metadata().workspaces[0].workspace_id;
+        let base = lease
+            .workspace_graph_snapshot(&workspace_id)
+            .expect("the workspace base resolves")
+            .expect("the fixture workspace exists");
+        assert!(
+            !base.changes.is_decoded(),
+            "the control: this base carries its history on disk"
+        );
+        assert_eq!(
+            base.changes.len(),
+            1,
+            "the control: there is a history here to decode"
+        );
+        assert!(
+            !base.entity_revisions.is_empty(),
+            "the control: this base carries its own entity revisions, so a \
+             graph build over it does not derive them across the history, \
+             which would read the map whatever this code does"
+        );
+        base
+    }
+
+    /// The currency digest folds the whole history in, and that fold is what
+    /// used to decode a map the open had left on disk. It now reads the
+    /// entries transiently, so the digest has to be proved unmoved: this is a
+    /// memory change, not a format change, and a digest that shifted would
+    /// invalidate every persisted text index and vector sidecar in the field.
+    #[test]
+    fn folding_the_history_into_the_currency_digest_moves_no_byte_and_keeps_nothing() {
+        let directory = TempDir::new().unwrap();
+        committed_local_repository_with_an_entity(&directory);
+        persist_a_materialized_graph_section(&directory);
+
+        let reopened = reopen(&directory);
+        let lease = reopened.read_authority();
+        let mut base = on_disk_history_base(&lease);
+
+        let from_disk = crate::storage::merkle::compute_retrieval_authority_hash(&base);
+        assert!(
+            !base.changes.is_decoded(),
+            "folding the history into the digest must not have kept it"
+        );
+
+        // Decode it deliberately, and take the same digest over the same map in
+        // memory. Byte equality between the two is the whole claim.
+        base.changes = base.changes.clone().into_inner().into();
+        assert!(
+            base.changes.is_decoded(),
+            "the control: this arm is the in-memory one"
+        );
+        let from_memory = crate::storage::merkle::compute_retrieval_authority_hash(&base);
+        assert_eq!(
+            from_disk, from_memory,
+            "the digest must not depend on whether the history was resident"
+        );
+    }
+
+    /// The other half of the same property. The base keeps its history on disk
+    /// only until something folds it in, and a graph build does exactly that,
+    /// so without this the saving above would be handed straight back one call
+    /// later, which is how it was found in the first place.
+    #[test]
+    fn a_graph_built_over_an_on_disk_history_leaves_it_on_disk() {
+        let directory = TempDir::new().unwrap();
+        committed_local_repository_with_an_entity(&directory);
+        persist_a_materialized_graph_section(&directory);
+
+        let reopened = reopen(&directory);
+        let lease = reopened.read_authority();
+        let base = on_disk_history_base(&lease);
+        let changes = base.changes.len();
+
+        let graph = crate::engine::InMemoryGraph::from_snapshot_without_text_index(base)
+            .expect("the served graph builds");
+
+        assert!(
+            !graph.history_is_decoded(),
+            "a graph built over an on-disk history must leave it on disk"
+        );
+        assert_eq!(
+            graph.history_len(),
+            changes,
+            "the control: the graph still holds that history, counted from the \
+             map header rather than by decoding it"
+        );
+        assert!(
+            !lease.snapshot().changes.is_decoded(),
+            "and the authority's own map is untouched by the build"
+        );
+    }
+
+    /// The guard for the term this change removes.
+    ///
+    /// Resolving a workspace base used to re-run the change-map admission pass
+    /// over a clone of the authority's map, which decoded the history the open
+    /// had just left on disk and held it for the life of the process. Measured
+    /// on a full VS Code store, that decode was 1,418,929,338 bytes, 41.1
+    /// percent of the served workspace snapshot, against a store whose whole
+    /// history is one change.
+    ///
+    /// The assertion is the decode counter rather than a size, because the
+    /// counter fails on the first byte and a size threshold has to be tuned to
+    /// the fixture.
+    #[test]
+    fn a_workspace_base_does_not_decode_the_history_the_open_left_on_disk() {
+        let directory = TempDir::new().unwrap();
+        drop(committed_local_repository(&directory));
+
+        persist_a_materialized_graph_section(&directory);
+
+        let reopened = reopen(&directory);
+        assert!(
+            reopened.opened_by_history_validation(),
+            "the control: only a proven open leaves the map on disk, so an \
+             unproven one would make every assertion below vacuous"
+        );
+        let lease = reopened.read_authority();
+        assert!(
+            lease.snapshot().materialized_graph.is_some(),
+            "the control: the base below is served from a section"
+        );
+        assert!(
+            !lease.snapshot().changes.is_decoded(),
+            "the control: the open left the change map on disk"
+        );
+        assert_eq!(
+            lease.snapshot().changes.len(),
+            1,
+            "the control: there is a history here to decode"
+        );
+
+        let workspace_id = lease.metadata().workspaces[0].workspace_id;
+        let decodes_before = decoded_on_this_thread();
+        let resolutions_before = WORKSPACE_BASE_RESOLUTIONS.with(|count| count.get());
+        let served_before = BASE_GRAPHS_SERVED_FROM_SECTION.with(|count| count.get());
+        let base = lease
+            .workspace_graph_snapshot(&workspace_id)
+            .expect("the workspace base resolves")
+            .expect("the fixture workspace exists");
+
+        assert_eq!(
+            WORKSPACE_BASE_RESOLUTIONS.with(|count| count.get()),
+            resolutions_before + 1,
+            "the control: a base was actually resolved rather than served from \
+             a prepared artifact, so the assertions below grade this code"
+        );
+        assert_eq!(
+            BASE_GRAPHS_SERVED_FROM_SECTION.with(|count| count.get()),
+            served_before + 1,
+            "the control: it was served from the section rather than folded \
+             from history, which is the shape a daemon's open has"
+        );
+        assert_eq!(
+            decoded_on_this_thread(),
+            decodes_before,
+            "resolving a workspace base must not decode the history the open \
+             left on disk"
+        );
+        assert!(
+            !base.changes.is_decoded(),
+            "the base carries the authority's encoded map, not a decode of it"
+        );
+        assert_eq!(
+            base.changes.len(),
+            1,
+            "and it is the same history, read from the map header"
+        );
+        assert!(
+            !lease.snapshot().changes.is_decoded(),
+            "the authority's own map is untouched by the resolution"
+        );
+    }
+
+    /// The other side of the same rule: a base whose history is in memory takes
+    /// the ordinary pass. Without this, the change above could have been a
+    /// blanket skip that never validates a change map again.
+    #[test]
+    fn a_workspace_base_over_a_decoded_history_still_takes_the_admission_pass() {
+        let directory = TempDir::new().unwrap();
+        drop(committed_local_repository(&directory));
+        let mut record = read_authority_json(directory.path());
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("history_validation")
+            .expect("the committed record carried a validation to remove");
+        write_authority_json(directory.path(), &record);
+
+        let reopened = reopen(&directory);
+        assert!(
+            !reopened.opened_by_history_validation(),
+            "the control: this open has no record to trust"
+        );
+        let lease = reopened.read_authority();
+        assert!(
+            lease.snapshot().changes.is_decoded(),
+            "the control: an unproven open holds its history in memory"
+        );
+        let workspace_id = lease.metadata().workspaces[0].workspace_id;
+        let base = lease
+            .workspace_graph_snapshot(&workspace_id)
+            .expect("the workspace base resolves")
+            .expect("the fixture workspace exists");
+        assert!(
+            AdmittedChangeMap::on_disk(&base.changes).is_none(),
+            "a decoded map is not witnessable on disk, so this base took the \
+             ordinary admission pass"
+        );
+    }
+
     #[test]
     fn an_open_without_a_verified_record_decodes_eagerly_and_validates_in_full() {
         let directory = TempDir::new().unwrap();

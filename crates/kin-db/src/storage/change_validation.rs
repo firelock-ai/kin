@@ -56,8 +56,20 @@ pub(crate) fn validate_semantic_change_entries<'a>(
 /// compares by pointer identity, which is exact and O(1), so a witness for one
 /// map can never license skipping the pass on a different map.
 #[derive(Clone, Copy)]
-pub(crate) struct AdmittedChangeMap<'a> {
-    changes: &'a std::collections::HashMap<SemanticChangeId, SemanticChange>,
+pub(crate) enum AdmittedChangeMap<'a> {
+    /// The pass ran in this process over exactly the borrowed map.
+    Derived(&'a std::collections::HashMap<SemanticChangeId, SemanticChange>),
+    /// The map is still on disk, and that IS the pass.
+    ///
+    /// An encoded map is built in exactly one place, by
+    /// `GraphSnapshot::from_bytes_with_encoded_history`, which recovery reaches
+    /// only when a durable validation record names these exact snapshot bytes
+    /// at this validator version. That record is the whole validator's verdict
+    /// on those bytes, admission included, so a map that is still encoded is a
+    /// map that record already admitted. Mutating one decodes it first
+    /// (`DerefMut` forces), so an encoded map is also provably the map the open
+    /// verified rather than a descendant of it.
+    OnDisk(&'a crate::storage::change_map::ChangeMap),
 }
 
 impl<'a> AdmittedChangeMap<'a> {
@@ -70,7 +82,23 @@ impl<'a> AdmittedChangeMap<'a> {
         boundary: &str,
     ) -> Result<Self, KinDbError> {
         validate_semantic_change_entries(changes.iter(), boundary)?;
-        Ok(Self { changes })
+        Ok(Self::Derived(changes))
+    }
+
+    /// Witness a map an open left on disk, or `None` for one in memory.
+    ///
+    /// `None` is the whole safety property of this constructor: a decoded map
+    /// carries no record of where it came from, so it gets the ordinary pass
+    /// and nothing here can hand it a free one. Only the encoded state, which
+    /// the variant above shows can be reached only under a durable validation
+    /// record, is witnessed.
+    ///
+    /// This exists because re-deriving the id of every change would decode the
+    /// history the open deliberately left on disk: measured on a full VS Code
+    /// store, 1,418,929,338 bytes retained for the life of the daemon to reach
+    /// a conclusion the record already carried.
+    pub(crate) fn on_disk(changes: &'a crate::storage::change_map::ChangeMap) -> Option<Self> {
+        (!changes.is_decoded()).then_some(Self::OnDisk(changes))
     }
 
     /// Carry an existing admission onto a map the caller just cloned from the
@@ -86,21 +114,31 @@ impl<'a> AdmittedChangeMap<'a> {
         admitted: &AdmittedChangeMap<'_>,
     ) -> Self {
         let _ = admitted;
-        Self { changes: clone }
+        Self::Derived(clone)
     }
 
     /// Whether this witness describes exactly `changes`, by pointer identity.
-    pub(crate) fn describes(
-        &self,
-        changes: &std::collections::HashMap<SemanticChangeId, SemanticChange>,
-    ) -> bool {
-        std::ptr::eq(self.changes, changes)
+    ///
+    /// Takes the map in its own type rather than its decoded entries, so that
+    /// asking the question does not decode the answer. A `Derived` witness
+    /// borrows entries, so it can only describe a map that already holds them;
+    /// against one still on disk it reports false without decoding it, which
+    /// is the same verdict a decode would have reached, since a fresh decode
+    /// is a fresh allocation and never the map the witness borrowed.
+    pub(crate) fn describes(&self, changes: &crate::storage::change_map::ChangeMap) -> bool {
+        match self {
+            Self::Derived(admitted) => changes
+                .decoded_if_present()
+                .is_some_and(|decoded| std::ptr::eq(*admitted, decoded)),
+            Self::OnDisk(admitted) => std::ptr::eq(*admitted, changes),
+        }
     }
 }
 
 #[cfg(test)]
 mod admitted_change_map_tests {
     use super::*;
+    use crate::storage::change_map::{ChangeMap, EncodedChanges, HistorySource};
     use crate::storage::format::GraphSnapshot;
     use crate::storage::repository::GitProjectionTreeReplay;
 
@@ -143,10 +181,10 @@ mod admitted_change_map_tests {
     /// that proves nothing about which map was actually admitted.
     #[test]
     fn an_equal_but_distinct_map_is_not_the_admitted_one() {
-        let admitted_map = std::collections::HashMap::new();
+        let admitted_map = ChangeMap::new();
         let twin = admitted_map.clone();
         assert_eq!(
-            admitted_map, twin,
+            *admitted_map, *twin,
             "the two maps must be equal for this test to mean anything"
         );
         let witness = AdmittedChangeMap::admit(&admitted_map, "admitted")
@@ -159,6 +197,71 @@ mod admitted_change_map_tests {
             !witness.describes(&twin),
             "an equal but distinct map must not be treated as the admitted one"
         );
+    }
+
+    /// A map in memory carries no record of where it came from, so it must not
+    /// be witnessable this way. This is the one check standing between the
+    /// on-disk witness and a free pass for any map at all.
+    #[test]
+    fn a_decoded_map_cannot_be_witnessed_as_being_on_disk() {
+        let decoded = ChangeMap::new();
+        assert!(decoded.is_decoded(), "the control: this map is in memory");
+        assert!(
+            AdmittedChangeMap::on_disk(&decoded).is_none(),
+            "a map in memory must take the ordinary admission pass"
+        );
+    }
+
+    /// The other direction, so the refusal above is discrimination rather than
+    /// a constructor that never returns a witness. An encoded map is witnessed,
+    /// it describes itself, and it describes nothing else, all without decoding.
+    #[test]
+    fn an_on_disk_map_is_witnessed_and_describes_only_itself() {
+        let encoded = encoded_change_map();
+        let other = encoded_change_map();
+        assert!(
+            !encoded.is_decoded(),
+            "the control: this map is still on disk"
+        );
+        let witness =
+            AdmittedChangeMap::on_disk(&encoded).expect("an encoded map is witnessed on disk");
+        assert!(witness.describes(&encoded));
+        assert!(
+            !witness.describes(&other),
+            "a witness for one on-disk map must not describe another"
+        );
+        assert!(
+            !encoded.is_decoded() && !other.is_decoded(),
+            "asking the question must not decode either map"
+        );
+    }
+
+    /// A witness minted over decoded entries must not describe a map that is
+    /// still on disk, and asking must not decode it. Without this, the identity
+    /// check would pay the very decode the witness exists to avoid.
+    #[test]
+    fn a_derived_witness_does_not_describe_an_on_disk_map() {
+        let decoded = ChangeMap::new();
+        let witness =
+            AdmittedChangeMap::admit(&decoded, "admitted").expect("an empty map is admissible");
+        let encoded = encoded_change_map();
+        assert!(!witness.describes(&encoded));
+        assert!(
+            !encoded.is_decoded(),
+            "the identity check must not have decoded it"
+        );
+    }
+
+    /// A map that reports itself as on disk. Its source is never read here:
+    /// every assertion above is about identity, and decoding is exactly what
+    /// these tests prove does not happen.
+    fn encoded_change_map() -> ChangeMap {
+        ChangeMap::encoded(EncodedChanges::new(
+            HistorySource::Memory(std::sync::Arc::from(Vec::new().into_boxed_slice())),
+            0..0,
+            1,
+            [0u8; 32],
+        ))
     }
 
     /// Every place that carries an admission onto a map it did not itself

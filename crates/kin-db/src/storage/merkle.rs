@@ -700,7 +700,14 @@ pub fn compute_retrieval_authority_hash(snapshot: &GraphSnapshot) -> MerkleHash 
 
     hash_map_domain(&mut hasher, "retrieval_entities", &snapshot.entities);
     hash_map_domain(&mut hasher, "retrieval_relations", &snapshot.relations);
-    hash_map_domain(&mut hasher, "retrieval_changes", &snapshot.changes);
+    // Read through `with_entries` rather than by deref. This fold is the only
+    // thing on a daemon's open path that looks at the whole history, and it
+    // keeps nothing, so memoizing the decode here left a converted store's
+    // entire history resident for the life of the process to produce one
+    // digest. The bytes folded in are identical either way.
+    snapshot
+        .changes
+        .with_entries(|changes| hash_map_domain(&mut hasher, "retrieval_changes", changes));
     hash_map_domain(
         &mut hasher,
         "retrieval_external_references",
