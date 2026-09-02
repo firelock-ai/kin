@@ -21211,57 +21211,45 @@ mod tests {
             entity.match_kind = Some(LocateMatchKind::TextFallback);
             entity
         };
-        // Prose alone: the collision stops OVERRIDING the fused order.
+        // Both cases fan out to TWO variants, because `fuse_locate_results`
+        // returns the single result untouched when there are fewer than two.
+        // A first draft used one variant and its assertion passed without the
+        // fusion code running at all; the lookup control below is what caught
+        // that, and it is why both cases here are two-variant.
         //
         // Below the tier the fused arm orders on RRF rank, not on entity score,
-        // so the collision does not get re-sorted by score the way the
-        // per-query comparator sorts it. A first draft of this test asserted it
-        // did and went red, correctly: the fused arm's contribution is that a
-        // demoted row can no longer be lifted OVER a row RRF put above it.
-        // Each variant's own ranking has already applied the tier for its own
-        // text before fusion sees it.
-        let prose_only = fuse_locate_results(
-            vec![prose.to_string()],
-            vec![fusion_result(vec![
+        // so a demoted collision does not get re-sorted by score the way the
+        // per-query comparator sorts it. The fused arm's contribution is
+        // narrower than that: a demoted row can no longer be lifted OVER a row
+        // RRF ranked above it. Each variant's own ranking has already applied
+        // the tier for its own text before fusion sees it.
+        let second_prose = "how do I send a request and read the answer from the server";
+        let list = || {
+            fusion_result(vec![
                 fallback("redisFormatCommand", 300.0),
                 with_kind("send", 180.0),
-            ])],
+            ])
+        };
+        // Prose in every variant: `send` is a collision under both, so it holds
+        // no tier anywhere and RRF decides.
+        let all_prose = fuse_locate_results(
+            vec![prose.to_string(), second_prose.to_string()],
+            vec![list(), list()],
             60.0,
         );
         assert_eq!(
-            prose_only.entities[0].name, "redisFormatCommand",
+            all_prose.entities[0].name, "redisFormatCommand",
             "a demoted collision cannot be lifted over the row RRF ranked above it"
         );
         // The control that proves the line above is about the TIER and not
-        // about the input order: the same two rows in the same order, under a
-        // LOOKUP. The tier then lifts `send` from second to first, which is the
-        // behavior a prose query no longer gets. Written as a query-shape
-        // control rather than through the kill switch, because the switch is
-        // process environment and these tests run in parallel.
-        let lookup = fuse_locate_results(
-            vec!["send".to_string()],
-            vec![fusion_result(vec![
-                fallback("redisFormatCommand", 300.0),
-                with_kind("send", 180.0),
-            ])],
-            60.0,
-        );
-        assert_eq!(
-            lookup.entities[0].name, "send",
-            "control: under a lookup the tier still lifts the name hit to rank one"
-        );
-        // The control: add an explicit `send` variant and the caller gets the
-        // macro back at rank one. Without this, a rule that demoted on the
-        // joined text would pass the assertion above and still be wrong.
+        // about the input order: identical lists, identical RRF, one variant
+        // swapped for a LOOKUP. `send` earns the tier in that variant and takes
+        // rank one back. Without this, a rule that demoted on the joined text,
+        // or one that demoted everything, would pass the assertion above and
+        // still be wrong.
         let with_symbol_variant = fuse_locate_results(
             vec![prose.to_string(), "send".to_string()],
-            vec![
-                fusion_result(vec![
-                    with_kind("send", 180.0),
-                    fallback("redisFormatCommand", 300.0),
-                ]),
-                fusion_result(vec![with_kind("send", 180.0)]),
-            ],
+            vec![list(), list()],
             60.0,
         );
         assert_eq!(
