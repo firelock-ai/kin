@@ -191,6 +191,15 @@ pub fn apply_belt_defaults(name: &str, arguments: &mut HashMap<String, serde_jso
             .or_insert_with(|| serde_json::json!(AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET));
     }
 
+    // A page the client's own per-result budget does not cut. Only when the
+    // caller named no limit of its own, so an agent that asks for more pages
+    // gets them.
+    if name == "semantic_locate" {
+        arguments
+            .entry("limit".to_string())
+            .or_insert_with(|| serde_json::json!(AGENT_DEFAULT_LOCATE_PAGE));
+    }
+
     // The response ceiling, on every belt tool that has one. Both spellings are
     // checked before inserting, because `ResponseBudget::from_arguments` takes
     // the FIRST of `max_chars` then `max_response_chars` that is present: an
@@ -491,6 +500,49 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
 /// caller looks. Both halves move together, and `full` keeps 45,000.
 pub const AGENT_DEFAULT_RESPONSE_MAX_CHARS: u64 = 12_000;
 
+/// The ranked entities `semantic_locate` returns per page on `agent-default`.
+///
+/// The response cap above bounds what the SERVER builds. This bounds what a
+/// CLIENT is handed, which is a different cut and the one that was binding.
+/// Measured on the demo's React and VS Code stores on 2026-09-02
+/// (`scratchpad/reports/demo-rerun.md`), every `semantic_locate` in all three
+/// agentic runs came back cut at the client's own 1,500-token per-result
+/// budget, which is 5,250 characters at that harness's 3.5 characters per
+/// token. Compaction had made the payload three to five times smaller and it
+/// still did not fit, so the cut landed every time and the model re-issued the
+/// same query three times per run rather than reading a whole answer.
+///
+/// A client cut is not a cut Kin can disclose: the server returned inside its
+/// own ceiling and the harness truncated afterwards, so none of the remediation
+/// text in [`crate::budget`] ever reached the model. The only lever Kin holds is
+/// to return a page that fits.
+///
+/// 12 is counted, not inferred. Read-only against the demo's own daemons on
+/// 2026-09-02, with the demo's own binary and environment so no second daemon
+/// was started, running the logged command and varying only the page:
+///
+/// | query | 24 | 13 | 12 | 11 |
+/// |---|---|---|---|---|
+/// | type character in editor | 6,471 | 4,624 | 4,343 | 4,065 |
+/// | handle keyboard input character insertion | 8,732 | 5,281 | 5,029 | 4,779 |
+/// | editor handles key press event for character input | 7,425 | 4,305 | 4,038 | 3,769 |
+/// | component asking for an update (react) | 7,669 | 4,743 | 4,464 | 4,128 |
+///
+/// The page-24 column reproduces `demo-rerun.md` byte for byte, which is the
+/// control that says this is the same surface it measured. At 13 the densest
+/// query is 5,281 bytes and misses the window by 31; at 12 every query fits,
+/// the worst with 221 characters to spare. So 12 is the largest page that fits
+/// them all.
+///
+/// An earlier inference from the report's density line put this at 13. It was
+/// off by one, which is what counting is for.
+///
+/// A page is not a cap on what the caller can reach. The answer carries
+/// `total_ranked` and `next_cursor`, so an agent that wants more asks for the
+/// next page instead of re-asking the same question, which is the behaviour this
+/// number exists to buy.
+pub const AGENT_DEFAULT_LOCATE_PAGE: u64 = 12;
+
 /// The context pack's own token budget on `agent-default`.
 ///
 /// `get_context_pack` bounds itself in TOKENS as well as characters, and its
@@ -544,6 +596,10 @@ fn belt_schema_defaults() -> BTreeMap<(&'static str, &'static str), serde_json::
     defaults.insert(
         ("get_context_pack", "token_budget"),
         serde_json::json!(AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET),
+    );
+    defaults.insert(
+        ("semantic_locate", "limit"),
+        serde_json::json!(AGENT_DEFAULT_LOCATE_PAGE),
     );
     defaults
 }
@@ -1118,6 +1174,60 @@ mod tests {
         assert!(
             problems.is_empty(),
             "agent-default response budgets disagree with the cap: {problems:#?}"
+        );
+    }
+
+    /// `semantic_locate`'s served page stays at or under the cap, and the number
+    /// advertised is the number injected.
+    ///
+    /// This is the client-side cut rather than the server-side one. Every
+    /// `semantic_locate` in all three agentic runs on the React and VS Code
+    /// stores came back cut at the harness's own 1,500-token per-result budget,
+    /// and the model answered by re-issuing the same query rather than paging.
+    /// A client cut is invisible to Kin, so the page has to fit before it is
+    /// sent.
+    ///
+    /// Advertised and injected are asserted together, for the same reason the
+    /// response budget is: a belt that shrank the page it sends while
+    /// advertising 20 would leave an agent reasoning about a page size it is not
+    /// getting.
+    #[test]
+    fn the_served_locate_page_stays_under_the_cap() {
+        let served = served_agent_default();
+        let locate = served
+            .tools
+            .iter()
+            .find(|tool| tool.name == "semantic_locate")
+            .expect("agent-default serves semantic_locate");
+        let advertised = locate.input_schema["properties"]["limit"]["default"].as_u64();
+        assert_eq!(
+            advertised,
+            Some(AGENT_DEFAULT_LOCATE_PAGE),
+            "the served page must be the cap; a client's own per-result budget cuts anything \
+             larger and Kin cannot disclose a cut it did not make"
+        );
+
+        let mut arguments = HashMap::new();
+        apply_belt_defaults("semantic_locate", &mut arguments);
+        assert_eq!(
+            arguments.get("limit").and_then(|value| value.as_u64()),
+            Some(AGENT_DEFAULT_LOCATE_PAGE),
+            "the belt must send the page it advertises"
+        );
+
+        // The control: the registry must still carry the larger default, so this
+        // is the profile choosing a page rather than the registry having lost
+        // one.
+        let registered = crate::tools::tool_definitions();
+        let full = registered
+            .tools
+            .iter()
+            .find(|tool| tool.name == "semantic_locate")
+            .expect("semantic_locate is registered");
+        let registered_limit = full.input_schema["properties"]["limit"]["default"].as_u64();
+        assert!(
+            registered_limit.is_some_and(|value| value > AGENT_DEFAULT_LOCATE_PAGE),
+            "the full profile's locate page was shrunk too: {registered_limit:?}"
         );
     }
 

@@ -211,9 +211,31 @@ FABRICATED_SEND_CALLERS = {
 # trusted: `verify` reaches TLS at cert_verify AND at the pool-key path that governs
 # connection reuse, and only the second was missing. These are the stranger's own
 # parameters, not a shape chosen to pass. The defect only appears at this budget.
+def budget_cut(payload):
+    """The response-budget disclosure on a payload, if the answer was cut.
+
+    A walk the budget truncated and a walk that genuinely found nothing return
+    the same short step list, and only this block tells them apart. Without it
+    check 10 read a cut answer as "the edge is absent from the graph", which is
+    a claim about the parser made from evidence about a byte ceiling. The server
+    already publishes the distinction under `degradations`, keyed on
+    `component: response_budget`; nothing here was reading it.
+    """
+    if not isinstance(payload, dict):
+        return None
+    for entry in (payload.get("degradations") or []):
+        if isinstance(entry, dict) and entry.get("component") == "response_budget":
+            return entry
+    return None
+
+
 TRACE_FOCAL = "HTTPAdapter.send"
 TRACE_DEPTH = 3
 TRACE_LIMIT_PER_STEP = 12
+# The registered `max_chars` default, which every profile inherits unless it
+# chooses otherwise. Named explicitly by the walk below so this check measures
+# the graph rather than a serving profile's budget.
+TRACE_MAX_CHARS = 45000
 
 # The hop the answer turns on. build_connection_pool_key_attributes' entire body is
 # `return _urllib3_request_context(request, verify, cert, self.poolmanager)`, and
@@ -1836,10 +1858,19 @@ def check_10(suite):
     repo = suite.fixture("requests")
     try:
         suite.sweep_gate("requests")
+        # `max_chars` is named here rather than left to the serving profile.
+        # This check asks whether the WALK reaches the pool-key hop at the
+        # stranger's depth and fan-out; it is not a check on whichever response
+        # ceiling the profile in front of it happens to default to, and when
+        # `agent-default` lowered that ceiling this walk was cut and the cut
+        # read as graph absence. TRACE_MAX_CHARS is the registered default every
+        # profile inherits, so this restores what the assertion always measured
+        # and stops it moving under a serving decision.
         payload = suite.cached(repo, "trace_data_flow",
                                {"focal": TRACE_FOCAL, "direction": "calls",
                                 "depth": TRACE_DEPTH, "include_body": False,
-                                "limit_per_step": TRACE_LIMIT_PER_STEP})
+                                "limit_per_step": TRACE_LIMIT_PER_STEP,
+                                "max_chars": TRACE_MAX_CHARS})
     except ProbeError as exc:
         res.unknown(str(exc))
         return res
@@ -1884,6 +1915,13 @@ def check_10(suite):
             res.unknown("the walk does not reach %s and the wider probe returned "
                         "nothing, so this cannot be told from a broken probe"
                         % TRACE_LOAD_BEARING)
+        elif budget_cut(payload) or budget_cut(wider):
+            cut = budget_cut(payload) or budget_cut(wider)
+            res.unknown("the walk does not reach %s and the response budget CUT the "
+                        "answer at %s chars (%s), so this is truncation and says "
+                        "nothing about whether the edge is in the graph: %r"
+                        % (TRACE_LOAD_BEARING, cut.get("max_chars"),
+                           cut.get("reason"), cut.get("remediation")))
         else:
             res.unknown("neither the stranger's walk nor a wider one reaches %s, so "
                         "the edge is absent from the graph rather than outranked; "
