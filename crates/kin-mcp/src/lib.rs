@@ -18,9 +18,9 @@ pub mod types;
 pub mod verdict;
 
 pub use agent_belt::{
-    canonicalize_tool_name, compact_for_agent_default, AGENT_DEFAULT_DESCRIPTION_BUDGET,
-    AGENT_DEFAULT_PROFILE_DESCRIPTION_BUDGET, DECLARATION_FILTER_ALIAS,
-    DECLARATION_FILTER_CANONICAL,
+    apply_belt_defaults, canonicalize_tool_name, compact_for_agent_default,
+    AGENT_DEFAULT_DESCRIPTION_BUDGET, AGENT_DEFAULT_PROFILE_DESCRIPTION_BUDGET,
+    DECLARATION_FILTER_ALIAS, DECLARATION_FILTER_CANONICAL,
 };
 pub use budget::{
     is_budgeted as is_budgeted_tool, BudgetAccounting, ResponseBudget, RESPONSE_DEFAULT_MAX_CHARS,

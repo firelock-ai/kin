@@ -234,15 +234,15 @@ at least one entry, and the cut is published in `elisions` and `degradations`; i
 `max_chars` and a narrower request, because with no `next_cursor` the withheld entries cannot be \
 reached by paging. Only when one surviving entry per list still exceeds the ceiling does the \
 response ship over budget, and it discloses that as `response_over_budget`. \
-Two response shapes exist and `surface` picks between them. The default at entity granularity is \
-`surface: \"compact\"`: per hit the `id`, `name`, `kind`, `file`, `line`, `signature` and `score`, \
+Two response shapes exist and `surface` picks between them. The default is the shared schema above, \
+because this payload deserializes straight back into the type `kin locate --json` and `POST /locate` \
+serialize. `surface: \"compact\"` asks for the agent shape instead, and the `agent-default` profile \
+asks for it on its agents' behalf: per hit the `id`, `name`, `kind`, `file`, `line`, `signature` and `score`, \
 plus the ranked file paths, `total_ranked`, `next_cursor`, `all_fallback`, a `ranked_by` clause and \
 the `semantic_coverage` object, and nothing else. It exists because the full shape spends most of \
 its bytes on the back-compat `files[].symbols` roll-up of entities `entities[]` already carries: on \
-a 730-entity store a twelve-hit page is 38,819 bytes full and 3,472 compact. Pass \
-`surface: \"full\"` for the shared `kin locate --json` schema described above, which is what a \
-consumer parsing all three locate surfaces with one parser wants; `explain: true` implies it, since \
-every field an explanation adds lives on that shape. File granularity is always the full shape, \
+a 730-entity store a twelve-hit page is 38,819 bytes full and 3,472 compact. Two arguments force the shared schema whatever else is set: `explain: true`, since every field an explanation adds lives on that shape, and an explicit \
+`include_snippet: true`, since that asks for source text per hit and the compact shape carries none. File granularity is always the full shape, \
 because there the file roll-up IS the answer.";
 
 /// Offline/generic dispatch arm for `semantic_locate`.

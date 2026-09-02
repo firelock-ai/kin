@@ -35,14 +35,19 @@ pub struct McpServerConfig {
     /// Product daemon mode dispatches inside the daemon and supplies its own
     /// retained binding; it never populates this stdio-side field.
     pub repository_authority: Option<RequestRepositoryAuthority>,
-    /// Serve the short `agent-default` descriptions and trimmed schemas rather
-    /// than the registered long forms.
+    /// This server is the curated `agent-default` belt.
+    ///
+    /// Two behaviours hang off it, and they are one concept: the belt serves the
+    /// short descriptions and trimmed schemas rather than the registered long
+    /// forms, and it asks `semantic_locate` for the compact response shape on
+    /// behalf of the agents it serves.
     ///
     /// Separate from `allowed_tools` because three profiles filter and only one
-    /// of them wants this. `benchmark` and `context-bench` keep the long forms
-    /// deliberately: their `tools/list` bytes are an input to a citable result,
-    /// and a benchmark number must not move because a description was rewritten.
-    pub compact_tool_descriptions: bool,
+    /// of them is this belt. `benchmark` and `context-bench` keep the long forms
+    /// and the shared payload deliberately: their bytes are an input to a
+    /// citable result, and a benchmark number must not move because a
+    /// description was rewritten or a payload was narrowed.
+    pub agent_belt: bool,
 }
 
 /// How the stdio server should present session authority.
@@ -73,7 +78,7 @@ impl Default for McpServerConfig {
             session_authority_mode: SessionAuthorityMode::DaemonRequired,
             snapshot_path: None,
             repository_authority: None,
-            compact_tool_descriptions: false,
+            agent_belt: false,
         }
     }
 }
@@ -1139,7 +1144,7 @@ fn handle_tools_list(id: Option<serde_json::Value>, config: &McpServerConfig) ->
     // annotation is a no-op on this profile anyway, because a short form names
     // only tools the profile serves, but the ORDER is what guarantees that
     // rather than the current wording.
-    if config.compact_tool_descriptions {
+    if config.agent_belt {
         crate::agent_belt::compact_for_agent_default(&mut tools);
     }
     JsonRpcResponse::success(id, serde_json::to_value(&tools).unwrap_or_default())
@@ -1165,6 +1170,12 @@ async fn handle_tools_call<G: PersistableMcpStore>(
     // because `semantic_search` does not search semantically; everything
     // internal stays keyed on the registered name.
     crate::agent_belt::canonicalize_tool_name(&mut call_params.name);
+    // The belt asks for the compact locate shape on its agents' behalf, only
+    // when the caller named no surface. Applied here rather than in the daemon
+    // because this is the one layer that knows which profile is being served.
+    if config.agent_belt {
+        crate::agent_belt::apply_belt_defaults(&call_params.name, &mut call_params.arguments);
+    }
     let budget = ResponseBudget::from_arguments(&call_params.arguments);
 
     if let Some(allowed) = &config.allowed_tools {
@@ -1269,6 +1280,12 @@ async fn handle_tools_call_daemon(
     // because `semantic_search` does not search semantically; everything
     // internal stays keyed on the registered name.
     crate::agent_belt::canonicalize_tool_name(&mut call_params.name);
+    // The belt asks for the compact locate shape on its agents' behalf, only
+    // when the caller named no surface. Applied here rather than in the daemon
+    // because this is the one layer that knows which profile is being served.
+    if config.agent_belt {
+        crate::agent_belt::apply_belt_defaults(&call_params.name, &mut call_params.arguments);
+    }
     let budget = ResponseBudget::from_arguments(&call_params.arguments);
 
     if let Some(allowed) = &config.allowed_tools {

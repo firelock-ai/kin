@@ -83,7 +83,7 @@ pub async fn start(
                 .collect::<HashSet<_>>(),
         );
     }
-    config.compact_tool_descriptions = resolved_profile.profile.wants_compact_descriptions();
+    config.agent_belt = resolved_profile.profile.is_agent_belt();
 
     let startup = kin_mcp::StartupDaemonBinding::new();
 
@@ -265,14 +265,15 @@ impl McpToolProfile {
         }
     }
 
-    /// Whether this profile serves the short descriptions and trimmed input
-    /// schemas rather than the registered long forms.
+    /// Whether this profile IS the curated agent belt: short descriptions,
+    /// trimmed input schemas, and the compact `semantic_locate` shape.
     ///
     /// `agent-default` only. `full` is the whole documented surface by
-    /// definition. `benchmark` and `context-bench` keep the long forms because
-    /// their `tools/list` bytes are an input to a citable result, and a
-    /// benchmark number must not move because a description was rewritten.
-    pub(crate) fn wants_compact_descriptions(self) -> bool {
+    /// definition. `benchmark` and `context-bench` keep the long forms and the
+    /// shared payload because their bytes are an input to a citable result, and
+    /// a benchmark number must not move because a description was rewritten or a
+    /// payload was narrowed.
+    pub(crate) fn is_agent_belt(self) -> bool {
         matches!(self, Self::AgentDefault)
     }
 

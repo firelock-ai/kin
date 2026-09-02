@@ -10533,24 +10533,78 @@ fn build_semantic_locate_result(
 
 /// Which locate shape this `semantic_locate` call gets.
 ///
-/// Compact unless the caller asked for `full`, or asked for an explanation,
-/// which only the full shape can carry. An unrecognized `surface` value takes
-/// the default rather than erroring: this argument narrows a response, and
-/// refusing the whole call over a misspelling would turn a formatting
-/// preference into a failed retrieval.
+/// Compact unless the caller asked for something only the full shape carries.
+/// Three things count as asking, in order:
+///
+/// 1. An explicit `surface`, which wins outright.
+/// 2. `explain: true`, because every field an explanation adds (`match_evidence`
+///    and the per-signal and per-stage breakdowns) lives on the shape compact
+///    drops.
+/// 3. An EXPLICIT `include_snippet: true`, because that argument asks for source
+///    text per hit and compact carries none. Keyed on the caller having written
+///    it rather than on the resolved value, since `include_snippet` defaults to
+///    true: reading the resolved value would send every default call to the full
+///    shape and there would be no compact surface at all.
+///
+/// The third rule is the one this got wrong first. Compact took precedence over
+/// an explicit `include_snippet: true` and dropped the bodies anyway, which is a
+/// silent refusal of a request the caller stated: the argument was accepted,
+/// bodies were hydrated, and the payload came back without them. A
+/// `distinct_query_tools_share_one_authority_load_per_publication` non-vacuity
+/// guard caught it, and it was right to.
+///
+/// An unrecognized `surface` value takes the default rather than erroring. This
+/// argument narrows a response, and refusing the whole call over a misspelling
+/// would turn a formatting preference into a failed retrieval.
 fn fused_locate_surface(
     arguments: &HashMap<String, serde_json::Value>,
     explain: bool,
 ) -> kin_cli::commands::locate_compact::LocateSurface {
     use kin_cli::commands::locate_compact::LocateSurface;
+    // An explanation outranks an explicit compact, because every field it adds
+    // lives on the shape compact drops: honouring both would serve a response
+    // that answered neither request.
     if explain {
         return LocateSurface::Full;
     }
-    arguments
+    // An explicit snippet request outranks an explicit `surface`, and the order
+    // is the whole point. Compact carries no source text, so honouring
+    // `surface: "compact"` beside `include_snippet: true` would accept a request
+    // for source and answer without it. That is the silent refusal a
+    // `distinct_query_tools_share_one_authority_load_per_publication` guard
+    // already caught once here.
+    //
+    // The order also keeps the rule REACHABLE. Below the `surface` check it
+    // could only fire when no surface was named, where the default is Full
+    // anyway, so it could never change an outcome: a check that cannot fail.
+    // Above it, it is what stops the `agent-default` belt's injected
+    // `surface: "compact"` from dropping bodies an agent explicitly asked for.
+    let asked_for_snippets = arguments
+        .get("include_snippet")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if asked_for_snippets {
+        return LocateSurface::Full;
+    }
+    if let Some(named) = arguments
         .get("surface")
         .and_then(serde_json::Value::as_str)
         .and_then(LocateSurface::parse)
-        .unwrap_or(LocateSurface::Compact)
+    {
+        return named;
+    }
+    // Full is the default ON THE WIRE, and that is a contract rather than a
+    // preference: `mcp_semantic_locate_fused_payload_round_trips_into_locate_schema`
+    // deserializes this payload straight back into `LocateResult`, so a consumer
+    // needs one parser across `kin locate --json`, `POST /locate` and this tool.
+    // Two more tests guard the same invariant from other angles.
+    //
+    // The compact shape is therefore opt-in here, and the `agent-default` belt
+    // opts in on behalf of the agents it serves: `kin-mcp`'s tools/call injects
+    // `surface: "compact"` when that profile is active and the caller named no
+    // surface. An agent gets the small payload, and every consumer parsing the
+    // shared schema keeps getting it.
+    LocateSurface::Full
 }
 
 /// Serialize a fused entity ranking onto the compact agent surface: per hit the
@@ -20044,24 +20098,96 @@ mod tests {
             .collect()
     }
 
+    /// The shared schema is the default ON THE WIRE, and compact is opt-in.
+    ///
+    /// This is the direction the three schema-parity tests require: the fused
+    /// payload deserializes straight back into `LocateResult`, so narrowing it
+    /// by default would break every consumer that parses the shared shape. The
+    /// `agent-default` belt opts in on its agents' behalf in `kin-mcp`.
     #[test]
-    fn compact_is_the_default_and_full_is_the_opt_out() {
+    fn the_wire_default_is_the_shared_schema_and_compact_is_opt_in() {
         use kin_cli::commands::locate_compact::LocateSurface;
         let args = tool_arguments(json!({"query": "q"}));
-        assert_eq!(fused_locate_surface(&args, false), LocateSurface::Compact);
+        assert_eq!(
+            fused_locate_surface(&args, false),
+            LocateSurface::Full,
+            "saying nothing must get the schema every other locate surface serves"
+        );
+        assert_eq!(
+            fused_locate_surface(&tool_arguments(json!({"surface": "compact"})), false),
+            LocateSurface::Compact,
+            "and naming compact must get it"
+        );
         assert_eq!(
             fused_locate_surface(&tool_arguments(json!({"surface": "full"})), false),
             LocateSurface::Full
         );
+        // An explanation only the full shape can carry implies the full shape,
+        // even when the caller also asked for compact.
         assert_eq!(
-            fused_locate_surface(&tool_arguments(json!({"surface": "compact"})), false),
-            LocateSurface::Compact
+            fused_locate_surface(&tool_arguments(json!({"surface": "compact"})), true),
+            LocateSurface::Full
         );
-        // An explanation only the full shape can carry implies the full shape.
-        assert_eq!(fused_locate_surface(&args, true), LocateSurface::Full);
         // A misspelling narrows nothing rather than failing the retrieval.
         assert_eq!(
             fused_locate_surface(&tool_arguments(json!({"surface": "entities"})), false),
+            LocateSurface::Full
+        );
+    }
+
+    /// A caller that explicitly asks for source text gets the shape that carries
+    /// it, rather than the argument being accepted and quietly dropped.
+    ///
+    /// Keyed on the caller having WRITTEN `include_snippet`, not on its resolved
+    /// value, because it defaults to true: reading the resolved value would send
+    /// every default call to the full shape and leave no compact surface at all.
+    /// The second assertion is what pins that difference, and it is the one that
+    /// fails if someone "simplifies" this to read the effective value.
+    /// A caller that explicitly asks for source text gets the shape that carries
+    /// it, even against an explicit `surface: "compact"`.
+    ///
+    /// The third case is the one that matters and the reason this rule sits
+    /// ABOVE the surface check. The `agent-default` belt injects
+    /// `surface: "compact"`, so without this an agent that asked for snippets
+    /// would have the argument accepted, the bodies hydrated, and a payload
+    /// returned without them. Below the surface check the rule would also be
+    /// unreachable, since the default is Full anyway.
+    #[test]
+    fn an_explicit_snippet_request_gets_the_shape_that_carries_snippets() {
+        use kin_cli::commands::locate_compact::LocateSurface;
+        assert_eq!(
+            fused_locate_surface(&tool_arguments(json!({"include_snippet": true})), false),
+            LocateSurface::Full,
+            "an explicit snippet request must not be silently dropped"
+        );
+        assert_eq!(
+            fused_locate_surface(&tool_arguments(json!({"query": "q"})), false),
+            LocateSurface::Full,
+            "and saying nothing gets the shared schema every locate surface serves"
+        );
+        assert_eq!(
+            fused_locate_surface(
+                &tool_arguments(json!({"include_snippet": true, "surface": "compact"})),
+                false
+            ),
+            LocateSurface::Full,
+            "a request for source outranks a request for a shape that has none, \
+             or the belt's injected compact silently drops what an agent asked for"
+        );
+        // The control on the other side: without the snippet request, an
+        // explicit compact is honoured. Otherwise the rule above would be
+        // swallowing every compact request rather than the contradictory ones.
+        assert_eq!(
+            fused_locate_surface(&tool_arguments(json!({"surface": "compact"})), false),
+            LocateSurface::Compact,
+            "an uncontradicted compact request must still be honoured"
+        );
+        // Asking for NO snippets is not a reason to widen the response.
+        assert_eq!(
+            fused_locate_surface(
+                &tool_arguments(json!({"include_snippet": false, "surface": "compact"})),
+                false
+            ),
             LocateSurface::Compact
         );
     }

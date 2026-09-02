@@ -27,7 +27,7 @@
 //! by name, so a caller that knows a withheld property can still pass it and the
 //! `full` profile still advertises every one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::types::ToolsListResult;
 
@@ -98,6 +98,32 @@ pub fn canonicalize_tool_name(name: &mut String) {
         name.clear();
         name.push_str(DECLARATION_FILTER_CANONICAL);
     }
+}
+
+/// Ask `semantic_locate` for the compact shape on this belt's behalf.
+///
+/// The compact response is opt-in on the wire, and deliberately so: the fused
+/// `semantic_locate` payload IS the `LocateResult` schema `kin locate --json`
+/// and `POST /locate` serialize, asserted by
+/// `mcp_semantic_locate_fused_payload_round_trips_into_locate_schema` and two
+/// sibling tests, so a consumer needs one parser across all three. Narrowing
+/// that by default would break the contract for every caller to help one of
+/// them.
+///
+/// This is where the one that needs helping asks. The belt exists to fit a small
+/// model's context, its agents read ids and coordinates rather than the shared
+/// schema, and on a 730-entity store the shapes are 38,819 bytes against 3,472
+/// at twelve results.
+///
+/// Only when the caller named no `surface` of its own. An agent that asks for
+/// `full` gets full, which is what makes this a default rather than an override.
+pub fn apply_belt_defaults(name: &str, arguments: &mut HashMap<String, serde_json::Value>) {
+    if name != "semantic_locate" {
+        return;
+    }
+    arguments
+        .entry("surface".to_string())
+        .or_insert_with(|| serde_json::Value::String("compact".to_string()));
 }
 
 /// The short description for each tool the `agent-default` profile serves, by
@@ -649,6 +675,54 @@ mod tests {
             "trace_data_flow's short form must say what it walks; its registered \
              form opens by warning that its own name is wrong"
         );
+    }
+
+    /// The belt asks for compact on behalf of its agents, and only when the
+    /// caller said nothing. This is the half of the compact surface that
+    /// actually reaches an agent, since the wire default is the shared schema.
+    #[test]
+    fn the_belt_asks_for_the_compact_locate_shape() {
+        let mut args: HashMap<String, serde_json::Value> = HashMap::new();
+        args.insert("query".into(), serde_json::Value::String("q".into()));
+        apply_belt_defaults("semantic_locate", &mut args);
+        assert_eq!(
+            args.get("surface").and_then(|v| v.as_str()),
+            Some("compact"),
+            "the belt must ask for the small payload"
+        );
+        // The query is untouched, so this is an addition rather than a rewrite.
+        assert_eq!(args.get("query").and_then(|v| v.as_str()), Some("q"));
+    }
+
+    /// A caller that named a surface keeps it. That is what makes the belt's
+    /// choice a default rather than an override, and it is the assertion that
+    /// fails if someone reaches for `insert` instead of `entry().or_insert`.
+    #[test]
+    fn the_belt_never_overrides_a_surface_the_caller_named() {
+        for named in ["full", "compact"] {
+            let mut args: HashMap<String, serde_json::Value> = HashMap::new();
+            args.insert("surface".into(), serde_json::Value::String(named.into()));
+            apply_belt_defaults("semantic_locate", &mut args);
+            assert_eq!(
+                args.get("surface").and_then(|v| v.as_str()),
+                Some(named),
+                "the caller's own surface must survive the belt"
+            );
+        }
+    }
+
+    /// And it touches nothing else. A default that leaked onto another tool
+    /// would be sending an argument its handler never advertised.
+    #[test]
+    fn the_belt_defaults_apply_to_locate_alone() {
+        for tool in ["semantic_search", "find_references", "get_context_pack"] {
+            let mut args: HashMap<String, serde_json::Value> = HashMap::new();
+            apply_belt_defaults(tool, &mut args);
+            assert!(
+                args.is_empty(),
+                "{tool} must be left exactly as the caller sent it"
+            );
+        }
     }
 
     /// Same for the keep-lists: a keep-list naming a property the tool does not
