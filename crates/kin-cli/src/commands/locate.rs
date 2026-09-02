@@ -20950,13 +20950,31 @@ mod tests {
                  me through the path.",
                 "TextmateSnippet.walk",
             ),
-            // The same VS Code question against a Rust store: `Walk` is the
-            // directory walker in ripgrep's `ignore` crate, and "Walk me
-            // through" is not a request for it.
+            // The same VS Code question against a Rust store. Measured on a
+            // ripgrep store, that one sentence collides on TWO ordinary words
+            // and fills the entire top six with tier-1 hits, none of them an
+            // answer: `Walk` (crates/ignore/src/walk.rs:1117, 461.3) and `walk`
+            // (crates/ignore/src/lib.rs:64, 456.1) from "Walk me through", then
+            // `End` (crates/printer/src/jsont.rs:65, 455.3),
+            // `PreludeWriter::end` (crates/printer/src/standard.rs:1647, 455.0)
+            // and `Match::end` (crates/matcher/src/lib.rs:100, 450.0) from "end
+            // up in the document". `end` is an open-class word, which is why
+            // the rule keys on the SHAPE OF THE QUERY and the shape of the
+            // matching token, never on a list of colliding words.
             (
                 "When I type a character in the editor, how does it end up in the document? Walk \
                  me through the path.",
                 "Walk",
+            ),
+            (
+                "When I type a character in the editor, how does it end up in the document? Walk \
+                 me through the path.",
+                "Match::end",
+            ),
+            (
+                "When I type a character in the editor, how does it end up in the document? Walk \
+                 me through the path.",
+                "End",
             ),
         ] {
             // The precondition: the shipped predicate DOES call this a name.
