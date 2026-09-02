@@ -779,47 +779,6 @@ pub fn name_match_is_prose_word_collision(query: &str, name: &str) -> bool {
     locate_env_bool("KIN_LOCATE_PROSE_NAME_DEMOTION", true) && is_prose_word_collision(query, name)
 }
 
-/// The weakest positive verdict [`score_name_match`] returns: the single-term
-/// "contains" fallback, one order below the 3.0 partial and five below the 5.0
-/// exact.
-///
-/// Named because [`score_name_match_for_query`] SELECTS it rather than inventing
-/// a number. It is also the value that flips the seed loop's BM25F field weight
-/// from name to body, at the `>= 2.0` gate beside every call, which is exactly
-/// "score this on its body evidence instead of its name".
-const LOCATE_WEAKEST_NAME_MATCH: f32 = 1.0;
-
-/// [`score_name_match`] with the FIR-3079 rule applied: a plain English word
-/// inside a sentence is not exact-name evidence, so it does not earn the exact
-/// name product.
-///
-/// The tier half of this fix stops a prose collision being UNBEATABLE. It does
-/// not stop it being high-scoring, and the measurement says that gap matters.
-/// On a fully embedded ripgrep store (3,808 entities, 7,741 of 7,741 indexed)
-/// the question "When I type a character in the editor, how does it end up in
-/// the document? Walk me through the path." returned five rows, every one a
-/// collision on the ordinary words "walk" and "end", scoring 462.0, 456.1,
-/// 455.8, 455.2 and 450.0. The best non-colliding row on that ranking scored
-/// 280.0 and the best vector row 169.8, so dropping the tier alone left rank one
-/// exactly where it was. On hiredis the same tier change works, because that
-/// store's text arm runs 300 to 900 and genuinely outbids the 180.0 and 55.0 its
-/// colliding macros scored. One rule, opposite outcomes, because composite
-/// scores are not comparable across stores.
-///
-/// So the collision also stops carrying the fixed exact-name product and
-/// competes on its text and vector terms, which is the same rule the tier
-/// states, applied to the score the comparator reads next. It only ever lowers
-/// a score, it fires only on the pair (prose query, non-symbolic naming token),
-/// and it is the same predicate, so the two halves cannot come to disagree
-/// about what a collision is.
-fn score_name_match_for_query(query: &str, search_term: &str, entity_name: &str) -> f32 {
-    let raw = score_name_match(search_term, entity_name);
-    if raw > LOCATE_WEAKEST_NAME_MATCH && name_match_is_prose_word_collision(query, entity_name) {
-        return LOCATE_WEAKEST_NAME_MATCH;
-    }
-    raw
-}
-
 /// Classify one located entity against the query.
 ///
 /// Falls back on the resolution origin only when the name did not match, so a
@@ -8291,7 +8250,7 @@ fn extract_search_signals(
                     continue;
                 }
                 // Part-based name matching: handles snake_case ↔ CamelCase ↔ SCREAMING_SNAKE
-                let name_mult = score_name_match_for_query(text, ident, &entity.name);
+                let name_mult = score_name_match(ident, &entity.name);
                 if name_mult == 0.0 {
                     continue; // No meaningful match
                 }
@@ -8352,7 +8311,7 @@ fn extract_search_signals(
                 let Some(entity) = entity_from_retrieval_key(graph, &retrieval_key)? else {
                     continue;
                 };
-                let name_match = score_name_match_for_query(text, ident, &entity.name);
+                let name_match = score_name_match(ident, &entity.name);
                 let field_weight = if name_match >= 2.0 {
                     bm25f_name_weight
                 } else {
