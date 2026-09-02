@@ -270,6 +270,18 @@ jobs:
       - name: Falsify the first-query readiness graders
         run: python3 scripts/acceptance/first_query_readiness_repro.py --self-test
 
+      # FIR-3099. A daemon that starts opens the store and schedules the
+      # embedding pass, so a session that asked Kin nothing was paying for a
+      # full embed of the repository it happened to be launched in: 1.80 GiB
+      # and 99 percent of a core sixty seconds after a handshake, on a 657.8
+      # KiB store. The grader that decides it reads the process table, and a
+      # careless substring match there counts the suite's own driver, which
+      # carries both the daemon path and the repository path in its argv. Each
+      # case is paired with the input that must produce the opposite count,
+      # including that driver and another lane's daemon.
+      - name: Falsify the MCP spawn-admission graders
+        run: python3 scripts/acceptance/mcp_spawn_admission_repro.py --self-test
+
       # FIR-2781. The v0.6.0 stranger walked Session.send with limit_per_step 4
       # and got a chain that stops two hops short of where verify goes: the cap
       # discarded eleven of fifteen callees, HTTPAdapter.send among them, and
@@ -924,6 +936,32 @@ jobs:
             echo "::warning title=First-query readiness suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: MCP spawn-admission suite (verdict comes from the gate step)
+        id: mcpspawn
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/mcp_spawn_admission_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/mcp_spawn.json >acceptance/mcp_spawn.log 2>&1 || rc=$?
+          cat acceptance/mcp_spawn.log
+          {
+            echo "### MCP spawn-admission suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/mcp_spawn.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=MCP spawn-admission suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       - name: Verdict-limits acceptance suite (verdict comes from the gate step)
         id: verdictlimits
         if: always()
@@ -1279,6 +1317,7 @@ jobs:
             --report first_contact=acceptance/first_contact.json \
             --report eject_journal=acceptance/eject_journal.json \
             --report first_query=acceptance/first_query.json \
+            --report mcp_spawn=acceptance/mcp_spawn.json \
             --report verdict_limits=acceptance/verdict_limits.json \
             --report working_copy_freshness=acceptance/working_copy_freshness.json \
             --report vcs_read_surfaces=acceptance/vcs_read_surfaces.json \

@@ -340,6 +340,14 @@ where
             // remedy-flavored "no daemon" error while one is on its way up.
             if method == Some("tools/call") {
                 if let Some(startup) = startup.as_ref() {
+                    // The first ask for a graph answer, and the only thing that
+                    // admits starting a daemon (FIR-3099). Before this line
+                    // every bind path attaches to a daemon that is already
+                    // serving and starts none, so a session that never calls a
+                    // tool never opens the store and never runs an embedding
+                    // pass. Set before the wait, because the wait is what the
+                    // launcher's binding task is sitting on.
+                    startup.admit_daemon_spawn();
                     if !startup
                         .wait_until_settled(TOOLS_CALL_STARTUP_BIND_GRACE)
                         .await
@@ -354,6 +362,24 @@ where
                     if !binding.is_bound() {
                         if let StartupBindingState::Bound(bound) = startup.snapshot() {
                             binding.bind(bound, BindingOrigin::Server);
+                        }
+                    }
+                    // Roots the pre-call binder resolved to a Kin repository it
+                    // was not yet allowed to start a daemon for. Put them
+                    // through the binder again now that it is. This is the
+                    // editor-launched-from-$HOME shape, where the client's roots
+                    // are the only thing naming a repository and the launch
+                    // directory settles unbound at once, so nothing was waited
+                    // for above. After the settle, not before it, so a startup
+                    // binding that is about to bind the same repository wins and
+                    // no second daemon is raced for it.
+                    if !binding.is_bound() {
+                        let deferred = binding.deferred_roots();
+                        if !deferred.is_empty() {
+                            if let Some(binder) = repo_binder.as_ref() {
+                                apply_workspace_roots(binder, deferred, &mut binding, repo_pinned)
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -509,7 +535,20 @@ async fn apply_workspace_roots(
                  can resolve; keeping the repository this server was started with"
             );
         }
-        WorkspaceBinding::OtherRepository(_) | WorkspaceBinding::Unresolvable => {
+        // Nothing is bound and the client named Kin repositories this server can
+        // see. Before FIR-3099 that could only mean their daemons refused to
+        // start, so there was nothing to retry. Now it is also what a bind that
+        // is not yet allowed to start one looks like, so the roots are kept for
+        // the first `tools/call` to put through the binder again.
+        WorkspaceBinding::OtherRepository(repos) => {
+            tracing::info!(
+                repositories = ?repos,
+                "kin-mcp: the client's workspace roots name a Kin repository with no daemon bound \
+                 yet; the first tool call binds it"
+            );
+            binding.defer_roots(roots);
+        }
+        WorkspaceBinding::Unresolvable => {
             tracing::info!("kin-mcp: no Kin repository among the client's workspace roots");
         }
     }
@@ -552,6 +591,11 @@ struct RepoBindingState {
     /// Set when the client's workspace moved somewhere this server could not
     /// follow. Cleared by the next successful bind.
     mismatch: Option<WorkspaceMismatch>,
+    /// Roots that named a Kin repository this server can see while nothing was
+    /// bound. Kept so the first `tools/call` can put them through the binder
+    /// again once starting a daemon is admitted. Cleared by the next successful
+    /// bind.
+    deferred_roots: Vec<PathBuf>,
 }
 
 /// A workspace change the server could not follow: it is still bound to
@@ -596,6 +640,22 @@ impl RepoBindingState {
         self.repo_root = Some(bound.root);
         self.origin = Some(origin);
         self.mismatch = None;
+        self.deferred_roots.clear();
+    }
+
+    /// Remember roots that resolved to a Kin repository nothing is serving yet.
+    fn defer_roots(&mut self, roots: Vec<PathBuf>) {
+        self.deferred_roots = roots;
+    }
+
+    /// The roots waiting for a tool call to admit starting their daemon.
+    ///
+    /// Cloned rather than taken, so a call whose bind still fails leaves them
+    /// for the next one. That costs a bind attempt per refused call, which is
+    /// the same trade the mismatch retry above already makes and for the same
+    /// reason: every call in this state is being refused anyway.
+    fn deferred_roots(&self) -> Vec<PathBuf> {
+        self.deferred_roots.clone()
     }
 
     fn mark_mismatch(&mut self, requested_roots: Vec<PathBuf>, repo_pinned: bool) {
@@ -2692,6 +2752,122 @@ mod tests {
                 tool["name"]
             );
         }
+    }
+
+    /// FIR-3099. The whole handshake, and a workspace-roots answer beside it,
+    /// must leave the launcher's binding task still waiting: none of them is a
+    /// caller asking Kin for a graph answer, and starting a daemon for one costs
+    /// the store open and a full embedding pass.
+    ///
+    /// The roots answer is in the script on purpose. It is the second spawn
+    /// door and the only one that fires when the server was launched outside a
+    /// repository, so a fix that closed the startup binding alone would pass a
+    /// version of this test that omitted it.
+    #[tokio::test]
+    async fn a_handshake_and_a_roots_answer_admit_no_daemon_spawn() {
+        let startup = StartupDaemonBinding::new();
+        let seen_roots = std::sync::Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
+        let recorder = std::sync::Arc::clone(&seen_roots);
+        let binder: RepoBinder = Box::new(move |roots: Vec<PathBuf>| {
+            let recorder = std::sync::Arc::clone(&recorder);
+            Box::pin(async move {
+                recorder.lock().unwrap().extend(roots);
+                // What an attach-only bind reports for a repository this server
+                // can see with no daemon serving it yet.
+                WorkspaceBinding::OtherRepository(vec![PathBuf::from("/work/repo")])
+            })
+        });
+
+        drive_daemon_loop_with_startup(
+            &[
+                initialize_with_roots_capability(),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+                roots_response(&["/work/repo"]),
+            ],
+            Some(binder),
+            None,
+            Some(std::sync::Arc::clone(&startup)),
+        )
+        .await;
+
+        assert!(
+            !startup.daemon_spawn_admitted(),
+            "initialize, initialized, tools/list and a roots answer must not admit starting a \
+             daemon: every one of them arrives before a caller has asked Kin anything"
+        );
+        assert!(
+            !seen_roots.lock().unwrap().is_empty(),
+            "the binder must still have been consulted, or this test would pass on a server \
+             that ignores workspace roots entirely"
+        );
+    }
+
+    /// The other direction, which is what keeps the test above from passing on
+    /// a server that can never start a daemon at all.
+    #[tokio::test]
+    async fn the_first_tool_call_admits_the_daemon_spawn() {
+        let startup = StartupDaemonBinding::new();
+        startup.resolve_unbound("no repository at the launch directory");
+
+        drive_daemon_loop_with_startup(
+            &[
+                initialize_with_roots_capability(),
+                tool_call(3, "semantic_locate"),
+            ],
+            None,
+            None,
+            Some(std::sync::Arc::clone(&startup)),
+        )
+        .await;
+
+        assert!(
+            startup.daemon_spawn_admitted(),
+            "a tools/call is a caller asking for a graph answer, and must admit the spawn the \
+             answer needs"
+        );
+    }
+
+    /// Roots a pre-call bind could not follow are kept, not discarded, so the
+    /// first tool call binds the repository the client named instead of
+    /// reporting no daemon for a repository Kin can see.
+    #[tokio::test]
+    async fn deferred_roots_are_rebound_on_the_first_tool_call() {
+        let startup = StartupDaemonBinding::new();
+        startup.resolve_unbound("no repository at the launch directory");
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&calls);
+        let binder: RepoBinder = Box::new(move |_roots: Vec<PathBuf>| {
+            let counter = std::sync::Arc::clone(&counter);
+            Box::pin(async move {
+                // First pass is the attach-only bind, which found no daemon.
+                // Second pass runs with the spawn admitted and binds.
+                if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    WorkspaceBinding::OtherRepository(vec![PathBuf::from("/work/repo")])
+                } else {
+                    WorkspaceBinding::Bound(bound_repo("/work/repo", "http://127.0.0.1:4311"))
+                }
+            })
+        });
+
+        drive_daemon_loop_with_startup(
+            &[
+                initialize_with_roots_capability(),
+                roots_response(&["/work/repo"]),
+                tool_call(3, "semantic_locate"),
+            ],
+            Some(binder),
+            None,
+            Some(std::sync::Arc::clone(&startup)),
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the tool call must put the deferred roots through the binder again, now that \
+             starting their daemon is admitted"
+        );
     }
 
     async fn drive_daemon_loop(
