@@ -57,47 +57,48 @@ jobs:
       BASE_BRANCH: main
       WAVE_BRANCH: automation/kin-registry-dependency-wave
     steps:
-      - name: Bind early disarm to the queued workflow policy
-        id: base
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          base_sha="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BASE_BRANCH}" \
-            --jq .object.sha)"
-          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]] ||
-             [ "$base_sha" != "$GITHUB_SHA" ]; then
-            echo "::error::early disarm is not bound to exact queued protected main"
-            exit 1
-          fi
-          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
-
-      # github.sha, not steps.base.outputs.base_sha: the step above already
-      # refuses unless that computed value equals github.sha, so the checkout
-      # ref and the assertion target are the same commit either way. A
-      # step-output expression reads as attacker-influenceable to a static
-      # checker with no view of the shell assertion that pins it, so this
-      # checkout uses the literal trusted context value instead. CodeQL rule
-      # actions/cache-poisoning/poisonable-step named this exact expression.
+      # The literal trusted context value, never a step output: a step-output
+      # expression reads as attacker-influenceable to a static checker with no
+      # view of the shell assertion that pins it (CodeQL rule
+      # actions/cache-poisoning/poisonable-step named exactly that shape).
+      # github.sha is what the binding step below proves to be protected
+      # main's history before anything reads it as policy.
       - name: Checkout exact policy for early disarm
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Refuse protected-main movement before early-disarm token mint
+      # Bound to the sha this run checked out, proven to be an ancestor of the
+      # protected tip rather than equal to it. Equality cannot hold while lanes
+      # land every few minutes: four receiver runs refused on 2026-09-02 with
+      # "queued receiver policy <sha> is not protected main <sha>" while main
+      # moved under them. The property that matters is that the policy running
+      # here is main's own history: a commit still reachable from the protected
+      # tip is unrewritten, and GitHub resolved github.sha from the default
+      # branch, so it is neither a branch nor a fork. A behind or diverged
+      # answer is exactly what a force-push looks like, and both refuse.
+      - name: Bind early disarm to the queued workflow policy
+        id: base
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          current_base="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BASE_BRANCH}" \
-            --jq .object.sha)"
-          if [ "$current_base" != "$GITHUB_SHA" ]; then
-            echo "::error::protected main moved before early disarm"
-            exit 1
-          fi
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --branch "$BASE_BRANCH"
+          echo "base_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse protected-main rewrite before early-disarm token mint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --branch "$BASE_BRANCH"
 
       - name: Mint repository-scoped early-disarm token
         id: app-token
@@ -149,35 +150,28 @@ jobs:
       KIN_ACTIONS_SHA: 398595fa14ba1eaebca6eb176facd8a57ce9db05 # v0.1.33
       BASE_BRANCH: main
     steps:
-      - name: Bind preparation to the queued workflow policy
-        id: base
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          base_sha="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BASE_BRANCH}" \
-            --jq .object.sha)"
-          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::protected main returned invalid object id $base_sha"
-            exit 1
-          fi
-          if [ "$base_sha" != "$GITHUB_SHA" ]; then
-            echo "::error::queued receiver policy $GITHUB_SHA is not protected main $base_sha"
-            exit 1
-          fi
-          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
-
-      # github.sha, not steps.base.outputs.base_sha: see the comment on the
-      # same substitution in disarm-wave above. The step directly above this
-      # one already refuses the job unless the computed value equals
-      # github.sha, so this checks out the same commit either way.
+      # github.sha, the literal trusted context value: see the comment on the
+      # same checkout in disarm-wave above. The binding step below proves this
+      # exact commit is protected main's history before anything reads it as
+      # policy, and it is the admitted base every later job binds to.
       - name: Checkout exact queued protected main
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Bind preparation to the queued workflow policy
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --branch "$BASE_BRANCH"
+          echo "base_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Checkout exact Kin dependency updater
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -354,28 +348,10 @@ jobs:
       WAVE_BRANCH: automation/kin-registry-dependency-wave
       ADMITTED_BASE: ${{ needs.prepare-wave.outputs.base_sha }}
     steps:
-      - name: Rebind the fresh mutation runner to queued policy
-        id: base
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          base_sha="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BASE_BRANCH}" \
-            --jq .object.sha)"
-          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]] ||
-             [ "$base_sha" != "$GITHUB_SHA" ] ||
-             [ "$base_sha" != "$ADMITTED_BASE" ]; then
-            echo "::error::fresh mutation runner is not bound to exact queued protected main"
-            exit 1
-          fi
-          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
-
-      # github.sha, not steps.base.outputs.base_sha: see the comment on the
-      # same substitution in disarm-wave above. The step directly above this
-      # one already refuses the job unless the computed value equals both
-      # github.sha and prepare-wave's admitted base, so this checks out the
-      # same commit either way.
+      # github.sha, the literal trusted context value: see the comment on the
+      # same checkout in disarm-wave above. The rebind step below refuses
+      # unless this exact commit is prepare-wave's admitted base and proves it
+      # is protected main's history.
       - name: Checkout exact protected main for trusted mutation code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -383,19 +359,32 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Refuse protected-main movement immediately before token mint
+      - name: Rebind the fresh mutation runner to queued policy
+        id: base
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          current_base="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BASE_BRANCH}" \
-            --jq .object.sha)"
-          if [ "$current_base" != "$GITHUB_SHA" ] ||
-             [ "$current_base" != "$ADMITTED_BASE" ]; then
-            echo "::error::protected main moved before dependency-wave token mint"
+          if [[ ! "$ADMITTED_BASE" =~ ^[0-9a-f]{40}$ ]] ||
+             [ "$ADMITTED_BASE" != "$GITHUB_SHA" ]; then
+            echo "::error::fresh mutation runner is not bound to the admitted queued policy"
             exit 1
           fi
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --branch "$BASE_BRANCH"
+          echo "base_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse protected-main rewrite immediately before token mint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$ADMITTED_BASE" \
+            --branch "$BASE_BRANCH"
 
       - name: Mint repository-scoped dependency-wave token
         id: app-token
@@ -454,19 +443,16 @@ jobs:
             echo "workspace_version=$(jq -r .workspace_version <<<"$candidate")"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Refuse protected-main movement before repository mutation
+      - name: Refuse protected-main rewrite before repository mutation
         if: needs.prepare-wave.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          current_base="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BASE_BRANCH}" \
-            --jq .object.sha)"
-          if [ "$current_base" != "$ADMITTED_BASE" ]; then
-            echo "::error::protected main moved before the fixed PR write"
-            exit 1
-          fi
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$ADMITTED_BASE" \
+            --branch "$BASE_BRANCH"
 
       - name: Ensure dependency-wave labels exist
         if: needs.prepare-wave.outputs.changed == 'true'
@@ -554,12 +540,19 @@ jobs:
              [ "$(jq -r .head.repo.full_name <<<"$pull")" != "$GITHUB_REPOSITORY" ] ||
              [ "$(jq -r .head.ref <<<"$pull")" != "$WAVE_BRANCH" ] ||
              [ "$(jq -r .base.ref <<<"$pull")" != "$BASE_BRANCH" ] ||
-             [ "$(jq -r .base.sha <<<"$pull")" != "$ADMITTED_BASE" ] ||
              ! jq -e '.auto_merge == null' >/dev/null <<<"$pull" ||
              [ "$api_head" != "$ACTION_HEAD" ]; then
             echo "::error::dependency PR is not the exact first-party automation branch"
             exit 1
           fi
+          # The pull base is main's tip at the moment the action pushed, which
+          # may be ahead of the admitted base. It has to be protected main at
+          # or after that base; anything else descends from something else.
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$ADMITTED_BASE" \
+            --descendant "$(jq -r .base.sha <<<"$pull")" \
+            --branch "$BASE_BRANCH"
           api_tree="$(gh api \
             "repos/${GITHUB_REPOSITORY}/git/commits/${api_head}" --jq .tree.sha)"
           if [ "$api_tree" != "$EXPECTED_TREE" ]; then

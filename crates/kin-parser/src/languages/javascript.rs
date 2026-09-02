@@ -191,7 +191,7 @@ const JS_GRAMMAR_MISMATCH_RATIO: f64 = 0.10;
 /// pays nothing and its extraction is byte-for-byte what it was.
 ///
 /// TypeScript does not accept every Flow annotation, so when the winning grammar
-/// still cannot read the file, [`repair_flow_function_types`] is given a turn.
+/// still cannot read the file, [`repair_flow_constructs`] is given a turn.
 pub fn parse_javascript_family(source: &[u8]) -> Result<Tree> {
     let javascript = parse_with(&tree_sitter_javascript::LANGUAGE, source)?;
     // `has_error` rather than a zero byte total, because the total exempts the
@@ -250,7 +250,7 @@ pub fn parse_javascript_family(source: &[u8]) -> Result<Tree> {
     // The repaired tree replaces the winner only on the same measurement the
     // winner was chosen by, so this cannot make the answer worse by the rule
     // that produced it, and a tie still keeps the tree already in hand.
-    let repaired = repair_flow_function_types(repair_language, source)?;
+    let repaired = repair_flow_constructs(repair_language, source)?;
     if unparsed_byte_total(&repaired) < best_unparsed {
         return Ok(repaired);
     }
@@ -399,51 +399,120 @@ fn outermost_error_ranges(tree: &Tree) -> Vec<(usize, usize)> {
 /// Rounds of blank-and-reparse the Flow repair will run before it gives up.
 ///
 /// Each round blanks every site the current tree reports at once, so the count
-/// bounds a pathological file rather than the ordinary one. React's
-/// `ReactFiberHooks.js`, the file this was written for, converges in one.
+/// bounds a pathological file rather than the ordinary one. Measured over
+/// React's 3,899 JavaScript files, EVERY file converges in a single round:
+/// raising the bound to 16 recovers not one further declaration and lowers the
+/// unparsed total by not one byte. `ReactFiberConfigDOM.js` is the hardest of
+/// them, carrying four of these constructs at once, and it converges in one too.
+/// So this number is a stop, not a budget, and a file that needed several rounds
+/// would be news.
 const FLOW_REPAIR_MAX_ROUNDS: usize = 8;
 
-/// Bytes either side of a reported error the repair will look in for the arrow
-/// that caused it.
+/// Bytes either side of a reported error the repair will look in for the
+/// construct that caused it.
 ///
 /// Tree-sitter does not always fault the offending token itself: on
 /// `dispatch: (A => mixed) | null` it reports the `)` after the arrow, not the
 /// arrow. A little slack finds it. The window stays small on purpose, because
 /// every byte of it is a byte the repair is willing to touch outside a span the
 /// grammar actually complained about, and it stops growing where the recovery
-/// does. Measured over React's 3,873 `.js` files on this crate's own grammars
-/// and runtime, the top-level declarations recovered go 30, 36, 36, 180, 381,
-/// 382 at windows 0, 2, 4, 8, 16 and 32. Sixteen is the knee: doubling it again
-/// buys one declaration, and halving it costs 201, because
-/// `ReactFlightClient.js` and `ReactFlightReplyServer.js` both need it. A window
-/// of 0 is worse than not looking outside the error at all, losing one
-/// declaration on top of recovering 351 fewer.
+/// does. Measured over React's 3,899 JavaScript files on this crate's own
+/// grammars and runtime, with every construct in [`FLOW_REPAIRS`] offered and
+/// scored against what this crate recovers today, windows 0, 2, 4, 8, 16, 32 and
+/// 48 GAIN 9, 9, 9, 332, 332, 333, 333 top-level declarations and LOSE 352, 345,
+/// 345, 201, 0, 0, 0 of them. Sixteen is the knee and the first window that costs
+/// nothing: doubling it buys one declaration, doubling it twice buys none, and
+/// halving it loses 201 that a narrower window blanks apart rather than
+/// recovers.
 ///
 /// The measurement belongs to the runtime and has to be redone on a bump rather
-/// than carried over: under tree-sitter 0.25 the same sweep peaks at 8, because
-/// recovery there fragments a file differently. No unit test pins this number.
-/// The corpus is what pins it.
+/// than carried over. When this window was first set, the same sweep run against
+/// tree-sitter 0.25 with only the shorthand construct offered peaked at 8 rather
+/// than 16, because recovery there fragments a file differently, and the number
+/// shipped wrong once because of it. A grammar-version match is not a runtime
+/// match.
+///
+/// `the_extends_anchor_finds_a_keyword_the_window_misses` pins a LOWER bound on
+/// this number and nothing more: it fails for any window too narrow to reach
+/// `extends` from an error reported at the supertype. Which of 16, 32 and 48 to
+/// take is the corpus's answer, not a test's.
 const FLOW_REPAIR_WINDOW: usize = 16;
 
-/// Read a Flow file the TypeScript grammar stumbled on, by blanking the one
-/// Flow form that grammar has no rule for and parsing again.
+/// One Flow construct the repair knows how to blank.
+struct FlowRepair {
+    /// The construct's name, for the log line a refused round leaves behind.
+    /// A refusal is the interesting event here, because it is how a repair says
+    /// it would have cost more than it recovered.
+    construct: &'static str,
+    /// The byte spans this construct occupies inside one window of `source`.
+    ///
+    /// A window rather than the whole tree, because the window is the unit the
+    /// repair's discipline is stated in and the unit a test can hand over
+    /// directly. Tree-sitter does not always fault the token a construct starts
+    /// at, so where the window falls relative to the construct is the thing most
+    /// likely to be wrong, and it is only checkable if a test can choose it.
+    scan: fn(&[u8], usize, usize) -> Vec<(usize, usize)>,
+}
+
+/// The Flow constructs the repair blanks, in the order a refused round offers
+/// them the chance to try again alone.
 ///
-/// TypeScript writes a function type as `(a: A) => B`. Flow also allows the
-/// parameter to be a bare type, `A => B`, and React uses that form freely: in a
-/// type alias (`type Dispatch<A> = A => void`), in an object type
-/// (`dispatch: (A => mixed) | null`), and in a parameter annotation
-/// (`init?: I => S`, `subscribe: (() => void) => () => void`). TypeScript has no
-/// rule for it, and one occurrence takes tree-sitter's recovery down with
-/// everything around it. On `ReactFiberHooks.js` that costs the whole file: the
-/// TypeScript tree leaves 65% of it unparsed against the JavaScript grammar's
-/// 46%, so the byte comparison keeps the JavaScript tree, whose top level holds
-/// 7 of the file's 110 declarations.
+/// Ordered by how often each sits beside an error TypeScript reported, measured
+/// over React's 3,899 JavaScript files on this crate's own runtime: the inexact
+/// object marker at 252 sites in 95 files, the variance sigil at 193 in 44, the
+/// shorthand function type at 179 in 68, `opaque` at 149 in 55, and the
+/// anonymous interface type at 6 in 4. The last is last by count and first by
+/// value: three of its six sites are in `ReactFiberConfigDOM.js`, which loses
+/// 323 top-level declarations without it.
+const FLOW_REPAIRS: &[FlowRepair] = &[
+    FlowRepair {
+        construct: "inexact object",
+        scan: inexact_object_scan,
+    },
+    FlowRepair {
+        construct: "variance sigil",
+        scan: variance_sigil_scan,
+    },
+    FlowRepair {
+        construct: "shorthand function type",
+        scan: shorthand_function_type_scan,
+    },
+    FlowRepair {
+        construct: "opaque type",
+        scan: opaque_type_scan,
+    },
+    FlowRepair {
+        construct: "anonymous interface type",
+        scan: anonymous_interface_scan,
+    },
+];
+
+/// What a repaired buffer has to beat to be kept.
+struct RepairScore {
+    unparsed: usize,
+    declarations: usize,
+}
+
+/// Read a Flow file the TypeScript grammar stumbled on, by blanking the Flow
+/// forms that grammar has no rule for and parsing again.
 ///
-/// The parameter and its arrow are blanked to spaces in a COPY of the source.
-/// Byte length and line structure are preserved, so every span the tree carries
-/// still points at the original bytes and `extract` still reads names and
-/// signatures from source this never touched. What the parse loses is the
-/// parameter type of a function type, which no extractor here reads.
+/// Five constructs, listed in [`FLOW_REPAIRS`] with the count that ranks them.
+/// Each is a form Flow's own parser accepts and TypeScript's grammar has no rule
+/// for, and one occurrence takes tree-sitter's recovery down with everything
+/// around it. On `ReactFiberHooks.js` a single shorthand function type cost the
+/// whole file; on `ReactFiberConfigDOM.js` the anonymous interface type costs
+/// 321 of its 346 top-level declarations on its own and the other four
+/// constructs account for the last 2, because the TypeScript tree leaves 90.4%
+/// of that file unparsed against the JavaScript grammar's 51.1% and the byte
+/// comparison correctly keeps the JavaScript tree, whose top level holds 23 of
+/// them.
+///
+/// Every site is blanked to spaces in a COPY of the source. Byte length and line
+/// structure are preserved, so every span the tree carries still points at the
+/// original bytes and `extract` still reads names and signatures from source
+/// this never touched. What the parse loses is a function type's parameter, a
+/// property's variance, an object type's openness, an alias's opacity and an
+/// anonymous interface's supertype, and no extractor here reads any of them.
 ///
 /// Two guards keep a repair from costing more than it recovers. Only bytes at or
 /// beside a span the grammar already reported as an error are considered, so a
@@ -452,69 +521,127 @@ const FLOW_REPAIR_WINDOW: usize = 16;
 /// declarations a top-level walk can reach, so a blank that trades a real
 /// declaration for a smaller byte count is refused and the tree comes back
 /// exactly as it was.
-fn repair_flow_function_types(
+///
+/// A round offers every construct at once, which is one parse for the ordinary
+/// file. When that round is refused, each construct is offered the round alone
+/// before the repair gives up, so one construct's bad guess on one file cannot
+/// take the others down with it. React's `match`-expression fixtures are that
+/// case: `['high', true] =>` looks exactly like a shorthand function type, and
+/// blanking the arms costs the file both its declarations.
+fn repair_flow_constructs(
     language: &tree_sitter_language::LanguageFn,
     source: &[u8],
 ) -> Result<Tree> {
     let mut buffer = source.to_vec();
     let mut tree = parse_with(language, &buffer)?;
-    let mut unparsed = unparsed_byte_total(&tree);
-    let mut declarations = top_level_declaration_count(&tree);
+    let mut score = RepairScore {
+        unparsed: unparsed_byte_total(&tree),
+        declarations: top_level_declaration_count(&tree),
+    };
 
     for _ in 0..FLOW_REPAIR_MAX_ROUNDS {
-        if unparsed == 0 {
+        if score.unparsed == 0 {
             break;
         }
-        let sites = shorthand_function_type_sites(&tree, &buffer);
-        if sites.is_empty() {
-            break;
+        let union = normalize_sites(
+            FLOW_REPAIRS
+                .iter()
+                .flat_map(|repair| sites_near_errors(&tree, &buffer, repair.scan))
+                .collect(),
+        );
+        if apply_repair_round(language, &union, &mut buffer, &mut tree, &mut score)? {
+            continue;
         }
-        let mut candidate = buffer.clone();
-        for (start, end) in sites {
-            for byte in &mut candidate[start..end] {
-                if *byte != b'\n' {
-                    *byte = b' ';
-                }
+        let mut progressed = false;
+        for repair in FLOW_REPAIRS {
+            let sites = sites_near_errors(&tree, &buffer, repair.scan);
+            if sites.is_empty() {
+                continue;
+            }
+            if apply_repair_round(language, &sites, &mut buffer, &mut tree, &mut score)? {
+                progressed = true;
+            } else {
+                tracing::debug!(
+                    construct = repair.construct,
+                    sites = sites.len(),
+                    "flow repair round refused: it bought no bytes or cost a declaration"
+                );
             }
         }
-        let next = parse_with(language, &candidate)?;
-        let next_unparsed = unparsed_byte_total(&next);
-        let next_declarations = top_level_declaration_count(&next);
-        if next_unparsed >= unparsed || next_declarations < declarations {
+        if !progressed {
             break;
         }
-        buffer = candidate;
-        tree = next;
-        unparsed = next_unparsed;
-        declarations = next_declarations;
     }
     Ok(tree)
 }
 
-/// The byte spans of Flow shorthand function-type parameters, arrow included,
-/// that sit at or beside an error the grammar reported.
+/// Blank `sites` in a copy of `buffer` and keep the result only if it parses to
+/// fewer unparsed bytes without losing a declaration.
 ///
-/// Returned sorted and non-overlapping, because the caller blanks them in one
-/// pass over the buffer.
-fn shorthand_function_type_sites(tree: &Tree, source: &[u8]) -> Vec<(usize, usize)> {
-    let mut sites = Vec::new();
-    for (error_start, error_end) in outermost_error_ranges(tree) {
-        let from = error_start.saturating_sub(FLOW_REPAIR_WINDOW);
-        let to = error_end
-            .saturating_add(FLOW_REPAIR_WINDOW)
-            .min(source.len());
-        let mut at = from;
-        while at < to && at + 2 <= source.len() {
-            if &source[at..at + 2] == b"=>" {
-                if let Some(start) = shorthand_parameter_start(source, at) {
-                    sites.push((start, at + 2));
-                }
-                at += 2;
-            } else {
-                at += 1;
+/// Returns whether the round was kept. A refused round leaves `buffer`, `tree`
+/// and `score` exactly as it found them.
+fn apply_repair_round(
+    language: &tree_sitter_language::LanguageFn,
+    sites: &[(usize, usize)],
+    buffer: &mut Vec<u8>,
+    tree: &mut Tree,
+    score: &mut RepairScore,
+) -> Result<bool> {
+    if sites.is_empty() {
+        return Ok(false);
+    }
+    let mut candidate = buffer.clone();
+    for (start, end) in sites {
+        for byte in &mut candidate[*start..*end] {
+            if *byte != b'\n' {
+                *byte = b' ';
             }
         }
     }
+    let next = parse_with(language, &candidate)?;
+    let next_unparsed = unparsed_byte_total(&next);
+    let next_declarations = top_level_declaration_count(&next);
+    if next_unparsed >= score.unparsed || next_declarations < score.declarations {
+        return Ok(false);
+    }
+    *buffer = candidate;
+    *tree = next;
+    score.unparsed = next_unparsed;
+    score.declarations = next_declarations;
+    Ok(true)
+}
+
+/// Run one construct's `scan` over every window the repair may look in: each
+/// span the grammar reported as an error, widened by [`FLOW_REPAIR_WINDOW`] on
+/// both sides.
+///
+/// This is the whole of "the repair only touches bytes beside an error the
+/// grammar already reported", stated once so every construct obeys it rather
+/// than each restating it. A scan may return a span that starts before its
+/// window, because the window's job is to find the construct and the construct
+/// is then taken whole.
+fn sites_near_errors(
+    tree: &Tree,
+    source: &[u8],
+    scan: fn(&[u8], usize, usize) -> Vec<(usize, usize)>,
+) -> Vec<(usize, usize)> {
+    let mut sites = Vec::new();
+    for (start, end) in outermost_error_ranges(tree) {
+        let from = start.saturating_sub(FLOW_REPAIR_WINDOW);
+        let to = end.saturating_add(FLOW_REPAIR_WINDOW).min(source.len());
+        sites.extend(scan(source, from, to));
+    }
+    normalize_sites(sites)
+}
+
+/// Sort `sites`, drop the duplicates, and drop any span that starts inside the
+/// one before it.
+///
+/// The caller blanks them in one pass over the buffer, which needs them sorted
+/// and non-overlapping. Overlaps are real once several constructs look at the
+/// same window: a shorthand function type inside an object type can be found by
+/// its own scan and again inside a span another construct claimed.
+fn normalize_sites(mut sites: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     sites.sort_unstable();
     sites.dedup();
     let mut kept: Vec<(usize, usize)> = Vec::new();
@@ -525,6 +652,292 @@ fn shorthand_function_type_sites(tree: &Tree, source: &[u8]) -> Vec<(usize, usiz
         kept.push((start, end));
     }
     kept
+}
+
+/// The byte spans of Flow shorthand function-type parameters, arrow included,
+/// that sit at or beside an error the grammar reported.
+///
+/// TypeScript writes a function type as `(a: A) => B`. Flow also allows the
+/// parameter to be a bare type, `A => B`, and React uses that form freely: in a
+/// type alias (`type Dispatch<A> = A => void`), in an object type
+/// (`dispatch: (A => mixed) | null`), and in a parameter annotation
+/// (`init?: I => S`, `subscribe: (() => void) => () => void`).
+fn shorthand_function_type_scan(source: &[u8], from: usize, to: usize) -> Vec<(usize, usize)> {
+    let mut sites = Vec::new();
+    let mut at = from;
+    while at < to && at + 2 <= source.len() {
+        if &source[at..at + 2] == b"=>" {
+            if let Some(start) = shorthand_parameter_start(source, at) {
+                sites.push((start, at + 2));
+            }
+            at += 2;
+        } else {
+            at += 1;
+        }
+    }
+    sites
+}
+
+/// The byte spans of Flow's inexact-object marker: the `...` that ends an object
+/// type whose author allowed properties beyond the ones listed.
+///
+/// Only the bare form is taken, a `...` with nothing but whitespace between it
+/// and the closing brace, and only where a member may start. That form has no
+/// reading as JavaScript at all: `{...}`, `[...]` and `f(...)` are each a syntax
+/// error, so a bare `...` before a `}` cannot be an object spread, an array
+/// spread or a rest parameter that merely wandered into an error window.
+///
+/// Flow's NAMED spread, `{...Props, a: b}`, is left alone, and that is the
+/// deliberate half. It is byte-for-byte a value spread, so no scan can tell the
+/// two apart, and a wrong guess rewrites running code rather than a type.
+/// Measured over React it is 23 of this construct's 252 sites.
+///
+/// Blanking is enough on its own because the marker is always last: `{a: T, ...}`
+/// becomes `{a: T,    }`, and a trailing comma is one TypeScript accepts.
+fn inexact_object_scan(source: &[u8], from: usize, to: usize) -> Vec<(usize, usize)> {
+    let mut sites = Vec::new();
+    let mut at = from;
+    while at < to && at + 3 <= source.len() {
+        if &source[at..at + 3] == b"..." {
+            if inexact_object_marker(source, at) {
+                sites.push((at, at + 3));
+            }
+            at += 3;
+        } else {
+            at += 1;
+        }
+    }
+    sites
+}
+
+/// Whether the `...` at `dots` is Flow's inexact-object marker.
+fn inexact_object_marker(source: &[u8], dots: usize) -> bool {
+    let mut before = dots;
+    while before > 0 && source[before - 1].is_ascii_whitespace() {
+        before -= 1;
+    }
+    // A member may start after the brace that opens the object type or after the
+    // comma that ended the member before it, and nowhere else.
+    if !matches!(source.get(before.wrapping_sub(1)), Some(b'{') | Some(b',')) {
+        return false;
+    }
+    let mut after = dots + 3;
+    while after < source.len() && source[after].is_ascii_whitespace() {
+        after += 1;
+    }
+    source.get(after) == Some(&b'}')
+}
+
+/// The byte spans of Flow's variance sigil: the `+` marking a property
+/// covariant.
+///
+/// Taken as the single `+` byte, so `+availHeight: number` becomes
+/// ` availHeight: number`, which TypeScript reads as the property it is.
+/// Variance is a checker rule about who may write the property, and nothing here
+/// reads it.
+///
+/// The sigil is recognised only where a member may start and only when the name
+/// it marks is followed by a `:`. A leading `+` in an expression is unary plus,
+/// and it fails both halves: `{a: +b}` puts the colon before the `+` rather than
+/// after the name, and `cond ? +a : b` puts a `?` where a member cannot start.
+///
+/// Flow's contravariant `-prop` is the mirror of this and is NOT handled, because
+/// React writes none and an unmeasured construct is one whose false positives
+/// nobody has counted.
+fn variance_sigil_scan(source: &[u8], from: usize, to: usize) -> Vec<(usize, usize)> {
+    let mut sites = Vec::new();
+    let to = to.min(source.len());
+    let from = from.min(to);
+    for (offset, byte) in source[from..to].iter().enumerate() {
+        let at = from + offset;
+        if *byte == b'+' && variance_sigil_marks_a_property(source, at) {
+            sites.push((at, at + 1));
+        }
+    }
+    sites
+}
+
+/// Whether the `+` at `plus` marks a property rather than adding a number.
+fn variance_sigil_marks_a_property(source: &[u8], plus: usize) -> bool {
+    let mut before = plus;
+    while before > 0 && source[before - 1].is_ascii_whitespace() {
+        before -= 1;
+    }
+    // `}` because an object type may end a member's own type, and `;` because a
+    // `declare class` body separates its members that way.
+    if before > 0 && !matches!(source[before - 1], b'{' | b',' | b';' | b'}') {
+        return false;
+    }
+    let mut after = plus + 1;
+    while after < source.len() && source[after].is_ascii_whitespace() {
+        after += 1;
+    }
+    let mut after = match source.get(after) {
+        // `+[key: string]: T`, a covariant indexer.
+        Some(b'[') => match balanced_close(source, after, b'[', b']') {
+            Some(close) => close + 1,
+            None => return false,
+        },
+        Some(byte) if is_type_name_byte(*byte) => {
+            let mut end = after;
+            while end < source.len() && is_type_name_byte(source[end]) {
+                end += 1;
+            }
+            end
+        }
+        _ => return false,
+    };
+    while after < source.len() && source[after].is_ascii_whitespace() {
+        after += 1;
+    }
+    if source.get(after) == Some(&b'?') {
+        after += 1;
+        while after < source.len() && source[after].is_ascii_whitespace() {
+            after += 1;
+        }
+    }
+    source.get(after) == Some(&b':')
+}
+
+/// The byte spans of Flow's `opaque` modifier on a type alias.
+///
+/// `opaque type Chunk = string` becomes `       type Chunk = string`, which
+/// TypeScript reads as the alias it is. Opacity is a checker rule about who may
+/// see through the alias, and nothing here reads it. `declare opaque type` and
+/// `export opaque type` are the same span with the same neighbours, so both fall
+/// out of the word-bounded match rather than needing a case each.
+fn opaque_type_scan(source: &[u8], from: usize, to: usize) -> Vec<(usize, usize)> {
+    const OPAQUE: &[u8] = b"opaque";
+    let mut sites = Vec::new();
+    let mut at = from;
+    while at < to && at + OPAQUE.len() <= source.len() {
+        if &source[at..at + OPAQUE.len()] == OPAQUE && !name_byte_before(source, at) {
+            let after_keyword = at + OPAQUE.len();
+            let mut after = after_keyword;
+            while after < source.len() && source[after].is_ascii_whitespace() {
+                after += 1;
+            }
+            // Whitespace is what separates the modifier from the alias keyword,
+            // and requiring it is what tells `opaque type` from an identifier
+            // that merely begins with those six bytes. It also settles the
+            // keyword's own right-hand boundary, so no separate word check is
+            // needed here.
+            if after > after_keyword && word_at(source, after, b"type") {
+                sites.push((at, after_keyword));
+                at = after;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    sites
+}
+
+/// The byte spans Flow's anonymous interface type occupies before its body.
+///
+/// `interface extends Element {_reactRootContainer?: FiberRoot}` is a type
+/// rather than a declaration: an object type that also inherits. TypeScript has
+/// no such form, and `ReactFiberConfigDOM.js` writes three of them in one union
+/// at its 220th line, which is why that file reaches kin's graph with none of
+/// its 222 functions. Blanking `interface extends Element ` leaves
+/// `{_reactRootContainer?: FiberRoot}`, an object type TypeScript reads, and
+/// gives up only the supertype, which no extractor here follows.
+///
+/// A NAMED `interface Foo {` is a declaration TypeScript already accepts and is
+/// never touched. The anonymous form is exactly the one whose `interface` is
+/// followed by `extends` or by the body brace, so the two need no more telling
+/// apart than that.
+fn anonymous_interface_scan(source: &[u8], from: usize, to: usize) -> Vec<(usize, usize)> {
+    const INTERFACE: &[u8] = b"interface";
+    let mut sites = Vec::new();
+    let mut at = from;
+    while at < to && at < source.len() {
+        // Two anchors for one construct, because the grammar faults neither
+        // reliably. On `| interface extends Element {...}` tree-sitter reports
+        // `Element`, and `interface` sits eighteen bytes to its left, two past a
+        // sixteen-byte window. `extends` is inside that window, and the word
+        // before `extends` says whether this is the construct or an ordinary
+        // `class X extends Y`. The anonymous form written without a supertype
+        // has no `extends` at all, so `interface` stays an anchor too.
+        let keyword = if word_at(source, at, INTERFACE) && !name_byte_before(source, at) {
+            Some(at)
+        } else if word_at(source, at, b"extends") && !name_byte_before(source, at) {
+            word_ending_before(source, at, INTERFACE)
+        } else {
+            None
+        };
+        if let Some(keyword) = keyword {
+            if let Some(body) = anonymous_interface_body(source, keyword + INTERFACE.len()) {
+                sites.push((keyword, body));
+                at = body;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    sites
+}
+
+/// Whether a name byte sits immediately left of `at`, which is what tells the
+/// keyword `interface` from the tail of `MyInterface`.
+fn name_byte_before(source: &[u8], at: usize) -> bool {
+    at.checked_sub(1)
+        .is_some_and(|prev| is_type_name_byte(source[prev]))
+}
+
+/// The offset of `word` when it is the word immediately left of `at`, whitespace
+/// between them allowed.
+fn word_ending_before(source: &[u8], at: usize, word: &[u8]) -> Option<usize> {
+    let mut end = at;
+    while end > 0 && source[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let start = end.checked_sub(word.len())?;
+    (&source[start..end] == word && !name_byte_before(source, start)).then_some(start)
+}
+
+/// The offset of the body brace of the anonymous interface type whose `interface`
+/// keyword ended at `after`, or `None` when what follows names an interface
+/// instead.
+fn anonymous_interface_body(source: &[u8], after: usize) -> Option<usize> {
+    let mut at = after;
+    while at < source.len() && source[at].is_ascii_whitespace() {
+        at += 1;
+    }
+    if at == after {
+        // `interfaceFoo`, not the keyword.
+        return None;
+    }
+    if source.get(at) == Some(&b'{') {
+        return Some(at);
+    }
+    if !word_at(source, at, b"extends") {
+        return None;
+    }
+    // The supertype list runs to the body brace. Type arguments may carry a
+    // brace of their own, as `extends Foo<{a: b}>` does, so the scan only stops
+    // at a brace outside them.
+    let mut depth = 0i32;
+    while at < source.len() {
+        match source[at] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b'{' if depth <= 0 => return Some(at),
+            b';' | b'}' => return None,
+            _ => {}
+        }
+        at += 1;
+    }
+    None
+}
+
+/// Whether `word` sits at `at` with no name byte on either side of it.
+fn word_at(source: &[u8], at: usize, word: &[u8]) -> bool {
+    source.len() >= at + word.len()
+        && &source[at..at + word.len()] == word
+        && !source
+            .get(at + word.len())
+            .is_some_and(|byte| is_type_name_byte(*byte))
 }
 
 /// The first byte of the shorthand parameter whose arrow starts at `arrow`, or
@@ -580,6 +993,23 @@ fn balanced_open(source: &[u8], from: isize, close: u8, open: u8) -> Option<isiz
             }
         }
         at -= 1;
+    }
+    None
+}
+
+/// The index of the `close` byte matching the `open` byte at `from`, scanning
+/// right, or `None` when the group runs off the end of the file.
+fn balanced_close(source: &[u8], from: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 0i32;
+    for (at, byte) in source.iter().enumerate().skip(from) {
+        if *byte == open {
+            depth += 1;
+        } else if *byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(at);
+            }
+        }
     }
     None
 }
@@ -2527,6 +2957,58 @@ mod tests {
             .collect()
     }
 
+    /// React's `match-expression-with-tuple-and-early-return.js`, verbatim.
+    ///
+    /// Its arms are written `['high', true] => 'high_active'`. Left of each arrow
+    /// is a bracketed group, which is exactly the shape a Flow shorthand
+    /// function-type parameter has, so blanking the arms lowers the byte total
+    /// enough for a repaired tree to win the grammar comparison and takes both of
+    /// the file's declarations with it. Measured over React, this is the only
+    /// file in 3,899 where the declaration guard fires.
+    ///
+    /// The file is here whole rather than reduced, and that is not laziness. A
+    /// two-arm reduction does not regress: it loses its function under
+    /// tree-sitter 0.25 and keeps it under the 0.26 this crate pins, so a test
+    /// built on the small version passes with the guard deleted and proves
+    /// nothing. How far recovery spreads is what decides this, so the file stays
+    /// whole, comment and all.
+    const FLOW_MATCH_FIXTURE: &[u8] = br#"// @flow
+import {useState} from 'react';
+
+/**
+ * Test that match expressions with tuple patterns don't produce overly
+ * conservative mutation effects on the matched values. Without the fix
+ * for ModuleLocal global type resolution, Array.isArray inside the match
+ * IIFE body would not get its signature resolved, causing
+ * MutateTransitiveConditionally on the match argument and wider mutable
+ * ranges that prevent fine-grained memoization.
+ */
+function useFoo(data: {status: string, priority: string}) {
+  const [count] = useState(0);
+  const active = count > 0;
+
+  if (data.status === 'closed') {
+    return active ? 'closed_active' : 'closed';
+  }
+
+  return match ([data.priority, active]) {
+    ['high', true] => 'high_active',
+    ['high', false] => 'high_inactive',
+    ['medium', true] => 'medium_active',
+    ['medium', false] => 'medium_inactive',
+    ['low', true] => 'low_active',
+    ['low', false] => 'low_inactive',
+    [_, true] => 'other_active',
+    [_, false] => 'other_inactive',
+  };
+}
+
+export const FIXTURE_ENTRYPOINT = {
+  fn: useFoo,
+  params: [{status: 'open', priority: 'high'}],
+};
+"#;
+
     /// A Flow file whose annotations the JavaScript grammar cannot read.
     ///
     /// Every construct here is one the grammar has no rule for and drops the
@@ -2956,63 +3438,15 @@ export function updateState<S>(initialState: (() => S) | S): [S, Dispatch<BasicS
     /// The guard that keeps the repair from paying for a smaller byte count with
     /// a declaration.
     ///
-    /// React's own compiler fixtures use the `match` expression proposal, whose
-    /// arms are written `['high', true] => 'high_active'`. Left of the arrow is a
-    /// bracketed group, which is exactly the shape a shorthand parameter has, so
-    /// blanking the arms lowers the byte total enough for the repaired tree to
-    /// win the grammar comparison, and it takes both of the file's declarations
-    /// with it. The declaration count is what tells the two apart. Measured over
-    /// React, this is the only file in 3,873 where the guard fires, and without
-    /// it that file goes from 2 declarations to 0.
-    ///
-    /// The fixture is React's `match-expression-with-tuple-and-early-return.js`
-    /// verbatim rather than a reduction of it, and that is not laziness. A
-    /// two-arm reduction does not regress: it loses its function under
-    /// tree-sitter 0.25 and keeps it under the 0.26 this crate pins, so a test
-    /// built on the small version passes with the guard deleted and proves
-    /// nothing. How far recovery spreads is what decides this, so the file stays
-    /// whole, comment and all.
+    /// [`FLOW_MATCH_FIXTURE`] is the one file in React where it fires, and the
+    /// declaration count is what tells a good round from a costly one: without
+    /// this guard that file goes from 2 declarations to 0.
     #[test]
     fn the_repair_refuses_a_round_that_costs_a_declaration() {
-        let source: &[u8] = br#"// @flow
-import {useState} from 'react';
-
-/**
- * Test that match expressions with tuple patterns don't produce overly
- * conservative mutation effects on the matched values. Without the fix
- * for ModuleLocal global type resolution, Array.isArray inside the match
- * IIFE body would not get its signature resolved, causing
- * MutateTransitiveConditionally on the match argument and wider mutable
- * ranges that prevent fine-grained memoization.
- */
-function useFoo(data: {status: string, priority: string}) {
-  const [count] = useState(0);
-  const active = count > 0;
-
-  if (data.status === 'closed') {
-    return active ? 'closed_active' : 'closed';
-  }
-
-  return match ([data.priority, active]) {
-    ['high', true] => 'high_active',
-    ['high', false] => 'high_inactive',
-    ['medium', true] => 'medium_active',
-    ['medium', false] => 'medium_inactive',
-    ['low', true] => 'low_active',
-    ['low', false] => 'low_inactive',
-    [_, true] => 'other_active',
-    [_, false] => 'other_inactive',
-  };
-}
-
-export const FIXTURE_ENTRYPOINT = {
-  fn: useFoo,
-  params: [{status: 'open', priority: 'high'}],
-};
-"#;
+        let source = FLOW_MATCH_FIXTURE;
         let plain = parse_with(&tree_sitter_typescript::LANGUAGE_TSX, source).unwrap();
         assert!(
-            !shorthand_function_type_sites(&plain, source).is_empty(),
+            !sites_near_errors(&plain, source, shorthand_function_type_scan).is_empty(),
             "the match arms must look like shorthand parameters, or this guards nothing"
         );
 
@@ -3033,6 +3467,367 @@ export const FIXTURE_ENTRYPOINT = {
         );
     }
 
+    /// A Flow file the TypeScript grammar cannot read because of the anonymous
+    /// interface type, written the way `ReactFiberConfigDOM.js` writes it.
+    ///
+    /// That file declares 346 names at its top level and reached kin's graph
+    /// with 23 and not one function. Three anonymous interface types in one
+    /// union at its 220th line are why: they defeat the TypeScript grammar so
+    /// thoroughly that it leaves 90.4% of the file unparsed against the
+    /// JavaScript grammar's 51.1%, the byte comparison keeps the JavaScript
+    /// tree, and the JavaScript tree has no function at its top level.
+    ///
+    /// The inexact object markers above the union are here for the same reason
+    /// they are there: they are the construct the grammar faults FIRST, and a
+    /// fixture that omitted them would let the repair start from an error the
+    /// real file never gives it.
+    const FLOW_ANONYMOUS_INTERFACE_SOURCE: &[u8] = br#"/**
+ * @flow
+ */
+
+import type {FiberRoot} from 'react-reconciler/src/ReactInternalTypes';
+
+export type EventTargetChildElement = {
+  type: string,
+  props: null | {
+    style?: {
+      position?: string,
+      zIndex?: number,
+      ...
+    },
+    ...
+  },
+  ...
+};
+
+export type Container =
+  | interface extends Element {_reactRootContainer?: FiberRoot}
+  | interface extends Document {_reactRootContainer?: FiberRoot}
+  | interface extends DocumentFragment {_reactRootContainer?: FiberRoot};
+export type Instance = Element;
+
+export function getRootHostContext(rootContainerInstance: Container): string {
+  return rootContainerInstance.namespaceURI;
+}
+
+export function appendChildToContainer(
+  container: Container,
+  child: Instance,
+): void {
+  container.appendChild(child);
+}
+
+export function commitUpdate(domElement: Instance, type: string): void {
+  domElement.setAttribute('type', type);
+}
+
+export function clearContainer(container: Container): void {
+  container.textContent = '';
+}
+"#;
+
+    /// The declarations `ReactFiberConfigDOM.js` lost, on a fixture that writes
+    /// the construct that lost them.
+    ///
+    /// Named one by one rather than counted, because the file this stands for
+    /// held 23 of its 346 names and a count would pass on the wrong 23.
+    #[test]
+    fn a_flow_anonymous_interface_type_no_longer_swallows_the_file() {
+        let output = extract_source(
+            "packages/react-dom-bindings/src/client/ReactFiberConfigDOM.js",
+            FLOW_ANONYMOUS_INTERFACE_SOURCE,
+        );
+        for name in [
+            "getRootHostContext",
+            "appendChildToContainer",
+            "commitUpdate",
+            "clearContainer",
+        ] {
+            assert!(
+                named(&output, EntityKind::Function, name),
+                "{name} is missing; entities: {:?}",
+                entities_besides_the_files_own_module(&output.entities)
+            );
+        }
+    }
+
+    /// The grammar's own answer on the same fixture, so a change that recovered
+    /// the declarations by some other route still has to leave the parse
+    /// readable.
+    ///
+    /// Both halves are asserted. Without the repair the TypeScript grammar
+    /// reaches almost nothing at this fixture's top level, which is the defect;
+    /// with it the whole fixture parses, which is the fix. A repair that merely
+    /// moved the errors would pass the entity test above on a tree nothing else
+    /// can trust.
+    #[test]
+    fn the_repair_leaves_the_anonymous_interface_fixture_fully_parsed() {
+        let unrepaired = parse_with(
+            &tree_sitter_typescript::LANGUAGE_TSX,
+            FLOW_ANONYMOUS_INTERFACE_SOURCE,
+        )
+        .unwrap();
+        assert!(
+            top_level_declaration_count(&unrepaired) <= 2,
+            "the fixture must actually defeat the TypeScript grammar, but it reached {} declarations",
+            top_level_declaration_count(&unrepaired)
+        );
+
+        let repaired = JavaScriptAdapter
+            .parse(FLOW_ANONYMOUS_INTERFACE_SOURCE)
+            .unwrap();
+        assert!(tree_is_typescript_family(&repaired));
+        assert_eq!(
+            unparsed_byte_total(&repaired),
+            0,
+            "the repaired parse must read the whole fixture"
+        );
+        assert_eq!(
+            top_level_declaration_count(&repaired),
+            7,
+            "every declaration the fixture writes: four functions and three type aliases"
+        );
+    }
+
+    /// Where the anonymous interface type starts and ends, and the declarations
+    /// it must never be confused with.
+    ///
+    /// Driven over the whole source rather than through an error window, because
+    /// the discrimination is what is being checked and a window that happened not
+    /// to reach the keyword would make every case below pass for the wrong
+    /// reason.
+    #[test]
+    fn an_anonymous_interface_type_is_taken_from_its_keyword() {
+        fn sites(source: &str) -> Vec<(usize, usize)> {
+            anonymous_interface_scan(source.as_bytes(), 0, source.len())
+        }
+        let with_supertype = "type C = interface extends Element {a?: T};";
+        assert_eq!(
+            sites(with_supertype),
+            vec![(
+                with_supertype.find("interface").unwrap(),
+                with_supertype.find('{').unwrap()
+            )],
+            "the span must run from the keyword to the body brace"
+        );
+
+        let bare = "type C = interface {a?: T};";
+        assert_eq!(
+            sites(bare),
+            vec![(bare.find("interface").unwrap(), bare.find('{').unwrap())]
+        );
+
+        // A NAMED interface is a declaration TypeScript already reads, and a
+        // class that extends is not this construct at all.
+        assert!(sites("interface Container {a?: T}").is_empty());
+        assert!(sites("declare interface Crypto {a?: T}").is_empty());
+        assert!(sites("class A extends B {}").is_empty());
+        // The tail of a longer name is not the keyword.
+        assert!(sites("type C = MyInterface extends B {}").is_empty());
+    }
+
+    /// The `extends` anchor on its own, reached from an error the repair could
+    /// not have found the keyword from.
+    ///
+    /// `word_ending_before` is what makes the second anchor safe: it is the
+    /// difference between `interface extends Element` and `class A extends B`,
+    /// and without it the repair would blank the head of every class in the
+    /// corpus.
+    #[test]
+    fn the_extends_anchor_reads_the_word_before_it() {
+        let source = b"type C = interface extends Element {a: T};";
+        let extends = find_subslice(source, b"extends").unwrap();
+        assert_eq!(
+            word_ending_before(source, extends, b"interface"),
+            Some(find_subslice(source, b"interface").unwrap())
+        );
+
+        let class = b"class Container extends Element {}";
+        let extends = find_subslice(class, b"extends").unwrap();
+        assert_eq!(word_ending_before(class, extends, b"interface"), None);
+    }
+
+    /// Flow's inexact-object marker, and the value spreads it must never be
+    /// mistaken for.
+    ///
+    /// The bare `...` before a `}` is the whole of what this repair takes,
+    /// because that byte sequence has no reading as JavaScript: `{...}`, `[...]`
+    /// and `f(...)` are each a syntax error. Everything with a name after the
+    /// dots is byte-for-byte a value spread and is left alone.
+    #[test]
+    fn only_the_bare_inexact_marker_is_taken() {
+        fn marks(source: &str) -> bool {
+            inexact_object_marker(source.as_bytes(), source.find("...").unwrap())
+        }
+        assert!(marks("type P = {a: string, ...};"));
+        assert!(marks("type P = {...};"));
+        assert!(marks("type P = {\n  a: string,\n  ...\n};"));
+
+        // A named spread, in a type and in a value, is the same bytes and is
+        // refused in both.
+        assert!(!marks("type P = {...Other, a: string};"));
+        assert!(!marks("const next = {...props, a: 1};"));
+        // A rest parameter and an array spread close on the wrong bracket.
+        assert!(!marks("function f(...args) {}"));
+        assert!(!marks("const all = [...items];"));
+    }
+
+    /// Flow's variance sigil, and the unary plus it must never be mistaken for.
+    ///
+    /// The sigil is recognised where a member may start and only when a `:`
+    /// follows the name it marks. Unary plus fails one half or the other in
+    /// every position it appears in.
+    #[test]
+    fn only_a_property_marker_is_taken_for_a_variance_sigil() {
+        fn marks(source: &str) -> bool {
+            variance_sigil_marks_a_property(source.as_bytes(), source.find('+').unwrap())
+        }
+        assert!(marks("type S = {+availHeight: number};"));
+        assert!(marks("declare class S {\n  +width: number;\n}"));
+        assert!(marks("type S = {+orientation?: string};"));
+        assert!(marks("type S = {+[key: string]: number};"));
+
+        // Unary plus after a colon, in a ternary, and adding two numbers.
+        assert!(!marks("const s = {a: +b};"));
+        assert!(!marks("const s = cond ? +a : b;"));
+        assert!(!marks("const s = a + b;"));
+        // A name with no annotation is a value, not a covariant property.
+        assert!(!marks("const s = {\n  +b\n};"));
+    }
+
+    /// Flow's `opaque` modifier, and the identifiers that merely contain it.
+    ///
+    /// Driven over the whole source for the same reason as the interface scan
+    /// above: an error window that happened to miss the keyword would let every
+    /// negative case pass without the discrimination doing any work.
+    #[test]
+    fn only_the_opaque_modifier_is_taken() {
+        fn sites(source: &str) -> Vec<(usize, usize)> {
+            opaque_type_scan(source.as_bytes(), 0, source.len())
+        }
+        assert_eq!(
+            sites("opaque type Chunk = string;"),
+            vec![(0, "opaque".len())]
+        );
+        let exported = "export opaque type Chunk = string;";
+        assert_eq!(
+            sites(exported),
+            vec![(
+                exported.find("opaque").unwrap(),
+                exported.find("opaque").unwrap() + "opaque".len()
+            )]
+        );
+
+        // A variable called `opaque`, a name that begins with it, a name that
+        // ends with it, and the two words run together.
+        assert!(sites("const opaque = 1;").is_empty());
+        assert!(sites("const opaqueType = 1;").is_empty());
+        assert!(sites("const halfopaque type = 1;").is_empty());
+        assert!(sites("const opaquetype = 1;").is_empty());
+    }
+
+    /// One construct's bad guess on a file must not take the others down with
+    /// it.
+    ///
+    /// React's own `match`-expression fixture, verbatim, with an anonymous
+    /// interface type appended. The arms (`['high', true] =>`) are what the
+    /// shorthand repair reads as function types, and blanking them costs the
+    /// file both the declarations the TypeScript grammar had already reached, so
+    /// the round offering every construct at once is refused by the declaration
+    /// guard. Underneath it the interface construct is offered the round alone,
+    /// and it is kept.
+    ///
+    /// Both constructs are real and both appear in React; no one file writes
+    /// both, so the fixture puts them together. Measured over React the retry
+    /// saves a round on five files across three constructs, where it buys a
+    /// smaller unparsed total rather than a declaration, which is why the case
+    /// it guards is written out here rather than borrowed from the corpus.
+    #[test]
+    fn a_refused_round_still_lets_the_other_constructs_run() {
+        let mut source = FLOW_MATCH_FIXTURE.to_vec();
+        source.extend_from_slice(
+            br#"
+export type Container =
+  | interface extends Element {_reactRootContainer?: Object}
+  | interface extends Document {_reactRootContainer?: Object};
+"#,
+        );
+        let source = source.as_slice();
+
+        let plain = parse_with(&tree_sitter_typescript::LANGUAGE_TSX, source).unwrap();
+        let union = normalize_sites(
+            FLOW_REPAIRS
+                .iter()
+                .flat_map(|repair| sites_near_errors(&plain, source, repair.scan))
+                .collect(),
+        );
+        let mut blanked = source.to_vec();
+        for (start, end) in &union {
+            for byte in &mut blanked[*start..*end] {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+        }
+        let all_at_once = parse_with(&tree_sitter_typescript::LANGUAGE_TSX, &blanked).unwrap();
+        assert!(
+            top_level_declaration_count(&all_at_once) < top_level_declaration_count(&plain),
+            "the round offering every construct must cost a declaration, or the retry beneath it \
+             is never reached: {} to {}",
+            top_level_declaration_count(&plain),
+            top_level_declaration_count(&all_at_once)
+        );
+
+        let repaired =
+            repair_flow_constructs(&tree_sitter_typescript::LANGUAGE_TSX, source).expect("repair");
+        assert!(
+            unparsed_byte_total(&repaired) < unparsed_byte_total(&plain),
+            "the interface construct's own round must still be kept: {} to {}",
+            unparsed_byte_total(&plain),
+            unparsed_byte_total(&repaired)
+        );
+        assert_eq!(
+            top_level_declaration_count(&repaired),
+            top_level_declaration_count(&plain),
+            "and it must cost nothing"
+        );
+        assert!(
+            sites_near_errors(&repaired, source, anonymous_interface_scan).is_empty(),
+            "no interface type may be left unread, or the round was not the one that ran"
+        );
+    }
+
+    /// The `extends` anchor reaching a keyword the window does not cover.
+    ///
+    /// This is the case the corpus has and no small fixture reproduces.
+    /// Tree-sitter faults the SUPERTYPE rather than the keyword on
+    /// `ReactFiberConfigDOM.js`, reporting a seven-byte error at `Element`, and
+    /// `interface` sits eighteen bytes to its left, two past the window. Written
+    /// small, the same construct is faulted from `extends` or earlier and the
+    /// window covers the keyword anyway, so the anchor is only checkable by
+    /// handing the scan the window the big file produces. That is what this
+    /// does, and it is why the scans take a window rather than a tree.
+    ///
+    /// Without the anchor the repair found zero sites in that file and it kept
+    /// all 323 of its lost declarations.
+    #[test]
+    fn the_extends_anchor_finds_a_keyword_the_window_misses() {
+        let source: &[u8] = b"export type Container =\n  | interface extends Element {a?: T};\n";
+        let keyword = find_subslice(source, b"interface").expect("fixture keyword");
+        let supertype = find_subslice(source, b"Element").expect("fixture supertype");
+        let from = supertype - FLOW_REPAIR_WINDOW;
+        assert!(
+            from > keyword,
+            "the window must start after the keyword, or this proves nothing"
+        );
+
+        assert_eq!(
+            anonymous_interface_scan(source, from, supertype + FLOW_REPAIR_WINDOW),
+            vec![(keyword, find_subslice(source, b"{").expect("fixture body"))],
+            "the scan must reach back to the keyword from the supertype's window"
+        );
+    }
+
     /// A tree with nothing to complain about offers the repair nothing to do, so
     /// a file the grammar reads is never rewritten.
     #[test]
@@ -3043,7 +3838,7 @@ const run = (a) => a + 1;
         let tree = parse_with(&tree_sitter_typescript::LANGUAGE_TSX, source).unwrap();
         assert_eq!(unparsed_byte_total(&tree), 0);
         assert!(
-            shorthand_function_type_sites(&tree, source).is_empty(),
+            sites_near_errors(&tree, source, shorthand_function_type_scan).is_empty(),
             "an arrow the grammar accepted is not a site"
         );
     }

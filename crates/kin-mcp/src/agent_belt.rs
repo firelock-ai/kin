@@ -18,6 +18,14 @@
 //! and `context-bench` profiles, whose payload bytes are part of a citable
 //! result and must not move because a description was rewritten.
 //!
+//! Measured the same way afterwards, with the acceptance exception below in
+//! place, the served profile is 33,464 bytes over 21 tools: 6,188 characters of
+//! description and 27,276 bytes of input schema. The descriptions are where the
+//! win is, 6,188 against 47,739. The schemas keep most of their bytes on
+//! purpose, because a property the shipped proofs or the acceptance suite grade
+//! has to stay advertised; [`schema_keep_lists`] names that exception and the
+//! checks that own it.
+//!
 //! Every short form answers two questions in one or two sentences: when to call
 //! this, and what comes back. Where two tools are easy to confuse, the one a
 //! caller reaches for by mistake names the other.
@@ -66,7 +74,8 @@ pub const AGENT_DEFAULT_DESCRIPTION_BUDGET: usize = 520;
 /// per-tool budget would be a profile that had learned nothing.
 pub const AGENT_DEFAULT_PROFILE_DESCRIPTION_BUDGET: usize = 10_000;
 
-/// The honest name for the declaration filter.
+/// The honest name for the declaration filter, accepted on a call and never
+/// served.
 ///
 /// `semantic_search` does not search semantically. Its own registered
 /// description opens "Find code declarations in the semantic graph by name,
@@ -76,18 +85,29 @@ pub const AGENT_DEFAULT_PROFILE_DESCRIPTION_BUDGET: usize = 10_000;
 /// before it reads five thousand characters of prose, and these two names are
 /// the wrong way round.
 ///
-/// Served under this name on `agent-default` only. The registration, the
-/// dispatch key, the budget shape and the negative-evidence spec all stay on
-/// `semantic_search`, so nothing internal is renamed and no existing caller
-/// breaks; [`canonical_tool_name`] maps this name back before any of them see
-/// it. `find_declarations` also reads as a pair with
-/// `find_references`, which is the tool an agent reaches for next.
+/// That reading still holds, and it was not enough to move the served name.
+/// `agent-default` advertised the filter under this name for four landings, and
+/// two proofs that run only on `main` went red on every one of them: the
+/// install proof throws `MCP tools/list omitted semantic_search`
+/// (`.github/workflows/install-proof.yml`) and the Windows npm proof asserts
+/// `toolNames.includes('semantic_search')`
+/// (`scripts/prove-windows-npm-first-run.mjs`). Renaming a public MCP tool on
+/// the default profile is a product decision that has to move those proofs, the
+/// docs and the acceptance suite in one deliberate change, rather than ride
+/// along inside a payload compaction.
+///
+/// So the name lives on as an accepted input only. [`canonical_tool_name`] maps
+/// it back at each dispatch entry, so a caller that learned it during those four
+/// landings still reaches the same handler, while `tools/list` advertises the
+/// registered name on every profile.
+/// `agent_default_serves_every_name_the_shipped_proofs_assert` is what holds
+/// that per pull request.
 pub const DECLARATION_FILTER_ALIAS: &str = "find_declarations";
 
 /// The registered name [`DECLARATION_FILTER_ALIAS`] stands in for.
 pub const DECLARATION_FILTER_CANONICAL: &str = "semantic_search";
 
-/// Map a served tool name back to the name everything internal is keyed on.
+/// Map an accepted tool name back to the name everything internal is keyed on.
 ///
 /// One function, called once per call at the point the name is parsed, so the
 /// profile filter, the dispatcher, the response-budget shape, the
@@ -118,7 +138,8 @@ pub fn canonicalize_tool_name(name: &mut String) {
     }
 }
 
-/// Ask `semantic_locate` for the compact shape on this belt's behalf.
+/// Ask, on this belt's agents' behalf, for the answer shape and the size a
+/// small model can afford.
 ///
 /// The compact response is opt-in on the wire, and deliberately so: the fused
 /// `semantic_locate` payload IS the `LocateResult` schema `kin locate --json`
@@ -134,14 +155,65 @@ pub fn canonicalize_tool_name(name: &mut String) {
 /// at twelve results.
 ///
 /// Only when the caller named no `surface` of its own. An agent that asks for
-/// `full` gets full, which is what makes this a default rather than an override.
+/// `full` gets full, which is what makes this a default rather than an override,
+/// and every insertion below follows the same rule.
+///
+/// The rest is the response size. The registered ceiling of 45,000 characters is
+/// right for a client with room and wrong for this belt: it is roughly 10,500
+/// tokens, so two default answers exhaust a 24,000-token run. Each budget tool
+/// therefore gets [`AGENT_DEFAULT_RESPONSE_MAX_CHARS`], the walker gets the
+/// shape rather than the bodies, and the context pack gets a token budget that
+/// fits inside the same answer. Every one of these is advertised on the served
+/// schema by [`apply_belt_schema_defaults`], so a caller reading `tools/list`
+/// sees the number the belt actually sends and can raise it with the same
+/// `max_chars` it always could.
 pub fn apply_belt_defaults(name: &str, arguments: &mut HashMap<String, serde_json::Value>) {
-    if name != "semantic_locate" {
-        return;
+    if name == "semantic_locate" {
+        arguments
+            .entry("surface".to_string())
+            .or_insert_with(|| serde_json::Value::String("compact".to_string()));
     }
-    arguments
-        .entry("surface".to_string())
-        .or_insert_with(|| serde_json::Value::String("compact".to_string()));
+
+    // Shape before bodies on the walker. Not inserted when the caller named
+    // either spelling, because `compact` is the alias for `include_body: false`
+    // and overriding a caller who asked for one of them would be the belt
+    // answering a question it was not asked.
+    if name == "trace_data_flow"
+        && !arguments.contains_key("include_body")
+        && !arguments.contains_key("compact")
+    {
+        arguments.insert("include_body".to_string(), serde_json::Value::Bool(false));
+    }
+
+    if name == "get_context_pack" {
+        arguments
+            .entry("token_budget".to_string())
+            .or_insert_with(|| serde_json::json!(AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET));
+    }
+
+    // A page the client's own per-result budget does not cut. Only when the
+    // caller named no limit of its own, so an agent that asks for more pages
+    // gets them.
+    if name == "semantic_locate" {
+        arguments
+            .entry("limit".to_string())
+            .or_insert_with(|| serde_json::json!(AGENT_DEFAULT_LOCATE_PAGE));
+    }
+
+    // The response ceiling, on every belt tool that has one. Both spellings are
+    // checked before inserting, because `ResponseBudget::from_arguments` takes
+    // the FIRST of `max_chars` then `max_response_chars` that is present: an
+    // unconditional insert would silently outrank a caller who had passed
+    // `max_response_chars` and hand them a ceiling they never asked for.
+    if BUDGET_TOOLS.contains(&name)
+        && !arguments.contains_key("max_chars")
+        && !arguments.contains_key("max_response_chars")
+    {
+        arguments.insert(
+            "max_chars".to_string(),
+            serde_json::json!(AGENT_DEFAULT_RESPONSE_MAX_CHARS),
+        );
+    }
 }
 
 /// The short description for each tool the `agent-default` profile serves, by
@@ -159,7 +231,7 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
              name, kind, file, line, signature and score. Read `ranked_by` first: with no \
              embeddings the ranking is lexical, so a plain word of your question can match a \
              symbol of that name and crowd the first rows. If you already know the exact symbol \
-             name, call find_declarations instead.",
+             name, call semantic_search instead.",
         ),
         (
             DECLARATION_FILTER_CANONICAL,
@@ -181,7 +253,10 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
             "kin_graph_status",
             "Report the graph this call is answered from: entity and relation counts, and how many \
              entities are embedded, pending or unindexed. Call it first when a search returns less \
-             than you expect, since an unembedded graph cannot rank by meaning.",
+             than you expect, since an unembedded graph cannot rank by meaning. On a store under \
+             continuous reconcile it can answer `sampling=last_settled_selected_graph` instead of a \
+             live one: the same counters as of the last settled reading, with a `stale` block \
+             giving that reading's age. Read `sampling` to tell the two apart.",
         ),
         // ── Walking: the chain question, and where it is answered ──
         (
@@ -305,11 +380,27 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
 /// The input properties `agent-default` advertises for each tool, by registered
 /// name. A tool absent from this table keeps its full schema.
 ///
-/// Two rules decided every list. A property that changes WHICH entities come
-/// back stays. A property that only reshapes the response (`compact`,
-/// `max_chars`, `explain`, `snippet_alias`, `pipeline`) goes, because the
-/// profile now picks those defaults itself and every one of them is another line
-/// the model reads before it can ask its question.
+/// Two rules decided every list, and one exception overrides the second.
+///
+/// A property that changes WHICH entities come back stays. A property that only
+/// reshapes the response (`explain`, `snippet_alias`, `pipeline`) goes, because
+/// the profile picks those defaults itself and every one of them is another
+/// line the model reads before it can ask its question.
+///
+/// The exception: a response-shaping property the shipped proofs or the
+/// acceptance suite assert stays anyway, because those checks read the served
+/// schema as the contract an agent discovers the knob from. Trimming
+/// `include_body` and `compact` off `trace_data_flow` and `max_chars` off every
+/// tool that registered one took three acceptance findings red for four
+/// landings, and an agent that cannot see the knob cannot ask for bodies or
+/// bound a response. Three checks own that contract:
+/// `scripts/acceptance/magic_repro.py` `check_6`, which requires `include_body`
+/// or `compact` on `trace_data_flow`; `check_14` arm 3, which requires the
+/// literal `last_settled_selected_graph` in the served `kin_graph_status`
+/// description; and `scripts/acceptance/response_budget_elisions.py` `check_2`,
+/// which grades every advertised `max_chars` or `max_response_chars` and
+/// reports UNREADABLE when it finds none. Do not trim these again without
+/// moving those checks in the same change.
 fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
     BTreeMap::from([
         // Thirteen properties down to five. `cursor` and `page_size` stay
@@ -318,22 +409,38 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
         // all, and a caller asking about a test cannot otherwise find one.
         (
             "semantic_locate",
-            &["query", "limit", "granularity", "cursor", "include_tests"] as &[&str],
+            &[
+                "query",
+                "limit",
+                "granularity",
+                "cursor",
+                "include_tests",
+                "max_chars",
+            ] as &[&str],
         ),
         (
             DECLARATION_FILTER_CANONICAL,
-            &["query", "kind", "language", "limit"] as &[&str],
+            &["query", "kind", "language", "limit", "max_chars"] as &[&str],
         ),
         // `query` stays beside `entity_id`: this tool resolves an exact symbol
         // name to its canonical definition, and dropping it would take away the
         // path a caller uses when it has a name and no id.
         (
             "find_references",
-            &["entity_id", "query", "relation_kinds"] as &[&str],
+            &["entity_id", "query", "relation_kinds", "max_chars"] as &[&str],
         ),
         (
             "trace_data_flow",
-            &["focal", "target", "direction", "depth"] as &[&str],
+            &[
+                "focal",
+                "target",
+                "direction",
+                "depth",
+                "include_body",
+                "compact",
+                "max_response_chars",
+                "max_chars",
+            ] as &[&str],
         ),
         (
             crate::handlers::path::TOOL_NAME,
@@ -345,27 +452,322 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
                 "direction",
                 "max_depth",
                 "limit",
+                "max_chars",
             ] as &[&str],
         ),
         (
             "graph_neighborhood",
-            &["entity_id", "depth", "direction", "limit"] as &[&str],
+            &["entity_id", "depth", "direction", "limit", "max_chars"] as &[&str],
         ),
         (
             "impact_analysis",
-            &["entity_ids", "files", "base", "head", "change_ids"] as &[&str],
+            &[
+                "entity_ids",
+                "files",
+                "base",
+                "head",
+                "change_ids",
+                "max_chars",
+            ] as &[&str],
         ),
         (
             "get_context_pack",
-            &["entity_id", "depth", "token_budget"] as &[&str],
+            &["entity_id", "depth", "token_budget", "max_chars"] as &[&str],
         ),
         ("kin_provenance_query", &["entity_id", "limit"] as &[&str]),
     ])
 }
 
-/// Rewrite one served tool list for the `agent-default` profile: short
-/// descriptions, trimmed schemas, and the declaration filter under its honest
-/// name.
+/// The response ceiling `agent-default` asks for on its agents' behalf.
+///
+/// Derived from one rule rather than taste: an agent must be able to make at
+/// least six tool calls at default answer size inside a 24,000-token run and
+/// still have room to answer. That puts one answer at about 2,800 tokens, and at
+/// the 4.28 bytes per token measured on this profile's own JSON against
+/// `google/gemma-4-e4b` that is about 12,000 characters.
+///
+/// The registered default is 45,000, which is [`crate::budget::
+/// RESPONSE_DEFAULT_MAX_CHARS`] and right for a client with room. On this belt
+/// it is catastrophic for the case the belt exists for: 45,000 characters is
+/// roughly 10,500 tokens, so TWO default answers exhaust a 24,000-token run
+/// before the model has reasoned about either. That is read from source rather
+/// than guessed, because `apply_belt_defaults` shaped only `semantic_locate`'s
+/// `surface` and every other tool fell through to the registered default.
+///
+/// Advertised AND injected, deliberately the same number. The acceptance suite
+/// treats the served schema as the contract an agent reads, so a belt that
+/// injected 12,000 while advertising 45,000 would be lying in the one place a
+/// caller looks. Both halves move together, and `full` keeps 45,000.
+pub const AGENT_DEFAULT_RESPONSE_MAX_CHARS: u64 = 12_000;
+
+/// The ranked entities `semantic_locate` returns per page on `agent-default`.
+///
+/// The response cap above bounds what the SERVER builds. This bounds what a
+/// CLIENT is handed, which is a different cut and the one that was binding.
+/// Measured on the demo's React and VS Code stores on 2026-09-02
+/// (`scratchpad/reports/demo-rerun.md`), every `semantic_locate` in all three
+/// agentic runs came back cut at the client's own 1,500-token per-result
+/// budget, which is 5,250 characters at that harness's 3.5 characters per
+/// token. Compaction had made the payload three to five times smaller and it
+/// still did not fit, so the cut landed every time and the model re-issued the
+/// same query three times per run rather than reading a whole answer.
+///
+/// A client cut is not a cut Kin can disclose: the server returned inside its
+/// own ceiling and the harness truncated afterwards, so none of the remediation
+/// text in [`crate::budget`] ever reached the model. The only lever Kin holds is
+/// to return a page that fits.
+///
+/// 12 is counted, not inferred. Read-only against the demo's own daemons on
+/// 2026-09-02, with the demo's own binary and environment so no second daemon
+/// was started, running the logged command and varying only the page:
+///
+/// | query | 24 | 13 | 12 | 11 |
+/// |---|---|---|---|---|
+/// | type character in editor | 6,471 | 4,624 | 4,343 | 4,065 |
+/// | handle keyboard input character insertion | 8,732 | 5,281 | 5,029 | 4,779 |
+/// | editor handles key press event for character input | 7,425 | 4,305 | 4,038 | 3,769 |
+/// | component asking for an update (react) | 7,669 | 4,743 | 4,464 | 4,128 |
+///
+/// The page-24 column reproduces `demo-rerun.md` byte for byte, which is the
+/// control that says this is the same surface it measured. At 13 the densest
+/// query is 5,281 bytes and misses the window by 31; at 12 every query fits,
+/// the worst with 221 characters to spare. So 12 is the largest page that fits
+/// them all.
+///
+/// An earlier inference from the report's density line put this at 13. It was
+/// off by one, which is what counting is for.
+///
+/// A page is not a cap on what the caller can reach. The answer carries
+/// `total_ranked` and `next_cursor`, so an agent that wants more asks for the
+/// next page instead of re-asking the same question, which is the behaviour this
+/// number exists to buy.
+pub const AGENT_DEFAULT_LOCATE_PAGE: u64 = 12;
+
+/// The context pack's own token budget on `agent-default`.
+///
+/// `get_context_pack` bounds itself in TOKENS as well as characters, and its
+/// registered default of 16,000 is larger than the whole answer this belt now
+/// asks for. 2,500 sits under the roughly 2,800 tokens
+/// [`AGENT_DEFAULT_RESPONSE_MAX_CHARS`] buys, leaving the envelope its room.
+pub const AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET: u64 = 2_500;
+
+/// The belt tools whose registered schema advertises a response budget.
+///
+/// Held as a list because [`apply_belt_defaults`] runs on every call and
+/// building the registry there to rediscover eight names would cost more than
+/// it saves. `the_budget_tool_list_matches_the_registry` fails if the registry
+/// and this list ever disagree, so it cannot go stale quietly.
+const BUDGET_TOOLS: [&str; 8] = [
+    "semantic_locate",
+    DECLARATION_FILTER_CANONICAL,
+    "find_references",
+    "trace_data_flow",
+    crate::handlers::path::TOOL_NAME,
+    "graph_neighborhood",
+    "impact_analysis",
+    "get_context_pack",
+];
+
+/// The properties whose advertised `default` this belt rewrites, by tool.
+///
+/// A number the profile injects has to be the number the profile advertises, or
+/// the served schema stops being the contract the acceptance suite grades it as.
+fn belt_schema_defaults() -> BTreeMap<(&'static str, &'static str), serde_json::Value> {
+    let mut defaults: BTreeMap<(&'static str, &'static str), serde_json::Value> = BTreeMap::new();
+    for tool in BUDGET_TOOLS {
+        defaults.insert(
+            (tool, "max_chars"),
+            serde_json::json!(AGENT_DEFAULT_RESPONSE_MAX_CHARS),
+        );
+    }
+    // `trace_data_flow` registers the same budget under both spellings, and a
+    // caller reading either one has to see the same ceiling.
+    defaults.insert(
+        ("trace_data_flow", "max_response_chars"),
+        serde_json::json!(AGENT_DEFAULT_RESPONSE_MAX_CHARS),
+    );
+    // Shape first. The tool's own belt description tells a model to pass false
+    // when it wants the shape of a chain, and then the registered default handed
+    // it bodies anyway.
+    defaults.insert(
+        ("trace_data_flow", "include_body"),
+        serde_json::Value::Bool(false),
+    );
+    defaults.insert(
+        ("get_context_pack", "token_budget"),
+        serde_json::json!(AGENT_DEFAULT_CONTEXT_PACK_TOKEN_BUDGET),
+    );
+    defaults.insert(
+        ("semantic_locate", "limit"),
+        serde_json::json!(AGENT_DEFAULT_LOCATE_PAGE),
+    );
+    defaults
+}
+
+/// Rewrite one tool's advertised property defaults for `agent-default`.
+///
+/// Only a property the schema already carries is touched, so this can never
+/// invent a knob, and only its `default` moves: `minimum` and `maximum` are the
+/// server's real limits and stay as registered, which is also what keeps
+/// `response_budget_elisions.py` `check_2` satisfied, since it requires
+/// `minimum < default <= maximum`.
+fn apply_belt_schema_defaults(tool: &str, schema: &mut serde_json::Value) {
+    let defaults = belt_schema_defaults();
+    let Some(properties) = schema
+        .get_mut("properties")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    for (name, property) in properties.iter_mut() {
+        let (Some(value), Some(property)) = (
+            defaults.get(&(tool, name.as_str())),
+            property.as_object_mut(),
+        ) else {
+            continue;
+        };
+        property.insert("default".to_string(), value.clone());
+    }
+}
+
+/// The most characters one `agent-default` PROPERTY description may carry.
+///
+/// The tool descriptions were the visible half of the belt's cost and 1353 cut
+/// them from 47,739 characters to 6,188. Measured on 2026-09-02 against
+/// `google/gemma-4-e4b`, the model the demo actually runs, that left the served
+/// list at 7,747 tokens of which 6,380 are input schema and only 1,367 are
+/// description. The schemas are where the budget goes now, and inside them the
+/// bytes are property prose: thirteen property descriptions ran past 200
+/// characters, and one of them, `max_chars`, carried the same 649 characters on
+/// seven different tools.
+///
+/// 200 is one plain clause. A property description exists to tell a model what
+/// to pass, and the shape, bounds and default are already machine-readable
+/// beside it in `type`, `enum`, `minimum`, `maximum` and `default`, so prose
+/// that restates them is paid for twice.
+/// `no_agent_default_property_description_exceeds_its_budget` fails on any
+/// property over it.
+pub const AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET: usize = 200;
+
+/// The tools whose schemas this module does not rewrite at all.
+///
+/// 1353 left the nested transaction contracts whole, and they stay whole: a
+/// staged mutation's shape is the thing a caller gets wrong, and it is the one
+/// place on this belt where the schema IS the documentation. They cost 11,245
+/// bytes and 2,423 tokens between them, which is 31 percent of every token in
+/// the served list, and that number belongs in a product decision about which
+/// tools a read-only agent is served rather than in a prose trim.
+const PROSE_EXEMPT_TOOLS: [&str; 2] = ["kin_transaction_stage", "kin_transaction_commit"];
+
+/// Short property descriptions that read the same on every tool carrying them.
+///
+/// Keyed by property name alone, because these properties mean one thing across
+/// the belt and the long forms said that one thing seven times.
+/// [`tool_property_descriptions`] overrides this per tool where the meaning
+/// genuinely differs.
+fn shared_property_descriptions() -> BTreeMap<&'static str, &'static str> {
+    BTreeMap::from([
+        (
+            "max_chars",
+            "Serialized characters this response may occupy. What the budget cut is named under \
+             `elisions` and `_kin.response`, and a list it cut keeps one entry, so an empty list \
+             means none were found.",
+        ),
+        (
+            "max_response_chars",
+            "Serialized characters this response may occupy. `max_chars` is the same parameter \
+             under the other retrieval tools' name. A cut chain keeps one step and reports the \
+             rest under `elisions.chain`.",
+        ),
+        (
+            "cursor",
+            "Opaque token from a prior result's `next_cursor`, returning the next page of the \
+             same collection. Pass it back unedited, and omit it for a fresh query.",
+        ),
+    ])
+}
+
+/// Short property descriptions for one tool's property, overriding
+/// [`shared_property_descriptions`] where a name means different things.
+///
+/// Keyed by `(tool, property)`. `direction` is the reason this table exists: it
+/// walks callees on `trace_data_flow` and dependencies on `graph_neighborhood`,
+/// and one clause cannot honestly say both.
+fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'static str> {
+    BTreeMap::from([
+        (
+            ("semantic_locate", "include_tests"),
+            "Rank test-role entities alongside source. Off by default unless your query itself \
+             reads as being about tests; what it withheld is counted under \
+             `semantic_coverage.graph_bodies`.",
+        ),
+        (
+            ("list_file_entities", "path"),
+            "Repository-relative path of the file to enumerate, such as \"lib/express.js\". No \
+             leading slash, no \"..\", no Kin or Git control component. Optional only when \
+             `cursor` names the file.",
+        ),
+        (
+            ("trace_data_flow", "target"),
+            "A symbol you are trying to reach, by exact name or UUID. Neighbours it stays \
+             reachable from survive the per-step cap first. Optional; one resolving to nothing \
+             is reported in degradations.",
+        ),
+        (
+            ("trace_data_flow", "include_body"),
+            "Inline each step's source body. Pass false for the SHAPE of the chain, which is a \
+             fraction of the size and is what you want unless you mean to read the code.",
+        ),
+        (
+            ("trace_data_flow", "direction"),
+            "Which way to walk: `calls` for callees, `callers` for callers, `both` merges.",
+        ),
+        (
+            ("graph_neighborhood", "direction"),
+            "Which way to walk: `out` for what the focal depends on, `in` for what depends on it \
+             (blast radius), `both` merges.",
+        ),
+    ])
+}
+
+/// Replace one tool's top-level property descriptions with their short forms.
+///
+/// Top-level only. A nested schema below a property belongs to whatever
+/// contract that property describes, and on this belt the only deep ones are
+/// the transaction mutations that [`PROSE_EXEMPT_TOOLS`] keeps whole anyway.
+fn shorten_property_descriptions(tool: &str, schema: &mut serde_json::Value) {
+    if PROSE_EXEMPT_TOOLS.contains(&tool) {
+        return;
+    }
+    let shared = shared_property_descriptions();
+    let per_tool = tool_property_descriptions();
+    let Some(properties) = schema
+        .get_mut("properties")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    for (name, property) in properties.iter_mut() {
+        let short = per_tool
+            .get(&(tool, name.as_str()))
+            .or_else(|| shared.get(name.as_str()));
+        let (Some(short), Some(property)) = (short, property.as_object_mut()) else {
+            continue;
+        };
+        if property.contains_key("description") {
+            property.insert(
+                "description".to_string(),
+                serde_json::Value::String((*short).to_string()),
+            );
+        }
+    }
+}
+
+/// Rewrite one served tool list for the `agent-default` profile: short tool
+/// descriptions, trimmed schemas, and short property descriptions inside the
+/// schemas that survive. Tool names are left exactly as registered, because two
+/// proofs that run only on `main` read `tools/list` and assert a name
+/// literally.
 ///
 /// A tool with no short form keeps its registered description, so adding a tool
 /// to the profile is never silently a tool with no description. The
@@ -381,14 +783,12 @@ pub fn compact_for_agent_default(list: &mut ToolsListResult) {
         if let Some(keep) = keeps.get(tool.name.as_str()) {
             trim_schema(&mut tool.input_schema, keep);
         }
-        if tool.name == DECLARATION_FILTER_CANONICAL {
-            tool.name = DECLARATION_FILTER_ALIAS.to_string();
-        }
+        shorten_property_descriptions(&tool.name, &mut tool.input_schema);
+        apply_belt_schema_defaults(&tool.name, &mut tool.input_schema);
     }
-    // The list is served in name order, and renaming a tool moves it. Re-sorting
-    // keeps that contract: a client caches the prompt it builds from
-    // `tools/list`, so an order that depended on a rename would miss the cache.
-    list.tools.sort_by(|left, right| left.name.cmp(&right.name));
+    // No name is rewritten here, so the name order `tools::tool_definitions`
+    // built survives untouched. A client caches the prompt it builds from
+    // `tools/list`, and an order this function moved would miss that cache.
 }
 
 /// Keep only the named properties, and narrow `required` to what survives.
@@ -545,28 +945,33 @@ mod tests {
                 .tools
                 .iter()
                 .any(|t| t.name == DECLARATION_FILTER_ALIAS),
-            "the alias is served, never registered"
+            "the alias is accepted on a call, never registered and never served"
         );
     }
 
-    /// The rename, on both halves: `agent-default` serves the honest name, and
-    /// a call under either name reaches the same handler.
+    /// Both halves: `agent-default` serves the registered name, and a call
+    /// under either name reaches the same handler.
+    ///
+    /// The alias was served for four landings and took two main-only proofs red
+    /// on each of them. Serving the registered name is what those proofs assert;
+    /// accepting the alias on a call is what keeps a caller that learned it in
+    /// the meantime working.
     #[test]
-    fn agent_default_serves_the_declaration_filter_under_its_honest_name() {
+    fn agent_default_serves_the_declaration_filter_under_its_registered_name() {
         let served = served_agent_default();
         assert!(
             served
                 .tools
                 .iter()
-                .any(|t| t.name == DECLARATION_FILTER_ALIAS),
-            "agent-default must serve {DECLARATION_FILTER_ALIAS}"
+                .any(|t| t.name == DECLARATION_FILTER_CANONICAL),
+            "agent-default must serve {DECLARATION_FILTER_CANONICAL}"
         );
         assert!(
             !served
                 .tools
                 .iter()
-                .any(|t| t.name == DECLARATION_FILTER_CANONICAL),
-            "and must not also serve the misleading name"
+                .any(|t| t.name == DECLARATION_FILTER_ALIAS),
+            "and must not serve the alias, which the shipped proofs do not know"
         );
         assert_eq!(
             canonical_tool_name(DECLARATION_FILTER_ALIAS),
@@ -581,6 +986,411 @@ mod tests {
         for name in ["semantic_locate", "find_references", "get_entity_source"] {
             assert_eq!(canonical_tool_name(name), name);
         }
+    }
+
+    /// Every tool name the shipped proofs assert by name must be served under
+    /// exactly that name on `agent-default`, and no tool may be served under a
+    /// name the registry does not carry.
+    ///
+    /// Two proofs read `tools/list` and assert a tool name literally.
+    /// `.github/workflows/install-proof.yml`, in its "Graph query and MCP
+    /// tool-call proof" step, throws `MCP tools/list omitted semantic_search`
+    /// and then calls that tool twice through `tools/call`.
+    /// `scripts/prove-windows-npm-first-run.mjs` asserts
+    /// `toolNames.includes('semantic_search')` for both npm entrypoints. Both
+    /// jobs are `skipped` on a pull request and graded only on `main`'s push
+    /// run, so before this test nothing per-PR could see a served name move:
+    /// the change that introduced this module served `semantic_search` as
+    /// `find_declarations`, and both proofs stayed red for four landings.
+    ///
+    /// The second assertion is the general form of that class. A served name
+    /// the registry does not carry is a rename by another route, whatever tool
+    /// it lands on, and it fails here rather than on `main` a landing later. If
+    /// you added a name to one of those two files, add it to
+    /// `PROOF_ASSERTED_NAMES` as well. If this test is in your way because you
+    /// meant to move a served name, that move takes those two files,
+    /// `docs/mcp-tools.md` and the acceptance suite with it, in one change.
+    #[test]
+    fn agent_default_serves_every_name_the_shipped_proofs_assert() {
+        // Read out of the two files named above on 2026-09-02. Both assert
+        // `semantic_search` and no other tool name.
+        const PROOF_ASSERTED_NAMES: &[&str] = &["semantic_search"];
+
+        let served: Vec<String> = served_agent_default()
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for name in PROOF_ASSERTED_NAMES {
+            assert!(
+                served.iter().any(|candidate| candidate == name),
+                "the shipped proofs call {name} by name and agent-default serves {served:?}"
+            );
+        }
+
+        let registered: Vec<String> = crate::tools::tool_definitions()
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let unregistered: Vec<&String> = served
+            .iter()
+            .filter(|name| !registered.contains(*name))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "agent-default serves {unregistered:?} under a name the registry does not carry, \
+             which is a public rename no per-PR check but this one can see"
+        );
+    }
+
+    /// No served property description may run past its budget.
+    ///
+    /// Property prose was 10,153 bytes of the served schemas outside the two
+    /// exempt transaction tools, and one clause, `max_chars`, carried the same
+    /// 649 characters on seven tools. The shape, bounds and default of a
+    /// property are already machine-readable beside its description, so prose
+    /// that restates them is paid for on every `tools/list` a small model reads.
+    ///
+    /// Top-level properties only, and the two tools in [`PROSE_EXEMPT_TOOLS`]
+    /// are skipped, because the earlier compaction kept their nested mutation
+    /// contracts whole and this test is not the place to reopen that.
+    ///
+    /// Nothing in the acceptance suite reads a property description, checked
+    /// rather than assumed: `magic_repro.py` `check_6` tests for the presence of
+    /// the `include_body` or `compact` KEY, `check_14` arm 3 reads the TOOL
+    /// description, and `response_budget_elisions.py` `grade_advertised_budget`
+    /// reads only `maximum`, `default` and `minimum`. So this budget binds
+    /// without moving a check.
+    #[test]
+    fn no_agent_default_property_description_exceeds_its_budget() {
+        let over: Vec<(String, String, usize)> = served_agent_default()
+            .tools
+            .into_iter()
+            .filter(|tool| !PROSE_EXEMPT_TOOLS.contains(&tool.name.as_str()))
+            .flat_map(|tool| {
+                let properties = tool
+                    .input_schema
+                    .get("properties")
+                    .and_then(|value| value.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                properties
+                    .into_iter()
+                    .filter_map(|(name, property)| {
+                        let length = property.get("description")?.as_str()?.chars().count();
+                        (length > AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET).then_some((
+                            tool.name.clone(),
+                            name,
+                            length,
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            over.is_empty(),
+            "over the {AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET}-character property budget: \
+             {over:?}; give each one a single clause in shared_property_descriptions or \
+             tool_property_descriptions"
+        );
+    }
+
+    /// The control for the budget above: the registered schemas must still carry
+    /// the long forms, or the profile is passing because the registry lost them.
+    #[test]
+    fn the_full_profile_keeps_the_long_property_descriptions() {
+        let full = crate::tools::tool_definitions();
+        let locate = full
+            .tools
+            .iter()
+            .find(|tool| tool.name == "semantic_locate")
+            .expect("semantic_locate is registered");
+        let budget = locate.input_schema["properties"]["max_chars"]["description"]
+            .as_str()
+            .expect("max_chars carries a description");
+        assert!(
+            budget.chars().count() > AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET,
+            "the full profile's max_chars prose was shortened too: {} chars",
+            budget.chars().count()
+        );
+    }
+
+    /// Every advertised response budget on `agent-default` stays at or under the
+    /// cap, and the number advertised is the number injected.
+    ///
+    /// The registered ceiling is 45,000 characters, about 10,500 gemma-4-e4b
+    /// tokens, so two default answers exhaust the 24,000-token run this belt
+    /// exists to fit. The cap is derived from one rule: six calls at default
+    /// size inside that run with room left to answer.
+    ///
+    /// Both halves are asserted together on purpose. A belt that injected the
+    /// cap while advertising 45,000 would pass any check that reads only one
+    /// side, and the served schema is what an agent reads before it decides
+    /// whether to narrow its own request. `minimum` and `maximum` are left as
+    /// registered, which is also what keeps
+    /// `response_budget_elisions.py` `check_2` satisfied, since it requires
+    /// `minimum < default <= maximum`.
+    #[test]
+    fn no_agent_default_response_budget_is_advertised_above_the_cap() {
+        let served = served_agent_default();
+        let mut problems: Vec<String> = Vec::new();
+        for tool in &served.tools {
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(|value| value.as_object());
+            let Some(properties) = properties else {
+                continue;
+            };
+            for key in ["max_chars", "max_response_chars"] {
+                let Some(property) = properties.get(key) else {
+                    continue;
+                };
+                let advertised = property.get("default").and_then(|value| value.as_u64());
+                match advertised {
+                    None => problems.push(format!("{}.{key} advertises no default", tool.name)),
+                    Some(value) if value > AGENT_DEFAULT_RESPONSE_MAX_CHARS => {
+                        problems.push(format!(
+                            "{}.{key} advertises {value}, over the \
+                             {AGENT_DEFAULT_RESPONSE_MAX_CHARS}-character cap",
+                            tool.name
+                        ))
+                    }
+                    Some(_) => {}
+                }
+                // The number advertised has to be the number the belt sends.
+                let mut arguments = HashMap::new();
+                apply_belt_defaults(&tool.name, &mut arguments);
+                let injected = arguments.get("max_chars").and_then(|value| value.as_u64());
+                if injected != Some(AGENT_DEFAULT_RESPONSE_MAX_CHARS) {
+                    problems.push(format!(
+                        "{} advertises a budget and the belt injects {injected:?}",
+                        tool.name
+                    ));
+                }
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "agent-default response budgets disagree with the cap: {problems:#?}"
+        );
+    }
+
+    /// `semantic_locate`'s served page stays at or under the cap, and the number
+    /// advertised is the number injected.
+    ///
+    /// This is the client-side cut rather than the server-side one. Every
+    /// `semantic_locate` in all three agentic runs on the React and VS Code
+    /// stores came back cut at the harness's own 1,500-token per-result budget,
+    /// and the model answered by re-issuing the same query rather than paging.
+    /// A client cut is invisible to Kin, so the page has to fit before it is
+    /// sent.
+    ///
+    /// Advertised and injected are asserted together, for the same reason the
+    /// response budget is: a belt that shrank the page it sends while
+    /// advertising 20 would leave an agent reasoning about a page size it is not
+    /// getting.
+    #[test]
+    fn the_served_locate_page_stays_under_the_cap() {
+        let served = served_agent_default();
+        let locate = served
+            .tools
+            .iter()
+            .find(|tool| tool.name == "semantic_locate")
+            .expect("agent-default serves semantic_locate");
+        let advertised = locate.input_schema["properties"]["limit"]["default"].as_u64();
+        assert_eq!(
+            advertised,
+            Some(AGENT_DEFAULT_LOCATE_PAGE),
+            "the served page must be the cap; a client's own per-result budget cuts anything \
+             larger and Kin cannot disclose a cut it did not make"
+        );
+
+        let mut arguments = HashMap::new();
+        apply_belt_defaults("semantic_locate", &mut arguments);
+        assert_eq!(
+            arguments.get("limit").and_then(|value| value.as_u64()),
+            Some(AGENT_DEFAULT_LOCATE_PAGE),
+            "the belt must send the page it advertises"
+        );
+
+        // The control: the registry must still carry the larger default, so this
+        // is the profile choosing a page rather than the registry having lost
+        // one.
+        let registered = crate::tools::tool_definitions();
+        let full = registered
+            .tools
+            .iter()
+            .find(|tool| tool.name == "semantic_locate")
+            .expect("semantic_locate is registered");
+        let registered_limit = full.input_schema["properties"]["limit"]["default"].as_u64();
+        assert!(
+            registered_limit.is_some_and(|value| value > AGENT_DEFAULT_LOCATE_PAGE),
+            "the full profile's locate page was shrunk too: {registered_limit:?}"
+        );
+    }
+
+    /// The belt must never outrank a caller who named a budget itself.
+    ///
+    /// `ResponseBudget::from_arguments` takes the FIRST of `max_chars` then
+    /// `max_response_chars` that is present, so an unconditional insert of
+    /// `max_chars` would silently override a caller who had passed
+    /// `max_response_chars` and answer under a ceiling they never asked for.
+    #[test]
+    fn the_belt_never_overrides_a_budget_the_caller_named() {
+        for key in ["max_chars", "max_response_chars"] {
+            let mut arguments = HashMap::from([(key.to_string(), serde_json::json!(58_000u64))]);
+            apply_belt_defaults("trace_data_flow", &mut arguments);
+            assert_eq!(
+                arguments.get(key).and_then(|value| value.as_u64()),
+                Some(58_000),
+                "the belt moved a {key} the caller named"
+            );
+            assert!(
+                !(key == "max_response_chars" && arguments.contains_key("max_chars")),
+                "the belt added max_chars beside a caller's max_response_chars, which \
+                 from_arguments would then prefer"
+            );
+        }
+        // Same rule on the walker's shape.
+        for key in ["include_body", "compact"] {
+            let mut arguments = HashMap::from([(key.to_string(), serde_json::json!(true))]);
+            apply_belt_defaults("trace_data_flow", &mut arguments);
+            assert_eq!(
+                arguments.get(key).and_then(|value| value.as_bool()),
+                Some(true),
+                "the belt moved a {key} the caller named"
+            );
+        }
+        // And a caller that names nothing gets the belt's shape.
+        let mut bare = HashMap::new();
+        apply_belt_defaults("trace_data_flow", &mut bare);
+        assert_eq!(
+            bare.get("include_body").and_then(|value| value.as_bool()),
+            Some(false),
+            "the walker's default shape on this belt is the chain, not the bodies"
+        );
+    }
+
+    /// [`BUDGET_TOOLS`] must name exactly the belt tools the REGISTRY gives a
+    /// budget property, or the belt caps a subset and nothing says so.
+    #[test]
+    fn the_budget_tool_list_matches_the_registry() {
+        let full = crate::tools::tool_definitions();
+        let belt: std::collections::HashSet<&str> = crate::tools::agent_default_tool_names()
+            .iter()
+            .copied()
+            .collect();
+        let mut registered: Vec<String> = full
+            .tools
+            .into_iter()
+            .filter(|tool| belt.contains(tool.name.as_str()))
+            .filter(|tool| {
+                tool.input_schema
+                    .get("properties")
+                    .and_then(|value| value.as_object())
+                    .is_some_and(|properties| {
+                        properties.contains_key("max_chars")
+                            || properties.contains_key("max_response_chars")
+                    })
+            })
+            .map(|tool| tool.name)
+            .collect();
+        registered.sort();
+        let mut listed: Vec<String> = BUDGET_TOOLS.iter().map(|name| name.to_string()).collect();
+        listed.sort();
+        assert_eq!(
+            listed, registered,
+            "BUDGET_TOOLS and the registry disagree about which belt tools carry a budget"
+        );
+    }
+
+    /// The knobs the shipped acceptance checks read out of the served surface.
+    ///
+    /// `agent-default` trims response-shaping properties, and three acceptance
+    /// checks read exactly those properties as the contract an agent discovers
+    /// a knob from. Trimming them took `Product Acceptance` red on `main` for
+    /// four landings, as `magic:6`, `magic:14` and `response_budget:2`, while
+    /// every pull request stayed green, because that job is `skipped` on a pull
+    /// request and graded only on `main`'s push run.
+    ///
+    /// The three checks, so the next person can find them.
+    /// `scripts/acceptance/magic_repro.py` `check_6` requires `include_body` or
+    /// `compact` on `trace_data_flow`. Its `check_14` arm 3 requires the literal
+    /// `last_settled_selected_graph` in the served `kin_graph_status`
+    /// description. `scripts/acceptance/response_budget_elisions.py` `check_2`
+    /// grades every advertised `max_chars` or `max_response_chars` and reports
+    /// UNREADABLE when it finds none, so the served profile has to advertise a
+    /// budget wherever the registry does.
+    ///
+    /// Every arm collects rather than panics, so one trimmed knob reports itself
+    /// and the other two arms still run.
+    #[test]
+    fn agent_default_serves_every_knob_the_shipped_checks_assert() {
+        const BUDGET_KEYS: [&str; 2] = ["max_chars", "max_response_chars"];
+        let served = served_agent_default();
+        let full = crate::tools::tool_definitions();
+        let properties = |list: &ToolsListResult, name: &str| -> Vec<String> {
+            list.tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.input_schema.get("properties"))
+                .and_then(|value| value.as_object())
+                .map(|object| object.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let has_budget =
+            |keys: &[String]| keys.iter().any(|key| BUDGET_KEYS.contains(&key.as_str()));
+        let mut problems: Vec<String> = Vec::new();
+
+        // magic_repro.py check_6.
+        let trace = properties(&served, "trace_data_flow");
+        if !trace
+            .iter()
+            .any(|key| key == "include_body" || key == "compact")
+        {
+            problems.push(format!(
+                "trace_data_flow advertises neither include_body nor compact, which \
+                 magic_repro.py check_6 requires: {trace:?}"
+            ));
+        }
+
+        // response_budget_elisions.py check_2, graded against the registry's own set.
+        for tool in &served.tools {
+            if !has_budget(&properties(&full, &tool.name)) {
+                continue;
+            }
+            let keys = properties(&served, &tool.name);
+            if !has_budget(&keys) {
+                problems.push(format!(
+                    "{} registers a budget parameter and agent-default advertises none, so \
+                     response_budget_elisions.py check_2 grades a smaller set than it did: \
+                     {keys:?}",
+                    tool.name
+                ));
+            }
+        }
+
+        // magic_repro.py check_14, arm 3.
+        let status = served
+            .tools
+            .iter()
+            .find(|tool| tool.name == "kin_graph_status")
+            .map(|tool| tool.description.as_str())
+            .unwrap_or_default();
+        if !status.contains("last_settled_selected_graph") {
+            problems.push(
+                "the kin_graph_status short description does not carry \
+                 last_settled_selected_graph, which magic_repro.py check_14 arm 3 requires"
+                    .to_string(),
+            );
+        }
+
+        assert!(
+            problems.is_empty(),
+            "agent-default trimmed a knob a shipped acceptance check reads: {problems:#?}"
+        );
     }
 
     /// The in-place form the dispatchers call must agree with the borrowing one,
@@ -600,9 +1410,9 @@ mod tests {
         }
     }
 
-    /// The served list stays in name order after the rename moved a tool.
+    /// The served list stays in name order.
     #[test]
-    fn the_served_list_stays_sorted_after_the_rename() {
+    fn the_served_list_stays_sorted() {
         let names: Vec<String> = served_agent_default()
             .tools
             .into_iter()
@@ -633,20 +1443,23 @@ mod tests {
             properties.contains_key("query"),
             "the question must survive"
         );
-        for shaping in [
-            "max_chars",
-            "compact",
-            "explain",
-            "snippet_alias",
-            "pipeline",
-        ] {
+        // `max_chars` is the exception the keep-list doc names. It shapes the
+        // response like the four below, and it stays advertised because
+        // response_budget_elisions.py check_2 grades the advertised budget and
+        // reports UNREADABLE when no tool carries one. An agent that cannot see
+        // it cannot bound a response either.
+        assert!(
+            properties.contains_key("max_chars"),
+            "max_chars is graded off the served schema and must stay advertised"
+        );
+        for shaping in ["compact", "explain", "snippet_alias", "pipeline"] {
             assert!(
                 !properties.contains_key(shaping),
                 "{shaping} shapes the response and should not be advertised here"
             );
         }
-        // The control: the registered schema still has them, so the profile is
-        // hiding them rather than the registry having lost them.
+        // The control: the registered schema still has them all, so the profile
+        // is hiding the four rather than the registry having lost them.
         let registered = crate::tools::tool_definitions();
         let full = registered
             .tools
@@ -702,7 +1515,7 @@ mod tests {
         let locate = descriptions["semantic_locate"];
         let filter = descriptions[DECLARATION_FILTER_CANONICAL];
         assert!(
-            locate.contains(DECLARATION_FILTER_ALIAS),
+            locate.contains(DECLARATION_FILTER_CANONICAL),
             "semantic_locate must name the tool a caller reaches for by mistake"
         );
         assert!(
@@ -767,18 +1580,58 @@ mod tests {
         }
     }
 
-    /// And it touches nothing else. A default that leaked onto another tool
-    /// would be sending an argument its handler never advertised.
+    /// Every argument the belt inserts is one the tool's registered schema
+    /// advertises, with one named exception, and a tool the belt has no default
+    /// for is left exactly as the caller sent it.
+    ///
+    /// This replaces a form that asserted the belt touched `semantic_locate`
+    /// alone. That held while `surface` was the only injection and stopped being
+    /// the point once the response ceiling moved onto every budget tool. The
+    /// durable invariant is the one that test's own comment named: a default
+    /// that leaked onto a tool would be sending an argument its handler never
+    /// advertised. That is what this asserts, against the registry rather than
+    /// against a list of names that has to be remembered.
+    ///
+    /// The exception is `semantic_locate`'s `surface`, which the registry
+    /// advertises on no profile. The compact shape is opt-in on the wire by
+    /// design, the handler reads the argument by name, and no tool in this
+    /// profile sets `additionalProperties: false`. It is named here so the
+    /// exception stays a decision on the record rather than a hole in the test.
     #[test]
-    fn the_belt_defaults_apply_to_locate_alone() {
-        for tool in ["semantic_search", "find_references", "get_context_pack"] {
-            let mut args: HashMap<String, serde_json::Value> = HashMap::new();
-            apply_belt_defaults(tool, &mut args);
-            assert!(
-                args.is_empty(),
-                "{tool} must be left exactly as the caller sent it"
-            );
+    fn the_belt_only_injects_arguments_the_tool_advertises() {
+        const UNADVERTISED_BY_DESIGN: [(&str, &str); 1] = [("semantic_locate", "surface")];
+        let full = crate::tools::tool_definitions();
+        let mut untouched = 0usize;
+        for tool in &full.tools {
+            let mut arguments: HashMap<String, serde_json::Value> = HashMap::new();
+            apply_belt_defaults(&tool.name, &mut arguments);
+            if arguments.is_empty() {
+                untouched += 1;
+                continue;
+            }
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(|value| value.as_object());
+            for key in arguments.keys() {
+                if UNADVERTISED_BY_DESIGN.contains(&(tool.name.as_str(), key.as_str())) {
+                    continue;
+                }
+                assert!(
+                    properties.is_some_and(|properties| properties.contains_key(key)),
+                    "the belt injected {key} into {}, whose registered schema does not \
+                     advertise it",
+                    tool.name
+                );
+            }
         }
+        // The control. Without it the loop above is satisfied by a belt that
+        // injects into everything, since every assertion would then be about a
+        // tool that has defaults rather than about one that must not.
+        assert!(
+            untouched > 0,
+            "every registered tool received a belt default, so this test proved nothing"
+        );
     }
 
     /// Same for the keep-lists: a keep-list naming a property the tool does not

@@ -127,6 +127,7 @@ jobs:
           bash ./scripts/test-publish-dev-container.sh
           bash ./scripts/kin-dev-image.test.sh
           python3 ./scripts/test-kin-registry-release-receiver.py
+          python3 ./scripts/test-kin-registry-wave-landing.py
           python3 ./scripts/test_install_optional_vfs.py
           python3 ./scripts/test_installer_parity.py
           # Every install surface builds a release asset name; the release
@@ -1305,6 +1306,103 @@ jobs:
             exit 1
           fi
           echo "every fast-gate shard succeeded"
+
+  # The served MCP surface, graded on the pull request that moves it.
+  #
+  # Five assertions in this repository read the served surface, and every one of
+  # them runs only on `main`'s push: install-proof.yml's "Graph query and MCP
+  # tool-call proof" step, which throws `MCP tools/list omitted semantic_search`
+  # and then calls that tool twice; `scripts/prove-windows-npm-first-run.mjs`,
+  # which asserts `toolNames.includes('semantic_search')` for both npm
+  # entrypoints; and Product Acceptance's `magic:6`, `magic:14` and
+  # `response_budget:2`, which read a schema knob, a description sentence and
+  # every advertised budget.
+  #
+  # On 2026-09-02 a change to the `agent-default` profile moved a served name
+  # and trimmed three schema knobs and a description sentence. All five of those
+  # assertions were `skipped` across 44 of 44 check runs on that pull request,
+  # and all five were red on `main` for four landings while every pull request
+  # read green. `crates/kin-mcp/src/agent_belt.rs` holds the first layer of that
+  # per pull request, at the library level; this is the second, on the wire,
+  # where a spawned server resolves a profile and writes a listing to a client.
+  #
+  # It reuses the acceptance suites' own readers rather than restating them, so
+  # a rule edited in either file moves here in the same commit. It publishes no
+  # required context of its own: `bin/kin-lane merge land` refuses on any check
+  # that is not green by name, and ruleset 19746451 is what would additionally
+  # make it block a merge through GitHub's own UI.
+  mcp-surface-contract:
+    name: MCP surface contract
+    needs: changes
+    if: >-
+      ${{ !cancelled()
+      && needs.changes.outputs.docs_only != 'true' }}
+    # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    # Shared with `check` through the cache key below, so the two declare one
+    # environment; `assert_shared_cache_key_jobs_declare_one_environment` in
+    # scripts/test-release-workflow-authority.py is what holds them together.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # FIR-2744, and see the note on the first cache step in this file.
+          add-rust-environment-hash-key: false
+          # This job reads the entry `check` writes and never writes one itself.
+          shared-key: check
+          save-if: false
+
+      # First, and with no binary. A grader that cannot fail is not evidence,
+      # and every grader below decides whether a public tool surface moved. The
+      # falsification drives each one against its correct case and against the
+      # exact break it exists for, in under a second, so a grader broken by an
+      # edit fails here rather than passing quietly beside a real server.
+      - name: Falsify the MCP surface graders
+        run: python3 scripts/acceptance/mcp_surface_contract.py --self-test
+
+      - name: Build kin + kin-daemon
+        run: cargo build --locked --bin kin --bin kin-daemon
+
+      # The suite's own exit codes carry the verdict: 1 when an assertion
+      # failed, 2 when one could not be read, 3 when the fixture could not be
+      # built. None of the three is a pass, and an unreadable surface says
+      # nothing about whether the surface moved, so all three fail this job.
+      - name: Grade the served agent-default MCP surface
+        env:
+          KIN_SURFACE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/mcp_surface_contract.py \
+            --kin target/debug/kin \
+            --daemon target/debug/kin-daemon \
+            --json acceptance/mcp-surface.json \
+            --label "$KIN_SURFACE_LABEL" \
+            --verbose >acceptance/mcp-surface.log 2>&1 || rc=$?
+          cat acceptance/mcp-surface.log
+          {
+            echo "### MCP surface contract (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/mcp-surface.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=The served MCP surface moved::the assertions that grade it on main are skipped on every pull request; this is the same set, on this pull request's own binaries"
+            exit 1
+          fi
+          echo "the served agent-default surface still satisfies every main-only assertion"
 
   # A skipped matrix job never expands, so the required per-platform contexts
   # would go missing instead of reporting skipped, and a required context nobody

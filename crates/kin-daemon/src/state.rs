@@ -2008,6 +2008,9 @@ struct HostedPublicationGuard {
     control: Option<Arc<crate::publication_lease::PublicationControl>>,
     lease: Option<crate::publication_lease::ActivePublicationLease>,
     rollout: Option<crate::publication_lease::LeaseProof>,
+    /// The same lease, bound in the control so the Firestore store can re-read
+    /// it before retrying a transient failure. Cleared when this guard drops.
+    _bound: Option<crate::publication_lease::BoundMutationLease>,
 }
 
 impl HostedPublicationGuard {
@@ -2016,6 +2019,7 @@ impl HostedPublicationGuard {
             control: None,
             lease: None,
             rollout: None,
+            _bound: None,
         }
     }
 
@@ -2023,10 +2027,19 @@ impl HostedPublicationGuard {
         control: Arc<crate::publication_lease::PublicationControl>,
         lease: crate::publication_lease::ActivePublicationLease,
     ) -> Self {
+        let bound = control.bind_mutation_lease(
+            crate::publication_lease::LeaseKind::Publication,
+            crate::publication_lease::LeaseProof {
+                scope: control.scope().to_string(),
+                token: lease.token.clone(),
+                fence: lease.fence,
+            },
+        );
         Self {
             control: Some(control),
             lease: Some(lease),
             rollout: None,
+            _bound: Some(bound),
         }
     }
 
@@ -2034,10 +2047,13 @@ impl HostedPublicationGuard {
         control: Arc<crate::publication_lease::PublicationControl>,
         proof: crate::publication_lease::LeaseProof,
     ) -> Self {
+        let bound = control
+            .bind_mutation_lease(crate::publication_lease::LeaseKind::Rollout, proof.clone());
         Self {
             control: Some(control),
             lease: None,
             rollout: Some(proof),
+            _bound: Some(bound),
         }
     }
 
@@ -2050,8 +2066,18 @@ impl HostedPublicationGuard {
     /// Renew then re-read the exact proof immediately before an external
     /// mutation. A lease that expired, was fenced, or changed hands cannot
     /// authorize the next write.
+    ///
+    /// A rollout proof is renewed here too, not only asserted. The first hosted
+    /// rollout publishes every repository's metadata and then its edges under
+    /// the one lease acquired at startup, and this is the only point on that
+    /// path that runs before each of those publications; a lease that was only
+    /// asserted here ran out under a fleet whose publication outlived the
+    /// window, with every write done and none of the credit kept.
     fn reassert_before_mutation(&mut self) -> Result<()> {
         if let (Some(control), Some(proof)) = (self.control.as_ref(), self.rollout.as_ref()) {
+            control
+                .renew_rollout_before_mutation(proof)
+                .map_err(|error| Self::publication_error("rollout lease renewal", error))?;
             control
                 .assert_rollout_lease(proof)
                 .map_err(|error| Self::publication_error("rollout proof reassertion", error))?;
@@ -5763,6 +5789,57 @@ impl DaemonState {
         }
     }
 
+    /// Drive the startup rollout that `bootstrap_runtime_if_absent` left
+    /// pending, from the Firestore fleet fence through publication, reader
+    /// admission and release. This is the sequence the daemon binary runs when
+    /// it owns the first rollout of a fleet or resumes its own exact startup
+    /// lease after a crash; it lives here so the same bytes can be driven end
+    /// to end under a test clock, and every step runs under the pending lease
+    /// with the proof bound for the Firestore store's retry gate.
+    #[doc(hidden)]
+    pub async fn complete_hosted_startup_rollout(
+        &self,
+        control: &Arc<crate::publication_lease::PublicationControl>,
+        pending: crate::publication_lease::ActivePublicationLease,
+        legacy_writer_drain_proof_sha256: Option<String>,
+    ) -> std::result::Result<(), String> {
+        let proof = crate::publication_lease::LeaseProof {
+            scope: control.scope().to_string(),
+            token: pending.token,
+            fence: pending.fence,
+        };
+        let _bound = control
+            .bind_mutation_lease(crate::publication_lease::LeaseKind::Rollout, proof.clone());
+        let fence = control
+            .spine_rollout_fence(&proof)
+            .map_err(|error| error.to_string())?;
+        let evidence = self.advance_hosted_spine_rollout_fence(fence).await?;
+        control
+            .checkpoint_spine_rollout_fence(&proof, &evidence)
+            .map_err(|error| error.to_string())?;
+        control
+            .complete_rollout_acquisition(&proof)
+            .map_err(|error| error.to_string())?;
+        let admission = crate::publication_lease::AdmitReaderRequest {
+            lease: proof.clone(),
+            repositories: control.fleet_repositories().to_vec(),
+            reader: crate::publication_lease::ReaderAdmissionInput {
+                identity: control.runtime_reader_identity().to_string(),
+                min_snapshot_schema: kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+                max_snapshot_schema: kin_db::GraphSnapshot::CURRENT_VERSION,
+                valid_for_seconds: crate::publication_lease::MAX_READER_ADMISSION_SECONDS,
+            },
+            legacy_writer_drain_proof_sha256,
+        };
+        self.prepare_hosted_spine_rollout(&admission).await?;
+        self.admit_hosted_spine_rollout_fence(admission).await?;
+        self.release_hosted_spine_rollout(crate::publication_lease::ReleaseRolloutLeaseRequest {
+            lease: proof,
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Publish the exact target fleet under the still-active rollout proof.
     /// Ordinary publication leases are intentionally unavailable while a
     /// rollout is active, so the rollout control plane owns this one bounded
@@ -5917,6 +5994,12 @@ impl DaemonState {
             .rollout_spine_fence_evidence(&request.lease)
             .map_err(|error| format!("load rollout evidence before reader admission: {error}"))?;
         let _publication_gate = self.spine_refresh_gate.write().await;
+        // The hydration proof below reads every committed row back before the
+        // reader is admitted; renew first so that proof runs under a fresh
+        // window rather than whatever the last publication left.
+        control
+            .renew_rollout_before_mutation(&request.lease)
+            .map_err(|error| format!("renew rollout before reader admission: {error}"))?;
         control
             .assert_rollout_lease(&request.lease)
             .map_err(|error| format!("reassert rollout before reader admission: {error}"))?;
@@ -5979,6 +6062,9 @@ impl DaemonState {
             .rollout_spine_fence_evidence(&request.lease)
             .map_err(|error| format!("load rollout evidence before release: {error}"))?;
         let _publication_gate = self.spine_refresh_gate.write().await;
+        control
+            .renew_rollout_before_mutation(&request.lease)
+            .map_err(|error| format!("renew rollout before release proof: {error}"))?;
         control
             .assert_rollout_lease(&request.lease)
             .map_err(|error| format!("reassert rollout before release: {error}"))?;
@@ -7380,6 +7466,26 @@ impl DaemonState {
         self.sibling_capture.get().copied()
     }
 
+    /// The gate the Firestore store consults before it retries a transient
+    /// failure: re-read the lease the in-flight hosted mutation is bound to,
+    /// and refuse the retry when that lease expired, was fenced or changed
+    /// hands while the failed request was in flight. A local daemon has no
+    /// publication control and nothing to defend, so its gate passes.
+    ///
+    /// Only the Firestore backend installs it, so a build without that
+    /// feature has no caller and would refuse the dead code under
+    /// `-D warnings`; the tests drive it on every feature shape.
+    #[cfg(any(feature = "firestore", test))]
+    pub(crate) fn hosted_transient_retry_gate(&self) -> kin_spine::TransientRetryGate {
+        let control = self.publication_control.clone();
+        Arc::new(move || match control.as_ref() {
+            Some(control) => control
+                .reassert_bound_mutation_lease()
+                .map_err(|error| error.to_string()),
+            None => Ok(()),
+        })
+    }
+
     fn create_spine_backend(
         &self,
     ) -> std::result::Result<Arc<dyn kin_spine::SpineBackend>, String> {
@@ -7418,7 +7524,12 @@ impl DaemonState {
                     database = database_id.as_deref().unwrap_or("(default)"),
                     "using Firestore spine backend for stateless daemon pool"
                 );
-                let backend = kin_spine::FirestoreSpineBackend::new(project_id, database_id);
+                let backend = kin_spine::FirestoreSpineBackend::new_with_endpoint(
+                    project_id,
+                    database_id,
+                    kin_spine::FirestoreEndpoint::GoogleApis,
+                    Some(self.hosted_transient_retry_gate()),
+                );
                 // Construction is intentionally publication-capable but not
                 // reader-ready. A first rollout must be able to create the
                 // Firestore fleet fence and cursor-bound heads even when
@@ -18062,5 +18173,215 @@ mod tests {
             "{}",
             plain.profile
         );
+    }
+
+    /// The stranger class from the 2026-09-02 rehearsal against production's
+    /// own control record (kin-ecosystem .kin-coord/reports/spinefix-20260902.md,
+    /// sections 3 and 5). The first hosted rollout publishes every
+    /// repository's metadata and then its edges under the one lease minted at
+    /// startup; nothing renewed it, and every run died with the work done and
+    /// the credit lost: 204 s of a 300 s lease consumed after ONE repository's
+    /// 27,987 entities, four repositories and the whole edge pass still ahead.
+    ///
+    /// This drives the exact sequence the binary runs, over the durable fake,
+    /// under a clock that charges each publication more than the old window
+    /// and less than the new one. Completion is then attributable only to the
+    /// renewal before each publication, and the fixture asserts that the total
+    /// charged exceeds the window one acquisition gives, so a change that made
+    /// the whole rollout fit inside one window would fail here rather than
+    /// pass for the wrong reason.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn first_hosted_rollout_outlives_its_startup_lease_by_renewing_before_each_publication() {
+        use crate::publication_lease::test_clock::ManualClock;
+        use crate::publication_lease::{
+            InMemoryPublicationControlStore, PublicationClock, PublicationControl,
+            DEFAULT_ROLLOUT_LEASE_SECONDS,
+        };
+        use kin_db::{InMemoryGraph, LocalFileBackend, StorageBackend, GENERATION_INIT};
+        use std::sync::atomic::AtomicI64;
+
+        const READER: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        /// Longer than the 300 s window the startup lease used to get and
+        /// shorter than the window it gets now: one publication fits only
+        /// under the new window, and the fleet fits only with renewal.
+        const PUBLICATION_SECONDS: i64 = 400;
+
+        let fleet = ["kin", "kin-db", "kin-editor", "kin-vfs", "kinlab"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        environment.apply("GOOGLE_CLOUD_PROJECT", Some("fixture-project"));
+        environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
+        environment.apply("KIN_GCS_PREFIX", Some("fixture-prefix"));
+        environment.apply("KIN_REPO_IDS", Some(&fleet.join(",")));
+        environment.apply::<_, &str>("KIN_DISABLE_SPINE", None);
+        let scope = "gcs://fixture-bucket/fixture-prefix";
+
+        let backend_root = tempfile::tempdir().unwrap();
+        for repo_id in &fleet {
+            let graph = InMemoryGraph::new();
+            graph
+                .upsert_entity(&test_entity(
+                    &format!("{}_entity", repo_id.replace('-', "_")),
+                    "src/lib.rs",
+                ))
+                .unwrap();
+            LocalFileBackend::new(backend_root.path())
+                .save_snapshot(
+                    repo_id,
+                    &graph.to_snapshot().to_bytes().unwrap(),
+                    GENERATION_INIT,
+                )
+                .unwrap();
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let clock = Arc::new(ManualClock::new());
+        let control = Arc::new(
+            PublicationControl::with_clock(
+                scope,
+                READER,
+                fleet.clone(),
+                Arc::new(InMemoryPublicationControlStore::default()),
+                Arc::clone(&clock) as Arc<dyn PublicationClock>,
+            )
+            .unwrap(),
+        );
+        let state = DaemonState::open_with_backend_and_publication_control(
+            layout,
+            Box::new(LocalFileBackend::new(backend_root.path())),
+            "kin",
+            Some(fleet.iter().cloned().collect()),
+            Arc::clone(&control),
+        )
+        .unwrap();
+        let fake = Arc::new(kin_spine::test_support::FakeSpineStore::cold());
+        let charged = Arc::new(AtomicI64::new(0));
+        *fake.prepare_hook.lock().unwrap() = Some(Box::new({
+            let clock = Arc::clone(&clock);
+            let charged = Arc::clone(&charged);
+            move |_repo_id: &str| {
+                clock.advance(PUBLICATION_SECONDS);
+                charged.fetch_add(PUBLICATION_SECONDS, Ordering::SeqCst);
+            }
+        }));
+        state.install_hosted_durable_spine_for_test(Arc::new(
+            kin_spine::FirestoreSpineBackend::with_store(fake.clone()),
+        ));
+        assert!(
+            state.hosted_spine_readiness_required(),
+            "the composed path is only under test with hosted readiness on"
+        );
+
+        let pending = control
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("an absent control record leaves one pending startup rollout");
+        let window = (pending.expires_at - pending.acquired_at).num_seconds();
+        assert!(
+            PUBLICATION_SECONDS > DEFAULT_ROLLOUT_LEASE_SECONDS as i64
+                && PUBLICATION_SECONDS < window,
+            "the fixture must charge each publication more than the old window ({}) and less \
+             than the minted one ({window}), or it proves nothing about renewal",
+            DEFAULT_ROLLOUT_LEASE_SECONDS
+        );
+
+        state
+            .complete_hosted_startup_rollout(
+                &control,
+                pending,
+                Some(format!("sha256:{}", "b".repeat(64))),
+            )
+            .await
+            .expect("the first hosted rollout must finish inside the lease it keeps renewing");
+
+        let total = charged.load(Ordering::SeqCst);
+        assert!(
+            total > window,
+            "the rollout charged {total} s against a {window} s window, so its completion \
+             cannot be attributed to renewal"
+        );
+        let record = control.status().unwrap();
+        assert!(
+            record.active_lease.is_none(),
+            "release must clear the startup lease"
+        );
+        control
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .expect("the reader is admitted once the rollout has released");
+        assert_eq!(
+            fake.publication_state.lock().unwrap().heads.len(),
+            fleet.len(),
+            "every repository head committed"
+        );
+        assert!(
+            control.bound_mutation_lease_for_test().is_none(),
+            "the startup sequence unbinds its proof when it is done"
+        );
+    }
+
+    /// The gate the Firestore store consults before a transient retry is the
+    /// state's own closure over its publication control: it passes with
+    /// nothing bound, passes on a live bound lease, refuses once that lease
+    /// has expired, and passes again once the owner is gone.
+    #[test]
+    #[serial_test::serial]
+    fn hosted_transient_retry_gate_reasserts_the_bound_lease() {
+        use crate::publication_lease::test_clock::ManualClock;
+        use crate::publication_lease::{
+            InMemoryPublicationControlStore, LeaseKind, LeaseProof, PublicationClock,
+            PublicationControl, HOSTED_ROLLOUT_LEASE_SECONDS,
+        };
+        use kin_db::LocalFileBackend;
+
+        const READER: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let fleet = vec!["kin".to_string(), "kin-db".to_string()];
+        let repo = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let backend_root = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ManualClock::new());
+        let control = Arc::new(
+            PublicationControl::with_clock(
+                "gcs://fixture/v2",
+                READER,
+                fleet.clone(),
+                Arc::new(InMemoryPublicationControlStore::default()),
+                Arc::clone(&clock) as Arc<dyn PublicationClock>,
+            )
+            .unwrap(),
+        );
+        let state = DaemonState::open_with_backend_and_publication_control(
+            layout,
+            Box::new(LocalFileBackend::new(backend_root.path())),
+            "kin",
+            Some(fleet.iter().cloned().collect()),
+            Arc::clone(&control),
+        )
+        .unwrap();
+        let gate = state.hosted_transient_retry_gate();
+        gate().expect("nothing bound, nothing to defend");
+
+        let pending = control
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("pending startup rollout");
+        let bound = control.bind_mutation_lease(
+            LeaseKind::Rollout,
+            LeaseProof {
+                scope: control.scope().to_string(),
+                token: pending.token.clone(),
+                fence: pending.fence,
+            },
+        );
+        gate().expect("a live bound lease passes");
+        clock.advance(HOSTED_ROLLOUT_LEASE_SECONDS as i64 + 1);
+        let refused = gate().expect_err("an expired bound lease refuses the retry");
+        assert!(refused.contains("expired"), "{refused}");
+        drop(bound);
+        gate().expect("an unbound lease defends nothing");
     }
 }

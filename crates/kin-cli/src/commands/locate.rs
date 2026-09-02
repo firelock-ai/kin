@@ -639,12 +639,158 @@ pub fn query_names_entity(query: &str, name: &str) -> bool {
         return false;
     }
     let target = name.to_ascii_lowercase();
-    let last = qualified_name_tail(&target).to_string();
+    let last = qualified_name_tail(&target);
+    query_tokens(query).any(|token| {
+        let lowered = token.to_ascii_lowercase();
+        lowered == target || lowered == last
+    })
+}
+
+/// The query tokenizer, defined once.
+///
+/// [`query_names_entity`] and the query-shape rules below have to split a query
+/// identically, or a token can name a symbol under one rule and not exist under
+/// the other. Tokens come back in their ORIGINAL case, because case is the
+/// signal [`is_symbolic_search_term`] reads; a caller matching against a name
+/// lowercases per token.
+fn query_tokens(query: &str) -> impl Iterator<Item = &str> {
     query
-        .to_ascii_lowercase()
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|token| !token.is_empty())
-        .any(|token| token == target || token == last)
+}
+
+/// A prose query carries at least this many tokens.
+///
+/// Three is the longest symbol path [`query_tokens`] routinely produces
+/// (`crate::Type::method`), so the floor sits one above it. Below the floor the
+/// tier is left exactly as it shipped, which is the conservative direction:
+/// this rule can only ever DEMOTE, and a short query a human meant as a lookup
+/// has to keep the guarantee the tier was built for.
+const LOCATE_PROSE_MIN_TOKENS: usize = 4;
+
+/// A prose query carries at least this many stopwords.
+///
+/// Two rather than one, because a symbol path can carry one by accident
+/// (`http.parse_request.to.string` tokenizes with `to`) while an English
+/// question essentially never carries fewer than two.
+const LOCATE_PROSE_MIN_STOPWORDS: usize = 2;
+
+/// Whether this query reads as a SENTENCE rather than a symbol lookup.
+///
+/// The distinction the exact-name tier never drew. `walk` typed alone is a
+/// request for the symbol `walk`; "Walk me through the path" is not, and the
+/// tier cannot tell them apart because all it ever sees is that some token
+/// equalled some name.
+///
+/// Two signals, both required, both chosen so the rule fires only on an
+/// unmistakable sentence: enough tokens to BE a sentence
+/// ([`LOCATE_PROSE_MIN_TOKENS`]) and enough English connectives that the string
+/// carries grammar ([`LOCATE_PROSE_MIN_STOPWORDS`]). Erring toward "lookup"
+/// preserves shipped behavior; erring toward "prose" would move rankings this
+/// rule was never meant to touch.
+///
+/// Reads [`ENGLISH_STOPWORDS`] rather than growing a second vocabulary. That
+/// list is already defined here as the words that "carry no code-identifier
+/// meaning", which is exactly the property this needs, and it is closed-class
+/// almost throughout: an open-class list would be useless here, because
+/// open-class words are precisely what symbols get named after (`send`,
+/// `socket`, `component`, `walk`). Sharing it does couple this rule to that
+/// list, so `the_prose_shape_rule_reads_the_queries_it_was_written_for` pins
+/// the verdict on named queries rather than on a count.
+pub fn query_is_prose(query: &str) -> bool {
+    let mut tokens = 0usize;
+    let mut stopwords = 0usize;
+    for token in query_tokens(query) {
+        tokens += 1;
+        if is_english_stopword(&token.to_ascii_lowercase()) {
+            stopwords += 1;
+        }
+    }
+    tokens >= LOCATE_PROSE_MIN_TOKENS && stopwords >= LOCATE_PROSE_MIN_STOPWORDS
+}
+
+/// Whether a query token that NAMES this entity is itself symbol-shaped.
+///
+/// The refinement of [`query_names_entity`] the prose rule needs: not "did some
+/// token name it" but "did a token that LOOKS LIKE A SYMBOL name it".
+/// [`is_symbolic_search_term`] reads the original-case token, so
+/// `redisReaderGetReply` and `Cross_Encoder_Model_Cached` are symbolic while
+/// `send`, `socket`, `component` and `walk` are not.
+///
+/// Strictly stronger than [`query_names_entity`]: every pair this accepts, that
+/// one accepts too. `the_symbolic_name_rule_never_claims_a_name_the_base_rule_denies`
+/// pins that, because two predicates reading one tokenizer are two things that
+/// can drift apart.
+fn query_names_entity_symbolically(query: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let target = name.to_ascii_lowercase();
+    let tail = qualified_name_tail(&target);
+    query_tokens(query).any(|token| {
+        let lowered = token.to_ascii_lowercase();
+        (lowered == target || lowered == tail) && is_symbolic_search_term(token)
+    })
+}
+
+/// Whether this entity's name match rests on nothing but a plain English word
+/// inside a sentence.
+///
+/// FIR-3079. Measured on a fully embedded hiredis store (730 entities, 1,485 of
+/// 1,485 indexed), "when I send a command, how does it reach the socket" ranked
+/// the Win32 compatibility macro `send` (sockcompat.h:90, score 180.0) first and
+/// `socket` (sockcompat.h:82, score 165.0) second, ahead of `redisFormatCommand`
+/// (hiredis.c:572) at score 300.0. A longer question about reply parsing put
+/// `socket` at score 55.0 above a row scoring 902.1. The tier is unbeatable by
+/// design, so a 16x score deficit still won, and the query never asked for
+/// either macro.
+///
+/// Only ever demotes, and only when BOTH halves hold: the query is a sentence,
+/// and no symbol-shaped token in it named this entity. A prose question that
+/// does name a real symbol ("how does redisReaderGetReply handle a partial
+/// reply") keeps its name tier, and every lookup keeps it unconditionally,
+/// which is the case the tier was built for and the one that must not regress.
+///
+/// It cannot separate "the walk function" from "walk me through", and does not
+/// try. It resolves that ambiguity toward the prose reading, because prose is
+/// what the caller typed and prose is the reading that was broken.
+///
+/// This is an ORDERING judgment and it changes no reported fact.
+/// [`classify_locate_match`] still calls the hit a name match, because the query
+/// still contained the name, and `match_evidence.name_match` and the cosine
+/// arm's own classifier keep agreeing with it. Public because
+/// `all_fallback` applies the same judgment at its own predicates, and one
+/// definition of "prose collision" is the point.
+///
+/// Split from [`name_match_is_prose_word_collision`] so the rule is testable
+/// without touching process environment: the tests pin THIS, and the wrapper
+/// adds only the kill switch.
+pub fn is_prose_word_collision(query: &str, name: &str) -> bool {
+    query_is_prose(query) && !query_names_entity_symbolically(query, name)
+}
+
+/// [`is_prose_word_collision`] under the kill switch.
+///
+/// `KIN_LOCATE_PROSE_NAME_DEMOTION=0` restores shipped ordering exactly, so one
+/// binary can run both arms of a ranking benchmark. The knob exists because a
+/// tier change moves every ranked result, and an A/B that has to compare two
+/// builds cannot tell a ranking change from a build difference.
+pub fn name_match_is_prose_word_collision(query: &str, name: &str) -> bool {
+    locate_env_bool("KIN_LOCATE_PROSE_NAME_DEMOTION", true) && is_prose_word_collision(query, name)
+}
+
+/// Whether a locate query reads as a symbol LOOKUP rather than a question.
+///
+/// The negation of [`query_is_prose`], stated once so the file-anchor admission
+/// and the exact-name tier read the SAME rule about the same query. A lookup is
+/// short or carries no English scaffolding: under four tokens, which is the
+/// longest symbol path the tokenizer routinely produces (`crate::Type::method`),
+/// or fewer than two stopwords, which a question essentially never is.
+///
+/// This is why the twelve control lookups the ranking lane pinned stay
+/// byte-identical with anchors on: every one of them is refused here.
+fn locate_query_is_symbol_lookup(query: &str) -> bool {
+    !query_is_prose(query)
 }
 
 /// Classify one located entity against the query.
@@ -655,6 +801,21 @@ pub fn query_names_entity(query: &str, name: &str) -> bool {
 /// `--explain`) reports `TextFallback`: the honest reading of "no name matched
 /// and this surface cannot say which pool answered" is the weaker claim, not the
 /// stronger one.
+///
+/// Deliberately unchanged by FIR-3079, and the reason is on the record. This
+/// answers a FACT, "did a query token equal this entity's name", and three
+/// other producers are documented as unable to disagree with it: the cosine
+/// arm's own `cosine_match_kind`, the `match_evidence.name_match` that rides
+/// beside it, and `semloc_query_has_exact_token`, which delegates here through
+/// [`query_names_entity`] precisely so one rule decides. Demoting here would
+/// make the fused arm report `text_fallback` while the cosine arm still
+/// reported `name` for the identical hit, putting a row in contradiction with
+/// its own evidence object.
+///
+/// The prose-collision judgment therefore lives in the ORDERING, in
+/// [`locate_exact_name_tier`], where a ranking decision belongs. The row still
+/// says the query contained its name, and it simply stops being unbeatable on
+/// that basis alone. See [`name_match_is_prose_word_collision`].
 fn classify_locate_match(
     query: &str,
     name: &str,
@@ -685,9 +846,22 @@ fn classify_locate_match(
 /// named. No score cap fixes that without flattening honest fallback ordering
 /// on queries that name nothing; a tier fixes it at every corpus scale and
 /// leaves scores meaningful within each tier.
-fn locate_exact_name_tier(entity: &LocateEntity) -> u8 {
+/// FIR-3079 gates the tier here, and ONLY here. A name hit whose name is a
+/// plain English word inside a sentence keeps `match_kind: name`, because the
+/// query did literally contain it, and simply loses the promotion, so it sorts
+/// on score beside everything else. Measured on a fully embedded hiredis store,
+/// that is what lets `redisFormatCommand` at score 300.0 outrank the Win32
+/// macro `send` at 180.0, and a row at 902.1 outrank the macro `socket` at
+/// 55.0, for questions that asked for neither macro.
+///
+/// The query is a parameter because the tier is a fact about a PAIR, the hit
+/// and the question, and it never was one about the hit alone. Callers that
+/// rank one query's results pass that query; the fused arm asks per variant.
+fn locate_exact_name_tier(entity: &LocateEntity, query: &str) -> u8 {
     match entity.match_kind {
-        Some(LocateMatchKind::Name) => 1,
+        Some(LocateMatchKind::Name) if !name_match_is_prose_word_collision(query, &entity.name) => {
+            1
+        }
         _ => 0,
     }
 }
@@ -804,6 +978,12 @@ pub struct LocateProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cosine: Option<f32>,
 }
+
+/// Resolution origin recorded on a row admitted as a ranked file's graph
+/// anchor rather than resolved from a query token. Always serialized, unlike
+/// the seed origins, so an anchor row can be told from a projected one on the
+/// surface an agent reads.
+pub const FILE_ANCHOR_ORIGIN: &str = "file_anchor";
 
 /// Default count of top ranked entities returned per `kin locate` page. Kept
 /// small (top-few high-confidence) so the agent sees the answer, not a file
@@ -17466,13 +17646,13 @@ fn entity_surface_class(name: &str, kind: &str) -> Option<&'static str> {
 /// A knob outside `[0, 1)` is a no-op rather than an amplifier: this function's
 /// job is to demote, and a value above one would silently promote every private
 /// name in the store.
-fn apply_entity_surface_penalty(ranked: &mut [(usize, LocateEntity)]) {
+fn apply_entity_surface_penalty(ranked: &mut [(usize, LocateEntity)], query: &str) {
     let penalty = locate_env_f32("KIN_LOCATE_ENTITY_SURFACE_PENALTY", 0.3);
     if !(0.0..1.0).contains(&penalty) {
         return;
     }
     for (_, entity) in ranked.iter_mut() {
-        if locate_exact_name_tier(entity) > 0 {
+        if locate_exact_name_tier(entity, query) > 0 {
             continue;
         }
         if entity_surface_class(&entity.name, &entity.kind).is_some() {
@@ -17507,6 +17687,98 @@ fn entity_projection_role_penalty(path: &str, test_query: bool) -> f32 {
     penalty
 }
 
+/// FIR-3079: demote a prose-word collision its own file does not corroborate.
+///
+/// kin#1367 takes such a row out of the exact-name tier, and on two measured
+/// questions it still leads on raw score: React's `Resolved.component` at
+/// 1052.0 against a best non-colliding 852.3, and ripgrep's
+/// `WalkBuilder::ignore` at 1052.0 against 652.0. Those two rows are
+/// indistinguishable by score, match kind and file rank, and one is wrong while
+/// the other is right. What differs is the neighbourhood: `Resolved.component`
+/// is the only row its file contributes to the whole ranking, while
+/// `WalkBuilder::ignore` sits with two siblings the retriever scored on their
+/// own. A word that hits one symbol in a file nothing else about the question
+/// reaches is a lexical accident; a word that hits a symbol in a file the
+/// retrieval also wanted for other reasons is an answer.
+///
+/// **This is a rule for those two shapes and not a general discriminator, and
+/// the honest failure modes are both measured.** It spares a WRONG row that has
+/// siblings: `TextmateSnippet.walk` carries eight of them, more than any correct
+/// row in the set. What makes that survivable is a fact about these rankings
+/// rather than a property of the rule: after kin#1367 every spared row already
+/// sits below a non-colliding leader. And it demotes a RIGHT row that is alone
+/// in its file, which `a_right_answer_alone_in_its_file_stays_on_the_page`
+/// pins: the demotion is a share of the score, never a floor, so such a row
+/// ranks lower and stays on the page.
+///
+/// Anchors admitted by [`FILE_ANCHOR_ORIGIN`] never corroborate. Corroboration
+/// means "the retrieval found something else here", and an anchor is admitted
+/// precisely because retrieval did not.
+fn apply_collision_corroboration_penalty(
+    ranked: &mut [(usize, LocateEntity)],
+    query: &str,
+    floor: f32,
+    target: usize,
+) {
+    if !locate_env_bool("KIN_LOCATE_COLLISION_CORROBORATION", true) {
+        return;
+    }
+    let is_collision = |entity: &LocateEntity| {
+        entity.match_kind == Some(LocateMatchKind::Name)
+            && is_prose_word_collision(query, &entity.name)
+    };
+    // A sibling corroborates only if the retrieval ranked it WELL, not merely
+    // ranked it. Measured 2026-09-02: React's `Resolved.component` at 1052.0 has
+    // two siblings from its file at ranks 109 and 110 of 136, scoring 52.4 and
+    // 52.1, which is five percent of its own score and no evidence at all that
+    // the file is about the question. ripgrep's `WalkBuilder::ignore` has two at
+    // 652.0, sixty-two percent of its 1052.0. Comparing against the collision's
+    // OWN score keeps this scale-free, which is what the exact-name tier's doc
+    // comment says a score rule has to be.
+    let sibling_share = locate_env_f32("KIN_LOCATE_COLLISION_SIBLING_SHARE", 0.25);
+    let mut corroboration: FxHashMap<String, usize> = FxHashMap::default();
+    let mut collision_scores: FxHashMap<String, f32> = FxHashMap::default();
+    for (_, entity) in ranked.iter() {
+        if !is_collision(entity) {
+            continue;
+        }
+        if let Some(file) = entity.provenance.file.as_deref() {
+            let best = collision_scores.entry(file.to_string()).or_insert(0.0);
+            *best = best.max(entity.score);
+        }
+    }
+    for (_, entity) in ranked.iter() {
+        if is_collision(entity) || entity.provenance.origin == FILE_ANCHOR_ORIGIN {
+            continue;
+        }
+        let Some(file) = entity.provenance.file.as_deref() else {
+            continue;
+        };
+        let Some(collision_score) = collision_scores.get(file) else {
+            continue;
+        };
+        if entity.score < collision_score * sibling_share {
+            continue;
+        }
+        *corroboration.entry(file.to_string()).or_default() += 1;
+    }
+    let target = target.max(1);
+    for (_, entity) in ranked.iter_mut() {
+        if !is_collision(entity) {
+            continue;
+        }
+        let found = entity
+            .provenance
+            .file
+            .as_deref()
+            .and_then(|file| corroboration.get(file))
+            .copied()
+            .unwrap_or(0);
+        let share = (found as f32 / target as f32).min(1.0);
+        entity.score *= floor + (1.0 - floor) * share;
+    }
+}
+
 /// The global entity ordering: definitions first, then the exact-name tier
 /// ([`locate_exact_name_tier`]: a hit the query literally named cannot be outbid
 /// by fallback scale), then composite score desc, then owner graph mass for the
@@ -17520,12 +17792,13 @@ fn entity_projection_role_penalty(path: &str, test_query: bool) -> f32 {
 /// disagree with it.
 fn order_locate_entities(
     ranked: &mut [(usize, LocateEntity)],
+    query: &str,
     owner_mass_of: impl Fn(&LocateEntity) -> usize,
 ) {
     ranked.sort_by(|(a_rank, a), (b_rank, b)| {
         b.definition
             .cmp(&a.definition)
-            .then_with(|| locate_exact_name_tier(b).cmp(&locate_exact_name_tier(a)))
+            .then_with(|| locate_exact_name_tier(b, query).cmp(&locate_exact_name_tier(a, query)))
             .then_with(|| {
                 b.score
                     .partial_cmp(&a.score)
@@ -17553,6 +17826,9 @@ pub fn build_entity_view(
     // (file_rank, LocateEntity) so global ranking can tie-break on file order.
     let mut ranked: Vec<(usize, LocateEntity)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // (file_rank, file score, file path, entity) for each anchor a ranked file
+    // offered.
+    let mut anchor_candidates: Vec<(usize, f32, String, kin_model::Entity)> = Vec::new();
     // Canonical-definition signal for exact-name ties (FIR-2337): owner graph
     // mass per name-hit entity id, computed for at most this many name hits so
     // a hundred-way `new` collision cannot turn projection into a graph walk.
@@ -17565,6 +17841,33 @@ pub fn build_entity_view(
     // and fall through to the file-order tie-break unchanged.
     let mut name_owner_mass: FxHashMap<String, usize> = FxHashMap::default();
     let owner_mass_limit = locate_env_usize("KIN_LOCATE_NAME_TIE_OWNER_MASS_LIMIT", 16);
+    // File-anchor admission (FIR-3079). The entity surface is a projection of
+    // the FILE ranking through the symbols a query token happened to name, so a
+    // file can rank first for a question and contribute nothing: measured on
+    // 2026-09-02, React's `ReactFiberWorkLoop.js` ranked FIRST for "what happens
+    // between a component asking for an update and that update appearing on
+    // screen" and contributed one row at rank 97 of 136, while six rows named
+    // `Component` took the page on the word "component". For a prose query the
+    // top ranked files also contribute their graph anchors, the definitions the
+    // rest of the repository depends on, so the surface can carry an answer the
+    // question never spelled. A lookup is left byte-identical.
+    let anchors_enabled =
+        locate_env_bool("KIN_LOCATE_FILE_ANCHORS", true) && !locate_query_is_symbol_lookup(query);
+    let anchor_files = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_FILES", 5);
+    let anchor_topk = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_TOPK", 2);
+    let anchor_probe = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_PROBE", 256);
+    // An anchor is a second opinion, never better evidence than the best thing
+    // retrieval actually found, so it is scored as a SHARE of this ranking's own
+    // top row rather than on an absolute constant. Measured 2026-09-02: an
+    // absolute 1500 handed rank one to `Extractor` from ripgrep's fifth-best
+    // file and pushed hiredis's right answer off rank one, which is the same
+    // failure a name-multiplier cap produced for kin#1367. A share is scale-free,
+    // so it behaves the same on a store whose text arm tops out at 280 and one
+    // where it reaches 1152.
+    let anchor_share = locate_env_f32("KIN_LOCATE_FILE_ANCHOR_SHARE", 0.9);
+    // Used only when a ranking has no scored row to take a share of, which is
+    // the docs-and-config repo whose files carry no entities at all.
+    let anchor_base = locate_env_f32("KIN_LOCATE_FILE_ANCHOR_SCORE", 100.0);
     // Built once on the first ranked file that resolves to no entity, because
     // it walks every tracked artifact and most rankings never need it.
     let mut tracked_artifacts: Option<HashSet<String>> = None;
@@ -17579,7 +17882,10 @@ pub fn build_entity_view(
             file_path: Some(kin_model::FilePathId::new(&file.path)),
             ..Default::default()
         };
-        let entities = if file.symbols.is_empty() {
+        // An anchor file is read whether or not a seed landed on it: "this file
+        // has no symbol a query token named" is the case anchors exist for.
+        let in_anchor_window = anchors_enabled && anchor_topk > 0 && file_rank < anchor_files;
+        let entities = if file.symbols.is_empty() && !in_anchor_window {
             Vec::new()
         } else {
             graph.query_entities(&filter)?
@@ -17666,18 +17972,133 @@ pub fn build_entity_view(
                 },
             ));
         }
+
+        if in_anchor_window {
+            for anchor in kin_ranking::entity_ranking::file_anchor_entities(
+                graph,
+                &entities,
+                anchor_topk,
+                anchor_probe,
+            )? {
+                if let Some(entity) = entities.iter().find(|candidate| candidate.id == anchor.id) {
+                    // Collected, not pushed: the score they take is a share of a
+                    // ranking that does not exist yet, and `seen` is deliberately
+                    // NOT claimed here so a later file's real evidence for the
+                    // same entity still wins the row.
+                    anchor_candidates.push((
+                        file_rank,
+                        file.score,
+                        file.path.clone(),
+                        entity.clone(),
+                    ));
+                }
+            }
+        }
     }
 
     // Surface penalty before the ordering, because it moves the composite score
     // the ordering then reads ([`apply_entity_surface_penalty`]).
-    apply_entity_surface_penalty(&mut ranked);
+    apply_entity_surface_penalty(&mut ranked, query);
+
+    // The anchors, beneath every row retrieval scored. The reference is this
+    // ranking's own top score, so the admission adapts to the store's scale
+    // instead of imposing one, and the share is strictly below 1.0 so an anchor
+    // can never take rank one from a row that carries real evidence. The decay
+    // keeps the file arm's order among the anchors themselves.
+    if !anchor_candidates.is_empty() {
+        let top = ranked
+            .iter()
+            .map(|(_, entity)| entity.score)
+            .fold(0.0_f32, f32::max);
+        let reference = if top > 0.0 {
+            top * anchor_share
+        } else {
+            anchor_base
+        };
+        // The file arm's own fused score carries the weight, normalized against
+        // the best file so it is a share like the reference is. A file the arm
+        // scored within a percent of its best contributes an anchor within a
+        // percent of the reference, which is the honest reading of "the file arm
+        // ranked these two nearly equally". Rank is the fallback for a ranking
+        // whose file scores are unusable.
+        let top_file = anchor_candidates
+            .iter()
+            .map(|(_, score, _, _)| *score)
+            .fold(0.0_f32, f32::max);
+        let mut admitted: Vec<(usize, LocateEntity)> = Vec::new();
+        for (file_rank, file_score, file_path, entity) in anchor_candidates {
+            let file_weight = if top_file > 0.0 && file_score > 0.0 {
+                file_score / top_file
+            } else {
+                1.0 / (1.0 + file_rank as f32)
+            };
+            let entity_id = entity.id.to_string();
+            if !seen.insert(entity_id.clone()) {
+                continue;
+            }
+            let file_origin = entity
+                .file_origin
+                .as_ref()
+                .map(|origin| origin.0.clone())
+                .or_else(|| Some(file_path.clone()));
+            // The match kind stays a fact: an anchor the query happens to name
+            // reports `name`, and one it does not reports the weaker claim,
+            // exactly as a projected symbol does.
+            let match_kind = classify_locate_match(query, &entity.name, FILE_ANCHOR_ORIGIN, None);
+            admitted.push((
+                file_rank,
+                LocateEntity {
+                    entity_id,
+                    id_space: LocateIdSpace::Entity,
+                    artifact_path: None,
+                    kind: format!("{:?}", entity.kind).to_lowercase(),
+                    name: entity.name.clone(),
+                    signature: entity.signature.clone(),
+                    score: reference
+                        * file_weight
+                        * entity_projection_role_penalty(&file_path, test_query),
+                    definition: true,
+                    span: entity_span_pair(&entity).into_iter().next(),
+                    // Bodies belong to the symbols the retrieval resolved; an
+                    // anchor carries coordinates and a signature, which is what
+                    // a focal needs to be opened.
+                    body: None,
+                    match_kind: Some(match_kind),
+                    provenance: LocateProvenance {
+                        file: file_origin,
+                        origin: FILE_ANCHOR_ORIGIN.to_string(),
+                        cosine: None,
+                    },
+                    matched_queries: Vec::new(),
+                },
+            ));
+        }
+        apply_entity_surface_penalty(&mut admitted, query);
+        ranked.extend(admitted);
+    }
+
+    // After the anchors, because an anchor must not corroborate a collision, and
+    // before the ordering, because the ordering reads the score this moves.
+    apply_collision_corroboration_penalty(
+        &mut ranked,
+        query,
+        // The floor is a CAP on the demotion, and it is pinned from both sides by
+        // measurement. It has to be under 0.810 or React's `Resolved.component`
+        // at 1052.0 keeps rank one over a best non-colliding 852.3, and it has to
+        // be high enough that a right answer alone in its file still lands on the
+        // six-row default page: at 0.5 the synthetic fixture's row fell from rank
+        // one to rank eight, off the page an agent reads.
+        locate_env_f32("KIN_LOCATE_COLLISION_LONE_FLOOR", 0.75),
+        locate_env_usize("KIN_LOCATE_COLLISION_CORROBORATION_TARGET", 2),
+    );
+
     let owner_mass_of = |entity: &LocateEntity| {
         name_owner_mass
             .get(entity.identity_key())
             .copied()
             .unwrap_or(0)
     };
-    order_locate_entities(&mut ranked, owner_mass_of);
+    order_locate_entities(&mut ranked, query, owner_mass_of);
 
     result.entities = ranked.into_iter().map(|(_, entity)| entity).collect();
 
@@ -18005,9 +18426,33 @@ pub fn fuse_locate_results(
             .filter_map(|candidate| candidate.match_kind)
             .max_by_key(|kind| locate_match_kind_strength(*kind));
     }
+    // The fused tier asks the FIR-3079 question per variant, not once over the
+    // joined text. Match kind above is the strongest kind any variant reported,
+    // so the tier has to be the strongest tier any variant would grant: a hit
+    // keeps the promotion when at least one variant that surfaced it named it
+    // outside a sentence, or named it with a symbol-shaped token. Asking the
+    // joined text instead would let one prose variant demote a hit an explicit
+    // symbol variant asked for by name.
+    let fused_tier: FxHashMap<String, u8> = fused_entities
+        .iter()
+        .map(|(entity, lists, _)| {
+            let tier = lists
+                .iter()
+                .map(|&list| locate_exact_name_tier(entity, &variants[list]))
+                .max()
+                .unwrap_or(0);
+            (entity.identity_key().to_string(), tier)
+        })
+        .collect();
+    let tier_of = |entity: &LocateEntity| -> u8 {
+        fused_tier
+            .get(entity.identity_key())
+            .copied()
+            .unwrap_or_else(|| locate_exact_name_tier(entity, ""))
+    };
     fused_entities.sort_by(|(a, _, sa), (b, _, sb)| {
-        locate_exact_name_tier(b)
-            .cmp(&locate_exact_name_tier(a))
+        tier_of(b)
+            .cmp(&tier_of(a))
             .then_with(|| sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| locate_entity_tiebreak_path(a).cmp(locate_entity_tiebreak_path(b)))
             .then_with(|| a.identity_key().cmp(b.identity_key()))
@@ -18735,8 +19180,8 @@ mod tests {
             .enumerate()
             .map(|(rank, (name, kind, score))| (rank, surface_hit(name, kind, *score, query)))
             .collect();
-        apply_entity_surface_penalty(&mut ranked);
-        order_locate_entities(&mut ranked, |_| 0);
+        apply_entity_surface_penalty(&mut ranked, query);
+        order_locate_entities(&mut ranked, query, |_| 0);
         ranked.into_iter().map(|(_, entity)| entity).collect()
     }
 
@@ -20716,6 +21161,363 @@ mod tests {
         assert!(!query_names_entity("anything", ""));
     }
 
+    /// The FIR-3079 rows, and the fact this fix deliberately does NOT touch.
+    ///
+    /// Every pair here was measured on a fully embedded hiredis store (730
+    /// entities, 1,485 of 1,485 indexed). The sentence "when I send a command,
+    /// how does it reach the socket" ranked the Win32 compatibility macro
+    /// `send` (sockcompat.h:90) first at score 180.0 and `socket`
+    /// (sockcompat.h:82) second at 165.0, ahead of `redisFormatCommand`
+    /// (hiredis.c:572) at 300.0. A longer reply-parsing question put `socket`
+    /// at 55.0 above a row at 902.1, a 16x deficit winning on tier alone.
+    ///
+    /// The query DID contain the word, so `match_kind` still says `name` and
+    /// this test asserts that it does. Three other producers are documented as
+    /// unable to disagree with that field (`cosine_match_kind`,
+    /// `match_evidence.name_match`, and `semloc_query_has_exact_token`, which
+    /// delegates to [`query_names_entity`]), so demoting the FACT would put a
+    /// fused row in contradiction with its own evidence object. Only the
+    /// ordering changes.
+    #[test]
+    fn a_prose_sentence_does_not_let_an_english_word_win_the_name_tier() {
+        for (query, name) in [
+            (
+                "when I send a command, how does it reach the socket",
+                "send",
+            ),
+            (
+                "when I send a command, how does it reach the socket",
+                "socket",
+            ),
+            (
+                "When a reply comes back from the Redis server, how does hiredis turn the bytes \
+                 on the socket into the reply object my code gets, and what happens along the \
+                 way if the reply is only half there?",
+                "socket",
+            ),
+            (
+                "What happens between a component asking for an update and that update appearing \
+                 on screen? Walk me through the path.",
+                "Resolved.component",
+            ),
+            (
+                "What happens between a component asking for an update and that update appearing \
+                 on screen? Walk me through the path.",
+                "Component",
+            ),
+            (
+                "When I type a character in the editor, how does it end up in the document? Walk \
+                 me through the path.",
+                "TextmateSnippet.walk",
+            ),
+            // The same VS Code question against a Rust store. Measured on a
+            // ripgrep store, that one sentence collides on TWO ordinary words
+            // and fills the entire top six with tier-1 hits, none of them an
+            // answer: `Walk` (crates/ignore/src/walk.rs:1117, 461.3) and `walk`
+            // (crates/ignore/src/lib.rs:64, 456.1) from "Walk me through", then
+            // `End` (crates/printer/src/jsont.rs:65, 455.3),
+            // `PreludeWriter::end` (crates/printer/src/standard.rs:1647, 455.0)
+            // and `Match::end` (crates/matcher/src/lib.rs:100, 450.0) from "end
+            // up in the document". `end` is an open-class word, which is why
+            // the rule keys on the SHAPE OF THE QUERY and the shape of the
+            // matching token, never on a list of colliding words.
+            (
+                "When I type a character in the editor, how does it end up in the document? Walk \
+                 me through the path.",
+                "Walk",
+            ),
+            (
+                "When I type a character in the editor, how does it end up in the document? Walk \
+                 me through the path.",
+                "Match::end",
+            ),
+            (
+                "When I type a character in the editor, how does it end up in the document? Walk \
+                 me through the path.",
+                "End",
+            ),
+        ] {
+            // The precondition: the shipped predicate DOES call this a name.
+            // Without it this test would pass on a query that never collided,
+            // which is exactly the error it caught on its first run.
+            assert!(
+                query_names_entity(query, name),
+                "control precondition: {name} is a shipped name hit for this query"
+            );
+            // The FACT is preserved, on purpose.
+            assert_eq!(
+                classify_locate_match(query, name, "", None),
+                LocateMatchKind::Name,
+                "the query did contain {name}, and match_kind reports facts"
+            );
+            // The RANKING judgment is what changed.
+            let mut entity = mk_locate_entity(name, 1.0, true);
+            entity.match_kind = Some(LocateMatchKind::Name);
+            assert_eq!(
+                locate_exact_name_tier(&entity, query),
+                0,
+                "{name} is an English word in a sentence, so it ranks on score"
+            );
+            assert!(name_match_is_prose_word_collision(query, name));
+        }
+    }
+
+    /// FIR-3079's other half, which must not regress: a LOOKUP keeps its
+    /// exact-name tier, whatever English word it is spelled with.
+    ///
+    /// The measurement says the tier is load-bearing on the same store.
+    /// `redisReaderGetReply` typed alone scores 450.0 and must outrank
+    /// `redisGetReplyFromReader` at 652.007; `send` typed alone scores 180.0 and
+    /// must outrank `win32_send` at 291.2. Both are score inversions only the
+    /// tier can win, so a rule that demoted them would undo FIR-2338 to fix
+    /// FIR-3079.
+    #[test]
+    fn a_symbol_lookup_keeps_its_exact_name_tier() {
+        for (query, name) in [
+            // Single English word typed alone: still a lookup.
+            ("send", "send"),
+            ("socket", "socket"),
+            ("walk", "Walk"),
+            ("search", "search"),
+            ("Component", "Component"),
+            // Symbol-shaped lookups, bare and qualified.
+            ("redisReaderGetReply", "redisReaderGetReply"),
+            ("redisReader::redisReaderGetReply", "redisReaderGetReply"),
+            ("SearchWorker::search", "SearchWorker::search"),
+            ("Gitignore", "Gitignore"),
+            // Prose that names a REAL symbol keeps the tier, because the token
+            // that named it is symbol-shaped.
+            (
+                "When a reply comes back, how does redisReaderGetReply handle a partial reply",
+                "redisReaderGetReply",
+            ),
+            (
+                "where is Cross_Encoder_Model_Cached decided?",
+                "cross_encoder_model_cached",
+            ),
+        ] {
+            let mut entity = mk_locate_entity(name, 1.0, true);
+            entity.match_kind = Some(LocateMatchKind::Name);
+            assert_eq!(
+                locate_exact_name_tier(&entity, query),
+                1,
+                "{query:?} is a lookup for {name}, or names it symbolically"
+            );
+            assert!(!name_match_is_prose_word_collision(query, name));
+        }
+    }
+
+    /// The shape rule itself, pinned on the exact strings that motivated it.
+    ///
+    /// Separated from the ordering tests because the thresholds are the
+    /// arguable part: a change to either constant shows up here as a specific
+    /// query changing sides rather than as a ranking that quietly moved.
+    #[test]
+    fn the_prose_shape_rule_reads_the_queries_it_was_written_for() {
+        for query in [
+            "when I send a command, how does it reach the socket",
+            "What happens between a component asking for an update and that update appearing on \
+             screen? Walk me through the path.",
+            "When ripgrep looks through a single file, what happens from reading the bytes to \
+             printing a line that matched?",
+            "where is prune_orphaned_vectors defined",
+        ] {
+            assert!(query_is_prose(query), "{query:?} is a sentence");
+        }
+        for query in [
+            "send",
+            "walk",
+            "redisReaderGetReply",
+            "redisReader::redisReaderGetReply",
+            "SearchWorker::search",
+            "call parse_request",
+            // Four tokens but only one stopword: a symbol path, not prose.
+            "http.parse_request.to.string",
+            "",
+        ] {
+            assert!(!query_is_prose(query), "{query:?} is a lookup");
+        }
+
+        // Both thresholds from both sides, so an off-by-one in either constant
+        // is visible as a named case rather than as a silently moved ranking.
+        // Token floor: three stopwords still lose to a three-token query.
+        assert!(!query_is_prose("is it the"), "3 tokens is under the floor");
+        assert!(
+            query_is_prose("is it the walk"),
+            "4 tokens clears the floor"
+        );
+        // Stopword floor: four tokens with one stopword is a symbol path.
+        assert!(
+            !query_is_prose("walk the parse_request handler"),
+            "1 stopword is under the floor"
+        );
+        assert!(
+            query_is_prose("walk the parse_request in handler"),
+            "2 stopwords clears the floor"
+        );
+    }
+
+    /// The drift guard. [`query_names_entity_symbolically`] is a REFINEMENT of
+    /// [`query_names_entity`], so it must never accept a pair the base rule
+    /// rejects; if it did, a demotion decision would rest on a name match the
+    /// rest of locate does not believe in.
+    ///
+    /// The two read one tokenizer ([`query_tokens`]) precisely so they cannot
+    /// disagree, and this is what would notice if someone split them again.
+    #[test]
+    fn the_symbolic_name_rule_never_claims_a_name_the_base_rule_denies() {
+        let mut symbolic_hits = 0usize;
+        for query in [
+            "send",
+            "when I send a command, how does it reach the socket",
+            "redisReaderGetReply",
+            "redisReader::redisReaderGetReply",
+            "how does redisReaderGetReply handle a partial reply from the server",
+            "InMemoryGraph::prune_orphaned_vectors",
+            "where is Cross_Encoder_Model_Cached decided?",
+            "Walk me through it",
+            "",
+            "unrelated words entirely",
+        ] {
+            for name in [
+                "send",
+                "socket",
+                "Walk",
+                "redisReaderGetReply",
+                "InMemoryGraph::prune_orphaned_vectors",
+                "cross_encoder_model_cached",
+                "http.parse_request",
+                "",
+            ] {
+                if query_names_entity_symbolically(query, name) {
+                    symbolic_hits += 1;
+                    assert!(
+                        query_names_entity(query, name),
+                        "{query:?} names {name:?} symbolically but not at all"
+                    );
+                }
+            }
+        }
+        // The positive control: without it every rejection would satisfy the
+        // implication and this test could not fail.
+        assert!(
+            symbolic_hits >= 4,
+            "the table must exercise the symbolic path, got {symbolic_hits} hits"
+        );
+    }
+
+    /// The ordering consequence, measured: demoting the collision hands rank
+    /// one to the higher-scoring row the tier was burying.
+    ///
+    /// On hiredis the sentence "when I send a command, how does it reach the
+    /// socket" ranked `send` at 180.0 above `redisFormatCommand` at 300.0. Once
+    /// `send` does not take the tier, both rows sit in it together and score
+    /// decides, which is the whole ask.
+    #[test]
+    fn demoting_the_collision_hands_rank_one_back_to_the_higher_score() {
+        let ranked = |query: &str| {
+            let mut entities: Vec<(usize, LocateEntity)> =
+                [("send", 180.0f32), ("redisFormatCommand", 300.0)]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, (name, score))| {
+                        let mut entity = mk_locate_entity(name, score, true);
+                        entity.match_kind = Some(classify_locate_match(query, name, "", None));
+                        (rank, entity)
+                    })
+                    .collect();
+            order_locate_entities(&mut entities, query, |_| 0);
+            entities
+                .into_iter()
+                .map(|(_, entity)| entity)
+                .collect::<Vec<_>>()
+        };
+        let prose = ranked("when I send a command, how does it reach the socket");
+        assert_eq!(
+            prose[0].name, "redisFormatCommand",
+            "score decides once the English-word collision leaves the name tier"
+        );
+        // The fact survives the demotion, which is the invariant the other lane
+        // and both all_fallback predicates depend on.
+        let demoted = prose.iter().find(|e| e.name == "send").unwrap();
+        assert_eq!(
+            demoted.match_kind,
+            Some(LocateMatchKind::Name),
+            "the row still reports that the query contained its name"
+        );
+        // The control that lets this fail: type the macro's name as a lookup
+        // and the shipped tier must still hand it rank one over the 300.0 row.
+        // FIR-2338 built that guarantee and this fix must not undo it.
+        assert_eq!(ranked("send")[0].name, "send");
+    }
+
+    /// The fused arm asks the tier question PER VARIANT, so one prose variant
+    /// cannot demote a hit an explicit symbol variant asked for by name.
+    ///
+    /// `match_kind` on a fused row is already the strongest kind any variant
+    /// reported. The tier has to match that shape or the two halves of one row
+    /// disagree: a caller who fans out "…prose…" plus "send" asked for `send`
+    /// by name in one of their own variants, and must get it.
+    #[test]
+    fn fused_ranking_keeps_a_name_tier_any_variant_earned() {
+        let with_kind = |name: &str, score: f32| {
+            let mut entity = mk_locate_entity(name, score, true);
+            entity.match_kind = Some(LocateMatchKind::Name);
+            entity
+        };
+        let prose = "when I send a command, how does it reach the socket";
+        let fallback = |name: &str, score: f32| {
+            let mut entity = mk_locate_entity(name, score, true);
+            entity.match_kind = Some(LocateMatchKind::TextFallback);
+            entity
+        };
+        // Both cases fan out to TWO variants, because `fuse_locate_results`
+        // returns the single result untouched when there are fewer than two.
+        // A first draft used one variant and its assertion passed without the
+        // fusion code running at all; the lookup control below is what caught
+        // that, and it is why both cases here are two-variant.
+        //
+        // Below the tier the fused arm orders on RRF rank, not on entity score,
+        // so a demoted collision does not get re-sorted by score the way the
+        // per-query comparator sorts it. The fused arm's contribution is
+        // narrower than that: a demoted row can no longer be lifted OVER a row
+        // RRF ranked above it. Each variant's own ranking has already applied
+        // the tier for its own text before fusion sees it.
+        let second_prose = "how do I send a request and read the answer from the server";
+        let list = || {
+            fusion_result(vec![
+                fallback("redisFormatCommand", 300.0),
+                with_kind("send", 180.0),
+            ])
+        };
+        // Prose in every variant: `send` is a collision under both, so it holds
+        // no tier anywhere and RRF decides.
+        let all_prose = fuse_locate_results(
+            vec![prose.to_string(), second_prose.to_string()],
+            vec![list(), list()],
+            60.0,
+        );
+        assert_eq!(
+            all_prose.entities[0].name, "redisFormatCommand",
+            "a demoted collision cannot be lifted over the row RRF ranked above it"
+        );
+        // The control that proves the line above is about the TIER and not
+        // about the input order: identical lists, identical RRF, one variant
+        // swapped for a LOOKUP. `send` earns the tier in that variant and takes
+        // rank one back. Without this, a rule that demoted on the joined text,
+        // or one that demoted everything, would pass the assertion above and
+        // still be wrong.
+        let with_symbol_variant = fuse_locate_results(
+            vec![prose.to_string(), "send".to_string()],
+            vec![list(), list()],
+            60.0,
+        );
+        assert_eq!(
+            with_symbol_variant.entities[0].name, "send",
+            "a variant that named the symbol outright keeps its tier"
+        );
+    }
+
     /// A method the graph stores under its owner is still named by the name it
     /// declares.
     ///
@@ -21380,6 +22182,991 @@ mod tests {
                 .contains("tie_break=owner_graph_mass:0"),
             "an unbroken tie still discloses the signal it consulted, got {:?}",
             flat.entities[0].provenance.origin
+        );
+    }
+
+    /// FIR-3079, the measured shape as a fixture: locate ranks the right FILE
+    /// first and the entity surface carries nothing from it, because the
+    /// surface is a projection of the symbols a query token happened to name.
+    ///
+    /// On React the file holding `scheduleUpdateOnFiber`, `performWorkOnRoot`
+    /// and `commitRoot` ranked FIRST for "what happens between a component
+    /// asking for an update and that update appearing on screen" and put one
+    /// row at rank 97 of 136. Here the same shape is two files: the right one
+    /// ranks first and its symbols are a helper nobody asked for, while a lower
+    /// file carries a high-scoring lexical row. Rank one must become the top
+    /// file's anchor.
+    #[test]
+    fn a_prose_question_gets_the_top_ranked_files_own_anchor() {
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let file = |path: &str, score: f32, symbols: Vec<LocateSymbol>| LocateFileEntry {
+            path: path.to_string(),
+            score,
+            signals: vec![],
+            spans: vec![],
+            symbols,
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        };
+        let symbol = |name: &str, score: f32| LocateSymbol {
+            name: name.to_string(),
+            span: Some([10, 20]),
+            score,
+            kind: "function".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        };
+        let graph = kin_db::InMemoryGraph::new();
+
+        // The right file. Its anchor is what the rest of the repository calls;
+        // the symbol the retrieval resolved on it is a helper.
+        let anchor = test_entity(
+            "scheduleUpdateOnFiber",
+            "packages/react-reconciler/src/ReactFiberWorkLoop.js",
+            900,
+            980,
+        );
+        graph.upsert_entity(&anchor).unwrap();
+        for _ in 0..9 {
+            let caller = test_entity(
+                "caller",
+                "packages/react-reconciler/src/ReactFiberHooks.js",
+                1,
+                2,
+            );
+            graph.upsert_entity(&caller).unwrap();
+            graph
+                .upsert_relation(&relation(RelationKind::Calls, caller.id, anchor.id))
+                .unwrap();
+        }
+        let helper = test_entity(
+            "shouldRemainOnPreviousScreen",
+            "packages/react-reconciler/src/ReactFiberWorkLoop.js",
+            10,
+            20,
+        );
+        graph.upsert_entity(&helper).unwrap();
+
+        // The lower file, carrying the kind of high-scoring lexical row that
+        // takes the page today.
+        let lexical = test_entity(
+            "updateDehydratedSuspenseComponent",
+            "packages/react-reconciler/src/ReactFiberBeginWork.js",
+            10,
+            20,
+        );
+        graph.upsert_entity(&lexical).unwrap();
+        // The second file has an anchor of its own, so the decay is pinned: it
+        // must sort below the first file's anchor even though its mass is
+        // higher. Without a decay the file arm's order would be lost here.
+        let second_anchor = test_entity(
+            "beginWork",
+            "packages/react-reconciler/src/ReactFiberBeginWork.js",
+            100,
+            400,
+        );
+        graph.upsert_entity(&second_anchor).unwrap();
+        for _ in 0..30 {
+            let caller = test_entity(
+                "beginWorkCaller",
+                "packages/react-reconciler/src/ReactFiberHooks.js",
+                1,
+                2,
+            );
+            graph.upsert_entity(&caller).unwrap();
+            graph
+                .upsert_relation(&relation(RelationKind::Calls, caller.id, second_anchor.id))
+                .unwrap();
+        }
+
+        let question = "what happens between a component asking for an update \
+                        and that update appearing on screen";
+        let build = |anchors: &str| {
+            let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHORS", anchors);
+            let mut result = LocateResult {
+                files: vec![
+                    file(
+                        "packages/react-reconciler/src/ReactFiberWorkLoop.js",
+                        0.14,
+                        vec![symbol("shouldRemainOnPreviousScreen", 95.7)],
+                    ),
+                    file(
+                        "packages/react-reconciler/src/ReactFiberBeginWork.js",
+                        0.13,
+                        vec![symbol("updateDehydratedSuspenseComponent", 852.2)],
+                    ),
+                ],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                question,
+                false,
+            )
+            .unwrap();
+            result
+        };
+
+        // Control first: this is the defect, and the test cannot pass by
+        // accident on a fixture where the anchor was already reachable.
+        let shipped = build("0");
+        let shipped_names: Vec<&str> = shipped
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert_eq!(
+            shipped_names,
+            vec![
+                "updateDehydratedSuspenseComponent",
+                "shouldRemainOnPreviousScreen"
+            ],
+            "control: without anchors the right file contributes only its helper"
+        );
+
+        let fixed = build("1");
+        let names: Vec<&str> = fixed
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "updateDehydratedSuspenseComponent",
+                "scheduleUpdateOnFiber",
+                "beginWork",
+                "shouldRemainOnPreviousScreen"
+            ],
+            "the anchor of the FIRST file is admitted beneath the row retrieval \
+             scored, above the second file's anchor, got {:?}",
+            fixed
+                .entities
+                .iter()
+                .map(|e| (&e.name, e.score))
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            fixed.entities[0].provenance.origin, FILE_ANCHOR_ORIGIN,
+            "an anchor never takes rank one from a row that carries evidence"
+        );
+        assert_eq!(
+            fixed.entities[1].provenance.origin, FILE_ANCHOR_ORIGIN,
+            "and an anchor row says on the surface why it is there"
+        );
+        assert!(
+            fixed.entities[1].score < fixed.entities[0].score,
+            "the share is strictly below the ranking's own top score"
+        );
+        assert!(
+            fixed.entities[1].score > fixed.entities[2].score,
+            "and the decay separates the two anchors rather than tying them: {} vs {}",
+            fixed.entities[1].score,
+            fixed.entities[2].score
+        );
+    }
+
+    /// A query that IS an identifier must be answered exactly as it was before
+    /// anchors existed. The control is the same fixture under a question, which
+    /// must differ: a rule that admitted nothing anywhere would pass the first
+    /// assertion alone.
+    #[test]
+    fn a_symbol_lookup_ranking_is_byte_identical_with_anchors_on() {
+        let file = |path: &str, symbols: Vec<LocateSymbol>| LocateFileEntry {
+            path: path.to_string(),
+            score: 0.2,
+            signals: vec![],
+            spans: vec![],
+            symbols,
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        };
+        let graph = kin_db::InMemoryGraph::new();
+        let mut widget = test_entity(
+            "CodeEditorWidget",
+            "src/vs/editor/browser/widget/codeEditorWidget.ts",
+            60,
+            900,
+        );
+        widget.kind = EntityKind::Class;
+        graph.upsert_entity(&widget).unwrap();
+        let other = test_entity(
+            "createTextModel",
+            "src/vs/editor/browser/widget/codeEditorWidget.ts",
+            10,
+            20,
+        );
+        graph.upsert_entity(&other).unwrap();
+
+        let build = |query: &str, anchors: &str| {
+            let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHORS", anchors);
+            let mut result = LocateResult {
+                files: vec![file(
+                    "src/vs/editor/browser/widget/codeEditorWidget.ts",
+                    vec![LocateSymbol {
+                        name: "createTextModel".to_string(),
+                        span: Some([10, 20]),
+                        score: 450.0,
+                        kind: "function".to_string(),
+                        definition: true,
+                        origin: "text".to_string(),
+                        cosine: None,
+                        snippet: None,
+                    }],
+                )],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                query,
+                false,
+            )
+            .unwrap();
+            result
+                .entities
+                .iter()
+                .map(|entity| entity.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            build("createTextModel", "1"),
+            build("createTextModel", "0"),
+            "a lookup is answered exactly as before"
+        );
+        assert_ne!(
+            build(
+                "how does a typed character reach the model behind the editor",
+                "1"
+            ),
+            build(
+                "how does a typed character reach the model behind the editor",
+                "0"
+            ),
+            "control: the same fixture under a question must differ, or the \
+             lookup assertion above proves nothing"
+        );
+    }
+
+    /// The lookup gate is the negation of kin#1367's `query_is_prose`, and this
+    /// pins both of its floors from both sides. An off-by-one in either constant
+    /// shows up here as a named case rather than as a ranking that quietly moved.
+    #[test]
+    fn the_lookup_shape_rule_reads_both_of_its_floors() {
+        // Every control the ranking lane holds byte-identical is a lookup here.
+        for control in [
+            "redisReaderGetReply",
+            "redisFormatCommand",
+            "send",
+            "socket",
+            "redisReader::redisReaderGetReply",
+            "Gitignore",
+            "SearchWorker::search",
+            "WalkParallel",
+            "walk",
+            "search",
+            "end",
+            "Match::end",
+            "TextModel",
+            "CodeEditorWidget",
+        ] {
+            assert!(
+                locate_query_is_symbol_lookup(control),
+                "{control} must be answered as a lookup"
+            );
+        }
+        // The token floor, both sides. Three words is the longest symbol path
+        // the tokenizer produces.
+        assert!(locate_query_is_symbol_lookup("is it the"));
+        assert!(!locate_query_is_symbol_lookup("is it the walk"));
+        // The stopword floor, both sides.
+        assert!(locate_query_is_symbol_lookup(
+            "walk the parse_request handler"
+        ));
+        assert!(!locate_query_is_symbol_lookup(
+            "walk the parse_request in handler"
+        ));
+        // A question that NAMES an identifier is still prose, so anchors are
+        // admitted beneath it; the exact-name tier is what keeps the named hit
+        // at rank one, and that rule lives in kin#1367 rather than here.
+        assert!(!locate_query_is_symbol_lookup(
+            "where is prune_orphaned_vectors decided in this repository"
+        ));
+        // The measured questions, all prose.
+        assert!(!locate_query_is_symbol_lookup(
+            "When I type a character in the editor, how does it end up in the \
+             document? Walk me through the path."
+        ));
+        assert!(!locate_query_is_symbol_lookup(
+            "How does ripgrep decide which files to look at, and how does it \
+             honour the ignore rules a project sets?"
+        ));
+    }
+
+    /// A method's anchor is its owning type. Without the kind rule a
+    /// widely-called method takes both anchor slots its file has, which is the
+    /// same failure by another route: the surface fills with one type's
+    /// internals and never names the type.
+    #[test]
+    fn a_widely_called_method_never_takes_an_anchor_slot() {
+        // Both knobs are pinned for the same reason the other fixtures pin
+        // theirs: an unguarded test reads whatever a concurrently running
+        // guarded one has left in the process environment, and this test read
+        // KIN_LOCATE_FILE_ANCHORS=0 from a neighbour and returned an empty
+        // ranking.
+        let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHORS", "1")
+            .with("KIN_LOCATE_COLLISION_CORROBORATION", "1");
+
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let graph = kin_db::InMemoryGraph::new();
+        let path = "src/vs/editor/browser/widget/codeEditorWidget.ts";
+        let mut method = test_entity("CodeEditorWidget.trigger", path, 700, 760);
+        method.kind = EntityKind::Method;
+        graph.upsert_entity(&method).unwrap();
+        for _ in 0..40 {
+            let caller = test_entity(
+                "caller",
+                "src/vs/editor/contrib/find/findController.ts",
+                1,
+                2,
+            );
+            graph.upsert_entity(&caller).unwrap();
+            graph
+                .upsert_relation(&relation(RelationKind::Calls, caller.id, method.id))
+                .unwrap();
+        }
+        let mut widget = test_entity("CodeEditorWidget", path, 60, 900);
+        widget.kind = EntityKind::Class;
+        graph.upsert_entity(&widget).unwrap();
+
+        let mut result = LocateResult {
+            files: vec![LocateFileEntry {
+                path: path.to_string(),
+                score: 0.25,
+                signals: vec![],
+                spans: vec![],
+                symbols: vec![],
+                explain: vec![],
+                provenance: None,
+                signal_scores: None,
+                score_breakdown: None,
+                matched_queries: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut result,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "how does a typed character reach the model behind the editor",
+            false,
+        )
+        .unwrap();
+        let names: Vec<&str> = result
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["CodeEditorWidget"],
+            "the class is the anchor even though the method carries forty times its mass"
+        );
+    }
+
+    /// The decay is the protection, and it is measured: on ripgrep the file
+    /// holding `Walk` ranked FIFTH while rank one was a genuinely right answer
+    /// the query named. An anchor from a fifth-ranked file must not take that
+    /// rank away.
+    #[test]
+    fn an_anchor_from_a_low_ranked_file_does_not_outrank_a_named_hit() {
+        // Both knobs are pinned for the same reason the other fixtures pin
+        // theirs: an unguarded test reads whatever a concurrently running
+        // guarded one has left in the process environment, and this test read
+        // KIN_LOCATE_FILE_ANCHORS=0 from a neighbour and returned an empty
+        // ranking.
+        let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHORS", "1")
+            .with("KIN_LOCATE_COLLISION_CORROBORATION", "1");
+
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let graph = kin_db::InMemoryGraph::new();
+        let named = test_entity("WalkBuilder::ignore", "crates/ignore/src/walk.rs", 890, 900);
+        graph.upsert_entity(&named).unwrap();
+        // The measured neighbourhood, and it is load-bearing since the
+        // corroboration rule landed: on the real store walk.rs contributes two
+        // more rows the retriever scored on their own, which is what keeps this
+        // collision at its full 1052. A fixture with the lone symbol would
+        // demote it to 789 and let this file's own anchor pass it.
+        for (sibling, lo, hi) in [
+            ("WalkBuilder::add_ignore", 910u32, 930u32),
+            ("WalkBuilder::add_custom_ignore_filename", 940, 960),
+        ] {
+            let entity = test_entity(sibling, "crates/ignore/src/walk.rs", lo, hi);
+            graph.upsert_entity(&entity).unwrap();
+        }
+        let mut deep = test_entity("Walk", "crates/ignore/src/walk.rs", 1117, 1200);
+        deep.kind = EntityKind::Class;
+        graph.upsert_entity(&deep).unwrap();
+        for _ in 0..60 {
+            let caller = test_entity("caller", "crates/core/search.rs", 1, 2);
+            graph.upsert_entity(&caller).unwrap();
+            graph
+                .upsert_relation(&relation(RelationKind::Calls, caller.id, deep.id))
+                .unwrap();
+        }
+
+        let spacer = |path: &str, score: f32| LocateFileEntry {
+            path: path.to_string(),
+            score,
+            signals: vec![],
+            spans: vec![],
+            symbols: vec![],
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        };
+        // File order is the measured one: walk.rs ranked FIFTH and still
+        // produced the entity ranking's rank one, so the anchor decay is what
+        // has to protect it. At rank five that anchor scores 300 against the
+        // named hit's 1052, which is a score decision and not a tier one, so
+        // this stays true whatever the exact-name tier is later ruled to do.
+        let mut result = LocateResult {
+            files: vec![
+                spacer("crates/regex/src/literal.rs", 0.231),
+                spacer("crates/core/flags/defs.rs", 0.227),
+                spacer("crates/ignore/src/incremental.rs", 0.226),
+                spacer("crates/ignore/src/dir.rs", 0.226),
+                LocateFileEntry {
+                    path: "crates/ignore/src/walk.rs".to_string(),
+                    score: 0.223,
+                    signals: vec![],
+                    spans: vec![],
+                    symbols: vec![
+                        LocateSymbol {
+                            name: "WalkBuilder::ignore".to_string(),
+                            span: Some([890, 900]),
+                            score: 1052.0,
+                            kind: "method".to_string(),
+                            definition: true,
+                            origin: "text".to_string(),
+                            cosine: None,
+                            snippet: None,
+                        },
+                        LocateSymbol {
+                            name: "WalkBuilder::add_ignore".to_string(),
+                            span: Some([910, 930]),
+                            score: 652.0,
+                            kind: "method".to_string(),
+                            definition: true,
+                            origin: "text".to_string(),
+                            cosine: None,
+                            snippet: None,
+                        },
+                        LocateSymbol {
+                            name: "WalkBuilder::add_custom_ignore_filename".to_string(),
+                            span: Some([940, 960]),
+                            score: 652.0,
+                            kind: "method".to_string(),
+                            definition: true,
+                            origin: "text".to_string(),
+                            cosine: None,
+                            snippet: None,
+                        },
+                    ],
+                    explain: vec![],
+                    provenance: None,
+                    signal_scores: None,
+                    score_breakdown: None,
+                    matched_queries: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut result,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "how does ripgrep decide which files to look at and honour the ignore rules",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            result.entities[0].name,
+            "WalkBuilder::ignore",
+            "a hit the query named keeps rank one, got {:?}",
+            result
+                .entities
+                .iter()
+                .map(|e| (&e.name, e.score))
+                .collect::<Vec<_>>()
+        );
+        let walk = result
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Walk")
+            .expect("the anchor the question was actually about is now on the page");
+        assert_eq!(walk.provenance.origin, FILE_ANCHOR_ORIGIN);
+        assert!(
+            walk.score < result.entities[0].score,
+            "and it is admitted beneath the evidence, not above it: {} vs {}",
+            walk.score,
+            result.entities[0].score
+        );
+    }
+
+    /// One ranked file for the corroboration fixtures.
+    fn corroboration_file(path: &str, score: f32, symbols: Vec<LocateSymbol>) -> LocateFileEntry {
+        LocateFileEntry {
+            path: path.to_string(),
+            score,
+            signals: vec![],
+            spans: vec![],
+            symbols,
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        }
+    }
+
+    /// One projected symbol for the corroboration fixtures.
+    fn corroboration_symbol(name: &str, score: f32, span: [u32; 2]) -> LocateSymbol {
+        LocateSymbol {
+            name: name.to_string(),
+            span: Some(span),
+            score,
+            kind: "function".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        }
+    }
+
+    /// FIR-3079, the React shape: a prose-word collision leads on raw score after
+    /// kin#1367 demotes it out of the name tier, and it is the ONLY row its file
+    /// contributes to the whole ranking. Measured at 1052.0 against a best
+    /// non-colliding 852.3.
+    ///
+    /// Every file here carries exactly one entity, so the file-anchor admission
+    /// finds nothing new and this test measures the corroboration rule alone.
+    #[test]
+    fn a_lexical_accident_alone_in_its_file_loses_the_page_lead() {
+        let graph = kin_db::InMemoryGraph::new();
+        let lone = test_entity(
+            "Resolved.component",
+            "compiler/packages/babel-plugin-react-compiler/src/Flood/Types.ts",
+            10,
+            20,
+        );
+        graph.upsert_entity(&lone).unwrap();
+        let clean = test_entity(
+            "attemptEarlyBailoutIfNoScheduledUpdate",
+            "packages/react-reconciler/src/ReactFiberBeginWork.js",
+            30,
+            60,
+        );
+        graph.upsert_entity(&clean).unwrap();
+
+        let question = "what happens between a component asking for an update \
+                        and that update appearing on screen";
+        let build = |on: &str| {
+            let _guard =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_COLLISION_CORROBORATION", on);
+            let mut result = LocateResult {
+                files: vec![
+                    corroboration_file(
+                        "compiler/packages/babel-plugin-react-compiler/src/Flood/Types.ts",
+                        0.14,
+                        vec![corroboration_symbol("Resolved.component", 1052.0, [10, 20])],
+                    ),
+                    corroboration_file(
+                        "packages/react-reconciler/src/ReactFiberBeginWork.js",
+                        0.13,
+                        vec![corroboration_symbol(
+                            "attemptEarlyBailoutIfNoScheduledUpdate",
+                            852.3,
+                            [30, 60],
+                        )],
+                    ),
+                ],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                question,
+                false,
+            )
+            .unwrap();
+            result
+        };
+
+        // Control: this is the shipped ranking, and the whole point is that the
+        // collision leads it on score alone.
+        let shipped = build("0");
+        assert_eq!(
+            shipped.entities[0].name, "Resolved.component",
+            "control: without the rule the accident still leads on raw score"
+        );
+        assert_eq!(shipped.entities[0].match_kind, Some(LocateMatchKind::Name));
+
+        let fixed = build("1");
+        assert_eq!(
+            fixed.entities[0].name,
+            "attemptEarlyBailoutIfNoScheduledUpdate",
+            "the uncorroborated accident loses the lead, got {:?}",
+            fixed
+                .entities
+                .iter()
+                .map(|e| (&e.name, e.score))
+                .collect::<Vec<_>>()
+        );
+        let demoted = fixed
+            .entities
+            .iter()
+            .find(|e| e.name == "Resolved.component")
+            .expect("a share is not a floor: the row is still ranked");
+        assert_eq!(
+            demoted.match_kind,
+            Some(LocateMatchKind::Name),
+            "the demotion moves the score and never the fact"
+        );
+        assert!(
+            (demoted.score - 789.0).abs() < 1.0,
+            "three quarters of 1052, got {}",
+            demoted.score
+        );
+    }
+
+    /// The ripgrep shape, and the case the rule exists to SPARE: the same score,
+    /// the same match kind, a collision on an ordinary word, and a right answer.
+    /// Its file contributes two more rows the retriever scored on their own.
+    #[test]
+    fn a_collision_its_own_file_corroborates_keeps_rank_one() {
+        // Both knobs are pinned for the same reason the other fixtures pin
+        // theirs: an unguarded test reads whatever a concurrently running
+        // guarded one has left in the process environment, and this test read
+        // KIN_LOCATE_FILE_ANCHORS=0 from a neighbour and returned an empty
+        // ranking.
+        let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHORS", "1")
+            .with("KIN_LOCATE_COLLISION_CORROBORATION", "1");
+
+        let graph = kin_db::InMemoryGraph::new();
+        for (name, lo, hi) in [
+            ("WalkBuilder::ignore", 890u32, 900u32),
+            ("WalkBuilder::add_ignore", 910, 930),
+            ("WalkBuilder::add_custom_ignore_filename", 940, 960),
+        ] {
+            let entity = test_entity(name, "crates/ignore/src/walk.rs", lo, hi);
+            graph.upsert_entity(&entity).unwrap();
+        }
+        let other = test_entity("ignore_messages", "crates/core/messages.rs", 10, 20);
+        graph.upsert_entity(&other).unwrap();
+
+        let mut result = LocateResult {
+            files: vec![
+                corroboration_file(
+                    "crates/ignore/src/walk.rs",
+                    0.223,
+                    vec![
+                        corroboration_symbol("WalkBuilder::ignore", 1052.0, [890, 900]),
+                        corroboration_symbol("WalkBuilder::add_ignore", 652.0, [910, 930]),
+                        corroboration_symbol(
+                            "WalkBuilder::add_custom_ignore_filename",
+                            652.0,
+                            [940, 960],
+                        ),
+                    ],
+                ),
+                corroboration_file(
+                    "crates/core/messages.rs",
+                    0.133,
+                    vec![corroboration_symbol("ignore_messages", 652.0, [10, 20])],
+                ),
+            ],
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut result,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "how does ripgrep decide which files to look at and honour the ignore rules",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            result.entities[0].name,
+            "WalkBuilder::ignore",
+            "a collision its file corroborates keeps rank one, got {:?}",
+            result
+                .entities
+                .iter()
+                .map(|e| (&e.name, e.score))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            (result.entities[0].score - 1052.0).abs() < 0.01,
+            "and keeps its whole score, got {}",
+            result.entities[0].score
+        );
+    }
+
+    /// The rule's own failure mode, measured rather than argued: a RIGHT answer
+    /// that is the only row its file contributes, whose name is an ordinary word
+    /// the question used, is demoted for being alone.
+    ///
+    /// The demotion is a share of the score and never a floor, so the row ranks
+    /// lower and stays on the page an agent reads. That is the claim this pins,
+    /// and it is what makes the failure mode survivable.
+    #[test]
+    fn a_right_answer_alone_in_its_file_stays_on_the_page() {
+        // The guard is not decoration. Without it this test reads whatever a
+        // concurrently running guarded test has left in the environment, and it
+        // first reported the rule as never firing for exactly that reason.
+        let _guard =
+            kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_COLLISION_CORROBORATION", "1");
+        let graph = kin_db::InMemoryGraph::new();
+        let right = test_entity("apply", "src/editor/apply.ts", 10, 40);
+        graph.upsert_entity(&right).unwrap();
+        let mut files = vec![corroboration_file(
+            "src/editor/apply.ts",
+            0.30,
+            vec![corroboration_symbol("apply", 900.0, [10, 40])],
+        )];
+        // Twelve unrelated rows straddling the demoted score, so where it lands
+        // is measured rather than assumed.
+        for i in 0..12 {
+            let path = format!("src/filler/mod{i}.ts");
+            let name = format!("filler_{i}");
+            let entity = test_entity(&name, &path, 1, 5);
+            graph.upsert_entity(&entity).unwrap();
+            files.push(corroboration_file(
+                &path,
+                0.29 - i as f32 * 0.01,
+                vec![corroboration_symbol(&name, 800.0 - i as f32 * 50.0, [1, 5])],
+            ));
+        }
+        let mut result = LocateResult {
+            files,
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut result,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "how does the editor apply an edit to the open document",
+            false,
+        )
+        .unwrap();
+        let position = result
+            .entities
+            .iter()
+            .position(|e| e.name == "apply")
+            .expect("the demoted right answer is still in the ranking");
+        let shape = result
+            .entities
+            .iter()
+            .map(|e| (e.name.clone(), e.score, e.match_kind))
+            .collect::<Vec<_>>();
+        assert!(
+            position > 0,
+            "this fixture only means something if the rule moved it: {shape:?}"
+        );
+        assert!(
+            position < DEFAULT_ENTITY_PAGE_SIZE,
+            "a share is not a floor: the demoted right answer must stay on the \
+             product's own {}-row default page, landed at {} of {shape:?}",
+            DEFAULT_ENTITY_PAGE_SIZE,
+            position + 1
+        );
+        let row = &result.entities[position];
+        assert!(
+            (row.score - 675.0).abs() < 1.0,
+            "three quarters of 900, got {}",
+            row.score
+        );
+    }
+
+    /// A lookup carries no prose, so the rule cannot fire on it and the ranking
+    /// is identical with it on and off. The control is the same fixture under a
+    /// question, which must differ.
+    #[test]
+    fn a_lookup_ranking_is_untouched_by_the_corroboration_rule() {
+        let graph = kin_db::InMemoryGraph::new();
+        let named = test_entity("ignore", "crates/ignore/src/dir.rs", 10, 20);
+        graph.upsert_entity(&named).unwrap();
+        let other = test_entity("ignore_messages", "crates/core/messages.rs", 10, 20);
+        graph.upsert_entity(&other).unwrap();
+        let build = |query: &str, on: &str| {
+            let _guard =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_COLLISION_CORROBORATION", on);
+            let mut result = LocateResult {
+                files: vec![
+                    corroboration_file(
+                        "crates/ignore/src/dir.rs",
+                        0.3,
+                        vec![corroboration_symbol("ignore", 900.0, [10, 20])],
+                    ),
+                    corroboration_file(
+                        "crates/core/messages.rs",
+                        0.2,
+                        vec![corroboration_symbol("ignore_messages", 800.0, [10, 20])],
+                    ),
+                ],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                query,
+                false,
+            )
+            .unwrap();
+            result
+                .entities
+                .iter()
+                .map(|e| (e.name.clone(), e.score))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            build("ignore", "1"),
+            build("ignore", "0"),
+            "a lookup is answered exactly as before"
+        );
+        assert_ne!(
+            build("how does it honour the ignore rules a project sets", "1"),
+            build("how does it honour the ignore rules a project sets", "0"),
+            "control: the same fixture under a question must differ"
+        );
+    }
+
+    /// The measured difference between the two collisions, as a rule: a sibling
+    /// corroborates only if the retrieval ranked it WELL.
+    ///
+    /// React's `Resolved.component` at 1052.0 has two siblings from its file at
+    /// ranks 109 and 110 of 136, scoring 52.4 and 52.1. ripgrep's
+    /// `WalkBuilder::ignore` at 1052.0 has two at 652.0. Counting rows rather
+    /// than weighing them calls both corroborated, which is how the first
+    /// version of this rule spared the row it was written for.
+    #[test]
+    fn a_sibling_corroborates_only_if_the_retrieval_ranked_it_well() {
+        let _guard =
+            kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_COLLISION_CORROBORATION", "1")
+                .with("KIN_LOCATE_FILE_ANCHORS", "0");
+        let question = "what happens between a component asking for an update \
+                        and that update appearing on screen";
+        let build = |sibling_score: f32| {
+            let graph = kin_db::InMemoryGraph::new();
+            let collision = test_entity("Resolved.component", "src/compiler/Types.ts", 10, 20);
+            graph.upsert_entity(&collision).unwrap();
+            let sibling = test_entity("convertFlowType", "src/compiler/Types.ts", 30, 40);
+            graph.upsert_entity(&sibling).unwrap();
+            let elsewhere = test_entity("prepareFreshStack", "src/reconciler/WorkLoop.js", 10, 20);
+            graph.upsert_entity(&elsewhere).unwrap();
+            let mut result = LocateResult {
+                files: vec![
+                    corroboration_file(
+                        "src/compiler/Types.ts",
+                        0.14,
+                        vec![
+                            corroboration_symbol("Resolved.component", 1052.0, [10, 20]),
+                            corroboration_symbol("convertFlowType", sibling_score, [30, 40]),
+                        ],
+                    ),
+                    corroboration_file(
+                        "src/reconciler/WorkLoop.js",
+                        0.13,
+                        vec![corroboration_symbol("prepareFreshStack", 852.3, [10, 20])],
+                    ),
+                ],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                question,
+                false,
+            )
+            .unwrap();
+            result
+                .entities
+                .iter()
+                .find(|entity| entity.name == "Resolved.component")
+                .map(|entity| entity.score)
+                .expect("the collision is always ranked, demoted or not")
+        };
+
+        // 52.4 of 1052.0 is five percent: the file is present, not relevant.
+        assert!(
+            (build(52.4) - 789.0).abs() < 1.0,
+            "a weak sibling must not rescue the collision, got {}",
+            build(52.4)
+        );
+        // 652.0 of 1052.0 is sixty-two percent: the retrieval wanted this file.
+        // One strong sibling is half the corroboration target, so the demotion
+        // is half of what it was: 0.75 + 0.25 * 0.5 = 0.875 of 1052.0.
+        assert!(
+            (build(652.0) - 920.5).abs() < 1.0,
+            "a strong sibling must lift the collision, got {}",
+            build(652.0)
         );
     }
 

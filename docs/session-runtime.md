@@ -244,6 +244,32 @@ The authoritative list of behavior-relevant variables is defined once in
 `kin-core` (`behavior_env`) and shared by both the daemon (which reports them)
 and the CLI (which compares them), so the two sides cannot drift apart.
 
+## When an MCP session starts a daemon
+
+`kin mcp start` starts no daemon until a caller asks for a graph answer. The
+first `tools/call` is that ask, and it is the only one: `initialize`, the tool
+list and the client's `roots/list` answer all arrive before anything has been
+asked of Kin, so none of them starts a daemon.
+
+Before that first call, every bind the server performs attaches to a daemon that
+is already serving the repository and starts none. A session opened beside a
+warm daemon is therefore exactly as fast as it ever was; a session opened on a
+repository nothing is serving stays at the cost of the stdio process until it is
+used.
+
+The reason is what a daemon start costs. Starting one opens the store and
+schedules the background embedding pass, which on a repository of any size is
+minutes of CPU or GPU and gigabytes of resident memory. Measured on 2026-09-02
+against a 657.8 KiB fixture store, the old behavior reached 1.80 GiB resident and
+99 percent of a core sixty seconds after a handshake, in a session that made no
+Kin call at all.
+
+The first call on a cold repository still pays for the start it needs. When the
+daemon is not ready inside the server's brief grace, that call is answered with
+the honest still-starting report naming the phase and the elapsed seconds, and
+the remedy is to retry rather than to restart anything. `KIN_DAEMON_AUTO_EMBED=0`
+remains the way to keep a daemon from embedding at all once it is running.
+
 ## Supervisor scope: what `KIN_HOME` does and does not bound
 
 Kin runs one worker daemon per repository and one **supervisor** per machine.

@@ -29,6 +29,22 @@ use uuid::Uuid;
 pub const PUBLICATION_CONTROL_SCHEMA: &str = "kin.graph-publication-control.v2";
 pub const DEFAULT_ROLLOUT_LEASE_SECONDS: u64 = 300;
 pub const MAX_ROLLOUT_LEASE_SECONDS: u64 = 1_800;
+/// Lease window the daemon requests for a rollout it drives itself: at the
+/// startup bootstrap and on every renewal before a mutation under a rollout
+/// proof.
+///
+/// The first hosted rollout publishes every repository's metadata and then its
+/// edges under this one lease, and the renewal in
+/// `HostedPublicationGuard::reassert_before_mutation` runs once per repository
+/// publication, so the window has to cover one repository, not the fleet.
+/// Measured 2026-09-02 from a laptop against production's own control record:
+/// one repository of 27,987 entities took 153 s at about 0.55 s per 100-write
+/// Firestore commit, and production's cold graph open alone took 110 s before
+/// the first commit. The 300 s default bounded the whole first rollout with
+/// nothing renewing it, and every attempt died with the work done and the
+/// credit lost. Renewal is the mechanism; this window is the margin, and it is
+/// the cap `validate_rollout_ttl` already admits.
+pub const HOSTED_ROLLOUT_LEASE_SECONDS: u64 = MAX_ROLLOUT_LEASE_SECONDS;
 pub const PUBLICATION_LEASE_SECONDS: u64 = 1_800;
 pub const MAX_READER_ADMISSION_SECONDS: u64 = 2_592_000;
 const STARTUP_BOOTSTRAP_HOLDER: &str = "kin-daemon-startup-bootstrap";
@@ -440,6 +456,39 @@ pub struct PublicationControl {
     /// drops this local guard, while the durable claim remains resumable by the
     /// exact holder.
     rollout_fencing_flights: Arc<Mutex<BTreeSet<u64>>>,
+    /// The lease this process is mutating hosted state under right now, bound
+    /// by the guard that owns it for exactly as long as it owns it. The
+    /// Firestore store re-reads this lease before it retries a transient
+    /// failure, so a request that stalled long enough for the lease to expire
+    /// or change hands is never retried under it.
+    mutation_lease: Mutex<Option<MutationLeaseBinding>>,
+}
+
+/// One in-flight hosted mutation's lease identity: the proof and the kind the
+/// proof must match when it is re-read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MutationLeaseBinding {
+    kind: LeaseKind,
+    proof: LeaseProof,
+}
+
+/// RAII handle for a bound mutation lease. Dropping it clears the binding it
+/// installed; a handle that found the same lease already bound by an outer
+/// owner clears nothing, so nested owners of one proof (the startup sequence
+/// around `prepare_hosted_spine_rollout`, which binds it again) leave the
+/// outer binding in place until the outer owner is done.
+pub(crate) struct BoundMutationLease {
+    control: Arc<PublicationControl>,
+    binding: MutationLeaseBinding,
+    owner: bool,
+}
+
+impl Drop for BoundMutationLease {
+    fn drop(&mut self) {
+        if self.owner {
+            self.control.unbind_mutation_lease(&self.binding);
+        }
+    }
 }
 
 struct RolloutFencingFlightGuard {
@@ -536,6 +585,7 @@ impl PublicationControl {
                 error: Some("hosted reader admission has not been checked".to_string()),
             }),
             rollout_fencing_flights: Arc::new(Mutex::new(BTreeSet::new())),
+            mutation_lease: Mutex::new(None),
         })
     }
 
@@ -715,7 +765,7 @@ impl PublicationControl {
             previous_repositories: None,
             holder: STARTUP_BOOTSTRAP_HOLDER.to_string(),
             request_id: STARTUP_BOOTSTRAP_REQUEST_ID.to_string(),
-            ttl_seconds: DEFAULT_ROLLOUT_LEASE_SECONDS,
+            ttl_seconds: HOSTED_ROLLOUT_LEASE_SECONDS,
             bootstrap_reader: Some(ReaderAdmissionInput {
                 identity: self.runtime_reader_identity.clone(),
                 min_snapshot_schema: kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
@@ -1408,6 +1458,23 @@ impl PublicationControl {
         ))
     }
 
+    /// Renew the exact rollout proof to the daemon-owned window before one
+    /// external mutation under it. The rollout publishes every repository's
+    /// metadata and edges under one lease, so each publication extends the
+    /// lease it runs under rather than trusting the window acquired at
+    /// bootstrap. A proof the record no longer names, or one whose lease has
+    /// already expired, fails here exactly as it fails on assertion, and the
+    /// caller stops rather than mutating under it.
+    pub(crate) fn renew_rollout_before_mutation(
+        &self,
+        proof: &LeaseProof,
+    ) -> Result<ActivePublicationLease, PublicationControlError> {
+        self.renew_rollout(RenewRolloutLeaseRequest {
+            lease: proof.clone(),
+            ttl_seconds: HOSTED_ROLLOUT_LEASE_SECONDS,
+        })
+    }
+
     pub fn admit_reader(
         &self,
         request: AdmitReaderRequest,
@@ -1667,6 +1734,79 @@ impl PublicationControl {
             self.clock.now(),
         )?;
         Ok(())
+    }
+
+    /// Bind the lease an in-flight hosted mutation runs under, for the lifetime
+    /// of the returned handle. A binding for the same lease that is already in
+    /// place stays owned by whoever installed it; a binding for a different
+    /// lease is replaced, because one record admits one active lease and the
+    /// newer owner is the live one.
+    pub(crate) fn bind_mutation_lease(
+        self: &Arc<Self>,
+        kind: LeaseKind,
+        proof: LeaseProof,
+    ) -> BoundMutationLease {
+        let binding = MutationLeaseBinding { kind, proof };
+        let owner = {
+            let mut bound = self
+                .mutation_lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if bound.as_ref() == Some(&binding) {
+                false
+            } else {
+                *bound = Some(binding.clone());
+                true
+            }
+        };
+        BoundMutationLease {
+            control: Arc::clone(self),
+            binding,
+            owner,
+        }
+    }
+
+    fn unbind_mutation_lease(&self, binding: &MutationLeaseBinding) {
+        let mut bound = self
+            .mutation_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bound.as_ref() == Some(binding) {
+            *bound = None;
+        }
+    }
+
+    /// Re-read the lease bound to this process's in-flight hosted mutation and
+    /// refuse when it has expired, been fenced or changed hands. With nothing
+    /// bound there is no lease to defend and the check passes; the Firestore
+    /// store calls this before every transient retry.
+    pub fn reassert_bound_mutation_lease(&self) -> Result<(), PublicationControlError> {
+        let bound = self
+            .mutation_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(binding) = bound else {
+            return Ok(());
+        };
+        let stored = self.load_required()?;
+        self.validate_record(&stored.record)?;
+        require_lease(
+            &stored.record,
+            &binding.proof,
+            binding.kind,
+            self.clock.now(),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bound_mutation_lease_for_test(&self) -> Option<(LeaseKind, LeaseProof)> {
+        self.mutation_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|binding| (binding.kind, binding.proof.clone()))
     }
 
     fn release(
@@ -4057,6 +4197,44 @@ mod object_store_control {
 #[cfg(feature = "gcs")]
 pub use object_store_control::Store as ObjectStorePublicationControlStore;
 
+/// A clock a test moves by hand. Shared by this module's tests and by the
+/// daemon state's composed-rollout regression, which charges each fake
+/// publication the time a real Firestore staging costs rather than sleeping.
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use std::sync::Mutex;
+
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+
+    use super::PublicationClock;
+
+    #[derive(Debug)]
+    pub(crate) struct ManualClock(Mutex<DateTime<Utc>>);
+
+    impl ManualClock {
+        pub(crate) fn new() -> Self {
+            Self(Mutex::new(
+                DateTime::parse_from_rfc3339("2026-08-27T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ))
+        }
+
+        pub(crate) fn advance(&self, seconds: i64) {
+            let mut now = self.0.lock().unwrap();
+            *now = now
+                .checked_add_signed(ChronoDuration::seconds(seconds))
+                .unwrap();
+        }
+    }
+
+    impl PublicationClock for ManualClock {
+        fn now(&self) -> DateTime<Utc> {
+            *self.0.lock().unwrap()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "gcs")]
@@ -4315,31 +4493,7 @@ mod tests {
         authority
     }
 
-    #[derive(Debug)]
-    struct ManualClock(Mutex<DateTime<Utc>>);
-
-    impl ManualClock {
-        fn new() -> Self {
-            Self(Mutex::new(
-                DateTime::parse_from_rfc3339("2026-08-27T12:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-            ))
-        }
-
-        fn advance(&self, seconds: i64) {
-            let mut now = self.0.lock().unwrap();
-            *now = now
-                .checked_add_signed(ChronoDuration::seconds(seconds))
-                .unwrap();
-        }
-    }
-
-    impl PublicationClock for ManualClock {
-        fn now(&self) -> DateTime<Utc> {
-            *self.0.lock().unwrap()
-        }
-    }
+    use super::test_clock::ManualClock;
 
     fn reader(identity: &str, valid_for_seconds: u64) -> ReaderAdmissionInput {
         ReaderAdmissionInput {
@@ -6441,5 +6595,144 @@ mod tests {
             first_store.create(&record),
             Err(PublicationControlError::Conflict(_))
         ));
+    }
+
+    /// The window the startup bootstrap actually requests, read from the lease
+    /// it mints and from the durable record, never from the constant alone. On
+    /// 2026-09-02 production's first Firestore rollout ran under this window,
+    /// it was 300 s, and nothing renewed it.
+    #[test]
+    fn startup_bootstrap_requests_the_hosted_rollout_window() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let control = control_for_fleet(Arc::clone(&store), clock, READER_A, staging_fleet());
+
+        let pending = control
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("absent runtime must leave one pending startup rollout");
+        let minted = (pending.expires_at - pending.acquired_at).num_seconds();
+        assert_eq!(minted, HOSTED_ROLLOUT_LEASE_SECONDS as i64);
+        let durable = control
+            .status()
+            .unwrap()
+            .active_lease
+            .expect("the durable record carries the startup lease");
+        assert_eq!(
+            (durable.expires_at - durable.acquired_at).num_seconds(),
+            HOSTED_ROLLOUT_LEASE_SECONDS as i64
+        );
+        assert_eq!(
+            HOSTED_ROLLOUT_LEASE_SECONDS, 1_800,
+            "the measured first rollout needs the cap validate_rollout_ttl admits, not the 300 s default"
+        );
+        assert!(
+            minted > DEFAULT_ROLLOUT_LEASE_SECONDS as i64,
+            "the minted window ({minted} s) must exceed the 300 s default that bounded production's first rollout"
+        );
+    }
+
+    /// Renewal before a mutation moves the expiry to a full window from now,
+    /// and it refuses exactly where assertion refuses: an expired lease, and a
+    /// proof the record does not name.
+    #[test]
+    fn rollout_renewal_before_mutation_extends_the_window_and_refuses_a_dead_lease() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let control = control_for_fleet(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            READER_A,
+            staging_fleet(),
+        );
+        let pending = control
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("pending startup rollout");
+
+        clock.advance(HOSTED_ROLLOUT_LEASE_SECONDS as i64 - 100);
+        let renewed = control
+            .renew_rollout_before_mutation(&proof(&pending))
+            .expect("a live lease renews");
+        assert_eq!(
+            renewed.expires_at,
+            clock.now() + ChronoDuration::seconds(HOSTED_ROLLOUT_LEASE_SECONDS as i64)
+        );
+        assert!(renewed.expires_at > pending.expires_at);
+        assert_eq!(renewed.token, pending.token, "renewal keeps the proof");
+        assert_eq!(renewed.fence, pending.fence);
+
+        let mut stranger = proof(&pending);
+        stranger.token = "not-the-active-token".to_string();
+        let refused = control
+            .renew_rollout_before_mutation(&stranger)
+            .unwrap_err();
+        assert!(
+            matches!(refused, PublicationControlError::Fenced(_)),
+            "{refused}"
+        );
+        assert!(
+            refused.to_string().contains("does not identify"),
+            "{refused}"
+        );
+
+        clock.advance(HOSTED_ROLLOUT_LEASE_SECONDS as i64 + 1);
+        let expired = control
+            .renew_rollout_before_mutation(&proof(&pending))
+            .unwrap_err();
+        assert!(
+            matches!(expired, PublicationControlError::Fenced(_)),
+            "{expired}"
+        );
+        assert!(expired.to_string().contains("expired"), "{expired}");
+    }
+
+    /// The lease bound to an in-flight mutation is what the Firestore store
+    /// re-reads before a transient retry: alive it passes, expired it refuses,
+    /// unbound there is nothing to defend. A nested owner of the same proof
+    /// leaves the outer binding in place.
+    #[test]
+    fn bound_mutation_lease_is_reasserted_and_cleared_with_its_owner() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let control = control_for_fleet(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            READER_A,
+            staging_fleet(),
+        );
+        control
+            .reassert_bound_mutation_lease()
+            .expect("nothing bound, nothing to defend");
+        let pending = control
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("pending startup rollout");
+
+        let bound = control.bind_mutation_lease(LeaseKind::Rollout, proof(&pending));
+        assert_eq!(
+            control.bound_mutation_lease_for_test(),
+            Some((LeaseKind::Rollout, proof(&pending)))
+        );
+        control
+            .reassert_bound_mutation_lease()
+            .expect("a live bound lease passes");
+        {
+            let _inner = control.bind_mutation_lease(LeaseKind::Rollout, proof(&pending));
+        }
+        assert!(
+            control.bound_mutation_lease_for_test().is_some(),
+            "a nested owner of the same proof must not clear the outer binding"
+        );
+
+        clock.advance(HOSTED_ROLLOUT_LEASE_SECONDS as i64 + 1);
+        let refused = control.reassert_bound_mutation_lease().unwrap_err();
+        assert!(refused.to_string().contains("expired"), "{refused}");
+
+        drop(bound);
+        assert!(control.bound_mutation_lease_for_test().is_none());
+        control
+            .reassert_bound_mutation_lease()
+            .expect("an unbound lease defends nothing");
     }
 }

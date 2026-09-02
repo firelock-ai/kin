@@ -29,6 +29,33 @@
 # arm depends on it, so a seeding failure names itself instead of arriving later
 # disguised as a broken endpoint lever.
 #
+# Arm 1a is FIR-3059's acceptance on these same bytes. A hosted daemon
+# bootstraps the GCS publication-control record before it serves, and the lease
+# in that record is the window its first hosted rollout runs under. On
+# 2026-09-02 that window was 300 s and nothing renewed it, so production's first
+# Firestore rollout died with every write done and none of the credit kept. The
+# arm reads the record back out of the emulator, the way a real record is read,
+# and grades the window against the value the daemon owns; the grader is
+# falsified first against the pre-fix shape, so a grader that accepts anything
+# cannot pass.
+#
+# The daemon that record comes from is the arm's own, not arm 1's. The
+# object_store client that writes the record wants a GCE token even against an
+# emulator, and this runner's metadata endpoint answers ResourceNotFound, so
+# arm 1's daemon bootstraps nothing (its log says so by name). The arm therefore
+# runs a metadata stub on the smoke network, points only its own daemon at it
+# through GCE_METADATA_HOST, gives that daemon its own prefix so no other arm's
+# record is read by mistake, and names one fleet member the bucket does not
+# hold, so the bootstrap mints the startup lease and then stops at the fence
+# with the lease still active. A completed lease records no window; an active
+# one does. Arms 1, 1b and 2 keep their exact conditions and never see the stub.
+#
+# What the arm grades today: the token path and the grader. fake-gcs-server
+# refuses the record write itself (400 "invalid uploadType" to object_store's
+# XML-API PUT; measured, see the arm), so the window is UNGRADED here by name
+# until the emulator accepts the write; the composed-rollout regression in
+# kin-daemon grades the same window on every pull request.
+#
 # Usage: scripts/test-gcs-emulator-endpoint.sh <image-ref>
 
 set -uo pipefail
@@ -38,6 +65,8 @@ GCS_IMAGE="${FAKE_GCS_IMAGE:-fsouza/fake-gcs-server:latest}"
 NET="kin-gcs-net-$$"
 GCS_CID=""
 KIN_CID=""
+META_CID=""
+META_IMAGE="${METADATA_STUB_IMAGE:-python:3.12-alpine}"
 BUCKET="kin-emulator-test"
 
 # The entrypoint runs `kin init`, which mints a fresh UUID v4 repo id into the
@@ -55,9 +84,10 @@ PUBLICATION_TOKEN="emulator-publication-admin-token"
 
 cleanup() {
   [ -n "${KIN_CID}" ] && docker rm -f "${KIN_CID}" >/dev/null 2>&1
+  [ -n "${META_CID}" ] && docker rm -f "${META_CID}" >/dev/null 2>&1
   [ -n "${GCS_CID}" ] && docker rm -f "${GCS_CID}" >/dev/null 2>&1
   docker network rm "${NET}" >/dev/null 2>&1
-  KIN_CID=""; GCS_CID=""
+  KIN_CID=""; META_CID=""; GCS_CID=""
   return 0
 }
 trap cleanup EXIT
@@ -104,9 +134,13 @@ printf '%s' "${IMAGE_IDENTITY}" | grep -Eq '^sha256:[0-9a-f]{64}$' \
 # variable cannot fail on it. The identity is the only argument that varies, so
 # it is the only one held in an array, and bash 3.2 aborts expanding an EMPTY
 # array under `set -u`, so it is expanded through the `${arr[@]+...}` guard.
+# Any argument after the identity mode is passed to docker run as given; arm 1a
+# uses that for its own prefix, fleet and metadata host, and nothing else does.
 start_kin() {
   local emulator_host="$1"
   local identity_mode="${2:-with-identity}"
+  shift; [ $# -gt 0 ] && shift
+  local extra_env=("$@")
   local identity_env=(-e "KIN_RELEASE_DAEMON_DIGEST_INTERNAL=${IMAGE_IDENTITY}")
   [ "${identity_mode}" = "omit-identity" ] && identity_env=()
   KIN_CID="$(docker run -d --network "${NET}" \
@@ -119,6 +153,7 @@ start_kin() {
     -e "KIN_DAEMON_AUTH_TOKEN=${DAEMON_TOKEN}" \
     -e "KIN_PUBLICATION_CONTROL_AUTH_TOKEN=${PUBLICATION_TOKEN}" \
     ${identity_env[@]+"${identity_env[@]}"} \
+    ${extra_env[@]+"${extra_env[@]}"} \
     "${IMAGE}" --port 4219)"
 }
 
@@ -137,11 +172,43 @@ await_kin() {
   echo "timeout"
 }
 
-echo "==> [setup] network and emulator"
+echo "==> [setup] network, emulator and the metadata stub arm 1a's daemon reads its token from"
 docker network create "${NET}" >/dev/null || fail "could not create docker network"
 GCS_CID="$(docker run -d --network "${NET}" --network-alias fake-gcs "${GCS_IMAGE}" \
   -scheme http -port 4443 -backend memory -public-host fake-gcs:4443)" \
   || fail "could not start ${GCS_IMAGE}"
+# The shape object_store expects (crate 0.14, gcp/credential.rs): a GET on
+# http://<GCE_METADATA_HOST>/computeMetadata/v1/instance/service-accounts/default/token
+# with Metadata-Flavor: Google, answered with access_token and expires_in. The
+# token is a fixed string the emulator never inspects; no real credential exists
+# anywhere in this job.
+METADATA_STUB=$(cat <<'PYSTUB'
+import http.server, json
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+    def _send(self, code, body, ctype):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Metadata-Flavor", "Google")
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path.endswith("/service-accounts/default/token"):
+            return self._send(200, json.dumps({"access_token": "emulator-smoke-token", "expires_in": 3000, "token_type": "Bearer"}), "application/json")
+        if path.endswith("/service-accounts/default/email"):
+            return self._send(200, "emulator-smoke@local", "text/plain")
+        if path.rstrip("/") in ("", "/computeMetadata/v1"):
+            return self._send(200, "computeMetadata/", "text/plain")
+        return self._send(404, "not found", "text/plain")
+http.server.ThreadingHTTPServer(("0.0.0.0", 80), H).serve_forever()
+PYSTUB
+)
+META_CID="$(docker run -d --network "${NET}" --network-alias metadata "${META_IMAGE}" python3 -c "${METADATA_STUB}")" \
+  || fail "could not start the metadata stub from ${META_IMAGE}"
 
 # ---------------------------------------------------------------------------
 # 0. Seed the bucket through the JSON API, and prove it took. Everything below
@@ -192,6 +259,106 @@ code="$(docker exec "${KIN_CID}" sh -c \
 [ -n "${code}" ] && [ "${code}" != "000" ] \
   || { dump_kin; fail "daemon reached listening but /readiness did not answer"; }
 echo "==> [serves] OK (listening, redirect logged, /readiness http ${code})"
+docker rm -f "${KIN_CID}" >/dev/null 2>&1; KIN_CID=""
+
+# ---------------------------------------------------------------------------
+# 1a. The startup rollout lease these bytes mint (FIR-3059). See the header.
+#     The grader is a function so it can be run against fixtures before it is
+#     run against the record; a grader that only ever sees the live record
+#     cannot show it would have refused the shape that failed production.
+# ---------------------------------------------------------------------------
+# grade_lease_window <record-json>: prints one PASS, FAIL or UNREADABLE line;
+# exits 0 on PASS, 1 on FAIL, 2 when the record carries no readable lease.
+grade_lease_window() {
+  python3 - "$1" <<'PY'
+import json
+import re
+import sys
+from datetime import datetime
+
+EXPECTED_SECONDS = 1800
+
+
+def parse(stamp):
+    # chrono writes nanoseconds; Python's parser wants at most six digits.
+    stamp = re.sub(r"(\.\d{1,6})\d*", r"\1", stamp).replace("Z", "+00:00")
+    return datetime.fromisoformat(stamp)
+
+
+try:
+    lease = json.loads(sys.argv[1])["active_lease"]
+    window = int((parse(lease["expires_at"]) - parse(lease["acquired_at"])).total_seconds())
+    holder = lease.get("holder")
+    fence = lease.get("fence")
+except (ValueError, KeyError, TypeError) as err:
+    print(f"UNREADABLE the control record carries no readable startup lease: {err!r}")
+    sys.exit(2)
+if window != EXPECTED_SECONDS:
+    print(f"FAIL startup rollout lease window is {window} s, expected {EXPECTED_SECONDS} s (holder {holder}, fence {fence})")
+    sys.exit(1)
+print(f"PASS startup rollout lease window is {window} s (holder {holder}, fence {fence})")
+PY
+}
+
+echo "==> [lease-window/self-test] the grader must refuse the pre-fix window and accept the fixed one"
+prefix_record='{"active_lease":{"holder":"kin-daemon-startup-bootstrap","fence":1,"acquired_at":"2026-09-02T08:20:00.712345678Z","expires_at":"2026-09-02T08:25:00.712345678Z"}}'
+grade_lease_window "${prefix_record}" >/dev/null 2>&1
+rc=$?
+[ "${rc}" -eq 1 ] || fail "lease-window self-test: the grader answered ${rc} to the pre-fix 300 s window instead of failing it, so it grades nothing"
+fixed_record='{"active_lease":{"holder":"kin-daemon-startup-bootstrap","fence":1,"acquired_at":"2026-09-02T08:20:00.712345678Z","expires_at":"2026-09-02T08:50:00.712345678Z"}}'
+grade_lease_window "${fixed_record}" >/dev/null 2>&1
+rc=$?
+[ "${rc}" -eq 0 ] || fail "lease-window self-test: the grader refused an 1800 s window (rc ${rc})"
+grade_lease_window '{"active_lease":null}' >/dev/null 2>&1
+rc=$?
+[ "${rc}" -eq 2 ] || fail "lease-window self-test: a record with no lease must be unreadable, not a pass or a fail (rc ${rc})"
+echo "==> [lease-window/self-test] OK"
+
+echo "==> [lease-window] a daemon of its own: own prefix, the metadata stub, and a fleet member the bucket does not hold"
+# The absent member is a real UUID v4 that no arm ever initializes, so the
+# bootstrap mints the startup lease, reads the fleet, and stops at that member
+# with the lease active. The prefix keeps this record apart from arm 1's.
+LEASE_PREFIX="lease-window"
+ABSENT_REPO="2c9d5c3e-7b1a-4f0e-9d2b-3a8e6f1c4b7d"
+start_kin "http://fake-gcs:4443" with-identity \
+  -e "KIN_GCS_PREFIX=${LEASE_PREFIX}" \
+  -e "KIN_REPO_IDS=${REPO_ID},${ABSENT_REPO}" \
+  -e GCE_METADATA_HOST=metadata
+state="$(await_kin)"
+[ "${state}" = "listening" ] \
+  || { dump_kin; fail "lease-window: the daemon did not reach serving state (state=${state}); the bootstrap runs before the API serves, so nothing below can be read"; }
+logs="$(docker logs "${KIN_CID}" 2>&1 || true)"
+contains "${logs}" "fetching token from metadata server" \
+  || { dump_kin; fail "lease-window: the daemon never asked the metadata stub for a token, so the bootstrap could not have written a record"; }
+# The object name carries the prefix, and the JSON API wants the slash encoded.
+record_object="${LEASE_PREFIX}%2F.kin-graph-publication-control.json"
+record="$(docker run --rm --network "${NET}" --entrypoint curl "${IMAGE}" -sS -f \
+  "http://fake-gcs:4443/storage/v1/b/${BUCKET}/o/${record_object}?alt=media" 2>/dev/null || true)"
+if [ -n "${record}" ]; then
+  verdict="$(grade_lease_window "${record}")"
+  rc=$?
+  echo "==> [lease-window] ${verdict}"
+  [ "${rc}" -eq 0 ] || { dump_kin; fail "lease-window: ${verdict}"; }
+else
+  # No record. One cause is known and measured, and it is the emulator's, not
+  # the daemon's: this fake-gcs-server answers 400 "invalid uploadType" to
+  # every XML-API PUT (plain, percent-encoded, with or without the create
+  # precondition; only the JSON media upload lands), and object_store writes
+  # through the XML PUT. Measured 2026-09-02 against the image built
+  # 2026-08-24 (kin-ecosystem .kin-coord/reports/leasefix-20260902.md). That
+  # exact refusal, in the daemon's own bootstrap line, is UNGRADED and said so
+  # on every run; the window then has no grader in CI until the emulator
+  # accepts the write, and this arm starts grading the day it does. Any other
+  # reason for an absent record is a daemon that stopped writing its record,
+  # which is a failure.
+  bootstrap_line="$(printf '%s\n' "${logs}" | grep -m1 'bootstrap hosted publication control' || true)"
+  if contains "${bootstrap_line}" "graph publication control store failed" && contains "${bootstrap_line}" "invalid uploadType"; then
+    echo "==> [lease-window] UNGRADED the daemon reached the record write and the emulator refused it (${bootstrap_line#*Generic GCS error: })"
+  else
+    dump_kin
+    fail "lease-window: the daemon served but no publication-control record exists at ${BUCKET}/${LEASE_PREFIX}/.kin-graph-publication-control.json and its bootstrap did not stop at the known emulator refusal${bootstrap_line:+ (daemon: ${bootstrap_line})}"
+  fi
+fi
 docker rm -f "${KIN_CID}" >/dev/null 2>&1; KIN_CID=""
 
 # ---------------------------------------------------------------------------

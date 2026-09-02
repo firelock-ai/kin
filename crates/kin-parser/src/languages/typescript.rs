@@ -121,6 +121,26 @@ pub(super) fn extract_typescript_tree(
     // copies of this rule and drifted anyway: the TypeScript index predicate
     // never matched `index.d.ts`. Sharing the helper is what the header
     // comment above already says the shared surface exists for.
+    // TypeScript merges a namespace with a class, interface, enum, function or
+    // type alias of the same name in the same file: `interface Event {}` beside
+    // `namespace Event {}` is ONE symbol, and 24 of the 70 namespaces in VS
+    // Code's editor and base subtree are written that way. Minting a Module for
+    // the namespace half leaves the file holding two entities under one name,
+    // which is the exact collision `owners.finish` warns about below and which
+    // the linker's (file, name) index cannot tell apart.
+    //
+    // Run over the finished list rather than checking as each header is pushed,
+    // because the merge is order-free in the source: `type Sizing` precedes its
+    // namespace in `grid.ts` and `namespace Tokens` precedes its interface in
+    // `marked.d.ts`. Every Module in `entities` at this point is a namespace
+    // header; the file's own module is pushed below.
+    let merged: std::collections::HashSet<String> = entities
+        .iter()
+        .filter(|e| e.kind != EntityKind::Module)
+        .map(|e| e.name.clone())
+        .collect();
+    entities.retain(|e| e.kind != EntityKind::Module || !merged.contains(&e.name));
+
     let (module_name, is_package) = js_module_identity(&file_id.0, suffixes);
     if !module_name.is_empty() {
         entities.push(ExtractedEntity {
@@ -201,7 +221,14 @@ fn extract_ts_node(
                 extract_calls_from_context(node, source, &name, None, relations);
             }
         }
-        "class_declaration" => {
+        // `abstract class Foo {}` is `abstract_class_declaration` in the
+        // grammar, a sibling of `class_declaration` carrying the identical
+        // field set (decorators, name, type_parameters, class_heritage, body).
+        // Matching only `class_declaration` dropped every abstract class and
+        // every method on it: 99 of the 102 abstract classes in VS Code's
+        // editor and base subtree, with 1,248 members inside them, against 14
+        // of 1,979 plain classes missed for unrelated reasons.
+        "class_declaration" | "abstract_class_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 extract_ts_class_like(node, &name, source, file_id, entities, relations);
@@ -431,6 +458,63 @@ fn extract_ts_node(
                 }
             }
         }
+        // `namespace X { ... }` is `internal_module` and `module X { ... }` is
+        // `module`; both carry a `name` and an optional `statement_block` body.
+        // Neither had an arm, so every declaration written inside a namespace
+        // was dropped along with the namespace itself. VS Code's
+        // `coreCommands.ts` declares 117 names and the graph held ten: the ten
+        // that sit at column zero outside all four of its namespaces.
+        //
+        // The body's children go back through `extract_ts_node` with their own
+        // plain names, which is what the Rust adapter's `mod_item` arm does in
+        // this same crate and what the call extractor can resolve: a call
+        // written `CoreNavigationCommands.MoveTo.runEditorCommand(x)` is a
+        // `member_expression`, and `extract_calls_from_context` collapses those
+        // to the bare property name. An entity named `CoreNavigationCommands.MoveTo`
+        // would be a name no call site in the repository ever writes.
+        "internal_module" | "module" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                // `declare module "marked"` names the module with a string
+                // literal; the quotes are syntax, not part of the name.
+                let name = name_node
+                    .utf8_text(source)
+                    .unwrap_or("")
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_string();
+                if !name.is_empty() {
+                    entities.push(ExtractedEntity {
+                        kind: EntityKind::Module,
+                        name,
+                        signature: node_signature(node, source),
+                        visibility: detect_ts_visibility(node, source),
+                        doc_summary: extract_preceding_comment(node, source),
+                        fingerprint: compute_fingerprint(node, source),
+                        span: span_from_node(node, file_id),
+                    });
+                }
+            }
+            // `declare module foo;` has no body to descend into.
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for child in body.children(&mut cursor) {
+                    extract_ts_node(
+                        &child, source, file_id, entities, relations, owners, definers,
+                    );
+                }
+            }
+        }
+        // `declare` wraps a plain declaration in the grammar, so a `.d.ts`
+        // file's `declare class`, `declare const`, `declare function` and
+        // `declare namespace` all reached the walk as `ambient_declaration` and
+        // matched nothing. Unwrap it and the arms above do the work.
+        "ambient_declaration" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                extract_ts_node(
+                    &child, source, file_id, entities, relations, owners, definers,
+                );
+            }
+        }
         "import_statement" => {}
         _ => {}
     }
@@ -462,8 +546,44 @@ fn extract_ts_class_like(
 
     // Recurse into class body for methods
     if let Some(body) = node.child_by_field_name("body") {
+        // TypeScript writes an overload set as N bodiless signatures followed by
+        // one implementation, and all N+1 are one method. `TextModel.applyEdits`
+        // is written five times in `textModel.ts` and `GridView.getView` three
+        // times. Emitting per node would leave the file holding six entities
+        // under one name, so the signatures collapse onto the implementation,
+        // and a `declare class`'s repeated signature with no implementation
+        // collapses onto its own first occurrence.
+        //
+        // Collected before the walk, because the implementation follows its
+        // signatures in the source and a check made as each member is reached
+        // would not yet have seen it.
+        let implemented: std::collections::HashSet<String> = {
+            let mut cursor = body.walk();
+            body.children(&mut cursor)
+                .filter(|m| m.kind() == "method_definition")
+                .filter_map(|m| m.child_by_field_name("name"))
+                .filter_map(|n| n.utf8_text(source).ok())
+                .map(str::to_string)
+                .collect()
+        };
+        let mut signatures_seen: std::collections::HashSet<String> = Default::default();
         let mut cursor = body.walk();
         for member in body.children(&mut cursor) {
+            if matches!(
+                member.kind(),
+                "method_signature" | "abstract_method_signature"
+            ) {
+                let Some(member_name) = member
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                if implemented.contains(&member_name) || !signatures_seen.insert(member_name) {
+                    continue;
+                }
+            }
             extract_ts_class_member(&member, source, file_id, name, entities, relations);
         }
     }
@@ -478,7 +598,19 @@ fn extract_ts_class_member(
     relations: &mut Vec<ExtractedRelation>,
 ) {
     match node.kind() {
-        "method_definition" | "public_field_definition" => {
+        // The pinned grammar gives `class_body` six child kinds and a member
+        // written without a body is not `method_definition`: `public abstract
+        // runCoreEditorCommand(...): void;` is `abstract_method_signature` and
+        // a `declare class`'s `space(token): string;` is `method_signature`.
+        // Matching only the two with bodies meant every abstract method was
+        // dropped even once its class was extracted, which is how the demo's
+        // `runCoreEditorCommand` stayed missing through the first arm.
+        // `index_signature` and `class_static_block`, the other two, carry no
+        // name and stay out.
+        "method_definition"
+        | "method_signature"
+        | "abstract_method_signature"
+        | "public_field_definition" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 let qualified = format!("{}.{}", class_name, name);
@@ -1626,5 +1758,286 @@ function registerHandler(target: EventTarget, event: string, handler: () => void
             .map(|e| e.name.as_str())
             .collect();
         assert!(invented.is_empty(), "got {invented:?}");
+    }
+
+    /// A faithful reduction of `src/vs/editor/browser/coreCommands.ts`, which
+    /// declares 117 names and whose graph held ten before this change: an
+    /// `export abstract class` with an abstract method on it, a second bare
+    /// `abstract class`, and the column-zero declarations between the
+    /// namespaces that were the only ones an unqualified `class_declaration`
+    /// arm could reach.
+    #[test]
+    fn an_abstract_class_and_the_methods_on_it_become_entities() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"
+export abstract class CoreEditorCommand<T> extends EditorCommand {
+    public runEditorCommand(accessor: ServicesAccessor, editor: ICodeEditor): void {
+        this.runCoreEditorCommand(editor, {});
+    }
+    public abstract runCoreEditorCommand(viewModel: IViewModel, args: Partial<T>): void;
+}
+
+abstract class EditorOrNativeTextInputCommand {
+    constructor(target: MultiCommand) {}
+    public runDOMCommand(activeElement: Element): void {}
+}
+
+function registerCommand<T extends Command>(command: T): T { return command; }
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("coreCommands.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert!(matches!(output.parse_state, ParseState::Valid));
+        let named = entities_besides_the_files_own_module(&output.entities);
+
+        assert!(
+            named.contains(&(EntityKind::Class, "CoreEditorCommand")),
+            "the exported abstract class is missing: {named:?}"
+        );
+        assert!(
+            named.contains(&(EntityKind::Class, "EditorOrNativeTextInputCommand")),
+            "the bare abstract class is missing: {named:?}"
+        );
+        assert!(
+            named.contains(&(EntityKind::Method, "CoreEditorCommand.runCoreEditorCommand")),
+            "the abstract method the demo named is missing: {named:?}"
+        );
+        assert!(
+            named.contains(&(EntityKind::Method, "CoreEditorCommand.runEditorCommand")),
+            "a concrete method on an abstract class is missing: {named:?}"
+        );
+        // The control: the plain function beside them was never dropped, so a
+        // suite that only asserted "some entities exist" would pass with the
+        // abstract arm deleted.
+        assert!(
+            named.contains(&(EntityKind::Function, "registerCommand")),
+            "the plain function is missing: {named:?}"
+        );
+    }
+
+    /// The `CoreNavigationCommands` shape: a namespace whose body holds the
+    /// classes an editor question routes to. Their names stay unqualified,
+    /// because `extract_calls_from_context` collapses a
+    /// `CoreNavigationCommands.MoveTo.runEditorCommand(x)` member expression to
+    /// the bare property, so a qualified entity would be a name no call site
+    /// writes.
+    #[test]
+    fn a_namespace_body_is_walked_like_the_files_own_top_level() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"
+export namespace CoreNavigationCommands {
+    export interface BaseCommandOptions { source?: string; }
+
+    export class BaseMoveToCommand extends CoreEditorCommand<MoveCommandOptions> {
+        public runCoreEditorCommand(viewModel: IViewModel, args: Partial<MoveCommandOptions>): void {}
+    }
+
+    export const MoveTo = registerCommand(new BaseMoveToCommand());
+
+    function parse(args: RawArguments): ParsedArguments { return args; }
+}
+
+module LegacyNames {
+    export class Renamed {}
+}
+
+declare module ambientWithNoBody;
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("coreCommands.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let named = entities_besides_the_files_own_module(&output.entities);
+        let modules: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Module && e.name != "coreCommands")
+            .map(|e| e.name.as_str())
+            .collect();
+
+        assert!(
+            named.contains(&(EntityKind::Class, "BaseMoveToCommand")),
+            "a class inside a namespace is missing: {named:?}"
+        );
+        assert!(
+            named.contains(&(EntityKind::Method, "BaseMoveToCommand.runCoreEditorCommand")),
+            "a method on a class inside a namespace is missing: {named:?}"
+        );
+        assert!(
+            named.contains(&(EntityKind::Interface, "BaseCommandOptions")),
+            "an interface inside a namespace is missing: {named:?}"
+        );
+        assert!(
+            named.contains(&(EntityKind::Function, "parse")),
+            "a function inside a namespace is missing: {named:?}"
+        );
+        assert!(
+            named.contains(&(EntityKind::Class, "Renamed")),
+            "a class inside a `module` block is missing: {named:?}"
+        );
+        assert!(
+            modules.contains(&"CoreNavigationCommands") && modules.contains(&"LegacyNames"),
+            "the namespace headers are missing: {modules:?}"
+        );
+        // A body-less `declare module foo;` has nothing to descend into and
+        // must not panic or invent a member.
+        assert!(
+            modules.contains(&"ambientWithNoBody"),
+            "the body-less ambient module is missing: {modules:?}"
+        );
+    }
+
+    /// An overload set is one method, however many times it is written.
+    /// `src/vs/editor/common/model/textModel.ts` declares `applyEdits` five
+    /// times as a signature and once with a body; `GridView.getView` three
+    /// times. Emitting per node put 144 duplicate `(file, name)` pairs across
+    /// 40 files into the VS Code graph before this collapsed them.
+    #[test]
+    fn an_overload_set_is_one_method_however_many_signatures_it_carries() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"
+export class TextModel {
+    public applyEdits(operations: readonly IIdentifiedSingleEditOperation[]): void;
+    public applyEdits(operations: readonly IIdentifiedSingleEditOperation[], computeUndoEdits: false): void;
+    public applyEdits(operations: readonly IIdentifiedSingleEditOperation[], computeUndoEdits: true): IValidEditOperation[];
+    public applyEdits(operations: readonly IIdentifiedSingleEditOperation[], computeUndoEdits: boolean = false): void | IValidEditOperation[] {
+        return this._doApplyEdits(operations);
+    }
+    public getLineContent(lineNumber: number): string { return ''; }
+}
+
+declare class AmbientOnly {
+    lex(src: string): Token[];
+    lex(src: string, options: Options): Token[];
+    inlineTokens(src: string): Token[];
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("textModel.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let names: Vec<&str> = output.entities.iter().map(|e| e.name.as_str()).collect();
+
+        let count = |needle: &str| names.iter().filter(|n| **n == needle).count();
+        assert_eq!(
+            count("TextModel.applyEdits"),
+            1,
+            "an overload set became {} entities: {names:?}",
+            count("TextModel.applyEdits")
+        );
+        assert_eq!(
+            count("AmbientOnly.lex"),
+            1,
+            "a signature with no implementation was emitted {} times: {names:?}",
+            count("AmbientOnly.lex")
+        );
+        // The controls: the collapse must not eat a method that is written once,
+        // whether it carries a body or not.
+        assert_eq!(count("TextModel.getLineContent"), 1, "{names:?}");
+        assert_eq!(count("AmbientOnly.inlineTokens"), 1, "{names:?}");
+    }
+
+    /// TypeScript merges a namespace with a same-named class, interface, enum,
+    /// function or type alias. `src/vs/base/common/event.ts` writes
+    /// `interface Event` beside `namespace Event`, and 24 of VS Code's 70
+    /// namespaces are written that way. One symbol, one entity.
+    #[test]
+    fn a_namespace_merged_with_a_same_name_declaration_mints_no_second_entity() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"
+export interface Event<T> { (listener: (e: T) => void): IDisposable; }
+
+export namespace Event {
+    export const None: Event<any> = () => Disposable.None;
+    export function once<T>(event: Event<T>): Event<T> { return event; }
+}
+
+export namespace Schemas {
+    export const file = 'file';
+}
+
+export namespace Tokens { }
+export interface Tokens { space: boolean; }
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("event.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let modules: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Module && e.name != "event")
+            .map(|e| e.name.as_str())
+            .collect();
+
+        assert!(
+            !modules.contains(&"Event"),
+            "the merged namespace minted a second entity under the interface's name: {modules:?}"
+        );
+        // Written the other way round in the source, which is why the merge is
+        // resolved over the finished list rather than as each header is pushed.
+        assert!(
+            !modules.contains(&"Tokens"),
+            "the merge is order-dependent: {modules:?}"
+        );
+        // The control: a namespace nothing merges with keeps its entity.
+        assert!(
+            modules.contains(&"Schemas"),
+            "a standalone namespace lost its entity: {modules:?}"
+        );
+        let named = entities_besides_the_files_own_module(&output.entities);
+        assert!(
+            named.contains(&(EntityKind::Function, "once")),
+            "the merged namespace's own members are missing: {named:?}"
+        );
+    }
+
+    /// A `.d.ts` file's declarations reach the walk wrapped in
+    /// `ambient_declaration`, which matched nothing. `marked.d.ts` and
+    /// `semver.d.ts` between them lost 105 of their 135 declared names.
+    #[test]
+    fn an_ambient_declaration_is_unwrapped_to_the_declaration_inside_it() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"
+declare class _Renderer {
+    space(token: Tokens.Space): string;
+}
+
+declare namespace Tokens {
+    interface Space { type: 'space'; }
+}
+
+declare function marked(src: string): string;
+
+export declare const MAX_LENGTH = 256;
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("marked.d.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let named = entities_besides_the_files_own_module(&output.entities);
+
+        assert!(
+            named.contains(&(EntityKind::Class, "_Renderer")),
+            "the ambient class is missing: {named:?}"
+        );
+        assert!(
+            named.contains(&(EntityKind::Method, "_Renderer.space")),
+            "the ambient class's method is missing: {named:?}"
+        );
+        assert!(
+            named.contains(&(EntityKind::Interface, "Space")),
+            "a declaration inside an ambient namespace is missing: {named:?}"
+        );
+        // `declare function marked(...): string;` is `function_signature`, not
+        // `function_declaration`, and it stays out of this change on purpose.
+        // A bare signature is also how TypeScript writes an overload set, so
+        // the arm cannot be added until overloads collapse onto their
+        // implementation: `src/vs/base/browser/dom.ts` writes `h` five times
+        // and `svgElem` five times, and matching the kind alone would mint five
+        // entities for one function. The fixture keeps the line so a reader can
+        // see what is still missing.
+        assert!(
+            named
+                .iter()
+                .any(|(kind, name)| *kind == EntityKind::Constant && *name == "MAX_LENGTH"),
+            "the exported ambient const is missing: {named:?}"
+        );
     }
 }

@@ -700,6 +700,15 @@ CI_JOB_DISPLAY_NAMES = {
     "fast-gate-lint": "Fast gate lint and policy",
     "fast-gate-tests": "Fast gate test shard",
     "fast-gate-tests-aggregate": "Fast gate build and tests",
+    # The served MCP surface, graded on the pull request that moves it. Five
+    # assertions read that surface and all five run only on main's push, so a
+    # profile change that moved a served name and trimmed three schema knobs and
+    # a description sentence was `skipped` across 44 of 44 check runs on its own
+    # pull request and red on main for four landings. This job publishes no
+    # required context and claims none: `bin/kin-lane merge land` refuses on any
+    # check that is not green by name, and ruleset 19746451 is what would make it
+    # additionally block a merge through GitHub's own UI.
+    "mcp-surface-contract": "MCP surface contract",
     # The inert pull-request producer of the two expanded `Check & Test` names.
     # It covered documentation-only diffs alone until FIR-2815 moved the ubuntu
     # and macOS suites off the pull-request path; it now covers every pull
@@ -799,6 +808,14 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     # context; the required CI gate reads and revalidates its server evidence.
     ".github/workflows/kin-registry-release-attest.yml": {
         "attest-completed-receiver": "Attest completed Kin registry receiver",
+    },
+    # The wave's own landing. The judge reads every check-run on the wave head
+    # by name and the land job squash-merges through the release App only when
+    # that full set has concluded green. Both run on workflow_run and schedule,
+    # so neither publishes a pull-request or merge-group context.
+    ".github/workflows/kin-registry-wave-land.yml": {
+        "judge-wave": "Judge the open Kin registry wave",
+        "land-wave": "Land the green Kin registry wave",
     },
     ".github/workflows/link-check.yml": {
         "link-check": "Check public documentation links",

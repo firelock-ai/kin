@@ -170,6 +170,27 @@ def is_ancestor(workspace: Path, base: str, head: str) -> bool:
     )
 
 
+def ensure_commit(workspace: Path, sha: str) -> None:
+    """Fetch `sha` from origin when the checkout does not hold it yet.
+
+    A pull base that moved past the checkout's knowledge of main is still main
+    history on origin, and GitHub serves any reachable commit by sha. The fetch
+    is allowed to fail: `is_ancestor` on a commit the checkout still lacks
+    answers no, which is the fail-closed direction.
+    """
+
+    present = _run(
+        ["git", "-C", str(workspace), "cat-file", "-e", f"{sha}^{{commit}}"],
+        check=False,
+    ).returncode
+    if present == 0:
+        return
+    _run(
+        ["git", "-C", str(workspace), "fetch", "--no-tags", "origin", sha],
+        check=False,
+    )
+
+
 def ensure_pull_head(workspace: Path, pull_number: int, head: str) -> None:
     present = _run(
         ["git", "-C", str(workspace), "cat-file", "-e", f"{head}^{{commit}}"],
@@ -411,9 +432,9 @@ def verify_merge_group_dependency_tree(
 ) -> None:
     """Reject any queued peer that changes the admitted dependency paths."""
 
-    if admitted.base != base:
+    if admitted.base != base and not is_ancestor(workspace, admitted.base, base):
         raise AdmissionError(
-            "merge group base differs from the admitted dependency base"
+            "merge group base does not descend from the admitted dependency base"
         )
     expected_tree = git(
         workspace,
@@ -762,10 +783,18 @@ def validate_attestation(
         validate_workflow_run(repository, latest, workflow_run)
     expected_tree = str(latest["tree"])
     base = str(latest["base"])
+    # The pull base is main's tip at the pull's last push and moves past the
+    # attested base whenever a lane lands between the receiver's checkout and
+    # its push. Protected main at or after the attested base is what the
+    # attestation needs; a base that is not an ancestor of it descends from
+    # something other than the policy that produced the admission.
     if expected_base is not None and base != expected_base:
-        raise AdmissionError(
-            f"dependency admission base {base} is not current pull base {expected_base}"
-        )
+        ensure_commit(workspace, expected_base)
+        if not is_ancestor(workspace, base, expected_base):
+            raise AdmissionError(
+                f"dependency admission base {base} is not an ancestor of "
+                f"current pull base {expected_base}"
+            )
     evidence = validate_delta(workspace, base, head, require_marker=True)
     if evidence.tree != expected_tree:
         raise AdmissionError(
@@ -1054,9 +1083,12 @@ def verify_merge_group(
         expected_head=candidate_head,
         require_open=True,
     )
-    if pull_evidence.base != base:
+    if pull_evidence.base != base and not is_ancestor(
+        workspace, pull_evidence.base, base
+    ):
         raise AdmissionError(
-            "merge group base differs from the current dependency pull base"
+            "merge group base is not protected main at or after the current "
+            "dependency pull base"
         )
     admitted = verify_attestation(
         workspace,
