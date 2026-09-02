@@ -546,8 +546,44 @@ fn extract_ts_class_like(
 
     // Recurse into class body for methods
     if let Some(body) = node.child_by_field_name("body") {
+        // TypeScript writes an overload set as N bodiless signatures followed by
+        // one implementation, and all N+1 are one method. `TextModel.applyEdits`
+        // is written five times in `textModel.ts` and `GridView.getView` three
+        // times. Emitting per node would leave the file holding six entities
+        // under one name, so the signatures collapse onto the implementation,
+        // and a `declare class`'s repeated signature with no implementation
+        // collapses onto its own first occurrence.
+        //
+        // Collected before the walk, because the implementation follows its
+        // signatures in the source and a check made as each member is reached
+        // would not yet have seen it.
+        let implemented: std::collections::HashSet<String> = {
+            let mut cursor = body.walk();
+            body.children(&mut cursor)
+                .filter(|m| m.kind() == "method_definition")
+                .filter_map(|m| m.child_by_field_name("name"))
+                .filter_map(|n| n.utf8_text(source).ok())
+                .map(str::to_string)
+                .collect()
+        };
+        let mut signatures_seen: std::collections::HashSet<String> = Default::default();
         let mut cursor = body.walk();
         for member in body.children(&mut cursor) {
+            if matches!(
+                member.kind(),
+                "method_signature" | "abstract_method_signature"
+            ) {
+                let Some(member_name) = member
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                if implemented.contains(&member_name) || !signatures_seen.insert(member_name) {
+                    continue;
+                }
+            }
             extract_ts_class_member(&member, source, file_id, name, entities, relations);
         }
     }
@@ -1848,6 +1884,55 @@ declare module ambientWithNoBody;
             modules.contains(&"ambientWithNoBody"),
             "the body-less ambient module is missing: {modules:?}"
         );
+    }
+
+    /// An overload set is one method, however many times it is written.
+    /// `src/vs/editor/common/model/textModel.ts` declares `applyEdits` five
+    /// times as a signature and once with a body; `GridView.getView` three
+    /// times. Emitting per node put 144 duplicate `(file, name)` pairs across
+    /// 40 files into the VS Code graph before this collapsed them.
+    #[test]
+    fn an_overload_set_is_one_method_however_many_signatures_it_carries() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"
+export class TextModel {
+    public applyEdits(operations: readonly IIdentifiedSingleEditOperation[]): void;
+    public applyEdits(operations: readonly IIdentifiedSingleEditOperation[], computeUndoEdits: false): void;
+    public applyEdits(operations: readonly IIdentifiedSingleEditOperation[], computeUndoEdits: true): IValidEditOperation[];
+    public applyEdits(operations: readonly IIdentifiedSingleEditOperation[], computeUndoEdits: boolean = false): void | IValidEditOperation[] {
+        return this._doApplyEdits(operations);
+    }
+    public getLineContent(lineNumber: number): string { return ''; }
+}
+
+declare class AmbientOnly {
+    lex(src: string): Token[];
+    lex(src: string, options: Options): Token[];
+    inlineTokens(src: string): Token[];
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("textModel.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let names: Vec<&str> = output.entities.iter().map(|e| e.name.as_str()).collect();
+
+        let count = |needle: &str| names.iter().filter(|n| **n == needle).count();
+        assert_eq!(
+            count("TextModel.applyEdits"),
+            1,
+            "an overload set became {} entities: {names:?}",
+            count("TextModel.applyEdits")
+        );
+        assert_eq!(
+            count("AmbientOnly.lex"),
+            1,
+            "a signature with no implementation was emitted {} times: {names:?}",
+            count("AmbientOnly.lex")
+        );
+        // The controls: the collapse must not eat a method that is written once,
+        // whether it carries a body or not.
+        assert_eq!(count("TextModel.getLineContent"), 1, "{names:?}");
+        assert_eq!(count("AmbientOnly.inlineTokens"), 1, "{names:?}");
     }
 
     /// TypeScript merges a namespace with a same-named class, interface, enum,
