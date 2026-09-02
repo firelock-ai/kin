@@ -664,21 +664,36 @@ jobs:
         with:
           tool: sccache
 
+      # This was a hand-rolled `actions/cache` carrying `target` and the sccache
+      # directory under a `hashFiles('Cargo.lock')` key, the only Windows leg in
+      # this file that did not use `rust-cache`. A cache key is immutable, so
+      # every main push that repinned a dependency asked for a key nothing had
+      # written and the post step tarred the whole Windows release tree to mint
+      # it. On 59c2239c2 that save started
+      # `tar --posix -cf cache.tzst ... --use-compress-program "zstd -T0"` at
+      # 17:36:59Z and had emitted nothing further at 18:04:28Z, when the
+      # 60-minute job timeout cancelled it. The job's own work had finished at
+      # 17:36:31Z: the build was green and the admission contract had passed, and
+      # the run still lost its Windows evidence to an archive nobody was waiting
+      # on. The same shape cost the prior sha 2m18s and the dispatch-only
+      # vector proof 5 minutes, so the ceiling was never bounded, only lucky.
+      #
+      # `rust-cache` bounds it by construction: it prunes the workspace's own
+      # artifacts out of `target` before saving, and it writes at most one entry
+      # per key. The three sibling Windows legs above already carry exactly this
+      # block, so this removes a bespoke shape rather than adding one.
+      #
+      # `${{ runner.temp }}/sccache` is deliberately not carried over.
+      # `sccache --show-stats` reported "Compile requests 0" at the end of both
+      # sampled runs (59c2239c2 and 39d3f481a), so what that path archived was a
+      # directory the build never read. The wrapper itself is left alone.
       - name: Cache cargo registry and build
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            ${{ runner.temp }}/sccache
-          # Cache key renamed with the feature set. The vectorless key indexed a
-          # dependency graph with no ndarray, tokenizers, hnsw or onig in it, so
-          # restoring from it would warm almost nothing and would report a hit
-          # while doing so.
-          key: windows-vector-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            windows-vector-cargo-
+          # FIR-2744, and see the note on the first cache step in this file.
+          add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
       # Windows ships native vector search, so this asserts the feature graph in
       # both directions rather than only forbidding features. `vector` and

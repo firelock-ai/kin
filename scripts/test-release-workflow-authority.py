@@ -16329,11 +16329,18 @@ def main() -> None:
     # save-if does not create that boundary. Do not reason about a related
     # change as though it did.
     #
-    # Scope: this covers Swatinem/rust-cache uses only. Three actions/cache
-    # uses remain deliberately outside it: the windows-installer and coverage
-    # jobs are admitted only from main, while fuzz may still write a cache on a
-    # qualifying pull request. This is not a repository-wide no-PR-writes
-    # invariant.
+    # Scope: this covers Swatinem/rust-cache uses only. Two cargo actions/cache
+    # uses remain deliberately outside it: coverage is admitted only from main,
+    # while fuzz may still write a cache on a qualifying pull request. This is
+    # not a repository-wide no-PR-writes invariant.
+    #
+    # windows-installer used to be the third. It hand-rolled an actions/cache
+    # whose key carried hashFiles('Cargo.lock') over a path that included
+    # `target`, so every repin minted a fresh multi-GB Windows entry, and on
+    # 59c2239c2 the post-step archive ran past the job's 60-minute timeout and
+    # cancelled a run whose work had already finished. It now carries the same
+    # rust-cache block as the three sibling Windows legs, which is why this
+    # assertion covers it.
     assert_rust_cache_steps(workflow_sources)
     assert_required_context_action_pins(workflow_sources)
     assert_tag_readback_retries(release_tag)
