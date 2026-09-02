@@ -29,7 +29,7 @@ pub use retrieval::{unified_retrieve, RetrievalCandidate, RetrievalQuery};
 pub use search::{resolve_roles, ScoredHit, TextIndex};
 pub use storage::format::{
     CompactionStats, GraphSnapshot, MaterializedGraphRefusal, MaterializedGraphSection,
-    WorkspaceGraphFacts, MATERIALIZED_GRAPH_SCHEMA_VERSION,
+    SnapshotFrameShape, WorkspaceGraphFacts, MATERIALIZED_GRAPH_SCHEMA_VERSION,
 };
 #[cfg(feature = "gcs")]
 pub use storage::GcsBackend;

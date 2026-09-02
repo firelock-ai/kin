@@ -1289,6 +1289,47 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         outcome
     }
 
+    /// [`persist_bytes`](Self::persist_bytes) for a frame nobody holds.
+    ///
+    /// The bytes are written straight into the backend's staging file as they
+    /// are serialized, so no contiguous copy of the repository ever exists. The
+    /// same validity argument applies: every successor persisted here descends
+    /// from an open that established complete history validity and carries its
+    /// own new changes through `validate_history_replay`, so the durable record
+    /// still says these are validated bytes.
+    ///
+    /// Returns the frame's length beside the outcome, because a caller that
+    /// never held the bytes cannot ask how long they were.
+    fn persist_streamed(
+        &self,
+        snapshot: &GraphSnapshot,
+        state: &mut PersistenceState,
+    ) -> (PersistOutcome, usize) {
+        // A `Cell` rather than a captured `&mut`, so the closure borrows this
+        // immutably and the length is readable the moment the call returns.
+        let written = std::cell::Cell::new(0u64);
+        let outcome = {
+            let mut produce = |out: &mut dyn std::io::Write| {
+                let shape = snapshot.stream_pre_validated(out)?;
+                written.set(shape.byte_len);
+                Ok((shape.byte_len, shape.sha256))
+            };
+            self.backend.save_snapshot_streamed(
+                self.repository_id.as_str(),
+                &mut produce,
+                state.cursor,
+                Some(HISTORY_VALIDATION_VERSION),
+            )
+        };
+        let snapshot_bytes = written.get() as usize;
+        let outcome = Self::record_save_outcome(&mut state.cursor, outcome);
+        if matches!(outcome, PersistOutcome::Committed) {
+            let retired = self.note_full_snapshot_committed(state, snapshot_bytes);
+            self.clear_retired_frames(retired);
+        }
+        (outcome, snapshot_bytes)
+    }
+
     /// A full snapshot is durable at `state.cursor`: the journal it retired is
     /// gone from the writer's view. Returns how many frames it retired, so the
     /// caller can ask storage to drop their bytes in whichever way its lock
@@ -1457,15 +1498,15 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
                 // `next` passed the successor's own storage-admission gate under
                 // the single writer permit and is immutable from that gate to
                 // this write.
-                let bytes = match next.snapshot.to_bytes_pre_validated() {
-                    Ok(bytes) => bytes,
-                    Err(error) => return PersistOutcome::NotCommitted(error),
-                };
-                let serialize_ms = timer.lap_ms();
-                let snapshot_bytes = bytes.len();
-                let outcome = self.persist_bytes(&bytes, &mut state);
+                //
+                // Streamed, so the frame is never assembled: on a full VS Code
+                // tree it is 2.24 GiB here, and this is the phase a conversion
+                // peaks in (FIR-3064). Serializing and writing are now one pass,
+                // so there is no separate serialize lap to report and the fused
+                // time is reported as the write.
+                let (outcome, snapshot_bytes) = self.persist_streamed(&next.snapshot, &mut state);
                 let write_ms = timer.lap_ms();
-                record_snapshot_persistence_phases(serialize_ms, write_ms, snapshot_bytes);
+                record_snapshot_persistence_phases(0, write_ms, snapshot_bytes);
                 outcome
             }
         }
@@ -1814,17 +1855,15 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
         // unavailable to this path.
         let _persist_span = tracing::info_span!("kindb.commit.persist_equivalent").entered();
         let mut timer = PublicationPhaseTimer::start();
-        let bytes = match next.snapshot.to_bytes_pre_validated() {
-            Ok(bytes) => bytes,
-            Err(error) => return PersistOutcome::NotCommitted(error),
-        };
-        let serialize_ms = timer.lap_ms();
-        let snapshot_bytes = bytes.len();
         let mut state = self.state.lock();
         state.pending_frame = None;
-        let outcome = self.persist_bytes(&bytes, &mut state);
+        // Streamed for the same reason the successor persist is, and it matters
+        // more here: this is where a `kin init` reaches its whole-run peak,
+        // because the post-init graph-section rewrite serializes the store with
+        // the section in it, 3.59 GiB on a full VS Code tree.
+        let (outcome, snapshot_bytes) = self.persist_streamed(&next.snapshot, &mut state);
         let write_ms = timer.lap_ms();
-        record_snapshot_persistence_phases(serialize_ms, write_ms, snapshot_bytes);
+        record_snapshot_persistence_phases(0, write_ms, snapshot_bytes);
         outcome
     }
 

@@ -210,6 +210,183 @@ fn stream_change_map(
     }
 }
 
+/// What a frame turned out to be once it was written.
+///
+/// A buffering writer learns these two facts by measuring the buffer it is
+/// holding. A streaming writer never holds one, so it has to carry them out
+/// itself, and they are exactly what the durability sequence needs: the
+/// recovery marker records a length and a sha256, and the authority record
+/// stores the same digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotFrameShape {
+    /// Bytes the whole frame occupies: header, body, checksum and any trailer.
+    pub byte_len: u64,
+    /// sha256 over those bytes, in the order they were written.
+    pub sha256: [u8; 32],
+}
+
+/// A writer that passes bytes through, hashes them, and counts them.
+///
+/// Two hashers on purpose. The frame's own checksum field covers the BODY
+/// only, and the recovery marker covers the WHOLE frame including that
+/// checksum, so a single pass cannot serve both. The body hasher is switched on
+/// for the body and off again for the checksum and trailer that follow it,
+/// which is the same boundary the buffering writer expresses as `&buf[16..]`.
+struct FrameWriter<'w, W: std::io::Write + ?Sized> {
+    out: &'w mut W,
+    frame: Sha256,
+    body: Sha256,
+    hashing_body: bool,
+    total: u64,
+    body_written: u64,
+    /// The destination's own first failure, kept because the one above it will
+    /// not be.
+    ///
+    /// `rmp_serde` reports an IO failure during the body as "invalid value
+    /// write: error while writing multi-byte MessagePack value", which says
+    /// nothing about the disk being full or the file being gone. That message
+    /// is what an operator would have had to debug a failed conversion with,
+    /// so the real error is captured here as it happens and reported instead.
+    failure: Option<std::io::Error>,
+}
+
+impl<'w, W: std::io::Write + ?Sized> FrameWriter<'w, W> {
+    fn new(out: &'w mut W) -> Self {
+        Self {
+            out,
+            frame: Sha256::new(),
+            body: Sha256::new(),
+            hashing_body: false,
+            total: 0,
+            body_written: 0,
+            failure: None,
+        }
+    }
+
+    /// Turn a serializer's error into the destination's, when the destination
+    /// is what actually failed.
+    fn attribute(&mut self, error: crate::error::KinDbError) -> crate::error::KinDbError {
+        match self.failure.take() {
+            Some(io) => crate::error::KinDbError::StorageError(format!(
+                "failed to write snapshot frame after {} bytes: {io}",
+                self.total
+            )),
+            None => error,
+        }
+    }
+}
+
+impl<W: std::io::Write + ?Sized> std::io::Write for FrameWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // `write_all` rather than `write`, so a short write from the
+        // destination cannot silently truncate the frame while this returns a
+        // count the serializer believes. The length this reports is therefore
+        // always the whole buffer.
+        if let Err(error) = self.out.write_all(buf) {
+            if self.failure.is_none() {
+                self.failure = Some(std::io::Error::new(error.kind(), error.to_string()));
+            }
+            return Err(error);
+        }
+        self.frame.update(buf);
+        if self.hashing_body {
+            self.body.update(buf);
+            self.body_written += buf.len() as u64;
+        }
+        self.total += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush().inspect_err(|error| {
+            if self.failure.is_none() {
+                self.failure = Some(std::io::Error::new(error.kind(), error.to_string()));
+            }
+        })
+    }
+}
+
+/// Write one `KNDB` frame around a serializable body straight to `out`.
+///
+/// The counterpart of [`assemble_snapshot_frame`], and the reason it has one:
+/// that function's buffer is exactly the size of the repository, 2.24 GiB at
+/// the commit and 3.59 GiB at the post-init graph-section rewrite of a full VS
+/// Code tree, and it stands on the heap while the persist that follows it is
+/// already the highest moment of a conversion. Streaming removes the whole
+/// allocation rather than shrinking it; nothing here scales with the store.
+///
+/// The bytes are the same bytes. Both paths write the same header, the same
+/// `write_snapshot_body` encoding, the same body checksum and the same
+/// trailer, in that order, and a test asserts the two are byte-identical over
+/// a snapshot carrying every optional field.
+///
+/// The counting pass is unchanged and still required: the body's length goes
+/// in a header that sits AHEAD of the body, so no single pass can know what to
+/// write there. What streaming removes is the second buffer, not the second
+/// walk.
+pub(crate) fn stream_snapshot_frame<W: std::io::Write + ?Sized, T: Serialize + ?Sized>(
+    out: &mut W,
+    body: &T,
+    version: u32,
+    persisted_root_hash: Option<[u8; 32]>,
+) -> Result<SnapshotFrameShape, crate::error::KinDbError> {
+    let mut counter = CountingWriter::default();
+    write_snapshot_body(&mut counter, body)?;
+    let body_len = counter.written() as u64;
+
+    let mut writer = FrameWriter::new(out);
+    let io = |error: std::io::Error| {
+        crate::error::KinDbError::StorageError(format!("failed to write snapshot frame: {error}"))
+    };
+    {
+        use std::io::Write as _;
+        writer.write_all(&GraphSnapshot::MAGIC).map_err(io)?;
+        writer.write_all(&version.to_le_bytes()).map_err(io)?;
+        writer.write_all(&body_len.to_le_bytes()).map_err(io)?;
+    }
+
+    writer.hashing_body = true;
+    if let Err(error) = write_snapshot_body(&mut writer, body) {
+        return Err(writer.attribute(error));
+    }
+    writer.hashing_body = false;
+
+    // The two passes have to agree, exactly as they do in the buffering path.
+    // A writing pass that produced a different number of bytes than the
+    // counting pass declared would mint a well-formed header describing a body
+    // nobody wrote, and every reader would slice the frame at the wrong offset.
+    //
+    // Streaming makes this check MORE load-bearing, not less: the buffering
+    // path could still be refused with nothing on disk, while here the bytes
+    // are already in a staged file. It fails loud, and the caller discards that
+    // file rather than promoting it, so a disagreeing frame is still never
+    // installed.
+    if writer.body_written != body_len {
+        return Err(crate::error::KinDbError::StorageError(format!(
+            "snapshot body length pass counted {body_len} bytes and the writing pass produced \
+             {}; refusing to frame a body the header does not describe",
+            writer.body_written
+        )));
+    }
+
+    let body_checksum: [u8; 32] = writer.body.clone().finalize().into();
+    {
+        use std::io::Write as _;
+        writer.write_all(&body_checksum).map_err(io)?;
+        if let Some(root_hash) = persisted_root_hash {
+            let mut trailer = Vec::with_capacity(GraphSnapshot::ROOT_HASH_TRAILER_LEN);
+            GraphSnapshot::append_root_hash_trailer(&mut trailer, body_checksum, root_hash);
+            writer.write_all(&trailer).map_err(io)?;
+        }
+        writer.flush().map_err(io)?;
+    }
+
+    Ok(SnapshotFrameShape {
+        byte_len: writer.total,
+        sha256: writer.frame.clone().finalize().into(),
+    })
+}
+
 fn assemble_snapshot_frame<T: Serialize + ?Sized>(
     body: &T,
     version: u32,
@@ -952,11 +1129,13 @@ impl GraphSnapshot {
         self.to_bytes_inner(Some(root_hash), true)
     }
 
-    fn to_bytes_inner(
-        &self,
-        persisted_root_hash: Option<[u8; 32]>,
-        validate_admission: bool,
-    ) -> Result<Vec<u8>, crate::error::KinDbError> {
+    /// The version this snapshot serializes as, refusing when its declared
+    /// version and its contents disagree.
+    ///
+    /// Shared by the buffering and streaming write paths so one gate governs
+    /// both. A second copy of it would be the kind of guard that is right on
+    /// the day it is written and silently absent from one path a release later.
+    fn wire_version_checked(&self) -> Result<u32, crate::error::KinDbError> {
         let wire_version = self.wire_version();
         if self.version != wire_version {
             return Err(crate::error::KinDbError::StorageError(format!(
@@ -969,6 +1148,50 @@ impl GraphSnapshot {
                 Self::MIN_SUPPORTED_VERSION
             )));
         }
+        Ok(wire_version)
+    }
+
+    /// Write this snapshot's frame straight to `out`, revalidating storage
+    /// admission first.
+    ///
+    /// The streaming counterpart of [`Self::to_bytes`], and the public entry
+    /// point for a caller that has somewhere to write and no reason to hold a
+    /// copy of the repository while it does.
+    pub fn stream_to(
+        &self,
+        out: &mut dyn std::io::Write,
+    ) -> Result<SnapshotFrameShape, crate::error::KinDbError> {
+        let wire_version = self.wire_version_checked()?;
+        self.validate_storage_admission()?;
+        stream_snapshot_frame(out, self, wire_version, None)
+    }
+
+    /// Write the frame for a snapshot whose storage admission the caller has
+    /// already validated on this exact object, straight to `out`.
+    ///
+    /// The streaming counterpart of [`Self::to_bytes_pre_validated`], and it
+    /// carries the same obligation: the caller validated THIS object under the
+    /// single-writer permit and nothing can mutate it between that gate and
+    /// this write. The version gate still runs, through the same helper the
+    /// buffering path uses.
+    ///
+    /// Returns what the frame turned out to be, because a streaming writer
+    /// never holds a buffer to measure and the durability sequence needs the
+    /// length and the digest it just wrote.
+    pub(crate) fn stream_pre_validated(
+        &self,
+        out: &mut dyn std::io::Write,
+    ) -> Result<SnapshotFrameShape, crate::error::KinDbError> {
+        let wire_version = self.wire_version_checked()?;
+        stream_snapshot_frame(out, self, wire_version, None)
+    }
+
+    fn to_bytes_inner(
+        &self,
+        persisted_root_hash: Option<[u8; 32]>,
+        validate_admission: bool,
+    ) -> Result<Vec<u8>, crate::error::KinDbError> {
+        let wire_version = self.wire_version_checked()?;
         if validate_admission {
             self.validate_storage_admission()?;
         }
@@ -3332,6 +3555,135 @@ mod tests {
                 "`{name}` decoded to a different relation count"
             );
         }
+    }
+
+    /// The frame streamed to a writer must be byte-identical to the frame
+    /// assembled in a buffer, for every shape.
+    ///
+    /// This is the bar the streaming write has to clear before it can be the
+    /// path a store is written by, and it is compared against the retained
+    /// two-buffer reference rather than against the one-buffer assembly, so
+    /// both shipped paths are held to the implementation the stores on disk
+    /// were written under.
+    ///
+    /// The reported shape is checked too. A streaming writer never holds the
+    /// frame, so the length and digest it reports are the only description of
+    /// what it wrote, and the recovery marker and the authority record are both
+    /// written from them: a writer that framed correctly and reported a wrong
+    /// digest would install a snapshot no reader could confirm.
+    #[test]
+    fn the_streamed_frame_is_the_buffered_frame_for_every_corpus_shape() {
+        for (name, snapshot) in frame_corpus() {
+            let reference = reference_two_buffer_frame(&snapshot, None);
+
+            let mut streamed: Vec<u8> = Vec::new();
+            let shape = snapshot
+                .stream_to(&mut streamed)
+                .expect("streaming assembly serializes");
+            assert_eq!(
+                reference,
+                streamed,
+                "`{name}` streams differently than it buffers, over its {} byte frame",
+                reference.len()
+            );
+            assert_eq!(
+                shape.byte_len as usize,
+                reference.len(),
+                "`{name}` reported a frame length it did not write"
+            );
+            assert_eq!(
+                shape.sha256,
+                <[u8; 32]>::from(Sha256::digest(&reference)),
+                "`{name}` reported a digest that is not the digest of its own frame"
+            );
+
+            let mut pre_validated: Vec<u8> = Vec::new();
+            snapshot
+                .stream_pre_validated(&mut pre_validated)
+                .expect("streaming pre-validated assembly serializes");
+            assert_eq!(
+                reference, pre_validated,
+                "`{name}` streams differently on the pre-validated path"
+            );
+
+            // The streamed frame still decodes to the snapshot it was made
+            // from, which a byte comparison alone would not catch if BOTH
+            // implementations were wrong in the same way.
+            let decoded = GraphSnapshot::from_bytes(&streamed).expect("streamed frame decodes");
+            assert_eq!(
+                decoded.entities.len(),
+                snapshot.entities.len(),
+                "`{name}` streamed to a different entity count"
+            );
+            assert_eq!(
+                decoded.relations.len(),
+                snapshot.relations.len(),
+                "`{name}` streamed to a different relation count"
+            );
+        }
+    }
+
+    /// A destination that refuses a write must fail the frame loud, in the
+    /// destination's own words.
+    ///
+    /// The buffering path could not have this defect: a `Vec` does not fail.
+    /// A file does, and a streaming writer that swallowed the error would
+    /// report a length and a digest for bytes that are not on disk, which the
+    /// recovery marker would then record as truth.
+    ///
+    /// The message is named on purpose. `rmp_serde` reports an IO failure
+    /// during the body as "invalid value write: error while writing multi-byte
+    /// MessagePack value", so asserting only `is_err()` would pass while an
+    /// operator debugging a failed kernel-scale conversion was told nothing
+    /// about a full disk. This test is why the writer keeps the destination's
+    /// own error.
+    #[test]
+    fn a_refusing_destination_fails_the_streamed_frame() {
+        struct RefusingWriter {
+            allowed: usize,
+        }
+
+        impl std::io::Write for RefusingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if buf.len() > self.allowed {
+                    return Err(std::io::Error::other("destination is full"));
+                }
+                self.allowed -= buf.len();
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut snapshot = GraphSnapshot::empty();
+        for index in 0..64 {
+            let entity = test_entity(&format!("refuse_{index}"));
+            snapshot.entities.insert(entity.id, entity);
+        }
+
+        // The positive control: the same snapshot streams cleanly into a writer
+        // that accepts everything, so the refusal below is the destination and
+        // not the fixture.
+        let mut accepted: Vec<u8> = Vec::new();
+        snapshot
+            .stream_to(&mut accepted)
+            .expect("an accepting destination takes the whole frame");
+        assert!(
+            accepted.len() > 16,
+            "the fixture must have a body to refuse"
+        );
+
+        let mut refusing = RefusingWriter { allowed: 16 };
+        let error = snapshot
+            .stream_to(&mut refusing)
+            .expect_err("a destination that refuses the body must fail the frame");
+        assert!(
+            error.to_string().contains("destination is full"),
+            "the destination's own error must reach the caller rather than the \
+             serializer's paraphrase of it: {error}"
+        );
     }
 
     /// The header must describe the body it is stapled to.

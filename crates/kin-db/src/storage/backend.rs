@@ -1956,6 +1956,63 @@ pub(crate) fn checked_next_generation(
     })
 }
 
+/// A frame that was streamed into its staging leaf, and the mapping the gates
+/// above it read.
+///
+/// The mapping is held only until the install, and released there rather than
+/// dropped at the end of the scope, because a file with a live mapping cannot
+/// be renamed on Windows. `take_for_install` is the one place that releases it,
+/// which is also the one place that consumes the candidate, so the two can
+/// never drift apart.
+struct StagedInstall {
+    staged: Option<mmap::StagedCandidate>,
+    mapping: Option<memmap2::Mmap>,
+}
+
+impl StagedInstall {
+    /// The staged bytes, which are the bytes that will be installed.
+    fn bytes(&self) -> &[u8] {
+        self.mapping.as_deref().unwrap_or(&[])
+    }
+
+    /// Release the mapping and hand over the candidate to be renamed into place.
+    fn take_for_install(&mut self) -> Result<mmap::StagedCandidate, KinDbError> {
+        self.mapping = None;
+        self.staged.take().ok_or_else(|| {
+            KinDbError::StorageError(
+                "a staged snapshot frame was installed twice; refusing the second".to_string(),
+            )
+        })
+    }
+
+    /// Whatever is left when the save did not install it.
+    fn into_unused(self) -> Option<mmap::StagedCandidate> {
+        self.staged
+    }
+}
+
+/// Where the bytes of a snapshot being installed live.
+///
+/// A snapshot frame is the size of the repository, 2.24 GiB at the commit of a
+/// full VS Code tree, so where it lives is the whole question at persist time
+/// rather than a detail of the call (FIR-3064). Every gate reads a slice
+/// either way.
+enum SnapshotSource<'a> {
+    /// Bytes the caller assembled and holds on the heap.
+    Buffered(&'a [u8]),
+    /// A candidate already streamed into its staging leaf and mapped.
+    Staged(&'a mut StagedInstall),
+}
+
+impl SnapshotSource<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Buffered(data) => data,
+            Self::Staged(install) => install.bytes(),
+        }
+    }
+}
+
 /// The file a snapshot's bytes were read through, kept open.
 ///
 /// An open that leaves the change map on disk drops `snapshot_bytes` and
@@ -2726,6 +2783,33 @@ pub trait StorageBackend: Send + Sync {
     ) -> SnapshotSaveOutcome {
         let _ = history_validator_version;
         self.save_snapshot_classified(repo_id, data, expected)
+    }
+
+    /// [`save_snapshot_validated`](Self::save_snapshot_validated) for a frame
+    /// the caller does not hold and should not have to.
+    ///
+    /// `produce` writes one complete snapshot frame to the writer it is given
+    /// and reports the frame's length and sha256, which it measured while
+    /// writing. A backend with a file to stream into never materializes the
+    /// frame at all: on a full VS Code tree that buffer is 2.24 GiB at the
+    /// commit and 3.59 GiB at the post-init graph-section rewrite, and it
+    /// stands on the heap at the highest moment of a conversion (FIR-3064).
+    ///
+    /// The default buffers and takes the ordinary path, which is correct for a
+    /// backend with nowhere to stream: a hosted object store and a SQL row both
+    /// need the bytes in hand before they can send them anywhere.
+    fn save_snapshot_streamed(
+        &self,
+        repo_id: &str,
+        produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(u64, [u8; 32]), KinDbError>,
+        expected: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> SnapshotSaveOutcome {
+        let mut buffer: Vec<u8> = Vec::new();
+        if let Err(error) = produce(&mut buffer) {
+            return SnapshotSaveOutcome::NotCommitted(error);
+        }
+        self.save_snapshot_validated(repo_id, &buffer, expected, history_validator_version)
     }
 
     /// Bind a validation record to the snapshot a repository already holds,
@@ -4018,6 +4102,53 @@ impl LocalSurfaceCapability {
     fn atomic_write(&self, leaf: &Path, data: &[u8]) -> Result<(), KinDbError> {
         Self::require_leaf(leaf)?;
         mmap::atomic_write_bytes_no_magic_at(&self.directory, leaf, &self.display_path, data)
+    }
+
+    /// Stream a candidate for `leaf` into its own staging file, hashing as it
+    /// writes, and hand back what it wrote.
+    ///
+    /// The counterpart of [`atomic_write`](Self::atomic_write) for a payload
+    /// nobody should hold: a snapshot frame is the size of the repository, so
+    /// buffering one to pass a slice here is the largest allocation a
+    /// conversion makes.
+    fn stage_streamed(
+        &self,
+        leaf: &Path,
+        produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(u64, [u8; 32]), KinDbError>,
+    ) -> Result<mmap::StagedCandidate, KinDbError> {
+        Self::require_leaf(leaf)?;
+        mmap::capability_stage_recovery_candidate_streamed_at(
+            &self.directory,
+            leaf,
+            &self.display_path,
+            produce,
+        )
+    }
+
+    /// Map a staged candidate read-only, so the bytes about to be installed are
+    /// the bytes the caller's gates read.
+    fn map_staged(&self, staged: &mmap::StagedCandidate) -> Result<memmap2::Mmap, KinDbError> {
+        mmap::capability_map_staged_candidate_at(&self.directory, staged, &self.display_path)
+    }
+
+    /// Drop a staged candidate that will not be installed.
+    fn discard_staged(&self, staged: mmap::StagedCandidate) {
+        staged.discard(&self.directory);
+    }
+
+    /// Install a staged candidate at `leaf` through the same marker, rename and
+    /// promotion sequence a buffered write goes through.
+    fn install_staged(&self, leaf: &Path, staged: mmap::StagedCandidate) -> Result<(), KinDbError> {
+        Self::require_leaf(leaf)?;
+        match mmap::atomic_write_staged_outcome_at(
+            &self.directory,
+            leaf,
+            &self.display_path,
+            staged,
+        )? {
+            mmap::AtomicWriteOutcome::Durable => Ok(()),
+            mmap::AtomicWriteOutcome::InstalledButUnconfirmed(error) => Err(error),
+        }
     }
 
     fn read_regular(&self, leaf: &Path, role: &str) -> Result<Vec<u8>, KinDbError> {
@@ -5527,6 +5658,16 @@ impl LocalFileBackend {
     fn snapshots_surface_name() -> &'static str {
         "snapshots"
     }
+
+    /// The destination name a streamed frame stages against.
+    ///
+    /// A staging leaf is derived from a destination leaf, and the generation a
+    /// save lands on is only known after its gates have run, so the frame is
+    /// streamed against this fixed name and the promotion renames it to the
+    /// versioned leaf. `clear_superseded_snapshots_unlocked` keeps only
+    /// `<20-digit generation>.kndb` and skips everything else, so a staging leaf
+    /// is invisible to it either way.
+    const STAGED_SNAPSHOT_LEAF: &'static str = "snapshot.staging";
 
     #[cfg(test)]
     fn versioned_snapshot_path(&self, repo_id: &str, generation: Generation) -> PathBuf {
@@ -7139,7 +7280,7 @@ impl LocalFileBackend {
     fn save_snapshot_unlocked(
         &self,
         namespace: &LocalRepositoryCapability,
-        data: &[u8],
+        mut source: SnapshotSource<'_>,
         expected_gen: Generation,
         history_validator_version: Option<u32>,
     ) -> Result<Generation, KinDbError> {
@@ -7162,7 +7303,7 @@ impl LocalFileBackend {
         let current_gen = current
             .as_ref()
             .map_or(GENERATION_INIT, |authority| authority.head_generation);
-        let requested_digest = Self::snapshot_digest(data);
+        let requested_digest = Self::snapshot_digest(source.bytes());
         if let Some(record) = current_record.as_ref() {
             let retry_generation = expected_gen.checked_add(1);
             if retry_generation == Some(record.head_generation)
@@ -7236,12 +7377,12 @@ impl LocalFileBackend {
             // conversion's single largest allocation, about 855 MiB, and it set
             // the whole run's peak because it happens last, while every retained
             // byte underneath it is still live (FIR-2654).
-            Some(_) => GraphSnapshot::prove_pre_validated_round_trip(data)?,
+            Some(_) => GraphSnapshot::prove_pre_validated_round_trip(source.bytes())?,
             // Unvalidated bytes still owe the semantic admission pass, which
             // walks the assembled snapshot. That obligation needs the value, so
             // this arm keeps the full decode.
             None => {
-                let _snapshot = GraphSnapshot::from_bytes(data)?;
+                let _snapshot = GraphSnapshot::from_bytes(source.bytes())?;
             }
         };
         let new_gen = checked_next_generation(current_gen, "local snapshot")?;
@@ -7253,7 +7394,20 @@ impl LocalFileBackend {
                 ))
             })?;
         let versioned_leaf = Self::versioned_snapshot_leaf(new_gen);
-        snapshots.atomic_write(&versioned_leaf, data)?;
+        // The bytes every gate above read are the bytes installed here. A
+        // buffered source writes them out; a staged source has already written
+        // them and is renamed into place, so nothing is copied twice and the
+        // digest, the round-trip proof and the destination cannot disagree.
+        //
+        // The mapping is released before the rename, deliberately: a file with
+        // a live mapping cannot be renamed on Windows, and the nightly Windows
+        // job is where that would be discovered.
+        match &mut source {
+            SnapshotSource::Buffered(data) => snapshots.atomic_write(&versioned_leaf, data)?,
+            SnapshotSource::Staged(install) => {
+                snapshots.install_staged(&versioned_leaf, install.take_for_install()?)?
+            }
+        }
 
         #[cfg(test)]
         if self
@@ -7334,10 +7488,69 @@ impl LocalFileBackend {
         };
         self.save_snapshot_unlocked(
             &lock.namespace,
-            data,
+            SnapshotSource::Buffered(data),
             expected_gen,
             history_validator_version,
         )
+    }
+
+    /// [`save_snapshot_locked`](Self::save_snapshot_locked) for a frame nobody
+    /// holds.
+    ///
+    /// The frame is streamed into its staging leaf under the lock, mapped, and
+    /// then taken through the identical gate sequence: the same digest, the
+    /// same idempotent-retry test, the same generation check, the same
+    /// round-trip proof and the same promotion. What changes is that those
+    /// gates read the file the install will rename rather than a copy of it on
+    /// the heap.
+    ///
+    /// A staged candidate that no install consumed is removed here. A leftover
+    /// unique staging leaf is disk rather than authority, because recovery only
+    /// ever looks at the deterministic `.tmp` name and its marker, but leaving
+    /// a repository-sized file behind on every refused save is not a cost this
+    /// path may pay.
+    fn save_snapshot_streamed_locked(
+        &self,
+        repo_id: &str,
+        produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(u64, [u8; 32]), KinDbError>,
+        expected_gen: Generation,
+        history_validator_version: Option<u32>,
+    ) -> Result<Generation, KinDbError> {
+        let lock = if expected_gen == GENERATION_INIT {
+            self.acquire_lock_for_initialization(repo_id)?
+        } else {
+            self.acquire_existing_lock(repo_id)?
+        };
+        let namespace = &lock.namespace;
+        let snapshots = namespace
+            .surface(Self::snapshots_surface_name(), true)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "snapshot surface disappeared while creating repo {repo_id}"
+                ))
+            })?;
+        let staged = snapshots.stage_streamed(Path::new(Self::STAGED_SNAPSHOT_LEAF), produce)?;
+        let mapping = match snapshots.map_staged(&staged) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                snapshots.discard_staged(staged);
+                return Err(error);
+            }
+        };
+        let mut install = StagedInstall {
+            staged: Some(staged),
+            mapping: Some(mapping),
+        };
+        let outcome = self.save_snapshot_unlocked(
+            namespace,
+            SnapshotSource::Staged(&mut install),
+            expected_gen,
+            history_validator_version,
+        );
+        if let Some(unused) = install.into_unused() {
+            snapshots.discard_staged(unused);
+        }
+        outcome
     }
 
     /// Append one authority frame while the caller holds this repository's
@@ -7489,7 +7702,7 @@ impl LocalFileBackend {
         };
         let generation = self.save_snapshot_unlocked(
             &lock.namespace,
-            data,
+            SnapshotSource::Buffered(data),
             expected_gen,
             history_validator_version,
         )?;
@@ -8221,6 +8434,31 @@ impl StorageBackend for LocalFileBackend {
         match self.save_snapshot_locked(
             repo_id,
             data,
+            expected_cursor.backend_generation(),
+            history_validator_version,
+        ) {
+            Ok(generation) => SnapshotSaveOutcome::Committed {
+                cursor: SnapshotCursor::from_backend_generation(generation),
+            },
+            Err(error @ KinDbError::SnapshotPersistenceIndeterminate(_)) => {
+                SnapshotSaveOutcome::Indeterminate(error)
+            }
+            Err(error) => SnapshotSaveOutcome::NotCommitted(error),
+        }
+    }
+
+    /// This backend has a file to stream into, so it does, and the frame never
+    /// exists as one contiguous allocation.
+    fn save_snapshot_streamed(
+        &self,
+        repo_id: &str,
+        produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(u64, [u8; 32]), KinDbError>,
+        expected_cursor: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> SnapshotSaveOutcome {
+        match self.save_snapshot_streamed_locked(
+            repo_id,
+            produce,
             expected_cursor.backend_generation(),
             history_validator_version,
         ) {

@@ -497,6 +497,16 @@ impl ExpectedContent {
         }
     }
 
+    /// What a writer that streamed the bytes measured while writing them.
+    ///
+    /// A streaming write never holds the bytes, so it cannot be asked what it
+    /// wrote afterwards; it counts and hashes as it goes and reports both here.
+    /// The promotion sequence then asks the file the same content-identity
+    /// question it asks of a buffered write, against the same two numbers.
+    pub(crate) fn streamed(byte_len: u64, sha256: [u8; 32]) -> Self {
+        Self { byte_len, sha256 }
+    }
+
     /// What the recovery marker says its candidate carries.
     fn from_marker(marker: &RecoveryMarker) -> Self {
         Self {
@@ -510,6 +520,12 @@ impl ExpectedContent {
 /// syscall count stays small on a gigabyte-scale frame, small enough that the
 /// buffer never shows up in a memory guard.
 const CONTENT_VERIFY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Bytes buffered while streaming a frame into its staging leaf. A MessagePack
+/// serializer writes in small pieces, so this is what keeps one gigabyte-scale
+/// frame from becoming tens of millions of `write` syscalls. Fixed size, so it
+/// scales with nothing.
+const STAGED_FRAME_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Whether an open regular file carries exactly `expected`, without retaining
 /// it.
@@ -2048,20 +2064,124 @@ pub(crate) fn confirm_installed_write_at(
     Ok(true)
 }
 
-fn capability_write_recovery_candidate_bytes(
+/// One recovery candidate that is already written and fsynced under a unique
+/// staging name, with what it carries.
+///
+/// The frame of a converted repository is the repository, so the bytes are
+/// streamed straight into this file rather than assembled in memory and copied
+/// here (FIR-3064). Between staging and adoption the caller may map it and
+/// prove it, and a candidate that is dropped rather than adopted takes its file
+/// with it, so a refused frame is never left where recovery could find it.
+pub(crate) struct StagedCandidate {
+    /// The unique staging leaf, relative to the same capability that made it.
+    leaf: PathBuf,
+    /// The length and digest the streaming writer measured as it wrote.
+    expected: ExpectedContent,
+}
+
+impl StagedCandidate {
+    /// The staging leaf, so the caller can map it before adopting it.
+    pub(crate) fn leaf(&self) -> &Path {
+        &self.leaf
+    }
+
+    /// What the streaming writer measured.
+    pub(crate) fn expected(&self) -> ExpectedContent {
+        self.expected
+    }
+
+    /// Remove the staged file. Best effort: a leftover unique staging leaf is
+    /// disk, never authority, because recovery only ever looks at the
+    /// deterministic `.tmp` name and its marker.
+    pub(crate) fn discard(self, directory: &cap_std::fs::Dir) {
+        let _ = directory.remove_file(&self.leaf);
+    }
+}
+
+/// Stream one recovery candidate into a unique staging leaf and fsync it.
+///
+/// `produce` is handed the staged file and reports what it wrote. Nothing here
+/// holds the bytes, which is the whole point: the buffering path allocates one
+/// contiguous copy of the entire repository to hand this function a slice.
+pub(crate) fn capability_stage_recovery_candidate_streamed_at(
     directory: &cap_std::fs::Dir,
     relative: &Path,
     display_root: &Path,
-    bytes: &[u8],
+    produce: &mut dyn FnMut(&mut dyn Write) -> Result<(u64, [u8; 32]), KinDbError>,
+) -> Result<StagedCandidate, KinDbError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+
+    validate_capability_atomic_destination(relative)?;
+    let leaf = unique_staging_path(relative, "candidate");
+    let display = capability_display_path(display_root, &leaf);
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(false);
+    let file = directory.open_with(&leaf, &options).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to create unique staged file {}: {error}",
+            display.display()
+        ))
+    })?;
+
+    // Buffered, because a MessagePack serializer writes small pieces and an
+    // unbuffered `write` per piece would turn one gigabyte-scale frame into
+    // tens of millions of syscalls. The buffer is fixed-size and shows up in no
+    // memory guard.
+    let mut writer = std::io::BufWriter::with_capacity(STAGED_FRAME_BUFFER_BYTES, file);
+    let measured = produce(&mut writer);
+    let flushed = writer.flush().map_err(|error| {
+        KinDbError::StorageError(format!("failed to write {}: {error}", display.display()))
+    });
+    let file = writer.into_inner().map_err(|error| {
+        KinDbError::StorageError(format!("failed to flush {}: {error}", display.display()))
+    });
+
+    let finish = (|| {
+        let (byte_len, sha256) = measured?;
+        flushed?;
+        let file = file?;
+        file.sync_all().map_err(|error| {
+            KinDbError::StorageError(format!("failed to fsync {}: {error}", display.display()))
+        })?;
+        Ok(ExpectedContent::streamed(byte_len, sha256))
+    })();
+
+    match finish {
+        Ok(expected) => Ok(StagedCandidate { leaf, expected }),
+        Err(error) => {
+            let _ = directory.remove_file(&leaf);
+            Err(error)
+        }
+    }
+}
+
+/// Adopt an already-staged candidate as the recovery candidate for `relative`.
+///
+/// The tail of [`capability_write_recovery_candidate_bytes`], shared rather
+/// than copied: the marker is written from what the candidate carries, then the
+/// candidate is renamed into the deterministic `.tmp` name, then the marker is
+/// renamed into place, then the directory is synced. A caller that streamed the
+/// candidate has already proved it by the time it gets here, and a caller that
+/// buffered it wrote it one line earlier. Both reach the destination through
+/// this one sequence.
+fn capability_adopt_recovery_candidate(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    unique_tmp_path: &Path,
+    expected: ExpectedContent,
 ) -> Result<(), KinDbError> {
     let tmp_path = recovery_tmp_path(relative);
     let marker_path = recovery_marker_path(relative);
-    let unique_tmp_path = unique_staging_path(relative, "candidate");
     let unique_marker_path = unique_staging_path(relative, "candidate-marker");
     let marker = RecoveryMarker {
         version: RECOVERY_MARKER_VERSION,
-        byte_len: bytes.len() as u64,
-        sha256: Sha256::digest(bytes).into(),
+        byte_len: expected.byte_len,
+        sha256: expected.sha256,
     };
     let marker_bytes = serde_json::to_vec(&marker).map_err(|error| {
         KinDbError::StorageError(format!(
@@ -2071,7 +2191,6 @@ fn capability_write_recovery_candidate_bytes(
     })?;
 
     let result = (|| {
-        capability_write_new_bytes_and_fsync(directory, &unique_tmp_path, display_root, bytes)?;
         capability_write_new_bytes_and_fsync(
             directory,
             &unique_marker_path,
@@ -2079,7 +2198,7 @@ fn capability_write_recovery_candidate_bytes(
             &marker_bytes,
         )?;
         directory
-            .rename(&unique_tmp_path, directory, &tmp_path)
+            .rename(unique_tmp_path, directory, &tmp_path)
             .map_err(|error| {
                 KinDbError::StorageError(format!(
                     "failed to install recovery candidate {}: {error}",
@@ -2109,10 +2228,32 @@ fn capability_write_recovery_candidate_bytes(
         sync_parent_dir_at(directory, relative, display_root)
     })();
     if result.is_err() {
-        let _ = directory.remove_file(&unique_tmp_path);
+        let _ = directory.remove_file(unique_tmp_path);
         let _ = directory.remove_file(&unique_marker_path);
     }
     result
+}
+
+/// Write one recovery candidate from bytes already in hand, then adopt it.
+fn capability_write_recovery_candidate_bytes(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    bytes: &[u8],
+) -> Result<(), KinDbError> {
+    let unique_tmp_path = unique_staging_path(relative, "candidate");
+    capability_write_new_bytes_and_fsync(directory, &unique_tmp_path, display_root, bytes)?;
+    let adopted = capability_adopt_recovery_candidate(
+        directory,
+        relative,
+        display_root,
+        &unique_tmp_path,
+        ExpectedContent::of(bytes),
+    );
+    if adopted.is_err() {
+        let _ = directory.remove_file(&unique_tmp_path);
+    }
+    adopted
 }
 
 fn capability_promote_recovery_candidate_outcome(
@@ -2252,6 +2393,65 @@ pub(crate) fn atomic_write_bytes_no_magic_outcome_at(
     validate_capability_atomic_destination(relative)?;
     capability_write_recovery_candidate_bytes(directory, relative, display_root, bytes)?;
     capability_promote_recovery_candidate_outcome(directory, relative, display_root)
+}
+
+/// Map a staged candidate read-only, so a caller can prove the bytes it just
+/// streamed before anything adopts them.
+///
+/// SAFETY: the leaf is a unique staging name this process created and no other
+/// writer knows, opened read-only through the retained capability with the same
+/// `nofollow` refusal as every other read here. Nothing renames or rewrites it
+/// between the fsync that produced it and the adoption that consumes it.
+pub(crate) fn capability_map_staged_candidate_at(
+    directory: &cap_std::fs::Dir,
+    staged: &StagedCandidate,
+    display_root: &Path,
+) -> Result<Mmap, KinDbError> {
+    let display = capability_display_path(display_root, staged.leaf());
+    let file = open_regular_nofollow_at(directory, staged.leaf(), display_root, "staged frame")?;
+    let mapping = unsafe {
+        Mmap::map(&file).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to map staged frame {}: {error}",
+                display.display()
+            ))
+        })?
+    };
+    if mapping.len() as u64 != staged.expected().byte_len {
+        return Err(KinDbError::StorageError(format!(
+            "staged frame {} is {} bytes where the streaming writer measured {}",
+            display.display(),
+            mapping.len(),
+            staged.expected().byte_len
+        )));
+    }
+    Ok(mapping)
+}
+
+/// Install a candidate that was streamed into its staging leaf rather than
+/// written from bytes in hand.
+///
+/// Everything after the staging write is the sequence the buffering path runs:
+/// the marker records the exact length and sha256 BEFORE the destination is
+/// claimed, the candidate is renamed into the deterministic recovery name, and
+/// the promotion verifies the destination against that marker. A crash at any
+/// point still leaves either the old snapshot or a complete new one.
+pub(crate) fn atomic_write_staged_outcome_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    staged: StagedCandidate,
+) -> Result<AtomicWriteOutcome, KinDbError> {
+    validate_capability_atomic_destination(relative)?;
+    let expected = staged.expected();
+    let leaf = staged.leaf().to_path_buf();
+    match capability_adopt_recovery_candidate(directory, relative, display_root, &leaf, expected) {
+        Ok(()) => capability_promote_recovery_candidate_outcome(directory, relative, display_root),
+        Err(error) => {
+            let _ = directory.remove_file(&leaf);
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn atomic_write_bytes_no_magic_at(
