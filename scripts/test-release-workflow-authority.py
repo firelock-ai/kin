@@ -10658,14 +10658,28 @@ def main() -> None:
         "github.event.workflow_run.event == 'push'",
         "github.event.workflow_run.head_branch == 'main'",
         "repository_dispatch:",
-        "types: [release_tag]",
+        # Two typed dispatches, pinned as one literal so adding a third is a
+        # reviewed edit here rather than a quiet trigger widening. release_tag
+        # is break glass and names an exact commit; release_tag_evaluate runs
+        # the scheduled algorithm on demand and names nothing. Both face the
+        # same actor allowlist and main-only ref below.
+        "types: [release_tag, release_tag_evaluate]",
         "github.event.action",
         "github.event.repository.default_branch",
         "github.event.client_payload.tag",
         "github.event.client_payload.sha",
         "EVENT_SHA: ${{ github.sha }}",
         'EVENT_NAME" != repository_dispatch',
-        'EVENT_ACTION" != release_tag',
+        # The dispatch action allowlist. It was a single `!=` test while there
+        # was one type; with two it is a case whose only admitting arm is this
+        # literal, so an unlisted action still falls to the refusing arm.
+        "release_tag|release_tag_evaluate) ;;",
+        "unsupported repository dispatch action",
+        # Evaluate runs the automatic selection, so it must never accept a
+        # caller-named commit. Ignoring one would tag a different commit than
+        # the caller believed they had chosen.
+        'EVENT_ACTION" = release_tag_evaluate',
+        "release_tag_evaluate runs the automatic selection and takes no tag or sha",
         'DEFAULT_BRANCH" != main',
         'REF" != "refs/heads/$DEFAULT_BRANCH"',
         "environment: release-tag",
