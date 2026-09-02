@@ -657,6 +657,138 @@ pub fn fanout_cap_keeps(locality: &[FanoutLocality], limit: usize) -> Vec<usize>
     kept
 }
 
+/// One candidate for a file's anchor, as the ranking sees it: identity, kind,
+/// name, and the structural graph mass measured for it.
+///
+/// Carrying a struct rather than an `Entity` keeps the ordering testable
+/// without a graph: the caller does the graph IO, this crate decides the order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAnchorCandidate {
+    pub id: EntityId,
+    pub kind: EntityKind,
+    pub name: String,
+    /// Structural relation count for this entity, excluding `CoChanges`.
+    pub mass: usize,
+}
+
+/// Whether a kind can be what a file is ABOUT.
+///
+/// Types and free functions can. Methods cannot: a method's anchor is the type
+/// that contains it, and admitting methods lets one type's internals take every
+/// anchor slot a file has, which is the failure this whole selection exists to
+/// avoid. Constants, variants, macros and modules are excluded from the other
+/// side: they are what a file holds, not what it is for.
+pub fn is_file_anchor_kind(kind: EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::Function
+            | EntityKind::Class
+            | EntityKind::Interface
+            | EntityKind::TraitDef
+            | EntityKind::EnumDef
+    )
+}
+
+/// Type-shaped anchors are preferred over free functions when mass ties, and
+/// when a probe budget has to choose which definitions to weigh at all. A file
+/// that defines a type is usually named for it; a file of free functions has no
+/// such head, so its functions are weighed on mass alone.
+pub fn file_anchor_kind_rank(kind: EntityKind) -> u8 {
+    match kind {
+        EntityKind::Class | EntityKind::Interface | EntityKind::TraitDef | EntityKind::EnumDef => 1,
+        _ => 0,
+    }
+}
+
+/// The anchors of one file, most-depended-on first.
+///
+/// `locate` ranks FILES with every signal it has (lexical, vector, graph
+/// resolve, multihop) and then projects ENTITIES only for the symbols a query
+/// token happened to name. A file can therefore rank first for a question and
+/// contribute nothing an agent can read: measured on 2026-09-02, VS Code's
+/// `codeEditorWidget.ts` ranked second for "when I type a character in the
+/// editor, how does it end up in the document" and the class `CodeEditorWidget`
+/// appeared nowhere in the 122-row ranking, while six `*.editor` methods from
+/// other files took the page on the word "editor".
+///
+/// This answers the question projection cannot: given a file the graph already
+/// ranked, which of its definitions is the file about. Structural relation count
+/// is the answer the graph already holds. A class the editor constructs from
+/// forty places carries more edges than any of its own private methods, and an
+/// entry point the scheduler calls carries more than its helpers. It is the same
+/// measure [`owner_graph_mass`] uses to break exact-name ties, applied to a
+/// different question.
+///
+/// Ordering: mass descending, then type over free function, then name, then id,
+/// so the result is total and deterministic on a store with ties.
+pub fn rank_file_anchors(
+    mut candidates: Vec<FileAnchorCandidate>,
+    limit: usize,
+) -> Vec<FileAnchorCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    candidates.retain(|candidate| is_file_anchor_kind(candidate.kind));
+    candidates.sort_by(|a, b| {
+        b.mass
+            .cmp(&a.mass)
+            .then_with(|| file_anchor_kind_rank(b.kind).cmp(&file_anchor_kind_rank(a.kind)))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+    });
+    candidates.truncate(limit);
+    candidates
+}
+
+/// Which of a file's definitions are worth a graph read, when the file has more
+/// of them than the probe budget allows.
+///
+/// Anchor kinds only, types before free functions, then name for determinism.
+/// The budget exists so one generated file with ten thousand definitions cannot
+/// turn a ranked page into a graph walk; on the three stores this was measured
+/// against, no file came close to the default.
+pub fn file_anchor_probe_order(entities: &[Entity], probe_limit: usize) -> Vec<&Entity> {
+    let mut probes: Vec<&Entity> = entities
+        .iter()
+        .filter(|entity| is_file_anchor_kind(entity.kind) && entity.role != EntityRole::Test)
+        .collect();
+    probes.sort_by(|a, b| {
+        file_anchor_kind_rank(b.kind)
+            .cmp(&file_anchor_kind_rank(a.kind))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+    });
+    probes.truncate(probe_limit);
+    probes
+}
+
+/// The anchors of one file, read from the graph: [`file_anchor_probe_order`]
+/// chooses what to weigh, [`structural_relation_count`] weighs it, and
+/// [`rank_file_anchors`] orders the result.
+///
+/// Graph-backed throughout: relations come from the store's own index, never
+/// from a path walk or a file read.
+pub fn file_anchor_entities<G: GraphStore>(
+    store: &G,
+    entities: &[Entity],
+    limit: usize,
+    probe_limit: usize,
+) -> std::result::Result<Vec<FileAnchorCandidate>, <G as GraphStore>::Error> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut candidates = Vec::new();
+    for entity in file_anchor_probe_order(entities, probe_limit) {
+        candidates.push(FileAnchorCandidate {
+            id: entity.id,
+            kind: entity.kind,
+            name: entity.name.clone(),
+            mass: structural_relation_count(store, &entity.id)?,
+        });
+    }
+    Ok(rank_file_anchors(candidates, limit))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,6 +860,112 @@ mod tests {
         let fanout = [SameFile, OtherFile, Unlocated];
         assert_eq!(fanout_cap_keeps(&fanout, 5), vec![0, 1, 2]);
         assert_eq!(fanout_cap_keeps(&fanout, 3), vec![0, 1, 2]);
+    }
+
+    /// The measured shape, as a ranking: a file whose page was taken by one
+    /// type's methods while the type itself never appeared. The anchor is the
+    /// definition the rest of the repository depends on, not the one whose name
+    /// a question happened to contain.
+    #[test]
+    fn a_files_anchor_is_the_definition_the_rest_of_the_repo_depends_on() {
+        let candidate = |name: &str, kind: EntityKind, mass: usize| FileAnchorCandidate {
+            id: EntityId::new(),
+            kind,
+            name: name.to_string(),
+            mass,
+        };
+        let ranked = rank_file_anchors(
+            vec![
+                candidate("EditorModeContext", EntityKind::Class, 7),
+                candidate("CodeEditorWidget", EntityKind::Class, 61),
+                candidate("EditorDecorationsCollection", EntityKind::Class, 12),
+            ],
+            2,
+        );
+        assert_eq!(
+            ranked.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["CodeEditorWidget", "EditorDecorationsCollection"],
+            "mass orders the anchors, and the limit is a limit"
+        );
+    }
+
+    /// A method's anchor is its owning type. Without this a widely-called
+    /// method takes every slot its own file has, which is the failure the
+    /// selection exists to avoid.
+    ///
+    /// The control is the free function beside it: dropping every candidate
+    /// would pass the first assertion alone.
+    #[test]
+    fn a_method_is_never_a_files_anchor() {
+        let candidate = |name: &str, kind: EntityKind, mass: usize| FileAnchorCandidate {
+            id: EntityId::new(),
+            kind,
+            name: name.to_string(),
+            mass,
+        };
+        let ranked = rank_file_anchors(
+            vec![
+                candidate("CodeEditorWidget.trigger", EntityKind::Method, 900),
+                candidate("createTextModel", EntityKind::Function, 3),
+            ],
+            5,
+        );
+        assert_eq!(
+            ranked.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["createTextModel"],
+            "the method is dropped at any mass; the free function survives at any mass"
+        );
+        assert!(!is_file_anchor_kind(EntityKind::Method));
+        assert!(is_file_anchor_kind(EntityKind::Function));
+    }
+
+    /// Kind is a tie-break, not an override. Both directions are pinned,
+    /// because a rule that preferred types unconditionally would pass the
+    /// first case and fail the second.
+    #[test]
+    fn a_type_wins_a_mass_tie_and_loses_a_mass_gap() {
+        let candidate = |name: &str, kind: EntityKind, mass: usize| FileAnchorCandidate {
+            id: EntityId::new(),
+            kind,
+            name: name.to_string(),
+            mass,
+        };
+        let tied = rank_file_anchors(
+            vec![
+                candidate("search_path", EntityKind::Function, 40),
+                candidate("Searcher", EntityKind::Class, 40),
+            ],
+            1,
+        );
+        assert_eq!(tied[0].name, "Searcher", "a type breaks a mass tie");
+
+        let gapped = rank_file_anchors(
+            vec![
+                candidate("scheduleUpdateOnFiber", EntityKind::Function, 120),
+                candidate("RootTag", EntityKind::EnumDef, 4),
+            ],
+            1,
+        );
+        assert_eq!(
+            gapped[0].name, "scheduleUpdateOnFiber",
+            "mass still decides when it differs, so a file of free functions has an anchor"
+        );
+    }
+
+    /// A zero limit asks for nothing and gets nothing, without touching the
+    /// candidates. The caller's kill switch runs through this path.
+    #[test]
+    fn a_zero_limit_returns_no_anchors() {
+        let ranked = rank_file_anchors(
+            vec![FileAnchorCandidate {
+                id: EntityId::new(),
+                kind: EntityKind::Class,
+                name: "Walk".to_string(),
+                mass: 99,
+            }],
+            0,
+        );
+        assert!(ranked.is_empty());
     }
 
     #[test]
