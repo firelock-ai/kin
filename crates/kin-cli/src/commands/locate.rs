@@ -17826,9 +17826,10 @@ pub fn build_entity_view(
     // (file_rank, LocateEntity) so global ranking can tie-break on file order.
     let mut ranked: Vec<(usize, LocateEntity)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    // (file_rank, file score, file path, entity) for each anchor a ranked file
-    // offered.
-    let mut anchor_candidates: Vec<(usize, f32, String, kin_model::Entity)> = Vec::new();
+    // (file_rank, file score, file path, entity, structural mass) for each
+    // anchor a ranked file offered. The mass rides along because the budget is
+    // spent across files by mass, not per file by a constant.
+    let mut anchor_candidates: Vec<(usize, f32, String, kin_model::Entity, usize)> = Vec::new();
     // Canonical-definition signal for exact-name ties (FIR-2337): owner graph
     // mass per name-hit entity id, computed for at most this many name hits so
     // a hundred-way `new` collision cannot turn projection into a graph walk.
@@ -17854,7 +17855,27 @@ pub fn build_entity_view(
     let anchors_enabled =
         locate_env_bool("KIN_LOCATE_FILE_ANCHORS", true) && !locate_query_is_symbol_lookup(query);
     let anchor_files = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_FILES", 5);
-    let anchor_topk = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_TOPK", 2);
+    // Per-file CEILING on what a file may offer the pool, not what it gets. A
+    // constant per-file budget is what this change exists to remove: measured
+    // 2026-09-02 across seven prose questions on four stores, two per file
+    // misses three of `ReactFiberWorkLoop.js`'s answers while seven per file
+    // reaches down to `I` (mass 18) and `E` (13), ripgrep's single-letter
+    // generic parameters, to fill `literal.rs`'s slots.
+    let anchor_topk = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_TOPK", 8);
+    // The budget that actually binds, spent across the whole anchor window by
+    // structural mass. `ReactFiberWorkLoop.js` has seven definitions above mass
+    // 85 and earns seven slots; `codeEditorWidget.ts` has one at 1346 and
+    // nothing else above 64, so it earns exactly one, and that one is the class
+    // the file is about. Shipped behaviour before this change is
+    // `KIN_LOCATE_FILE_ANCHOR_TOPK=2` with a budget large enough not to bind.
+    let anchor_budget = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_BUDGET", 8);
+    // How much of an anchor's own mass share modulates its file weight. 0.0 is
+    // the pure file-arm order this rule shipped with. Raising it lets a
+    // massively-connected anchor from a lower-ranked file sort above a thin one
+    // from the top file, which is the difference between VS Code's
+    // `CodeEditorWidget` (1346) and `snippetParser.ts`'s `SnippetParser` (157)
+    // on two files the arm scored within a percent of each other.
+    let anchor_mass_weight = locate_env_f32("KIN_LOCATE_FILE_ANCHOR_MASS_WEIGHT", 0.0);
     let anchor_probe = locate_env_usize("KIN_LOCATE_FILE_ANCHOR_PROBE", 256);
     // An anchor is a second opinion, never better evidence than the best thing
     // retrieval actually found, so it is scored as a SHARE of this ranking's own
@@ -17990,6 +18011,7 @@ pub fn build_entity_view(
                         file.score,
                         file.path.clone(),
                         entity.clone(),
+                        anchor.mass,
                     ));
                 }
             }
@@ -18006,6 +18028,29 @@ pub fn build_entity_view(
     // can never take rank one from a row that carries real evidence. The decay
     // keeps the file arm's order among the anchors themselves.
     if !anchor_candidates.is_empty() {
+        // ONE budget across the whole anchor window, spent by structural mass.
+        // `rank_file_anchors` already orders exactly that way (mass desc, type
+        // over free function, name, id) and is reused rather than reimplemented,
+        // so the pooled order and the per-file order can never disagree.
+        if anchor_candidates.len() > anchor_budget {
+            let pooled: Vec<kin_ranking::entity_ranking::FileAnchorCandidate> = anchor_candidates
+                .iter()
+                .map(
+                    |(_, _, _, entity, mass)| kin_ranking::entity_ranking::FileAnchorCandidate {
+                        id: entity.id,
+                        kind: entity.kind,
+                        name: entity.name.clone(),
+                        mass: *mass,
+                    },
+                )
+                .collect();
+            let keep: HashSet<String> =
+                kin_ranking::entity_ranking::rank_file_anchors(pooled, anchor_budget)
+                    .into_iter()
+                    .map(|candidate| candidate.id.to_string())
+                    .collect();
+            anchor_candidates.retain(|(_, _, _, entity, _)| keep.contains(&entity.id.to_string()));
+        }
         let top = ranked
             .iter()
             .map(|(_, entity)| entity.score)
@@ -18023,15 +18068,30 @@ pub fn build_entity_view(
         // whose file scores are unusable.
         let top_file = anchor_candidates
             .iter()
-            .map(|(_, score, _, _)| *score)
+            .map(|(_, score, _, _, _)| *score)
             .fold(0.0_f32, f32::max);
+        let top_mass = anchor_candidates
+            .iter()
+            .map(|(_, _, _, _, mass)| *mass)
+            .max()
+            .unwrap_or(0);
         let mut admitted: Vec<(usize, LocateEntity)> = Vec::new();
-        for (file_rank, file_score, file_path, entity) in anchor_candidates {
+        for (file_rank, file_score, file_path, entity, mass) in anchor_candidates {
             let file_weight = if top_file > 0.0 && file_score > 0.0 {
                 file_score / top_file
             } else {
                 1.0 / (1.0 + file_rank as f32)
             };
+            // The mass share never grows the weight, only lets a thin anchor
+            // give way to a massive one, so the reference share stays the
+            // ceiling and rank one is unreachable however this is tuned.
+            let mass_share = if top_mass > 0 {
+                mass as f32 / top_mass as f32
+            } else {
+                1.0
+            };
+            let file_weight = file_weight
+                * ((1.0 - anchor_mass_weight) + anchor_mass_weight * mass_share).clamp(0.0, 1.0);
             let entity_id = entity.id.to_string();
             if !seen.insert(entity_id.clone()) {
                 continue;
@@ -22381,6 +22441,238 @@ mod tests {
             "and the decay separates the two anchors rather than tying them: {} vs {}",
             fixed.entities[1].score,
             fixed.entities[2].score
+        );
+    }
+
+    /// FIR-3106, the measured shape as a fixture: one anchor budget spent
+    /// across the window by structural mass, not a constant spent per file.
+    ///
+    /// Measured 2026-09-02 on four stores. `ReactFiberWorkLoop.js` carries
+    /// seven definitions above mass 85 (captureCommitPhaseError 176 down to
+    /// performWorkOnRoot 85) and a per-file two misses three of the catalogue's
+    /// answers; ripgrep's `literal.rs` has to reach `I` at mass 18 and `E` at 13,
+    /// single-letter generic parameters, to fill a seventh slot. A constant
+    /// cannot tell those files apart. A pooled budget can, and this pins which
+    /// entities it admits by name.
+    #[test]
+    fn one_anchor_budget_is_spent_across_files_by_mass() {
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let file = |path: &str, score: f32, symbols: Vec<LocateSymbol>| LocateFileEntry {
+            path: path.to_string(),
+            score,
+            signals: vec![],
+            spans: vec![],
+            symbols,
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        };
+        let symbol = |name: &str, score: f32| LocateSymbol {
+            name: name.to_string(),
+            span: Some([10, 20]),
+            score,
+            kind: "function".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        };
+        let graph = kin_db::InMemoryGraph::new();
+        let mut line = 100;
+        let mut massed = |name: &str, path: &str, mass: usize| {
+            let entity = test_entity(name, path, line, line + 10);
+            line += 20;
+            graph.upsert_entity(&entity).unwrap();
+            for _ in 0..mass {
+                let caller = test_entity("caller", "src/callers.rs", 1, 2);
+                graph.upsert_entity(&caller).unwrap();
+                graph
+                    .upsert_relation(&relation(RelationKind::Calls, caller.id, entity.id))
+                    .unwrap();
+            }
+            entity
+        };
+
+        // The work-loop shape: a deep band of real definitions in one file.
+        const LOOP: &str = "src/work_loop.rs";
+        for (name, mass) in [
+            ("capture_commit_phase_error", 30),
+            ("prepare_fresh_stack", 25),
+            ("flush_spawned_work", 20),
+            ("commit_root", 19),
+            ("render_root_concurrent", 18),
+            ("schedule_update_on_fiber", 17),
+            ("perform_work_on_root", 16),
+        ] {
+            massed(name, LOOP, mass);
+        }
+        massed("should_remain_on_previous_screen", LOOP, 2);
+
+        // The literal.rs shape: one real definition and a tail of
+        // single-letter generic parameters.
+        const LITERAL: &str = "src/literal.rs";
+        massed("Extractor", LITERAL, 22);
+        for (name, mass) in [("E", 3), ("I", 2), ("e", 1)] {
+            massed(name, LITERAL, mass);
+        }
+        // The literal file's own lexical row, kept distinct from its anchor:
+        // `seen` is claimed by the projected symbol first, so a fixture that
+        // projects the same entity it expects as an anchor silently tests
+        // nothing. That is what the first run of this test did.
+        massed("strip_literal_prefix", LITERAL, 1);
+
+        let question = "what happens between a component asking for an update \
+                        and that update appearing on screen";
+        let anchors_of = |topk: &str, budget: &str| -> Vec<String> {
+            let _topk = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_TOPK", topk);
+            let _budget =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_BUDGET", budget);
+            let mut result = LocateResult {
+                files: vec![
+                    file(
+                        LOOP,
+                        0.14,
+                        vec![symbol("should_remain_on_previous_screen", 95.7)],
+                    ),
+                    file(LITERAL, 0.13, vec![symbol("strip_literal_prefix", 852.2)]),
+                ],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                question,
+                false,
+            )
+            .unwrap();
+            let mut names: Vec<String> = result
+                .entities
+                .iter()
+                .filter(|entity| entity.provenance.origin == FILE_ANCHOR_ORIGIN)
+                .map(|entity| entity.name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+
+        // Control first, and it is the defect: the shipped per-file constant
+        // spends two slots on the literal file, and one of them is a
+        // single-letter generic parameter, while the work loop keeps five of
+        // its real definitions off the surface.
+        let shipped = anchors_of("2", "64");
+        assert_eq!(
+            shipped,
+            vec![
+                "E".to_string(),
+                "Extractor".to_string(),
+                "capture_commit_phase_error".to_string(),
+                "prepare_fresh_stack".to_string(),
+            ],
+            "control: a per-file two spends a slot on `E`, a single-letter \
+             generic parameter, while five real work-loop definitions stay off \
+             the surface"
+        );
+
+        // The budget, spent by mass across both files: the whole work-loop band
+        // and exactly one row from the literal file.
+        let pooled = anchors_of("8", "8");
+        assert_eq!(
+            pooled,
+            vec![
+                "Extractor".to_string(),
+                "capture_commit_phase_error".to_string(),
+                "commit_root".to_string(),
+                "flush_spawned_work".to_string(),
+                "perform_work_on_root".to_string(),
+                "prepare_fresh_stack".to_string(),
+                "render_root_concurrent".to_string(),
+                "schedule_update_on_fiber".to_string(),
+            ],
+            "the budget admits the work loop's whole band and one row from the \
+             literal file, and never reaches its single-letter parameters"
+        );
+        for junk in ["E", "I", "e"] {
+            assert!(
+                !pooled.iter().any(|name| name == junk),
+                "a single-letter generic parameter never buys a slot the band wants, got {:?}",
+                pooled
+            );
+        }
+
+        // The mass blend, dark by default and pinned here so it cannot ship
+        // untested. At weight 1.0 an anchor's own mass share modulates its file
+        // weight, so the literal file's real definition (mass 22) sorts above
+        // the work loop's thinnest band member (mass 16) even though its file
+        // ranks lower. At weight 0.0, the shipped order, the file arm wins and
+        // every work-loop anchor sits above it.
+        let ordered = |weight: &str| -> Vec<String> {
+            let _topk = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_TOPK", "8");
+            let _budget =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_BUDGET", "8");
+            let _weight =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_MASS_WEIGHT", weight);
+            let mut result = LocateResult {
+                files: vec![
+                    file(
+                        LOOP,
+                        0.14,
+                        vec![symbol("should_remain_on_previous_screen", 95.7)],
+                    ),
+                    file(LITERAL, 0.13, vec![symbol("strip_literal_prefix", 852.2)]),
+                ],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                question,
+                false,
+            )
+            .unwrap();
+            result
+                .entities
+                .iter()
+                .filter(|entity| entity.provenance.origin == FILE_ANCHOR_ORIGIN)
+                .map(|entity| entity.name.clone())
+                .collect()
+        };
+        let dark = ordered("0.0");
+        assert_eq!(
+            dark.last().map(String::as_str),
+            Some("Extractor"),
+            "at weight zero the file arm decides and the lower file's anchor is last, got {dark:?}"
+        );
+        let blended = ordered("1.0");
+        let position = |names: &[String], want: &str| {
+            names
+                .iter()
+                .position(|name| name == want)
+                .unwrap_or(usize::MAX)
+        };
+        assert!(
+            position(&blended, "Extractor") < position(&blended, "perform_work_on_root"),
+            "at weight one a mass-22 anchor from the lower file outranks a mass-16 \
+             one from the top file, got {blended:?}"
+        );
+        assert!(
+            position(&blended, "capture_commit_phase_error") < position(&blended, "Extractor"),
+            "and the top file's own mass leader still leads, got {blended:?}"
         );
     }
 
