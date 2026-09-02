@@ -152,13 +152,13 @@ kin-daemon-spawn = { path = "crates/kin-daemon-spawn" }
 kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
 kin-registry = { path = "crates/kin-registry" }
-kin-lsp = { version = "=0.7.12", registry = "kin" }
+kin-lsp = { version = "=0.7.13", registry = "kin" }
 # Cross-platform base: NO "metal" here. `[workspace.dependencies]` entries cannot be
 # `[target.'cfg(...)']`-gated, so listing "metal" here forces the macOS-only kin-infer/metal
 # backend on every target (incl. Linux, where it cannot compile). Metal is re-enabled
 # additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
 # binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
-kin-db = { version = "=0.7.88", registry = "kin", default-features = false }
+kin-db = { version = "=0.7.90", registry = "kin", default-features = false }
 kin-vfs-core = { version = "=0.4.23", registry = "kin" }
 
 [profile.release]

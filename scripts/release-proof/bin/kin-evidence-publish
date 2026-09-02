@@ -1,0 +1,361 @@
+#!/usr/bin/env node
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+// Publishes one proof-loop record to the release-evidence branch, where the
+// release train's gate can read it.
+//
+// The gate lives in the train (kin's scripts/check-release-proof-artifacts.mjs,
+// called by release-train.yml before it arms auto-merge and by release.yml
+// before it promotes). It reads evidence/<candidate-sha>/preflight.json and
+// evidence/<candidate-sha>/stranger.env off an orphan branch. Nothing wrote
+// those records until this tool: bin/kin-release-preflight and bin/kin-stranger
+// both wrote only to the operator's local .kin-coord, which no Actions job can
+// see, which is why v0.5.44 could ship with no captain and no evidence.
+//
+// Three disciplines are structural here rather than conventional.
+//
+// The token is resolved and proven before anything else happens. An
+// unauthenticated read of a private repo returns 404, which is also what an
+// absent record returns, so a publisher with no token reads "nothing here yet"
+// off every route and fails at the write, after the proof run it was recording
+// has already passed. That is how the v0.5.46 preflight failed at 05:15:12Z on
+// 2026-08-21. So the token is read from the environment or from gh, and it is
+// checked against the repo for push access at the door, in one line an operator
+// can act on.
+//
+// Append-only. A record is created through the contents API WITHOUT a blob sha,
+// and GitHub refuses that call when the path already exists. So overwriting is
+// not something this tool declines to do, it is something it cannot do. A
+// re-publish of byte-identical content is a no-op success, because a proof run
+// repeated after an interrupted publish must not be made to look like
+// tampering. A re-publish of DIFFERENT content under a sha that already has a
+// record is refused loudly: two different answers for one candidate is exactly
+// the ambiguity the gate exists to prevent, and the fix is a human reading both,
+// never a machine picking one.
+//
+// Never fatal to a verdict. This tool exits non-zero and says why, but its
+// callers run it after their verdict is decided and do not let it change that
+// verdict. A proof run that passed and failed to publish is a passed run whose
+// record can be posted again; a proof run failed by its own bookkeeping would
+// teach operators to skip the bookkeeping.
+
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
+
+const API = process.env.KIN_EVIDENCE_API || 'https://api.github.com';
+const BRANCH = process.env.KIN_EVIDENCE_BRANCH || 'release-evidence';
+const DEFAULT_REPO = 'firelock-ai/kin';
+const COMMIT_SHA = /^[0-9a-f]{40}$/;
+const PREFLIGHT_RECORD = 'preflight.json';
+const STRANGER_RECORD = 'stranger.env';
+const RECORDS = new Set([PREFLIGHT_RECORD, STRANGER_RECORD]);
+
+function usage(message) {
+  process.stderr.write(
+    `${message}\n\n` +
+    'usage: kin-evidence-publish --sha <40-hex commit> --name <preflight.json|stranger.env> --file <path>\n' +
+    '                            [--repo owner/name] [--require-archive <64-hex sha256>]\n' +
+    'the token comes from GH_TOKEN, else GITHUB_TOKEN, else "gh auth token", and must have push\n',
+  );
+  process.exit(2);
+}
+
+function parseArgs(argv) {
+  const args = { repo: DEFAULT_REPO };
+  for (let i = 0; i < argv.length; i += 1) {
+    const flag = argv[i];
+    const value = argv[i + 1];
+    switch (flag) {
+      case '--sha': args.sha = value; i += 1; break;
+      case '--name': args.name = value; i += 1; break;
+      case '--file': args.file = value; i += 1; break;
+      case '--repo': args.repo = value; i += 1; break;
+      case '--require-archive': args.requireArchive = value; i += 1; break;
+      default: usage(`unknown argument: ${flag}`);
+    }
+  }
+  if (!args.sha || !COMMIT_SHA.test(args.sha)) {
+    usage(`--sha must be a 40-character commit sha, got "${args.sha ?? ''}"`);
+  }
+  // The gate looks up exactly these two names. A typo would publish a record
+  // nothing ever reads, which is indistinguishable from never publishing.
+  if (!RECORDS.has(args.name)) {
+    usage(`--name must be one of ${[...RECORDS].join(', ')}, got "${args.name ?? ''}"`);
+  }
+  if (!args.file) usage('--file is required');
+  if (args.requireArchive !== undefined && !/^[0-9a-f]{64}$/.test(args.requireArchive)) {
+    usage(`--require-archive must be a 64-character sha256, got "${args.requireArchive}"`);
+  }
+  return args;
+}
+
+async function call(token, method, route, body) {
+  const headers = {
+    accept: 'application/vnd.github+json',
+    'user-agent': 'kin-evidence-publish',
+    'x-github-api-version': '2022-11-28',
+  };
+  if (token) headers.authorization = `Bearer ${token}`;
+  if (body !== undefined) headers['content-type'] = 'application/json';
+  const response = await fetch(`${API}${route}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  let parsed = null;
+  try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
+  return { status: response.status, ok: response.ok, body: parsed, text };
+}
+
+async function readExisting(token, repo, route) {
+  const existing = await call(token, 'GET', route);
+  if (existing.status === 404) return null;
+  if (!existing.ok) {
+    throw new Error(
+      `could not read ${route} on ${BRANCH} of ${repo}: HTTP ${existing.status} ${existing.text.slice(0, 200)}`,
+    );
+  }
+  return existing.body;
+}
+
+// The branch has no history to share with main on purpose: these records
+// describe commits, they are not part of any commit's tree, and putting them on
+// main would make every proof run into drift the train then wants to release.
+async function createOrphanBranch(token, repo, filePath, content, message) {
+  const blob = await call(token, 'POST', `/repos/${repo}/git/blobs`, {
+    content, encoding: 'base64',
+  });
+  if (!blob.ok) throw new Error(`could not create blob: HTTP ${blob.status} ${blob.text.slice(0, 200)}`);
+  const tree = await call(token, 'POST', `/repos/${repo}/git/trees`, {
+    tree: [{ path: filePath, mode: '100644', type: 'blob', sha: blob.body.sha }],
+  });
+  if (!tree.ok) throw new Error(`could not create tree: HTTP ${tree.status} ${tree.text.slice(0, 200)}`);
+  const commit = await call(token, 'POST', `/repos/${repo}/git/commits`, {
+    message, tree: tree.body.sha, parents: [],
+  });
+  if (!commit.ok) throw new Error(`could not create commit: HTTP ${commit.status} ${commit.text.slice(0, 200)}`);
+  const ref = await call(token, 'POST', `/repos/${repo}/git/refs`, {
+    ref: `refs/heads/${BRANCH}`, sha: commit.body.sha,
+  });
+  if (!ref.ok) throw new Error(`could not create ${BRANCH}: HTTP ${ref.status} ${ref.text.slice(0, 200)}`);
+  return commit.body.sha;
+}
+
+// The chain, enforced at write time as well as read time. A stranger record is
+// only meaningful under a candidate whose preflight judged the very archive the
+// stranger ran, so publishing one under any other candidate is refused here
+// rather than discovered by the gate at release time. It also turns an
+// operator's mistyped candidate sha into an immediate, named failure instead of
+// a record that sits unread until a release is held by it.
+async function assertArchiveJudged(token, repo, sha, archive) {
+  const route = `/repos/${repo}/contents/evidence/${sha}/preflight.json?ref=${BRANCH}`;
+  const record = await readExisting(token, repo, route);
+  if (!record) {
+    throw new Error(
+      `cannot file a stranger record under ${sha}: no preflight record is ` +
+      `published there yet, so nothing establishes that archive ${archive} ` +
+      'belongs to this candidate. Publish the preflight record first.',
+    );
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(Buffer.from(record.content ?? '', 'base64').toString());
+  } catch (cause) {
+    throw new Error(`the published preflight record for ${sha} is not valid JSON: ${cause.message}`);
+  }
+  const judged = (Array.isArray(parsed.legs) ? parsed.legs : [])
+    .map((leg) => leg?.result?.archive?.sha256)
+    .filter(Boolean);
+  if (!judged.includes(archive)) {
+    throw new Error(
+      `archive ${archive} is not one the published preflight for ${sha} judged ` +
+      `(${judged.join(', ') || 'none'}). Either the candidate sha is wrong or ` +
+      'the stranger ran on a different build; both need a human, not a retry.',
+    );
+  }
+}
+
+// Name what is being filed, before filing it.
+//
+// Three stranger run roots for one release carried the same archive sha256 and
+// names differing by one trailing character (rc0545, rc0545b, rc0545c), and one
+// of them was still running. Picking the wrong one under time pressure at a
+// release window is silent otherwise: the publish succeeds and the record reads
+// plausible. Echoing the record's own identifying fields makes a wrong pick
+// visible at the moment it happens rather than months later in a provenance
+// question.
+function describeRecord(name, raw) {
+  if (name === STRANGER_RECORD) {
+    const env = {};
+    for (const line of raw.toString().split('\n')) {
+      const eq = line.indexOf('=');
+      if (eq > 0) env[line.slice(0, eq).trim()] = line.slice(eq + 1);
+    }
+    return `arms=${env.arms ?? '<none>'} started_at=${env.started_at ?? '<none>'} ` +
+      `finished_at=${env.finished_at ?? '<none>'} archive=${(env.archive_sha256 ?? '').slice(0, 16)}`;
+  }
+  try {
+    const record = JSON.parse(raw.toString());
+    const commits = [...new Set((record.legs ?? [])
+      .map((leg) => leg?.result?.expected?.commit).filter(Boolean))];
+    return `run=${record.run ?? '<none>'} verdict=${record.verdict ?? '<none>'} ` +
+      `legs=${(record.legs ?? []).length} commit=${commits.join(',') || '<none>'}`;
+  } catch {
+    return 'unparseable';
+  }
+}
+
+// A stranger record with no finished_at describes a run that had not finished
+// when it was read. Refusing it is not fussiness: this branch is append-only by
+// construction, so filing the in-flight version means the completed version can
+// NEVER replace it, and the candidate is left permanently evidenced by a record
+// of a run whose outcome nobody had yet. The one case that produced this rule
+// was live at the moment it would have been published.
+function refuseUnfinished(name, raw, where) {
+  if (name !== STRANGER_RECORD) return;
+  const text = raw.toString();
+  const finished = text.split('\n').find((line) => line.startsWith('finished_at='));
+  if (!finished || !finished.slice('finished_at='.length).trim()) {
+    const started = text.split('\n').find((line) => line.startsWith('started_at='));
+    throw new Error(
+      `${where} carries no finished_at, so this run had not finished when the ` +
+      `file was read${started ? ` (${started.trim()})` : ''}. Evidence is ` +
+      'append-only, so filing it now would permanently evidence this candidate ' +
+      'with a run whose outcome nobody has yet. Wait for the run to land.',
+    );
+  }
+}
+
+// The token, resolved the way the operator's own shell resolves it.
+//
+// Reading only the environment is what broke the v0.5.46 preflight at 05:15:12Z
+// on 2026-08-21: an operator whose gh is logged in has no GH_TOKEN exported, so
+// the publisher sent every request unauthenticated and failed at the write with
+// HTTP 401 Requires authentication, after all three legs had already passed.
+// The back-fill runbook resolved it this way hours earlier and did not fail.
+function resolveToken() {
+  const fromEnv = (process.env.GH_TOKEN || process.env.GITHUB_TOKEN || '').trim();
+  if (fromEnv) return fromEnv;
+  try {
+    return execFileSync('gh', ['auth', 'token'], {
+      // Bounded on purpose. A credential helper that stalls would otherwise
+      // hang the publish forever, at a release window, with nothing printed. A
+      // timeout throws, which lands in the no-token refusal below, and a
+      // refusal an operator can read beats a hang they have to guess at.
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+    }).trim();
+  } catch {
+    // gh absent, logged out, or refusing. Either way there is no token, and
+    // that is the caller's answer, not an error to report from here.
+    return '';
+  }
+}
+
+// One line, never a raw body. gh and the API both answer a refusal with JSON,
+// and a refusal that spills JSON at a release window is one nobody reads to the
+// end of.
+function apiReason(response) {
+  const message = typeof response.body?.message === 'string' ? response.body.message : '';
+  const text = message.replace(/\s+/g, ' ').trim();
+  // Deliberately NOT falling back to the raw body. A response from something
+  // other than GitHub, or from a proxy in front of it, carries HTML or JSON
+  // that would arrive here as the "reason" and put a wall of it on the line an
+  // operator is meant to read.
+  return text ? text.slice(0, 120) : 'the response carried no message field';
+}
+
+// Prove the token reaches the repo BEFORE anything is read or written.
+//
+// This has to come first because a missing token does not announce itself: an
+// unauthenticated read of a private repo returns 404, the same answer an absent
+// path gives, so an empty environment makes every read here say "no record yet"
+// and "no branch yet" and walks the run all the way to the write before failing
+// there. The read side wears the costume of a normal first run. Asking for the
+// repo and requiring push turns that into one named refusal at the door.
+async function assertCanWrite(token, repo) {
+  if (!token) {
+    throw new Error(
+      `no GitHub token: GH_TOKEN and GITHUB_TOKEN are unset and "gh auth token" returned nothing, so nothing can be recorded on ${repo}. Run "gh auth login" or export GH_TOKEN.`,
+    );
+  }
+  const info = await call(token, 'GET', `/repos/${repo}`);
+  if (info.status === 404) {
+    throw new Error(
+      `this token cannot see ${repo} (HTTP 404, which is what a private repo returns to a token that cannot read it), so it cannot record evidence there.`,
+    );
+  }
+  if (!info.ok) {
+    throw new Error(`this token was refused by ${repo}: HTTP ${info.status} ${apiReason(info)}`);
+  }
+  if (info.body?.permissions?.push !== true) {
+    throw new Error(
+      `this token can read ${repo} but has no push permission, so the record would be refused at the write. Use a token with write access to ${repo}.`,
+    );
+  }
+}
+
+async function publish({ sha, name, file, repo, requireArchive }, { token = resolveToken(), log = console.log } = {}) {
+  await assertCanWrite(token, repo);
+  if (requireArchive) {
+    await assertArchiveJudged(token, repo, sha, requireArchive);
+  }
+  const raw = fs.readFileSync(file);
+  log(`filing ${name} for ${sha} from ${file}: ${describeRecord(name, raw)}`);
+  refuseUnfinished(name, raw, file);
+  const content = raw.toString('base64');
+  const filePath = `evidence/${sha}/${name}`;
+  const route = `/repos/${repo}/contents/${filePath}`;
+  const message = `Record ${name} for candidate ${sha}`;
+
+  const existing = await readExisting(token, repo, `${route}?ref=${BRANCH}`);
+  if (existing) {
+    const already = Buffer.from(existing.content ?? '', 'base64');
+    if (already.equals(raw)) {
+      log(`already recorded, identical: ${filePath} on ${BRANCH}`);
+      return { published: false, identical: true, path: filePath };
+    }
+    throw new Error(
+      `${filePath} already exists on ${BRANCH} with DIFFERENT content. This ` +
+      'candidate already has a record and evidence is append-only, so nothing ' +
+      'here will overwrite it. Two different answers for one candidate needs a ' +
+      'human to read both, not a machine to pick one.',
+    );
+  }
+
+  const branch = await call(token, 'GET', `/repos/${repo}/branches/${BRANCH}`);
+  if (branch.status === 404) {
+    const created = await createOrphanBranch(token, repo, filePath, content, message);
+    log(`created ${BRANCH} as an orphan branch and recorded ${filePath} (${created})`);
+    return { published: true, created: true, path: filePath };
+  }
+  if (!branch.ok) {
+    throw new Error(`could not read branch ${BRANCH}: HTTP ${branch.status} ${branch.text.slice(0, 200)}`);
+  }
+
+  // No `sha` field, so this cannot be an update. GitHub refuses the call if the
+  // path exists, which is what makes append-only structural here.
+  const put = await call(token, 'PUT', route, { message, content, branch: BRANCH });
+  if (!put.ok) {
+    throw new Error(
+      `could not record ${filePath} on ${BRANCH}: HTTP ${put.status} ${put.text.slice(0, 200)}`,
+    );
+  }
+  log(`recorded ${filePath} on ${BRANCH}`);
+  return { published: true, created: false, path: filePath };
+}
+
+module.exports = { parseArgs, publish, resolveToken, BRANCH };
+
+if (require.main === module) {
+  publish(parseArgs(process.argv.slice(2)))
+    .then(() => process.exit(0))
+    .catch((error) => {
+      process.stderr.write(`kin-evidence-publish: ${error.message}\n`);
+      process.exit(1);
+    });
+}

@@ -125,13 +125,10 @@ fn publish(
 ) -> Result<TagExecution> {
     require_tag_ref(&request.name)?;
     let lease = authority.manager.read_authority();
-    if let Some(receipt) = lease
-        .metadata()
-        .receipts
-        .iter()
-        .find(|receipt| receipt.operation_id == request.operation_id)
-        .cloned()
-    {
+    // Whole rather than as persisted: a receipt names its operation record
+    // rather than repeating it (kin-db 0.7.89, FIR-3064), and the replay below
+    // reads that record.
+    if let Some(receipt) = kin_core::rejoined_receipt(lease.metadata(), request.operation_id) {
         let roots = lease.roots().clone();
         drop(lease);
         return replay(authority, &roots, receipt, request);

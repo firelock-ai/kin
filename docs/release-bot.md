@@ -7,15 +7,18 @@ Kin's release front door is automatic and fail closed:
 2. The PR moves Cargo, npm, the explicit `kin-spine` path pin, `Cargo.lock`,
    and `CHANGELOG.md` together, then uses normal protected-main checks and
    GitHub auto-merge.
-3. `.github/workflows/release-tag.yml` finds the exact reviewed commit where
+3. `.github/workflows/release-cut.yml` selects the candidate that version will
+   be proven at, arms `release/vX.Y.Z-candidate`, dispatches the archive build,
+   and publishes `preflight.json` for it.
+4. `.github/workflows/release-tag.yml` finds the exact reviewed commit where
    the coherent untagged version first appeared and creates `vX.Y.Z` with the
    scoped release App.
-4. The existing tag-only `.github/workflows/release.yml` publishes and proves
+5. The existing tag-only `.github/workflows/release.yml` publishes and proves
    the release. `.github/workflows/release-recovery.yml` retries only failed or
    timed-out jobs, at most twice, while preserving the same immutable tag. Its
    final job publishes and attests deterministic `release-promotion.json`
    only after every stable-release capstone succeeds.
-5. Installer and hosted reconcilers take over afterward.
+6. Installer and hosted reconcilers take over afterward.
 
 The typed `repository_dispatch` remains a break-glass recovery path. It lets
 the release captain create a tag **without holding the founder credential**,
@@ -86,6 +89,56 @@ by `GITHUB_TOKEN`, whereas the App-owned merge emits the `main` push that starts
 CI and automatic tag admission. Main must require up-to-date checks so new
 merges cause the train to coalesce and re-test rather than release an older
 changelog against newer code.
+
+## Automatic release cut
+
+The mint tags the newest reviewed `main` commit in the staged version's range
+that carries both proof records under `evidence/<sha>/` on the `release-evidence`
+branch. `release-cut.yml` is what puts a record there without a captain.
+
+It runs on a completed CI run for a `main` push, on a completed RC Build for a
+`release/v*-candidate` branch, on the typed `release_cut` repository dispatch
+from the same allowlist the mint admits, and on a fifteen-minute sweep offset
+from the mint's and the train's. There is deliberately **no**
+`workflow_dispatch`: a dispatch takes a ref, and the publish job reaches the
+release App's key, so a branch must never be able to select the code running
+beside it. `scripts/select-release-candidate.py` decides, and both of its
+judgments are pure functions over one snapshot:
+
+1. `vX.Y.Z` already exists, so the cut is done.
+2. A sha in the range carries both records, so the mint owns it.
+3. The current candidate is kept until it is proven or dead. With `preflight.json`
+   recorded it waits for the stranger; alive with a usable RC Build it is proven;
+   alive with none it is armed again, twice at most.
+4. Otherwise the newest `main` commit in the range whose CI **and** Acceptance
+   push runs concluded success, and whose required contexts each appear exactly
+   once under push provenance, becomes the candidate.
+
+A sha still being graded is skipped rather than waited for, because on a busy
+`main` the newest sha is always pending and a selector that waits never
+converges. A sha whose required context is red, duplicated by a rerun, or
+claimed by another App is named and skipped: the mint reads a duplicated
+required context as ambiguous authority, so answering a flaky required job with
+a rerun is what kills the sha, and the next first-pass-green commit becomes the
+candidate instead.
+
+The proof runs on hosted runners, one per archive on the runner that executes it
+natively, using the tooling vendored under `scripts/release-proof/` from the
+private `kin-ecosystem` umbrella. `VENDORED.json` records each file's sha256 and
+`scripts/release-proof/vendored.test.mjs` refuses one that drifted. The three
+leg records are merged by `scripts/release-proof/merge-preflight-records.mjs`,
+which judges its own output with the mint's gate before anything is published;
+the merge is deterministic because the evidence branch is append-only and a
+re-publish of differing bytes is refused as tampering.
+
+**The stranger is still a local step.** Three arms at 12 GiB each do not fit a
+16 GiB hosted runner beside a Docker daemon, and the driver is a Claude Code
+session that on the account login shares the founder's subscription limit, which
+cut three arms on 2026-09-02. `bin/kin-stranger` already passes
+`ANTHROPIC_API_KEY` through on the account endpoint, so what is missing is a
+runner with the memory and a key, not a change to the tool. The publish job
+prints the exact command with all three arms named, and the mint stays refused
+for the missing `stranger.env` rather than being fed a partial one.
 
 ## Tag admission (fail-closed checks, in order)
 
@@ -392,22 +445,48 @@ and the CI gate alike.
 `.github/workflows/kin-registry-release-attest.yml` then binds the exact wave
 head to a release-App attestation that the required CI gate revalidates.
 
-`.github/workflows/kin-registry-wave-land.yml` lands the wave. It runs when a
-check-producing workflow completes on the wave branch and on a sweep four times
-an hour, and `scripts/land-kin-registry-wave.py` decides `land`, `wait` or
-`refuse`: one open first-party wave opened by the release App with no
-auto-merge armed, one bot commit carrying the reserved marker, a diff inside
-`Cargo.toml` and `Cargo.lock`, every check-run on the head concluded and none
-failed over the full set (`per_page=100`, the listed length asserted against
-`total_count`, the newest run per check name, skipped and neutral green, the
-six ruleset contexts present), the pull mergeable, and the attestation
-verified. Only then does the land job mint the App token, squash-merge with the
-pull title and body and never the marker line, and prove the squash is on
-`main`. A failed check, a foreign commit, an off-scope file or an unreadable
-listing refuses loudly; checks still running, a missing attestation or an open
-hold wait quietly. GitHub's own auto-merge is not the mechanism, because it
-merges on the six ruleset contexts alone and the admission chain refuses any
-server-owned landing state on the wave.
+The pull-request action rebases the wave onto main's current tip, so once
+main has moved the head's tree is tip plus delta rather than policy plus
+delta. The receiver's post-write check, the attester and the CI gate therefore
+prove the head carries exactly the admitted delta instead of comparing trees:
+its parent is protected main at or after the admitted base, main did not touch
+the pin files in between, the delta read against that parent passes every
+admission rule, and transplanting the head's pin files onto the admitted base
+reproduces the admitted tree. With an unmoved main every clause is the old
+equality.
+
+`.github/workflows/kin-registry-wave-land.yml` lands the wave. It runs on the
+wave branch's own CI completion, on a typed `kin-registry-wave-land`
+repository dispatch (the manual kick, admitted from the captain and the
+release App, which the receiver sends once after every wave it writes), and on
+a sweep four times an hour as a fallback. `scripts/land-kin-registry-wave.py`
+decides `land`, `wait` or `refuse`: one open first-party wave opened by the
+release App with no auto-merge armed, one bot commit carrying the reserved
+marker, a diff inside `Cargo.toml` and `Cargo.lock`, every check-run on the
+head concluded and none failed over the full set (`per_page=100`, the listed
+length asserted against `total_count`, the newest run per check name, skipped
+and neutral green, the six ruleset contexts present), the pull mergeable, and
+the attestation verified. A judgment re-reads the whole snapshot for a bounded
+budget while the verdict is a transient wait (checks running, a cancelled
+suite awaiting its rerun, an attestation on its way, GitHub still computing
+mergeability, a re-pushed head), so one trigger outlasts the checks it waits
+on. Only then does the land job mint the App token, squash-merge with the pull
+title and body and never the marker line, and prove the squash is on `main`.
+A failed check, a foreign commit, an off-scope file or an unreadable listing
+refuses loudly; everything transient and an open hold wait quietly. A wave
+whose pins a lane already carried onto main has nothing to merge and is left
+for the receiver's next refresh, never squashed as an empty diff. GitHub's
+own auto-merge is not the mechanism, because it merges on the six ruleset
+contexts alone and the admission chain refuses any server-owned landing state
+on the wave.
+
+Kick one judgment by hand with:
+
+```sh
+gh api --method POST repos/firelock-ai/kin/dispatches \
+  -f event_type=kin-registry-wave-land \
+  -f 'client_payload[reason]=<why>'
+```
 
 The hold is the repository variable `KIN_MAIN_FROZEN`, the wave's equivalent
 of the fleet's `kin_main_frozen` gate. Set it with

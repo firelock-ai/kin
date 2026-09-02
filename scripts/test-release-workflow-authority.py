@@ -851,6 +851,18 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/registry-index-migrate.yml": {
         "migrate": None,
     },
+    # The automatic candidate selection and the hosted half of its proof. Every
+    # trigger resolves from protected main and none of its jobs runs on a
+    # pull_request or merge_group event, so none can claim a required context;
+    # it is registered here because this census is what would otherwise let a
+    # new workflow's job NAME appear unreviewed.
+    ".github/workflows/release-cut.yml": {
+        "select": "Select the release candidate",
+        "arm": "Arm the release candidate",
+        "preflight": "Preflight ${{ matrix.artifact }}",
+        "publish": "Publish the candidate's preflight record",
+        "report": "Report the cut's decision",
+    },
     ".github/workflows/release-recovery.yml": {
         "reconcile": "Reconcile failed release",
     },
@@ -869,6 +881,7 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
         "hold-alarm": "Report a held rail",
     },
     ".github/workflows/release.yml": {
+        "duplicate_guard": "Refuse a duplicate release run",
         "config": "Resolve release config",
         "build_daemon_image": "Build immutable daemon image",
         "attest_daemon_image": "Attest immutable daemon image",
@@ -930,6 +943,10 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
         ".github/workflows/rc-build.yml",
         "capability",
     ): "3e7512c3b44ab447531be464599f6237bff7efe798d54728c012676a7c3aed23",
+    (
+        ".github/workflows/release-cut.yml",
+        "preflight",
+    ): "f86f3c6f46bcacba012e93cd28dab5aaa2d711a66078007e4a4fbeb21e6629e7",
     (
         ".github/workflows/release.yml",
         "build",
@@ -16329,11 +16346,18 @@ def main() -> None:
     # save-if does not create that boundary. Do not reason about a related
     # change as though it did.
     #
-    # Scope: this covers Swatinem/rust-cache uses only. Three actions/cache
-    # uses remain deliberately outside it: the windows-installer and coverage
-    # jobs are admitted only from main, while fuzz may still write a cache on a
-    # qualifying pull request. This is not a repository-wide no-PR-writes
-    # invariant.
+    # Scope: this covers Swatinem/rust-cache uses only. Two cargo actions/cache
+    # uses remain deliberately outside it: coverage is admitted only from main,
+    # while fuzz may still write a cache on a qualifying pull request. This is
+    # not a repository-wide no-PR-writes invariant.
+    #
+    # windows-installer used to be the third. It hand-rolled an actions/cache
+    # whose key carried hashFiles('Cargo.lock') over a path that included
+    # `target`, so every repin minted a fresh multi-GB Windows entry, and on
+    # 59c2239c2 the post-step archive ran past the job's 60-minute timeout and
+    # cancelled a run whose work had already finished. It now carries the same
+    # rust-cache block as the three sibling Windows legs, which is why this
+    # assertion covers it.
     assert_rust_cache_steps(workflow_sources)
     assert_required_context_action_pins(workflow_sources)
     assert_tag_readback_retries(release_tag)

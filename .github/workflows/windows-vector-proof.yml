@@ -71,17 +71,25 @@ jobs:
         with:
           tool: sccache
 
+      # Same bound as the `windows-installer` leg in ci.yml, and for the same
+      # reason. This carried `target` under a lockfile-keyed `actions/cache`, so
+      # every dispatch against a repinned lock minted a fresh entry by tarring
+      # the whole Windows release tree. The header note above measures what that
+      # cost on run 30969196206: 5 of the 36 minutes went to the post-job save.
+      # ci.yml's Windows installer leg ran the identical shape into its 60-minute
+      # timeout on 59c2239c2, which is the failure this workflow's larger budget
+      # had been hiding rather than avoiding. `rust-cache` prunes the workspace's
+      # own artifacts out of `target` before saving and writes one entry per key.
+      #
+      # `${{ runner.temp }}/sccache` is still set as the wrapper's directory by
+      # the build step below; it is simply no longer archived.
       - name: Cache cargo registry and build
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            ${{ runner.temp }}/sccache
-          key: windows-vector-proof-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            windows-vector-proof-
+          # FIR-2744, and see the note on the first cache step in ci.yml.
+          add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
       # Keyed on the model id rather than the lock: the download is invariant
       # across source changes, and a cold fetch is most of this job's wall clock.

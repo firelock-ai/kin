@@ -555,8 +555,21 @@ jobs:
             --branch "$BASE_BRANCH"
           api_tree="$(gh api \
             "repos/${GITHUB_REPOSITORY}/git/commits/${api_head}" --jq .tree.sha)"
-          if [ "$api_tree" != "$EXPECTED_TREE" ]; then
-            echo "::error::dependency PR tree $api_tree differs from admitted $EXPECTED_TREE"
+          # The action rebases the wave onto main's tip, so the head's tree is
+          # the admitted tree only while main stood still. The proof that
+          # holds either way: the head's parent is protected main at or after
+          # the admitted base, the delta read against that parent is the
+          # admitted delta, and the head's pin files transplanted onto the
+          # admitted base give the admitted tree. It reads the head it just
+          # fetched, and the API's tree has to agree with it.
+          verified="$(python3 scripts/verify-kin-registry-wave-head.py verify-generated-head \
+            --workspace "$GITHUB_WORKSPACE" \
+            --pull "$PR" \
+            --head "$api_head" \
+            --admitted-base "$ADMITTED_BASE" \
+            --expected-tree "$EXPECTED_TREE")"
+          if [ "$(jq -r .tree <<<"$verified")" != "$api_tree" ]; then
+            echo "::error::dependency PR tree $api_tree differs from the verified head tree"
             exit 1
           fi
 
@@ -599,3 +612,19 @@ jobs:
           path: ${{ runner.temp }}/kin-registry-result/result.json
           if-no-files-found: error
           retention-days: 30
+
+      # One judgment per written wave, whatever GitHub's cron and completion
+      # events do: the kick is a typed repository_dispatch the landing
+      # workflow admits from the release App, and its judge waits out the
+      # checks the push just started.
+      - name: Kick the wave landing judge once
+        if: needs.prepare-wave.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ steps.open-pr.outputs.pull-request-number }}
+          PR_HEAD: ${{ steps.open-pr.outputs.pull-request-head-sha }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/dispatches" \
+            -f event_type=kin-registry-wave-land \
+            -f "client_payload[reason]=receiver run ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT} wrote pull ${PR} head ${PR_HEAD}"

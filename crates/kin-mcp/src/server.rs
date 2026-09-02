@@ -19,7 +19,6 @@ use crate::error::{McpError, Result};
 use crate::handlers::{handle_tool_call, RequestRepositoryAuthority};
 use crate::session::SessionRegistry;
 use crate::startup_binding::{StartupBindingState, StartupDaemonBinding};
-use crate::tools::tool_definitions;
 use crate::types::*;
 
 /// MCP server configuration.
@@ -1184,29 +1183,10 @@ fn handle_initialize(
 }
 
 fn handle_tools_list(id: Option<serde_json::Value>, config: &McpServerConfig) -> JsonRpcResponse {
-    let mut tools = tool_definitions();
-    if let Some(allowed) = &config.allowed_tools {
-        // Captured before the filter, because the annotation below has to tell a
-        // registered tool this profile withholds from a phrase that is simply
-        // prose. After the retain, the withheld ones are gone and that
-        // distinction is unrecoverable.
-        let registered: Vec<String> = tools.tools.iter().map(|tool| tool.name.clone()).collect();
-        tools.tools.retain(|tool| allowed.contains(&tool.name));
-        // A served description that sends the reader to a tool this profile does
-        // not serve is a surface contradicting itself, and it is not rare: the
-        // default profile has five of them naming seven withheld tools
-        // (FIR-3031). Answered here rather than in any description, because this
-        // is the one place the served set is known.
-        crate::tools::annotate_unserved_cross_references(&mut tools, &registered, allowed);
-    }
-    // After the filter and the annotation, so the short forms are the last word
-    // and cannot be re-lengthened by a note computed from the long ones. The
-    // annotation is a no-op on this profile anyway, because a short form names
-    // only tools the profile serves, but the ORDER is what guarantees that
-    // rather than the current wording.
-    if config.agent_belt {
-        crate::agent_belt::compact_for_agent_default(&mut tools);
-    }
+    // The filter, the withheld-tool annotation and the belt compaction live in
+    // one function, so a test that measures the served bytes measures what this
+    // writes to the client rather than its own copy of the recipe.
+    let tools = crate::tools::served_tools_list(config.allowed_tools.as_ref(), config.agent_belt);
     JsonRpcResponse::success(id, serde_json::to_value(&tools).unwrap_or_default())
 }
 

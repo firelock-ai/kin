@@ -45,7 +45,8 @@ pub use session::{
 };
 pub use startup_binding::{StartupBindingState, StartupDaemonBinding};
 pub use tools::{
-    agent_default_tool_names, benchmark_tool_names, context_bench_tool_names, tool_definitions,
+    agent_default_tool_names, agent_query_tool_names, benchmark_tool_names,
+    context_bench_tool_names, name_set as tool_name_set, served_tools_list, tool_definitions,
 };
 pub use types::{
     ContentBlock, JsonRpcRequest, JsonRpcResponse, ToolCallParams, ToolCallResult, ToolDefinition,

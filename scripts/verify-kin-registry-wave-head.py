@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from dataclasses import dataclass
@@ -44,7 +46,14 @@ class PendingAttestation(AdmissionError):
 
 @dataclass(frozen=True)
 class DeltaEvidence:
+    # `base` is the commit the delta was read against: the head's own parent.
+    # `admitted_base` is the receiver's policy commit the delta was admitted
+    # on. The two differ whenever main moved between the receiver's checkout
+    # and its push, because the pull-request action rebases the wave onto
+    # main's tip, and `validate_admitted_head` is the proof that the head still
+    # carries exactly the admitted delta in that case.
     base: str
+    admitted_base: str
     head: str
     tree: str
     paths: frozenset[str]
@@ -295,12 +304,149 @@ def validate_delta(
         raise AdmissionError("dependency-wave patch carries no content change")
     return DeltaEvidence(
         base=base,
+        admitted_base=base,
         head=head,
         tree=tree,
         paths=paths,
         delta_sha256=hashlib.sha256(patch).hexdigest(),
         package_version=_version_evidence(after_versions[0]),
         workspace_version=_version_evidence(after_versions[1]),
+    )
+
+
+def first_parent(workspace: Path, head: str) -> str:
+    """The single parent of a dependency-wave head; a merge is never a wave."""
+
+    listed = (
+        git(workspace, "rev-list", "--parents", "-n", "1", head)
+        .decode("ascii", errors="replace")
+        .split()
+    )
+    if len(listed) != 2:
+        raise AdmissionError(
+            f"dependency-wave head {head} does not have exactly one parent"
+        )
+    return require_sha("dependency-wave head parent", listed[1])
+
+
+def transplant_tree(workspace: Path, admitted_base: str, head: str) -> str:
+    """The tree of `admitted_base` carrying `head`'s copies of the allowed paths."""
+
+    with tempfile.TemporaryDirectory() as directory:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(directory) / "index")}
+        subprocess.run(
+            ["git", "-C", str(workspace), "read-tree", admitted_base],
+            check=True,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        entries = git(workspace, "ls-tree", "-z", head, "--", *sorted(ALLOWED_PATHS))
+        for entry in entries.split(b"\0"):
+            if not entry:
+                continue
+            meta, _, path = entry.partition(b"\t")
+            mode, kind, blob = meta.split(b" ")
+            if kind != b"blob":
+                raise AdmissionError(
+                    f"dependency-wave head carries a non-blob at {path.decode()!r}"
+                )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"{mode.decode()},{blob.decode()},{path.decode()}",
+                ],
+                check=True,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        written = subprocess.run(
+            ["git", "-C", str(workspace), "write-tree"],
+            check=True,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.decode("ascii").strip()
+        return require_sha("transplanted dependency-wave tree", written)
+
+
+def validate_admitted_head(
+    workspace: Path,
+    admitted_base: str,
+    admitted_tree: str,
+    head: str,
+    *,
+    require_marker: bool,
+) -> DeltaEvidence:
+    """Prove `head` carries exactly the admitted delta, wherever main has moved.
+
+    The receiver admits a delta on its policy commit, and the pull-request
+    action then commits that delta onto main's CURRENT tip, so the head's
+    parent is the admitted base only while main stood still. What has to
+    hold is narrower than "the head's tree is the admitted tree": the head's
+    parent is protected main at or after the admitted base, main did not touch
+    the admitted paths in between (so the delta bytes are the admitted bytes),
+    the delta read against the parent passes every admission rule, and
+    transplanting the head's copies of the admitted paths onto the admitted
+    base reproduces the admitted tree. With an unmoved main every clause
+    collapses to the old equality.
+    """
+
+    admitted_base = require_sha("admitted base", admitted_base)
+    admitted_tree = require_sha("admitted tree", admitted_tree)
+    head = require_sha("dependency-wave head", head)
+    ensure_commit(workspace, admitted_base)
+    parent = first_parent(workspace, head)
+    if parent != admitted_base:
+        ensure_commit(workspace, parent)
+        if not is_ancestor(workspace, admitted_base, parent):
+            raise AdmissionError(
+                f"dependency-wave head parent {parent} does not descend from "
+                f"admitted base {admitted_base}"
+            )
+        moved = _paths(
+            git(
+                workspace,
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                admitted_base,
+                parent,
+                "--",
+                *sorted(ALLOWED_PATHS),
+            )
+        )
+        if moved:
+            raise AdmissionError(
+                "protected main changed admitted dependency paths after the "
+                "admitted base, so the wave has to be rebuilt: "
+                + ", ".join(sorted(moved))
+            )
+    evidence = validate_delta(workspace, parent, head, require_marker=require_marker)
+    carried = transplant_tree(workspace, admitted_base, head)
+    if carried != admitted_tree:
+        raise AdmissionError(
+            f"dependency-wave head carries tree {carried} onto the admitted base, "
+            f"not the admitted {admitted_tree}"
+        )
+    return DeltaEvidence(
+        base=parent,
+        admitted_base=admitted_base,
+        head=head,
+        tree=evidence.tree,
+        paths=evidence.paths,
+        delta_sha256=evidence.delta_sha256,
+        package_version=evidence.package_version,
+        workspace_version=evidence.workspace_version,
     )
 
 
@@ -390,6 +536,7 @@ def validate_index_delta(
         raise AdmissionError("staged dependency-wave patch carries no content change")
     return DeltaEvidence(
         base=base,
+        admitted_base=base,
         head="index",
         tree=expected_tree,
         paths=paths,
@@ -795,18 +942,16 @@ def validate_attestation(
                 f"dependency admission base {base} is not an ancestor of "
                 f"current pull base {expected_base}"
             )
-    evidence = validate_delta(workspace, base, head, require_marker=True)
-    if evidence.tree != expected_tree:
-        raise AdmissionError(
-            f"dependency head tree {evidence.tree} differs from admitted {expected_tree}"
-        )
+    evidence = validate_admitted_head(
+        workspace, base, expected_tree, head, require_marker=True
+    )
     if evidence.delta_sha256 != latest["delta_sha256"]:
         raise AdmissionError("dependency head delta differs from admitted fingerprint")
     if evidence.package_version != latest["package_version"]:
         raise AdmissionError("dependency head package version differs from admission")
     if evidence.workspace_version != latest["workspace_version"]:
         raise AdmissionError("dependency head workspace version differs from admission")
-    if evidence.base != latest["policy_sha"]:
+    if evidence.admitted_base != latest["policy_sha"]:
         raise AdmissionError("dependency admission policy differs from its exact base")
     return evidence
 
@@ -1207,10 +1352,57 @@ def emit_index_evidence(argv: Sequence[str]) -> int:
     return 0
 
 
+def verify_generated_head(argv: Sequence[str]) -> int:
+    """The receiver's post-write check: the pushed head carries the admitted delta."""
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--workspace", type=Path, required=True)
+    parser.add_argument("--pull", type=int, required=True)
+    parser.add_argument("--head", required=True)
+    parser.add_argument("--admitted-base", required=True)
+    parser.add_argument("--expected-tree", required=True)
+    args = parser.parse_args(argv)
+    try:
+        if args.pull < 1:
+            raise AdmissionError("pull number must be positive")
+        head = require_sha("generated head", args.head)
+        ensure_pull_head(args.workspace, args.pull, head)
+        evidence = validate_admitted_head(
+            args.workspace,
+            args.admitted_base,
+            args.expected_tree,
+            head,
+            require_marker=True,
+        )
+    except AdmissionError as exc:
+        print(
+            f"::error title=Generated Kin registry head is not the admitted delta::{exc}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "admitted_base": evidence.admitted_base,
+                "parent": evidence.base,
+                "head": evidence.head,
+                "tree": evidence.tree,
+                "delta_sha256": evidence.delta_sha256,
+                "package_version": evidence.package_version,
+                "workspace_version": evidence.workspace_version,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(argv or sys.argv[1:])
     if arguments[:1] == ["emit-index-evidence"]:
         return emit_index_evidence(arguments[1:])
+    if arguments[:1] == ["verify-generated-head"]:
+        return verify_generated_head(arguments[1:])
     args = parse_args(arguments)
     try:
         if args.repository != EXPECTED_REPOSITORY:

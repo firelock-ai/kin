@@ -1,0 +1,1012 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# kin-release-preflight: run the release's own proofs against local bytes,
+# before anything is tagged.
+#
+# The release proves a tag with the Install Proof (install, first run, MCP,
+# VFS projection, embedding, semantic retrieval, and a block of assertions on
+# what it captured) and the fleet gates shipped bytes with the same kin suite.
+# Both of those ran only after a tag existed, which is how v0.5.38 was built,
+# published, and then failed `semantic_coverage.complete` on every platform
+# with nothing local having ever asked the question. This tool asks it here:
+# the same flow, the same assertions, the same repro suite, against a build
+# from a worktree or an archive as shipped, on this host and inside a Debian 12
+# container for a Linux archive, with the glibc floor read off the packaged
+# kin-vfs and shim exactly as the release does.
+#
+# DEV-LOCAL. NON-CITABLE. The publish-fetch surface (get.kinlab.dev, the
+# attestation, the tag binding, the provenance manifest) is not exercised, and
+# the bytes are whatever this machine built or was handed. A pass here is what
+# lets a landing be submitted; it is never release, proof, or investor evidence.
+#
+# See --help for the runbook. Exit: 0 every leg PASS; 1 a leg FAILED; 2 nothing
+# failed but a leg or assertion was UNREADABLE; 64 usage; 65 refused before any
+# leg ran (stamp mismatch, missing tool, missing input); 66 a lane lock could
+# not be taken.
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  d="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$d/$SELF" ;; esac
+done
+# Bash reads a script incrementally, so a save to this file while a run is in
+# flight makes the interpreter resume mid-token and die on a syntax error the
+# file no longer contains. Every run therefore executes a private copy of itself
+# and records that copy's sha256; the helpers are copied into the run root the
+# same way before anything executes them.
+if [ -z "${KIN_PREFLIGHT_ORIGIN:-}" ]; then
+  origin="$(cd -P "$(dirname "$SELF")" && pwd)/$(basename "$SELF")"
+  copy="$(mktemp "${TMPDIR:-/tmp}/kin-release-preflight.XXXXXX")" || exit 65
+  cp "$origin" "$copy" || exit 65
+  KIN_PREFLIGHT_ORIGIN="$origin" KIN_PREFLIGHT_COPY="$copy" exec bash "$copy" "$@"
+fi
+BIN_DIR="$(cd -P "$(dirname "$KIN_PREFLIGHT_ORIGIN")" && pwd)"
+WS="$(cd -P "$BIN_DIR/.." && pwd)"
+HELPERS="$BIN_DIR/kin-release-preflight.d"
+KIN_LANE="$BIN_DIR/kin-lane"
+SUITE_RESOLVER="${KIN_PREFLIGHT_SUITE_RESOLVER:-$BIN_DIR/kin-acceptance-suite}"
+
+usage() {
+  cat <<'USAGE'
+usage:
+  kin-release-preflight --build <kin-checkout> [options]
+  kin-release-preflight --bin <kin> --daemon <kin-daemon> [options]
+  kin-release-preflight --archive <kin-<os>-<arch>.tar.gz> [--archive ...] [options]
+  kin-release-preflight --rc-run <run-id> [options]
+
+What it judges, and where:
+  --build DIR         release-build kin-cli and kin-daemon in DIR (a kin-lane worktree
+                      builds through `bin/kin-lane run <lane> kin -- cargo build`, any
+                      other checkout builds in place with --locked --release), then
+                      overlay them onto the newest published archive for this host
+                      (kin-vfs, the shim and KinNotifier.app come from that base) and
+                      prove the result on the host
+  --bin/--daemon      the same, from binaries you already built
+  --archive FILE      a release-shaped archive as shipped. The host's own target runs
+                      on the host; a Linux archive runs inside a Debian 12 container
+                      of its architecture (linux/arm64 for kin-linux-aarch64), where the
+                      glibc floor guard also runs on kin-vfs and the shim. Repeat the
+                      flag to judge several archives in one run
+  --rc-run ID         download every kin-<os>-<arch>.tar.gz a kin rc-build.yml run
+                      produced and judge each one as --archive would. This is how
+                      the Linux leg runs before a tag exists: a macOS host cannot
+                      cross-build a linux-aarch64 archive, and rc-build.yml builds
+                      release-shaped archives for a branch or tag without cutting
+                      one. Dispatch it ON the candidate branch, which is how the run
+                      resolves its workflow and its cache scope from the candidate:
+                      `gh workflow run rc-build.yml --repo firelock-ai/kin --ref <branch>`
+  Every leg runs kin scripts/acceptance/magic_repro.py against the installed binaries and requires
+  every check to pass.
+
+Options:
+  --base-archive FILE archive to overlay --build/--bin binaries onto (default: the newest
+                      GitHub release's archive for this host, cached under
+                      .kin-coord/preflight/base/<tag>/)
+  --kin-repo DIR      kin checkout supplying scripts/install.sh, check-glibc-floor.mjs
+                      and the workflow the assertions were ported from (default: the
+                      --build checkout, else <umbrella>/kin)
+  --kin-ref REF       git ref of --kin-repo to take those files from (default: the
+                      working tree for --build, else origin/main after a bounded fetch)
+  --expect-commit SHA the 40-hex commit both binaries must report (default: the --build
+                      checkout's HEAD, else the binaries' own stamp, which must agree)
+  --allow-dirty       waive the clean-source assertions (dirty, commit, lock provenance)
+                      for a build from uncommitted changes; the verdict says so
+  --lane NAME         lane name for the gpu/daemon locks (default: the --build worktree's
+                      lane, else preflight)
+  --lock-wait SECS    how long to wait for the locks before refusing (default 900)
+  --embed-seconds N   kin embed --max-seconds (default 300, the workflow's)
+  --cpu-embed         embed on the CPU (KIN_EMBED_BACKEND=cpu) in the host leg and take
+                      no gpu lock; the flow and its assertions are unchanged, the
+                      macOS accelerator path is not what ran, and the verdict says so
+  --leg-timeout SECS  wall-clock bound per leg (default 2700; the workflow's own job
+                      backstop is 90 minutes)
+  --no-linux          skip container legs even for Linux archives
+  --no-repro          skip the kin acceptance suite
+  --linux-image IMG   use this Docker image for the Linux legs instead of building
+                      the bundled Debian 12 image (it must carry node, git, python3,
+                      a C compiler, readelf, and run as a non-root user)
+  --run-root DIR      where the run's scratch, log and report go
+                      (default: /private/tmp/kpf/<stamp> on macOS, /tmp/kpf/<stamp>
+                      elsewhere, kept short because the flow binds Unix sockets under
+                      it; the log and JSON report are also copied to
+                      .kin-coord/preflight/<stamp>/)
+  --keep              keep the installed trees and probe repositories after the run
+  -h, --help          this text
+
+Verdict:
+  One block at the end: PASS, FAIL or UNREADABLE per leg with the literal failing
+  assertion, the magic repro tally, and a FINAL line. UNREADABLE means an assertion
+  could not be evaluated (a capture missing, an expected value unresolved) and is
+  never reported as PASS. Every line carries NON-CITABLE, because it is.
+
+Runbook:
+  before you enqueue a kin PR:
+    bin/kin-release-preflight --build .kin-coord/worktrees/<lane>-kin
+  before a tag, or on release-candidate bytes, or on a shipped archive:
+    bin/kin-release-preflight --archive dist/kin-macos-aarch64.tar.gz --archive dist/kin-linux-aarch64.tar.gz
+  on a release candidate that has no tag yet, which is the only form that runs
+  the Linux leg before the cut:
+    gh workflow run rc-build.yml --repo firelock-ai/kin --ref <candidate-branch>
+    bin/kin-release-preflight --rc-run <run-id>
+  read the FINAL line and the report path it names; nothing is tagged without PASS.
+USAGE
+}
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+say() { printf '[%s] preflight: %s\n' "$(ts)" "$*"; }
+warn() { printf '[%s] preflight: WARNING: %s\n' "$(ts)" "$*" >&2; }
+die() { printf '[%s] preflight: REFUSED: %s\n' "$(ts)" "$*" >&2; exit "${2:-65}"; }
+sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+  else sha256sum "$1" | cut -d' ' -f1; fi
+}
+bounded() { # <secs> <cmd...>: run under coreutils timeout when present
+  local secs="$1"; shift
+  if [ -n "${TIMEOUT_BIN:-}" ]; then "$TIMEOUT_BIN" -k 30 "$secs" "$@"; else "$@"; fi
+}
+
+# Quote the publisher's own reason, not the bare fact that it failed.
+#
+# On 2026-08-21 at 05:15:12Z the v0.5.46 preflight passed all three legs and
+# then printed "kin-evidence-publish: could not record evidence/a621321a.../
+# preflight.json on release-evidence: HTTP 401 Requires authentication". The
+# warning under it said only that the publisher had failed, so the reason lived
+# one line up in the scrollback and the retry command carried no hint that it
+# needed a token. The publisher's full output is printed either way; this lifts
+# its reason into the warning so the two are never separated.
+publish_reason() { # <file holding the publisher's output>
+  local line
+  line="$(sed -n 's/^kin-evidence-publish: //p' "$1" | tail -n 1)"
+  [ -n "$line" ] || line="$(command grep -v '^[[:space:]]*$' "$1" | tail -n 1)"
+  [ -n "$line" ] || line="the publisher printed no reason."
+  printf '%s' "$line"
+}
+
+# Never fatal to the verdict, and never silent about why. Returns 0 always: the
+# caller's verdict was decided before this ran and bookkeeping does not change
+# it.
+publish_record() { # <candidate sha> <report path>
+  local candidate="$1" report="$2" log rc
+  log="$(mktemp "${TMPDIR:-/tmp}/kin-preflight-publish.XXXXXX")" || return 0
+  "$BIN_DIR/kin-evidence-publish" --sha "$candidate" --name preflight.json --file "$report" > "$log" 2>&1
+  rc=$?
+  cat "$log"
+  if [ "$rc" -eq 0 ]; then
+    say "preflight record published for candidate $candidate"
+  else
+    warn "NOT PUBLISHED: $(publish_reason "$log") The verdict above stands and the record can be posted again with: $BIN_DIR/kin-evidence-publish --sha $candidate --name preflight.json --file $report"
+  fi
+  rm -f "$log"
+  return 0
+}
+
+# Print the exact interpreter that proved it can import tomllib. Do not return
+# only its directory: Homebrew's framework directory can contain python3.13 but
+# no python3 entry, which lets a later PATH lookup fall through to Apple's
+# Python 3.9 even though this probe passed with a newer interpreter.
+resolve_tomllib_python() {
+  local candidate real
+  for candidate in "$(command -v python3 2>/dev/null)" /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    real="$("$candidate" -c 'import sys,os; print(os.path.realpath(sys.executable))' 2>/dev/null)" || continue
+    [ -n "$real" ] && [ -x "$real" ] || continue
+    if "$real" -c 'import tomllib' >/dev/null 2>&1; then
+      printf '%s\n' "$real"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Sourcing this file with KIN_PREFLIGHT_DEFINITIONS_ONLY=1 stops here, with the
+# helpers defined and nothing run, so the behavioral suite can drive
+# publish_record against a stub publisher. Set KIN_PREFLIGHT_ORIGIN too, or the
+# self-copy above execs a real run over the caller.
+if [ "${KIN_PREFLIGHT_DEFINITIONS_ONLY:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
+
+# ------------------------------------------------------------------ arguments
+BUILD_DIR=""; BIN_KIN=""; BIN_DAEMON=""; BASE_ARCHIVE=""; KIN_REPO=""; KIN_REF=""
+EXPECT_COMMIT=""; ALLOW_DIRTY=0; LANE=""; LOCK_WAIT=900; EMBED_SECONDS=300; LEG_TIMEOUT=2700
+NO_LINUX=0; NO_REPRO=0; LINUX_IMAGE=""; RUN_ROOT=""; KEEP=0; CPU_EMBED=0
+RC_RUN=""; RC_REPO="firelock-ai/kin"
+ARCHIVES=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --build) BUILD_DIR="${2:?--build needs a directory}"; shift 2 ;;
+    --bin) BIN_KIN="${2:?--bin needs a path}"; shift 2 ;;
+    --daemon) BIN_DAEMON="${2:?--daemon needs a path}"; shift 2 ;;
+    --archive) ARCHIVES+=("${2:?--archive needs a file}"); shift 2 ;;
+    --rc-run) RC_RUN="${2:?--rc-run needs a run id}"; shift 2 ;;
+    --rc-repo) RC_REPO="${2:?--rc-repo needs owner/name}"; shift 2 ;;
+    --base-archive) BASE_ARCHIVE="${2:?--base-archive needs a file}"; shift 2 ;;
+    --kin-repo) KIN_REPO="${2:?--kin-repo needs a directory}"; shift 2 ;;
+    --kin-ref) KIN_REF="${2:?--kin-ref needs a ref}"; shift 2 ;;
+    --expect-commit) EXPECT_COMMIT="${2:?--expect-commit needs a sha}"; shift 2 ;;
+    --allow-dirty) ALLOW_DIRTY=1; shift ;;
+    --lane) LANE="${2:?--lane needs a name}"; shift 2 ;;
+    --lock-wait) LOCK_WAIT="${2:?--lock-wait needs seconds}"; shift 2 ;;
+    --embed-seconds) EMBED_SECONDS="${2:?--embed-seconds needs a number}"; shift 2 ;;
+    --cpu-embed) CPU_EMBED=1; shift ;;
+    --leg-timeout) LEG_TIMEOUT="${2:?--leg-timeout needs seconds}"; shift 2 ;;
+    --no-linux) NO_LINUX=1; shift ;;
+    --no-repro) NO_REPRO=1; shift ;;
+    --linux-image) LINUX_IMAGE="${2:?--linux-image needs an image}"; shift 2 ;;
+    --run-root) RUN_ROOT="${2:?--run-root needs a directory}"; shift 2 ;;
+    --keep) KEEP=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'kin-release-preflight: unknown argument %s\n\n' "$1" >&2; usage >&2; exit 64 ;;
+  esac
+done
+if [ -n "$BUILD_DIR" ] && { [ -n "$BIN_KIN" ] || [ -n "$BIN_DAEMON" ]; }; then
+  printf 'kin-release-preflight: --build and --bin/--daemon are exclusive\n' >&2; exit 64
+fi
+if { [ -n "$BIN_KIN" ] && [ -z "$BIN_DAEMON" ]; } || { [ -z "$BIN_KIN" ] && [ -n "$BIN_DAEMON" ]; }; then
+  printf 'kin-release-preflight: --bin and --daemon go together\n' >&2; exit 64
+fi
+if [ -z "$BUILD_DIR" ] && [ -z "$BIN_KIN" ] && [ "${#ARCHIVES[@]}" -eq 0 ] && [ -z "$RC_RUN" ]; then
+  usage >&2; exit 64
+fi
+# A run id resolved out of a URL or an error message is a number that names no
+# run, and gh answers it with a 404 that reads like any other failure. Refuse
+# anything that is not a bare run id before the network is involved.
+case "$RC_RUN" in
+  ""|*[!0-9]*) [ -z "$RC_RUN" ] || { printf 'kin-release-preflight: --rc-run must be a numeric run id, got %s\n' "$RC_RUN" >&2; exit 64; } ;;
+esac
+case "$EXPECT_COMMIT" in ""|[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+  *) printf 'kin-release-preflight: --expect-commit must be a hex sha\n' >&2; exit 64 ;; esac
+
+# ---------------------------------------------------------------------- host
+HOST_OS="$(uname -s)"; HOST_MACHINE="$(uname -m)"
+case "$HOST_OS" in
+  Darwin) RUNNER_OS=macOS; SETUP_SHELL=zsh ;;
+  Linux) RUNNER_OS=Linux; SETUP_SHELL=bash ;;
+  *) die "unsupported host $HOST_OS" ;;
+esac
+case "$HOST_MACHINE" in
+  arm64|aarch64) RUNNER_ARCH=ARM64; HOST_ARCH_NAME=aarch64 ;;
+  x86_64|amd64) RUNNER_ARCH=X64; HOST_ARCH_NAME=x86_64 ;;
+  *) die "unsupported host architecture $HOST_MACHINE" ;;
+esac
+case "$RUNNER_OS" in macOS) HOST_TARGET="macos-$HOST_ARCH_NAME" ;; *) HOST_TARGET="linux-$HOST_ARCH_NAME" ;; esac
+TIMEOUT_BIN=""
+for candidate in timeout gtimeout /opt/homebrew/bin/timeout /usr/local/bin/timeout; do
+  if command -v "$candidate" >/dev/null 2>&1 && "$candidate" --version 2>/dev/null | command grep -q GNU; then
+    TIMEOUT_BIN="$(command -v "$candidate")"; break
+  fi
+done
+[ -n "$TIMEOUT_BIN" ] || warn "no GNU timeout on PATH; legs run without a wall-clock bound"
+[ -x "$KIN_LANE" ] || die "kin-lane not found at $KIN_LANE"
+[ -f "$HELPERS/proof-flow.sh" ] && [ -f "$HELPERS/validate.mjs" ] || die "helpers missing under $HELPERS"
+for tool in node git tar cc; do
+  command -v "$tool" >/dev/null 2>&1 || die "$tool is required on the host"
+done
+NODE_DIR="$(cd -P "$(dirname "$(command -v node)")" && pwd)"
+# The Codex TOML normalization needs a tomllib-capable Python, which is what
+# the hosted runners carry. Resolve and pass the exact executable rather than
+# asking the proof flow to perform a second, potentially different PATH lookup.
+PYTHON_BIN="$(resolve_tomllib_python)" || die "no python3 with tomllib (3.11+) found; the Codex TOML proof needs one"
+PY_DIR="$(dirname "$PYTHON_BIN")"
+FLOW_PATH="$NODE_DIR:$PY_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
+if [ -n "$TIMEOUT_BIN" ]; then FLOW_PATH="$FLOW_PATH:$(dirname "$TIMEOUT_BIN")"; fi
+GIT_DIR_="$(cd -P "$(dirname "$(command -v git)")" && pwd)"
+case ":$FLOW_PATH:" in *":$GIT_DIR_:"*) ;; *) FLOW_PATH="$FLOW_PATH:$GIT_DIR_" ;; esac
+
+# ---------------------------------------------------------------- run layout
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+if [ -z "$RUN_ROOT" ]; then
+  # Short on purpose: the flow binds Unix sockets under the probe repository and
+  # macOS caps a socket path at 104 bytes.
+  case "$RUNNER_OS" in macOS) RUN_ROOT="/private/tmp/kpf/$STAMP" ;; *) RUN_ROOT="/tmp/kpf/$STAMP" ;; esac
+fi
+[ ! -e "$RUN_ROOT" ] || die "run root already exists: $RUN_ROOT"
+mkdir -p "$RUN_ROOT/tools" "$RUN_ROOT/dist" "$RUN_ROOT/legs" || die "could not create $RUN_ROOT"
+RUN_ROOT="$(cd "$RUN_ROOT" && pwd -P)"
+DURABLE="$WS/.kin-coord/preflight/$STAMP"
+LOG="$RUN_ROOT/preflight.log"
+REPORT="$RUN_ROOT/preflight.json"
+exec > >(tee -a "$LOG") 2>&1
+STATE_DIR="$WS/.kin-coord/preflight"
+HF_HOME_DIR="${KIN_PREFLIGHT_HF_HOME:-$STATE_DIR/hf-home}"
+mkdir -p "$STATE_DIR" "$HF_HOME_DIR"
+
+cat <<BANNER
+================================================================================
+  kin-release-preflight  DEV-LOCAL  NON-CITABLE
+  The release's own proofs against local bytes. Not a release, not a proof, not
+  investor evidence. What it can say: this landing would (or would not) survive
+  the Install Proof and the magic repro as they exist at the ref under test.
+  run root: $RUN_ROOT
+  log:      $LOG
+  running:  a private copy of $KIN_PREFLIGHT_ORIGIN (sha256 $(sha256_of "$KIN_PREFLIGHT_COPY"))
+================================================================================
+BANNER
+
+# ------------------------------------------------- release-candidate archives
+# rc-build.yml builds release-shaped archives for any ref without cutting a tag,
+# which is what lets the Linux leg run before the cut: this host cannot
+# cross-build a linux-aarch64 archive, so without a candidate build the Debian 12
+# container leg and its glibc floor guard were skipped on every pre-tag run.
+#
+# Every failure here is loud and names the run id. A run that produced no kin
+# archive must not degrade into the same skipped-Linux-leg verdict this option
+# exists to remove, because that verdict is indistinguishable from never having
+# passed the option at all.
+if [ -n "$RC_RUN" ]; then
+  command -v gh >/dev/null 2>&1 || die "gh is required for --rc-run $RC_RUN"
+  RC_DIR="$RUN_ROOT/rc/$RC_RUN"
+  mkdir -p "$RC_DIR" || die "could not create $RC_DIR for --rc-run $RC_RUN"
+  say "--rc-run $RC_RUN: downloading candidate archives from $RC_REPO"
+  if ! bounded 900 gh run download "$RC_RUN" --repo "$RC_REPO" --dir "$RC_DIR" > "$RUN_ROOT/rc-download.log" 2>&1; then
+    tail -n 20 "$RUN_ROOT/rc-download.log" >&2 || true
+    die "gh run download failed for run $RC_RUN in $RC_REPO (see $RUN_ROOT/rc-download.log); it is not an rc-build.yml run, or it published no artifact"
+  fi
+  rc_found=0
+  while IFS= read -r rc_archive; do
+    rc_name="$(basename "$rc_archive")"
+    case "$rc_name" in
+      kin-macos-aarch64.tar.gz|kin-macos-x86_64.tar.gz|kin-linux-aarch64.tar.gz|kin-linux-x86_64.tar.gz) ;;
+      *) continue ;;
+    esac
+    # The sidecar travels in the same artifact, and bin/kin-stranger refuses an
+    # archive without one, so a candidate that arrives unpaired is a defect in
+    # the run rather than something to work around here.
+    [ -f "$rc_archive.sha256" ] || die "--rc-run $RC_RUN: $rc_name arrived without its $rc_name.sha256 sidecar"
+    rc_want="$(cut -d' ' -f1 < "$rc_archive.sha256" | tr -d '[:space:]')"
+    rc_have="$(sha256_of "$rc_archive")"
+    [ "$rc_want" = "$rc_have" ] || die "--rc-run $RC_RUN: $rc_name checksum mismatch: sidecar $rc_want, bytes $rc_have"
+    ARCHIVES+=("$rc_archive")
+    rc_found=$((rc_found + 1))
+    say "--rc-run $RC_RUN: $rc_name (sha256 $rc_have)"
+  done < <(find "$RC_DIR" -type f -name 'kin-*.tar.gz' | sort)
+  [ "$rc_found" -gt 0 ] || die "--rc-run $RC_RUN: run $RC_RUN in $RC_REPO published no kin-<os>-<arch>.tar.gz artifact, so there is nothing to judge; dispatch one with 'gh workflow run rc-build.yml --repo $RC_REPO --ref <candidate-branch>'"
+  say "--rc-run $RC_RUN: $rc_found candidate archive(s) under judgment"
+fi
+
+# ------------------------------------------------------------- lock handling
+HELD_LOCKS=""
+release_locks() {
+  local held
+  for held in $HELD_LOCKS; do
+    "$KIN_LANE" release "$held" "$LANE" 2>&1 | sed 's/^/[kin-lane] /' || true
+  done
+  HELD_LOCKS=""
+}
+CONTAINERS=""
+cleanup() {
+  local rc=$? name
+  for name in $CONTAINERS; do docker rm -f "$name" >/dev/null 2>&1 || true; done
+  release_locks
+  [ -z "${KIN_PREFLIGHT_COPY:-}" ] || rm -f "$KIN_PREFLIGHT_COPY"
+  return "$rc"
+}
+trap cleanup EXIT
+trap 'say "interrupted"; exit 130' INT TERM
+
+acquire_lock() { # <resource>
+  local resource="$1" waited=0 holder
+  until "$KIN_LANE" acquire "$resource" "$LANE" --pid $$ "release preflight $STAMP"; do
+    holder="$("$KIN_LANE" holder "$resource" 2>/dev/null || true)"
+    if [ "$waited" -ge "$LOCK_WAIT" ]; then
+      say "$resource lock still held by '${holder:-unknown}' after ${waited}s; not stealing"
+      return 1
+    fi
+    say "waiting on the $resource lock (holder: ${holder:-unknown}); ${waited}s of ${LOCK_WAIT}s"
+    sleep 15; waited=$((waited + 15))
+  done
+  holder="$("$KIN_LANE" holder "$resource" 2>/dev/null || true)"
+  if [ "$holder" != "$LANE" ]; then
+    say "acquire returned 0 but the $resource holder reads '$holder', not '$LANE'; refusing to run under an unproven lease"
+    return 1
+  fi
+  HELD_LOCKS="$HELD_LOCKS $resource"
+  say "$resource lock held by $LANE (pid $$, verified by read-back)"
+}
+
+# --------------------------------------------------------- source under test
+# KIN_REPO / KIN_REF supply the installer, the floor guard, and the workflow the
+# assertions were ported from. TOOL_SRC names how each file is read.
+if [ -n "$BUILD_DIR" ]; then
+  [ -d "$BUILD_DIR" ] || die "--build directory not found: $BUILD_DIR"
+  BUILD_DIR="$(cd "$BUILD_DIR" && pwd -P)"
+  git -C "$BUILD_DIR" rev-parse --show-toplevel >/dev/null 2>&1 || die "$BUILD_DIR is not a git checkout"
+  [ -f "$BUILD_DIR/crates/kin-cli/Cargo.toml" ] || die "$BUILD_DIR does not look like a kin checkout"
+  [ -n "$KIN_REPO" ] || KIN_REPO="$BUILD_DIR"
+fi
+[ -n "$KIN_REPO" ] || KIN_REPO="$WS/kin"
+[ -d "$KIN_REPO" ] || die "kin repo not found: $KIN_REPO (pass --kin-repo)"
+KIN_REPO="$(cd "$KIN_REPO" && pwd -P)"
+read_kin_file() { # <relative path> <dest>: from the working tree (--build) or a git ref
+  local rel="$1" dest="$2"
+  if [ -z "$KIN_REF" ]; then
+    [ -f "$KIN_REPO/$rel" ] || return 1
+    cp "$KIN_REPO/$rel" "$dest"
+  else
+    git -C "$KIN_REPO" cat-file -e "$KIN_REF:$rel" 2>/dev/null || return 1
+    git -C "$KIN_REPO" show "$KIN_REF:$rel" > "$dest"
+  fi
+}
+if [ -z "$BUILD_DIR" ] && [ -z "$KIN_REF" ]; then
+  # Archives are judged with the tooling at origin/main: the guard that catches a
+  # glibc regression is the current one, not the one the archive's commit knew.
+  if bounded 90 git -C "$KIN_REPO" fetch -q origin main 2>/dev/null; then
+    KIN_REF="origin/main"
+  else
+    warn "could not fetch origin/main in $KIN_REPO; using the local origin/main ref"
+    KIN_REF="origin/main"
+  fi
+fi
+if [ -n "$KIN_REF" ]; then TOOL_SRC="$KIN_REPO @ $KIN_REF"; else TOOL_SRC="$KIN_REPO (working tree)"; fi
+read_kin_file scripts/install.sh "$RUN_ROOT/tools/install.sh" || die "scripts/install.sh not found at $TOOL_SRC"
+if read_kin_file scripts/check-glibc-floor.mjs "$RUN_ROOT/tools/check-glibc-floor.mjs"; then
+  GLIBC_GUARD="present"
+else
+  GLIBC_GUARD="absent at $TOOL_SRC"
+fi
+WORKFLOW_SHA=""
+if read_kin_file .github/workflows/install-proof.yml "$RUN_ROOT/tools/install-proof.yml"; then
+  WORKFLOW_SHA="$(sha256_of "$RUN_ROOT/tools/install-proof.yml")"
+fi
+PORTED_SHA="$(sed -n 's/^  sha256: "\([0-9a-f]\{64\}\)",$/\1/p' "$HELPERS/validate.mjs" | head -1)"
+cp "$HELPERS/proof-flow.sh" "$RUN_ROOT/tools/proof-flow.sh"
+cp "$HELPERS/validate.mjs" "$RUN_ROOT/tools/validate.mjs"
+# The acceptance suite comes from kin, never from a copy kept here. A release
+# archive carries kin, kin-daemon, kin-vfs, the shim, README and INSTALL and no
+# scripts directory, so the bytes under test cannot supply their own checks;
+# the suite is pinned to the same KIN_REPO @ KIN_REF that already supplies
+# scripts/install.sh and check-glibc-floor.mjs. bin/kin-acceptance-suite prints
+# the path, sha256 and tree sha it resolved, and refuses a copy that came from
+# outside that tree. The umbrella used to keep its own copy and it drifted six
+# checks behind kin's within two days, which is why there is one copy now.
+MAGIC_SRC="not staged"
+if [ ! -x "$SUITE_RESOLVER" ]; then
+  warn "bin/kin-acceptance-suite is missing at $SUITE_RESOLVER; no leg can run the acceptance suite"
+  MAGIC_SRC="UNAVAILABLE: no resolver at $SUITE_RESOLVER"
+else
+  if [ -n "$KIN_REF" ]; then
+    SUITE_ARGS=( --kin-repo "$KIN_REPO" --ref "$KIN_REF" )
+  else
+    SUITE_ARGS=( --checkout "$KIN_REPO" )
+  fi
+  if "$SUITE_RESOLVER" magic "${SUITE_ARGS[@]}" \
+       --dest "$RUN_ROOT/tools/kin-magic-repro" --label "preflight magic" \
+       --json "$RUN_ROOT/tools/magic-suite.json" >/dev/null; then
+    MAGIC_SRC="$TOOL_SRC:scripts/acceptance/magic_repro.py"
+  else
+    # Not fatal here on purpose. proof-flow.sh already refuses a leg asked to
+    # run a suite that was never staged, and that refusal names the leg, so a
+    # run that skipped the suite deliberately still works and a run that needed
+    # it fails where it needed it rather than here.
+    MAGIC_SRC="UNAVAILABLE from $TOOL_SRC"
+    warn "the acceptance suite could not be resolved from $TOOL_SRC; every leg that runs it will refuse"
+  fi
+fi
+chmod +x "$RUN_ROOT/tools/proof-flow.sh" "$RUN_ROOT/tools/install.sh" 2>/dev/null
+say "tooling from $TOOL_SRC: install.sh, check-glibc-floor.mjs $GLIBC_GUARD"
+say "acceptance suite: $MAGIC_SRC"
+# validate.mjs is a hand port of install-proof.yml's "Validate installed
+# capability proof" block. When the two disagree, a PASS here is a PASS against
+# assertions the release gate no longer runs, and it is quotable: the report
+# names a verdict without naming which contract produced it. That is worse than
+# no preflight, so the run refuses rather than warning. This used to warn and
+# continue, and it sat drifted across a release that then died on the very gate
+# the stale port could not have judged.
+drift_procedure() {
+  printf 'resync:\n'
+  printf '  1. read the "Validate installed capability proof" step of\n'
+  printf '     .github/workflows/install-proof.yml at %s\n' "$TOOL_SRC"
+  printf '  2. port every changed assertion into %s/validate.mjs,\n' "$HELPERS"
+  printf '     assertion for assertion, keeping PASS/FAIL/UNREADABLE reporting\n'
+  printf '  3. set PORTED_FROM.sha256 in that file to %s\n' "${WORKFLOW_SHA:-the sha printed above}"
+  printf '  4. re-run this command; the gate compares the two shas again\n'
+}
+if [ -z "$WORKFLOW_SHA" ]; then
+  drift_procedure >&2
+  die ".github/workflows/install-proof.yml could not be read at $TOOL_SRC, so the ported validator ($PORTED_SHA) cannot be checked against the contract it claims to mirror; an unverifiable port is not a gate"
+fi
+if [ "$WORKFLOW_SHA" != "$PORTED_SHA" ]; then
+  drift_procedure >&2
+  die "install-proof.yml at $TOOL_SRC is sha256 $WORKFLOW_SHA, but $HELPERS/validate.mjs records PORTED_FROM.sha256 $PORTED_SHA. The ported validator judges a contract the release gate no longer runs, so a PASS here would not be the workflow's PASS"
+fi
+
+# ---------------------------------------------------- expected lock provenance
+resolve_lock_sha() { # <commit> -> prints sha256 of that commit's Cargo.lock, or nothing
+  local commit="$1" tmp
+  tmp="$RUN_ROOT/tools/Cargo.lock.$commit"
+  if git -C "$KIN_REPO" cat-file -e "$commit:Cargo.lock" 2>/dev/null; then
+    git -C "$KIN_REPO" show "$commit:Cargo.lock" > "$tmp" && sha256_of "$tmp"; return
+  fi
+  if bounded 60 git -C "$KIN_REPO" fetch -q origin "$commit" 2>/dev/null \
+     && git -C "$KIN_REPO" cat-file -e "$commit:Cargo.lock" 2>/dev/null; then
+    git -C "$KIN_REPO" show "$commit:Cargo.lock" > "$tmp" && sha256_of "$tmp"; return
+  fi
+  if command -v curl >/dev/null 2>&1 \
+     && bounded 60 curl -fsSL "https://raw.githubusercontent.com/firelock-ai/kin/$commit/Cargo.lock" -o "$tmp" 2>/dev/null; then
+    sha256_of "$tmp"; return
+  fi
+  return 1
+}
+
+# ------------------------------------------------------ build / bin overlay
+LEG_NAMES=()      # display names, in run order
+LEG_KINDS=()      # host | linux
+LEG_ARCHIVES=()   # archive path per leg
+LEG_COMMITS=()    # expected commit per leg
+LEG_LOCKS=()      # expected lock sha per leg
+LEG_PLATFORMS=()  # docker platform for linux legs
+LEG_TARGETS=()    # kin-<os>-<arch>
+PROVENANCE=""     # human-readable lines about the bytes
+
+stamp_sha_of_line() { printf '%s\n' "$1" | sed -n 's/.*(\([0-9a-f]\{40\}\).*/\1/p'; }
+
+BUILT_KIN=""; BUILT_DAEMON=""; BUILD_SHA=""; BUILD_DIRTY=""; BUILD_BRANCH=""
+if [ -n "$BUILD_DIR" ]; then
+  BUILD_SHA="$(git -C "$BUILD_DIR" rev-parse HEAD)"
+  BUILD_BRANCH="$(git -C "$BUILD_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
+  if [ -n "$(git -C "$BUILD_DIR" status --porcelain --untracked-files=no)" ]; then BUILD_DIRTY=1; else BUILD_DIRTY=0; fi
+  say "build tree: $BUILD_DIR @ ${BUILD_SHA} ($BUILD_BRANCH)$( [ "$BUILD_DIRTY" = 1 ] && printf ' DIRTY' )"
+  if [ "$BUILD_DIRTY" = 1 ] && [ "$ALLOW_DIRTY" != 1 ]; then
+    die "the build tree has uncommitted tracked changes; the release asserts a clean build. Commit to the lane branch (a dirty tree is not durable), or pass --allow-dirty to waive the clean-source assertions"
+  fi
+  # A kin-lane worktree builds through kin-lane so its CARGO_TARGET_DIR and the
+  # compiler cache are the lane's own; anything else builds in place.
+  lane_from_wt=""
+  case "$BUILD_DIR" in
+    "$WS/.kin-coord/worktrees/"*-kin)
+      lane_from_wt="$(basename "$BUILD_DIR")"; lane_from_wt="${lane_from_wt%-kin}" ;;
+  esac
+  [ -n "$LANE" ] || LANE="${lane_from_wt:-preflight}"
+  say "building kin-cli + kin-daemon (release, --locked)"
+  if [ -n "$lane_from_wt" ] && [ -d "$WS/.kin-coord/worktrees/$lane_from_wt-kin" ]; then
+    (
+      # kin-lane run exports KIN_VFS_DISABLE for the lane's own tooling; the
+      # flow later unsets everything it inherits, so that is fine here.
+      "$KIN_LANE" run "$lane_from_wt" kin -- cargo build --locked --release -p kin-cli -p kin-daemon
+    ) > "$RUN_ROOT/build.log" 2>&1
+    build_rc=$?
+    TARGET_DIR="$WS/.kin-coord/cargo-target/$lane_from_wt-kin"
+  else
+    (
+      cd "$BUILD_DIR" && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$BUILD_DIR/target}" \
+        cargo build --locked --release -p kin-cli -p kin-daemon
+    ) > "$RUN_ROOT/build.log" 2>&1
+    build_rc=$?
+    TARGET_DIR="${CARGO_TARGET_DIR:-$BUILD_DIR/target}"
+  fi
+  if [ "$build_rc" -ne 0 ]; then
+    tail -n 30 "$RUN_ROOT/build.log" >&2
+    die "cargo build failed (rc=$build_rc); see $RUN_ROOT/build.log"
+  fi
+  BUILT_KIN="$TARGET_DIR/release/kin"; BUILT_DAEMON="$TARGET_DIR/release/kin-daemon"
+  [ -x "$BUILT_KIN" ] && [ -x "$BUILT_DAEMON" ] || die "build produced no kin/kin-daemon under $TARGET_DIR/release"
+  say "built: $BUILT_KIN"
+  say "built: $BUILT_DAEMON"
+elif [ -n "$BIN_KIN" ]; then
+  [ -x "$BIN_KIN" ] || die "--bin not executable: $BIN_KIN"
+  [ -x "$BIN_DAEMON" ] || die "--daemon not executable: $BIN_DAEMON"
+  BUILT_KIN="$(cd -P "$(dirname "$BIN_KIN")" && pwd)/$(basename "$BIN_KIN")"
+  BUILT_DAEMON="$(cd -P "$(dirname "$BIN_DAEMON")" && pwd)/$(basename "$BIN_DAEMON")"
+fi
+[ -n "$LANE" ] || LANE="preflight"
+
+fetch_base_archive() { # prints the path of a base archive for the host target
+  if [ -n "$BASE_ARCHIVE" ]; then
+    [ -f "$BASE_ARCHIVE" ] || die "--base-archive not found: $BASE_ARCHIVE"
+    printf '%s\n' "$(cd -P "$(dirname "$BASE_ARCHIVE")" && pwd)/$(basename "$BASE_ARCHIVE")"; return
+  fi
+  command -v gh >/dev/null 2>&1 || die "gh is required to fetch a base archive (or pass --base-archive)"
+  local tag dest
+  tag="$(bounded 60 gh release view --repo firelock-ai/kin --json tagName --jq .tagName 2>/dev/null || true)"
+  [ -n "$tag" ] || die "could not resolve the newest kin release tag through gh; pass --base-archive"
+  dest="$STATE_DIR/base/$tag"
+  mkdir -p "$dest"
+  if [ ! -f "$dest/kin-$HOST_TARGET.tar.gz" ] || [ ! -f "$dest/kin-$HOST_TARGET.tar.gz.sha256" ]; then
+    say "fetching base archive kin-$HOST_TARGET.tar.gz from release $tag" >&2
+    ( cd "$dest" && bounded 600 gh release download "$tag" --repo firelock-ai/kin \
+        -p "kin-$HOST_TARGET.tar.gz" -p "kin-$HOST_TARGET.tar.gz.sha256" --clobber ) >&2 \
+      || die "gh release download failed for $tag"
+  fi
+  local want have
+  want="$(cut -d' ' -f1 "$dest/kin-$HOST_TARGET.tar.gz.sha256")"
+  have="$(sha256_of "$dest/kin-$HOST_TARGET.tar.gz")"
+  [ "$want" = "$have" ] || die "base archive checksum mismatch for $tag: sidecar $want, bytes $have"
+  printf '%s\n' "$dest/kin-$HOST_TARGET.tar.gz"
+}
+
+if [ -n "$BUILT_KIN" ]; then
+  kin_line="$("$BUILT_KIN" --version 2>&1 | tail -1)"
+  daemon_line="$("$BUILT_DAEMON" --version 2>&1 | tail -1)"
+  kin_sha="$(stamp_sha_of_line "$kin_line")"; daemon_sha="$(stamp_sha_of_line "$daemon_line")"
+  say "kin:        $kin_line"
+  say "kin-daemon: $daemon_line"
+  [ -n "$kin_sha" ] && [ -n "$daemon_sha" ] || die "a --version line carries no full build sha ('$kin_line' / '$daemon_line')"
+  if [ "$kin_sha" != "$daemon_sha" ]; then
+    die "STAMP MISMATCH: kin names $kin_sha but kin-daemon names $daemon_sha. Rebuild both (-p kin-cli -p kin-daemon) from one tree; a mixed pair proves nothing about either"
+  fi
+  case "$kin_line$daemon_line" in *-dirty*) [ "$ALLOW_DIRTY" = 1 ] || die "the binaries stamp themselves dirty; commit and rebuild, or pass --allow-dirty" ;; esac
+  base="$(fetch_base_archive)" || exit 65
+  base_sha="$(sha256_of "$base")"
+  say "base archive: $base (sha256 $base_sha)"
+  assemble="$RUN_ROOT/assemble"; rm -rf "$assemble"; mkdir -p "$assemble"
+  tar -xzf "$base" -C "$assemble" || die "could not extract $base"
+  content_root="$(find "$assemble" -mindepth 1 -maxdepth 1 -type d -name 'kin-*' | head -1)"
+  [ -n "$content_root" ] || die "base archive has no kin-* content root"
+  [ "$(basename "$content_root")" = "kin-$HOST_TARGET" ] || die "base archive content root $(basename "$content_root") is not kin-$HOST_TARGET"
+  cp "$BUILT_KIN" "$content_root/kin" && cp "$BUILT_DAEMON" "$content_root/kin-daemon" || die "overlay failed"
+  chmod +x "$content_root/kin" "$content_root/kin-daemon"
+  host_archive="$RUN_ROOT/dist/kin-$HOST_TARGET.tar.gz"
+  ( cd "$assemble" && tar -czf "$host_archive" "kin-$HOST_TARGET" ) || die "could not assemble $host_archive"
+  rm -rf "$assemble"
+  expected_commit="${EXPECT_COMMIT:-${BUILD_SHA:-$kin_sha}}"
+  lock_sha=""
+  if [ -n "$BUILD_DIR" ]; then
+    lock_sha="$(sha256_of "$BUILD_DIR/Cargo.lock")"
+  else
+    lock_sha="$(resolve_lock_sha "$expected_commit" || true)"
+  fi
+  LEG_NAMES+=("host ($HOST_TARGET, built)"); LEG_KINDS+=(host); LEG_ARCHIVES+=("$host_archive")
+  LEG_COMMITS+=("$expected_commit"); LEG_LOCKS+=("$lock_sha"); LEG_PLATFORMS+=(""); LEG_TARGETS+=("kin-$HOST_TARGET")
+  PROVENANCE="$PROVENANCE
+  kin:          $BUILT_KIN
+                sha256 $(sha256_of "$BUILT_KIN")
+                $kin_line
+  kin-daemon:   $BUILT_DAEMON
+                sha256 $(sha256_of "$BUILT_DAEMON")
+                $daemon_line
+  base archive: $base (sha256 $base_sha) supplies kin-vfs, the shim and KinNotifier.app; kin and kin-daemon were overlaid onto it, so the assembled archive is neither a release nor a reproducible build
+  assembled:    $host_archive (sha256 $(sha256_of "$host_archive"))
+  expected:     commit $expected_commit${BUILD_DIR:+ (HEAD of $BUILD_DIR)}; Cargo.lock sha256 ${lock_sha:-UNRESOLVED}"
+fi
+
+# ----------------------------------------------------------- shipped archives
+container_stamp() { # <archive> <platform> -> prints "kin_line|daemon_line" read inside a container
+  local archive="$1" platform="$2" dir img
+  dir="$(dirname "$archive")"
+  img="$(linux_image_for "${platform#linux/}")"
+  docker run --rm --platform "$platform" -v "$dir:/d:ro" "$img" \
+    bash -c 'set -e; t="$(mktemp -d)"; tar -xzf "/d/'"$(basename "$archive")"'" -C "$t"; r="$(find "$t" -mindepth 1 -maxdepth 1 -type d | head -1)"; chmod +x "$r/kin" "$r/kin-daemon"; k="$("$r/kin" --version 2>&1 | tail -1)"; d="$("$r/kin-daemon" --version 2>&1 | tail -1)"; printf "%s|%s\n" "$k" "$d"' 2>"$RUN_ROOT/stamp-$(basename "$archive").err"
+}
+
+# One local image tag per platform. A single tag cannot serve both legs: docker
+# image inspect answers for whichever variant was built, so an arm64-only tag
+# passes the cache check and then an amd64 run finds no local variant, attempts
+# a registry pull, and fails with its stderr discarded, which read as two empty
+# build stamps on 2026-08-20. An explicit --linux-image is trusted for both.
+LINUX_IMAGE_ARM64=""; LINUX_IMAGE_AMD64=""
+linux_image_for() { case "$1" in arm64) printf '%s' "$LINUX_IMAGE_ARM64" ;; amd64) printf '%s' "$LINUX_IMAGE_AMD64" ;; esac; }
+set_linux_image_for() { case "$1" in arm64) LINUX_IMAGE_ARM64="$2" ;; amd64) LINUX_IMAGE_AMD64="$2" ;; esac; }
+ensure_linux_image() { # <arch: arm64|amd64>
+  local arch="$1"
+  [ -z "$(linux_image_for "$arch")" ] || return 0
+  command -v docker >/dev/null 2>&1 || return 1
+  docker info >/dev/null 2>&1 || return 1
+  if [ -n "$LINUX_IMAGE" ]; then set_linux_image_for "$arch" "$LINUX_IMAGE"; return 0; fi
+  local uid gid tag
+  uid="$(id -u)"; gid="$(id -g)"
+  tag="kin-release-preflight/debian12:u$uid-$arch"
+  if docker image inspect "$tag" >/dev/null 2>&1; then set_linux_image_for "$arch" "$tag"; return 0; fi
+  say "building the Debian 12 leg image $tag for linux/$arch (once; cached afterwards)"
+  bounded 1200 docker build --platform "linux/$arch" -t "$tag" \
+    --build-arg "UID=$uid" --build-arg "GID=$gid" -f "$HELPERS/Dockerfile" "$HELPERS" > "$RUN_ROOT/image-build-$arch.log" 2>&1 \
+    || { tail -n 30 "$RUN_ROOT/image-build-$arch.log" >&2; return 1; }
+  set_linux_image_for "$arch" "$tag"
+}
+
+LINUX_SKIPPED=""
+for archive in ${ARCHIVES[@]+"${ARCHIVES[@]}"}; do
+  [ -f "$archive" ] || die "--archive not found: $archive"
+  archive="$(cd -P "$(dirname "$archive")" && pwd)/$(basename "$archive")"
+  name="$(basename "$archive")"
+  case "$name" in
+    kin-macos-aarch64.tar.gz|kin-macos-x86_64.tar.gz|kin-linux-aarch64.tar.gz|kin-linux-x86_64.tar.gz) ;;
+    *) die "--archive must be a release-shaped kin-<os>-<arch>.tar.gz, got $name" ;;
+  esac
+  target="${name%.tar.gz}"
+  archive_sha="$(sha256_of "$archive")"
+  if [ "$target" = "kin-$HOST_TARGET" ]; then
+    # Read the stamps natively.
+    tmpx="$RUN_ROOT/dist/.x-$target"; rm -rf "$tmpx"; mkdir -p "$tmpx"
+    tar -xzf "$archive" -C "$tmpx" || die "could not extract $archive"
+    kin_line="$("$tmpx/$target/kin" --version 2>&1 | tail -1)"; daemon_line="$("$tmpx/$target/kin-daemon" --version 2>&1 | tail -1)"
+    rm -rf "$tmpx"
+    kin_sha="$(stamp_sha_of_line "$kin_line")"; daemon_sha="$(stamp_sha_of_line "$daemon_line")"
+    [ -n "$kin_sha" ] && [ -n "$daemon_sha" ] || die "$name: a --version line carries no full build sha ('$kin_line' / '$daemon_line')"
+    [ "$kin_sha" = "$daemon_sha" ] || die "STAMP MISMATCH in $name: kin names $kin_sha but kin-daemon names $daemon_sha"
+    expected_commit="${EXPECT_COMMIT:-$kin_sha}"
+    if [ -n "$EXPECT_COMMIT" ]; then commit_source=" (--expect-commit)"; else commit_source=" (the stamp both binaries carry)"; fi
+    lock_sha="$(resolve_lock_sha "$expected_commit" || true)"
+    LEG_NAMES+=("host ($HOST_TARGET, archive)"); LEG_KINDS+=(host); LEG_ARCHIVES+=("$archive")
+    LEG_COMMITS+=("$expected_commit"); LEG_LOCKS+=("$lock_sha"); LEG_PLATFORMS+=(""); LEG_TARGETS+=("$target")
+    PROVENANCE="$PROVENANCE
+  archive:      $archive (sha256 $archive_sha)
+                kin:        $kin_line
+                kin-daemon: $daemon_line
+  expected:     commit $expected_commit$commit_source; Cargo.lock sha256 ${lock_sha:-UNRESOLVED}"
+  else
+    case "$target" in
+      kin-linux-aarch64) platform="linux/arm64" ;;
+      kin-linux-x86_64) platform="linux/amd64" ;;
+      *) LINUX_SKIPPED="$LINUX_SKIPPED
+  $name: a $target archive cannot execute on this $HOST_TARGET host and has no container leg; skipped"; continue ;;
+    esac
+    if [ "$NO_LINUX" = 1 ]; then
+      LINUX_SKIPPED="$LINUX_SKIPPED
+  $name: --no-linux; skipped"; continue
+    fi
+    if ! ensure_linux_image "${platform#linux/}"; then
+      LINUX_SKIPPED="$LINUX_SKIPPED
+  $name: docker is unavailable or the leg image could not be built; the Linux leg was skipped (see $RUN_ROOT/image-build-*.log if present)"
+      continue
+    fi
+    case "$platform" in
+      linux/arm64) [ "$HOST_ARCH_NAME" = aarch64 ] || warn "$name runs under emulation on this $HOST_MACHINE host; it is slow and its timings mean nothing" ;;
+      linux/amd64) [ "$HOST_ARCH_NAME" = x86_64 ] || warn "$name runs under emulation on this $HOST_MACHINE host; it is slow and its timings mean nothing" ;;
+    esac
+    stamps="$(container_stamp "$archive" "$platform" || true)"
+    kin_line="${stamps%%|*}"; daemon_line="${stamps#*|}"
+    kin_sha="$(stamp_sha_of_line "$kin_line")"; daemon_sha="$(stamp_sha_of_line "$daemon_line")"
+    [ -n "$kin_sha" ] && [ -n "$daemon_sha" ] || die "$name: could not read both build stamps inside the container ('$kin_line' / '$daemon_line'); docker stderr: $(tail -3 "$RUN_ROOT/stamp-$name.err" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+    [ "$kin_sha" = "$daemon_sha" ] || die "STAMP MISMATCH in $name: kin names $kin_sha but kin-daemon names $daemon_sha"
+    expected_commit="${EXPECT_COMMIT:-$kin_sha}"
+    if [ -n "$EXPECT_COMMIT" ]; then commit_source=" (--expect-commit)"; else commit_source=" (the stamp both binaries carry)"; fi
+    lock_sha="$(resolve_lock_sha "$expected_commit" || true)"
+    LEG_NAMES+=("linux (${platform#linux/}, debian 12, archive)"); LEG_KINDS+=(linux); LEG_ARCHIVES+=("$archive")
+    LEG_COMMITS+=("$expected_commit"); LEG_LOCKS+=("$lock_sha"); LEG_PLATFORMS+=("$platform"); LEG_TARGETS+=("$target")
+    PROVENANCE="$PROVENANCE
+  archive:      $archive (sha256 $archive_sha)
+                kin:        $kin_line
+                kin-daemon: $daemon_line
+  expected:     commit $expected_commit$commit_source; Cargo.lock sha256 ${lock_sha:-UNRESOLVED}
+  container:    $(linux_image_for "${platform#linux/}") ($platform)"
+  fi
+done
+if [ -n "$BUILT_KIN" ] && [ "$NO_LINUX" != 1 ]; then
+  linux_from_archive=0
+  for kind in ${LEG_KINDS[@]+"${LEG_KINDS[@]}"}; do [ "$kind" = linux ] && linux_from_archive=1; done
+  if [ "$linux_from_archive" = 0 ]; then
+    LINUX_SKIPPED="$LINUX_SKIPPED
+  no Linux archive was given and this host cannot cross-build one, so the Linux leg (Debian 12 container + glibc floor) was skipped; pass --archive kin-linux-aarch64.tar.gz from a release or an RC build to run it"
+  fi
+fi
+[ "${#LEG_NAMES[@]}" -gt 0 ] || die "nothing to run: no leg could be formed from the inputs${LINUX_SKIPPED}"
+
+printf '\n-- bytes under judgment --%s\n' "$PROVENANCE"
+[ -z "$LINUX_SKIPPED" ] || printf -- '-- skipped --%s\n' "$LINUX_SKIPPED"
+printf -- '-- tooling --\n  %s\n  validate.mjs ported from install-proof.yml sha256 %s (gate: the ref carries the same sha)\n  hf cache: %s\n\n' \
+  "$TOOL_SRC" "$PORTED_SHA" "$HF_HOME_DIR"
+
+# Seed the embedding model from the operator's own Hugging Face cache when it is
+# already there, so a run does not spend the network on bytes this machine holds.
+# The proof exercises the embedder, not the download.
+if [ "${KIN_PREFLIGHT_SEED_HF:-1}" = 1 ]; then
+  seed_model="models--nomic-ai--nomic-embed-text-v1.5"
+  if [ ! -d "$HF_HOME_DIR/hub/$seed_model" ] && [ -d "$HOME/.cache/huggingface/hub/$seed_model" ]; then
+    say "seeding $seed_model into $HF_HOME_DIR from ~/.cache/huggingface"
+    mkdir -p "$HF_HOME_DIR/hub"
+    cp -R "$HOME/.cache/huggingface/hub/$seed_model" "$HF_HOME_DIR/hub/" 2>/dev/null || warn "seeding the model cache failed; the leg will download it"
+  fi
+fi
+
+# ------------------------------------------------------------------ the legs
+# GPU priming: everything above staged inputs without holding anything. The
+# locks are taken now, immediately before compute, and released by the trap.
+need_gpu=0
+for kind in "${LEG_KINDS[@]}"; do [ "$kind" = host ] && [ "$CPU_EMBED" != 1 ] && need_gpu=1; done
+acquire_lock daemon || exit 66
+if [ "$need_gpu" = 1 ]; then
+  acquire_lock gpu || { say "the host leg embeds on Metal and needs the gpu lock; --cpu-embed runs the same flow on the CPU without it"; exit 66; }
+fi
+[ "$CPU_EMBED" != 1 ] || say "host leg embeds on the CPU (--cpu-embed); no gpu lock taken and no Metal work runs"
+
+LEG_VERDICTS=(); LEG_FAILING=(); LEG_REPRO=(); LEG_RESULTS=(); LEG_GLIBC=(); LEG_WAIVED=()
+i=0
+while [ "$i" -lt "${#LEG_NAMES[@]}" ]; do
+  name="${LEG_NAMES[$i]}"; kind="${LEG_KINDS[$i]}"; archive="${LEG_ARCHIVES[$i]}"
+  commit="${LEG_COMMITS[$i]}"; lock_sha="${LEG_LOCKS[$i]}"; platform="${LEG_PLATFORMS[$i]}"; target="${LEG_TARGETS[$i]}"
+  case "$kind" in host) slug="host" ;; *) slug="linux-${platform#linux/}" ;; esac
+  [ "$i" -eq 0 ] || slug="$slug$((i + 1))"
+  leg_dir="$RUN_ROOT/legs/$slug"
+  mkdir -p "$leg_dir"
+  say "== leg $name =="
+  say "   archive $archive"
+  t0=$(date +%s)
+  if [ "$kind" = host ]; then
+    wrap=()
+    [ -z "$TIMEOUT_BIN" ] || wrap=("$TIMEOUT_BIN" -k 60 "$LEG_TIMEOUT")
+    lang=C.UTF-8; [ "$RUNNER_OS" != macOS ] || lang=en_US.UTF-8
+    shell=/bin/bash; [ "$SETUP_SHELL" != zsh ] || shell=/bin/zsh
+    repro_flag=1; [ "$NO_REPRO" != 1 ] || repro_flag=0
+    # A fresh environment: nothing from this shell reaches the flow except what
+    # a hosted runner would also have.
+    env -i \
+      PATH="$FLOW_PATH" USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-$(id -un)}" \
+      LANG="$lang" TERM="${TERM:-xterm}" SHELL="$shell" \
+      PF_ROOT="$leg_dir" PF_ARCHIVE="$archive" PF_TOOLS="$RUN_ROOT/tools" PF_LEG="$slug" \
+      PF_RUNNER_OS="$RUNNER_OS" PF_RUNNER_ARCH="$RUNNER_ARCH" PF_SETUP_SHELL="$SETUP_SHELL" \
+      PF_EXPECTED_COMMIT="$commit" PF_EXPECTED_LOCK_SHA="$lock_sha" PF_ALLOW_DIRTY="$ALLOW_DIRTY" \
+      PF_HF_HOME="$HF_HOME_DIR" PF_EMBED_SECONDS="$EMBED_SECONDS" \
+      PF_PYTHON="$PYTHON_BIN" \
+      PF_GLIBC_FLOOR=0 PF_MAGIC_REPRO="$repro_flag" PF_EMBED_BACKEND="$( [ "$CPU_EMBED" = 1 ] && printf cpu )" \
+      ${wrap[@]+"${wrap[@]}"} bash "$RUN_ROOT/tools/proof-flow.sh"
+    leg_rc=$?
+    result_json="$leg_dir/result.json"
+  else
+    cname="kin-preflight-$STAMP-$slug"
+    CONTAINERS="$CONTAINERS $cname"
+    case "$platform" in linux/arm64) c_arch=ARM64 ;; *) c_arch=X64 ;; esac
+    repro_flag=1; [ "$NO_REPRO" != 1 ] || repro_flag=0
+    # An emulated leg binds archive shape, install, and the glibc floor only.
+    # Under qemu the daemon starves its own enrichment (5s LSP timeouts fire on
+    # a ~10x slowdown: the same commit built 24 relations natively and 13
+    # emulated on 2026-08-20) and the repro suite's provenance guard can only
+    # ever see /usr/bin/qemu-x86_64 as the serving binary, so daemon-runtime
+    # judgments here are structurally unable to pass and are not attempted.
+    # release.yml's Public Install Proof on real runners is the binding
+    # daemon-runtime authority for the foreign arch, post-tag.
+    emulated=0
+    case "$platform" in
+      linux/arm64) [ "$HOST_ARCH_NAME" = aarch64 ] || emulated=1 ;;
+      linux/amd64) [ "$HOST_ARCH_NAME" = x86_64 ] || emulated=1 ;;
+    esac
+    if [ "$emulated" = 1 ]; then
+      repro_flag=0
+      say "   emulated leg: daemon-runtime steps are out of scope here (install + glibc floor bind; real-runner legs in release.yml carry the daemon-runtime proof)"
+    fi
+    # The archive is copied under the run root so the container sees it at a
+    # fixed path; the leg itself runs on the container's own filesystem and
+    # exports its logs, captures and result back to /rig/legs/<slug>.
+    cp "$archive" "$RUN_ROOT/dist/$target.tar.gz" 2>/dev/null || true
+    bounded "$LEG_TIMEOUT" docker run --rm --name "$cname" --platform "$platform" \
+      -v "$RUN_ROOT:/rig" -v "$HF_HOME_DIR:/rig-hf" \
+      -e PF_ROOT=/home/dev/preflight -e PF_ARCHIVE="/rig/dist/$target.tar.gz" -e PF_TOOLS=/rig/tools \
+      -e PF_LEG="$slug" -e PF_RUNNER_OS=Linux -e PF_RUNNER_ARCH="$c_arch" -e PF_SETUP_SHELL=bash \
+      -e PF_EXPECTED_COMMIT="$commit" -e PF_EXPECTED_LOCK_SHA="$lock_sha" -e PF_ALLOW_DIRTY="$ALLOW_DIRTY" \
+      -e PF_HF_HOME=/rig-hf -e PF_EMBED_SECONDS="$EMBED_SECONDS" -e PF_GLIBC_FLOOR=1 \
+      -e PF_MAGIC_REPRO="$repro_flag" -e PF_EMULATED="$emulated" \
+      -e PF_EXPORT_DIR="/rig/legs/$slug" \
+      -e HOME=/home/dev -e USER=dev -e LOGNAME=dev -e LANG=C.UTF-8 -e TERM=xterm -e SHELL=/bin/bash \
+      "$(linux_image_for "${platform#linux/}")" bash /rig/tools/proof-flow.sh
+    leg_rc=$?
+    CONTAINERS="$(printf '%s' "$CONTAINERS" | sed "s| $cname||")"
+    result_json="$leg_dir/result.json"
+  fi
+  t1=$(date +%s)
+  say "   leg exit $leg_rc in $((t1 - t0))s"
+  # Read the verdict off the result the leg wrote, never off its exit alone: a
+  # leg that died before writing one is UNREADABLE, not PASS.
+  if [ -f "$result_json" ]; then
+    verdict="$(node -e 'const r=require(process.argv[1]);process.stdout.write(r.verdict||"UNREADABLE")' "$result_json")"
+    failing="$(node -e 'const r=require(process.argv[1]);const f=r.failing||[];const u=r.unreadable||[];process.stdout.write(f.length?f.map(x=>`${x.kind} ${x.name}: ${x.message}`).join("\n"):(u.length?u.map(x=>`${x.kind} ${x.name}: ${x.message}`).join("\n"):""))' "$result_json")"
+    repro="$(node -e 'const r=require(process.argv[1]);const m=r.magic_repro;process.stdout.write(m?`${m.verdict} (${m.counts.PASS} pass, ${m.counts.FAIL} fail, ${m.counts.UNREADABLE} unreadable of ${m.total}${m.note?`; ${m.note}`:""}${m.checks.filter(c=>c.status!=="PASS").map(c=>`; ${c.id}/${c.ticket} ${c.status}: ${c.detail}`).join("")})`:"not run")' "$result_json")"
+    glibc="$(node -e 'const r=require(process.argv[1]);const g=r.glibc_floor;process.stdout.write(g?`${g.status}: ${g.detail}`:"")' "$result_json")"
+    waived="$(node -e 'const r=require(process.argv[1]);process.stdout.write((r.waived||[]).map(x=>`${x.name}: ${x.message}`).join("\n"))' "$result_json")"
+  else
+    verdict="UNREADABLE"; failing="the leg wrote no result.json (exit $leg_rc); see $LOG and $leg_dir/logs"; repro="not run"; glibc=""; waived=""
+  fi
+  LEG_VERDICTS+=("$verdict"); LEG_FAILING+=("$failing"); LEG_REPRO+=("$repro"); LEG_RESULTS+=("$result_json"); LEG_GLIBC+=("$glibc"); LEG_WAIVED+=("$waived")
+  i=$((i + 1))
+done
+release_locks
+
+# ---------------------------------------------------------------- the verdict
+overall=PASS
+i=0
+while [ "$i" -lt "${#LEG_NAMES[@]}" ]; do
+  case "${LEG_VERDICTS[$i]}" in FAIL) overall=FAIL ;; UNREADABLE) [ "$overall" = FAIL ] || overall=UNREADABLE ;; esac
+  case "${LEG_REPRO[$i]}" in FAIL*) overall=FAIL ;; UNREADABLE*) [ "$overall" = FAIL ] || overall=UNREADABLE ;; esac
+  i=$((i + 1))
+done
+printf '\n'
+printf '================================================================================\n'
+printf '  kin-release-preflight VERDICT  (DEV-LOCAL, NON-CITABLE)  run %s\n' "$STAMP"
+printf '================================================================================\n'
+i=0
+while [ "$i" -lt "${#LEG_NAMES[@]}" ]; do
+  printf '  leg %-42s %s\n' "${LEG_NAMES[$i]}" "${LEG_VERDICTS[$i]}"
+  if [ -n "${LEG_FAILING[$i]}" ]; then
+    printf '%s\n' "${LEG_FAILING[$i]}" | while IFS= read -r line; do printf '      %s\n' "$line"; done
+  fi
+  [ -z "${LEG_GLIBC[$i]}" ] || printf '      glibc floor: %s\n' "${LEG_GLIBC[$i]}"
+  if [ -n "${LEG_WAIVED[$i]}" ]; then
+    printf '%s\n' "${LEG_WAIVED[$i]}" | while IFS= read -r line; do printf '      waived: %s\n' "$line"; done
+  fi
+  printf '      magic-repro: %s\n' "${LEG_REPRO[$i]}"
+  printf '      result: %s\n' "${LEG_RESULTS[$i]}"
+  i=$((i + 1))
+done
+[ -z "$LINUX_SKIPPED" ] || printf '  skipped:%s\n' "$LINUX_SKIPPED"
+[ "$CPU_EMBED" != 1 ] || printf '  note: host leg embedded on the CPU (--cpu-embed); the macOS Metal path did not run\n'
+printf '  FINAL: %s  (NON-CITABLE)  report %s  log %s\n' "$overall" "$REPORT" "$LOG"
+printf '================================================================================\n'
+
+# ------------------------------------------------------------------ the report
+LEG_INDEX_JSON="$RUN_ROOT/legs.tsv"
+: > "$LEG_INDEX_JSON"
+i=0
+while [ "$i" -lt "${#LEG_NAMES[@]}" ]; do
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${LEG_NAMES[$i]}" "${LEG_KINDS[$i]}" "${LEG_TARGETS[$i]}" "${LEG_ARCHIVES[$i]}" "${LEG_VERDICTS[$i]}" "${LEG_RESULTS[$i]}" "${LEG_REPRO[$i]}" >> "$LEG_INDEX_JSON"
+  i=$((i + 1))
+done
+STAMP="$STAMP" OVERALL="$overall" RUN_ROOT="$RUN_ROOT" LOG="$LOG" LEGS_TSV="$LEG_INDEX_JSON" \
+PROVENANCE="$PROVENANCE" SKIPPED="$LINUX_SKIPPED" TOOL_SRC="$TOOL_SRC" PORTED_SHA="$PORTED_SHA" WORKFLOW_SHA="$WORKFLOW_SHA" \
+LANE="$LANE" HOST="$(uname -srm)" ALLOW_DIRTY="$ALLOW_DIRTY" CPU_EMBED="$CPU_EMBED" \
+node - > "$REPORT" <<'NODE'
+const fs = require("fs");
+const legs = fs.readFileSync(process.env.LEGS_TSV, "utf8").split("\n").filter(Boolean).map((line) => {
+  const [name, kind, target, archive, verdict, result, repro] = line.split("\t");
+  let detail = null;
+  try { detail = JSON.parse(fs.readFileSync(result, "utf8")); } catch { detail = null; }
+  return { name, kind, target, archive, verdict, magic_repro: repro, result_path: result, result: detail };
+});
+process.stdout.write(`${JSON.stringify({
+  schema: "kin.release-preflight.v1",
+  citable: false,
+  lane: "DEV-LOCAL",
+  run: process.env.STAMP,
+  host: process.env.HOST,
+  lock_lane: process.env.LANE,
+  verdict: process.env.OVERALL,
+  allow_dirty: process.env.ALLOW_DIRTY === "1",
+  cpu_embed: process.env.CPU_EMBED === "1",
+  tooling: { source: process.env.TOOL_SRC, validator_ported_from_sha256: process.env.PORTED_SHA, workflow_sha256_at_ref: process.env.WORKFLOW_SHA || null },
+  provenance: process.env.PROVENANCE.split("\n").map((l) => l.trim()).filter(Boolean),
+  skipped: process.env.SKIPPED.split("\n").map((l) => l.trim()).filter(Boolean),
+  legs,
+  run_root: process.env.RUN_ROOT,
+  log: process.env.LOG,
+}, null, 2)}\n`);
+NODE
+mkdir -p "$DURABLE" && cp "$REPORT" "$LOG" "$DURABLE/" 2>/dev/null && say "report and log copied to $DURABLE"
+
+# ------------------------------------------------------- publish the evidence
+# The release train's gate reads evidence/<candidate-sha>/preflight.json off
+# kin's release-evidence branch. Nothing wrote that record before this, because
+# this report has only ever landed in the operator's local .kin-coord, which no
+# Actions job can see. That gap is how v0.5.44 shipped itself with no captain
+# and no proof evidence.
+#
+# The candidate sha is read back out of the report just written rather than
+# derived a second way. The gate requires every leg to name the same commit, so
+# reading the same field the gate reads means a record that publishes is a
+# record the gate can accept, and legs that disagree stop the publish here
+# instead of surfacing later as a release nobody can explain.
+#
+# Never fatal to the verdict. This runs after the verdict is decided and cannot
+# change it. A passed run that failed to publish is a passed run whose record
+# can be posted again; a run failed by its own bookkeeping would teach
+# operators to skip the bookkeeping.
+if [ "$overall" = PASS ] && [ "${KIN_PREFLIGHT_NO_PUBLISH:-0}" != 1 ]; then
+  candidate="$(node -e '
+    const report = require(process.argv[1]);
+    const legs = Array.isArray(report.legs) ? report.legs : [];
+    const commits = [...new Set(legs
+      .map((leg) => leg && leg.result && leg.result.expected && leg.result.expected.commit)
+      .filter(Boolean))];
+    if (commits.length === 1 && /^[0-9a-f]{40}$/.test(commits[0])) {
+      process.stdout.write(commits[0]);
+    }
+  ' "$REPORT" 2>/dev/null || true)"
+  if [ -z "$candidate" ]; then
+    warn "NOT PUBLISHED: the report names no single 40-character candidate commit across its legs, so there is no sha to record it under. The verdict above stands."
+  else
+    publish_record "$candidate" "$REPORT"
+  fi
+fi
+
+if [ "$KEEP" != 1 ]; then
+  # Keep logs, captures, results and the dist; drop the installed trees, HOMEs,
+  # probe repositories and repro fixtures, which are the bulk.
+  i=0
+  while [ "$i" -lt "${#LEG_NAMES[@]}" ]; do
+    leg_dir="$(dirname "${LEG_RESULTS[$i]}")"
+    for heavy in home archive stub w repro temp; do
+      [ -e "$leg_dir/$heavy" ] && rm -rf "$leg_dir/$heavy"
+    done
+    i=$((i + 1))
+  done
+fi
+
+case "$overall" in PASS) exit 0 ;; FAIL) exit 1 ;; *) exit 2 ;; esac

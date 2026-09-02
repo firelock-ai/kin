@@ -411,8 +411,20 @@ fn validate_base_authority_preflight(
                  its exact authority lease"
             )
         })?;
+    // A persisted receipt names its operation record rather than repeating it
+    // (kin-db 0.7.89, FIR-3064), so it is validated against the log entry it
+    // names rather than against an embedded copy of it. That is the same set of
+    // comparisons `RepositoryCommitReceipt::validate` made.
+    let operation = lease
+        .metadata()
+        .operation_log
+        .iter()
+        .find(|operation| operation.operation_id == receipt.operation_id)
+        .ok_or_else(|| {
+            anyhow!("session base names an operation this repository's log does not hold")
+        })?;
     receipt
-        .validate()
+        .validate_against(operation)
         .context("validate exact session recovery receipt")?;
     if receipt.repository_id != base.repository_id
         || receipt.roots_before != base.authority_roots
