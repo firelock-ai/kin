@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-// Merge the per-archive preflight leg records rc-build.yml uploads into the one
-// preflight.json the mint reads.
+// Merge the per-archive preflight leg records release-cut.yml's preflight job
+// uploads into the one preflight.json the mint reads.
 //
 // The local preflight judges every archive in one run and writes one record.
 // Hosted, each archive is judged on the runner that can execute it (macOS for

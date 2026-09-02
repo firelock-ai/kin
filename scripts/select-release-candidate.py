@@ -20,8 +20,8 @@ the decision rests on and answers one of four things:
               complete green sha exists yet
   arm         move release/v<version>-candidate to the chosen sha and dispatch
               rc-build.yml there
-  proof       an rc-build for the current candidate succeeded and carries the
-              preflight leg records; merge and publish them
+  proof       an rc-build for the current candidate succeeded and still holds
+              the candidate archives; preflight them and publish the record
   stranger    preflight.json is filed for the candidate and stranger.env is the
               only missing half; run the three-arm stranger on the same archive
   refuse      no reviewed main commit carrying the version qualifies, named sha
@@ -78,11 +78,20 @@ CI_WORKFLOW_NAME = "CI"
 ACCEPTANCE_WORKFLOW = ".github/workflows/acceptance.yml"
 RC_BUILD_WORKFLOW = ".github/workflows/rc-build.yml"
 RC_BUILD_WORKFLOW_NAME = "RC Build"
-# The artifacts rc-build.yml's preflight job uploads, one leg record per
-# archive. A run missing one of them proved less than a record built from it
-# would claim, so it is not usable evidence.
-PREFLIGHT_ARTIFACT_PREFIX = "kin-release-preflight-"
-PREFLIGHT_ARTIFACTS = ("kin-linux-aarch64", "kin-linux-x86_64", "kin-macos-aarch64")
+# The artifacts rc-build.yml's build matrix uploads, one archive per row, named
+# by `matrix.artifact` alone. These are the bytes release-cut.yml's preflight
+# job downloads by that same name, so a run missing one of them cannot feed the
+# leg that judges it and is not usable evidence.
+#
+# These names were once written with a `kin-release-preflight-` prefix, which is
+# what release-cut.yml's own preflight job calls the LEG RECORDS it uploads into
+# its own run. No rc-build run has ever carried a name of that shape, so no
+# rc-build could ever be usable, the decision never reached `proof`, and the
+# preflight job that would have produced those records is gated on that very
+# decision. The loop armed a fresh build every cycle and burned the candidate at
+# RC_BUILD_ATTEMPT_LIMIT. A selector reads the run it is judging for what that
+# run produces, never for what a later consumer of it produces.
+RC_BUILD_ARTIFACTS = ("kin-linux-aarch64", "kin-linux-x86_64", "kin-macos-aarch64")
 # One rebuild is a flake allowance. A second failure on the same sha is a
 # verdict about the sha, and the next landing supplies a new one.
 RC_BUILD_ATTEMPT_LIMIT = 2
@@ -433,9 +442,9 @@ def read_branch(fetch: Fetch, repository: str, branch: str) -> str | None:
 def read_rc_builds(fetch: Fetch, repository: str, branch: str) -> list[dict[str, Any]]:
     """Every rc-build dispatch on the candidate branch, newest first.
 
-    A completed successful run also carries the names of its artifacts, which
-    is how a run from before the preflight job existed is told apart from one
-    whose leg records can be published.
+    A completed successful run also carries the names of its unexpired
+    artifacts, which is how a run still holding the candidate archives is told
+    apart from one whose archives have aged out of the artifact store.
     """
 
     runs = read_listing(
@@ -816,14 +825,14 @@ def judge(snapshot: dict[str, Any], grade: Grader) -> Decision:
             if usable:
                 return Decision(
                     PROOF,
-                    f"rc-build {usable[0]['id']} succeeded for {candidate} with the preflight leg records",
+                    f"rc-build {usable[0]['id']} succeeded for {candidate} and still holds its archives",
                     version,
                     branch,
                     candidate=candidate,
                     rc_run=usable[0]["id"],
                     details={"stranger_command": stranger_command(version, candidate, usable[0]["id"])},
                 )
-            spent = [f"{build['id']} ({build.get('conclusion') or 'no preflight legs'})" for build in builds]
+            spent = [f"{build['id']} ({build.get('conclusion') or 'no conclusion'})" for build in builds]
             if len(spent) >= RC_BUILD_ATTEMPT_LIMIT:
                 dead[candidate] = [f"rc-build attempts exhausted: {', '.join(spent)}"]
                 notes.append(f"current candidate {candidate} died: {dead[candidate][0]}")
@@ -898,10 +907,18 @@ def judge(snapshot: dict[str, Any], grade: Grader) -> Decision:
 
 
 def _usable(build: dict[str, Any]) -> bool:
+    """A completed rc-build still holding every candidate archive it built.
+
+    `artifacts` is filtered to unexpired names when the run is read, so a run
+    whose archives aged out reads as missing them and is refused rather than
+    reused: the stranger has to run on the very bytes a published preflight
+    record names, and a rebuild is not guaranteed to reproduce that sha256.
+    """
+
     if build.get("status") != "completed" or build.get("conclusion") != "success":
         return False
     names = set(build.get("artifacts") or [])
-    return all(f"{PREFLIGHT_ARTIFACT_PREFIX}{artifact}" in names for artifact in PREFLIGHT_ARTIFACTS)
+    return all(artifact in names for artifact in RC_BUILD_ARTIFACTS)
 
 
 def _newest_usable_run(rc_builds: list[dict[str, Any]], sha: str) -> int | None:
