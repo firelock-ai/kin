@@ -1517,6 +1517,38 @@ enum GraphAction {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Export the drawable projection of the live graph as JSON
+    Export {
+        /// Cap the exported node count, sampled by degree with per-module
+        /// quotas. 0 exports every entity; omitted uses the default cap
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Keep only these entity kinds (comma-separated, e.g. function,class)
+        #[arg(long, value_name = "KINDS")]
+        kinds: Option<String>,
+        /// Keep only entities whose file starts with this repository path prefix
+        #[arg(long, value_name = "PREFIX")]
+        path: Option<String>,
+        /// Attach optional node fields (comma-separated: signature,line)
+        #[arg(long, value_name = "FIELDS")]
+        include: Option<String>,
+        /// Write the payload to this file instead of stdout
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Follow live graph changes, one event per line
+    Watch {
+        /// Keep only these event types (comma-separated, e.g.
+        /// EntityChanged,RelationChanged)
+        #[arg(long, value_name = "TYPES")]
+        types: Option<String>,
+        /// Output machine-readable NDJSON, one event object per line
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Serve an interactive force-directed visualization of the semantic graph
     Viz {
         /// Port to bind the local HTTP server to
@@ -3581,6 +3613,31 @@ fn main() -> Result<()> {
                         commands::graph::source(entity, json).await
                     }
                     GraphAction::Body { entity, json } => commands::graph::body(entity, json).await,
+                    GraphAction::Export {
+                        limit,
+                        kinds,
+                        path,
+                        include,
+                        out,
+                        json,
+                    } => {
+                        commands::graph_export::export(commands::graph_export::ExportArgs {
+                            limit,
+                            kinds,
+                            path,
+                            include,
+                            out,
+                            json,
+                        })
+                        .await
+                    }
+                    GraphAction::Watch { types, json } => {
+                        commands::graph_export::watch(commands::graph_export::WatchArgs {
+                            types,
+                            json,
+                        })
+                        .await
+                    }
                     GraphAction::Viz { port, open } => commands::graph_viz::run(port, open).await,
                 },
                 Command::Git { action } => match action {

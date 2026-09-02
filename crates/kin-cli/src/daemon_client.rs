@@ -1437,6 +1437,58 @@ impl DaemonClient {
             .context("parse daemon graph command response")
     }
 
+    /// `GET /graph/export`: the drawable projection of the live graph.
+    ///
+    /// A GET with query parameters rather than a `GraphCommandRequest`, because
+    /// the graph command family answers in `lines` for a terminal and this
+    /// answers in a payload for a renderer. Routing it through the same client
+    /// keeps daemon discovery, the bearer token and the build-match check
+    /// identical to every other graph command.
+    pub async fn graph_export(
+        &self,
+        query: &str,
+    ) -> Result<crate::commands::graph_export::GraphExportPayload> {
+        let url = if query.is_empty() {
+            format!("{}/graph/export", self.base_url)
+        } else {
+            format!("{}/graph/export?{query}", self.base_url)
+        };
+        let resp = self.send(self.client.get(&url), "graph export").await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("graph export", resp).await);
+        }
+        resp.json().await.context("parse graph export response")
+    }
+
+    /// `GET /graph/events`: the live delta stream, as a still-open response.
+    ///
+    /// Returns the response rather than a parsed body because the body never
+    /// ends: the caller reads frames off it until it decides to stop.
+    pub async fn graph_events(&self, query: &str) -> Result<reqwest::Response> {
+        let url = if query.is_empty() {
+            format!("{}/graph/events", self.base_url)
+        } else {
+            format!("{}/graph/events?{query}", self.base_url)
+        };
+        let resp = self
+            .send(
+                self.client
+                    .get(&url)
+                    // The stream stays open until the caller closes it, so the
+                    // client's ordinary request timeout would end it on a quiet
+                    // graph and read as a daemon failure. A year is not a limit
+                    // anyone reaches; it is the absence of one, spelled.
+                    .timeout(std::time::Duration::from_secs(60 * 60 * 24 * 365))
+                    .header(reqwest::header::ACCEPT, "text/event-stream"),
+                "graph events",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("graph events", resp).await);
+        }
+        Ok(resp)
+    }
+
     pub async fn overview(
         &self,
         request: &crate::commands::overview::OverviewRequest,
@@ -7671,7 +7723,7 @@ async fn resolve_daemon_url_inner(
 }
 
 /// Simple percent-encoding for query parameters.
-mod urlencoding {
+pub(crate) mod urlencoding {
     pub fn encode(s: &str) -> String {
         let mut result = String::with_capacity(s.len());
         for byte in s.bytes() {
