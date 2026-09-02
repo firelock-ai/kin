@@ -71,6 +71,41 @@ UNREADABLE = "UNREADABLE"
 # a default that moves would otherwise quietly re-point this whole suite.
 AGENT_DEFAULT_PROFILE = "agent-default"
 
+# The query profile and the exact names it serves, read out of
+# crates/kin-mcp/src/tools.rs::agent_query_tool_names on 2026-09-02. Written out
+# rather than derived: the served set is a public surface, and a check that
+# derived it from the binary under test would agree with any surface that
+# binary happened to serve.
+AGENT_QUERY_PROFILE = "agent-query"
+AGENT_QUERY_NAMES = (
+    "find_references",
+    "get_context_pack",
+    "get_entity_source",
+    "graph_neighborhood",
+    "impact_analysis",
+    "kin_artifact_list",
+    "kin_artifact_read",
+    "kin_graph_status",
+    "kin_provenance_query",
+    "list_file_entities",
+    "semantic_locate",
+    "semantic_search",
+    "trace_data_flow",
+    "trace_path",
+)
+
+# The share of agent-default's tools/list the query profile may cost.
+#
+# Native tool calling re-sends the whole tools array on every turn, so this is a
+# per-turn cost. Measured on 2026-09-02 by the demo's MCP executor against a
+# real `kin mcp start`: agent-default's tools/list was 30,194 bytes and 8,627
+# tokens on google/gemma-4-e4b, 36 percent of that run's 24,000-token ceiling
+# before the model had asked anything (FIR-3107). The assertion is in BYTES,
+# because bytes are what this process can measure; the demo measured 3.5 bytes
+# per token on that model, so the ratio held here is the ratio of the token cost
+# on it too.
+AGENT_QUERY_LIST_CEILING_PERCENT = 65
+
 # The tool names the two shipped proofs assert literally. Read out of
 # .github/workflows/install-proof.yml and scripts/prove-windows-npm-first-run.mjs
 # on 2026-09-02; both assert this one name and no other. Adding a name to either
@@ -175,6 +210,46 @@ def grade_served_names_are_registered(listing, registry):
             "agent-default serves %s under a name the registry does not carry" % unregistered
         ]
     return []
+
+
+def grade_query_profile(query, default):
+    """The query profile serves its exact set, no write tool, and far fewer bytes."""
+    tools = query.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return ["the agent-query profile listed no tools"]
+    served = sorted(name for name in (tool.get("name") for tool in tools) if name)
+    problems = []
+    if served != sorted(AGENT_QUERY_NAMES):
+        problems.append(
+            "agent-query serves %s, not the set this suite grades (%s)"
+            % (served, sorted(AGENT_QUERY_NAMES))
+        )
+    write_side = [
+        name
+        for name in served
+        if name.startswith("kin_session_") or name.startswith("kin_transaction_")
+    ]
+    if write_side:
+        problems.append("agent-query serves the write tools %s" % write_side)
+
+    baseline = default.get("tools")
+    if not isinstance(baseline, list) or not baseline:
+        problems.append("agent-default listed no tools, so there is nothing to measure against")
+        return problems
+    query_bytes = len(json.dumps(query, sort_keys=True))
+    default_bytes = len(json.dumps(default, sort_keys=True))
+    if query_bytes * 100 > default_bytes * AGENT_QUERY_LIST_CEILING_PERCENT:
+        problems.append(
+            "agent-query's tools/list is %d bytes against agent-default's %d (%d%%), over "
+            "the %d%% ceiling the profile exists to buy"
+            % (
+                query_bytes,
+                default_bytes,
+                query_bytes * 100 // max(default_bytes, 1),
+                AGENT_QUERY_LIST_CEILING_PERCENT,
+            )
+        )
+    return problems
 
 
 def grade_search_call(payload):
@@ -518,10 +593,38 @@ def run_checks(suite, verbose=False):
     )
 
     try:
+        query, _, query_stderr = suite.serve(AGENT_QUERY_PROFILE, [])
+    except McpError as error:
+        query, query_stderr, query_error = None, "", error
+    if query is None:
+        res = Result(*[entry for entry in CHECK_TITLES if entry[0] == "7"][0])
+        res.unknown(
+            "the agent-query profile was unreadable, so its surface is unknown: %s" % query_error
+        )
+        results.append(res)
+    else:
+        record(
+            "7", "FIR-3107", "the query profile serves its exact set and costs far fewer bytes",
+            grade_query_profile(query, served),
+            "agent-query served %d tools in %d bytes against agent-default's %d in %d"
+            % (
+                len(query.get("tools") or []),
+                len(json.dumps(query, sort_keys=True)),
+                len(served.get("tools") or []),
+                len(json.dumps(served, sort_keys=True)),
+            ),
+        )
+        if AGENT_QUERY_PROFILE not in (query_stderr or ""):
+            results[-1].unknown(
+                "the server printed no notice naming %r, so which surface was measured is "
+                "unknown" % AGENT_QUERY_PROFILE
+            )
+
+    try:
         registry, _, _ = suite.serve("full", [])
     except McpError as error:
         registry = None
-        for ident, source, title in CHECK_TITLES[5:]:
+        for ident, source, title in [entry for entry in CHECK_TITLES if entry[0] in ("5", "6")]:
             res = Result(ident, source, title)
             res.unknown("the full profile was unreadable, so the registry is unknown: %s" % error)
             results.append(res)
@@ -557,6 +660,7 @@ CHECK_TITLES = [
     ("4", "magic:14", "the kin_graph_status description names the as-of-earlier shape"),
     ("5", "response_budget:2", "every advertised budget is one a client accepts"),
     ("6", "the general form", "no name is served that the registry does not carry"),
+    ("7", "FIR-3107", "the query profile serves its exact set and costs far fewer bytes"),
 ]
 
 
@@ -638,6 +742,34 @@ def self_test():
     expect("call on a good result",
            grade_search_call({"result": {"content": [{"text": "hello in probe.py"}]}}), False)
 
+    def profile_listing(names, padding=0):
+        return {
+            "tools": [
+                {
+                    "name": name,
+                    "description": "d" * (40 + padding),
+                    "inputSchema": {"properties": {"query": {}}},
+                }
+                for name in names
+            ]
+        }
+
+    default_listing = profile_listing(
+        list(AGENT_QUERY_NAMES)
+        + [
+            "kin_session_start",
+            "kin_session_heartbeat",
+            "kin_session_end",
+            "kin_transaction_begin",
+            "kin_transaction_stage",
+            "kin_transaction_commit",
+            "kin_transaction_abort",
+        ],
+        padding=400,
+    )
+    expect("query profile on a good pair",
+           grade_query_profile(profile_listing(AGENT_QUERY_NAMES), default_listing), False)
+
     # And one break per grader.
     expect("control on the full profile",
            grade_profile_notice("Kin MCP: serving the 'full' tool profile (66 tools) from --tool-profile."),
@@ -676,11 +808,28 @@ def self_test():
            grade_search_call({"result": {"content": [{"text": "nothing here"}]}}), True)
     expect("call on no frame at all", grade_search_call(None), True)
 
+    moved = profile_listing(AGENT_QUERY_NAMES)
+    moved["tools"][0]["name"] = "find_declarations"
+    expect("query profile when a served name moved",
+           grade_query_profile(moved, default_listing), True)
+
+    writeful = profile_listing(list(AGENT_QUERY_NAMES) + ["kin_transaction_commit"])
+    expect("query profile when a write tool joined it",
+           grade_query_profile(writeful, default_listing), True)
+
+    # The whole point of the profile, and the break that would make it
+    # pointless: a query listing that costs what the default costs.
+    expect("query profile when it saves nothing",
+           grade_query_profile(profile_listing(AGENT_QUERY_NAMES, padding=400), default_listing),
+           True)
+
     # An empty listing must never read as a clean surface.
     expect("names on an empty listing", grade_proof_asserted_names({"tools": []}), True)
     expect("knob on an empty listing", grade_trace_shape_knob({"tools": []}), True)
     expect("description on an empty listing", grade_graph_status_description({"tools": []}), True)
     expect("budgets on an empty listing", grade_advertised_budgets({"tools": []}, registry), True)
+    expect("query profile on an empty listing",
+           grade_query_profile({"tools": []}, default_listing), True)
 
     for problem in problems:
         print("SELF-TEST FAIL %s" % problem)

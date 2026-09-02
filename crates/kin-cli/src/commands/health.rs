@@ -2574,6 +2574,18 @@ fn evaluate_mcp_client_against(
                         path.display()
                     ),
                 ),
+                // `kin setup` writes `agent-default`, and an operator who
+                // narrowed the entry to the query half of that same belt
+                // made a supported choice rather than a mistake. Reporting it
+                // as misconfigured would tell someone who deliberately dropped
+                // the transaction contracts from every prompt to put them back.
+                Some("agent-query") => (
+                    HealthStatus::Healthy,
+                    format!(
+                        "{servers_key}.kin present with the query-only agent-query profile ({})",
+                        path.display()
+                    ),
+                ),
                 // An entry that names no profile is served the curated
                 // agent-default surface by `kin mcp start` itself, so it is
                 // correctly wired even though `kin setup` would have stated it.
@@ -2590,7 +2602,7 @@ fn evaluate_mcp_client_against(
                 Some(other) => (
                     HealthStatus::Misconfigured,
                     format!(
-                        "{servers_key}.kin present but KIN_MCP_TOOL_PROFILE is {other} (expected agent-default, or unset to take it as the default) in {}",
+                        "{servers_key}.kin present but KIN_MCP_TOOL_PROFILE is {other} (expected agent-default, agent-query, or unset to take agent-default as the default) in {}",
                         path.display()
                     ),
                 ),
@@ -10124,6 +10136,40 @@ mod tests {
         assert!(
             detail.contains("defaults to the agent-default profile"),
             "the reader must be told which surface an unset profile resolves to: {detail}"
+        );
+    }
+
+    /// The query-only surface is a supported choice, not a fault.
+    ///
+    /// `kin setup` writes `agent-default`, and an operator who narrowed the
+    /// entry to the same belt without its session and transaction tools stopped
+    /// paying for contracts a query-only client never calls (FIR-3107). Doctor
+    /// telling them to put those back would be doctor arguing with a product
+    /// decision.
+    #[test]
+    fn mcp_config_on_the_query_profile_is_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": "kin",
+                        "args": ["mcp", "start"],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-query" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client_against(&path, "claude", "kin");
+        assert!(matches!(status, HealthStatus::Healthy), "detail: {detail}");
+        assert!(
+            detail.contains("agent-query"),
+            "the reader must be told which surface is wired: {detail}"
         );
     }
 

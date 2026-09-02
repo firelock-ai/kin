@@ -395,6 +395,51 @@ pub fn annotate_unserved_cross_references(
     }
 }
 
+/// The tool listing one profile serves, exactly as a client receives it.
+///
+/// `allowed` is the profile's name set, or `None` for the unfiltered surface;
+/// `agent_belt` is whether the short descriptions and trimmed schemas apply.
+///
+/// One function rather than a body inside the stdio handler, because the size of
+/// this listing is now a number checks assert. A test that rebuilt the listing
+/// by restating the filter, the annotation and the compaction would be measuring
+/// its own restatement, and would keep reporting a saving after the server had
+/// stopped producing one.
+pub fn served_tools_list(
+    allowed: Option<&std::collections::HashSet<String>>,
+    agent_belt: bool,
+) -> ToolsListResult {
+    let mut tools = tool_definitions();
+    if let Some(allowed) = allowed {
+        // Captured before the filter, because the annotation below has to tell a
+        // registered tool this profile withholds from a phrase that is simply
+        // prose. After the retain, the withheld ones are gone and that
+        // distinction is unrecoverable.
+        let registered: Vec<String> = tools.tools.iter().map(|tool| tool.name.clone()).collect();
+        tools.tools.retain(|tool| allowed.contains(&tool.name));
+        // A served description that sends the reader to a tool this profile does
+        // not serve is a surface contradicting itself, and it is not rare: the
+        // default profile has five of them naming seven withheld tools
+        // (FIR-3031). Answered here rather than in any description, because this
+        // is the one place the served set is known.
+        annotate_unserved_cross_references(&mut tools, &registered, allowed);
+    }
+    // After the filter and the annotation, so the short forms are the last word
+    // and cannot be re-lengthened by a note computed from the long ones. The
+    // annotation is a no-op on the default profile anyway, because a short form
+    // names only tools that profile serves, but the ORDER is what guarantees
+    // that rather than the current wording.
+    if agent_belt {
+        crate::agent_belt::compact_for_agent_default(&mut tools);
+    }
+    tools
+}
+
+/// The name set for one profile, in the shape [`served_tools_list`] takes.
+pub fn name_set(names: &[&str]) -> std::collections::HashSet<String> {
+    names.iter().map(|name| (*name).to_string()).collect()
+}
+
 /// Build the list of all MCP tools that Kin exposes, in name order.
 ///
 /// The order is part of the contract. A client caches the prompt it builds from
@@ -1617,6 +1662,56 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
     ]
 }
 
+/// Tool names for the query half of the agent belt.
+///
+/// [`agent_default_tool_names`] minus the session and transaction tools. Same
+/// tools, same served names, same short descriptions and trimmed schemas: this
+/// is that profile with its write half removed, not a second belt to keep in
+/// step with it.
+///
+/// Native tool calling re-sends the whole `tools` array on every turn, so the
+/// served list is a per-turn cost rather than a per-session one. Measured on
+/// 2026-09-02 by the demo's MCP executor against a real `kin mcp start` on
+/// `agent-default`: `tools/list` was 30,194 bytes and 8,627 tokens on
+/// google/gemma-4-e4b, 36 percent of that run's 24,000-token ceiling before the
+/// model had asked anything, and the run bought two tool calls. Across six runs
+/// the model called `semantic_locate`, `trace_data_flow` and
+/// `graph_neighborhood` and never once reached for a session or a transaction
+/// tool, while `kin_transaction_stage` and `kin_transaction_commit` alone were
+/// 11,245 of those bytes (FIR-3107).
+///
+/// So a client that only queries should not carry the write contracts in every
+/// prompt. This is that surface, and
+/// `the_query_profile_costs_far_fewer_bytes_than_agent_default` holds the saving
+/// on the served schemas a client actually receives.
+///
+/// A second served list, not a mode. `agent-default` is unchanged and still
+/// serves every write tool, and nothing here makes Kin itself read-only.
+///
+/// `get_entity_source` stays. It joined `agent-default` because staging a body
+/// update means restating the current source, which is a write-side argument,
+/// but it is also the tool that turns an id into the exact graph-owned body,
+/// and a querying belt whose discovery tools hand back bounded snippets needs
+/// that door as much as a writing one does.
+pub fn agent_query_tool_names() -> &'static [&'static str] {
+    &[
+        "kin_artifact_list",
+        "kin_artifact_read",
+        "kin_graph_status",
+        "semantic_locate",
+        "semantic_search",
+        "get_context_pack",
+        "impact_analysis",
+        "get_entity_source",
+        "trace_data_flow",
+        crate::handlers::path::TOOL_NAME,
+        "find_references",
+        "graph_neighborhood",
+        crate::handlers::file_entities::TOOL_NAME,
+        "kin_provenance_query",
+    ]
+}
+
 /// Tool names for the READ-ONLY graph-native ContextBench profile.
 ///
 /// This is the belt the graph-native benchmark agent arm drives: purely
@@ -2610,6 +2705,164 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
             visible,
             profile.len(),
             "every profile tool should be listable"
+        );
+    }
+
+    /// The query profile is `agent-default` with its write half removed, and the
+    /// removed half is exactly the session and transaction tools.
+    ///
+    /// The exact names are written out rather than derived, because deriving
+    /// them from `agent_default_tool_names()` by the same rule the profile is
+    /// built with would be a check that cannot fail: any name added to the
+    /// default belt would silently join the query one, which is the decision this
+    /// test exists to make somebody take.
+    #[test]
+    fn agent_query_serves_the_query_half_of_the_agent_belt() {
+        let query: Vec<&str> = agent_query_tool_names().to_vec();
+        let mut sorted = query.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            query.len(),
+            "agent-query lists a name twice: {query:?}"
+        );
+        assert_eq!(
+            sorted,
+            vec![
+                "find_references",
+                "get_context_pack",
+                "get_entity_source",
+                "graph_neighborhood",
+                "impact_analysis",
+                "kin_artifact_list",
+                "kin_artifact_read",
+                "kin_graph_status",
+                "kin_provenance_query",
+                "list_file_entities",
+                "semantic_locate",
+                "semantic_search",
+                "trace_data_flow",
+                "trace_path",
+            ],
+            "the query profile's served names moved; a name here is a public surface"
+        );
+
+        // Every one of them is a tool the registry defines, and every one is
+        // annotated read-only. The annotation is the structural half: a tool
+        // that mutates artifacts, sessions or the graph cannot join this list
+        // without this failing, whatever its name suggests.
+        let list = tool_definitions();
+        for name in &query {
+            let tool = list
+                .tools
+                .iter()
+                .find(|tool| tool.name == *name)
+                .unwrap_or_else(|| {
+                    panic!("agent-query tool '{name}' is not in tool_definitions()")
+                });
+            assert!(
+                tool.annotations.read_only_hint && !tool.annotations.destructive_hint,
+                "agent-query serves '{name}', which the registry does not annotate read-only"
+            );
+        }
+
+        let default: BTreeSet<&str> = agent_default_tool_names().iter().copied().collect();
+        let query_set: BTreeSet<&str> = query.iter().copied().collect();
+        assert!(
+            query_set.is_subset(&default),
+            "agent-query serves a name agent-default does not, so the two belts have drifted: {:?}",
+            query_set.difference(&default).collect::<Vec<_>>()
+        );
+        let removed: Vec<&str> = default.difference(&query_set).copied().collect();
+        assert_eq!(
+            removed,
+            vec![
+                "kin_session_end",
+                "kin_session_heartbeat",
+                "kin_session_start",
+                "kin_transaction_abort",
+                "kin_transaction_begin",
+                "kin_transaction_commit",
+                "kin_transaction_stage",
+            ],
+            "the query profile removed something other than the write half"
+        );
+    }
+
+    /// The saving, measured on the listing a client receives.
+    ///
+    /// This is the finding the profile exists for. Native tool calling re-sends
+    /// the whole `tools` array on every turn, so the served list is a per-turn
+    /// cost: measured on 2026-09-02 against a real `kin mcp start`,
+    /// `agent-default`'s `tools/list` was 30,194 bytes and 8,627 tokens on
+    /// google/gemma-4-e4b, 36 percent of that run's 24,000-token ceiling before
+    /// the model had asked anything (FIR-3107).
+    ///
+    /// The assertion is in BYTES, because bytes are what this process can
+    /// measure. Tokens are a property of somebody else's tokenizer, and a test
+    /// that pretended to count them would be asserting a number it made up. The
+    /// demo measured 3.5 bytes per token on that model, so the ratio held here
+    /// is the ratio of the token cost on it too; the absolute token number is
+    /// the demo's to report, not this test's.
+    ///
+    /// Driven through `served_tools_list`, which is the function the stdio
+    /// handler calls, so this measures the bytes written to a client rather than
+    /// a restatement of the filter, the annotation and the compaction.
+    #[test]
+    fn the_query_profile_costs_far_fewer_bytes_than_agent_default() {
+        // No more than 65 percent of the default belt's listing. A ceiling
+        // rather than the measured number: the point is that the write
+        // contracts are gone, and pinning the exact byte count would fail on
+        // every description edit while saying nothing about that.
+        const CEILING_PERCENT: usize = 65;
+
+        let default = served_tools_list(Some(&name_set(agent_default_tool_names())), true);
+        let query = served_tools_list(Some(&name_set(agent_query_tool_names())), true);
+        assert_eq!(default.tools.len(), agent_default_tool_names().len());
+        assert_eq!(query.tools.len(), agent_query_tool_names().len());
+
+        let bytes = |list: &ToolsListResult| {
+            serde_json::to_string(list)
+                .expect("a tool listing serializes")
+                .len()
+        };
+        let (default_bytes, query_bytes) = (bytes(&default), bytes(&query));
+        // Printed, not merely asserted: the number is the artifact, and the next
+        // person to move a description should be able to read what it cost.
+        println!(
+            "tools/list bytes: agent-default {default_bytes} over {} tools, agent-query \
+             {query_bytes} over {} tools ({}%)",
+            default.tools.len(),
+            query.tools.len(),
+            query_bytes * 100 / default_bytes.max(1),
+        );
+        assert!(
+            query_bytes * 100 <= default_bytes * CEILING_PERCENT,
+            "agent-query's tools/list is {query_bytes} bytes against agent-default's \
+             {default_bytes}, over the {CEILING_PERCENT}% ceiling this profile exists to buy"
+        );
+
+        // The control. A ratio under a ceiling proves nothing if the listing it
+        // measured was empty, or if the two profiles were served the same bytes.
+        assert!(
+            query_bytes > 5_000,
+            "the query listing is {query_bytes} bytes, which is too small to be a real surface"
+        );
+        let serialized = serde_json::to_string(&query).expect("a tool listing serializes");
+        for withheld in [
+            "kin_transaction_stage",
+            "kin_transaction_commit",
+            "kin_session_start",
+        ] {
+            assert!(
+                !serialized.contains(withheld),
+                "the query listing still carries `{withheld}`, so the saving is not what it looks"
+            );
+        }
+        assert!(
+            serialized.contains("semantic_locate") && serialized.contains("trace_data_flow"),
+            "the query listing lost the retrieval tools it exists to serve"
         );
     }
 

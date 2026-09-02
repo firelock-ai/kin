@@ -1324,6 +1324,13 @@ jobs:
 
   # The served MCP surface, graded on the pull request that moves it.
   #
+  # It grades two profiles now: `agent-default`, which is what `kin setup`
+  # writes and what the five main-only assertions below read, and `agent-query`,
+  # the query-only list a client that never writes can serve instead. The second
+  # is here rather than in an acceptance suite because its whole claim is a
+  # size, and a size that is only graded on `main` moves for four landings
+  # before anyone sees it (FIR-3107).
+  #
   # Five assertions in this repository read the served surface, and every one of
   # them runs only on `main`'s push: install-proof.yml's "Graph query and MCP
   # tool-call proof" step, which throws `MCP tools/list omitted semantic_search`
@@ -1392,7 +1399,7 @@ jobs:
       # failed, 2 when one could not be read, 3 when the fixture could not be
       # built. None of the three is a pass, and an unreadable surface says
       # nothing about whether the surface moved, so all three fail this job.
-      - name: Grade the served agent-default MCP surface
+      - name: Grade the served MCP surfaces
         env:
           KIN_SURFACE_LABEL: ${{ github.event_name }}-${{ github.sha }}
         run: |
@@ -1417,7 +1424,7 @@ jobs:
             echo "::error title=The served MCP surface moved::the assertions that grade it on main are skipped on every pull request; this is the same set, on this pull request's own binaries"
             exit 1
           fi
-          echo "the served agent-default surface still satisfies every main-only assertion"
+          echo "the served surfaces still satisfy every main-only assertion"
 
   # A skipped matrix job never expands, so the required per-platform contexts
   # would go missing instead of reporting skipped, and a required context nobody
