@@ -11,10 +11,18 @@ use std::collections::BTreeSet;
 
 use sha2::{Digest, Sha256};
 
+use crate::admission::AdmissionPolicyDelta;
 use crate::{
     Entity, EntityDelta, ExternalReferenceDelta, Hash256, ModelError, Relation, RelationDelta,
     Result, SemanticChange, SemanticChangeId, TransactionDelta, TreeDelta,
 };
+
+/// Domain separator hashed ahead of a semantic change's canonical preimage.
+///
+/// Named because the streaming derivation writes it through the same sink as
+/// the payload, and the reference walk the tests keep must write the identical
+/// bytes for the comparison to mean anything.
+const SEMANTIC_CHANGE_HASH_DOMAIN: &[u8] = b"kin-semantic-change-v6\0";
 
 /// Compute the immutable v6 identity of a complete semantic change.
 ///
@@ -22,10 +30,189 @@ use crate::{
 /// deltas are sorted by stable target identity, so producer iteration order is
 /// irrelevant. All remaining immutable fields participate, including exact
 /// change origin and admission-policy transitions.
+///
+/// The preimage is streamed one field and one delta at a time through the
+/// sinks [`crate::RepositoryTransaction::transaction_hash`] uses, so deriving
+/// an identity holds no copy of the change. The implementation this replaced
+/// copied the change's deltas once to validate them and the whole change again
+/// to sort it, built a `serde_json::Value` tree of that copy in order to delete
+/// `id` from it, and held the encoding as one buffer. A change that carries a
+/// whole tree pays that on every derivation, and an admission derives the same
+/// change's identity a dozen times: on a one-commit import of an 18,508-file
+/// repository the tree alone took resident memory from 1.2 GiB to 13.7 GiB in
+/// twelve seconds.
 pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticChangeId> {
-    let delta = change.transaction_delta();
-    validate_transaction_delta(&delta)?;
+    validate_change_deltas(change)?;
+    let view = CanonicalChangeIdentity::new(change);
 
+    // Two passes over the same walk, because the preimage carries its byte
+    // length ahead of its payload and a hasher cannot be told the length
+    // afterwards. The first pass counts and keeps nothing; the second hashes
+    // and keeps nothing.
+    let mut counter = CountingSink::default();
+    view.write_canonical_preimage(&mut counter)?;
+    let payload_len = counter.len();
+
+    let mut sink = HashingSink::new();
+    sink.write_bytes(SEMANTIC_CHANGE_HASH_DOMAIN);
+    sink.write_bytes(&payload_len.to_le_bytes());
+    let header_len = sink.written();
+    view.write_canonical_preimage(&mut sink)?;
+
+    // The two passes walk the same immutable view, so they agree or something
+    // under them is not deterministic. Refuse rather than return a well-formed
+    // hash of a preimage whose length prefix contradicts its payload, because
+    // every change in every store on disk is named by this value.
+    let hashed_payload = sink.written() - header_len;
+    if hashed_payload != payload_len {
+        return Err(ModelError::InvalidOperation(format!(
+            "semantic change identity preimage counted {payload_len} bytes and hashed \
+             {hashed_payload}"
+        )));
+    }
+    Ok(SemanticChangeId::from_hash(Hash256::from_bytes(
+        sink.finish(),
+    )))
+}
+
+/// Fields of a [`SemanticChange`] that reach its identity preimage whatever
+/// the change carries.
+///
+/// Every field but `id`, which the preimage derives, and
+/// `external_reference_deltas`, which the derive skips when empty and the
+/// walk below therefore skips too. Hoisted so the count the object header
+/// carries and the fields the walk writes come from one constant rather than
+/// from a copy that can drift.
+const CHANGE_IDENTITY_FIELD_COUNT: usize = 13;
+
+/// The identity-bearing fields of one [`SemanticChange`], borrowed and in
+/// canonical order.
+///
+/// The preimage is the change's derived serialization with `id` removed and
+/// the four independent delta collections sorted by target. Neither can be had
+/// by streaming the derive: a serializer emits fields as `Serialize` delivers
+/// them and has nothing to delete or reorder. The implementation this replaced
+/// got a mutable object by building a `serde_json::Value` tree of a clone,
+/// which is the cost named on [`compute_semantic_change_id`].
+///
+/// This view writes the object by hand instead, in the byte-wise key order the
+/// tree walk sorted the derive's fields into, and hands each delta collection
+/// to [`append_canonical_seq`] so one delta's encoding is resident at a time.
+/// It is the shape of `CanonicalTransaction` in `repository.rs` with one
+/// difference: it is a walk rather than a `Serialize` impl, so no serializer
+/// ever sees it and the positional-differential rule for hand-written
+/// serializations does not apply. What guards it instead is
+/// `the_identity_preimage_matches_the_tree_walk`, which diffs these bytes
+/// against the retained tree walk over the derive, offset by offset, on every
+/// field a change can carry, and the pinned identities beneath it.
+struct CanonicalChangeIdentity<'a> {
+    source: &'a SemanticChange,
+    entity_deltas: Vec<&'a EntityDelta>,
+    relation_deltas: Vec<&'a RelationDelta>,
+    tree_deltas: Vec<&'a TreeDelta>,
+    external_reference_deltas: Vec<&'a ExternalReferenceDelta>,
+}
+
+impl<'a> CanonicalChangeIdentity<'a> {
+    fn new(source: &'a SemanticChange) -> Self {
+        let mut entity_deltas: Vec<&'a EntityDelta> = source.entity_deltas.iter().collect();
+        entity_deltas.sort_by_key(|delta| EntityDelta::target_id(delta));
+
+        let mut relation_deltas: Vec<&'a RelationDelta> = source.relation_deltas.iter().collect();
+        relation_deltas.sort_by_key(|delta| RelationDelta::target_id(delta));
+
+        let mut tree_deltas: Vec<&'a TreeDelta> = source.tree_deltas.iter().collect();
+        tree_deltas.sort_by_key(|delta| TreeDelta::artifact_id(delta));
+
+        let mut external_reference_deltas: Vec<&'a ExternalReferenceDelta> =
+            source.external_reference_deltas.iter().collect();
+        external_reference_deltas.sort_by_key(|delta| ExternalReferenceDelta::target_id(delta));
+
+        Self {
+            source,
+            entity_deltas,
+            relation_deltas,
+            tree_deltas,
+            external_reference_deltas,
+        }
+    }
+
+    /// The preimage, written one field at a time into any sink.
+    ///
+    /// Byte for byte what the tree walk emits for the derive with `id`
+    /// removed. The keys are in BYTE-WISE order rather than declaration order,
+    /// because that is the order the walk sorts a `serde_json::Map` into, and
+    /// `external_reference_deltas` is written only when it is non-empty,
+    /// because the derive skips it then and the count in the header has to
+    /// say what follows.
+    fn write_canonical_preimage<S: CanonicalSink>(&self, out: &mut S) -> Result<()> {
+        let source = self.source;
+        let field_count =
+            CHANGE_IDENTITY_FIELD_COUNT + usize::from(!self.external_reference_deltas.is_empty());
+
+        append_canonical_object_header(out, field_count)?;
+
+        append_canonical_key(out, "admission_policy_delta")?;
+        append_canonical_value(out, &source.admission_policy_delta)?;
+        append_canonical_key(out, "author")?;
+        append_canonical_value(out, &source.author)?;
+        append_canonical_key(out, "entity_deltas")?;
+        append_canonical_seq(out, &self.entity_deltas)?;
+        append_canonical_key(out, "evidence")?;
+        append_canonical_value(out, &source.evidence)?;
+        if !self.external_reference_deltas.is_empty() {
+            append_canonical_key(out, "external_reference_deltas")?;
+            append_canonical_seq(out, &self.external_reference_deltas)?;
+        }
+        append_canonical_key(out, "message")?;
+        append_canonical_value(out, &source.message)?;
+        append_canonical_key(out, "origin")?;
+        append_canonical_value(out, &source.origin)?;
+        append_canonical_key(out, "parents")?;
+        append_canonical_value(out, &source.parents)?;
+        append_canonical_key(out, "projected_files")?;
+        append_canonical_value(out, &source.projected_files)?;
+        append_canonical_key(out, "relation_deltas")?;
+        append_canonical_seq(out, &self.relation_deltas)?;
+        append_canonical_key(out, "risk_summary")?;
+        append_canonical_value(out, &source.risk_summary)?;
+        append_canonical_key(out, "spec_link")?;
+        append_canonical_value(out, &source.spec_link)?;
+        append_canonical_key(out, "timestamp")?;
+        append_canonical_value(out, &source.timestamp)?;
+        append_canonical_key(out, "tree_deltas")?;
+        append_canonical_seq(out, &self.tree_deltas)?;
+
+        Ok(())
+    }
+
+    /// The whole preimage in one buffer.
+    ///
+    /// Only the tests want this. They compare it byte for byte and pin it by
+    /// digest; production hashes it as it is produced and never holds it.
+    #[cfg(test)]
+    fn canonical_preimage(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.write_canonical_preimage(&mut out)?;
+        Ok(out)
+    }
+}
+
+/// The streamed identity preimage of `change`, collected into one buffer.
+#[cfg(test)]
+pub(crate) fn change_identity_preimage(change: &SemanticChange) -> Result<Vec<u8>> {
+    CanonicalChangeIdentity::new(change).canonical_preimage()
+}
+
+/// The identity preimage as the implementation this crate replaced produced
+/// it: the derive as a `serde_json::Value` tree with `id` removed, walked by
+/// the encoder that defines the format.
+///
+/// Kept as the oracle the streaming walk is checked against. Keeping it is the
+/// point: a differential in which both sides go through the same new code
+/// proves nothing.
+#[cfg(test)]
+pub(crate) fn change_identity_preimage_via_tree(change: &SemanticChange) -> Result<Vec<u8>> {
     let mut canonical_change = change.clone();
     canonical_change
         .entity_deltas
@@ -53,9 +240,19 @@ pub fn compute_semantic_change_id(change: &SemanticChange) -> Result<SemanticCha
     }
     let mut canonical = Vec::new();
     append_canonical_json(&mut canonical, &payload)?;
+    Ok(canonical)
+}
+
+/// The identity as the implementation this crate replaced derived it, kept
+/// verbatim so the streaming derivation can be measured against it.
+#[cfg(test)]
+pub(crate) fn reference_semantic_change_id(change: &SemanticChange) -> Result<SemanticChangeId> {
+    let delta = change.transaction_delta();
+    validate_transaction_delta(&delta)?;
+    let canonical = change_identity_preimage_via_tree(change)?;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"kin-semantic-change-v6\0");
+    hasher.update(SEMANTIC_CHANGE_HASH_DOMAIN);
     append_len_prefixed_hash_field(&mut hasher, &canonical)?;
     let result = hasher.finalize();
     let mut bytes = [0_u8; 32];
@@ -87,8 +284,40 @@ pub fn validate_semantic_change_id(change: &SemanticChange) -> Result<()> {
 /// One transaction may target each entity, relation, or artifact at most once.
 /// Modified deltas preserve identity and carry two different complete states.
 pub fn validate_transaction_delta(delta: &TransactionDelta) -> Result<()> {
+    validate_deltas(
+        &delta.entity_deltas,
+        &delta.relation_deltas,
+        &delta.tree_deltas,
+        delta.admission_policy_delta.as_ref(),
+        &delta.external_reference_deltas,
+    )
+}
+
+/// [`validate_transaction_delta`] over a change's own deltas, where they are.
+///
+/// `SemanticChange::transaction_delta` copies every delta into a
+/// `TransactionDelta`, and identity derivation used to call it for no reason
+/// but to hand the copy to the validator. On a change that carries a whole
+/// tree, that copy is the whole tree.
+fn validate_change_deltas(change: &SemanticChange) -> Result<()> {
+    validate_deltas(
+        &change.entity_deltas,
+        &change.relation_deltas,
+        &change.tree_deltas,
+        change.admission_policy_delta.as_ref(),
+        &change.external_reference_deltas,
+    )
+}
+
+fn validate_deltas(
+    entity_deltas: &[EntityDelta],
+    relation_deltas: &[RelationDelta],
+    tree_deltas: &[TreeDelta],
+    admission_policy_delta: Option<&AdmissionPolicyDelta>,
+    external_reference_deltas: &[ExternalReferenceDelta],
+) -> Result<()> {
     let mut entity_targets = BTreeSet::new();
-    for entity_delta in &delta.entity_deltas {
+    for entity_delta in entity_deltas {
         let target = entity_delta.target_id();
         if !entity_targets.insert(target) {
             return Err(ModelError::InvalidOperation(format!(
@@ -118,7 +347,7 @@ pub fn validate_transaction_delta(delta: &TransactionDelta) -> Result<()> {
     }
 
     let mut relation_targets = BTreeSet::new();
-    for relation_delta in &delta.relation_deltas {
+    for relation_delta in relation_deltas {
         let target = relation_delta.target_id();
         if !relation_targets.insert(target) {
             return Err(ModelError::InvalidOperation(format!(
@@ -148,7 +377,7 @@ pub fn validate_transaction_delta(delta: &TransactionDelta) -> Result<()> {
     }
 
     let mut external_reference_targets = BTreeSet::new();
-    for reference_delta in &delta.external_reference_deltas {
+    for reference_delta in external_reference_deltas {
         let target = reference_delta.target_id();
         if !external_reference_targets.insert(target) {
             return Err(ModelError::InvalidOperation(format!(
@@ -162,7 +391,7 @@ pub fn validate_transaction_delta(delta: &TransactionDelta) -> Result<()> {
     }
 
     let mut tree_targets = BTreeSet::new();
-    for tree_delta in &delta.tree_deltas {
+    for tree_delta in tree_deltas {
         let target = tree_delta.artifact_id();
         if !tree_targets.insert(target) {
             return Err(ModelError::InvalidOperation(format!(
@@ -178,7 +407,7 @@ pub fn validate_transaction_delta(delta: &TransactionDelta) -> Result<()> {
         }
     }
 
-    if let Some(policy_delta) = &delta.admission_policy_delta {
+    if let Some(policy_delta) = admission_policy_delta {
         policy_delta.validate()?;
     }
     Ok(())
@@ -469,6 +698,7 @@ pub(crate) fn append_canonical_key<S: CanonicalSink>(output: &mut S, key: &str) 
     append_len_prefixed_vec_field(output, key.as_bytes())
 }
 
+#[cfg(test)]
 fn append_canonical_json<S: CanonicalSink>(
     output: &mut S,
     value: &serde_json::Value,
@@ -589,6 +819,7 @@ fn append_len_prefixed_vec_field<S: CanonicalSink>(output: &mut S, value: &[u8])
     Ok(())
 }
 
+#[cfg(test)]
 fn serialization(error: serde_json::Error) -> ModelError {
     ModelError::Serialization(error.to_string())
 }
@@ -596,8 +827,13 @@ fn serialization(error: serde_json::Error) -> ModelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relation::{RelationEvidence, RelationOrigin};
     use crate::{
-        AuthorId, ChangeOrigin, GitObjectId, LocatedEntry, RepoPath, Timestamp, TreeEntry,
+        alloc_probe, AdmissionPolicyDelta, ArtifactId, AuthorId, ChangeOrigin, EntityId,
+        EntityKind, EntityMetadata, EntityRole, EvidenceId, ExternalReference, FilePathId,
+        FingerprintAlgorithm, GitObjectId, GraphNodeId, LanguageId, LocatedEntry, RelationId,
+        RelationKind, RepoPath, RiskLevel, RiskSummary, SemanticFingerprint, SharedAdmissionPolicy,
+        SourceSpan, SpecId, Timestamp, TreeEntry, Visibility,
     };
     use chrono::{TimeZone, Utc};
 
@@ -918,5 +1154,429 @@ mod tests {
         let baseline = compute_semantic_change_id(&change).unwrap();
         change.external_reference_deltas = vec![ExternalReferenceDelta::Added { new: first }];
         assert_ne!(compute_semantic_change_id(&change).unwrap(), baseline);
+    }
+
+    fn span(path: &str, start: usize) -> SourceSpan {
+        SourceSpan {
+            file: FilePathId::new(path),
+            start_byte: start,
+            end_byte: start + 240,
+            start_line: 2,
+            start_col: 0,
+            end_line: 14,
+            end_col: 1,
+        }
+    }
+
+    /// An entity with every optional field present and a metadata bag that
+    /// nests every JSON shape, so the flattened map path is anchored too.
+    fn wide_entity(seed: u128, name: &str) -> Entity {
+        let byte = seed as u8;
+        let mut metadata = EntityMetadata::default();
+        metadata.extra.insert(
+            "decorators".to_string(),
+            serde_json::json!(["route", { "path": "/v1", "methods": ["GET", "POST"] }]),
+        );
+        metadata
+            .extra
+            .insert("complexity".to_string(), serde_json::json!(seed as u64 % 7));
+        metadata
+            .extra
+            .insert("ratio".to_string(), serde_json::json!(0.5));
+        metadata
+            .extra
+            .insert("negative".to_string(), serde_json::json!(-3));
+        metadata.extra.insert(
+            "async".to_string(),
+            serde_json::json!(seed.is_multiple_of(2)),
+        );
+        metadata
+            .extra
+            .insert("deprecated".to_string(), serde_json::Value::Null);
+        Entity {
+            id: EntityId(uuid::Uuid::from_u128(seed)),
+            kind: EntityKind::Method,
+            name: name.to_string(),
+            language: LanguageId::Python,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([byte; 32]),
+                signature_hash: Hash256::from_bytes([byte ^ 0x11; 32]),
+                behavior_hash: Hash256::from_bytes([byte ^ 0x22; 32]),
+                equivalence_hash: Hash256::from_bytes([byte ^ 0x33; 32]),
+                stability_score: 0.875,
+            },
+            file_origin: Some(FilePathId::new(format!("src/{name}.py"))),
+            span: Some(span(&format!("src/{name}.py"), 10)),
+            signature: format!("def {name}(self, value: int) -> str"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: Some(format!("{name} re\u{0301}sume\u{0301} \u{1F9EA}")),
+            metadata,
+            lineage_parent: Some(EntityId(uuid::Uuid::from_u128(seed + 1_000_000))),
+            created_in: Some(SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32]))),
+            superseded_by: None,
+        }
+    }
+
+    fn wide_relation(seed: u128, src: EntityId, dst: GraphNodeId, confidence: f32) -> Relation {
+        Relation {
+            id: RelationId(uuid::Uuid::from_u128(seed)),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(src),
+            dst,
+            confidence,
+            origin: RelationOrigin::Lsp,
+            created_in: Some(SemanticChangeId::from_hash(Hash256::from_bytes([0x78; 32]))),
+            import_source: Some("requests".to_string()),
+            evidence: vec![RelationEvidence {
+                source_span: Some(span("src/caller.py", 300)),
+                parser_rule: Some("call_expression".to_string()),
+                token: Some("get".to_string()),
+                source_path: Some("requests".to_string()),
+                resolved_path: None,
+                occurrence_count: 2,
+                ..RelationEvidence::default()
+            }],
+        }
+    }
+
+    fn located(path: &str, entry: TreeEntry) -> LocatedEntry {
+        LocatedEntry::new(RepoPath::from_utf8(path).unwrap(), entry)
+    }
+
+    /// A change that carries every field an identity can see, `width` deltas
+    /// of every variant in every collection, and every collection out of
+    /// canonical order.
+    fn wide_change(width: u128) -> SemanticChange {
+        let mut change = empty_change();
+        change.origin = ChangeOrigin::GitCommit {
+            oid: GitObjectId::sha1([0x42; 20]),
+        };
+        change.parents = vec![
+            SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32])),
+            SemanticChangeId::from_hash(Hash256::from_bytes([0x32; 32])),
+        ];
+        change.message = "wide change: re\u{0301}sume\u{0301} \u{1F9EA} \u{200F}bidi".to_string();
+        let external =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        for index in (0..width).rev() {
+            let byte = index as u8;
+            let entity = wide_entity(1_000 + index, &format!("entity_{index}"));
+            let entity_id = entity.id;
+            let earlier = wide_entity(1_000 + index, &format!("entity_{index}_before"));
+            change.entity_deltas.push(match index % 3 {
+                0 => EntityDelta::Added { new: entity },
+                1 => EntityDelta::Modified {
+                    old: earlier,
+                    new: entity,
+                },
+                _ => EntityDelta::Removed { old: entity },
+            });
+
+            let target = if index.is_multiple_of(2) {
+                GraphNodeId::Entity(EntityId(uuid::Uuid::from_u128(2_000 + index)))
+            } else {
+                GraphNodeId::ExternalReference(external.id)
+            };
+            let relation = wide_relation(5_000 + index, entity_id, target, 0.75);
+            let weaker = wide_relation(5_000 + index, entity_id, target, 0.5);
+            change.relation_deltas.push(match index % 3 {
+                0 => RelationDelta::Added { new: relation },
+                1 => RelationDelta::Modified {
+                    old: weaker,
+                    new: relation,
+                },
+                _ => RelationDelta::Removed { old: relation },
+            });
+
+            let artifact_id = ArtifactId(uuid::Uuid::from_u128(9_000 + index));
+            let blob = located(
+                &format!("src/file_{index}.py"),
+                TreeEntry::blob(Hash256::from_bytes([byte; 32]), index.is_multiple_of(2)),
+            );
+            change.tree_deltas.push(match index % 3 {
+                0 => TreeDelta::Added {
+                    artifact_id,
+                    new: blob,
+                },
+                1 => TreeDelta::Updated {
+                    artifact_id,
+                    old: located(
+                        &format!("src/link_{index}"),
+                        TreeEntry::symlink(Hash256::from_bytes([byte ^ 0x44; 32])),
+                    ),
+                    new: located(
+                        &format!("vendor/module_{index}"),
+                        TreeEntry::gitlink(GitObjectId::sha1([byte; 20])),
+                    ),
+                },
+                _ => TreeDelta::Removed {
+                    artifact_id,
+                    old: blob,
+                },
+            });
+        }
+        change.external_reference_deltas = vec![
+            ExternalReferenceDelta::Added {
+                new: ExternalReference::new_resolved("python-module-v1", "zzz-later", "sym")
+                    .unwrap(),
+            },
+            ExternalReferenceDelta::Removed {
+                old: ExternalReference::new_resolved("npm-package-v1", "@mui/utils", "merge")
+                    .unwrap(),
+            },
+            ExternalReferenceDelta::Added { new: external },
+        ];
+        change.admission_policy_delta = Some(AdmissionPolicyDelta::initialize(
+            SharedAdmissionPolicy::empty(0),
+        ));
+        change.projected_files = vec![FilePathId::new("src/b.py"), FilePathId::new("src/a.py")];
+        change.spec_link = Some(SpecId(uuid::Uuid::from_u128(0x5bec)));
+        change.evidence = vec![
+            EvidenceId(uuid::Uuid::from_u128(0xe2)),
+            EvidenceId(uuid::Uuid::from_u128(0xe1)),
+        ];
+        change.risk_summary = Some(RiskSummary {
+            overall_risk: RiskLevel::High,
+            breaking_changes: vec!["drops `get`".to_string()],
+            test_coverage_gaps: Vec::new(),
+            contract_violations: vec!["contract-1".to_string()],
+            work_risks: vec!["an in-progress work item".to_string()],
+            notes: vec!["note".to_string()],
+        });
+        change
+    }
+
+    /// Reorder every independent collection of `change` by `seed`.
+    fn permute(change: &mut SemanticChange, seed: u64) {
+        fn shuffle<T>(items: &mut [T], seed: u64) {
+            if items.len() < 2 {
+                return;
+            }
+            let rotate = usize::try_from(seed).unwrap_or(0) % items.len();
+            items.rotate_left(rotate);
+            if seed % 2 == 1 {
+                items.reverse();
+            }
+            if seed % 3 == 2 {
+                let middle = items.len() / 2;
+                items.swap(0, middle);
+            }
+        }
+        shuffle(&mut change.entity_deltas, seed);
+        shuffle(&mut change.relation_deltas, seed.wrapping_add(1));
+        shuffle(&mut change.tree_deltas, seed.wrapping_add(2));
+        shuffle(&mut change.external_reference_deltas, seed.wrapping_add(3));
+    }
+
+    fn pinned_fixture() -> SemanticChange {
+        let mut fixture = empty_change();
+        fixture.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32]));
+        fixture.timestamp = Timestamp::from(
+            chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        fixture.author = AuthorId::new("fixture");
+        fixture.message = "phase two".to_string();
+        fixture.origin = ChangeOrigin::GitCommit {
+            oid: GitObjectId::sha1([0x66; 20]),
+        };
+        fixture
+    }
+
+    /// The streamed identity preimage is the tree walk's, byte for byte, on
+    /// every field a change can carry and every order its collections can
+    /// arrive in.
+    ///
+    /// BYTES, not hashes, because a divergence then names the offset and the
+    /// bytes on both sides rather than two digests that differ. Both sides
+    /// must not go through the streaming walk, or the differential proves
+    /// nothing, which is why `change_identity_preimage_via_tree` is kept.
+    ///
+    /// The shapes are the empty change, the pinned fixture, a wide change with
+    /// every optional field present and every delta variant in every
+    /// collection, eight reorderings of that change, and the same change with
+    /// its skipped tail absent, so both branches of the header's field count
+    /// are reached. The controls at the end make sure the comparison sees
+    /// content: the reorderings share one identity and the other shapes each
+    /// have their own.
+    #[test]
+    fn the_identity_preimage_matches_the_tree_walk() {
+        let mut shapes: Vec<(String, SemanticChange)> = vec![
+            ("empty change".to_string(), empty_change()),
+            ("pinned fixture".to_string(), pinned_fixture()),
+            ("wide change".to_string(), wide_change(9)),
+        ];
+        for seed in 0..8_u64 {
+            let mut permuted = wide_change(9);
+            permute(&mut permuted, seed);
+            shapes.push((format!("wide change, reordering {seed}"), permuted));
+        }
+        let mut without_references = wide_change(5);
+        without_references.external_reference_deltas.clear();
+        shapes.push((
+            "wide change without external references".to_string(),
+            without_references,
+        ));
+
+        for (name, change) in &shapes {
+            let streamed = change_identity_preimage(change).unwrap();
+            let walked = change_identity_preimage_via_tree(change).unwrap();
+            if streamed != walked {
+                let offset = streamed
+                    .iter()
+                    .zip(walked.iter())
+                    .position(|(left, right)| left != right)
+                    .unwrap_or_else(|| streamed.len().min(walked.len()));
+                let window = |bytes: &[u8]| {
+                    bytes[offset.min(bytes.len())..(offset + 24).min(bytes.len())].to_vec()
+                };
+                panic!(
+                    "{name}: the identity preimage walk diverges from the tree walk at offset \
+                     {offset} (streamed {} bytes, tree walk {}); streamed {:?}, tree walk {:?}",
+                    streamed.len(),
+                    walked.len(),
+                    window(&streamed),
+                    window(&walked)
+                );
+            }
+            assert!(
+                !streamed.is_empty(),
+                "{name}: encoded to nothing, so this comparison cannot fail"
+            );
+            assert_eq!(
+                compute_semantic_change_id(change).unwrap(),
+                reference_semantic_change_id(change).unwrap(),
+                "{name}: the streamed identity differs from the one it replaced"
+            );
+        }
+
+        let wide = compute_semantic_change_id(&shapes[2].1).unwrap();
+        for (name, change) in &shapes[3..11] {
+            assert_eq!(
+                compute_semantic_change_id(change).unwrap(),
+                wide,
+                "{name}: delta order reached the identity"
+            );
+        }
+        let distinct: BTreeSet<SemanticChangeId> = [0, 1, 2, 11]
+            .into_iter()
+            .map(|index| compute_semantic_change_id(&shapes[index].1).unwrap())
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "four different changes produced fewer than four identities, so the comparison \
+             above is not seeing content"
+        );
+    }
+
+    /// Deriving an identity still validates the deltas it hashes.
+    ///
+    /// The validation moved from a copy of the deltas to the deltas
+    /// themselves, and a derivation that skipped it would mint an identity for
+    /// a change no replay can apply.
+    #[test]
+    fn deriving_an_identity_refuses_an_invalid_delta_set() {
+        let mut duplicated = wide_change(3);
+        let repeated = duplicated.entity_deltas[0].clone();
+        duplicated.entity_deltas.push(repeated);
+        let error = compute_semantic_change_id(&duplicated).unwrap_err();
+        assert!(
+            error.to_string().contains("more than one delta for entity"),
+            "{error}"
+        );
+
+        let mut unstable = wide_change(3);
+        let entity = match &mut unstable.entity_deltas[0] {
+            EntityDelta::Added { new } | EntityDelta::Modified { new, .. } => new,
+            EntityDelta::Removed { old } => old,
+        };
+        entity.fingerprint.stability_score = f32::NAN;
+        let error = compute_semantic_change_id(&unstable).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid fingerprint stability score"),
+            "{error}"
+        );
+
+        // The control: the same change validates and derives once repaired.
+        compute_semantic_change_id(&wide_change(3)).unwrap();
+    }
+
+    /// A populated change's identity is pinned, and the pin is anchored to the
+    /// retained tree walk as well as to the streaming derivation.
+    ///
+    /// The empty fixture in `semantic_change_v6_hash_domain_has_a_pinned_fixture`
+    /// reaches none of the collections. This one reaches every field and every
+    /// delta variant, so a change to how any of them is framed moves it. It was
+    /// measured through `reference_semantic_change_id`, the implementation the
+    /// streaming walk replaced, on the commit that introduced the walk.
+    #[test]
+    fn a_populated_change_has_a_pinned_identity() {
+        const PINNED: &str = "0c62d43eca6530d579900e459b2dcc2385cf483bcebea896cb02c0eb4c43085e";
+        let change = wide_change(9);
+        let reference = reference_semantic_change_id(&change).unwrap().to_string();
+        let streamed = compute_semantic_change_id(&change).unwrap().to_string();
+        println!("WIDE_CHANGE_IDENTITY reference {reference} streamed {streamed}");
+        assert_eq!(
+            reference, PINNED,
+            "the tree walk this pin was measured from no longer produces it, so the pin \
+             anchors nothing"
+        );
+        assert_eq!(
+            streamed, PINNED,
+            "changing the kin-semantic-change-v6 preimage of a populated change is a wire break"
+        );
+    }
+
+    /// Deriving an identity holds one delta at a time, never a copy of the
+    /// change.
+    ///
+    /// Priced against the change's own clone so there is no constant to
+    /// drift. The retained implementation is the control: it must show the
+    /// probe at least two copies of the change, or a probe that cannot see a
+    /// whole-change materialization proves nothing about the streaming walk.
+    #[test]
+    fn deriving_an_identity_holds_one_delta_at_a_time() {
+        let change = wide_change(1_024);
+
+        // Warm any lazily-initialized state so it is not charged to one arm.
+        compute_semantic_change_id(&change).unwrap();
+        reference_semantic_change_id(&change).unwrap();
+
+        let clone_cost = alloc_probe::measure(|| {
+            let copy = change.clone();
+            std::hint::black_box(&copy);
+        })
+        .peak_live;
+        let reference = alloc_probe::measure(|| {
+            reference_semantic_change_id(&change).unwrap();
+        })
+        .peak_live;
+        let streamed = alloc_probe::measure(|| {
+            compute_semantic_change_id(&change).unwrap();
+        })
+        .peak_live;
+        println!("clone {clone_cost} reference {reference} streamed {streamed}");
+
+        assert!(
+            clone_cost > 0 && reference > 0 && streamed > 0,
+            "the allocation probe measured nothing, so it cannot fail: clone {clone_cost}, \
+             reference {reference}, streamed {streamed}"
+        );
+        assert!(
+            reference >= clone_cost * 2,
+            "the retained derivation peaked at {reference} bytes against a clone's \
+             {clone_cost}, so the probe is not seeing the copies it exists to price"
+        );
+        assert!(
+            streamed * 8 <= clone_cost,
+            "deriving an identity peaked at {streamed} bytes against a clone's {clone_cost}; \
+             the derivation is holding a copy of the change again"
+        );
     }
 }

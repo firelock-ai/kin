@@ -2323,86 +2323,10 @@ mod tests {
         }
     }
 
-    /// Thread-local peak-live-bytes probe for the canonicalization measurement.
-    ///
-    /// Thread-local rather than process-wide on purpose: `cargo test` runs this
-    /// binary's tests in parallel threads, and a global counter would be moved
-    /// by whatever else happens to be running, which is the difference between
-    /// a measurement and a coincidence.
-    ///
-    /// Counts live heap rather than RSS. RSS keeps counting pages the allocator
-    /// freed but has not returned to the OS, so it is not reproducible across
-    /// allocators or platforms; live bytes are.
-    mod alloc_probe {
-        use std::alloc::{GlobalAlloc, Layout, System};
-        use std::cell::Cell;
-
-        thread_local! {
-            static ARMED: Cell<bool> = const { Cell::new(false) };
-            static LIVE: Cell<isize> = const { Cell::new(0) };
-            static PEAK: Cell<isize> = const { Cell::new(0) };
-        }
-
-        pub struct CountingAllocator;
-
-        fn record(delta: isize) {
-            // `try_with` because a thread tearing down has no thread-local
-            // left to reach, and an allocator must not panic there.
-            let _ = ARMED.try_with(|armed| {
-                if !armed.get() {
-                    return;
-                }
-                let _ = LIVE.try_with(|live| {
-                    let now = live.get() + delta;
-                    live.set(now);
-                    let _ = PEAK.try_with(|peak| {
-                        if now > peak.get() {
-                            peak.set(now);
-                        }
-                    });
-                });
-            });
-        }
-
-        unsafe impl GlobalAlloc for CountingAllocator {
-            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                let pointer = unsafe { System.alloc(layout) };
-                if !pointer.is_null() {
-                    record(layout.size() as isize);
-                }
-                pointer
-            }
-
-            unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-                record(-(layout.size() as isize));
-                unsafe { System.dealloc(pointer, layout) }
-            }
-
-            unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-                let moved = unsafe { System.realloc(pointer, layout, new_size) };
-                if !moved.is_null() {
-                    record(new_size as isize - layout.size() as isize);
-                }
-                moved
-            }
-        }
-
-        /// Peak live bytes allocated by `body` on this thread.
-        pub fn peak_live_bytes(body: impl FnOnce()) -> usize {
-            LIVE.with(|live| live.set(0));
-            PEAK.with(|peak| peak.set(0));
-            ARMED.with(|armed| armed.set(true));
-            body();
-            ARMED.with(|armed| armed.set(false));
-            usize::try_from(PEAK.with(Cell::get)).unwrap_or(0)
-        }
-    }
-
-    #[global_allocator]
-    static COUNTING_ALLOCATOR: alloc_probe::CountingAllocator = alloc_probe::CountingAllocator;
-
+    /// Peak live bytes allocated by `body` on this thread, from the crate's
+    /// one allocation probe.
     fn measure_peak_live_bytes(body: impl FnOnce()) -> usize {
-        alloc_probe::peak_live_bytes(body)
+        crate::alloc_probe::peak_live_bytes(body)
     }
 
     fn sealed_observation() -> SealedObservationBinding {
@@ -4891,14 +4815,12 @@ mod tests {
     /// the fixture set collectively reached all of them. A skipped arm is a
     /// missing anchor, and a missing anchor must fail rather than pass quietly.
     ///
-    /// Not covered here, deliberately and named so it does not drop out of the
-    /// ticket: `compute_semantic_change_id` does not route through this encoder
-    /// at all. It still clones its change and builds a `serde_json::Value` tree,
-    /// because it must REMOVE the self-referential `id` field before hashing and
-    /// a streaming serializer cannot mutate an object it is emitting. The fix
-    /// shape exists in this crate already, a borrowed view in the manner of
-    /// `CanonicalTransaction`, and it is FIR-2692 rather than part of this
-    /// change.
+    /// `compute_semantic_change_id` is covered here too, since it stopped
+    /// building a `serde_json::Value` tree of its change to delete `id` from
+    /// and became a hand-kept walk over a borrowed view. Every change in every
+    /// fixture has its identity preimage diffed against the retained tree walk
+    /// of the derive with `id` removed, the same oracle the transaction view
+    /// is diffed against; the walk's own module carries the wider corpus.
     #[test]
     fn every_canonical_payload_encodes_to_the_same_bytes_as_the_tree_walk() {
         fn agree<T: serde::Serialize>(what: &str, value: &T) {
@@ -4961,6 +4883,22 @@ mod tests {
             );
             for (index, change) in transaction.changes.iter().enumerate() {
                 agree(&format!("{name}, change {index}"), change);
+                let streamed = crate::identity::change_identity_preimage(change).unwrap();
+                let walked = crate::identity::change_identity_preimage_via_tree(change).unwrap();
+                assert_eq!(
+                    streamed,
+                    walked,
+                    "{name}, change {index}: the identity preimage walk emits {} bytes and the \
+                     tree walk emits {}; every change identity in every store would move",
+                    streamed.len(),
+                    walked.len()
+                );
+                assert!(
+                    !streamed.is_empty(),
+                    "{name}, change {index}: the identity preimage encoded to nothing, so this \
+                     comparison cannot fail"
+                );
+                reached.insert("change_identity");
                 // `MergeSideValue::entity` and `::relation` hash these standalone
                 // rather than nested, and a `MergeSideValue` stores only the
                 // resulting hash, so anchoring a merge record does not anchor
@@ -5082,6 +5020,7 @@ mod tests {
             "relation_delta",
             "tree_delta",
             "resolved_artifact",
+            "change_identity",
         ]
         .into_iter()
         .collect();

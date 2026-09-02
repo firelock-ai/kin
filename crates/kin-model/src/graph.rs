@@ -394,9 +394,15 @@ pub trait ChangeStore: Send + Sync {
         &self,
         head: &SemanticChangeId,
     ) -> std::result::Result<ResolvedGraphState, Self::Error> {
-        let first_parent_history = collect_changes_first_parent(self, head)?;
-        let mut state = replay_graph_state(first_parent_history.clone())?;
-        state.tree = replay_tree(first_parent_history).map_err(Self::Error::from)?;
+        let mut first_parent_history = collect_changes_first_parent(self, head)?;
+        // The graph replay consumes the history and the tree replay reads only
+        // its tree deltas, so the tree deltas are taken out ahead of the
+        // hand-over rather than the whole history being copied for the second
+        // pass. The graph replay still runs first, so a history that is
+        // invalid both ways reports the error it always reported.
+        let tree_history = take_tree_history(&mut first_parent_history);
+        let mut state = replay_graph_state(first_parent_history)?;
+        state.tree = replay_tree_history(tree_history).map_err(Self::Error::from)?;
         Ok(state)
     }
     /// Resolve the exact repository tree at `head`.
@@ -997,8 +1003,12 @@ fn collect_changes_first_parent<G: ChangeStore + ?Sized>(
         let change = store
             .get_change(&change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
-        reverse_history.push(change.clone());
+        // The walk needs one thing from a change after it is kept, its first
+        // parent, and reads it before the push so the change moves in rather
+        // than being copied. On a bootstrap of a one-commit import that copy
+        // was the whole tree's deltas.
         current = change.parents.first().copied();
+        reverse_history.push(change);
     }
 
     reverse_history.reverse();
@@ -1043,17 +1053,40 @@ fn resolve_tree_states(
     Ok(states)
 }
 
+/// One change's contribution to a tree replay: its identity, which names it
+/// in an error, and its tree deltas.
+type TreeHistoryStep = (SemanticChangeId, Vec<crate::change::TreeDelta>);
+
+/// Take every change's tree deltas out of `history`, leaving the changes
+/// otherwise intact for a graph replay, which never reads them.
+fn take_tree_history(history: &mut [SemanticChange]) -> Vec<TreeHistoryStep> {
+    history
+        .iter_mut()
+        .map(|change| (change.id, std::mem::take(&mut change.tree_deltas)))
+        .collect()
+}
+
 fn replay_tree<I>(changes: I) -> std::result::Result<ResolvedTree, ModelError>
 where
     I: IntoIterator<Item = SemanticChange>,
 {
+    replay_tree_history(
+        changes
+            .into_iter()
+            .map(|change| (change.id, change.tree_deltas)),
+    )
+}
+
+fn replay_tree_history<I>(steps: I) -> std::result::Result<ResolvedTree, ModelError>
+where
+    I: IntoIterator<Item = TreeHistoryStep>,
+{
     let mut tree = ResolvedTree::default();
 
-    for change in changes {
-        tree = tree.apply(&change.tree_deltas).map_err(|error| {
+    for (change_id, tree_deltas) in steps {
+        tree = tree.apply(&tree_deltas).map_err(|error| {
             ModelError::Conflict(format!(
-                "invalid repository tree transition in change {}: {error}",
-                change.id
+                "invalid repository tree transition in change {change_id}: {error}"
             ))
         })?;
     }
@@ -2499,7 +2532,7 @@ mod tests {
     };
     use crate::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
     use crate::timestamp::Timestamp;
-    use crate::{ArtifactId, RepoPath};
+    use crate::{alloc_probe, ArtifactId, RepoPath};
 
     fn make_change_id(byte: u8) -> SemanticChangeId {
         SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
@@ -2668,6 +2701,180 @@ mod tests {
             ModelError::ChangeNotFound(id) => assert_eq!(id, expected.to_string()),
             other => panic!("expected missing-change error, got {other}"),
         }
+    }
+
+    /// A one-change history `width` entities and artifacts wide, the shape a
+    /// one-commit import replays.
+    fn wide_history_change(head: SemanticChangeId, width: u128) -> SemanticChange {
+        let entity_deltas = (0..width)
+            .map(|index| EntityDelta::Added {
+                new: make_entity(
+                    EntityId(uuid::Uuid::from_u128(1 + index)),
+                    &format!("entity_{index}"),
+                ),
+            })
+            .collect();
+        let mut change = make_semantic_change(head, vec![], entity_deltas, vec![]);
+        change.tree_deltas = (0..width)
+            .map(|index| TreeDelta::Added {
+                artifact_id: ArtifactId(uuid::Uuid::from_u128(10_000 + index)),
+                new: LocatedEntry::new(
+                    repo_path(&format!("src/file_{index}.rs")),
+                    TreeEntry::blob(Hash256::from_bytes([index as u8; 32]), false),
+                ),
+            })
+            .collect();
+        change
+    }
+
+    /// The resolution as it stood before its clones were removed, kept
+    /// verbatim so the saving can be measured against it: the store's copy is
+    /// cloned again to be kept, and the kept history is cloned whole because
+    /// the graph replay consumed it before the tree replay could read it.
+    fn reference_resolve_graph_at(
+        store: &HistoryStore,
+        head: &SemanticChangeId,
+    ) -> ResolvedGraphState {
+        let mut reverse_history = Vec::new();
+        let mut current = Some(*head);
+        while let Some(change_id) = current {
+            let change = store.get_change(&change_id).unwrap().unwrap();
+            reverse_history.push(change.clone());
+            current = change.parents.first().copied();
+        }
+        reverse_history.reverse();
+        let mut state = replay_graph_state(reverse_history.clone()).unwrap();
+        state.tree = replay_tree(reverse_history).unwrap();
+        state
+    }
+
+    /// Resolving a graph keeps the one copy of the history the store hands
+    /// over and makes no other.
+    ///
+    /// Priced against the history's own clone so there is no constant to
+    /// drift, in both of the probe's currencies. Bytes requested see every
+    /// copy, including the one the lineage walk used to make and drop before
+    /// the replay; peak live bytes see the copy that used to sit beside the
+    /// replay at its peak. Two copies were removed, so the saving must be
+    /// about two histories requested and about one history at the peak.
+    #[test]
+    fn resolving_a_graph_does_not_copy_the_history_it_replays() {
+        let head = make_change_id(250);
+        let change = wide_history_change(head, 1_024);
+        let store = HistoryStore::from_changes([change.clone()]);
+
+        // Warm any lazily-initialized state so it is not charged to one arm.
+        store.resolve_graph_at(&head).unwrap();
+        reference_resolve_graph_at(&store, &head);
+
+        let history = alloc_probe::measure(|| {
+            let copy = vec![change.clone()];
+            std::hint::black_box(&copy);
+        });
+        let cloning = alloc_probe::measure(|| {
+            let state = reference_resolve_graph_at(&store, &head);
+            std::hint::black_box(&state);
+        });
+        let resolving = alloc_probe::measure(|| {
+            let state = store.resolve_graph_at(&head).unwrap();
+            std::hint::black_box(&state);
+        });
+        println!(
+            "history requested {} peak {} | cloning requested {} peak {} | resolving requested {} \
+             peak {}",
+            history.requested,
+            history.peak_live,
+            cloning.requested,
+            cloning.peak_live,
+            resolving.requested,
+            resolving.peak_live
+        );
+        assert!(
+            history.requested > 0 && cloning.requested > 0 && resolving.requested > 0,
+            "the allocation probe measured nothing, so it cannot fail"
+        );
+
+        // Both resolutions still answer the same state.
+        let resolved = store.resolve_graph_at(&head).unwrap();
+        let reference = reference_resolve_graph_at(&store, &head);
+        assert_eq!(resolved.entities, reference.entities);
+        assert_eq!(resolved.relations, reference.relations);
+        assert_eq!(resolved.tree, reference.tree);
+        assert_eq!(
+            resolved.entity_revisions.len(),
+            reference.entity_revisions.len()
+        );
+        assert_eq!(resolved.entity_revisions.len(), 1_024);
+
+        let saved = cloning.requested.saturating_sub(resolving.requested);
+        assert!(
+            saved * 4 >= history.requested * 7,
+            "resolving requested {} bytes against the cloning reference's {}, a saving of {} \
+             where removing two copies of a {}-byte history should save about {}; a history \
+             clone is back",
+            resolving.requested,
+            cloning.requested,
+            saved,
+            history.requested,
+            history.requested * 2
+        );
+        let saved_at_peak = cloning.peak_live.saturating_sub(resolving.peak_live);
+        assert!(
+            saved_at_peak * 4 >= history.peak_live * 3,
+            "resolving peaked at {} live bytes against the cloning reference's {}, a saving of \
+             {} where the copy removed from beside the replay costs {}; the whole-history \
+             clone ahead of the replay is back",
+            resolving.peak_live,
+            cloning.peak_live,
+            saved_at_peak,
+            history.peak_live
+        );
+    }
+
+    /// The graph replay still runs ahead of the tree replay, so a history
+    /// that is invalid both ways reports the error it always reported.
+    #[test]
+    fn a_history_invalid_both_ways_still_reports_the_graph_error_first() {
+        let head = make_change_id(251);
+        let entity = make_entity(EntityId(uuid::Uuid::from_u128(77)), "phantom");
+        let mut revised = entity.clone();
+        revised.name = "phantom_revised".into();
+        let mut change = make_semantic_change(
+            head,
+            vec![],
+            vec![EntityDelta::Modified {
+                old: entity,
+                new: revised,
+            }],
+            vec![],
+        );
+        change.tree_deltas = vec![TreeDelta::Removed {
+            artifact_id: ArtifactId(uuid::Uuid::from_u128(78)),
+            old: LocatedEntry::new(
+                repo_path("never-added"),
+                TreeEntry::blob(Hash256::from_bytes([1; 32]), false),
+            ),
+        }];
+        let store = HistoryStore::from_changes([change]);
+
+        let error = store.resolve_graph_at(&head).unwrap_err().to_string();
+        assert!(
+            error.contains("stale old payload for entity"),
+            "expected the graph replay's refusal, got: {error}"
+        );
+        assert!(
+            !error.contains("tree transition"),
+            "the tree replay answered ahead of the graph replay: {error}"
+        );
+
+        // The control: the tree half is invalid on its own, so the order
+        // above is a decision and not an accident of a valid tree.
+        let tree_error = store.resolve_tree_at(&head).unwrap_err().to_string();
+        assert!(
+            tree_error.contains("invalid repository tree transition"),
+            "the tree half of the fixture is not invalid, so this test cannot see order: \
+             {tree_error}"
+        );
     }
 
     #[test]

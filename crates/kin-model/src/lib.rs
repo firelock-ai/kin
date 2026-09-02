@@ -35,6 +35,8 @@
 //! wrongly.
 
 pub mod admission;
+#[cfg(test)]
+pub(crate) mod alloc_probe;
 pub mod branch;
 pub(crate) mod canonical_ser;
 pub mod change;
