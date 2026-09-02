@@ -113,6 +113,11 @@ EXPECTED_SUITES = (
         "acceptance/first_query.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/mcp_spawn_admission_repro.py",
+        "mcp_spawn",
+        "acceptance/mcp_spawn.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/verdict_limits_repro.py",
         "verdict_limits",
         "acceptance/verdict_limits.json",
