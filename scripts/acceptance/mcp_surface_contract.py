@@ -212,6 +212,16 @@ def grade_served_names_are_registered(listing, registry):
     return []
 
 
+def listing_bytes(listing):
+    """The bytes a client reads off the pipe.
+
+    Compact, the way serde writes it, with no separators of Python's own.
+    `json.dumps` defaults insert `", "` and `": "` and read 4.5 percent high on
+    this listing: 34,470 against the 32,976 the wire carries.
+    """
+    return len(json.dumps(listing, separators=(",", ":"), sort_keys=True))
+
+
 def grade_query_profile(query, default):
     """The query profile serves its exact set, no write tool, and far fewer bytes."""
     tools = query.get("tools")
@@ -236,8 +246,8 @@ def grade_query_profile(query, default):
     if not isinstance(baseline, list) or not baseline:
         problems.append("agent-default listed no tools, so there is nothing to measure against")
         return problems
-    query_bytes = len(json.dumps(query, sort_keys=True))
-    default_bytes = len(json.dumps(default, sort_keys=True))
+    query_bytes = listing_bytes(query)
+    default_bytes = listing_bytes(default)
     if query_bytes * 100 > default_bytes * AGENT_QUERY_LIST_CEILING_PERCENT:
         problems.append(
             "agent-query's tools/list is %d bytes against agent-default's %d (%d%%), over "
@@ -609,9 +619,9 @@ def run_checks(suite, verbose=False):
             "agent-query served %d tools in %d bytes against agent-default's %d in %d"
             % (
                 len(query.get("tools") or []),
-                len(json.dumps(query, sort_keys=True)),
+                listing_bytes(query),
                 len(served.get("tools") or []),
-                len(json.dumps(served, sort_keys=True)),
+                listing_bytes(served),
             ),
         )
         if AGENT_QUERY_PROFILE not in (query_stderr or ""):

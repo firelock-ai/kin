@@ -59,13 +59,13 @@ use crate::types::ToolsListResult;
 
 /// The most characters one `agent-default` description may carry.
 ///
-/// 520 is roughly two sentences of technical prose. It is a budget rather than a
+/// 265 is roughly two sentences of technical prose. It is a budget rather than a
 /// target: several tools here are shorter, and none should need more, because a
 /// description longer than this is documentation, and documentation belongs in
 /// the `full` profile where a reader has the room for it.
 /// `no_agent_default_description_exceeds_its_budget` below fails on any tool
 /// that exceeds it.
-pub const AGENT_DEFAULT_DESCRIPTION_BUDGET: usize = 520;
+pub const AGENT_DEFAULT_DESCRIPTION_BUDGET: usize = 265;
 
 /// The whole profile's description budget.
 ///
@@ -223,156 +223,89 @@ pub fn apply_belt_defaults(name: &str, arguments: &mut HashMap<String, serde_jso
 /// table has one key per tool and the rename stays a serving concern.
 fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
-        // ── Retrieval: the four questions an agent actually arrives with ──
-        (
-            "semantic_locate",
-            "Find the code behind a plain-language question, ranked from the graph. Call this when \
-             you know what the code does but not what it is called. Returns each hit's entity_id, \
-             name, kind, file, line, signature and score. Read `ranked_by` first: with no \
-             embeddings the ranking is lexical, so a plain word of your question can match a \
-             symbol of that name and crowd the first rows. If you already know the exact symbol \
-             name, call semantic_search instead.",
-        ),
-        (
-            DECLARATION_FILTER_CANONICAL,
-            "Filter declarations by name, kind or language: functions, methods, classes, structs, \
-             traits, enums, types and constants the graph already parsed. Call this when you know \
-             what the thing is called, or want every class in one language. It matches names, not \
-             meaning, and does not rank by your query. Returns id, name, kind, language, file and \
-             line range per match, plus the total. For a description rather than a name, call \
-             semantic_locate.",
-        ),
-        (
-            "list_file_entities",
-            "List every entity the graph holds for one file, given a repo-relative path. This is \
-             the only retrieval tool that can say what it left out: it returns the whole set and \
-             reports whether that set is complete, where a ranked tool cannot. Call it for \"what \
-             is in this file\" and before concluding a file contains nothing.",
-        ),
-        (
-            "kin_graph_status",
-            "Report the graph this call is answered from: entity and relation counts, and how many \
-             entities are embedded, pending or unindexed. Call it first when a search returns less \
-             than you expect, since an unembedded graph cannot rank by meaning. On a store under \
-             continuous reconcile it can answer `sampling=last_settled_selected_graph` instead of a \
-             live one: the same counters as of the last settled reading, with a `stale` block \
-             giving that reading's age. Read `sampling` to tell the two apart.",
-        ),
-        // ── Walking: the chain question, and where it is answered ──
-        (
-            "trace_data_flow",
-            "Walk the call chain out from one entity and get the whole path back in one call, as \
-             an ordered list of steps. Call it when you name ONE thing and ask what it reaches or \
-             what reaches it: give it a focal entity_id, a direction and a depth. It walks call \
-             and import edges, so it does not follow a value through a variable. When your question \
-             names TWO things and asks how one reaches the other, call trace_path instead.",
-        ),
-        (
-            crate::handlers::path::TOOL_NAME,
-            "Find how one entity reaches another and get the routes back as ordered hops. Call it \
-             when your question names TWO things: how does A reach B. Takes `from` and `to`, each an \
-             exact name, an entity id, or name@file to pin a twin. Every hop carries id, name, kind, \
-             file, line and the relation into the next. Read `found` and `gap` before concluding A \
-             never reaches B; a class stands for its members. For one endpoint, call \
-             trace_data_flow.",
-        ),
         (
             "find_references",
-            "Find who depends on one entity: its direct callers, importers and references, one row \
-             per referencing entity with that caller's id, name, kind, file and the lines it \
-             references from. Call it for \"what breaks if I change this\" at one hop. For a whole \
-             chain rather than one hop, call trace_data_flow.",
-        ),
-        (
-            "graph_neighborhood",
-            "Get what one entity depends on and what depends on it, out to a depth you choose, as \
-             lightweight summaries with ids. Call it to orient around unfamiliar code. Use \
-             find_references when you want callers only, and trace_data_flow when you want an \
-             ordered path rather than a neighborhood.",
-        ),
-        (
-            "impact_analysis",
-            "Walk the graph from a change to every entity it could affect. Target it one way at a \
-             time: entity_ids, file paths, base and head change ids, or change_ids. Call it before \
-             editing, to answer \"what breaks if I change this\" across the repository rather than \
-             at one hop.",
-        ),
-        // ── Reading ──
-        (
-            "get_entity_source",
-            "Return one entity's exact implementation body by entity_id, from graph-owned truth, \
-             with its name, kind, language, file, line range and signature. This is how you read \
-             the code once any other tool has handed you an id.",
+            "Find who depends on one entity: direct callers, importers and references, one row each with id, name, kind, file and the lines it references from. Call it for one hop. For a whole chain, use trace_data_flow.",
         ),
         (
             "get_context_pack",
-            "Assemble a ready-to-read bundle around one entity, fitted to a token budget: the \
-             focal body plus the signatures of what it depends on, and optionally its tests and \
-             transitive dependencies. Call it when you are about to change an entity and want its \
-             surroundings in one call instead of several get_entity_source reads.",
+            "Assemble a bundle around one entity within a token budget: the focal body plus the signatures of what it depends on, optionally its tests and transitive dependencies. Call it instead of several get_entity_source reads.",
+        ),
+        (
+            "get_entity_source",
+            "Return one entity's exact graph-owned body by id. Call it when you hold an id and need the real source text, not a snippet.",
+        ),
+        (
+            "graph_neighborhood",
+            "Get what one entity depends on and what depends on it, to a depth you choose, as summaries with ids. Call it to orient in unfamiliar code. Use find_references for callers only, trace_data_flow for an ordered path.",
+        ),
+        (
+            "impact_analysis",
+            "Walk the graph from a change to every entity it could affect. Target it one way at a time: entity_ids, file paths, base and head change ids, or change_ids. Call it before editing, across the whole repository.",
         ),
         (
             "kin_artifact_list",
-            "List the repository's tracked files at one semantic change, code and non-code alike: \
-             Dockerfiles, lockfiles, configuration, assets, symlinks and unsupported languages. \
-             Call it to answer what the repository contains, rather than what the parsers turned \
-             into entities.",
+            "List the repository's tracked files at one semantic change, code and non-code alike: Dockerfiles, lockfiles, configuration, assets, symlinks. Call it for what the repository contains, not what the parsers turned into entities.",
         ),
         (
             "kin_artifact_read",
-            "Read one tracked file's exact bytes by artifact_id or repo-relative path, returned as \
-             base64 and, when it is valid UTF-8, as text. Call it for a file the parsers produced \
-             no entities for, which is what a locate hit carrying artifact_path instead of \
-             entity_id means.",
+            "Read one tracked file's exact bytes by artifact_id or repo-relative path, as base64 and, when valid UTF-8, as text. Call it for a file the parsers made no entities for, which a locate hit's artifact_path means.",
+        ),
+        (
+            "kin_graph_status",
+            "The graph this call is answered from: entity and relation counts, and how many are embedded, pending or unindexed. Call it when a search returns less than you expect. `sampling=last_settled_selected_graph` means the last settled reading, aged in `stale`.",
         ),
         (
             "kin_provenance_query",
-            "Answer who changed an entity and whether it was approved: its change count, latest \
-             change, approvals on that change, a page of its changes newest first, and recent \
-             audit events. Call it before relying on code whose history matters.",
-        ),
-        // ── Sessions ──
-        (
-            "kin_session_start",
-            "Register this agent with Kin and get a session_id: who you are, your transport, \
-             working directory and capabilities. Call it once at the start of your work, before \
-             any transaction, so activity is attributed and other agents can see your presence.",
-        ),
-        (
-            "kin_session_heartbeat",
-            "Keep a session marked alive. Call it periodically during long work so Kin does not \
-             treat the session as stale and release what it holds.",
+            "Answer who changed an entity and whether it was approved: change count, latest change, approvals on it, a page of changes newest first, and recent audit events. Call it before relying on code whose history matters.",
         ),
         (
             "kin_session_end",
-            "End a session and release everything it held, freeing its intents so other agents are \
-             no longer warned off those scopes. Call it when your work finishes.",
-        ),
-        // ── Writing ──
-        (
-            "kin_transaction_begin",
-            "Open a repository mutation transaction and get a transaction_id. Call it before \
-             staging any change. Nothing is written until kin_transaction_commit.",
+            "Close this session and release what it holds. Call it when your work is done.",
         ),
         (
-            "kin_transaction_stage",
-            "Stage one or more mutations onto an open transaction. Four verbs: 'create' admits a \
-             file the graph has never seen, 'update' changes an entity inside one it holds, \
-             'delete' retires one, 'rename' moves one. An 'update' replaces the entity's whole \
-             body, so read the current one with get_entity_source first rather than guessing it.",
+            "kin_session_heartbeat",
+            "Keep this session alive. Call it periodically during long work so the session does not lapse at its idle TTL.",
         ),
         (
-            "kin_transaction_commit",
-            "Publish every staged mutation atomically: the daemon reparses the final bytes and \
-             journals the semantic change, the workspace tree and the ref together. All of it \
-             lands or none of it does. Re-sending a fenced commit is safe and reports whether it \
-             already landed.",
+            "kin_session_start",
+            "Register this agent with Kin and get a session_id: who you are, your transport, working directory and capabilities. Call it once at the start of your work, before any transaction, so activity is attributed.",
         ),
         (
             "kin_transaction_abort",
-            "Abandon an open transaction and discard everything staged on it. Call it when you \
-             decide against a change, or to start clean after a refusal. Refused once \
-             kin_transaction_commit has fenced the transaction; re-send the commit instead.",
+            "Abandon an open transaction and discard everything staged on it. Call it when you decide against a change, or to start clean after a refusal. Refused once kin_transaction_commit has fenced it.",
+        ),
+        (
+            "kin_transaction_begin",
+            "Open a transaction to stage mutations onto. Returns a transaction_id; nothing lands until kin_transaction_commit.",
+        ),
+        (
+            "kin_transaction_commit",
+            "Publish every staged mutation atomically: the daemon reparses the final bytes and journals the semantic change, the workspace tree and the ref together. All of it lands or none does. Re-sending a fenced commit is safe.",
+        ),
+        (
+            "kin_transaction_stage",
+            "Stage mutations onto an open transaction. Four verbs: 'create' admits a file the graph has never seen, 'update' changes an entity, 'delete' retires one, 'rename' moves one. An 'update' replaces the whole body; read it first with get_entity_source.",
+        ),
+        (
+            "list_file_entities",
+            "List every entity the graph holds for one file, by repo-relative path. The only retrieval tool that says what it left out: it returns the whole set and reports whether it is complete. Call it before concluding a file holds nothing.",
+        ),
+        (
+            "semantic_locate",
+            "Find code by a plain-language question, ranked from the graph. Call it when you know what the code does but not its name. Returns id, name, kind, file, line, signature, score. Read `ranked_by`. Know the exact name? Use semantic_search.",
+        ),
+        (
+            DECLARATION_FILTER_CANONICAL,
+            "Filter declarations by name, kind or language: functions, methods, classes, structs, traits, enums, types, constants. Call it when you know what the thing is called. It matches names, not meaning. For a description, use semantic_locate.",
+        ),
+        (
+            "trace_data_flow",
+            "Walk the call chain out from ONE entity and get the whole path back, as ordered steps. Give a focal, a direction and a depth. It walks call and import edges, not values through variables. Naming TWO things? Use trace_path.",
+        ),
+        (
+            "trace_path",
+            "Find how one entity reaches another, as ordered hops. Call it when your question names TWO things. `from` and `to` take a name, an id, or name@file. Read `found` and `gap` before concluding A never reaches B. One endpoint? Use trace_data_flow.",
         ),
     ])
 }
@@ -641,13 +574,13 @@ fn apply_belt_schema_defaults(tool: &str, schema: &mut serde_json::Value) {
 /// characters, and one of them, `max_chars`, carried the same 649 characters on
 /// seven different tools.
 ///
-/// 200 is one plain clause. A property description exists to tell a model what
+/// 90 is one plain clause. A property description exists to tell a model what
 /// to pass, and the shape, bounds and default are already machine-readable
 /// beside it in `type`, `enum`, `minimum`, `maximum` and `default`, so prose
 /// that restates them is paid for twice.
 /// `no_agent_default_property_description_exceeds_its_budget` fails on any
 /// property over it.
-pub const AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET: usize = 200;
+pub const AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET: usize = 90;
 
 /// The tools whose schemas this module does not rewrite at all.
 ///
@@ -669,20 +602,19 @@ fn shared_property_descriptions() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         (
             "max_chars",
-            "Serialized characters this response may occupy. What the budget cut is named under \
-             `elisions` and `_kin.response`, and a list it cut keeps one entry, so an empty list \
-             means none were found.",
+            "Serialized characters this response may occupy; what was cut is named in `elisions`.",
         ),
         (
             "max_response_chars",
-            "Serialized characters this response may occupy. `max_chars` is the same parameter \
-             under the other retrieval tools' name. A cut chain keeps one step and reports the \
-             rest under `elisions.chain`.",
+            "Serialized characters this response may occupy; the same parameter as `max_chars`.",
         ),
         (
             "cursor",
-            "Opaque token from a prior result's `next_cursor`, returning the next page of the \
-             same collection. Pass it back unedited, and omit it for a fresh query.",
+            "Opaque token from a prior result's `next_cursor`. Pass it back unedited.",
+        ),
+        (
+            "session_id",
+            "Owning session UUID. In enforce mode it must match the authenticated caller.",
         ),
     ])
 }
@@ -697,35 +629,55 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
     BTreeMap::from([
         (
             ("semantic_locate", "include_tests"),
-            "Rank test-role entities alongside source. Off by default unless your query itself \
-             reads as being about tests; what it withheld is counted under \
-             `semantic_coverage.graph_bodies`.",
+            "Rank test-role entities alongside source. Off unless your query is about tests.",
+        ),
+        (
+            ("semantic_locate", "limit"),
+            "Max ranked rows per page: entities, or files at file granularity. Default 20.",
         ),
         (
             ("list_file_entities", "path"),
-            "Repository-relative path of the file to enumerate, such as \"lib/express.js\". No \
-             leading slash, no \"..\", no Kin or Git control component. Optional only when \
-             `cursor` names the file.",
+            "Repo-relative file path, no leading slash and no \"..\". Optional when `cursor` names it.",
+        ),
+        (
+            ("list_file_entities", "page_size"),
+            "Entities per page (default 200, 1..1000). `total_in_file` is the whole-file count.",
         ),
         (
             ("trace_data_flow", "target"),
-            "A symbol you are trying to reach, by exact name or UUID. Neighbours it stays \
-             reachable from survive the per-step cap first. Optional; one resolving to nothing \
-             is reported in degradations.",
+            "A symbol to reach, by exact name or UUID. Its branch survives the per-step cap first.",
         ),
         (
             ("trace_data_flow", "include_body"),
-            "Inline each step's source body. Pass false for the SHAPE of the chain, which is a \
-             fraction of the size and is what you want unless you mean to read the code.",
+            "Inline each step's source. False gives the chain's shape at a fraction of the size.",
         ),
         (
             ("trace_data_flow", "direction"),
             "Which way to walk: `calls` for callees, `callers` for callers, `both` merges.",
         ),
         (
+            ("trace_path", "direction"),
+            "`forward`: from reaches to. `reverse`: the other way. `either` (default) tries both.",
+        ),
+        (
+            ("trace_path", "max_depth"),
+            "Hops between the two ends (default 6, ceiling 12). Containment hops are not counted.",
+        ),
+        (
+            ("trace_path", "limit"),
+            "Routes returned, shortest first (default 3, ceiling 25). See `routes_total`.",
+        ),
+        (
+            ("trace_path", "from_file"),
+            "Pin `from` to the entity of that name in this file. Same as the name@file spelling.",
+        ),
+        (
+            ("find_references", "relation_kinds"),
+            "Filter to calls, imports or references. Defaults to all three.",
+        ),
+        (
             ("graph_neighborhood", "direction"),
-            "Which way to walk: `out` for what the focal depends on, `in` for what depends on it \
-             (blast radius), `both` merges.",
+            "`out` for what the focal depends on, `in` for what depends on it, `both` merges.",
         ),
     ])
 }
@@ -754,7 +706,17 @@ fn shorten_property_descriptions(tool: &str, schema: &mut serde_json::Value) {
         let (Some(short), Some(property)) = (short, property.as_object_mut()) else {
             continue;
         };
-        if property.contains_key("description") {
+        // Only when it is actually shorter. A "short form" table keyed by
+        // property name meets the same name on tools whose registered
+        // description is already one clause, and replacing those made three
+        // tools BIGGER when this table grew: `kin_transaction_begin` by 41
+        // bytes, `kin_session_end` and `kin_session_heartbeat` by 64 each. A
+        // trim that can lengthen its subject is not a trim, and the arithmetic
+        // hid it because the total still fell.
+        let Some(existing) = property.get("description").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if short.len() < existing.len() {
             property.insert(
                 "description".to_string(),
                 serde_json::Value::String((*short).to_string()),
