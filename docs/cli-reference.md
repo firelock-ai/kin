@@ -8,7 +8,7 @@ Kin is pre-1.0 and the command surface moves. Where this page and your build dis
 
 Descriptions are the command's own help text. A `--json` flag switches that command to machine-readable output. Angle brackets mark a required argument, square brackets an optional one, and a trailing `...` an argument that takes the rest of the line.
 
-82 commands are documented below. 4 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `semantic-only-guard`) are hidden from `kin --help` because they exist for benchmark and internal orchestration, and they are not part of the supported surface.
+83 commands are documented below. 4 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `semantic-only-guard`) are hidden from `kin --help` because they exist for benchmark and internal orchestration, and they are not part of the supported surface.
 
 `kin capabilities` prints the readiness matrix for the Git-replacement command set, and `kin capabilities --json` gives the same inventory to a machine. Reach for it before scripting against a command you have not used.
 
@@ -2251,6 +2251,36 @@ kin graph body <entity> [options]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--json` |  | Output machine-readable JSON |
+
+#### `kin graph export`
+
+Export the drawable projection of the live graph as JSON. Reads the daemon's live graph, projects it to nodes and links, and samples it server side so every consumer draws the same picture. The payload contract is `graph-export.schema.json` in `packages/boundary-contracts`; `docs/graph-feed.md` explains the sampling rule and how to pair an export with `kin graph watch`.
+
+```
+kin graph export [options]
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--limit <n>` | `1400` | Cap the exported node count, sampled by degree with per-module quotas. `0` exports every entity |
+| `--kinds <kinds>` |  | Keep only these entity kinds, comma-separated (`function,class`). Any spelling of a kind name matches |
+| `--path <prefix>` |  | Keep only entities whose file starts with this repository path prefix |
+| `--include <fields>` |  | Attach optional node fields, comma-separated (`signature,line`) |
+| `--out <file>` |  | Write the payload to this file instead of stdout |
+| `--json` |  | Print the payload instead of a one-line summary |
+
+#### `kin graph watch`
+
+Follow live graph changes, one event per line. Streams the daemon's graph delta events for as long as it runs. `--json` makes it NDJSON, one event object per line, ready to pipe. The frame contract is `graph-event.schema.json` in `packages/boundary-contracts`.
+
+```
+kin graph watch [options]
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--types <types>` |  | Keep only these event types, comma-separated (`EntityChanged,RelationChanged`) |
+| `--json` |  | Output NDJSON, one event object per line |
 
 #### `kin graph viz`
 
