@@ -8038,6 +8038,95 @@ async fn search(
     Ok(Json(result))
 }
 
+/// Turn a `get_context_pack` call's names and question into focal entities
+/// before the pack builder sees it.
+///
+/// The identity resolver lives in kin-cli, which kin-mcp cannot reach, so this
+/// is where a name becomes an entity. Names are resolved first and in the
+/// caller's order, because a name is a stronger claim than a ranking's
+/// suggestion, and each resolved entry carries how it was resolved so the
+/// pack's method line can still say.
+///
+/// Leaves an argument in place when nothing resolved it, so the builder refuses
+/// over it. That is deliberate: a name the graph does not carry and a name
+/// nobody tried to resolve are different failures, and quietly dropping the
+/// field would report the first as the second.
+fn resolve_context_pack_focals(
+    graph: &kin_db::InMemoryGraph,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    let mut arguments = arguments.clone();
+    let limit = arguments
+        .get("max_focals")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(kin_cli::commands::context::QUESTION_FOCAL_MAX as u64)
+        .clamp(1, 32) as usize;
+    let mut focals: Vec<serde_json::Value> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+
+    let named: Vec<String> = arguments
+        .get("entities")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    for token in &named {
+        let Ok(Some(entry)) = kin_cli::commands::context::resolve_focal_for_mcp(graph, token)
+        else {
+            continue;
+        };
+        let id = entry
+            .get("entity_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if id.is_empty() || seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        focals.push(entry);
+    }
+    if !named.is_empty() && !focals.is_empty() {
+        arguments.remove("entities");
+    }
+
+    let question = arguments
+        .get("question")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if let Some(question) = question {
+        if let Ok((ranked, coverage)) =
+            kin_cli::commands::context::question_focals(graph, &question, limit)
+        {
+            arguments.insert("coverage".to_string(), json!(coverage));
+            for hit in ranked {
+                if focals.len() >= limit || seen.contains(&hit.entity_id) {
+                    continue;
+                }
+                seen.push(hit.entity_id.clone());
+                focals.push(json!({
+                    "entity_id": hit.entity_id,
+                    "score": hit.score,
+                    "route": "question",
+                }));
+            }
+            if !focals.is_empty() {
+                arguments.remove("question");
+            }
+        }
+    }
+
+    if !focals.is_empty() {
+        focals.truncate(limit);
+        arguments.insert("question_focals".to_string(), json!(focals));
+    }
+    arguments
+}
+
 /// POST /context — build context packs against daemon-owned graph state.
 async fn context(
     headers: axum::http::HeaderMap,
@@ -13519,7 +13608,40 @@ async fn mcp_tools_call_inner(
         ))
     } else {
         let repository_authority = mcp_repository_authority_source(&state);
-        let handled = if request.name == "find_references" {
+        let handled = if request.name == "get_context_pack"
+            && (request
+                .arguments
+                .get("question")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|question| !question.trim().is_empty())
+                || request
+                    .arguments
+                    .get("entities")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|entities| !entities.is_empty()))
+        {
+            // The identity resolver and the ranking live in kin-cli, the pack
+            // builder in kin-mcp, and this is the one layer holding all three.
+            // Names and questions are both turned into focal entities here, so
+            // the builder is handed entities rather than being asked to resolve
+            // or to rank, and so either argument reaching the builder still raw
+            // means what it means everywhere else: no daemon.
+            match repository_authority {
+                Ok(repository_authority) => {
+                    let arguments = resolve_context_pack_focals(graph.as_ref(), &request.arguments);
+                    kin_mcp::handlers::handle_tool_call(
+                        &request.name,
+                        &arguments,
+                        graph.as_ref(),
+                        &sessions,
+                        kin_mcp::SessionAuthorityMode::OfflineFallback,
+                        repository_authority.as_ref(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        } else if request.name == "find_references" {
             mcp_find_references_with_stable_authority(
                 &state,
                 session_id.as_ref(),

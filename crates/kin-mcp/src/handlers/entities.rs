@@ -747,6 +747,18 @@ same-file candidates there were and how many were dropped to fit. Read `edge_cov
 and the response's `negative` verdict before acting on an EMPTY `dependents`: a graph \
 that does not link this language's calls across files returns the same `[]` for a symbol \
 with twenty callers as for one with none. \
+A question that names several things takes several focals: pass `entities` \
+with their names or ids, or pass `question` and let Kin's own ranking pick them. The pack \
+then carries every focal, the graph route between connected focals BEFORE either focal's \
+neighborhood, and each neighborhood water-filled into what remains, so a short one never \
+holds budget a long one needed. Reach for it whenever the answer lives between two things \
+rather than around one: \"when I type a character, how does it reach the document\" is \
+answered by the chain, and a pack built for either end alone answers a different question. \
+This shape returns `method`, one sentence naming each focal, how it resolved, and what it \
+contributed; `routes`, the entities between each connected pair; `route_search.bounded`, \
+true when a search stopped at its bound so an absent route is not evidence there is none; \
+and `measured_tokens`, what the rendered pack costs, which is never above `token_budget` \
+because rows are dropped until it is not. \
 If get_entity_source is available to you it is cheaper for a raw \
 body alone; if you need to follow an actual call chain step by step, use trace_data_flow.";
 
@@ -760,6 +772,14 @@ pub fn handle_get_context_pack<G: GraphStore>(
         build_context_pack_with_traffic_and_provenance, ContextOptions, DependencyRelation,
     };
     use kin_model::context::TokenBudget;
+
+    // Several focals, or a question the daemon already resolved into them, take
+    // the multi-focal assembler. A call naming only `entity_id` keeps this
+    // handler's original path and its original payload, so nothing reading
+    // today's shape moves under it.
+    if let Some(result) = multi_focal_pack_result(args, store)? {
+        return Ok(result);
+    }
 
     let id_str = get_string_param(args, "entity_id")?;
     let entity_id = parse_entity_id(&id_str)?;
@@ -1199,6 +1219,240 @@ pub fn handle_get_context_pack<G: GraphStore>(
 
     let json = serialize_with_measured_tokens(&mut result)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// The token budget a pack request names, in the tiers the builder takes.
+fn pack_token_budget(args: &HashMap<String, serde_json::Value>) -> kin_model::context::TokenBudget {
+    use kin_model::context::TokenBudget;
+    match get_optional_u64(args, "token_budget", 16000) as usize {
+        0..=8000 => TokenBudget::Small8k,
+        8001..=16000 => TokenBudget::Medium16k,
+        16001..=32000 => TokenBudget::Large32k,
+        n => TokenBudget::Custom(n),
+    }
+}
+
+/// Build a multi-focal pack when the call asks for one, and report `None` when
+/// it does not so the single-focal path runs untouched.
+///
+/// `entities` and `question` are both resolved before this handler is reached,
+/// by the daemon, which is the only layer holding the identity resolver, the
+/// ranking and this builder at once. The resolver lives in kin-cli beside the
+/// commands that share it, and kin-mcp cannot reach kin-cli; rather than keep a
+/// second copy here, the daemon hands this handler entity ids and this handler
+/// resolves nothing. An `entities` or `question` argument arriving here still
+/// unresolved therefore means what it means on every other ranked surface,
+/// there is no daemon, and it is reported that way rather than answered with a
+/// narrower pack.
+fn multi_focal_pack_result<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<Option<ToolCallResult>> {
+    use kin_context::FocalResolution;
+
+    let named: Vec<String> = args
+        .get("entities")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let ranked = args
+        .get("question_focals")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let question = get_optional_string_param(args, "question");
+
+    let asked_by_name = !named.is_empty();
+    let asked_by_question = question
+        .as_deref()
+        .is_some_and(|question| !question.trim().is_empty());
+
+    if ranked.is_empty() && (asked_by_name || asked_by_question) {
+        // The daemon resolves both forms before this point, so reaching here
+        // with either one still in its raw form means no daemon resolved it.
+        let what = if asked_by_question {
+            "a question"
+        } else {
+            "entities by name"
+        };
+        return Ok(Some(ToolCallResult::error(format!(
+            "get_context_pack cannot resolve {what} without the Kin daemon: name and question \
+             resolution run against the daemon's live graph and index, which are unavailable in \
+             offline mode. Start the repo daemon and retry, or pass entity ids."
+        ))));
+    }
+    if ranked.is_empty() {
+        return Ok(None);
+    }
+
+    let mut ids: Vec<kin_model::ids::EntityId> = Vec::new();
+    let mut resolutions: Vec<FocalResolution> = Vec::new();
+    let mut unresolved: Vec<serde_json::Value> = Vec::new();
+
+    // A caller may name `entity_id` and `entities` together; the single id
+    // leads, because it is the more specific claim.
+    if let Some(id_str) = get_optional_string_param(args, "entity_id") {
+        let entity_id = parse_entity_id(&id_str)?;
+        if let Some(entity) = store.get_entity(&entity_id).map_err(McpError::graph)? {
+            ids.push(entity.id);
+            resolutions.push(FocalResolution::by_id(id_str));
+        } else {
+            unresolved.push(serde_json::json!({ "query": id_str, "reason": "no such entity" }));
+        }
+    }
+
+    for hit in &ranked {
+        let Some(id_str) = hit.get("entity_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Ok(entity_id) = parse_entity_id(id_str) else {
+            continue;
+        };
+        if ids.contains(&entity_id) {
+            continue;
+        }
+        let Some(entity) = store.get_entity(&entity_id).map_err(McpError::graph)? else {
+            continue;
+        };
+        // A pre-resolved entry says which route found it, because the two are
+        // different claims: a name the caller typed is a stronger one than an
+        // entity a ranking suggested, and the pack's method line reports both.
+        let resolution = match hit.get("route").and_then(serde_json::Value::as_str) {
+            Some("name") => {
+                let query = hit
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let twins = hit
+                    .get("twins")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let pin = hit
+                    .get("pin")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                FocalResolution::by_name(query).with_twins(twins, pin)
+            }
+            Some("id") => FocalResolution::by_id(
+                hit.get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(id_str)
+                    .to_string(),
+            ),
+            _ => FocalResolution::from_question(
+                hit.get("score")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0) as f32,
+            ),
+        };
+        ids.push(entity.id);
+        resolutions.push(resolution);
+    }
+
+    if ids.is_empty() {
+        return Ok(Some(ToolCallResult::error(format!(
+            "get_context_pack resolved no focal entity from {}",
+            serde_json::to_string(&unresolved).map_err(McpError::Json)?
+        ))));
+    }
+
+    let opts = kin_context::MultiFocalOptions {
+        budget: pack_token_budget(args),
+        max_depth: get_optional_u64(args, "depth", 2) as u32,
+        include_tests: true,
+        include_contracts: true,
+        assistant_hint: None,
+        resolutions,
+        coverage: get_optional_string_param(args, "coverage"),
+    };
+    let (pack, report) = kin_context::build_multi_focal_pack(store, &ids, &opts)
+        .map_err(|error| McpError::Context(error.to_string()))?;
+
+    let row =
+        |entry: &kin_model::context::ContextEntry, section: &str| -> Result<serde_json::Value> {
+            let entity = store
+                .get_entity(&entry.entity_id)
+                .map_err(McpError::graph)?;
+            Ok(match entity {
+                Some(entity) => serde_json::json!({
+                    "id": entity.id,
+                    "name": entity.name,
+                    "kind": entity.kind,
+                    "signature": entity.signature,
+                    "file_path": entity.file_origin.as_ref().map(|path| path.to_string()),
+                    "read_path": entity_read_path(&entity),
+                    "start_line": entity_presentation_start_line(&entity),
+                    "end_line": entity_presentation_end_line(&entity),
+                    "section": section,
+                    "projection": format!("{:?}", entry.projection_level),
+                }),
+                None => serde_json::json!({
+                    "id": entry.entity_id,
+                    "section": section,
+                    "projection": format!("{:?}", entry.projection_level),
+                }),
+            })
+        };
+
+    let mut entities = Vec::new();
+    for entry in &pack.focal_entities {
+        entities.push(row(entry, "focal")?);
+    }
+    for entry in &pack.transitive_deps {
+        let section = if entry.content.starts_with(kin_context::ROUTE_MARKER) {
+            kin_context::ROUTE_GROUP
+        } else {
+            kin_context::group::TRANSITIVE_DEPS
+        };
+        entities.push(row(entry, section)?);
+    }
+    for entry in &pack.dependency_signatures {
+        entities.push(row(entry, kin_context::group::DEPENDENCIES)?);
+    }
+    for entry in &pack.tests {
+        entities.push(row(entry, kin_context::group::TESTS)?);
+    }
+    for entry in &pack.contracts {
+        entities.push(row(entry, kin_context::group::CONTRACTS)?);
+    }
+
+    let mut result = serde_json::json!({
+        "method": report.method,
+        "focals": serde_json::to_value(&report.focals).map_err(McpError::Json)?,
+        "routes": serde_json::to_value(&report.routes).map_err(McpError::Json)?,
+        "route_search": serde_json::to_value(&report.route_search).map_err(McpError::Json)?,
+        "neighborhood_depth": report.neighborhood_depth,
+        "token_budget": report.budget_tokens,
+        // What the rendered pack costs, which is the number a caller subtracts
+        // from its own window. `tokens_used` below is what this JSON payload
+        // costs, and the two are deliberately different measurements of
+        // different bytes.
+        "measured_tokens": report.measured_tokens,
+        "entities": entities,
+        "lines": kin_context::render_multi_focal_lines(&pack, &report),
+        "tokens_used": 0,
+    });
+    if !unresolved.is_empty() {
+        result["unresolved"] = serde_json::json!(unresolved);
+    }
+    for (group, elision) in &report.elisions {
+        crate::budget::record_elision_for(
+            &mut result,
+            group,
+            elision.kept,
+            elision.elided,
+            &elision.reason,
+        );
+    }
+
+    let json = serialize_with_measured_tokens(&mut result)?;
+    Ok(Some(ToolCallResult::text(json)))
 }
 
 /// Passes allowed to settle `tokens_used` against the bytes carrying it.

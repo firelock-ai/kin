@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use kin_model::EntityStore;
-use kin_model::{Entity, EntityFilter, EntityId, EntityKind, TokenBudget};
+use kin_model::{Entity, TokenBudget};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -47,12 +47,72 @@ async fn announce_active_scope(
     Ok(scope)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextRequest {
+    /// The first focal, kept as its own field so a client and a daemon that
+    /// predate several focals still speak to each other.
+    #[serde(default)]
     pub entity: String,
     pub budget: String,
     #[serde(default)]
     pub assistant: Option<String>,
+    /// Focal entities beyond the first, each a name, a pinned name or an id in
+    /// the syntax [`crate::entity_ref`] parses.
+    ///
+    /// A daemon predating this field ignores it and answers about `entity`
+    /// alone, which is a pack for one end of the question. That is why
+    /// [`ContextResponse::multi_focal`] exists and why the CLI refuses a
+    /// response missing it: a quietly narrowed answer is worse than an error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<String>,
+    /// A question to resolve the focals from, through the graph's own ranking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    /// The most focals a question may resolve to. Defaults to
+    /// [`QUESTION_FOCAL_MAX`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_focals: Option<usize>,
+}
+
+/// How many focals a question resolves to unless the caller says otherwise.
+///
+/// The ranking is ordered, so taking more of it costs budget on entities the
+/// question named less clearly. Five is what the demo measured a chain question
+/// needs: fewer lost an end of the chain, more spent the pack on near misses.
+pub const QUESTION_FOCAL_MAX: usize = 5;
+
+impl ContextRequest {
+    /// One focal, the way the surface has always taken it.
+    pub fn one(entity: impl Into<String>, budget: impl Into<String>) -> Self {
+        Self {
+            entity: entity.into(),
+            budget: budget.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Every focal token the caller gave, in order, first field first.
+    pub fn focal_tokens(&self) -> Vec<String> {
+        let mut tokens = Vec::new();
+        if !self.entity.trim().is_empty() {
+            tokens.push(self.entity.trim().to_string());
+        }
+        for entity in &self.entities {
+            if !entity.trim().is_empty() {
+                tokens.push(entity.trim().to_string());
+            }
+        }
+        tokens
+    }
+
+    /// Whether this request needs the multi-focal assembler.
+    ///
+    /// One named focal and no question is the surface's original shape and
+    /// keeps its original code path, byte for byte, so nothing that depends on
+    /// today's rendering moves under it.
+    pub fn is_multi_focal(&self) -> bool {
+        self.question.is_some() || self.focal_tokens().len() > 1
+    }
 }
 
 /// Names the structured half of [`ContextResponse`]. A daemon predating it
@@ -130,6 +190,37 @@ pub struct ContextResponse {
     /// text stays in `lines` for a client that predates this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Every focal this pack was built from, in the order the caller named
+    /// them. `target` stays the first of them so a reader written against one
+    /// focal keeps working.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub focals: Vec<ContextTarget>,
+    /// How a multi-focal pack was assembled: which focals, how each resolved,
+    /// what each contributed, the routes between them and what the budget
+    /// refused.
+    ///
+    /// Absent on a single-focal pack, and absent from a daemon that predates
+    /// multi-focal packs. The CLI reads the second case as a refusal rather
+    /// than as a pack, because a daemon that quietly answered about one focal
+    /// has answered a different question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_focal: Option<kin_context::MultiFocalReport>,
+    /// What the rendered output actually costs, by the estimator kin builds
+    /// packs with (`kin_context::estimate_tokens`, a structure-aware count with
+    /// a 15 percent margin).
+    ///
+    /// Reported on every pack, including the single-focal one, which can exceed
+    /// its budget by design: every section there keeps a row whatever the
+    /// budget says. A caller subtracting a pack from its own context window
+    /// needs the number the bytes cost, not the number it asked for.
+    #[serde(default)]
+    pub measured_tokens: usize,
+    /// Focal tokens that resolved to nothing, in the caller's own spelling.
+    ///
+    /// A pack built from two of three named focals answers a narrower question
+    /// than the one asked, and the difference is invisible in the pack itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved: Vec<String>,
 }
 
 /// What one pack section lost to the token budget.
@@ -156,22 +247,44 @@ pub struct ContextElision {
 pub const CONTEXT_ELISION_REASON_TOKEN_BUDGET: &str = "token_budget";
 
 pub async fn run(
-    entity: String,
+    entities: Vec<String>,
+    question: Option<String>,
     budget: String,
     assistant: Option<String>,
+    max_focals: Option<usize>,
     json: bool,
 ) -> Result<()> {
+    let mut entities = entities;
+    let question = question.filter(|text| !text.trim().is_empty());
+    if entities.is_empty() && question.is_none() {
+        anyhow::bail!(
+            "kin context needs an entity or a question: `kin context <entity> [<entity>...]` or `kin context --question \"<what you want to know>\"`"
+        );
+    }
+    let entity = if entities.is_empty() {
+        String::new()
+    } else {
+        entities.remove(0)
+    };
+    let request = ContextRequest {
+        entity,
+        budget,
+        assistant,
+        entities,
+        question,
+        max_focals,
+    };
+
     let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "context").await?;
-    let response = run_daemon_context(
-        &layout,
-        &ContextRequest {
-            entity,
-            budget,
-            assistant,
-        },
-    )
-    .await?;
+    let response = run_daemon_context(&layout, &request).await?;
+
+    if answered_a_narrower_question(&request, &response) {
+        anyhow::bail!(
+            "the running daemon does not support multi-focal context packs; restart it with the current Kin build"
+        );
+    }
+
     if json {
         if response.schema_version.is_empty() {
             anyhow::bail!(
@@ -216,21 +329,16 @@ pub fn build_context_response(
     graph: &kin_db::InMemoryGraph,
     request: &ContextRequest,
 ) -> Result<ContextResponse> {
+    if request.is_multi_focal() {
+        return build_multi_focal_response(graph, request);
+    }
     let token_budget = parse_budget(&request.budget)?;
 
-    let assistant_hint =
-        request
-            .assistant
-            .as_deref()
-            .and_then(|a| match a.to_lowercase().as_str() {
-                "claude" | "claude-code" => Some(kin_context::AssistantHint::ClaudeCode),
-                "codex" => Some(kin_context::AssistantHint::Codex),
-                "gemini" | "gemini-cli" => Some(kin_context::AssistantHint::GeminiCli),
-                _ => None,
-            });
+    let assistant_hint = assistant_hint_from(request.assistant.as_deref());
 
     let Some(target) = resolve_context_target(graph, &request.entity)? else {
         let lines = context_not_found_guidance(&request.entity);
+        let measured_tokens = kin_context::estimate_tokens(&lines.join("\n"));
         return Ok(ContextResponse {
             error: Some(lines.join("\n")),
             lines,
@@ -241,6 +349,10 @@ pub fn build_context_response(
             pack: None,
             dependency_selection: None,
             budget_elisions: BTreeMap::new(),
+            focals: Vec::new(),
+            multi_focal: None,
+            measured_tokens,
+            unresolved: vec![request.entity.clone()],
         });
     };
     let opts = kin_context::ContextOptions {
@@ -360,6 +472,18 @@ pub fn build_context_response(
             }
         ));
     }
+    // The same sentence the multi-focal method line carries, in the header a
+    // person reads first. A pack whose ranking could not see half the store is
+    // a different answer from one whose ranking saw all of it, and until now
+    // neither pack said which it was.
+    lines.push(format!(
+        "  Semantic coverage: {}",
+        coverage_sentence(&crate::commands::locate::local_semantic_coverage(
+            graph,
+            Some(graph)
+        ))
+    ));
+
     lines.push(String::new());
     lines.push("--- Context Pack ---".to_string());
 
@@ -373,15 +497,18 @@ pub fn build_context_response(
         lines.push(entry.content.clone());
     }
 
+    let measured_tokens = kin_context::estimate_tokens(&lines.join("\n"));
+    let focal_target = ContextTarget {
+        id: target.id.to_string(),
+        name: target.name.clone(),
+        kind: format!("{:?}", target.kind),
+        budget_tokens: token_budget.max_tokens(),
+    };
+
     Ok(ContextResponse {
         lines,
         schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
-        target: Some(ContextTarget {
-            id: target.id.to_string(),
-            name: target.name.clone(),
-            kind: format!("{:?}", target.kind),
-            budget_tokens: token_budget.max_tokens(),
-        }),
+        target: Some(focal_target.clone()),
         dependency_selection: Some(ContextDependencySelection {
             source: selection.source().as_str().to_string(),
             returned: dependencies_returned,
@@ -391,6 +518,10 @@ pub fn build_context_response(
         }),
         budget_elisions: elisions,
         error: None,
+        focals: vec![focal_target],
+        multi_focal: None,
+        measured_tokens,
+        unresolved: Vec::new(),
         pack: Some(pack),
     })
 }
@@ -503,71 +634,30 @@ fn dependency_selection_note(
     }
 }
 
+/// The entity a single-focal `kin context <symbol>` is about.
+///
+/// Routed through the shared identity resolver, the one `kin trace`, `kin
+/// impact` and `kin xref` use, so one name means one entity across every read
+/// command. It also accepts the `Name#Kind@path:line` suffix the multi-focal
+/// form takes, so the two spellings do not diverge on the same command.
+///
+/// This replaces a local picker whose final tiebreak was `a.id.cmp(&b.id)`,
+/// commented "stable, deterministic final tiebreak". It was deterministic
+/// within one store and not across two: entity ids are minted per ingest, so
+/// two ingests of one tree resolved one name to different entities. Measured on
+/// this module's own fixture, twenty ingests of a header declaration beside a
+/// source definition split eleven to nine. That is the defect FIR-3071 named,
+/// and `kin context` was the read command it was never fixed on.
 fn resolve_context_target(
     graph: &kin_db::InMemoryGraph,
     entity_query: &str,
 ) -> Result<Option<Entity>> {
-    let trimmed = entity_query.trim();
-    if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
-        return Ok(graph.get_entity(&EntityId(uuid))?);
-    }
-
-    let filter = EntityFilter {
-        name_pattern: Some(trimmed.to_string()),
-        ..Default::default()
-    };
-    // `query_entities` matches names by exact/token/substring and then returns
-    // candidates sorted by entity id, so a bare `.next()` would pick an
-    // arbitrary match — e.g. `kin context Foo` landing on `Foo.__init__` instead
-    // of the class `Foo`. Rank the matches by intent here so the symbol the user
-    // typed wins: an exact name beats a partial one, and a type/container
-    // declaration beats one of its members.
-    Ok(pick_context_target(trimmed, graph.query_entities(&filter)?))
-}
-
-/// Choose the entity a `kin context <symbol>` query most likely meant from the
-/// name-pattern matches the graph returned.
-fn pick_context_target(query: &str, mut candidates: Vec<Entity>) -> Option<Entity> {
-    candidates.sort_by(|a, b| {
-        name_match_rank(query, a)
-            .cmp(&name_match_rank(query, b))
-            .then_with(|| kind_rank(a.kind).cmp(&kind_rank(b.kind)))
-            // Shorter names are more canonical (`Foo` over `Foo.__init__`).
-            .then_with(|| a.name.len().cmp(&b.name.len()))
-            // Stable, deterministic final tiebreak.
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    candidates.into_iter().next()
-}
-
-/// Lower is a better name match: an exact hit beats a case-insensitive hit,
-/// which beats a mere substring/token match.
-fn name_match_rank(query: &str, entity: &Entity) -> u8 {
-    if entity.name == query {
-        0
-    } else if entity.name.eq_ignore_ascii_case(query) {
-        1
-    } else {
-        2
-    }
-}
-
-/// Lower is preferred: a type/container declaration outranks one of its members
-/// when both match equally well, so `kin context Foo` resolves to the class
-/// rather than `Foo.__init__` or another method.
-fn kind_rank(kind: EntityKind) -> u8 {
-    match kind {
-        EntityKind::Class
-        | EntityKind::Interface
-        | EntityKind::TraitDef
-        | EntityKind::TypeAlias
-        | EntityKind::EnumDef
-        | EntityKind::Module
-        | EntityKind::Package
-        | EntityKind::Schema
-        | EntityKind::EventContract => 0,
-        _ => 1,
-    }
+    let reference = crate::entity_ref::parse_entity_ref(entity_query);
+    let resolved =
+        crate::entity_identity::resolve_identity(graph, &reference.name, &reference.qualifiers)?;
+    let mut matches = resolved.matches;
+    crate::entity_ref::apply_line(&mut matches, reference.line);
+    Ok(crate::entity_identity::choose_definition(&matches).cloned())
 }
 
 fn parse_budget(s: &str) -> Result<TokenBudget> {
@@ -581,6 +671,426 @@ fn parse_budget(s: &str) -> Result<TokenBudget> {
             })?;
             Ok(TokenBudget::Custom(n))
         }
+    }
+}
+
+/// True when a response came back about a narrower question than the one asked.
+///
+/// A daemon predating several focals decodes a multi-focal request, ignores the
+/// fields it does not know, and answers about `entity` alone. That answer is
+/// well formed, and it is about one end of a question that named several
+/// things, which is the shape a caller cannot detect from the pack itself.
+fn answered_a_narrower_question(request: &ContextRequest, response: &ContextResponse) -> bool {
+    request.is_multi_focal() && response.multi_focal.is_none()
+}
+
+/// The assistant hint a request's string names, shared by both pack paths so
+/// one spelling cannot mean two things.
+fn assistant_hint_from(assistant: Option<&str>) -> Option<kin_context::AssistantHint> {
+    assistant.and_then(|hint| match hint.to_lowercase().as_str() {
+        "claude" | "claude-code" => Some(kin_context::AssistantHint::ClaudeCode),
+        "codex" => Some(kin_context::AssistantHint::Codex),
+        "gemini" | "gemini-cli" => Some(kin_context::AssistantHint::GeminiCli),
+        _ => None,
+    })
+}
+
+/// One entity a question ranked for, and the score it ranked at.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionFocal {
+    pub entity_id: String,
+    pub score: f32,
+}
+
+/// One sentence on what the ranking behind these focals could see.
+///
+/// Read off the same [`SemanticCoverage`] every locate surface publishes, and
+/// deliberately not derived from the embedding fraction alone: a store can have
+/// every embedding indexed and still rank on text alone, which is exactly the
+/// case a reader needs told.
+///
+/// [`SemanticCoverage`]: crate::commands::locate::SemanticCoverage
+pub fn coverage_sentence(coverage: &crate::commands::locate::SemanticCoverage) -> String {
+    if !coverage.supported {
+        return "this build carries no vector retrieval, so the ranking ran on lexical and graph \
+                signals alone"
+            .to_string();
+    }
+    let mut sentence = format!(
+        "{} of {} entities embedded",
+        coverage.indexed, coverage.total
+    );
+    if coverage.pending > 0 {
+        sentence.push_str(&format!(", {} pending", coverage.pending));
+    }
+    if !coverage.complete {
+        let cause = if coverage.limited_by.is_empty() {
+            "cause not reported".to_string()
+        } else {
+            coverage.limited_by.join(", ")
+        };
+        sentence.push_str(&format!(", incomplete: {cause}"));
+    }
+    sentence
+}
+
+/// The focals a question resolves to, through the graph's own ranking.
+///
+/// This is `kin locate` in process, against the same graph the pack is built
+/// from, and the entities it returns are its own ranking rather than anything
+/// re-derived here. The snippet options matter: the plain default switches the
+/// `entities[]` ranking off entirely and would leave a question resolving to
+/// nothing on a healthy store, so the agent projection is asked for with the
+/// bodies turned off, which is the ranking without the source it would cost.
+pub fn question_focals(
+    graph: &kin_db::InMemoryGraph,
+    question: &str,
+    limit: usize,
+) -> Result<(Vec<QuestionFocal>, String)> {
+    use crate::commands::locate::{LocateScope, SnippetOptions};
+
+    let result =
+        crate::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source(
+            graph,
+            None,
+            question,
+            false,
+            LOCATE_MAX_FILES,
+            false,
+            Vec::new(),
+            Some(graph),
+            SnippetOptions::enabled(None).without_bodies(),
+            None,
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            LocateScope::SOURCE_ONLY,
+        )?;
+    let coverage = result
+        .semantic_coverage
+        .clone()
+        .unwrap_or_else(|| crate::commands::locate::local_semantic_coverage(graph, Some(graph)));
+    let focals = result
+        .entities
+        .iter()
+        // An artifact hit carries no entity id. It is a real answer to the
+        // question and not a focal entity, so it is skipped here rather than
+        // turned into one.
+        .filter(|hit| !hit.entity_id.is_empty())
+        .take(limit)
+        .map(|hit| QuestionFocal {
+            entity_id: hit.entity_id.clone(),
+            score: hit.score,
+        })
+        .collect();
+    Ok((focals, coverage_sentence(&coverage)))
+}
+
+/// Files `kin locate` ranks over when a question resolves focals, matching the
+/// CLI's own default so the ranking a question sees is the ranking a person
+/// would see typing `kin locate`.
+const LOCATE_MAX_FILES: usize = 10;
+
+/// One focal, resolved through the shared identity resolver.
+struct ResolvedFocal {
+    entity: kin_model::Entity,
+    resolution: kin_context::FocalResolution,
+}
+
+/// Resolve one focal token to an entity, or to the guidance a miss needs.
+///
+/// The resolution itself is [`crate::entity_identity::resolve_identity`], the
+/// one `kin trace`, `kin impact` and `kin xref` use, so a name means the same
+/// entity whichever command reads it. This adds only the suffix spelling
+/// (`Name#Kind@path:line`), because `kin context A B C` has nowhere to put a
+/// per-focal `--file`.
+///
+/// The two miss shapes come straight off the resolver's own two stages: an
+/// empty `name_matches` is a name the graph does not carry, and an empty
+/// `matches` beside a non-empty `name_matches` is a pin that excluded
+/// everything. They need opposite fixes, so they are never merged into one
+/// message.
+fn resolve_focal(
+    graph: &kin_db::InMemoryGraph,
+    token: &str,
+) -> Result<std::result::Result<ResolvedFocal, Vec<String>>> {
+    let reference = crate::entity_ref::parse_entity_ref(token);
+    let resolved =
+        crate::entity_identity::resolve_identity(graph, &reference.name, &reference.qualifiers)?;
+
+    if resolved.name_matches.is_empty() {
+        return Ok(Err(context_not_found_guidance(&reference.name)));
+    }
+
+    let mut matches = resolved.matches.clone();
+    crate::entity_ref::apply_line(&mut matches, reference.line);
+    let Some(chosen) = crate::entity_identity::choose_definition(&matches) else {
+        // The name is in the graph and the pin excluded every entity carrying
+        // it. Naming the twins that do exist is what turns this from a dead end
+        // into a correctable one.
+        let mut lines = vec![format!(
+            "Entity '{}' is in the graph, but nothing there matches the pin {}.",
+            reference.name,
+            reference.pin_note().unwrap_or_default()
+        )];
+        for candidate in resolved.name_matches.iter().take(8) {
+            lines.push(format!(
+                "  {} ({})",
+                crate::entity_identity::entity_location(candidate),
+                kin_review::StableEntityIdentity::from_entity(candidate).kind
+            ));
+        }
+        return Ok(Err(lines));
+    };
+
+    let twins = resolved.name_matches.len();
+    let resolution = if resolved.addressed_by_id {
+        kin_context::FocalResolution::by_id(token.to_string())
+    } else {
+        kin_context::FocalResolution::by_name(reference.name.clone())
+            .with_twins(twins, reference.pin_note())
+    };
+    Ok(Ok(ResolvedFocal {
+        entity: chosen.clone(),
+        resolution,
+    }))
+}
+
+/// One focal, resolved for a caller that speaks JSON rather than Rust.
+///
+/// The daemon's MCP route is that caller: it holds the resolver and the pack
+/// builder in two crates that cannot see each other, so it resolves here and
+/// forwards the entity id with the route that found it. Returns `None` for a
+/// token the graph cannot resolve, which the daemon leaves in place so the
+/// builder refuses over it rather than silently answering a smaller question.
+pub fn resolve_focal_for_mcp(
+    graph: &kin_db::InMemoryGraph,
+    token: &str,
+) -> Result<Option<serde_json::Value>> {
+    let Ok(focal) = resolve_focal(graph, token)? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::json!({
+        "entity_id": focal.entity.id.to_string(),
+        "route": focal.resolution.route,
+        "query": focal.resolution.query,
+        "twins": focal.resolution.twins,
+        "pin": focal.resolution.pin,
+    })))
+}
+
+/// The focals a request resolved to, kept together so the three parallel lists
+/// cannot drift out of step.
+#[derive(Default)]
+struct FocalSet {
+    ids: Vec<kin_model::EntityId>,
+    resolutions: Vec<kin_context::FocalResolution>,
+    targets: Vec<ContextTarget>,
+}
+
+impl FocalSet {
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Take one focal, unless this entity is already in the set.
+    ///
+    /// A question routinely ranks an entity a caller also named, and a name
+    /// routinely resolves to an entity another name already reached. Either way
+    /// the pack should carry it once, and the caller's own naming wins the
+    /// resolution story because it is the more specific claim.
+    fn admit(
+        &mut self,
+        entity: &kin_model::Entity,
+        resolution: kin_context::FocalResolution,
+        budget_tokens: usize,
+    ) {
+        if self.ids.contains(&entity.id) {
+            return;
+        }
+        self.ids.push(entity.id);
+        self.resolutions.push(resolution);
+        self.targets.push(ContextTarget {
+            id: entity.id.to_string(),
+            name: entity.name.clone(),
+            kind: format!("{:?}", entity.kind),
+            budget_tokens,
+        });
+    }
+}
+
+/// Build a pack from several focals.
+///
+/// The focals the caller named are resolved first, in their own order, so a
+/// question never displaces something explicitly asked for. Then, when there is
+/// a question, the graph's ranking fills the rest of the slots with what it
+/// says the question is about.
+fn build_multi_focal_response(
+    graph: &kin_db::InMemoryGraph,
+    request: &ContextRequest,
+) -> Result<ContextResponse> {
+    let token_budget = parse_budget(&request.budget)?;
+    let limit = request
+        .max_focals
+        .unwrap_or(QUESTION_FOCAL_MAX)
+        .clamp(1, 32);
+
+    let mut focals = FocalSet::default();
+    let mut unresolved: Vec<String> = Vec::new();
+    let mut guidance: Vec<String> = Vec::new();
+
+    for token in request.focal_tokens() {
+        match resolve_focal(graph, &token)? {
+            Ok(focal) => {
+                focals.admit(&focal.entity, focal.resolution, token_budget.max_tokens());
+            }
+            Err(miss) => {
+                unresolved.push(token.clone());
+                guidance.extend(miss);
+            }
+        }
+    }
+
+    // Coverage is stated on EVERY route, not only the question one. A store
+    // with no embeddings ranks and packs perfectly happily, and the pack it
+    // returns looks the same as one from a fully embedded store; the demo's
+    // stores had no embeddings tonight and nothing on any surface said so. The
+    // question route overwrites this with the coverage its own ranking
+    // observed, which is the same reading taken at the same instant.
+    let mut coverage = Some(coverage_sentence(
+        &crate::commands::locate::local_semantic_coverage(graph, Some(graph)),
+    ));
+    if let Some(question) = request.question.as_deref() {
+        let (hits, coverage_note) = question_focals(graph, question, limit)?;
+        coverage = Some(coverage_note);
+        for hit in hits {
+            if focals.len() >= limit {
+                break;
+            }
+            let Ok(uuid) = uuid::Uuid::parse_str(&hit.entity_id) else {
+                continue;
+            };
+            let Some(entity) = graph.get_entity(&kin_model::EntityId(uuid))? else {
+                continue;
+            };
+            focals.admit(
+                &entity,
+                kin_context::FocalResolution::from_question(hit.score),
+                token_budget.max_tokens(),
+            );
+        }
+    }
+
+    if focals.is_empty() {
+        let mut lines = match request.question.as_deref() {
+            Some(question) if guidance.is_empty() => vec![
+                format!("Nothing in this repo's graph ranks for '{question}'."),
+                "hint: `kin graph status` reports whether the store is indexed and embedded."
+                    .to_string(),
+            ],
+            _ => guidance,
+        };
+        if lines.is_empty() {
+            lines = context_not_found_guidance(&request.entity);
+        }
+        let measured_tokens = kin_context::estimate_tokens(&lines.join("\n"));
+        return Ok(ContextResponse {
+            // A multi-focal request that resolved nothing is a miss like any
+            // other, so it exits the way `kin trace` does rather than handing
+            // guidance back as though it were a pack (FIR-3071).
+            error: Some(lines.join("\n")),
+            lines,
+            schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
+            target: None,
+            pack: None,
+            dependency_selection: None,
+            budget_elisions: BTreeMap::new(),
+            focals: Vec::new(),
+            // Stamped even with no pack: the caller asked a multi-focal
+            // question and needs to know the daemon understood it, or it reads
+            // an empty answer as an old daemon and retries forever.
+            multi_focal: Some(empty_multi_focal_report(
+                token_budget.max_tokens(),
+                coverage,
+            )),
+            measured_tokens,
+            unresolved,
+        });
+    }
+
+    let opts = kin_context::MultiFocalOptions {
+        budget: token_budget,
+        max_depth: 2,
+        include_tests: true,
+        include_contracts: true,
+        assistant_hint: assistant_hint_from(request.assistant.as_deref()),
+        resolutions: focals.resolutions,
+        coverage,
+    };
+    let (pack, report) = kin_context::build_multi_focal_pack(graph, &focals.ids, &opts)?;
+
+    let mut lines = kin_context::render_multi_focal_lines(&pack, &report);
+    if !guidance.is_empty() {
+        // The misses go after the pack, so a reader sees the answer first and
+        // then what it does not cover.
+        lines.push(String::new());
+        lines.extend(guidance);
+    }
+
+    let budget_elisions = report
+        .elisions
+        .iter()
+        .map(|(group, elision)| {
+            (
+                group.clone(),
+                ContextElision {
+                    elided: elision.elided,
+                    kept: elision.kept,
+                    total: elision.total,
+                    reason: elision.reason.clone(),
+                },
+            )
+        })
+        .collect();
+
+    Ok(ContextResponse {
+        error: None,
+        lines,
+        schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
+        target: focals.targets.first().cloned(),
+        pack: Some(pack),
+        dependency_selection: None,
+        budget_elisions,
+        focals: focals.targets,
+        measured_tokens: report.measured_tokens,
+        multi_focal: Some(report),
+        unresolved,
+    })
+}
+
+/// The report a multi-focal request that resolved no focal still carries, so a
+/// caller can tell "this daemon understood the question" from "this daemon is
+/// too old to have been asked".
+fn empty_multi_focal_report(
+    budget_tokens: usize,
+    coverage: Option<String>,
+) -> kin_context::MultiFocalReport {
+    kin_context::MultiFocalReport {
+        focals: Vec::new(),
+        routes: Vec::new(),
+        route_search: kin_context::RouteSearch {
+            max_hops: kin_context::ROUTE_MAX_HOPS,
+            ..Default::default()
+        },
+        neighborhood_depth: 0,
+        budget_tokens,
+        measured_tokens: 0,
+        elisions: BTreeMap::new(),
+        coverage,
+        method: "Method: no focal entity resolved, so no pack was built".to_string(),
+        method_style: "full".to_string(),
     }
 }
 
@@ -601,8 +1111,8 @@ fn context_not_found_guidance(entity: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use kin_model::{
-        EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId,
-        SemanticFingerprint, Visibility,
+        EntityId, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256,
+        LanguageId, SemanticFingerprint, Visibility,
     };
 
     #[test]
@@ -634,6 +1144,7 @@ mod tests {
                 entity: "definitelyMissingEntity".to_string(),
                 budget: "8k".to_string(),
                 assistant: None,
+                ..ContextRequest::default()
             },
         )
         .unwrap();
@@ -657,6 +1168,7 @@ mod tests {
                 entity: "checkout".to_string(),
                 budget: "8k".to_string(),
                 assistant: None,
+                ..ContextRequest::default()
             },
         )
         .unwrap();
@@ -710,6 +1222,7 @@ mod tests {
                 entity: "checkout".to_string(),
                 budget: "8k".to_string(),
                 assistant: None,
+                ..ContextRequest::default()
             },
         )
         .expect("a resolved entity builds a context response");
@@ -744,6 +1257,7 @@ mod tests {
                 entity: "frobnicate".to_string(),
                 budget: "8k".to_string(),
                 assistant: None,
+                ..ContextRequest::default()
             },
         )
         .expect("an unresolved entity still answers");
@@ -799,6 +1313,7 @@ mod tests {
                 entity: "NoteStore".to_string(),
                 budget: "8k".to_string(),
                 assistant: None,
+                ..ContextRequest::default()
             },
         )
         .expect("a resolved entity builds a context response");
@@ -851,6 +1366,7 @@ mod tests {
                 entity: "read_notes".to_string(),
                 budget: "8k".to_string(),
                 assistant: None,
+                ..ContextRequest::default()
             },
         )
         .expect("a resolved entity builds a context response");
@@ -956,6 +1472,7 @@ mod tests {
                 entity: "focal".to_string(),
                 budget: budget.to_string(),
                 assistant: None,
+                ..ContextRequest::default()
             },
         )
         .unwrap()
@@ -1039,6 +1556,490 @@ mod tests {
         assert!(
             whole.pack.as_ref().unwrap().actual_tokens <= 32_000,
             "the fixture must actually fit, or the assertion above proves nothing"
+        );
+    }
+
+    // ---- several focals, and the question route ------------------------
+
+    fn linked_store() -> (kin_db::InMemoryGraph, Vec<Entity>) {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+        let graph = kin_db::InMemoryGraph::new();
+        let names = [
+            "handleKeyboardInput",
+            "applyEdits",
+            "pushEditOperations",
+            "TextDocument",
+        ];
+        let mut chain = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let mut entity = test_entity(name);
+            entity.file_origin = Some(kin_model::FilePathId::new(format!("src/{name}.ts")));
+            entity.doc_summary = Some(format!("{name} in the editor input path"));
+            entity.span = Some(kin_model::SourceSpan {
+                file: kin_model::FilePathId::new(format!("src/{name}.ts")),
+                start_byte: 0,
+                end_byte: 64,
+                start_line: (index as u32 + 1) * 10,
+                start_col: 0,
+                end_line: (index as u32 + 1) * 10 + 6,
+                end_col: 0,
+            });
+            graph.upsert_entity(&entity).unwrap();
+            chain.push(entity);
+        }
+        for pair in chain.windows(2) {
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: kin_model::GraphNodeId::Entity(pair[0].id),
+                    dst: kin_model::GraphNodeId::Entity(pair[1].id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+        (graph, chain)
+    }
+
+    /// The failure this whole path exists for: a question that names two
+    /// things used to produce a pack about one of them.
+    #[test]
+    fn two_named_focals_produce_one_pack_carrying_both() {
+        let (graph, chain) = linked_store();
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "handleKeyboardInput".to_string(),
+                entities: vec!["TextDocument".to_string()],
+                budget: "8k".to_string(),
+                ..ContextRequest::default()
+            },
+        )
+        .expect("two focals build a pack");
+
+        let report = response
+            .multi_focal
+            .as_ref()
+            .expect("a multi-focal request carries its report");
+        assert_eq!(report.focals.len(), 2);
+        assert_eq!(response.focals.len(), 2);
+        let pack = response.pack.as_ref().expect("a pack");
+        let focal_ids: Vec<String> = pack
+            .focal_entities
+            .iter()
+            .map(|entry| entry.entity_id.to_string())
+            .collect();
+        assert!(
+            focal_ids.contains(&chain[0].id.to_string()),
+            "{focal_ids:?}"
+        );
+        assert!(
+            focal_ids.contains(&chain[3].id.to_string()),
+            "{focal_ids:?}"
+        );
+        assert_eq!(report.route_search.pairs_connected, 1);
+        assert!(
+            report
+                .routes
+                .iter()
+                .any(|route| route.via_names.contains(&"applyEdits".to_string())),
+            "the material between the ends is in the pack: {:?}",
+            report.routes
+        );
+    }
+
+    /// One focal and no question keeps the original path, byte for byte, so
+    /// nothing already reading `kin context Foo` moves under this change.
+    #[test]
+    fn one_focal_still_takes_the_single_focal_path() {
+        let (graph, _) = linked_store();
+        let response = build_context_response(&graph, &ContextRequest::one("applyEdits", "8k"))
+            .expect("one focal builds a pack");
+        assert!(
+            response.multi_focal.is_none(),
+            "one focal is not a multi-focal pack"
+        );
+        assert!(response.dependency_selection.is_some());
+        assert!(response.lines[0].starts_with("Context pack for 'applyEdits'"));
+    }
+
+    /// The number a caller subtracts from its own window is the number the
+    /// bytes cost, on both paths.
+    #[test]
+    fn every_pack_reports_what_its_rendering_costs() {
+        let (graph, _) = linked_store();
+        for request in [
+            ContextRequest::one("applyEdits", "8k"),
+            ContextRequest {
+                entity: "handleKeyboardInput".to_string(),
+                entities: vec!["TextDocument".to_string()],
+                budget: "800".to_string(),
+                ..ContextRequest::default()
+            },
+        ] {
+            let response = build_context_response(&graph, &request).expect("a pack");
+            assert_eq!(
+                response.measured_tokens,
+                kin_context::estimate_tokens(&response.lines.join("\n")),
+                "the reported size is the size of the lines returned"
+            );
+        }
+    }
+
+    /// The multi-focal pack keeps the promise the single-focal one does not.
+    #[test]
+    fn a_multi_focal_pack_comes_in_under_its_budget() {
+        let (graph, _) = linked_store();
+        for budget in ["300", "700", "1500"] {
+            let response = build_context_response(
+                &graph,
+                &ContextRequest {
+                    entity: "handleKeyboardInput".to_string(),
+                    entities: vec!["TextDocument".to_string(), "applyEdits".to_string()],
+                    budget: budget.to_string(),
+                    ..ContextRequest::default()
+                },
+            )
+            .expect("a pack");
+            let asked: usize = budget.parse().unwrap();
+            assert!(
+                response.measured_tokens <= asked,
+                "asked {asked}, measured {}",
+                response.measured_tokens
+            );
+        }
+    }
+
+    #[test]
+    fn the_method_line_is_the_second_line_of_the_human_form() {
+        let (graph, _) = linked_store();
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "handleKeyboardInput".to_string(),
+                entities: vec!["TextDocument".to_string()],
+                budget: "8k".to_string(),
+                ..ContextRequest::default()
+            },
+        )
+        .expect("a pack");
+        let method = &response.lines[1];
+        assert!(method.starts_with("Method: 2 focals"), "{method}");
+        assert!(method.contains("named as handleKeyboardInput"), "{method}");
+        assert!(method.contains("named as TextDocument"), "{method}");
+        assert_eq!(
+            method,
+            &response.multi_focal.as_ref().unwrap().method,
+            "the line a person reads and the field a machine reads are one string"
+        );
+    }
+
+    /// A focal that resolves and one that does not: answer with what there is,
+    /// and say what is missing rather than pretending the question was smaller.
+    #[test]
+    fn an_unresolved_focal_is_named_beside_the_pack_it_is_missing_from() {
+        let (graph, _) = linked_store();
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "applyEdits".to_string(),
+                entities: vec!["frobnicate".to_string()],
+                budget: "8k".to_string(),
+                ..ContextRequest::default()
+            },
+        )
+        .expect("one resolved focal still builds a pack");
+        assert_eq!(response.unresolved, vec!["frobnicate".to_string()]);
+        assert_eq!(response.focals.len(), 1);
+        let rendered = response.lines.join("\n");
+        assert!(
+            rendered.contains("frobnicate"),
+            "the miss is in the output a person reads: {rendered}"
+        );
+    }
+
+    /// A twin is chosen, and the choice is stated. The demo measured this
+    /// exact case resolving two ways across ingests of one tree.
+    #[test]
+    fn a_twin_is_reported_in_the_method_line() {
+        let (graph, _) = linked_store();
+        let mut twin = test_entity("applyEdits");
+        twin.file_origin = Some(kin_model::FilePathId::new("src/applyEdits.h"));
+        graph.upsert_entity(&twin).unwrap();
+
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "applyEdits".to_string(),
+                entities: vec!["TextDocument".to_string()],
+                budget: "8k".to_string(),
+                ..ContextRequest::default()
+            },
+        )
+        .expect("a pack");
+        let method = &response.lines[1];
+        assert!(
+            method.contains("1 of 2 under that name"),
+            "the method says a choice was made: {method}"
+        );
+    }
+
+    /// The pack's focal choice among twins does not move between ingests.
+    ///
+    /// This is the multi-focal surface's stake in `choose_definition`, which
+    /// belongs to the shared identity resolver rather than to this module. A
+    /// pack is built for a specific entity, so a resolver that answered
+    /// differently per ingest would build a different pack from the same
+    /// question, and the count alone cannot see that: a chooser keyed on the
+    /// entity id reports "1 of 2" just as truthfully while picking either one.
+    /// Twenty independently minted pairs, so a chooser reaching for an id lands
+    /// on both twins and fails here.
+    #[test]
+    fn the_twin_a_pack_is_built_for_does_not_move_between_ingests() {
+        let mut chosen = Vec::new();
+        for trial in 0..20 {
+            let graph = kin_db::InMemoryGraph::new();
+            let mut definition = test_entity("applyEdits");
+            definition.file_origin = Some(kin_model::FilePathId::new("src/applyEdits.ts"));
+            let mut declaration = test_entity("applyEdits");
+            declaration.file_origin = Some(kin_model::FilePathId::new("src/applyEdits.h"));
+            declaration.signature = "declare function applyEdits();".to_string();
+
+            // Alternate insertion order, so listing order varies alongside ids.
+            if trial % 2 == 0 {
+                graph.upsert_entity(&definition).unwrap();
+                graph.upsert_entity(&declaration).unwrap();
+            } else {
+                graph.upsert_entity(&declaration).unwrap();
+                graph.upsert_entity(&definition).unwrap();
+            }
+
+            let response = build_context_response(&graph, &ContextRequest::one("applyEdits", "8k"))
+                .expect("a pack");
+            let target = response.target.as_ref().expect("a resolved target");
+            let file = if target.id == definition.id.to_string() {
+                "src/applyEdits.ts"
+            } else {
+                "src/applyEdits.h"
+            };
+            chosen.push(file);
+        }
+        let first = chosen[0];
+        assert!(
+            chosen.iter().all(|file| *file == first),
+            "twenty ingests of one tree must build the pack for one twin, got {chosen:?}"
+        );
+    }
+
+    /// A pinned twin is the one that lands, and the pin is stated.
+    #[test]
+    fn a_pinned_twin_is_the_one_the_pack_carries() {
+        let (graph, _) = linked_store();
+        let mut twin = test_entity("applyEdits");
+        twin.file_origin = Some(kin_model::FilePathId::new("src/applyEdits.h"));
+        graph.upsert_entity(&twin).unwrap();
+
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "applyEdits@src/applyEdits.h".to_string(),
+                entities: vec!["TextDocument".to_string()],
+                budget: "8k".to_string(),
+                ..ContextRequest::default()
+            },
+        )
+        .expect("a pack");
+        assert_eq!(response.focals[0].id, twin.id.to_string());
+        assert!(
+            response.lines[1].contains("pinned by src/applyEdits.h"),
+            "{}",
+            response.lines[1]
+        );
+    }
+
+    /// The question route, end to end on a fixture store: no entity named, and
+    /// the pack still comes back built from what the ranking says the question
+    /// is about, with the score and the store's coverage on the record.
+    #[test]
+    fn a_question_resolves_its_own_focals_through_the_ranking() {
+        let (graph, chain) = linked_store();
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                budget: "2000".to_string(),
+                question: Some("how does handleKeyboardInput reach the TextDocument".to_string()),
+                ..ContextRequest::default()
+            },
+        )
+        .expect("a question builds a pack");
+
+        let report = response
+            .multi_focal
+            .as_ref()
+            .expect("the question route reports its method");
+        assert!(
+            !report.focals.is_empty(),
+            "the ranking named the focals: {}",
+            report.method
+        );
+        assert!(
+            report
+                .focals
+                .iter()
+                .any(|focal| focal.resolution.route == "question"),
+            "and they are on the record as located rather than named: {:?}",
+            report.focals
+        );
+        let known: Vec<String> = chain.iter().map(|entity| entity.id.to_string()).collect();
+        assert!(
+            report
+                .focals
+                .iter()
+                .all(|focal| known.contains(&focal.entity_id)),
+            "every focal is an entity of this store"
+        );
+        assert!(
+            report.coverage.is_some(),
+            "the coverage the ranking had is reported: {report:?}"
+        );
+        assert!(
+            report.method.contains("semantic coverage"),
+            "and it reaches the line a person reads: {}",
+            report.method
+        );
+    }
+
+    /// Coverage is stated whichever route built the pack. A store with no
+    /// embeddings packs exactly like a fully embedded one, which is what left
+    /// the demo unable to see that its stores had none.
+    #[test]
+    fn every_route_states_the_coverage_its_ranking_had() {
+        let (graph, _) = linked_store();
+
+        let single = build_context_response(&graph, &ContextRequest::one("applyEdits", "8k"))
+            .expect("one focal builds a pack");
+        assert!(
+            single
+                .lines
+                .iter()
+                .any(|line| line.starts_with("  Semantic coverage: ")),
+            "the single-focal header states it: {:?}",
+            single.lines
+        );
+
+        let named = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "applyEdits".to_string(),
+                entities: vec!["TextDocument".to_string()],
+                budget: "8k".to_string(),
+                ..ContextRequest::default()
+            },
+        )
+        .expect("two named focals build a pack");
+        let report = named.multi_focal.as_ref().expect("a report");
+        assert!(
+            report.coverage.is_some(),
+            "the named route states it too, with no question anywhere: {report:?}"
+        );
+        assert!(
+            report.method.contains("semantic coverage"),
+            "and it reaches the method line: {}",
+            report.method
+        );
+    }
+
+    /// The question route runs the graph's own ranking. A question that ranks
+    /// nothing says so, and still carries the report, so a caller can tell a
+    /// daemon that understood the question from one too old to have been asked.
+    #[test]
+    fn a_question_that_ranks_nothing_says_so_and_still_reports_its_method() {
+        let graph = kin_db::InMemoryGraph::new();
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                budget: "800".to_string(),
+                question: Some("how does a character reach the document".to_string()),
+                ..ContextRequest::default()
+            },
+        )
+        .expect("an empty graph still answers");
+        assert!(response.pack.is_none());
+        assert!(
+            response.multi_focal.is_some(),
+            "the report is stamped even with no pack, so an empty answer is not read as an old daemon"
+        );
+        let rendered = response.lines.join("\n");
+        assert!(rendered.contains("kin graph status"), "{rendered}");
+    }
+
+    /// The guard that keeps an old daemon's narrower answer from passing for
+    /// the answer that was asked for.
+    #[test]
+    fn a_response_missing_its_report_is_read_as_a_narrower_answer() {
+        let multi = ContextRequest {
+            entity: "a".to_string(),
+            entities: vec!["b".to_string()],
+            budget: "8k".to_string(),
+            ..ContextRequest::default()
+        };
+        let single = ContextRequest::one("a", "8k");
+        let old_daemon = ContextResponse {
+            error: None,
+            lines: vec!["Context pack for 'a' (Function):".to_string()],
+            schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
+            target: None,
+            pack: None,
+            dependency_selection: None,
+            budget_elisions: BTreeMap::new(),
+            focals: Vec::new(),
+            multi_focal: None,
+            measured_tokens: 9,
+            unresolved: Vec::new(),
+        };
+        assert!(
+            answered_a_narrower_question(&multi, &old_daemon),
+            "a multi-focal request answered without a report is a narrower answer"
+        );
+        assert!(
+            !answered_a_narrower_question(&single, &old_daemon),
+            "a single-focal request is answered correctly by exactly this response"
+        );
+    }
+
+    #[test]
+    fn a_request_knows_which_path_it_needs() {
+        assert!(!ContextRequest::one("a", "8k").is_multi_focal());
+        assert!(ContextRequest {
+            entity: "a".to_string(),
+            entities: vec!["b".to_string()],
+            budget: "8k".to_string(),
+            ..ContextRequest::default()
+        }
+        .is_multi_focal());
+        assert!(ContextRequest {
+            budget: "8k".to_string(),
+            question: Some("what happens on save".to_string()),
+            ..ContextRequest::default()
+        }
+        .is_multi_focal());
+    }
+
+    #[test]
+    fn focal_tokens_drop_blanks_and_keep_the_callers_order() {
+        let request = ContextRequest {
+            entity: "  first  ".to_string(),
+            entities: vec!["".to_string(), "second".to_string(), "   ".to_string()],
+            budget: "8k".to_string(),
+            ..ContextRequest::default()
+        };
+        assert_eq!(
+            request.focal_tokens(),
+            vec!["first".to_string(), "second".to_string()]
         );
     }
 }
