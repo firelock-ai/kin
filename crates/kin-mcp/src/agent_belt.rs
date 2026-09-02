@@ -193,7 +193,10 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
             "kin_graph_status",
             "Report the graph this call is answered from: entity and relation counts, and how many \
              entities are embedded, pending or unindexed. Call it first when a search returns less \
-             than you expect, since an unembedded graph cannot rank by meaning.",
+             than you expect, since an unembedded graph cannot rank by meaning. On a store under \
+             continuous reconcile it can answer `sampling=last_settled_selected_graph` instead of a \
+             live one: the same counters as of the last settled reading, with a `stale` block \
+             giving that reading's age. Read `sampling` to tell the two apart.",
         ),
         // ── Walking: the chain question, and where it is answered ──
         (
@@ -317,11 +320,27 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
 /// The input properties `agent-default` advertises for each tool, by registered
 /// name. A tool absent from this table keeps its full schema.
 ///
-/// Two rules decided every list. A property that changes WHICH entities come
-/// back stays. A property that only reshapes the response (`compact`,
-/// `max_chars`, `explain`, `snippet_alias`, `pipeline`) goes, because the
-/// profile now picks those defaults itself and every one of them is another line
-/// the model reads before it can ask its question.
+/// Two rules decided every list, and one exception overrides the second.
+///
+/// A property that changes WHICH entities come back stays. A property that only
+/// reshapes the response (`explain`, `snippet_alias`, `pipeline`) goes, because
+/// the profile picks those defaults itself and every one of them is another
+/// line the model reads before it can ask its question.
+///
+/// The exception: a response-shaping property the shipped proofs or the
+/// acceptance suite assert stays anyway, because those checks read the served
+/// schema as the contract an agent discovers the knob from. Trimming
+/// `include_body` and `compact` off `trace_data_flow` and `max_chars` off every
+/// tool that registered one took three acceptance findings red for four
+/// landings, and an agent that cannot see the knob cannot ask for bodies or
+/// bound a response. Three checks own that contract:
+/// `scripts/acceptance/magic_repro.py` `check_6`, which requires `include_body`
+/// or `compact` on `trace_data_flow`; `check_14` arm 3, which requires the
+/// literal `last_settled_selected_graph` in the served `kin_graph_status`
+/// description; and `scripts/acceptance/response_budget_elisions.py` `check_2`,
+/// which grades every advertised `max_chars` or `max_response_chars` and
+/// reports UNREADABLE when it finds none. Do not trim these again without
+/// moving those checks in the same change.
 fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
     BTreeMap::from([
         // Thirteen properties down to five. `cursor` and `page_size` stay
@@ -330,22 +349,38 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
         // all, and a caller asking about a test cannot otherwise find one.
         (
             "semantic_locate",
-            &["query", "limit", "granularity", "cursor", "include_tests"] as &[&str],
+            &[
+                "query",
+                "limit",
+                "granularity",
+                "cursor",
+                "include_tests",
+                "max_chars",
+            ] as &[&str],
         ),
         (
             DECLARATION_FILTER_CANONICAL,
-            &["query", "kind", "language", "limit"] as &[&str],
+            &["query", "kind", "language", "limit", "max_chars"] as &[&str],
         ),
         // `query` stays beside `entity_id`: this tool resolves an exact symbol
         // name to its canonical definition, and dropping it would take away the
         // path a caller uses when it has a name and no id.
         (
             "find_references",
-            &["entity_id", "query", "relation_kinds"] as &[&str],
+            &["entity_id", "query", "relation_kinds", "max_chars"] as &[&str],
         ),
         (
             "trace_data_flow",
-            &["focal", "target", "direction", "depth"] as &[&str],
+            &[
+                "focal",
+                "target",
+                "direction",
+                "depth",
+                "include_body",
+                "compact",
+                "max_response_chars",
+                "max_chars",
+            ] as &[&str],
         ),
         (
             crate::handlers::path::TOOL_NAME,
@@ -357,19 +392,27 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
                 "direction",
                 "max_depth",
                 "limit",
+                "max_chars",
             ] as &[&str],
         ),
         (
             "graph_neighborhood",
-            &["entity_id", "depth", "direction", "limit"] as &[&str],
+            &["entity_id", "depth", "direction", "limit", "max_chars"] as &[&str],
         ),
         (
             "impact_analysis",
-            &["entity_ids", "files", "base", "head", "change_ids"] as &[&str],
+            &[
+                "entity_ids",
+                "files",
+                "base",
+                "head",
+                "change_ids",
+                "max_chars",
+            ] as &[&str],
         ),
         (
             "get_context_pack",
-            &["entity_id", "depth", "token_budget"] as &[&str],
+            &["entity_id", "depth", "token_budget", "max_chars"] as &[&str],
         ),
         ("kin_provenance_query", &["entity_id", "limit"] as &[&str]),
     ])
@@ -653,6 +696,93 @@ mod tests {
         );
     }
 
+    /// The knobs the shipped acceptance checks read out of the served surface.
+    ///
+    /// `agent-default` trims response-shaping properties, and three acceptance
+    /// checks read exactly those properties as the contract an agent discovers
+    /// a knob from. Trimming them took `Product Acceptance` red on `main` for
+    /// four landings, as `magic:6`, `magic:14` and `response_budget:2`, while
+    /// every pull request stayed green, because that job is `skipped` on a pull
+    /// request and graded only on `main`'s push run.
+    ///
+    /// The three checks, so the next person can find them.
+    /// `scripts/acceptance/magic_repro.py` `check_6` requires `include_body` or
+    /// `compact` on `trace_data_flow`. Its `check_14` arm 3 requires the literal
+    /// `last_settled_selected_graph` in the served `kin_graph_status`
+    /// description. `scripts/acceptance/response_budget_elisions.py` `check_2`
+    /// grades every advertised `max_chars` or `max_response_chars` and reports
+    /// UNREADABLE when it finds none, so the served profile has to advertise a
+    /// budget wherever the registry does.
+    ///
+    /// Every arm collects rather than panics, so one trimmed knob reports itself
+    /// and the other two arms still run.
+    #[test]
+    fn agent_default_serves_every_knob_the_shipped_checks_assert() {
+        const BUDGET_KEYS: [&str; 2] = ["max_chars", "max_response_chars"];
+        let served = served_agent_default();
+        let full = crate::tools::tool_definitions();
+        let properties = |list: &ToolsListResult, name: &str| -> Vec<String> {
+            list.tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.input_schema.get("properties"))
+                .and_then(|value| value.as_object())
+                .map(|object| object.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let has_budget =
+            |keys: &[String]| keys.iter().any(|key| BUDGET_KEYS.contains(&key.as_str()));
+        let mut problems: Vec<String> = Vec::new();
+
+        // magic_repro.py check_6.
+        let trace = properties(&served, "trace_data_flow");
+        if !trace
+            .iter()
+            .any(|key| key == "include_body" || key == "compact")
+        {
+            problems.push(format!(
+                "trace_data_flow advertises neither include_body nor compact, which \
+                 magic_repro.py check_6 requires: {trace:?}"
+            ));
+        }
+
+        // response_budget_elisions.py check_2, graded against the registry's own set.
+        for tool in &served.tools {
+            if !has_budget(&properties(&full, &tool.name)) {
+                continue;
+            }
+            let keys = properties(&served, &tool.name);
+            if !has_budget(&keys) {
+                problems.push(format!(
+                    "{} registers a budget parameter and agent-default advertises none, so \
+                     response_budget_elisions.py check_2 grades a smaller set than it did: \
+                     {keys:?}",
+                    tool.name
+                ));
+            }
+        }
+
+        // magic_repro.py check_14, arm 3.
+        let status = served
+            .tools
+            .iter()
+            .find(|tool| tool.name == "kin_graph_status")
+            .map(|tool| tool.description.as_str())
+            .unwrap_or_default();
+        if !status.contains("last_settled_selected_graph") {
+            problems.push(
+                "the kin_graph_status short description does not carry \
+                 last_settled_selected_graph, which magic_repro.py check_14 arm 3 requires"
+                    .to_string(),
+            );
+        }
+
+        assert!(
+            problems.is_empty(),
+            "agent-default trimmed a knob a shipped acceptance check reads: {problems:#?}"
+        );
+    }
+
     /// The in-place form the dispatchers call must agree with the borrowing one,
     /// or a call under the alias reaches a different place than a test asserts.
     #[test]
@@ -703,20 +833,23 @@ mod tests {
             properties.contains_key("query"),
             "the question must survive"
         );
-        for shaping in [
-            "max_chars",
-            "compact",
-            "explain",
-            "snippet_alias",
-            "pipeline",
-        ] {
+        // `max_chars` is the exception the keep-list doc names. It shapes the
+        // response like the four below, and it stays advertised because
+        // response_budget_elisions.py check_2 grades the advertised budget and
+        // reports UNREADABLE when no tool carries one. An agent that cannot see
+        // it cannot bound a response either.
+        assert!(
+            properties.contains_key("max_chars"),
+            "max_chars is graded off the served schema and must stay advertised"
+        );
+        for shaping in ["compact", "explain", "snippet_alias", "pipeline"] {
             assert!(
                 !properties.contains_key(shaping),
                 "{shaping} shapes the response and should not be advertised here"
             );
         }
-        // The control: the registered schema still has them, so the profile is
-        // hiding them rather than the registry having lost them.
+        // The control: the registered schema still has them all, so the profile
+        // is hiding the four rather than the registry having lost them.
         let registered = crate::tools::tool_definitions();
         let full = registered
             .tools
