@@ -16,13 +16,14 @@ This script is the selection half of the pipeline. `select` reads everything
 the decision rests on and answers one of four things:
 
   stand-down  nothing to do now: the version is tagged, a fully evidenced sha
-              is waiting on the mint, the current candidate's preflight is
-              recorded and only the stranger record is missing, an rc-build is
-              still running, or no complete green sha exists yet
+              is waiting on the mint, an rc-build is still running, or no
+              complete green sha exists yet
   arm         move release/v<version>-candidate to the chosen sha and dispatch
               rc-build.yml there
   proof       an rc-build for the current candidate succeeded and carries the
               preflight leg records; merge and publish them
+  stranger    preflight.json is filed for the candidate and stranger.env is the
+              only missing half; run the three-arm stranger on the same archive
   refuse      no reviewed main commit carrying the version qualifies, named sha
               by sha with the context that disqualified it
 
@@ -32,9 +33,13 @@ The rule, in the order it is applied:
    version.
 2. A sha in the range carries both records: the mint owns it.
 3. A current candidate, the branch tip, which must lie in the range, is kept
-   until it is proven or dead. With its preflight recorded it waits for the
-   stranger. Alive with a usable rc-build it is proven; alive with none it is
-   armed again, up to RC_BUILD_ATTEMPT_LIMIT attempts. Dead means a required
+   until it is proven or dead. With its preflight recorded the stranger is what
+   is left, and it must run on the very bytes that preflight judged, so a
+   candidate whose rc-build artifacts have expired is refused rather than
+   rebuilt: a second build is not guaranteed to reproduce the archive sha256
+   the published record already names. Alive with a usable rc-build it is
+   proven; alive with none it is armed again, up to RC_BUILD_ATTEMPT_LIMIT
+   attempts. Dead means a required
    context that is red or duplicated, a CI or Acceptance push run that did not
    conclude success, or exhausted rc-build attempts.
 4. Otherwise the newest main commit in the range whose CI and Acceptance push
@@ -120,6 +125,7 @@ TRIGGER_SWEEP = "sweep"
 STAND_DOWN = "stand-down"
 ARM = "arm"
 PROOF = "proof"
+STRANGER = "stranger"
 REFUSE = "refuse"
 GREEN = "green"
 PENDING = "pending"
@@ -753,13 +759,34 @@ def judge(snapshot: dict[str, Any], grade: Grader) -> Decision:
                 candidate=candidate,
             )
         if PREFLIGHT_RECORD in records(candidate):
+            # The stranger has to run on the very bytes the published preflight
+            # judged, because kin-evidence-publish refuses a stranger record
+            # naming an archive no preflight leg for this candidate judged. The
+            # rc-build's artifacts carry those bytes and they expire, so an
+            # expired run is a refusal rather than a rebuild: a second build of
+            # the same sha is not guaranteed to reproduce the archive sha256 the
+            # record already names, and a candidate that can no longer be proven
+            # needs a human rather than a retry.
+            rc_run = _newest_usable_run(rc_builds, candidate)
+            if rc_run is None:
+                return Decision(
+                    REFUSE,
+                    f"preflight is recorded for {candidate} but no rc-build still holds the "
+                    "archives it judged, so the stranger cannot run on the bytes the record "
+                    "names; this candidate can no longer be proven and the next landing "
+                    "supplies a new one",
+                    version,
+                    branch,
+                    candidate=candidate,
+                )
             return Decision(
-                STAND_DOWN,
+                STRANGER,
                 f"preflight is recorded for {candidate}; the stranger record is the missing half",
                 version,
                 branch,
                 candidate=candidate,
-                details={"stranger_command": stranger_command(version, candidate, _newest_usable_run(rc_builds, candidate))},
+                rc_run=rc_run,
+                details={"stranger_command": stranger_command(version, candidate, rc_run)},
             )
         grade_of = grade(candidate)
         if grade_of.get("verdict") == PENDING:

@@ -64,7 +64,7 @@ jobs:
           for pkg in $PACKAGES; do
             path="$(index_path "$pkg")"
             status=""
-            for attempt in $(seq 1 50); do
+            for _ in $(seq 1 50); do
               code=$(curl -sS -m 30 -o idx.body -w '%{http_code}' "$BASE_URL/registry/cargo/$path")
               if [ "$code" = "200" ]; then
                 status="serving"

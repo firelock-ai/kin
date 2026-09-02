@@ -131,14 +131,45 @@ which judges its own output with the mint's gate before anything is published;
 the merge is deterministic because the evidence branch is append-only and a
 re-publish of differing bytes is refused as tampering.
 
-**The stranger is still a local step.** Three arms at 12 GiB each do not fit a
-16 GiB hosted runner beside a Docker daemon, and the driver is a Claude Code
-session that on the account login shares the founder's subscription limit, which
-cut three arms on 2026-09-02. `bin/kin-stranger` already passes
-`ANTHROPIC_API_KEY` through on the account endpoint, so what is missing is a
-runner with the memory and a key, not a change to the tool. The publish job
-prints the exact command with all three arms named, and the mint stays refused
-for the missing `stranger.env` rather than being fed a partial one.
+**The stranger runs on a runner the fleet owns.** It cannot run on a hosted one,
+and the reason is memory rather than wall clock. `bin/kin-stranger` launches one
+background process per arm and waits on them together, and each container is
+created `--cpus=5 --memory=12g`, so three concurrent arms demand 15 CPUs and
+36 GB, which no standard hosted tier holds. The caps cannot be lowered to fit:
+the tool's own reference says they are deliberately below the capability tier
+that gates the fused pipeline because they are the hardware a laptop audience
+actually has, and that **the cap is the measurement**, printing MEASUREMENT
+CONTAMINATED when the cgroup ceiling at capture differs from the flag the
+container was created with. A smaller arm is not a smaller proof, it is an
+unfilable one. Wall clock is not the constraint: the phase caps are 3600 s and
+7200 s and the arms are concurrent, so a run fits a six-hour cap with room.
+
+The job is gated on the repository variable `KIN_STRANGER_RUNNER`, which names
+the runner, in the same shape `ci.yml` already uses for `KIN_HEAVY_RUNNER`. The
+gate is a variable rather than a live runner query for two reasons: `GITHUB_TOKEN`
+cannot list runners, because `administration` is not among the permissions a
+workflow token can hold, and more importantly a job whose `runs-on` labels match
+no online runner does not skip, it queues until the job timeout, which is the
+silent hang this repository refuses everywhere else. Set the variable when a
+runner is registered and clear it when it goes away:
+
+```
+gh variable set KIN_STRANGER_RUNNER --repo firelock-ai/kin --body '<runner label>'
+gh secret set KIN_STRANGER_ANTHROPIC_API_KEY --repo firelock-ai/kin
+```
+
+With the variable unset the cut still selects, arms and preflights, and the
+`stranger-standby` job prints the exact local command with all three arms named
+and raises a warning. Either way the mint stays refused for the missing
+`stranger.env` rather than being fed a partial one.
+
+The driver takes its credential from `KIN_STRANGER_ANTHROPIC_API_KEY`, exported
+as `ANTHROPIC_API_KEY`. No harness change was needed: `driver_env_argv` unsets
+that variable on exactly one branch, the local endpoint, and the endpoint
+defaults to the account, so an exported key rides through and Claude Code
+prefers it over `ANTHROPIC_AUTH_TOKEN`. The job refuses at the door when the
+secret is empty rather than sending every request out unauthenticated and
+discovering it hours later in a transcript that records only a server error.
 
 ## Tag admission (fail-closed checks, in order)
 

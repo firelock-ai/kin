@@ -444,18 +444,56 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(decision.candidate, MIDDLE)
         self.assertEqual(grader.calls, [])
 
-    def test_a_half_evidenced_candidate_waits_for_the_stranger_and_prints_its_command(self) -> None:
+    def test_a_half_evidenced_candidate_asks_for_the_stranger_and_names_its_archive(self) -> None:
         grader = Grader({})
         decision = selector.judge(
-            snapshot(candidate=MIDDLE, evidence={MIDDLE: [selector.PREFLIGHT_RECORD]}),
+            snapshot(
+                candidate=MIDDLE,
+                evidence={MIDDLE: [selector.PREFLIGHT_RECORD]},
+                rc_builds=[rc_build(MIDDLE)],
+            ),
             grader,
         )
-        self.assertDecision(decision, selector.STAND_DOWN, "the stranger record is the missing half")
+        self.assertDecision(decision, selector.STRANGER, "the stranger record is the missing half")
+        # The rc-build run travels with the decision, because the stranger has
+        # to run on the very bytes the published preflight judged.
+        self.assertEqual(decision.rc_run, 34_000_000_001)
         command = decision.details["stranger_command"]
         self.assertIn("bin/kin-stranger prepare", command)
         self.assertIn("--arms green,brown,vcs", command)
         self.assertIn(f"--candidate-sha {MIDDLE}", command)
-        self.assertEqual(grader.calls, [])
+        self.assertEqual(grader.calls, [], "a filed preflight must cost no grading")
+
+    def test_a_half_evidenced_candidate_whose_archives_expired_refuses(self) -> None:
+        """The record names an archive sha256; a rebuild is not guaranteed to reproduce it."""
+
+        decision = selector.judge(
+            snapshot(candidate=MIDDLE, evidence={MIDDLE: [selector.PREFLIGHT_RECORD]}, rc_builds=[]),
+            Grader({}),
+        )
+        self.assertDecision(decision, selector.REFUSE, "no rc-build still holds the archives it judged")
+        self.assertEqual(decision.candidate, MIDDLE)
+
+    def test_an_expired_rc_build_is_not_a_usable_archive_source(self) -> None:
+        stale = rc_build(MIDDLE, artifacts=[])
+        decision = selector.judge(
+            snapshot(candidate=MIDDLE, evidence={MIDDLE: [selector.PREFLIGHT_RECORD]}, rc_builds=[stale]),
+            Grader({}),
+        )
+        self.assertDecision(decision, selector.REFUSE, "no rc-build still holds")
+
+    def test_both_records_beat_the_stranger_decision(self) -> None:
+        """Once stranger.env lands the candidate belongs to the mint, not to another run."""
+
+        decision = selector.judge(
+            snapshot(
+                candidate=MIDDLE,
+                evidence={MIDDLE: [selector.PREFLIGHT_RECORD, selector.STRANGER_RECORD]},
+                rc_builds=[rc_build(MIDDLE)],
+            ),
+            Grader({}),
+        )
+        self.assertDecision(decision, selector.STAND_DOWN, "awaits the mint")
 
     def test_the_newest_green_sha_is_armed(self) -> None:
         grader = Grader({NEWEST: green_grade(NEWEST)})
@@ -787,6 +825,76 @@ class ContractTests(unittest.TestCase):
             "scripts/release-proof/bin/kin-evidence-publish",
         ):
             self.assertIn(needle, workflow, f"release-cut.yml must run {needle}")
+
+    def test_the_stranger_is_gated_on_a_variable_rather_than_a_runner_query(self) -> None:
+        """A job whose labels match no online runner queues; it does not skip.
+
+        GITHUB_TOKEN cannot list runners (`administration` is not among the
+        permissions a workflow token can hold) and the release App carries
+        contents, issues and pull-requests only, so live availability is not
+        readable from inside the run. The switch is therefore explicit, and
+        every path has to be covered: one job when it is set, one when it is not.
+        """
+
+        workflow = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
+        jobs = dict(re.findall(r"(?ms)^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:\n|\Z)", workflow))
+        self.assertIn("stranger", jobs)
+        self.assertIn("stranger-standby", jobs)
+        self.assertIn("vars.KIN_STRANGER_RUNNER != ''", jobs["stranger"])
+        self.assertIn("vars.KIN_STRANGER_RUNNER == ''", jobs["stranger-standby"])
+        self.assertIn("runs-on: ${{ vars.KIN_STRANGER_RUNNER }}", jobs["stranger"])
+        # The standby path is the one that keeps a release moving without a
+        # runner, so it has to carry the whole command rather than a pointer.
+        for needle in ("bin/kin-stranger prepare", "--arms green,brown,vcs", "--candidate-sha", "::warning::"):
+            self.assertIn(needle, jobs["stranger-standby"], f"the standby path must print {needle}")
+
+    def test_the_stranger_refuses_before_spending_an_arm_on_a_missing_credential(self) -> None:
+        workflow = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
+        jobs = dict(re.findall(r"(?ms)^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:\n|\Z)", workflow))
+        stranger = jobs["stranger"]
+        self.assertIn("KIN_STRANGER_ANTHROPIC_API_KEY", stranger)
+        self.assertIn('if [ -z "${STRANGER_KEY:-}" ]; then', stranger)
+        # An interrupted run resumes rather than re-preparing: `prepare` refuses
+        # a reused container without --force because a reused container tests an
+        # upgrade path, which is a different question.
+        self.assertIn("bin/kin-stranger resume", stranger)
+        # Read the executable lines only. A bare substring search cannot tell a
+        # comment explaining why --force is wrong from a command using it, and
+        # would fail on the explanation that keeps the decision reviewable.
+        active = [
+            line for line in stranger.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertFalse(
+            [line for line in active if "--force" in line],
+            "the stranger job must never force a reused container: that tests an upgrade path",
+        )
+
+    def test_the_stranger_never_publishes_and_the_publisher_never_drives(self) -> None:
+        """The App key must not reach the machine running a Claude driver on candidate bytes."""
+
+        workflow = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
+        jobs = dict(re.findall(r"(?ms)^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:\n|\Z)", workflow))
+        self.assertNotIn("KIN_RELEASE_BOT_PRIVATE_KEY", jobs["stranger"])
+        self.assertNotIn("kin-evidence-publish", jobs["stranger"])
+        self.assertNotIn("environment:", jobs["stranger"])
+        self.assertIn("environment: release-tag", jobs["publish-stranger"])
+        self.assertIn("kin-evidence-publish", jobs["publish-stranger"])
+        self.assertNotIn("ANTHROPIC_API_KEY", jobs["publish-stranger"])
+        # --require-archive is what binds the record to the bytes the preflight
+        # judged, checked at write time rather than by the gate at release time.
+        # Read the executable lines only: the comment above that step explains
+        # the flag, and a bare substring search is satisfied by the explanation
+        # alone, so removing the flag itself left this assertion green.
+        publisher_active = [
+            line for line in jobs["publish-stranger"].splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertTrue(
+            [line for line in publisher_active if "--require-archive" in line],
+            "the stranger record must be published with --require-archive, which binds it "
+            "to an archive the published preflight actually judged",
+        )
 
     def test_the_workflow_keeps_the_release_app_off_the_proof_runners(self) -> None:
         """The preflight job downloads and judges; only the publish job may write."""
