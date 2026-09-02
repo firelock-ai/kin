@@ -773,8 +773,18 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             bulk_keys: &[],
             narrow_param: "limit",
         },
+        // `clipped_steps` sheds before `chain`, because the ladder trims from
+        // the end of this list. A clip is a note about breadth the walk gave
+        // up; the chain is the answer, and `spine_clipped_steps` beside it
+        // keeps the count when the detail goes.
+        //
+        // Naming only `chain` was FIR-2602's shape on this tool. A deep walk
+        // measured on 2026-09-02 spent 758 characters on six clips that the
+        // table could not count, and shipped 15,875 characters against a
+        // 12,000 ceiling (FIR-3107). A key the table does not name is a key
+        // the bounder cannot cut.
         "trace_data_flow" => ResponseShape {
-            collections: &["chain"],
+            collections: &["chain", "clipped_steps"],
             body_keys: &["body"],
             explain_keys: &[],
             top_explain_keys: &[],
@@ -1277,6 +1287,41 @@ fn run_ladder(
             break;
         }
     }
+    // Before the floor goes, the cheapest bytes in the response: the verbatim
+    // restatements of one sentence.
+    //
+    // Measured on 2026-09-02 (FIR-3107) on a `trace_data_flow` at depth, at the
+    // agent belt's 12,000-character ceiling. The part of that response the
+    // budget never trims was 9,210 characters, and roughly 7,700 of it was FOUR
+    // copies of one 1,900-character limiting-factor sentence:
+    // `_kin.verdict.limiting_factor`, `_kin.verdict.note`, `negative.advice`
+    // and `negative.trust_reason`. No rung above could reach the ceiling
+    // because the answer rows were not what was over it.
+    //
+    // This drops two of the three restatements and leaves a pointer. It never
+    // touches `limiting_factor`, which is the canonical copy every reader is
+    // sent to first, nor `trust_reason`, which is the sentence `negative`
+    // publishes in its own right. Nothing is lost: the statement survives, and
+    // the two places that repeated it now name where it lives.
+    // Applied here so the floor guard below measures the response after the
+    // pointer rather than before it, and applied AGAIN by the envelope
+    // finalizer once its loop settles, because a pass of that loop can rebuild
+    // the verdict and write the long form back over this.
+    point_restated_limiting_factor(payload, budget);
+
+    // The floor of one entry per list is absolute, and a response that cannot
+    // reach its ceiling with it says so rather than giving it up.
+    //
+    // A rung that released the floor when releasing it was what fit was written
+    // for FIR-3107 and taken out again: `response_budget_elisions.py` check 4
+    // went red on it locally, because at a tight ceiling an `impact_analysis`
+    // then emptied `entity_impacts`, `affected_callers`, `affected_tests` and
+    // `changed_ids` all at once. That is FIR-2602 exactly, and an empty array
+    // reading as "the walk found none" is a worse answer than a response that
+    // ships over its ceiling and discloses it. The rungs above are what bring
+    // the measured case inside its ceiling; `the_entry_floor_holds_even_when_    // releasing_it_would_fit` is what keeps this decision from being undone by
+    // the next person who reads the arithmetic and not the history.
+
     if withheld_any {
         let kept = primary
             .and_then(|key| payload.get(key))
@@ -1302,6 +1347,151 @@ fn run_ladder(
 
     disclose(payload, budget, started_at, &cuts, &remediations);
 }
+
+/// The join every restatement of the limiting factor is built with.
+///
+/// One literal, so this reads exactly what [`crate::verdict`] and
+/// [`crate::negative`] wrote rather than a pattern that resembles it.
+const LIMITING_FACTOR_JOIN: &str = " Limiting factor: ";
+
+/// Point the restatements at the canonical sentence and say so, on a response
+/// over its ceiling. Returns how many fields were pointed.
+///
+/// Called twice on the stdio path: once inside the ladder, so the floor rung
+/// below it measures the smaller response, and once by the envelope finalizer
+/// after its loop settles, because that loop rebuilds the verdict and would
+/// otherwise write the long form back over the pointer. Both the rewrite and
+/// its disclosure are idempotent, so the second call is free when the first
+/// already held.
+pub(crate) fn point_restated_limiting_factor(
+    payload: &mut Value,
+    budget: &ResponseBudget,
+) -> usize {
+    let pointed = shed_restated_limiting_factor(payload, budget);
+    if pointed > 0 {
+        disclose_restatements_pointed(payload, pointed);
+    }
+    pointed
+}
+
+/// Replace a verbatim restatement of the limiting factor with a pointer to it,
+/// in the two fields that carry one, and only on a response over its ceiling.
+///
+/// Returns how many fields were pointed.
+///
+/// The rewrite fires only when the tail after the join IS the canonical
+/// sentence, ignoring a trailing full stop. A field whose tail says anything
+/// else is left alone, which is what keeps this from turning a field that had
+/// something of its own to say into a pointer at something else.
+fn shed_restated_limiting_factor(payload: &mut Value, budget: &ResponseBudget) -> usize {
+    if measure(payload) <= budget.max_chars {
+        return 0;
+    }
+    // Each row is one field that ends by restating another, and the field it
+    // restates. `_kin.verdict.limiting_factor` and `negative.trust_reason` are
+    // both left whole: the first is the canonical sentence the server tells
+    // every reader to consult first, the second is what `negative` publishes in
+    // its own right and what the acceptance suite grades.
+    const RESTATEMENTS: [(&str, &str, &str, &str); 2] = [
+        (
+            crate::envelope::ENVELOPE_KEY,
+            "verdict",
+            "note",
+            "limiting_factor",
+        ),
+        (crate::negative::NEGATIVE_KEY, "", "advice", "trust_reason"),
+    ];
+    let mut pointed = 0usize;
+    for (root, section, field, canonical_field) in RESTATEMENTS {
+        fn block<'a>(value: &'a Value, root: &str, section: &str) -> Option<&'a Value> {
+            let block = value.get(root)?;
+            if section.is_empty() {
+                Some(block)
+            } else {
+                block.get(section)
+            }
+        }
+        let Some(canonical) = block(payload, root, section)
+            .and_then(|block| block.get(canonical_field))
+            .and_then(Value::as_str)
+            .map(|text| text.trim_end_matches('.').to_string())
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let Some(text) = block(payload, root, section)
+            .and_then(|block| block.get(field))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(at) = text.rfind(LIMITING_FACTOR_JOIN) else {
+            continue;
+        };
+        // Word for word, or not at all. A tail that says anything of its own is
+        // left alone, which is what keeps this from turning a field with
+        // something to say into a pointer at something else.
+        if text[at + LIMITING_FACTOR_JOIN.len()..].trim_end_matches('.') != canonical {
+            continue;
+        }
+        let mut shortened = text[..at].to_string();
+        let owner = if section.is_empty() {
+            format!("{root}.{canonical_field}")
+        } else {
+            format!("{root}.{section}.{canonical_field}")
+        };
+        shortened.push_str(&format!("{LIMITING_FACTOR_JOIN}see `{owner}`."));
+        let target = if section.is_empty() {
+            payload.get_mut(root).and_then(|block| block.get_mut(field))
+        } else {
+            payload
+                .get_mut(root)
+                .and_then(|block| block.get_mut(section))
+                .and_then(|block| block.get_mut(field))
+        };
+        if let Some(target) = target {
+            *target = Value::String(shortened);
+            pointed += 1;
+        }
+    }
+    pointed
+}
+
+/// Say that a restatement was replaced by a pointer.
+///
+/// Its own entry rather than a clause inside [`BOUNDED_REASON`], because that
+/// reason code means answer rows were withheld and `prior_bound` reads it on
+/// the second arm to decide whether the response was bounded. Nothing was
+/// withheld here.
+fn disclose_restatements_pointed(payload: &mut Value, pointed: usize) {
+    let entry = json!({
+        "component": "response_budget",
+        "reason": RESTATEMENT_POINTED_REASON,
+        "detail": format!(
+            "this response was over its ceiling, so {pointed} field(s) that restated \
+             another field word for word now point at it instead. Nothing was dropped: \
+             `_kin.verdict.limiting_factor` and `negative.trust_reason` carry the statement \
+             in full, and each pointer names the field it points at"
+        ),
+    });
+    match payload
+        .get_mut("degradations")
+        .and_then(Value::as_array_mut)
+    {
+        Some(existing) => {
+            existing.retain(|prior| {
+                prior.get("reason").and_then(Value::as_str) != Some(RESTATEMENT_POINTED_REASON)
+            });
+            existing.push(entry);
+        }
+        None => payload["degradations"] = Value::Array(vec![entry]),
+    }
+}
+
+/// The reason code a response whose restatements were replaced by a pointer
+/// carries.
+pub const RESTATEMENT_POINTED_REASON: &str = "qualification_restatement_pointed";
 
 /// The reason code a response the budget cut carries.
 pub const BOUNDED_REASON: &str = "response_bounded";
@@ -2276,6 +2466,151 @@ mod tests {
         assert!(cuts
             .iter()
             .all(|cut| cut["component"] == json!("response_budget")));
+    }
+
+    /// A trace payload whose fixed part is a fixed size, so a test can put the
+    /// ceiling on either side of it.
+    ///
+    /// `fixed_chars` stands for the part of a real response the budget never
+    /// trims: the `_kin` envelope, the `negative` object and the fields that
+    /// qualify the walk. Measured on 2026-09-02 that part was 9,210 characters
+    /// of a 12,000-character ceiling (FIR-3107), which is the whole reason the
+    /// rung below exists.
+    fn floor_case_payload(steps: usize, step_chars: usize, fixed_chars: usize) -> Value {
+        let chain: Vec<Value> = (1..=steps)
+            .map(|step| {
+                json!({
+                    "step": step,
+                    "parent_step": step - 1,
+                    "entity_id": format!("id-{step}"),
+                    "entity_name": format!("hop_{step}"),
+                    "signature": "s".repeat(step_chars),
+                })
+            })
+            .collect();
+        json!({
+            "focal_name": "Session.send",
+            "untrimmable": "f".repeat(fixed_chars),
+            "total_steps": steps,
+            "chain": chain,
+        })
+    }
+
+    /// The floor of one entry per list holds even when giving it up is exactly
+    /// what would fit.
+    ///
+    /// This fixture is the tempting case: one surviving row does not fit and no
+    /// rows do, so releasing the floor would put the response inside its
+    /// ceiling. A rung that did that was written for FIR-3107 and taken out
+    /// again, because `response_budget_elisions.py` check 4 went red on it: at a
+    /// tight ceiling an `impact_analysis` emptied `entity_impacts`,
+    /// `affected_callers`, `affected_tests` and `changed_ids` in one pass, which
+    /// is FIR-2602 reappearing. An empty array reads as "the walk found none",
+    /// and no counter beside it outranks that reading, so a response that cannot
+    /// reach its ceiling says so in `response_over_budget` instead.
+    #[test]
+    fn the_entry_floor_holds_even_when_releasing_it_would_fit() {
+        const BUDGET: usize = 8_000;
+        let mut payload = floor_case_payload(4, 2_400, 6_000);
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        // Both controls, because the case is defined by the gap between them.
+        let mut one_row = payload.clone();
+        one_row["chain"] = json!([payload["chain"][0].clone()]);
+        assert!(
+            measure(&one_row) > BUDGET,
+            "the fixture fits at the floor, so it is not the tempting case"
+        );
+        let mut none = payload.clone();
+        none["chain"] = json!([]);
+        assert!(
+            measure(&none) <= BUDGET,
+            "the fixture does not fit even empty, so releasing the floor was never on offer"
+        );
+
+        enforce(&mut payload, "trace_data_flow", &budget).expect("trace_data_flow is budgeted");
+        assert_eq!(
+            payload["chain"].as_array().map(Vec::len),
+            Some(1),
+            "the budget emptied a walk that reached four steps to make a ceiling: {payload}"
+        );
+        let reasons: Vec<&str> = payload["degradations"]
+            .as_array()
+            .expect("a cut is disclosed")
+            .iter()
+            .filter_map(|entry| entry["reason"].as_str())
+            .collect();
+        assert!(
+            reasons.contains(&OVER_BUDGET_REASON),
+            "a response that stayed over its ceiling has to say so: {reasons:?}"
+        );
+    }
+
+    /// `clipped_steps` is an array a trace answer carries and the shape table
+    /// did not name, which is FIR-2602's shape: a key the table does not name
+    /// is a key the bounder cannot cut. Six clips were 758 characters of a
+    /// 12,000-character ceiling in the measured case (FIR-3107).
+    ///
+    /// It sheds before the chain, because a clip is a note about breadth the
+    /// walk gave up and the chain is the answer.
+    #[test]
+    fn clipped_steps_shed_before_the_chain_they_annotate() {
+        const BUDGET: usize = 6_000;
+        let mut payload = floor_case_payload(4, 400, 0);
+        payload["clipped_steps"] = Value::Array(
+            (0..20)
+                .map(|index| {
+                    json!({
+                        "step": index,
+                        "limit_per_step": 12,
+                        "dropped_callees": 7,
+                        "dropped_crossing_file": 3,
+                        "note": "n".repeat(300),
+                    })
+                })
+                .collect(),
+        );
+        assert!(
+            measure(&payload) > BUDGET,
+            "the fixture must overflow or nothing is trimmed"
+        );
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "trace_data_flow", &budget).expect("trace_data_flow is budgeted");
+
+        let clips = payload["clipped_steps"]
+            .as_array()
+            .expect("clips survive")
+            .len();
+        assert!(
+            clips < 20,
+            "the bounder still cannot count `clipped_steps`, so it cannot cut them: {payload}"
+        );
+        let chain = payload["chain"].as_array().expect("a chain survives").len();
+        // The order is the assertion, not the survival: the ladder keeps going
+        // until the response fits, so the chain can lose a row too. What must
+        // not happen is the annotation outliving the answer it annotates.
+        assert!(
+            20 - clips > 4 - chain,
+            "the chain gave up {} rows while the clips gave up {}, so the annotation is \
+             outranking the answer: {payload}",
+            4 - chain,
+            20 - clips
+        );
+        assert!(
+            chain > 1,
+            "the clips were shed and the answer went with them anyway: {payload}"
+        );
+        assert_eq!(
+            payload["elisions"]["clipped_steps"]["elided"],
+            json!(20 - clips),
+            "the clips went without appearing in the one map that answers what was lost: \
+             {payload}"
+        );
     }
 
     /// One `trace_data_flow` chain, wide and shallow, with `target_name` echoing

@@ -1412,7 +1412,7 @@ kin mcp start [options]
 | --- | --- | --- |
 | `--global` |  | Run in global mode, serving every repo in this home's registry (KIN_REGISTRY_PATH, else <KIN_HOME>/registry.toml, else ~/.kin/registry.toml) |
 | `--repo <path>` |  | Bind this server to a specific Kin repository instead of relying on the launching process's working directory. Overrides KIN_MCP_REPO. Use this for a global agent-CLI MCP entry that may launch outside any Kin repository (e.g. an umbrella workspace root). |
-| `--tool-profile <profile>` |  | Tool surface to serve: `agent-default` (the curated agent belt, and the default), `full` (every tool, roughly 12k extra tokens of schemas per session), `benchmark`, or `context-bench`. Overrides KIN_MCP_TOOL_PROFILE. |
+| `--tool-profile <profile>` |  | Tool surface to serve: `agent-default` (the curated agent belt, and the default), `agent-query` (that belt without the session and transaction tools, for a client that only queries), `full` (every tool, roughly 12k extra tokens of schemas per session), `benchmark`, or `context-bench`. Overrides KIN_MCP_TOOL_PROFILE. |
 | `--no-spawn` |  | Never start or revive a daemon from this server: bind only a daemon that is already running, and answer graph tool calls with an honest "no daemon is running" error otherwise. This is the probe mode for watchdogs and boot-time checks (equivalent to KIN_NO_DAEMON=1): the MCP handshake and tool list are served in full, and nothing heavy is ever spawned by the check itself. |
 
 ### `kin assistant`

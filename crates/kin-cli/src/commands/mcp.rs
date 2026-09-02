@@ -263,6 +263,11 @@ async fn run_startup_binding(
 pub(crate) enum McpToolProfile {
     /// The curated belt every configured agent gets. The default.
     AgentDefault,
+    /// The same belt with its write half removed: discovery and retrieval
+    /// tools, no session and no transaction tools. A second served list for a
+    /// client that only queries, not a mode: `AgentDefault` is unchanged and
+    /// still serves every write tool.
+    AgentQuery,
     /// The retrieval belt the benchmark arm drives.
     Benchmark,
     /// Read-only graph-native ContextBench belt: no write-side session or
@@ -276,6 +281,7 @@ pub(crate) enum McpToolProfile {
 /// `--tool-profile` accept, in the order a help message should list them.
 const TOOL_PROFILE_TOKENS: &[(&str, McpToolProfile)] = &[
     ("agent-default", McpToolProfile::AgentDefault),
+    ("agent-query", McpToolProfile::AgentQuery),
     ("full", McpToolProfile::Full),
     ("benchmark", McpToolProfile::Benchmark),
     ("context-bench", McpToolProfile::ContextBench),
@@ -286,6 +292,7 @@ impl McpToolProfile {
     pub(crate) fn allowed_tool_names(self) -> Option<&'static [&'static str]> {
         match self {
             Self::AgentDefault => Some(kin_mcp::agent_default_tool_names()),
+            Self::AgentQuery => Some(kin_mcp::agent_query_tool_names()),
             Self::Benchmark => Some(kin_mcp::benchmark_tool_names()),
             Self::ContextBench => Some(kin_mcp::context_bench_tool_names()),
             Self::Full => None,
@@ -295,13 +302,14 @@ impl McpToolProfile {
     /// Whether this profile IS the curated agent belt: short descriptions,
     /// trimmed input schemas, and the compact `semantic_locate` shape.
     ///
-    /// `agent-default` only. `full` is the whole documented surface by
-    /// definition. `benchmark` and `context-bench` keep the long forms and the
-    /// shared payload because their bytes are an input to a citable result, and
-    /// a benchmark number must not move because a description was rewritten or a
-    /// payload was narrowed.
+    /// `agent-default` and `agent-query`, which is that belt with its write half
+    /// removed and therefore the same short forms. `full` is the whole
+    /// documented surface by definition. `benchmark` and `context-bench` keep
+    /// the long forms and the shared payload because their bytes are an input to
+    /// a citable result, and a benchmark number must not move because a
+    /// description was rewritten or a payload was narrowed.
     pub(crate) fn is_agent_belt(self) -> bool {
-        matches!(self, Self::AgentDefault)
+        matches!(self, Self::AgentDefault | Self::AgentQuery)
     }
 
     pub(crate) fn token(self) -> &'static str {
@@ -364,8 +372,12 @@ impl ResolvedToolProfile {
             ),
             ToolProfileSource::Default => format!(
                 "Kin MCP: serving the default '{token}' tool profile ({count} tools). Set \
-                 KIN_MCP_TOOL_PROFILE=full (or --tool-profile full) for the complete {} tool \
-                 surface; accepted profiles: {}.",
+                 KIN_MCP_TOOL_PROFILE=agent-query (or --tool-profile agent-query) for the same \
+                 belt without the session and transaction tools ({} tools), which a \
+                 query-only client re-sends in every prompt and never calls, or \
+                 KIN_MCP_TOOL_PROFILE=full for the complete {} tool surface; accepted \
+                 profiles: {}.",
+                McpToolProfile::AgentQuery.tool_count(),
                 McpToolProfile::Full.tool_count(),
                 accepted_tool_profiles()
             ),
@@ -885,7 +897,7 @@ mod tests {
         bind_daemon_for_repo_dir, bind_first_kin_repo_against, build_mcp_start_config,
         registry_should_resolve, registry_startup_choice, resolve_repo_override,
         resolve_tool_profile, session_authority_notice, BindRefusal, DaemonBindMode,
-        McpToolProfile, RegistryStartupChoice, ToolProfileSource,
+        McpToolProfile, RegistryStartupChoice, ToolProfileSource, TOOL_PROFILE_TOKENS,
     };
     use kin_core::registry::{KinRegistry, RegisteredRepo};
     use kin_core::test_env::EnvVarGuard;
@@ -986,12 +998,22 @@ mod tests {
 
     #[test]
     fn every_named_profile_resolves_to_its_own_surface() {
-        for (token, expected) in [
+        let rows = [
             ("agent-default", McpToolProfile::AgentDefault),
+            ("agent-query", McpToolProfile::AgentQuery),
             ("benchmark", McpToolProfile::Benchmark),
             ("context-bench", McpToolProfile::ContextBench),
             ("full", McpToolProfile::Full),
-        ] {
+        ];
+        // Written out AND counted. Without the count a profile added to
+        // `TOOL_PROFILE_TOKENS` would ride in unnamed, and this loop would
+        // report every token it happened to list.
+        assert_eq!(
+            rows.len(),
+            TOOL_PROFILE_TOKENS.len(),
+            "a profile joined the token table without a row here"
+        );
+        for (token, expected) in rows {
             let resolved = resolve_tool_profile(None, Some(token));
             assert_eq!(resolved.profile, expected, "for token {token}");
             assert_eq!(resolved.source, ToolProfileSource::Env);
@@ -1033,20 +1055,35 @@ mod tests {
         );
     }
 
-    /// The startup line is the only channel this change has — stdout belongs to
-    /// the protocol — so an unconfigured server must announce both what it is
-    /// serving and how to ask for the rest.
+    /// The startup line is the only channel this change has, since stdout
+    /// belongs to the protocol, so an unconfigured server must announce what it
+    /// is serving and both ways to ask for something else.
     #[test]
-    fn the_default_startup_notice_names_the_surface_and_the_opt_in() {
+    fn the_default_startup_notice_names_the_surface_and_the_opt_ins() {
         let notice = resolve_tool_profile(None, None).startup_notice();
         assert!(notice.contains("agent-default"), "notice: {notice}");
         assert!(
             notice.contains("KIN_MCP_TOOL_PROFILE=full"),
             "notice: {notice}"
         );
+        // The lighter surface is the one a query-only client wants and the one
+        // nobody would guess exists. The default profile was invisible until
+        // this line said so, and a second profile nobody is told about is the
+        // same defect one profile along.
+        assert!(
+            notice.contains("KIN_MCP_TOOL_PROFILE=agent-query"),
+            "notice must name the query-only surface: {notice}"
+        );
         assert!(
             notice.contains(&kin_mcp::agent_default_tool_names().len().to_string()),
             "notice must state the served count: {notice}"
+        );
+        assert!(
+            notice.contains(&format!(
+                "({} tools)",
+                kin_mcp::agent_query_tool_names().len()
+            )),
+            "notice must state what the query surface costs: {notice}"
         );
     }
 

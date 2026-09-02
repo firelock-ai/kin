@@ -2716,6 +2716,14 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
         }
     }
 
+    // The loop above rebuilds the verdict on any pass that marked the response
+    // bounded, so a pointer the ladder wrote inside the loop is overwritten by
+    // the long form on the next pass. It is applied here, after the loop has
+    // settled, where nothing rewrites those fields again.
+    if crate::budget::point_restated_limiting_factor(annotated, budget) > 0 {
+        settle_response_accounting(annotated, &mut accounting);
+    }
+
     // The last accounting rewrite is itself part of the response. Reconcile
     // the residual marker against that exact shape, then settle its size once
     // more because adding or removing the marker changes the measured bytes.
@@ -3547,6 +3555,277 @@ mod tests {
 
     /// A daemon envelope over a graph that reports itself ready, which is the
     /// state every one of these fixtures answers from.
+    /// One `trace_data_flow` answer at depth, in the shape the demo measured on
+    /// hiredis on 2026-09-02: eleven hops, most of them reached by name alone,
+    /// six clipped nodes, a two-candidate focal and partial C edge coverage.
+    ///
+    /// Sized to overflow the agent belt's own 12,000-character ceiling, which is
+    /// what the case is about.
+    fn deep_trace_payload() -> Value {
+        let steps: Vec<Value> = (1..=11)
+            .map(|index| {
+                json!({
+                    "step": index,
+                    "role": "callee",
+                    "relation_kind": "Calls",
+                    "resolution": if index > 4 { "name_only" } else { "type_resolved" },
+                    "parent_step": index - 1,
+                    "depth": (index + 1) / 2,
+                    "reference_lines": [120 + index, 340 + index],
+                    "reference_lines_absent_reason": null,
+                    "fanout_truncated": false,
+                    "fanout_dropped": 0,
+                    "terminal": null,
+                    "entity_id": format!("6f1c9b0e-{index:04}-4a21-9d33-2b7e5c8a10{index:02}"),
+                    "entity_name": format!("redisAsyncCommand_stage_{index}"),
+                    "entity_kind": "Function",
+                    "entity_role": "source",
+                    "entity_file": format!("src/async_stage_{index}.c"),
+                    "external": false,
+                    "start_line": 100 + index * 7,
+                    "end_line": 160 + index * 7,
+                    "signature": "int redisAsyncCommand(redisAsyncContext *ac, redisCallbackFn *fn, void *privdata, const char *format, ...)",
+                    "body": null,
+                    "span_coherence": null,
+                    "crossing": null,
+                })
+            })
+            .collect();
+        let clips: Vec<Value> = (0..6)
+            .map(|index| {
+                json!({
+                    "step": index,
+                    "limit_per_step": 12,
+                    "dropped_callees": 7,
+                    "dropped_crossing_file": 3,
+                    "spine": true,
+                })
+            })
+            .collect();
+        json!({
+            "focal_id": "6f1c9b0e-0000-4a21-9d33-2b7e5c8a1000",
+            "focal_name": "redisAsyncCommand",
+            "focal_kind": "Function",
+            "focal_file": "src/async.c",
+            "focal_entity": {
+                "entity_id": "6f1c9b0e-0000-4a21-9d33-2b7e5c8a1000",
+                "entity_name": "redisAsyncCommand",
+                "entity_kind": "Function",
+                "entity_role": "source",
+                "entity_file": "src/async.c",
+                "external": false,
+                "start_line": 700,
+                "end_line": 760,
+                "signature": "int redisAsyncCommand(redisAsyncContext *ac, redisCallbackFn *fn, void *privdata, const char *format, ...)",
+                "body": null,
+                "span_coherence": null,
+                "crossing": null,
+            },
+            "direction": "calls",
+            "depth": 6,
+            "limit_per_step": 12,
+            "bodies_included": false,
+            "include_type_edges": false,
+            "chain": steps,
+            "total_steps": 11,
+            "truncated": true,
+            "focal_resolution": { "addressed_by": "name", "same_name_candidates": 2 },
+            "edge_coverage": {
+                "language": "C",
+                "classes": { "calls": "present", "imports": "absent", "references": "partial" },
+                "cross_file_classes": ["calls"],
+                "budget_exhausted": false,
+                "reference_enrichment": "build_only",
+                "scope_entities": 6160,
+            },
+            "clipped_steps": clips,
+            "spine_clipped_steps": 4,
+            "max_response_chars": 45000,
+            "fanout_narrowed": 0,
+            "terminal_external_steps": 0,
+            "terminal_annotation_steps": 0,
+            "terminal_leaf_steps": 2,
+            "terminal_bound_steps": 3,
+            "terminal_coverage_gap_steps": 0,
+        })
+    }
+
+    fn belt_bounded_deep_trace() -> Value {
+        let budget = ResponseBudget {
+            max_chars: crate::agent_belt::AGENT_DEFAULT_RESPONSE_MAX_CHARS as usize,
+            ..ResponseBudget::default()
+        };
+        let annotated = finalize_bounded(
+            ToolCallResult::text(deep_trace_payload().to_string()),
+            ready_daemon_envelope(),
+            "trace_data_flow",
+            &budget,
+        );
+        annotated_value(&annotated)
+    }
+
+    /// The measured case, and the one the belt advertises a number for.
+    ///
+    /// `trace_data_flow` on `agent-default` is injected `max_chars: 12,000` and
+    /// advertises the same number, and on 2026-09-02 the demo's run against
+    /// hiredis received 15,875 characters, 32 percent over (FIR-3107). It had
+    /// bounded everything it could reach: the chain was already at its floor of
+    /// one entry, and what was over the ceiling was the part of the response the
+    /// budget never trims.
+    ///
+    /// Measured here on this fixture, that part was 9,210 characters against a
+    /// 12,000 ceiling, and roughly 7,700 of it was four verbatim copies of one
+    /// 1,900-character limiting-factor sentence. So the answer fits now by
+    /// writing that sentence once and pointing at it, rather than by giving up
+    /// the walk it was asked for.
+    #[test]
+    fn a_deep_trace_answers_inside_the_ceiling_the_belt_advertises() {
+        const CEILING: usize = crate::agent_belt::AGENT_DEFAULT_RESPONSE_MAX_CHARS as usize;
+        // The control. A fixture that fits on its own grades nothing, because
+        // every rung below returns at its first line.
+        let raw = crate::budget::measure(&deep_trace_payload());
+        assert!(
+            raw > CEILING / 2,
+            "the fixture is {raw} characters, too small to reach the ceiling with an envelope"
+        );
+
+        let final_payload = belt_bounded_deep_trace();
+        let shipped = crate::budget::measure(&final_payload);
+        println!("deep trace ships {shipped} characters against a {CEILING} ceiling");
+        assert!(
+            shipped <= CEILING,
+            "the answer ships {shipped} characters against the {CEILING} it advertises: \
+             {final_payload}"
+        );
+        assert_eq!(
+            final_payload["_kin"]["response"]["chars_after_budget"],
+            json!(shipped),
+            "the accounting has to name the size that ships"
+        );
+
+        // It fit by shedding restatement, not by giving up the walk.
+        let chain = final_payload["chain"]
+            .as_array()
+            .expect("a chain survives")
+            .len();
+        assert!(
+            chain > 0,
+            "the answer gave up every step to fit: {final_payload}"
+        );
+
+        let degradations = final_payload["degradations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let reasons: Vec<&str> = degradations
+            .iter()
+            .filter_map(|entry| entry["reason"].as_str())
+            .collect();
+        assert!(
+            reasons.contains(&crate::budget::RESTATEMENT_POINTED_REASON),
+            "nothing disclosed what was shortened: {reasons:?}"
+        );
+        assert!(
+            !reasons.contains(&crate::budget::OVER_BUDGET_REASON),
+            "the answer fits and still says it did not: {reasons:?}"
+        );
+        let detail = degradations
+            .iter()
+            .find(|entry| entry["reason"] == json!(crate::budget::RESTATEMENT_POINTED_REASON))
+            .and_then(|entry| entry["detail"].as_str())
+            .expect("the disclosure carries a detail")
+            .to_string();
+        // Printed, not merely asserted: the sentence a caller reads is the
+        // artifact.
+        println!("composed disclosure: {detail}");
+        assert!(
+            detail.contains("_kin.verdict.limiting_factor")
+                && detail.contains("negative.trust_reason"),
+            "the disclosure does not name where the statement still lives: {detail}"
+        );
+
+        // Nothing was lost. The canonical copies are whole and the two fields
+        // that restated them point at them by name.
+        let factor = final_payload["_kin"]["verdict"]["limiting_factor"]
+            .as_str()
+            .expect("a bounded trace names a limiting factor");
+        assert!(
+            factor.len() > 400,
+            "the canonical sentence was shortened, which is the one thing this must not do: \
+             {factor}"
+        );
+        let note = final_payload["_kin"]["verdict"]["note"]
+            .as_str()
+            .expect("the verdict carries a note");
+        assert!(
+            note.contains("see `_kin.verdict.limiting_factor`"),
+            "the note does not point at the sentence it used to repeat: {note}"
+        );
+        assert!(
+            !note.contains(factor),
+            "the note still carries the whole sentence verbatim: {note}"
+        );
+        let trust_reason = final_payload["negative"]["trust_reason"]
+            .as_str()
+            .expect("the negative carries its own reason");
+        assert!(
+            trust_reason.len() > 400,
+            "negative.trust_reason was shortened; the acceptance suite reads it whole: \
+             {trust_reason}"
+        );
+        let advice = final_payload["negative"]["advice"]
+            .as_str()
+            .expect("the negative carries advice");
+        assert!(
+            advice.contains("see `negative.trust_reason`"),
+            "the advice does not point at the reason it used to repeat: {advice}"
+        );
+    }
+
+    /// The direction that makes the test above mean something: a response INSIDE
+    /// its ceiling keeps every word, restatements included.
+    ///
+    /// Without this, a pointer written unconditionally would pass everything
+    /// above while quietly shortening every trace answer Kin serves.
+    #[test]
+    fn a_trace_that_fits_keeps_every_restatement() {
+        let budget = ResponseBudget {
+            max_chars: 60_000,
+            ..ResponseBudget::default()
+        };
+        let annotated = finalize_bounded(
+            ToolCallResult::text(deep_trace_payload().to_string()),
+            ready_daemon_envelope(),
+            "trace_data_flow",
+            &budget,
+        );
+        let payload = annotated_value(&annotated);
+        assert!(
+            crate::budget::measure(&payload) <= 60_000,
+            "the roomy arm has to fit, or it is grading the same case as the tight one"
+        );
+        let note = payload["_kin"]["verdict"]["note"]
+            .as_str()
+            .expect("the verdict carries a note");
+        assert!(
+            !note.contains("see `_kin.verdict.limiting_factor`"),
+            "a response with room to spare was shortened anyway: {note}"
+        );
+        let reasons: Vec<&str> = payload["degradations"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry["reason"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !reasons.contains(&crate::budget::RESTATEMENT_POINTED_REASON),
+            "nothing was shortened and the response says it was: {reasons:?}"
+        );
+    }
+
     fn ready_daemon_envelope() -> Envelope {
         Envelope::daemon().with_health(&json!({
             "initialized": true,

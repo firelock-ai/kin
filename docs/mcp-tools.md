@@ -159,6 +159,7 @@ command line (the flag wins):
 | profile | surface |
 | -- | -- |
 | `agent-default` | the curated agent belt, **the default** |
+| `agent-query` | the same belt with no session and no transaction tools, for a client that only queries |
 | `full` | every tool this reference documents |
 | `benchmark` | the retrieval belt the benchmark arm drives |
 | `context-bench` | read-only graph-native retrieval, no write-side session or transaction tools |
@@ -185,6 +186,30 @@ This is a context budget, measured. On 2026-09-02 the profile's `tools/list` was
 over 20 tools, 47,739 of it descriptions and 30,456 input schemas, spent before the model
 asked anything. `full`, `benchmark` and `context-bench` keep the long forms: the last two
 because their `tools/list` bytes are an input to a citable benchmark result.
+
+#### `agent-query` is that belt without its write half
+
+Native tool calling re-sends the whole `tools` array on every turn, so the served list is a
+per-turn cost, not a per-session one. Measured on 2026-09-02 against a real `kin mcp start`,
+`agent-default`'s `tools/list` was 30,194 bytes and 8,627 tokens on google/gemma-4-e4b: 36
+percent of that run's 24,000-token ceiling before the model had asked anything, and the run
+bought two tool calls. `kin_transaction_stage` and `kin_transaction_commit` alone were 11,245
+of those bytes, and across six runs the model never reached for a session or a transaction
+tool (FIR-3107).
+
+`agent-query` is `agent-default` minus the three session tools and the four transaction tools.
+Same served names, same short descriptions, same trimmed schemas, so nothing an agent learned
+on one profile is wrong on the other. Point a query-only client at it:
+
+```sh
+KIN_MCP_TOOL_PROFILE=agent-query kin mcp start --repo /path/to/repo
+```
+
+This is a second served list, not a mode. `agent-default` is unchanged, every write tool is
+still served on it, and nothing here makes Kin read-only. What `agent-query` buys is context:
+a client that never stages or commits stops paying for those contracts in every prompt. Like
+every profile it is a context budget rather than a permission boundary, so the paragraph above
+applies: a local process holding your daemon's credentials can still write.
 
 `agent-default` serves the declaration filter under its registered name, `semantic_search`,
 like every other profile. It also accepts **`find_declarations`** on a `tools/call`, which is
