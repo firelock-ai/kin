@@ -525,17 +525,270 @@ jobs:
             --file "$RUNNER_TEMP/preflight.json" \
             --repo "$GITHUB_REPOSITORY"
 
-      # The stranger is still local, and this is where a captain reads what to
-      # run. Three arms at 12 GiB each do not fit a 16 GiB hosted runner beside
-      # a Docker daemon, and the driver is a Claude Code session: on the account
-      # login it shares the founder's subscription limit, which cut three arms
-      # on 2026-09-02, and there is no repository secret carrying an API key for
-      # it yet. bin/kin-stranger already passes ANTHROPIC_API_KEY through on the
-      # account endpoint (it scrubs that variable only for --local-model), so
-      # the remaining work is a runner with the memory and a key, not a change
-      # to the tool. Until then this prints the exact command, and the mint
-      # stays refused for the missing stranger.env rather than fed a fake one.
-      - name: Say what the stranger still has to run
+      - name: Say what the stranger will run next
+        env:
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Preflight recorded for \`${CANDIDATE}\`"
+            echo ""
+            echo "\`evidence/${CANDIDATE}/preflight.json\` is on the \`release-evidence\` branch."
+            echo "The mint needs \`stranger.env\` beside it. The next cycle decides \`stranger\`"
+            echo "and runs it, on the self-hosted runner when one is registered and otherwise"
+            echo "printing the exact local command."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::preflight.json published for ${CANDIDATE}"
+
+  # The stranger, on a runner the fleet owns.
+  #
+  # Why this cannot be a hosted runner, in numbers rather than in impressions.
+  # bin/kin-stranger launches one background process per arm and waits on all of
+  # them afterwards, and each container is created --cpus=5 --memory=12g from
+  # DEF_CPUS and DEF_MEMORY. Three concurrent arms therefore demand 15 CPUs and
+  # 36 GB, which no standard hosted tier holds, and the argument does not turn on
+  # which tier applies because 36 GB beats the most generous one. Wall clock is
+  # NOT the constraint and an earlier reading that said so was wrong: DEF_P1 is
+  # 3600 and DEF_P2 is 7200, the arms run concurrently, so a run fits inside a
+  # six-hour cap with room. Memory is what refuses.
+  #
+  # And the arm cannot be shrunk to fit. The tool's own reference says the caps
+  # are deliberately below the capability tier that gates the fused pipeline,
+  # because they are the hardware a laptop audience actually has, and that THE
+  # CAP IS THE MEASUREMENT: it prints MEASUREMENT CONTAMINATED when the cgroup
+  # ceiling at capture differs from the flag the container was created with. A
+  # smaller arm is not a smaller proof, it is an unfilable one.
+  #
+  # The gate is a repository variable, not a live runner query. GitHub's
+  # GITHUB_TOKEN cannot list runners: `administration` is not among the
+  # permissions a workflow token can be granted, and the release App carries
+  # contents, issues and pull-requests only. More importantly a job whose
+  # `runs-on` labels match no online runner does not skip, it QUEUES until the
+  # job timeout, which is the silent hang this repository refuses everywhere
+  # else. So the switch is explicit and follows the same shape ci.yml already
+  # uses for vars.KIN_HEAVY_RUNNER: a captain sets
+  #   gh variable set KIN_STRANGER_RUNNER --repo firelock-ai/kin --body "kin-stranger"
+  # when the runner is registered, and clears it when it goes away.
+  #
+  # It reads the API key and no other secret, and it publishes nothing: the
+  # record it produces is filed by publish-stranger below, so the release App
+  # never reaches the machine executing candidate bytes under a Claude driver.
+  stranger:
+    name: Run the stranger on the candidate archive
+    needs: select
+    if: needs.select.outputs.decision == 'stranger' && vars.KIN_STRANGER_RUNNER != ''
+    runs-on: ${{ vars.KIN_STRANGER_RUNNER }}
+    # Three concurrent arms at phase caps of 3600 s and 7200 s, plus image and
+    # container setup. Six hours is headroom, not an expectation.
+    timeout-minutes: 360
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      recorded: ${{ steps.run.outputs.recorded }}
+    steps:
+      - name: Refuse before spending an arm on a missing credential
+        env:
+          STRANGER_KEY: ${{ secrets.KIN_STRANGER_ANTHROPIC_API_KEY }}
+          UMBRELLA: ${{ vars.KIN_STRANGER_UMBRELLA }}
+        run: |
+          set -euo pipefail
+          # Both refusals are at the door on purpose. An absent key sends every
+          # driver request out unauthenticated and the transcript records only a
+          # server error, hours in; an absent umbrella fails at the first docker
+          # exec with the same delay. Neither is worth discovering late.
+          if [ -z "${STRANGER_KEY:-}" ]; then
+            echo "::error::the repository secret KIN_STRANGER_ANTHROPIC_API_KEY is not set, so the stranger driver has no credential. Set it, or clear the KIN_STRANGER_RUNNER variable so the cut prints the local command instead."
+            exit 1
+          fi
+          umbrella="${UMBRELLA:-$HOME/GitHub/kin-ecosystem}"
+          if [ ! -x "$umbrella/bin/kin-stranger" ]; then
+            echo "::error::no kin-stranger at ${umbrella}/bin/kin-stranger. This job runs on a runner the fleet owns because the harness lives in the private kin-ecosystem umbrella beside its missions, drivers and image; point vars.KIN_STRANGER_UMBRELLA at that checkout."
+            exit 1
+          fi
+          echo "KIN_UMBRELLA=$umbrella" >> "$GITHUB_ENV"
+          echo "stranger harness: ${umbrella}/bin/kin-stranger"
+
+      - name: Download the candidate archive the preflight judged
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RC_RUN: ${{ needs.select.outputs.rc_run }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RC_RUN" =~ ^[1-9][0-9]*$ ]] || [[ ! "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::selection handed over no exact candidate and rc-build run"
+            exit 1
+          fi
+          dir="${RUNNER_TEMP}/kin-rc-${CANDIDATE:0:12}"
+          rm -rf "$dir"
+          gh run download "$RC_RUN" --repo "$GITHUB_REPOSITORY" \
+            --name kin-linux-aarch64 --dir "$dir/kin-linux-aarch64"
+          archive="$dir/kin-linux-aarch64/kin-linux-aarch64.tar.gz"
+          test -f "$archive"
+          # The sidecar travels in the same artifact and kin-stranger refuses an
+          # archive without one, so a candidate that arrives unpaired is a defect
+          # in the rc-build rather than something to work around here.
+          test -f "$archive.sha256"
+          want="$(cut -d' ' -f1 < "$archive.sha256")"
+          have="$(shasum -a 256 "$archive" | cut -d' ' -f1)"
+          if [ "$want" != "$have" ]; then
+            echo "::error::kin-linux-aarch64.tar.gz sidecar says ${want}, bytes are ${have}"
+            exit 1
+          fi
+          echo "KIN_STRANGER_ARCHIVE=$archive" >> "$GITHUB_ENV"
+          echo "archive sha256 ${have}"
+
+      - name: Drive the three arms
+        id: run
+        env:
+          # The account path, with a key. driver_env_argv drops
+          # ANTHROPIC_API_KEY on exactly one branch, `[ "$ep" = local ]`, and
+          # the endpoint defaults to account, so an exported key rides through
+          # untouched and Claude Code prefers it over ANTHROPIC_AUTH_TOKEN.
+          # Exporting the secret is the whole integration; the harness needs no
+          # change, which is why this job adds no --driver flag.
+          ANTHROPIC_API_KEY: ${{ secrets.KIN_STRANGER_ANTHROPIC_API_KEY }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+          VERSION: ${{ needs.select.outputs.version }}
+        run: |
+          set -euo pipefail
+          run_id="rc${VERSION//./}-${CANDIDATE:0:7}"
+          cd "$KIN_UMBRELLA"
+          # A run root that already exists is an interrupted run, not a fresh
+          # one. `prepare` refuses a reused container without --force because a
+          # reused container tests an upgrade path, a different question, so the
+          # documented recovery is `resume`, which restarts only the phases that
+          # did not finish. Forcing here would silently change what is measured.
+          root="${KIN_STRANGER_ROOT:-/Users/Shared/kin-stranger}/${run_id}"
+          if [ -d "$root" ]; then
+            echo "::notice::${run_id} already has a run root; resuming rather than re-preparing"
+            bin/kin-stranger resume --run "$run_id" --candidate-sha "$CANDIDATE"
+          else
+            # Every arm the mint's coverage gate requires. The tool defaults to
+            # this set now, and it is named anyway: on 2026-09-02 two complete
+            # two-arm runs were refused at the mint, and evidence is
+            # append-only, so a record missing an arm cannot be replaced.
+            bin/kin-stranger prepare --run "$run_id" --arms green,brown,vcs
+            bin/kin-stranger run --run "$run_id" \
+              --archive "$KIN_STRANGER_ARCHIVE" \
+              --candidate-sha "$CANDIDATE"
+          fi
+          record="${root}/run.env"
+          if [ ! -s "$record" ]; then
+            echo "::error::the stranger finished but wrote no run.env under ${root}"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/stranger"
+          cp "$record" "$RUNNER_TEMP/stranger/stranger.env"
+          echo "recorded=true" >> "$GITHUB_OUTPUT"
+          echo "stranger record at ${record}"
+
+      - name: Upload the stranger record
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: kin-stranger-record
+          path: ${{ runner.temp }}/stranger/stranger.env
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-stranger:
+    name: Publish the candidate's stranger record
+    needs: [select, stranger]
+    if: needs.select.outputs.decision == 'stranger' && needs.stranger.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release-tag
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout the queued proof tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Re-bind the publish to protected main history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::selection handed over no exact candidate sha"
+            exit 1
+          fi
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --branch main
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$CANDIDATE" \
+            --branch main
+
+      - name: Collect the stranger record
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: kin-stranger-record
+          path: ${{ runner.temp }}/stranger
+
+      - name: Mint repository-scoped evidence token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: firelock-ai
+          repositories: kin
+          permission-contents: write
+
+      # --require-archive is the link, checked at write time rather than
+      # discovered by the gate at release time: the publisher refuses unless the
+      # preflight already published for this candidate judged this exact
+      # archive. It also turns a mistyped candidate into a named failure instead
+      # of a record that sits unread until a release is held by it.
+      - name: Publish stranger.env for the candidate
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          record="$RUNNER_TEMP/stranger/stranger.env"
+          archive="$(sed -n 's/^archive_sha256=//p' "$record" | head -1)"
+          if [[ ! "$archive" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::the stranger record names no archive_sha256, so nothing links it to the bytes the preflight judged"
+            exit 1
+          fi
+          scripts/release-proof/bin/kin-evidence-publish \
+            --sha "$CANDIDATE" \
+            --name stranger.env \
+            --file "$record" \
+            --repo "$GITHUB_REPOSITORY" \
+            --require-archive "$archive"
+          {
+            echo "## Both proof records are filed for \`${CANDIDATE}\`"
+            echo ""
+            echo "The mint selects the newest fully evidenced sha in the version range on its"
+            echo "next evaluation, which is its cron or any completed CI run for a main push."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # No runner, so say so loudly and hand over the exact command. This is the
+  # path that keeps the release moving: the cut still selects, arms and
+  # preflights, and only the last step waits on a person.
+  stranger-standby:
+    name: Report the stranger a runner cannot take
+    needs: select
+    if: needs.select.outputs.decision == 'stranger' && vars.KIN_STRANGER_RUNNER == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Print the command a captain has to run
         env:
           CANDIDATE: ${{ needs.select.outputs.candidate }}
           VERSION: ${{ needs.select.outputs.version }}
@@ -545,10 +798,15 @@ jobs:
           run_id="rc${VERSION//./}-${CANDIDATE:0:7}"
           download="/tmp/kin-rc-${CANDIDATE:0:12}"
           {
-            echo "## Preflight recorded for \`${CANDIDATE}\`"
+            echo "## The stranger is waiting on a runner"
             echo ""
-            echo "\`evidence/${CANDIDATE}/preflight.json\` is on the \`release-evidence\` branch."
-            echo "The mint needs \`stranger.env\` beside it, which is still a local step:"
+            echo "\`evidence/${CANDIDATE}/preflight.json\` is filed and \`stranger.env\` is the"
+            echo "only missing half. No runner carries the \`KIN_STRANGER_RUNNER\` variable, so"
+            echo "this cycle cannot run it. Three arms at 5 CPUs and 12g each need 15 CPUs and"
+            echo "36 GB concurrently, which no hosted runner holds, and the caps are the"
+            echo "measurement rather than a knob."
+            echo ""
+            echo "Run it here:"
             echo ""
             echo '```'
             echo "gh run download ${RC_RUN} --repo ${GITHUB_REPOSITORY} --dir ${download}"
@@ -558,10 +816,14 @@ jobs:
             echo "  --candidate-sha ${CANDIDATE}"
             echo '```'
             echo ""
-            echo "Name all three arms: the coverage gate refuses a record missing one, and"
-            echo "the evidence branch is append-only, so a two-arm record cannot be replaced."
+            echo "Or register a runner and set the variable, which deletes this step:"
+            echo ""
+            echo '```'
+            echo "gh variable set KIN_STRANGER_RUNNER --repo ${GITHUB_REPOSITORY} --body '<runner label>'"
+            echo "gh secret set KIN_STRANGER_ANTHROPIC_API_KEY --repo ${GITHUB_REPOSITORY}"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::preflight.json published for ${CANDIDATE}; the stranger run is still local"
+          echo "::warning::${CANDIDATE} has its preflight record and needs the stranger; no KIN_STRANGER_RUNNER is set, so the command is in this run's summary and a captain has to run it"
 
   # A refusal is a real outcome and has to be loud. The selector exits 1 and
   # names the contexts that disqualified the newest sha, which fails the select

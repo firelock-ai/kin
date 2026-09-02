@@ -861,6 +861,15 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
         "arm": "Arm the release candidate",
         "preflight": "Preflight ${{ matrix.artifact }}",
         "publish": "Publish the candidate's preflight record",
+        # The stranger runs on a runner the fleet owns, gated by the
+        # KIN_STRANGER_RUNNER variable, because three concurrent arms need 15
+        # CPUs and 36 GB and a job whose labels match no online runner queues
+        # rather than skipping. It reads the driver's API key and nothing else;
+        # the record it produces is filed by publish-stranger, so the release
+        # App never reaches the machine executing candidate bytes.
+        "stranger": "Run the stranger on the candidate archive",
+        "publish-stranger": "Publish the candidate's stranger record",
+        "stranger-standby": "Report the stranger a runner cannot take",
         "report": "Report the cut's decision",
     },
     ".github/workflows/release-recovery.yml": {
