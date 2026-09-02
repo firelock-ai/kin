@@ -1,0 +1,222 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Kin Registry Wave Landing
+
+# Lands the receiver's dependency-wave pull request by itself, the moment every
+# check-run on its head has concluded green. Two arms: every completion of a
+# check-producing workflow on the wave branch, and a sweep four times an hour
+# for producers that are not workflows of this repository (CodeQL's default
+# setup) or that concluded while a judgment was already running. Both events
+# resolve this workflow from the default branch, and the judge proves
+# github.sha is protected main history before reading it as policy.
+#
+# The judgment is scripts/land-kin-registry-wave.py, whose rule is the fleet's
+# landing rule: the FULL check-run set on the head, read by name with
+# per_page=100 and the listed length asserted against total_count, every run
+# concluded, none failed, skipped and neutral green, the six ruleset contexts
+# present, one bot commit carrying the reserved marker, a diff inside the
+# receiver's write set, and the release-App attestation verified. GitHub's own
+# auto-merge is not the mechanism: it merges on the six ruleset contexts alone,
+# and the admission chain refuses any server-owned landing state on the wave.
+# There is no manual dispatch arm, because this workflow reaches a
+# release-capable secret.
+on:
+  workflow_run:
+    workflows:
+      - CI
+      - SAST
+      - Secret Scan
+      - DCO
+      - PR Text Hygiene
+      - Daemon Smoke
+      - Docker
+      - Fuzz
+      - Acceptance
+      - Install Proof Canary
+      - Link Check
+      - CodeQL
+    types: [completed]
+  schedule:
+    - cron: "5,20,35,50 * * * *"
+
+permissions:
+  contents: read
+
+env:
+  BASE_BRANCH: main
+  WAVE_BRANCH: automation/kin-registry-dependency-wave
+
+jobs:
+  judge-wave:
+    name: Judge the open Kin registry wave
+    # A completion on any other branch is not news about the wave, and a head
+    # repository other than this one is never the wave.
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event.workflow_run.head_branch == 'automation/kin-registry-dependency-wave' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    concurrency:
+      group: kin-registry-wave-judge-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      decision: ${{ steps.judge.outputs.decision || 'wait' }}
+      pull: ${{ steps.judge.outputs.pull }}
+      head: ${{ steps.judge.outputs.head }}
+    env:
+      # The GitHub-side landing hold, the wave's equivalent of the fleet's
+      # kin_main_frozen gate. A captain sets it with
+      #   gh variable set KIN_MAIN_FROZEN --repo firelock-ai/kin --body "<why>"
+      # and lifts it with `gh variable delete KIN_MAIN_FROZEN`. Any non-empty
+      # value holds every wave landing and is reported in the judgment.
+      KIN_MAIN_FROZEN: ${{ vars.KIN_MAIN_FROZEN }}
+    steps:
+      - name: Find the open dependency wave
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          count="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+            -f state=open \
+            -f "head=${GITHUB_REPOSITORY_OWNER}:${WAVE_BRANCH}" \
+            -f "base=${BASE_BRANCH}" \
+            -f per_page=100 \
+            --jq 'length')"
+          if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+            echo "::error::open wave listing did not answer with a count: $count"
+            exit 1
+          fi
+          echo "open=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" = 0 ]; then
+            echo "::notice::no open pull request from ${WAVE_BRANCH}; nothing to judge"
+          fi
+
+      # The literal trusted context value: see the same checkout in
+      # kin-registry-release.yml. The binding step below proves github.sha is
+      # protected main's history before the judgment reads it as policy.
+      - name: Checkout the queued landing policy
+        if: steps.find.outputs.open != '0'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind the judgment to protected main history
+        if: steps.find.outputs.open != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --branch "$BASE_BRANCH"
+
+      - name: Judge the wave against its full check set
+        id: judge
+        if: steps.find.outputs.open != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          verdict="$(python3 scripts/land-kin-registry-wave.py judge \
+            --repository "$GITHUB_REPOSITORY" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --freeze "$KIN_MAIN_FROZEN")"
+          printf '%s\n' "$verdict"
+          {
+            echo "decision=$(jq -r .decision <<<"$verdict")"
+            echo "pull=$(jq -r '.pull // ""' <<<"$verdict")"
+            echo "head=$(jq -r '.head // ""' <<<"$verdict")"
+          } >> "$GITHUB_OUTPUT"
+
+  land-wave:
+    name: Land the green Kin registry wave
+    needs: judge-wave
+    if: needs.judge-wave.outputs.decision == 'land'
+    concurrency:
+      group: kin-registry-wave-land-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release-tag
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      issues: read
+      pull-requests: read
+    env:
+      KIN_MAIN_FROZEN: ${{ vars.KIN_MAIN_FROZEN }}
+      JUDGED_PULL: ${{ needs.judge-wave.outputs.pull }}
+      JUDGED_HEAD: ${{ needs.judge-wave.outputs.head }}
+    steps:
+      - name: Checkout the queued landing policy for the merge
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind the landing to protected main history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$JUDGED_PULL" =~ ^[1-9][0-9]*$ ]] ||
+             [[ ! "$JUDGED_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::judgment handed over no exact pull and head"
+            exit 1
+          fi
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --branch "$BASE_BRANCH"
+
+      - name: Mint repository-scoped landing token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: firelock-ai
+          repositories: kin
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Verify exact landing App identity and scope
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-kin-release-app-token.py \
+            --app-slug "$APP_SLUG" \
+            --repository "$GITHUB_REPOSITORY"
+
+      # Every read goes through the workflow token; only the merge call and
+      # its read-back use the App token, the way the attester keeps the App
+      # away from Actions reads.
+      - name: Squash the green wave onto protected main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIN_LAND_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/land-kin-registry-wave.py land \
+            --repository "$GITHUB_REPOSITORY" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --freeze "$KIN_MAIN_FROZEN" \
+            --pull "$JUDGED_PULL" \
+            --head "$JUDGED_HEAD" \
+            --merge-token-env KIN_LAND_TOKEN

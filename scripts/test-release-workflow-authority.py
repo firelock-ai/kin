@@ -800,6 +800,14 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/kin-registry-release-attest.yml": {
         "attest-completed-receiver": "Attest completed Kin registry receiver",
     },
+    # The wave's own landing. The judge reads every check-run on the wave head
+    # by name and the land job squash-merges through the release App only when
+    # that full set has concluded green. Both run on workflow_run and schedule,
+    # so neither publishes a pull-request or merge-group context.
+    ".github/workflows/kin-registry-wave-land.yml": {
+        "judge-wave": "Judge the open Kin registry wave",
+        "land-wave": "Land the green Kin registry wave",
+    },
     ".github/workflows/link-check.yml": {
         "link-check": "Check public documentation links",
     },

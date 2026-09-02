@@ -127,6 +127,7 @@ jobs:
           bash ./scripts/test-publish-dev-container.sh
           bash ./scripts/kin-dev-image.test.sh
           python3 ./scripts/test-kin-registry-release-receiver.py
+          python3 ./scripts/test-kin-registry-wave-landing.py
           python3 ./scripts/test_install_optional_vfs.py
           python3 ./scripts/test_installer_parity.py
           # Every install surface builds a release asset name; the release

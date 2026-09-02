@@ -373,3 +373,44 @@ A clean refusal with no tag created proves the untrusted input and head guards.
 It deliberately stops before App-token minting, so verify the Environment
 policy and secret placement independently during setup; the first admitted
 release proves the complete token-and-ruleset path.
+
+## Registry dependency wave
+
+`.github/workflows/kin-registry-release.yml` receives a typed
+`kin-registry-release` dispatch from a registry publish, reconciles the full
+pin set hourly, prepares the new Cargo pins on a credential-free runner, and
+writes the admitted bytes to one pull request on
+`automation/kin-registry-dependency-wave` through the release App. Every job
+binds to the commit it checked out, `github.sha`, and proves it is protected
+main's history with `scripts/verify-protected-main-history.py`: the commit must
+be the tip of `main` or an ancestor of it, read through the compare API. A lane
+landing while the receiver runs no longer refuses the wave; a force-pushed or
+foreign ref still does. The wave's pull base is proven to be protected main at
+or after the admitted base for the same reason, in the receiver, the attester
+and the CI gate alike.
+
+`.github/workflows/kin-registry-release-attest.yml` then binds the exact wave
+head to a release-App attestation that the required CI gate revalidates.
+
+`.github/workflows/kin-registry-wave-land.yml` lands the wave. It runs when a
+check-producing workflow completes on the wave branch and on a sweep four times
+an hour, and `scripts/land-kin-registry-wave.py` decides `land`, `wait` or
+`refuse`: one open first-party wave opened by the release App with no
+auto-merge armed, one bot commit carrying the reserved marker, a diff inside
+`Cargo.toml` and `Cargo.lock`, every check-run on the head concluded and none
+failed over the full set (`per_page=100`, the listed length asserted against
+`total_count`, the newest run per check name, skipped and neutral green, the
+six ruleset contexts present), the pull mergeable, and the attestation
+verified. Only then does the land job mint the App token, squash-merge with the
+pull title and body and never the marker line, and prove the squash is on
+`main`. A failed check, a foreign commit, an off-scope file or an unreadable
+listing refuses loudly; checks still running, a missing attestation or an open
+hold wait quietly. GitHub's own auto-merge is not the mechanism, because it
+merges on the six ruleset contexts alone and the admission chain refuses any
+server-owned landing state on the wave.
+
+The hold is the repository variable `KIN_MAIN_FROZEN`, the wave's equivalent
+of the fleet's `kin_main_frozen` gate. Set it with
+`gh variable set KIN_MAIN_FROZEN --repo firelock-ai/kin --body "<why>"` and
+lift it with `gh variable delete KIN_MAIN_FROZEN --repo firelock-ai/kin`. Any
+non-empty value holds every wave landing and is named in the judgment.
