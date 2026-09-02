@@ -1,0 +1,598 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Release Cut
+
+# Selects the release candidate and proves half of it, with nobody at a keyboard.
+#
+# release-tag.yml mints a tag for the newest reviewed main commit in the staged
+# version's range carrying BOTH proof records, and release.yml refuses to
+# promote a tag that has none. Nothing produced those records automatically: a
+# captain picked the sha, pushed release/v<version>-candidate, dispatched
+# rc-build.yml, ran bin/kin-release-preflight on the archives and drove
+# bin/kin-stranger, then published both records by hand. On 2026-09-02 that
+# procedure cost a day. A rerun of a flaky required job made the first candidate
+# unmintable, because the mint reads a duplicated required context as ambiguous
+# authority; the stranger ran the tool's default two arms while the gate
+# required three; the account limit cut the driver mid-arm three times; and the
+# shared Mac ran out of memory under the host leg.
+#
+# This workflow owns the mechanical half. It selects the candidate itself,
+# arms the candidate branch, dispatches the archive build, and judges those
+# archives on hosted runners, publishing preflight.json exactly as the local
+# run does. What it does NOT do is run the stranger: see "The stranger is still
+# local" below, which is a measured limit rather than a gap left open.
+#
+# Trigger authority, and why there is no workflow_dispatch. Every arm here
+# resolves its workflow code from protected main, and the publish job reaches
+# the release App's key. A workflow_dispatch takes a ref, so it would let a
+# branch select the code that runs beside that credential. The typed
+# repository_dispatch cannot: GitHub always runs it from the default branch and
+# only when the workflow exists there. This mirrors release-tag.yml.
+on:
+  workflow_run:
+    workflows: [CI, RC Build]
+    types: [completed]
+  repository_dispatch:
+    types: [release_cut]
+  schedule:
+    # Offset from the mint (:11,:26,:41,:56) and the train (:07,:22,:37,:52) so
+    # a cycle selects, arms and proves between two mint evaluations rather than
+    # racing one. GitHub's cron stalled for most of 2026-09-02, so the schedule
+    # is the fallback here and never the only path.
+    - cron: "3,18,33,48 * * * *"
+
+permissions:
+  contents: read
+
+# Never two cuts at once, and never cancel one mid-flight: a cancelled preflight
+# leaves an armed candidate with no record, which the next cycle then re-arms.
+concurrency:
+  group: kin-release-cut
+  cancel-in-progress: false
+
+jobs:
+  select:
+    name: Select the release candidate
+    # The branch filters live in the selector's own trigger validation, which
+    # reads GitHub-owned context rather than a payload, so this condition is
+    # the cheap half: it keeps the job from starting on the CI and RC Build
+    # completions that are obviously not occasions. `workflow_run` fires on
+    # every completion of both workflows, which on a busy main is most of the
+    # day.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        (
+          (
+            github.event.workflow_run.name == 'CI' &&
+            github.event.workflow_run.event == 'push' &&
+            github.event.workflow_run.head_branch == 'main'
+          ) ||
+          (
+            github.event.workflow_run.name == 'RC Build' &&
+            github.event.workflow_run.event == 'workflow_dispatch' &&
+            startsWith(github.event.workflow_run.head_branch, 'release/v')
+          )
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    outputs:
+      decision: ${{ steps.select.outputs.decision || 'stand-down' }}
+      version: ${{ steps.select.outputs.version }}
+      branch: ${{ steps.select.outputs.branch }}
+      candidate: ${{ steps.select.outputs.candidate }}
+      rc_run: ${{ steps.select.outputs.rc_run }}
+      move: ${{ steps.select.outputs.move }}
+      reason: ${{ steps.select.outputs.reason }}
+    steps:
+      # The literal trusted context value, as in kin-registry-wave-land.yml.
+      # The binding step below proves github.sha is protected main's history
+      # before the judgment reads it as policy.
+      - name: Checkout the queued cut policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate the cut trigger
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          python3 scripts/select-release-candidate.py validate-trigger \
+            --event-file "$GITHUB_EVENT_PATH" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --event-action "$EVENT_ACTION" \
+            --actor "$GITHUB_ACTOR" \
+            --repository "$GITHUB_REPOSITORY" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --ref "$GITHUB_REF" \
+            --workflow-sha "$GITHUB_SHA"
+
+      - name: Bind the cut to protected main history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --branch main
+
+      # The range is read from a freshly fetched protected main rather than
+      # from the checkout this run started with, for the reason release-tag.yml
+      # gives: a rerun of an older run carries that run's sha, which resolves
+      # the version main carried then rather than the version it carries now.
+      - name: Select the candidate
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git update-ref refs/remotes/origin/main FETCH_HEAD
+          python3 scripts/select-release-candidate.py select \
+            --repository "$GITHUB_REPOSITORY" \
+            --workspace "$GITHUB_WORKSPACE" \
+            | tee "$RUNNER_TEMP/release-cut-decision.json"
+
+      # Uploaded on every path, including the ones that stood down and the ones
+      # that refused, so what a cycle decided is readable from outside it
+      # without a session reading a log.
+      - name: Publish this cycle's decision
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: release-cut-decision
+          path: ${{ runner.temp }}/release-cut-decision.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  arm:
+    name: Arm the release candidate
+    needs: select
+    if: needs.select.outputs.decision == 'arm'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The same main-only Environment that protects the release App key
+    # everywhere else it is used. A job only resolves it by declaring it;
+    # without the binding the job silently falls back to repository-scoped
+    # copies of the same secret names, so a key rotation applied to the
+    # environment never reaches this arm.
+    environment: release-tag
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Checkout the queued cut policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Re-bind the arm to protected main history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::selection handed over no exact candidate sha"
+            exit 1
+          fi
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --branch main
+          # The candidate itself has to be main's own history too. The selector
+          # read it out of a first-parent log, and this proves the same thing
+          # against the API immediately before the branch moves.
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$CANDIDATE" \
+            --branch main
+
+      - name: Mint repository-scoped candidate-branch token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          # owner plus repositories narrows the installation token to this one
+          # repository; owner alone would widen it to every repo the org-wide
+          # install can reach.
+          owner: firelock-ai
+          repositories: kin
+          permission-contents: write
+
+      - name: Move the candidate branch to the selected sha
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH: ${{ needs.select.outputs.branch }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+          MOVE: ${{ needs.select.outputs.move }}
+        run: |
+          set -euo pipefail
+          case "$MOVE" in
+            create|fast-forward|reset|none) ;;
+            *) echo "::error::unsupported branch move '$MOVE'"; exit 1 ;;
+          esac
+          if [ "$MOVE" = none ]; then
+            echo "::notice::${BRANCH} already points at ${CANDIDATE}"
+          elif [ "$MOVE" = create ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/heads/${BRANCH}" \
+              -f sha="$CANDIDATE" >/dev/null
+          else
+            # A reset is deliberate and named by the selector: the newest green
+            # sha can be OLDER than a candidate that has since died, and a
+            # candidate branch is scratch that no ruleset protects, so moving it
+            # backwards is correct rather than a rewrite of anything reviewed.
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
+              -f sha="$CANDIDATE" \
+              -F force=true >/dev/null
+          fi
+          got="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" -q '.object.sha')"
+          if [ "$got" != "$CANDIDATE" ]; then
+            echo "::error::${BRANCH} reads back at ${got}, not ${CANDIDATE}"
+            exit 1
+          fi
+          echo "${BRANCH} -> ${CANDIDATE} (${MOVE})"
+
+      # The dispatch goes out on the workflow token, not the App's. rc-build.yml
+      # holds no credential by design and needs none to start, and keeping the
+      # App token off this call keeps its blast radius to the branch write above.
+      - name: Dispatch the candidate archive build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ needs.select.outputs.branch }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          before="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/rc-build.yml/runs?branch=${BRANCH}&per_page=1" -q '.workflow_runs[0].id // 0')"
+          gh workflow run rc-build.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
+          # Read the run back rather than trusting the dispatch's exit code: the
+          # API answers 204 before the run exists, so a dispatch that produced
+          # nothing is silent otherwise and the next cycle would arm again.
+          run_id=""
+          attempt=0
+          while [ "$attempt" -lt 10 ]; do
+            attempt=$((attempt + 1))
+            sleep 6
+            run_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/rc-build.yml/runs?branch=${BRANCH}&event=workflow_dispatch&per_page=5" \
+              -q "[.workflow_runs[] | select(.head_sha == \"${CANDIDATE}\" and (.id | tonumber) > ${before})] | sort_by(.id) | last | .id // empty")"
+            if [ -n "$run_id" ]; then
+              echo "rc-build run ${run_id} appeared on attempt ${attempt}"
+              break
+            fi
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::rc-build.yml was dispatched on ${BRANCH} but no run for ${CANDIDATE} appeared within a minute"
+            exit 1
+          fi
+          {
+            echo "## Release candidate armed"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| candidate | \`${CANDIDATE}\` |"
+            echo "| branch | \`${BRANCH}\` |"
+            echo "| rc-build | [${run_id}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run_id}) |"
+            echo ""
+            echo "The RC Build's completion is itself a trigger for this workflow, so the"
+            echo "preflight follows without another occasion."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc-build run ${run_id} building ${CANDIDATE}"
+
+  # The host leg of the proof, on runners that can execute each archive.
+  #
+  # The local tool judges every archive in one run because that Mac can run a
+  # macOS archive natively and the Linux ones under emulation. Hosted, each
+  # archive runs on the runner whose architecture matches it, which is strictly
+  # better evidence: the emulated legs the local run marks out of scope (the
+  # daemon starves its own enrichment under qemu) execute natively here.
+  #
+  # This job reads no secret and declares no environment. It downloads
+  # artifacts, runs the proof and uploads a leg record; publishing is the next
+  # job's job, and keeping the App token away from the runner that executes
+  # candidate bytes is the whole reason the two are separate.
+  preflight:
+    name: Preflight ${{ matrix.artifact }}
+    needs: [select, arm]
+    # `always()` because `arm` is skipped on the proof path: the RC Build
+    # completion that triggers this cycle arrives when the branch is already
+    # armed, so requiring `arm` to have succeeded would skip the very job the
+    # trigger exists to start.
+    if: >-
+      always() &&
+      needs.select.outputs.decision == 'proof' &&
+      needs.select.result == 'success'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One row per archive rc-build.yml produces, each on the runner that
+          # executes it natively. The rows are the same three artifacts
+          # scripts/select-release-candidate.py requires of a usable rc-build,
+          # and the merge refuses a record whose legs do not cover them.
+          - os: macos-latest
+            artifact: kin-macos-aarch64
+          - os: ubuntu-24.04-arm
+            artifact: kin-linux-aarch64
+          - os: ubuntu-latest
+            artifact: kin-linux-x86_64
+    steps:
+      - name: Checkout the queued proof tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prove the vendored proof tooling is the bytes its manifest names
+        run: node --test scripts/release-proof/vendored.test.mjs
+
+      - name: Download the candidate archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RC_RUN: ${{ needs.select.outputs.rc_run }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RC_RUN" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::selection handed over no rc-build run id"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/rc"
+          gh run download "$RC_RUN" --repo "$GITHUB_REPOSITORY" \
+            --name "$ARTIFACT" --dir "$RUNNER_TEMP/rc/$ARTIFACT"
+          archive="$RUNNER_TEMP/rc/$ARTIFACT/$ARTIFACT.tar.gz"
+          test -f "$archive"
+          test -f "$archive.sha256"
+          # The sidecar is checked before anything runs the bytes; the preflight
+          # checks it again, and both are cheap against an artifact store.
+          want="$(cut -d' ' -f1 < "$archive.sha256")"
+          have="$(shasum -a 256 "$archive" | cut -d' ' -f1)"
+          if [ "$want" != "$have" ]; then
+            echo "::error::${ARTIFACT}.tar.gz sidecar says ${want}, bytes are ${have}"
+            exit 1
+          fi
+          echo "KIN_RC_ARCHIVE=$archive" >> "$GITHUB_ENV"
+          echo "$ARTIFACT sha256 $have"
+
+      - name: Judge the archive with the release preflight
+        env:
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+          ARTIFACT: ${{ matrix.artifact }}
+          # The publisher lives in the next job. A leg record published from
+          # here would be one of three answers under one candidate sha, and the
+          # evidence branch is append-only, so the first to land would win and
+          # the mint would read a one-leg proof as the whole thing.
+          KIN_PREFLIGHT_NO_PUBLISH: "1"
+          # Hosted runners carry no Metal accelerator and no gpu lock table, and
+          # the verdict records that the CPU path is what ran.
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+          if [[ ! "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::selection handed over no exact candidate sha"
+            exit 1
+          fi
+          # coreutils gives the preflight the GNU timeout its leg bound needs;
+          # without one it warns and runs unbounded, which on a hosted runner
+          # means a hung leg burns the whole job timeout with no verdict.
+          if ! timeout --version >/dev/null 2>&1; then
+            if [ "$RUNNER_OS" = macOS ]; then brew install coreutils; fi
+          fi
+          set +e
+          scripts/release-proof/bin/kin-release-preflight \
+            --archive "$KIN_RC_ARCHIVE" \
+            --kin-repo "$GITHUB_WORKSPACE" \
+            --kin-ref "$GITHUB_SHA" \
+            --expect-commit "$CANDIDATE" \
+            --cpu-embed \
+            --no-linux \
+            --lane release-proof \
+            --run-root "$RUNNER_TEMP/kpf" \
+            --leg-timeout 3600
+          rc=$?
+          set -e
+          # 0 PASS, 1 a leg FAILED, 2 UNREADABLE, 65 refused before any leg ran.
+          # Only PASS may produce a leg record: an UNREADABLE run is not a pass
+          # and must not reach the merge as one.
+          echo "preflight exit ${rc}"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the preflight did not pass for ${ARTIFACT} (exit ${rc})"
+            exit "$rc"
+          fi
+          record="$(ls -1 "$RUNNER_TEMP/kpf"/preflight.json 2>/dev/null || true)"
+          if [ -z "$record" ]; then
+            echo "::error::the preflight passed but wrote no preflight.json under $RUNNER_TEMP/kpf"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/leg"
+          cp "$record" "$RUNNER_TEMP/leg/preflight.json"
+
+      - name: Upload this leg's record
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: kin-release-preflight-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/leg/preflight.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish the candidate's preflight record
+    needs: [select, preflight]
+    if: needs.select.outputs.decision == 'proof' && needs.preflight.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release-tag
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout the queued proof tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Re-bind the publish to protected main history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::selection handed over no exact candidate sha"
+            exit 1
+          fi
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --branch main
+          python3 scripts/verify-protected-main-history.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$CANDIDATE" \
+            --branch main
+
+      - name: Collect every leg record
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          pattern: kin-release-preflight-*
+          path: ${{ runner.temp }}/legs
+
+      - name: Merge the leg records into the candidate's preflight record
+        env:
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          legs=()
+          while IFS= read -r record; do
+            legs+=("$record")
+          done < <(find "$RUNNER_TEMP/legs" -name preflight.json -type f | sort)
+          if [ "${#legs[@]}" -eq 0 ]; then
+            echo "::error::no leg records were downloaded, so there is nothing to publish"
+            exit 1
+          fi
+          echo "merging ${#legs[@]} leg record(s)"
+          node scripts/release-proof/merge-preflight-records.mjs \
+            --candidate "$CANDIDATE" \
+            --out "$RUNNER_TEMP/preflight.json" \
+            "${legs[@]}"
+
+      - name: Mint repository-scoped evidence token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: firelock-ai
+          repositories: kin
+          permission-contents: write
+
+      # The publisher refuses to overwrite: a record is created without a blob
+      # sha, which GitHub rejects when the path exists, so a re-publish of
+      # identical bytes is a no-op success and a re-publish of different bytes
+      # is a loud refusal. That is why the merge above has to be deterministic.
+      - name: Publish preflight.json for the candidate
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          scripts/release-proof/bin/kin-evidence-publish \
+            --sha "$CANDIDATE" \
+            --name preflight.json \
+            --file "$RUNNER_TEMP/preflight.json" \
+            --repo "$GITHUB_REPOSITORY"
+
+      # The stranger is still local, and this is where a captain reads what to
+      # run. Three arms at 12 GiB each do not fit a 16 GiB hosted runner beside
+      # a Docker daemon, and the driver is a Claude Code session: on the account
+      # login it shares the founder's subscription limit, which cut three arms
+      # on 2026-09-02, and there is no repository secret carrying an API key for
+      # it yet. bin/kin-stranger already passes ANTHROPIC_API_KEY through on the
+      # account endpoint (it scrubs that variable only for --local-model), so
+      # the remaining work is a runner with the memory and a key, not a change
+      # to the tool. Until then this prints the exact command, and the mint
+      # stays refused for the missing stranger.env rather than fed a fake one.
+      - name: Say what the stranger still has to run
+        env:
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+          VERSION: ${{ needs.select.outputs.version }}
+          RC_RUN: ${{ needs.select.outputs.rc_run }}
+        run: |
+          set -euo pipefail
+          run_id="rc${VERSION//./}-${CANDIDATE:0:7}"
+          download="/tmp/kin-rc-${CANDIDATE:0:12}"
+          {
+            echo "## Preflight recorded for \`${CANDIDATE}\`"
+            echo ""
+            echo "\`evidence/${CANDIDATE}/preflight.json\` is on the \`release-evidence\` branch."
+            echo "The mint needs \`stranger.env\` beside it, which is still a local step:"
+            echo ""
+            echo '```'
+            echo "gh run download ${RC_RUN} --repo ${GITHUB_REPOSITORY} --dir ${download}"
+            echo "bin/kin-stranger prepare --run ${run_id} --arms green,brown,vcs"
+            echo "bin/kin-stranger run --run ${run_id} \\"
+            echo "  --archive ${download}/kin-linux-aarch64/kin-linux-aarch64.tar.gz \\"
+            echo "  --candidate-sha ${CANDIDATE}"
+            echo '```'
+            echo ""
+            echo "Name all three arms: the coverage gate refuses a record missing one, and"
+            echo "the evidence branch is append-only, so a two-arm record cannot be replaced."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::preflight.json published for ${CANDIDATE}; the stranger run is still local"
+
+  # A refusal is a real outcome and has to be loud. The selector exits 1 and
+  # names the contexts that disqualified the newest sha, which fails the select
+  # job; this job exists so the refusal reaches the run's conclusion even when
+  # the selector stood down for a reason worth reading.
+  report:
+    name: Report the cut's decision
+    needs: select
+    if: always() && needs.select.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Summarize
+        env:
+          DECISION: ${{ needs.select.outputs.decision }}
+          REASON: ${{ needs.select.outputs.reason }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+          RESULT: ${{ needs.select.result }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Release cut: ${DECISION:-unreadable}"
+            echo ""
+            echo "${REASON:-the selector produced no reason, which is itself the finding}"
+            echo ""
+            [ -n "$CANDIDATE" ] && echo "Candidate: \`${CANDIDATE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$RESULT" != success ]; then
+            echo "::error::the selection job concluded ${RESULT}; the cut did not decide"
+            exit 1
+          fi
+          echo "release cut decision: ${DECISION} (${REASON})"

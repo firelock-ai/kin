@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# A single-host lock table with the three verbs bin/kin-release-preflight
+# calls on the fleet's bin/kin-lane: acquire, holder and release. The fleet's
+# tool arbitrates one shared Mac between many sessions and is 4,500 lines
+# because of it. A hosted runner is one job on one machine, so the preflight's
+# daemon and gpu locks have nobody to contend with; what the preflight still
+# needs is the contract, because it refuses to run a leg under a lease it
+# cannot read back. This shim keeps that contract honest on its own table under
+# scripts/release-proof/.kin-coord/locks: a resource held by another lane is
+# refused, a holder is read back from disk, and a release by a lane that does
+# not hold the resource is refused.
+#
+# Not a copy of the fleet tool, and not a substitute for it on the shared box:
+# the umbrella's bin/kin-release-preflight keeps calling the real one there.
+set -euo pipefail
+
+SELF_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCKS="${KIN_RELEASE_PROOF_LOCKS:-$SELF_DIR/../.kin-coord/locks}"
+
+die() { printf 'kin-lane (release-proof shim): %s\n' "$*" >&2; exit 1; }
+
+holder_of() { # <resource> -> the lane holding it, or nothing
+  [ -f "$LOCKS/$1/lane" ] && cat "$LOCKS/$1/lane" || true
+}
+
+cmd_acquire() { # <resource> <lane> [--pid <pid>] [reason...]
+  local res="${1:?resource}" lane="${2:?lane}" held
+  mkdir -p "$LOCKS"
+  held="$(holder_of "$res")"
+  if [ -n "$held" ] && [ "$held" != "$lane" ]; then
+    printf '%s is held by %s\n' "$res" "$held" >&2
+    return 1
+  fi
+  mkdir -p "$LOCKS/$res"
+  printf '%s\n' "$lane" > "$LOCKS/$res/lane"
+  printf '%s\n' "$*" > "$LOCKS/$res/argv"
+  printf 'acquired %s for %s\n' "$res" "$lane"
+}
+
+cmd_holder() { # <resource>
+  holder_of "${1:?resource}"
+}
+
+cmd_release() { # <resource> <lane>
+  local res="${1:?resource}" lane="${2:?lane}" held
+  held="$(holder_of "$res")"
+  [ -n "$held" ] || { printf '%s not held\n' "$res"; return 0; }
+  [ "$held" = "$lane" ] || die "'$res' is held by '$held', not '$lane', so this release is refused"
+  rm -rf -- "$LOCKS/$res"
+  printf 'released %s\n' "$res"
+}
+
+case "${1:-}" in
+  acquire) shift; cmd_acquire "$@" ;;
+  holder) shift; cmd_holder "$@" ;;
+  release) shift; cmd_release "$@" ;;
+  *) die "usage: kin-lane acquire <resource> <lane> [--pid <pid>] [reason] | holder <resource> | release <resource> <lane>" ;;
+esac
