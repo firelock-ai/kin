@@ -114,7 +114,7 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
         relations,
         outgoing,
         incoming,
-        changes: HashMap::new(),
+        changes: kin_db::storage::ChangeMap::new(),
         change_children: HashMap::new(),
         work_items: HashMap::new(),
         annotations: HashMap::new(),

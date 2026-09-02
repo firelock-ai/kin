@@ -818,7 +818,7 @@ pub(crate) fn compute_live_retrieval_authority_hash(
     graph_root_hash: MerkleHash,
     entities: &hashbrown::HashMap<EntityId, Entity>,
     relations: &hashbrown::HashMap<RelationId, Relation>,
-    changes: &hashbrown::HashMap<SemanticChangeId, SemanticChange>,
+    changes: &HashMap<SemanticChangeId, SemanticChange>,
     entity_revisions: &hashbrown::HashMap<EntityId, Vec<EntityRevision>>,
     external_references: &hashbrown::HashMap<ExternalReferenceId, ExternalReference>,
     resolved_tree: &ResolvedTree,

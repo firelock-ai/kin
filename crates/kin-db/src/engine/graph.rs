@@ -1254,7 +1254,10 @@ impl GraphHashSource for EntityData {
 /// Semantic change DAG. Named refs are repository authority, not graph state.
 #[derive(Clone)]
 struct ChangeData {
-    changes: HashMap<SemanticChangeId, SemanticChange>,
+    /// Held as the snapshot's own lazily decoded map rather than copied into
+    /// an engine map, so a graph built over a converted store's workspace
+    /// base keeps the history on disk until a history read asks for it.
+    changes: crate::storage::ChangeMap,
     /// Parent → children in the change DAG.
     change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
 }
@@ -2342,7 +2345,7 @@ impl InMemoryGraph {
                 opaque_artifacts: HashMap::new(),
             }),
             changes: RwLock::new(ChangeData {
-                changes: HashMap::new(),
+                changes: crate::storage::ChangeMap::new(),
                 change_children: HashMap::new(),
             }),
             work: RwLock::new(WorkData {
@@ -2843,7 +2846,7 @@ impl InMemoryGraph {
         let graph = Self {
             entities: RwLock::new(entity_data),
             changes: RwLock::new(ChangeData {
-                changes: changes.into_iter().collect(),
+                changes,
                 change_children: change_children.into_iter().collect(),
             }),
             work: RwLock::new(WorkData {
@@ -3074,7 +3077,9 @@ impl InMemoryGraph {
         let graph = Self {
             entities: RwLock::new(entity_data),
             changes: RwLock::new(ChangeData {
-                changes,
+                // The locate projection keeps its own map type; a graph built
+                // from it holds the decoded map, as it always did.
+                changes: changes.into_iter().collect(),
                 change_children: HashMap::new(),
             }),
             work: RwLock::new(WorkData {
@@ -4115,7 +4120,7 @@ impl InMemoryGraph {
             file_layouts: ent.file_layouts.into_values().collect(),
             structured_artifacts: ent.structured_artifacts.into_values().collect(),
             opaque_artifacts: ent.opaque_artifacts.into_values().collect(),
-            changes: chg.changes.into_iter().collect(),
+            changes: chg.changes,
             change_children: chg.change_children.into_iter().collect(),
             work_items: wrk.work_items.into_iter().collect(),
             annotations: wrk.annotations.into_iter().collect(),

@@ -4,7 +4,9 @@
 pub mod authority;
 pub mod authority_frame;
 pub mod backend;
+pub(crate) mod body_walk;
 pub(crate) mod canonical_hash;
+pub mod change_map;
 pub(crate) mod change_validation;
 pub mod delta;
 pub mod format;
@@ -43,6 +45,7 @@ pub use backend::{
     VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
     MAX_VECTOR_ARTIFACT_BYTES, MAX_VECTOR_ARTIFACT_METADATA_BYTES,
 };
+pub use change_map::{ChangeMap, ChangeMapInner};
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
 };

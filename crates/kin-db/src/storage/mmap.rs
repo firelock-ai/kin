@@ -1713,6 +1713,46 @@ pub(crate) fn read_regular_file_at(
     Ok(bytes)
 }
 
+/// [`read_regular_file_at`], keeping the handle the bytes were read through.
+///
+/// The handle is what lets a caller drop the bytes and read part of them
+/// again later: on every platform this crate builds for, a file stays
+/// readable through an open handle after its name is removed, so a snapshot
+/// generation the backend has since superseded is still the same bytes to
+/// whoever opened it. Positional reads only, so the handle can be shared.
+pub(crate) fn read_regular_file_keeping_handle_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    role: &str,
+) -> Result<(Vec<u8>, File, PathBuf), KinDbError> {
+    let display = capability_display_path(display_root, relative);
+    let mut file = open_regular_nofollow_at(directory, relative, display_root, role)?;
+    let len = file
+        .metadata()
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to inspect {role} {}: {error}",
+                display.display()
+            ))
+        })?
+        .len();
+    let capacity = usize::try_from(len).map_err(|_| {
+        KinDbError::StorageError(format!(
+            "{role} {} length does not fit in memory",
+            display.display()
+        ))
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.read_to_end(&mut bytes).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to read {role} {}: {error}",
+            display.display()
+        ))
+    })?;
+    Ok((bytes, file, display))
+}
+
 /// Sync the parent directory selected beneath a retained repository
 /// capability, never by reopening its ambient path.
 pub(crate) fn sync_parent_dir_at(

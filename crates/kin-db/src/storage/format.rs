@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::storage::body_walk::{map_entry_count, top_level_element_ranges};
+use crate::storage::change_map::{ChangeMap, ChangeMapInner, EncodedChanges, HistorySource};
 use crate::storage::change_validation::{validate_semantic_change_entries, AdmittedChangeMap};
 use crate::storage::repository::{GitProjectionTreeReplay, PersistedRepositoryAuthority};
 use crate::types::*;
@@ -108,6 +110,106 @@ impl std::io::Write for CountingWriter {
 /// The version is a parameter rather than `CURRENT_VERSION`, because the
 /// version a snapshot is WRITTEN at is decided by what it carries, not by what
 /// this binary is capable of reading. See [`GraphSnapshot::wire_version`].
+/// Decode the change map element of a frame that an open already verified.
+///
+/// `expected_body_checksum` is the checksum the frame carried at open. The
+/// frame is verified again here, so a file that changed underneath a running
+/// process refuses by checksum rather than decoding whatever is there now, and
+/// a frame that verifies but is not the one opened, because the name was
+/// reused for other bytes, refuses by the recorded checksum.
+pub(crate) fn decode_change_map_element(
+    data: &[u8],
+    expected_body_checksum: [u8; 32],
+    range: std::ops::Range<usize>,
+    expected_len: usize,
+) -> Result<ChangeMapInner, crate::error::KinDbError> {
+    let frame = GraphSnapshot::decode_frame(data, true)?;
+    if frame.body_checksum != Some(expected_body_checksum) {
+        return Err(crate::error::KinDbError::StorageError(
+            "snapshot bytes are not the bytes this repository was opened from".to_string(),
+        ));
+    }
+    let element = frame.body.get(range.clone()).ok_or_else(|| {
+        crate::error::KinDbError::StorageError(format!(
+            "change map range {range:?} lies outside a {} byte body",
+            frame.body.len()
+        ))
+    })?;
+    let decoded: ChangeMapInner = {
+        let _span = tracing::info_span!("kindb.snapshot.decode_change_map").entered();
+        rmp_serde::from_slice(element).map_err(|e| {
+            crate::error::KinDbError::StorageError(format!("change map decode failed: {e}"))
+        })?
+    };
+    if decoded.len() != expected_len {
+        return Err(crate::error::KinDbError::StorageError(format!(
+            "change map decoded {} entries where its header declared {expected_len}",
+            decoded.len()
+        )));
+    }
+    Ok(decoded)
+}
+
+/// Deserialize every entry of a change map element with its real key and
+/// value types, hand each value to `visit`, and keep none of them.
+///
+/// Returns the number of entries visited, which the caller compares against
+/// the header's own count.
+fn stream_change_map(
+    element: &[u8],
+    visit: &mut dyn FnMut(&SemanticChange) -> Result<(), crate::error::KinDbError>,
+) -> Result<usize, crate::error::KinDbError> {
+    use serde::de::{DeserializeSeed, MapAccess};
+
+    struct StreamChanges<'v> {
+        visit: &'v mut dyn FnMut(&SemanticChange) -> Result<(), crate::error::KinDbError>,
+        failure: Option<crate::error::KinDbError>,
+    }
+
+    impl<'de> Visitor<'de> for &mut StreamChanges<'_> {
+        type Value = usize;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map of semantic changes")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut visited = 0usize;
+            while let Some((_, change)) = map.next_entry::<SemanticChangeId, SemanticChange>()? {
+                if let Err(error) = (self.visit)(&change) {
+                    self.failure = Some(error);
+                    return Err(serde::de::Error::custom("change visitor refused"));
+                }
+                visited += 1;
+            }
+            Ok(visited)
+        }
+    }
+
+    impl<'de> DeserializeSeed<'de> for &mut StreamChanges<'_> {
+        type Value = usize;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+    }
+
+    let mut seed = StreamChanges {
+        visit,
+        failure: None,
+    };
+    let mut deserializer = rmp_serde::Deserializer::from_read_ref(element);
+    match (&mut seed).deserialize(&mut deserializer) {
+        Ok(visited) => Ok(visited),
+        Err(error) => Err(seed.failure.take().unwrap_or_else(|| {
+            crate::error::KinDbError::StorageError(format!("change map stream failed: {error}"))
+        })),
+    }
+}
+
 fn assemble_snapshot_frame<T: Serialize + ?Sized>(
     body: &T,
     version: u32,
@@ -434,7 +536,13 @@ pub struct GraphSnapshot {
     pub relations: HashMap<RelationId, Relation>,
     pub outgoing: HashMap<EntityId, Vec<RelationId>>,
     pub incoming: HashMap<EntityId, Vec<RelationId>>,
-    pub changes: HashMap<SemanticChangeId, SemanticChange>,
+    /// The repository's history, decoded on first use.
+    ///
+    /// On a converted repository this map is most of the body and the served
+    /// graph reads it by reference or not at all, so an open may leave it on
+    /// disk; see [`ChangeMap`]. It dereferences to the plain map, so every
+    /// reader below is unchanged and pays the decode the first time it looks.
+    pub changes: ChangeMap,
     pub change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
     pub work_items: HashMap<WorkId, WorkItem>,
     pub annotations: HashMap<AnnotationId, Annotation>,
@@ -650,7 +758,7 @@ impl GraphSnapshot {
             relations: HashMap::new(),
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
-            changes: HashMap::new(),
+            changes: ChangeMap::new(),
             change_children: HashMap::new(),
             work_items: HashMap::new(),
             annotations: HashMap::new(),
@@ -925,6 +1033,101 @@ impl GraphSnapshot {
     ) -> Result<Self, crate::error::KinDbError> {
         Self::from_bytes_with_persisted_root_hash_inner(data, true, false)
             .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Decode exact, already-validated snapshot bytes and leave the change map
+    /// on disk.
+    ///
+    /// The obligations are [`Self::from_bytes_reusing_exact_validation`]'s:
+    /// the frame and its checksum are verified, every other element is
+    /// decoded as its declared type, the header and body versions must agree,
+    /// and the root-hash trailer is checked. What differs is the change map:
+    /// its element is walked once so `visit_change` sees every change in
+    /// stream order without any of them being retained, and the snapshot's
+    /// `changes` is a [`ChangeMap`] that re-reads `source` and decodes the one
+    /// element the first time a reader asks for an entry.
+    ///
+    /// This is what makes an open cost what the served graph costs rather than
+    /// what the history costs. On a converted repository the map is 93 to 95
+    /// percent of the body, and the sweep that needs to see each change once,
+    /// for body requirements and the Gitlink index, gets it from the visitor.
+    pub(crate) fn from_bytes_with_encoded_history(
+        data: &[u8],
+        source: HistorySource,
+        visit_change: &mut dyn FnMut(&SemanticChange) -> Result<(), crate::error::KinDbError>,
+    ) -> Result<(Self, Option<[u8; 32]>), crate::error::KinDbError> {
+        let frame = {
+            let _span = tracing::info_span!("kindb.snapshot.decode_frame").entered();
+            Self::decode_frame(data, true)?
+        };
+        let body_checksum = frame
+            .body_checksum
+            .expect("a checksum-verifying frame decode carries the body checksum");
+        match frame.version {
+            Self::MIN_SUPPORTED_VERSION..=Self::MAX_SUPPORTED_VERSION => {}
+            _ => unreachable!("decode_frame validates supported versions"),
+        }
+        let ranges = {
+            let _span = tracing::info_span!("kindb.snapshot.walk_body_elements").entered();
+            top_level_element_ranges(frame.body)?
+        };
+        let expected_width = if frame.version == Self::MAX_SUPPORTED_VERSION {
+            GRAPH_SNAPSHOT_FIELD_COUNT
+        } else {
+            GRAPH_SNAPSHOT_V13_FIELD_COUNT
+        };
+        if ranges.len() != expected_width {
+            return Err(crate::error::KinDbError::StorageError(format!(
+                "snapshot body declares v{} but carries {} elements where {expected_width} were expected",
+                frame.version,
+                ranges.len()
+            )));
+        }
+        let changes = ranges[CHANGES_FIELD_INDEX].clone();
+        let element = &frame.body[changes.clone()];
+        let change_count = map_entry_count(element)?;
+        {
+            let _span = tracing::info_span!(
+                "kindb.snapshot.stream_change_map",
+                changes = change_count,
+                encoded_bytes = element.len()
+            )
+            .entered();
+            let visited = stream_change_map(element, visit_change)?;
+            if visited != change_count {
+                return Err(crate::error::KinDbError::StorageError(format!(
+                    "snapshot change map declares {change_count} entries and streamed {visited}"
+                )));
+            }
+        }
+        // Everything but the change map, decoded by the one decoder every full
+        // open uses, over a body in which the map is one empty-map marker.
+        let mut partial = Vec::with_capacity(frame.body.len() - element.len() + 1);
+        partial.extend_from_slice(&frame.body[..changes.start]);
+        partial.push(0x80);
+        partial.extend_from_slice(&frame.body[changes.end..]);
+        let mut snapshot = Self::decode_current_snapshot(&partial)?;
+        drop(partial);
+        if !snapshot.changes.is_empty() {
+            return Err(crate::error::KinDbError::StorageError(
+                "snapshot decode without its change map produced a change map".to_string(),
+            ));
+        }
+        if snapshot.version != frame.version {
+            return Err(crate::error::KinDbError::StorageError(format!(
+                "snapshot header declares v{} but its body declares v{}",
+                frame.version, snapshot.version
+            )));
+        }
+        debug_assert_eq!(snapshot.version, snapshot.wire_version());
+        snapshot.changes = ChangeMap::encoded(EncodedChanges::new(
+            source,
+            changes,
+            change_count,
+            body_checksum,
+        ));
+        let persisted_root_hash = Self::decode_root_hash_trailer(data, &frame)?;
+        Ok((snapshot, persisted_root_hash))
     }
 
     /// Decode exact snapshot bytes whose writer already proved admission.
@@ -1989,6 +2192,9 @@ pub(crate) const GRAPH_SNAPSHOT_FIELD_COUNT: usize = 36;
 /// append has to state what the older widths were instead of silently
 /// redefining one of them.
 pub(crate) const GRAPH_SNAPSHOT_V13_FIELD_COUNT: usize = 35;
+/// Where the change map sits in the positional body, pinned to the struct by
+/// `the_change_field_index_names_the_change_map`.
+pub(crate) const CHANGES_FIELD_INDEX: usize = 5;
 pub(crate) const REPOSITORY_AUTHORITY_FIELD_INDEX: usize = 33;
 pub(crate) const MATERIALIZED_GRAPH_FIELD_INDEX: usize = 35;
 
@@ -2024,7 +2230,7 @@ pub struct BorrowedGraphSnapshot<'a> {
     pub opaque_artifacts: &'a hashbrown::HashMap<FilePathId, OpaqueArtifact>,
     pub external_references: &'a hashbrown::HashMap<ExternalReferenceId, ExternalReference>,
     // ChangeData fields
-    pub changes: &'a hashbrown::HashMap<SemanticChangeId, SemanticChange>,
+    pub changes: &'a ChangeMapInner,
     pub change_children: &'a hashbrown::HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
     // WorkData fields
     pub work_items: &'a hashbrown::HashMap<WorkId, WorkItem>,
@@ -4098,5 +4304,260 @@ mod tests {
              is the newest it can read; which version a given body gets is \
              decided by `wire_version` from its contents, not by this constant"
         );
+    }
+
+    // FIR-3064: an open leaves the change map on disk.
+
+    fn a_history_change(index: usize, parent: Option<SemanticChangeId>) -> SemanticChange {
+        seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            parents: parent.into_iter().collect(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("history"),
+            message: format!("history change {index}"),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: vec![FilePathId::new("src/main.rs")],
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        })
+    }
+
+    /// Entities, a relation and a first-parent chain of `changes` changes, so
+    /// the map is neither the only domain nor an empty one.
+    fn a_snapshot_with_history(changes: usize) -> GraphSnapshot {
+        let caller = test_entity("caller");
+        let callee = test_entity("callee");
+        let relation = test_relation(caller.id, callee.id);
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities.insert(caller.id, caller);
+        snapshot.entities.insert(callee.id, callee);
+        snapshot.relations.insert(relation.id, relation);
+        let mut parent = None;
+        for index in 0..changes {
+            let change = a_history_change(index, parent);
+            parent = Some(change.id);
+            snapshot.changes.insert(change.id, change);
+        }
+        snapshot
+    }
+
+    fn memory_source(frame: &[u8]) -> HistorySource {
+        HistorySource::Memory(Arc::from(frame))
+    }
+
+    fn decode_lazily(
+        frame: &[u8],
+        source: HistorySource,
+    ) -> (GraphSnapshot, Vec<SemanticChangeId>) {
+        let mut visited = Vec::new();
+        let (snapshot, _) =
+            GraphSnapshot::from_bytes_with_encoded_history(frame, source, &mut |change| {
+                visited.push(change.id);
+                Ok(())
+            })
+            .expect("a lazy decode of an intact frame succeeds");
+        (snapshot, visited)
+    }
+
+    fn decoded_on_this_thread() -> usize {
+        crate::storage::change_map::change_maps_decoded_on_this_thread()
+    }
+
+    #[test]
+    fn the_change_field_index_names_the_change_map() {
+        let snapshot = a_snapshot_with_history(3);
+        let body = rmp_serde::to_vec(&snapshot).expect("encodes");
+        let ranges = top_level_element_ranges(&body).expect("walks");
+        assert_eq!(ranges.len(), GRAPH_SNAPSHOT_V13_FIELD_COUNT);
+        let element = &body[ranges[CHANGES_FIELD_INDEX].clone()];
+        assert_eq!(map_entry_count(element).expect("a map"), 3);
+        let decoded: ChangeMapInner =
+            rmp_serde::from_slice(element).expect("the element is the map");
+        assert_eq!(snapshot.changes, decoded);
+        // The neighbours are the adjacency and the change children, both
+        // empty here, so a slipped index would read zero entries.
+        assert_eq!(
+            map_entry_count(&body[ranges[CHANGES_FIELD_INDEX - 1].clone()]).unwrap(),
+            0
+        );
+        assert_eq!(
+            map_entry_count(&body[ranges[CHANGES_FIELD_INDEX + 1].clone()]).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_lazy_decode_reads_every_field_the_full_decode_reads_and_leaves_the_map_on_disk() {
+        let snapshot = a_snapshot_with_history(3);
+        let frame = encode_snapshot_without_admission_validation(&snapshot);
+        let eager = GraphSnapshot::from_bytes_reusing_exact_validation(&frame).expect("eager");
+        let decodes_before = decoded_on_this_thread();
+
+        let (lazy, mut visited) = decode_lazily(&frame, memory_source(&frame));
+        assert!(
+            !lazy.changes.is_decoded(),
+            "the open must not decode the change map"
+        );
+        assert_eq!(
+            lazy.changes.len(),
+            3,
+            "the length is read from the map header"
+        );
+        let mut expected: Vec<_> = eager.changes.keys().copied().collect();
+        expected.sort();
+        visited.sort();
+        assert_eq!(
+            visited, expected,
+            "the visitor sees every change exactly once"
+        );
+        assert_eq!(lazy.version, eager.version);
+        assert_eq!(lazy.entities.len(), eager.entities.len());
+        assert_eq!(lazy.relations.len(), eager.relations.len());
+        assert_eq!(
+            decoded_on_this_thread(),
+            decodes_before,
+            "nothing decoded the map"
+        );
+
+        // The first read decodes exactly what the eager decode holds, and the
+        // whole snapshot then re-encodes to the same body.
+        assert!(lazy.changes.get(&expected[0]).is_some());
+        assert!(lazy.changes.is_decoded());
+        assert_eq!(decoded_on_this_thread(), decodes_before + 1);
+        assert_eq!(lazy.changes, eager.changes);
+        // Every other field too, named by the first one that differs. Byte
+        // equality of a re-encoding would be the wrong check: a map's
+        // encoding order is its iteration order, which two maps do not share.
+        assert_eq!(
+            crate::storage::authority_frame::first_difference(&lazy, &eager),
+            None
+        );
+    }
+
+    #[test]
+    fn a_lazy_decode_reads_a_v14_body_and_an_empty_v13_body() {
+        let mut with_section = a_v14_snapshot("served");
+        for (id, change) in a_snapshot_with_history(2).changes.into_iter() {
+            with_section.changes.insert(id, change);
+        }
+        let frame = encode_snapshot_without_admission_validation(&with_section);
+        let (lazy, visited) = decode_lazily(&frame, memory_source(&frame));
+        assert_eq!(lazy.version, GraphSnapshot::MAX_SUPPORTED_VERSION);
+        assert!(lazy.materialized_graph.is_some(), "the section rides along");
+        assert_eq!(visited.len(), 2);
+        assert!(!lazy.changes.is_decoded());
+        assert_eq!(lazy.changes.len(), 2);
+
+        let empty = GraphSnapshot::empty().to_bytes().expect("serializes");
+        let (lazy, visited) = decode_lazily(&empty, memory_source(&empty));
+        assert_eq!(lazy.version, GraphSnapshot::MIN_SUPPORTED_VERSION);
+        assert!(visited.is_empty());
+        assert!(!lazy.changes.is_decoded());
+        assert!(lazy.changes.is_empty());
+        assert_eq!(
+            lazy.changes.iter().count(),
+            0,
+            "an empty map decodes to nothing"
+        );
+    }
+
+    #[test]
+    fn a_visitor_refusal_refuses_the_lazy_decode_with_its_own_error() {
+        let frame = encode_snapshot_without_admission_validation(&a_snapshot_with_history(3));
+        let mut seen = 0usize;
+        let error = GraphSnapshot::from_bytes_with_encoded_history(
+            &frame,
+            memory_source(&frame),
+            &mut |_| {
+                seen += 1;
+                if seen == 2 {
+                    Err(crate::error::KinDbError::StorageError(
+                        "the second change is refused".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("the visitor's refusal refuses the decode");
+        assert!(
+            error.to_string().contains("the second change is refused"),
+            "{error}"
+        );
+        assert_eq!(seen, 2, "the stream stops at the refusal");
+    }
+
+    #[test]
+    fn a_change_map_refuses_bytes_that_changed_since_the_open() {
+        let intact = encode_snapshot_without_admission_validation(&a_snapshot_with_history(3));
+
+        // A flipped byte fails the frame checksum on re-read.
+        let mut flipped = intact.clone();
+        flipped[40] ^= 0x01;
+        let (lazy, _) = decode_lazily(&intact, memory_source(&flipped));
+        let error = lazy.changes.decoded().expect_err("changed bytes refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("could not be decoded on first use"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("checksum mismatch"), "{error}");
+        assert!(
+            !lazy.changes.is_decoded(),
+            "a refused decode leaves nothing behind"
+        );
+
+        // A different frame that verifies on its own is still not the frame
+        // this map was opened from.
+        let other = encode_snapshot_without_admission_validation(&a_snapshot_with_history(2));
+        let (lazy, _) = decode_lazily(&intact, memory_source(&other));
+        let error = lazy.changes.decoded().expect_err("other bytes refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("not the bytes this repository was opened from"),
+            "{error}"
+        );
+
+        // Control: the intact frame decodes.
+        let (lazy, _) = decode_lazily(&intact, memory_source(&intact));
+        assert_eq!(
+            lazy.changes.decoded().expect("intact bytes decode").len(),
+            3
+        );
+    }
+
+    #[test]
+    fn an_encoded_clone_shares_its_source_and_a_decoded_clone_copies() {
+        let frame = encode_snapshot_without_admission_validation(&a_snapshot_with_history(3));
+        let (lazy, visited) = decode_lazily(&frame, memory_source(&frame));
+        let twin = lazy.changes.clone();
+        assert!(
+            !twin.is_decoded(),
+            "cloning an encoded map costs a pointer, not a history"
+        );
+
+        let decodes_before = decoded_on_this_thread();
+        assert!(lazy.changes.contains_key(&visited[0]));
+        assert!(lazy.changes.is_decoded());
+        assert!(!twin.is_decoded(), "the twin decodes on its own first use");
+        let copy = lazy.changes.clone();
+        assert!(
+            copy.is_decoded(),
+            "cloning a decoded map copies its entries"
+        );
+        assert_eq!(
+            copy, twin,
+            "the twin decodes from the shared source to the same map"
+        );
+        assert!(twin.is_decoded());
+        assert_eq!(decoded_on_this_thread(), decodes_before + 2);
     }
 }

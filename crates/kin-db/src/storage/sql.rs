@@ -233,6 +233,7 @@ impl SqliteBackend {
         }
         Ok(Some(SnapshotAuthority {
             snapshot_bytes,
+            snapshot_source: None,
             snapshot_generation,
             head_generation,
             // No durable place to bind a history validation here, so every

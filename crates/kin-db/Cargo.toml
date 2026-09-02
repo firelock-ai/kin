@@ -49,6 +49,7 @@ chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 libc = { workspace = true }
 bincode = "1"
+rmp = "0.8"
 rmp-serde = "1"
 sha2 = "0.11"
 gix-ignore = "0.21"

@@ -441,6 +441,12 @@ impl LineageSource for hashbrown::HashMap<SemanticChangeId, SemanticChange> {
     }
 }
 
+impl LineageSource for crate::storage::change_map::ChangeMap {
+    fn lineage_change(&self, change_id: &SemanticChangeId) -> Option<&SemanticChange> {
+        self.get(change_id)
+    }
+}
+
 /// Resolve the exact repository tree at every target in one first-parent pass.
 ///
 /// `ChangeStore::resolve_tree_at` resolves one head by collecting that head's

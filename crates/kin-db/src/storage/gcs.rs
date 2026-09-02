@@ -526,6 +526,7 @@ impl GcsBackend {
         let snapshot_bytes = Self::decode_full_snapshot_authority(&bytes)?;
         Ok(Some(SnapshotAuthority {
             snapshot_bytes,
+            snapshot_source: None,
             snapshot_generation: generation,
             head_generation: generation,
             // No durable place to bind a history validation here, so every

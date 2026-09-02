@@ -1956,10 +1956,26 @@ pub(crate) fn checked_next_generation(
     })
 }
 
+/// The file a snapshot's bytes were read through, kept open.
+///
+/// An open that leaves the change map on disk drops `snapshot_bytes` and
+/// reads the frame again from this handle the first time a reader asks for a
+/// change. The handle rather than the path, because the backend retires a
+/// superseded generation's name on the next save and an open handle keeps
+/// the bytes readable regardless.
+#[derive(Debug, Clone)]
+pub struct SnapshotFileSource {
+    pub(crate) file: std::sync::Arc<std::fs::File>,
+    pub(crate) display: String,
+}
+
 /// Atomic persistence authority for a snapshot plus its acknowledged journal.
 #[derive(Debug)]
 pub struct SnapshotAuthority {
     pub snapshot_bytes: Vec<u8>,
+    /// Where `snapshot_bytes` can be read again, when the backend has a file
+    /// to hand back. `None` means every decode of this authority is whole.
+    pub snapshot_source: Option<SnapshotFileSource>,
     /// Backend publication generation represented by `snapshot_bytes` before
     /// journal replay. This is not `RootBundle::generation`.
     pub snapshot_generation: Generation,
@@ -2134,6 +2150,11 @@ impl RecoveredSnapshot {
 pub(crate) struct RecoveredRepositoryAuthority {
     pub recovered: RecoveredSnapshot,
     pub reused_complete_validation: bool,
+    /// Whether the change map was streamed through the caller's visitor and
+    /// left on disk. When this is false the visitor saw nothing and the
+    /// snapshot's `changes` is decoded, so a caller that needs every change
+    /// once reads it from the map instead.
+    pub history_streamed: bool,
     pub payload_stats: AuthorityPayloadStats,
 }
 
@@ -2148,7 +2169,7 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
     backend: &B,
     repo_id: &str,
 ) -> Result<Option<RecoveredSnapshot>, KinDbError> {
-    load_recovered_snapshot_inner(backend, repo_id, None)
+    load_recovered_snapshot_inner(backend, repo_id, None, HistoryDecode::Eager)
         .map(|recovered| recovered.map(|recovered| recovered.recovered))
 }
 
@@ -2159,18 +2180,61 @@ pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
 /// always perform full storage admission. This narrower entrypoint is reserved
 /// for [`RepositoryAuthorityManager`](crate::storage::RepositoryAuthorityManager),
 /// which still revalidates every referenced immutable body after recovery.
+#[cfg(test)]
 pub(crate) fn load_recovered_repository_authority<B: StorageBackend + ?Sized>(
     backend: &B,
     repo_id: &str,
     expected_validator_version: u32,
 ) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
-    load_recovered_snapshot_inner(backend, repo_id, Some(expected_validator_version))
+    load_recovered_snapshot_inner(
+        backend,
+        repo_id,
+        Some(expected_validator_version),
+        HistoryDecode::Eager,
+    )
+}
+
+/// [`load_recovered_repository_authority`], leaving the change map on disk
+/// when the backend hands back the file it read.
+///
+/// Every change is streamed through `visit_change` exactly once, in the
+/// order the map stores them, and none is retained; the recovered snapshot's
+/// `changes` decodes itself the first time a reader asks for an entry. When
+/// the base cannot be decoded that way, because the backend kept no file
+/// handle, the journal is not empty, or no durable validation names these
+/// exact bytes, recovery decodes the whole body exactly as the plain entry
+/// point does and the visitor is never called, which
+/// [`RecoveredRepositoryAuthority::history_streamed`] reports.
+pub(crate) fn load_recovered_repository_authority_streaming<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repo_id: &str,
+    expected_validator_version: u32,
+    visit_change: &mut dyn FnMut(&kin_model::SemanticChange) -> Result<(), KinDbError>,
+) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
+    load_recovered_snapshot_inner(
+        backend,
+        repo_id,
+        Some(expected_validator_version),
+        HistoryDecode::Streamed(visit_change),
+    )
+}
+
+/// How recovery decodes a journal-free base that a durable validation names.
+pub(crate) enum HistoryDecode<'v> {
+    /// The whole body, change map included, as every open did before
+    /// FIR-3064.
+    Eager,
+    /// Every other element decoded, the change map streamed once through the
+    /// visitor and left on disk. Falls back to `Eager` when the backend has no
+    /// file to hand back or the base is not journal-free and proven.
+    Streamed(&'v mut dyn FnMut(&kin_model::SemanticChange) -> Result<(), KinDbError>),
 }
 
 fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
     backend: &B,
     repo_id: &str,
     expected_validator_version: Option<u32>,
+    history: HistoryDecode<'_>,
 ) -> Result<Option<RecoveredRepositoryAuthority>, KinDbError> {
     let (loaded, raw_deltas) = backend.load_recovery_state(repo_id)?;
 
@@ -2183,8 +2247,14 @@ fn load_recovered_snapshot_inner<B: StorageBackend + ?Sized>(
             raw_deltas.len()
         )));
     };
-    recover_snapshot_from_state(repo_id, &authority, &raw_deltas, expected_validator_version)
-        .map(Some)
+    recover_snapshot_from_state(
+        repo_id,
+        &authority,
+        &raw_deltas,
+        expected_validator_version,
+        history,
+    )
+    .map(Some)
 }
 
 /// Which decoder owns the acknowledged journal of one recovery.
@@ -2209,6 +2279,7 @@ pub(crate) fn recover_snapshot_from_state(
     authority: &SnapshotAuthority,
     raw_deltas: &[PersistedDelta],
     expected_validator_version: Option<u32>,
+    history: HistoryDecode<'_>,
 ) -> Result<RecoveredRepositoryAuthority, KinDbError> {
     if authority.snapshot_generation > authority.head_generation {
         return Err(KinDbError::StorageError(format!(
@@ -2243,12 +2314,39 @@ pub(crate) fn recover_snapshot_from_state(
                 );
             }
         }
-        let snapshot = if reused_complete_validation {
-            let _span =
-                tracing::info_span!("kindb.snapshot.reuse_exact_complete_validation").entered();
-            GraphSnapshot::from_bytes_reusing_exact_validation(&authority.snapshot_bytes)?
-        } else {
-            GraphSnapshot::from_bytes(&authority.snapshot_bytes)?
+        let mut history_streamed = false;
+        let snapshot = match (
+            reused_complete_validation,
+            history,
+            &authority.snapshot_source,
+        ) {
+            (true, HistoryDecode::Streamed(visit_change), Some(source)) => {
+                let _span =
+                    tracing::info_span!("kindb.snapshot.reuse_exact_complete_validation_streamed")
+                        .entered();
+                let frame_len = u64::try_from(authority.snapshot_bytes.len()).map_err(|_| {
+                    KinDbError::StorageError(format!(
+                        "repo {repo_id} snapshot length does not fit u64"
+                    ))
+                })?;
+                let (snapshot, _) = GraphSnapshot::from_bytes_with_encoded_history(
+                    &authority.snapshot_bytes,
+                    crate::storage::change_map::HistorySource::File {
+                        file: std::sync::Arc::clone(&source.file),
+                        display: source.display.clone(),
+                        frame_len,
+                    },
+                    visit_change,
+                )?;
+                history_streamed = true;
+                snapshot
+            }
+            (true, _, _) => {
+                let _span =
+                    tracing::info_span!("kindb.snapshot.reuse_exact_complete_validation").entered();
+                GraphSnapshot::from_bytes_reusing_exact_validation(&authority.snapshot_bytes)?
+            }
+            (false, _, _) => GraphSnapshot::from_bytes(&authority.snapshot_bytes)?,
         };
         let payload_stats = AuthorityPayloadStats::from_recovery(
             authority.snapshot_generation,
@@ -2267,6 +2365,7 @@ pub(crate) fn recover_snapshot_from_state(
                 history_validation: authority.history_validation.clone(),
                 journal_sha256: None,
             },
+            history_streamed,
             reused_complete_validation,
             payload_stats,
         });
@@ -2400,6 +2499,7 @@ pub(crate) fn recover_snapshot_from_state(
                     journal_sha256: None,
                 },
                 reused_complete_validation: false,
+                history_streamed: false,
                 payload_stats,
             })
         }
@@ -2467,6 +2567,7 @@ pub(crate) fn recover_snapshot_from_state(
                     journal_sha256: Some(journal_sha256),
                 },
                 reused_complete_validation,
+                history_streamed: false,
                 payload_stats,
             })
         }
@@ -2515,6 +2616,7 @@ pub trait StorageBackend: Send + Sync {
             .load_snapshot(repo_id)?
             .map(|(snapshot_bytes, generation)| SnapshotAuthority {
                 snapshot_bytes,
+                snapshot_source: None,
                 snapshot_generation: generation,
                 head_generation: generation,
                 history_validation: None,
@@ -3855,6 +3957,29 @@ impl LocalSurfaceCapability {
     fn read_regular(&self, leaf: &Path, role: &str) -> Result<Vec<u8>, KinDbError> {
         Self::require_leaf(leaf)?;
         mmap::read_regular_file_at(&self.directory, leaf, &self.display_path, role)
+    }
+
+    /// [`read_regular`](Self::read_regular), also returning the open handle
+    /// the bytes came through, so part of them can be read again later.
+    fn read_regular_keeping_handle(
+        &self,
+        leaf: &Path,
+        role: &str,
+    ) -> Result<(Vec<u8>, SnapshotFileSource), KinDbError> {
+        Self::require_leaf(leaf)?;
+        let (bytes, file, display) = mmap::read_regular_file_keeping_handle_at(
+            &self.directory,
+            leaf,
+            &self.display_path,
+            role,
+        )?;
+        Ok((
+            bytes,
+            SnapshotFileSource {
+                file: std::sync::Arc::new(file),
+                display: display.display().to_string(),
+            },
+        ))
     }
 
     fn sync(&self, leaf: &Path) -> Result<(), KinDbError> {
@@ -6680,7 +6805,7 @@ impl LocalFileBackend {
         &self,
         namespace: &LocalRepositoryCapability,
         record: &LocalAuthorityRecord,
-    ) -> Result<Vec<u8>, KinDbError> {
+    ) -> Result<(Vec<u8>, SnapshotFileSource), KinDbError> {
         let repo_id = &namespace.repo_id;
         let snapshots = namespace
             .surface(Self::snapshots_surface_name(), false)?
@@ -6690,7 +6815,8 @@ impl LocalFileBackend {
                 ))
             })?;
         let leaf = Path::new(&record.snapshot_file);
-        let snapshot_bytes = snapshots.read_regular(leaf, "authoritative snapshot")?;
+        let (snapshot_bytes, source) =
+            snapshots.read_regular_keeping_handle(leaf, "authoritative snapshot")?;
         let digest = Self::snapshot_digest(&snapshot_bytes);
         if digest != record.snapshot_sha256 {
             return Err(KinDbError::StorageError(format!(
@@ -6704,7 +6830,7 @@ impl LocalFileBackend {
         // and make local recovery deserialize and validate the same exact
         // content-addressed bytes twice before repository open can use them.
         namespace.confirm_surface_visible(&snapshots)?;
-        Ok(snapshot_bytes)
+        Ok((snapshot_bytes, source))
     }
 
     fn clear_superseded_snapshots_unlocked(
@@ -6796,7 +6922,8 @@ impl LocalFileBackend {
             return Ok(None);
         };
 
-        let snapshot_bytes = self.read_authoritative_snapshot_bytes_unlocked(namespace, &record)?;
+        let (snapshot_bytes, snapshot_source) =
+            self.read_authoritative_snapshot_bytes_unlocked(namespace, &record)?;
         let snapshots = namespace
             .surface(Self::snapshots_surface_name(), false)?
             .ok_or_else(|| {
@@ -6816,6 +6943,7 @@ impl LocalFileBackend {
         self.confirm_repository_visible(namespace)?;
         Ok(Some(SnapshotAuthority {
             snapshot_bytes,
+            snapshot_source: Some(snapshot_source),
             snapshot_generation: record.snapshot_generation,
             head_generation: record.head_generation,
             history_validation: record.history_validation,
@@ -7292,6 +7420,7 @@ impl LocalFileBackend {
         let cursor = SnapshotCursor::from_backend_generation(generation);
         let authority = SnapshotAuthority {
             snapshot_bytes: data.to_vec(),
+            snapshot_source: None,
             snapshot_generation: generation,
             head_generation: generation,
             history_validation: history_validator_version.map(|validator_version| {
@@ -8633,6 +8762,7 @@ mod tests {
             Ok((
                 Some(SnapshotAuthority {
                     snapshot_bytes: self.snapshot_bytes.clone(),
+                    snapshot_source: None,
                     snapshot_generation: self.snapshot_generation,
                     head_generation: self.head_generation,
                     history_validation: None,

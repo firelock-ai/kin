@@ -43,14 +43,17 @@ use crate::storage::authority::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, AuthorityRewriteDecision,
     DurableAuthorityPersistence, PersistOutcome, RetainedPersistOutcome, VersionedAuthorityState,
 };
+#[cfg(test)]
+use crate::storage::backend::load_recovered_repository_authority;
 use crate::storage::backend::{
-    load_recovered_repository_authority, validate_source_blob_size, verify_source_blob_digest,
-    AuthorityPayloadStats, Generation, LocalAuthorityFreezeLock, LocalFileBackend,
-    PreparedWorkspaceGraphArtifact, RecoveredSnapshot, SnapshotCursor, SnapshotSaveOutcome,
-    SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend, VerifiedSourceBlobBatch,
-    MAX_SOURCE_BLOB_BYTES,
+    load_recovered_repository_authority_streaming, validate_source_blob_size,
+    verify_source_blob_digest, AuthorityPayloadStats, Generation, LocalAuthorityFreezeLock,
+    LocalFileBackend, PreparedWorkspaceGraphArtifact, RecoveredSnapshot, SnapshotCursor,
+    SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend,
+    VerifiedSourceBlobBatch, MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::canonical_hash::canonical_hash_into;
+use crate::storage::change_map::ChangeMap;
 use crate::storage::change_validation::AdmittedChangeMap;
 use crate::storage::format::{
     GraphSnapshot, MaterializedGraphRefusal, MaterializedGraphSection, WorkspaceGraphFacts,
@@ -845,6 +848,16 @@ impl RepositoryAuthorityState {
     fn from_validated_snapshot(snapshot: GraphSnapshot) -> Self {
         let mut authenticated_gitlinks = BTreeSet::new();
         extend_authenticated_gitlinks(&mut authenticated_gitlinks, snapshot.changes.values());
+        Self::from_validated_snapshot_with_gitlinks(snapshot, authenticated_gitlinks)
+    }
+
+    /// [`from_validated_snapshot`](Self::from_validated_snapshot) for an open
+    /// that already walked every change once and carries the index it built,
+    /// so the change map is not decoded a second time to rebuild it.
+    fn from_validated_snapshot_with_gitlinks(
+        snapshot: GraphSnapshot,
+        authenticated_gitlinks: BTreeSet<(ArtifactId, GitObjectId)>,
+    ) -> Self {
         Self {
             snapshot,
             authenticated_gitlinks: Arc::new(authenticated_gitlinks),
@@ -2325,11 +2338,21 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         backend: Arc<B>,
     ) -> Result<(Self, Option<AuthorityPayloadStats>), KinDbError> {
         let started = std::time::Instant::now();
-        let recovered = load_recovered_repository_authority(
+        // Everything the open needs from every change is gathered here, once,
+        // while recovery streams the change map past. When the base can be
+        // decoded that way the map stays on disk, and the two walks below that
+        // used to read it whole, the body sweep's requirement collection and
+        // the Gitlink index, read this instead.
+        let mut sweep = HistorySweep::default();
+        let recovered = load_recovered_repository_authority_streaming(
             backend.as_ref(),
             repository_id.as_str(),
             HISTORY_VALIDATION_VERSION,
+            &mut |change| sweep.visit(change),
         )?;
+        let history_streamed = recovered
+            .as_ref()
+            .is_some_and(|recovered| recovered.history_streamed);
         let payload_stats = recovered.as_ref().map(|recovered| recovered.payload_stats);
         let recovered_authority = recovered.is_some();
         let recovered_at = started.elapsed();
@@ -2420,8 +2443,28 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         // every open, proof or no proof. This is linear in stored bytes rather
         // than superlinear in history, and keeping it unconditional is what
         // keeps "a tampered store still refuses" true of the fast path and not
-        // only of the fallback.
-        validate_all_authority_bodies(backend.as_ref(), &repository_id, &snapshot)?;
+        // only of the fallback. What the streamed open changes is only where
+        // the change-derived requirements come from: the sweep that already
+        // saw every change, rather than a second walk over a decoded map.
+        let change_bodies = if history_streamed {
+            if sweep.changes_seen != snapshot.changes.len() {
+                return Err(storage(format!(
+                    "repository {} history stream visited {} changes where the snapshot declares {}",
+                    repository_id,
+                    sweep.changes_seen,
+                    snapshot.changes.len()
+                )));
+            }
+            ChangeBodyRequirements::Collected(std::mem::take(&mut sweep.body_requirements))
+        } else {
+            ChangeBodyRequirements::Walk(&snapshot.changes)
+        };
+        validate_all_authority_bodies_with(
+            backend.as_ref(),
+            &repository_id,
+            &snapshot,
+            change_bodies,
+        )?;
         let bodies_at = started.elapsed();
         // Reopen latency at real repository scale is a standing concern, and it
         // is not obvious from outside which phase dominates. Report the split
@@ -2429,6 +2472,9 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         tracing::debug!(
             repository = %repository_id,
             by_history_validation = reopen_proof.is_some(),
+            history_streamed,
+            changes_streamed = sweep.changes_seen,
+            change_map_decoded = snapshot.changes.is_decoded(),
             recover_ms = recovered_at.as_millis(),
             structural_ms = (structural_at - recovered_at).as_millis(),
             replay_ms = (replay_at - structural_at).as_millis(),
@@ -2437,7 +2483,14 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             "repository authority open"
         );
 
-        let mut initial = RepositoryAuthorityState::from_validated_snapshot(snapshot);
+        let mut initial = if history_streamed {
+            RepositoryAuthorityState::from_validated_snapshot_with_gitlinks(
+                snapshot,
+                std::mem::take(&mut sweep.authenticated_gitlinks),
+            )
+        } else {
+            RepositoryAuthorityState::from_validated_snapshot(snapshot)
+        };
         // Prepared state binds to the digest of the durable authority this open
         // actually loaded, so a repository with no persisted authority yet has
         // nothing to bind to and gets no cache at all.
@@ -3003,6 +3056,7 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
             locked.authority(),
             locked.frames(),
             None,
+            crate::storage::backend::HistoryDecode::Eager,
         )?
         .recovered
         .snapshot;
@@ -6326,7 +6380,7 @@ fn resolve_workspace_base_graph_snapshot_capturing(
         incoming: HashMap::new(),
         changes: match history {
             WorkspaceBaseHistory::Carried(_) => authority_snapshot.changes.clone(),
-            WorkspaceBaseHistory::Omitted => HashMap::new(),
+            WorkspaceBaseHistory::Omitted => ChangeMap::new(),
         },
         change_children: match history {
             WorkspaceBaseHistory::Carried(_) => authority_snapshot.change_children.clone(),
@@ -7012,6 +7066,7 @@ fn validate_merge_transaction_delta_bodies<B: StorageBackend + ?Sized>(
 }
 
 #[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 struct AuthorityBodyRequirement {
     expected_len: Option<u64>,
     label: String,
@@ -7226,8 +7281,58 @@ fn collect_operation_body_requirements(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The `(digest, expected length)` set the last body sweep on this thread
+    /// verified, so a test can check that a streamed open verified exactly
+    /// what an eager walk of the same store would have.
+    static LAST_BODY_SWEEP_REQUIREMENTS: std::cell::RefCell<BTreeMap<Hash256, Option<u64>>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+/// What an open needs from every change, gathered once while recovery streams
+/// the change map past so the map itself can stay on disk.
+#[derive(Default)]
+struct HistorySweep {
+    body_requirements: BTreeMap<Hash256, AuthorityBodyRequirement>,
+    authenticated_gitlinks: BTreeSet<(ArtifactId, GitObjectId)>,
+    changes_seen: usize,
+}
+
+impl HistorySweep {
+    fn visit(&mut self, change: &kin_model::SemanticChange) -> Result<(), KinDbError> {
+        collect_tree_delta_body_requirements(
+            &mut self.body_requirements,
+            &change.tree_deltas,
+            &format!("change {}", change.id),
+        )?;
+        extend_authenticated_gitlinks(&mut self.authenticated_gitlinks, std::iter::once(change));
+        self.changes_seen += 1;
+        Ok(())
+    }
+}
+
+/// Where the change-derived half of the body requirements comes from.
+enum ChangeBodyRequirements<'a> {
+    /// Walk the decoded map, which decodes it if it was left on disk.
+    Walk(&'a ChangeMap),
+    /// Take what a [`HistorySweep`] already collected over every change.
+    Collected(BTreeMap<Hash256, AuthorityBodyRequirement>),
+}
+
+#[cfg(test)]
 fn collect_all_authority_body_requirements(
     snapshot: &GraphSnapshot,
+) -> Result<BTreeMap<Hash256, AuthorityBodyRequirement>, KinDbError> {
+    collect_all_authority_body_requirements_with(
+        snapshot,
+        ChangeBodyRequirements::Walk(&snapshot.changes),
+    )
+}
+
+fn collect_all_authority_body_requirements_with(
+    snapshot: &GraphSnapshot,
+    changes: ChangeBodyRequirements<'_>,
 ) -> Result<BTreeMap<Hash256, AuthorityBodyRequirement>, KinDbError> {
     let metadata = snapshot
         .repository_authority
@@ -7249,12 +7354,26 @@ fn collect_all_authority_body_requirements(
             "Git external object",
         )?;
     }
-    for change in snapshot.changes.values() {
-        collect_tree_delta_body_requirements(
-            &mut requirements,
-            &change.tree_deltas,
-            &format!("change {}", change.id),
-        )?;
+    match changes {
+        ChangeBodyRequirements::Walk(changes) => {
+            for change in changes.values() {
+                collect_tree_delta_body_requirements(
+                    &mut requirements,
+                    &change.tree_deltas,
+                    &format!("change {}", change.id),
+                )?;
+            }
+        }
+        ChangeBodyRequirements::Collected(collected) => {
+            for (digest, requirement) in collected {
+                require_authority_body(
+                    &mut requirements,
+                    digest,
+                    requirement.expected_len,
+                    requirement.label,
+                )?;
+            }
+        }
     }
     for workspace in &metadata.workspaces {
         collect_tree_body_requirements(
@@ -7393,6 +7512,20 @@ fn validate_all_authority_bodies<B: StorageBackend + ?Sized>(
     repository_id: &RepositoryId,
     snapshot: &GraphSnapshot,
 ) -> Result<(), KinDbError> {
+    validate_all_authority_bodies_with(
+        backend,
+        repository_id,
+        snapshot,
+        ChangeBodyRequirements::Walk(&snapshot.changes),
+    )
+}
+
+fn validate_all_authority_bodies_with<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repository_id: &RepositoryId,
+    snapshot: &GraphSnapshot,
+    changes: ChangeBodyRequirements<'_>,
+) -> Result<(), KinDbError> {
     let metadata = snapshot
         .repository_authority
         .as_ref()
@@ -7400,8 +7533,15 @@ fn validate_all_authority_bodies<B: StorageBackend + ?Sized>(
     let requirements = {
         let _span =
             tracing::info_span!("kindb.repository.collect_authority_body_requirements").entered();
-        collect_all_authority_body_requirements(snapshot)?
+        collect_all_authority_body_requirements_with(snapshot, changes)?
     };
+    #[cfg(test)]
+    LAST_BODY_SWEEP_REQUIREMENTS.with(|last| {
+        *last.borrow_mut() = requirements
+            .iter()
+            .map(|(digest, requirement)| (*digest, requirement.expected_len))
+            .collect();
+    });
     if requirements.is_empty() {
         return Ok(());
     }
@@ -19869,6 +20009,266 @@ mod tests {
             );
         }
     }
+
+    // FIR-3064: an open leaves the change map on disk.
+
+    fn snapshot_file(directory: &TempDir, generation: Generation) -> std::path::PathBuf {
+        directory
+            .path()
+            .join(repository_id().as_str())
+            .join("snapshots")
+            .join(format!("{generation:020}.kndb"))
+    }
+
+    fn decoded_on_this_thread() -> usize {
+        crate::storage::change_map::change_maps_decoded_on_this_thread()
+    }
+
+    #[test]
+    fn an_open_with_a_verified_record_leaves_the_change_map_on_disk() {
+        let directory = TempDir::new().unwrap();
+        drop(committed_local_repository(&directory));
+        // What an eager walk of this store verifies, read before the open
+        // under test so the comparison does not depend on it.
+        let eager = load_recovered_repository_authority(
+            &LocalFileBackend::new(directory.path()),
+            repository_id().as_str(),
+            HISTORY_VALIDATION_VERSION,
+        )
+        .unwrap()
+        .expect("the committed store recovers")
+        .recovered
+        .snapshot;
+        let eager_bodies: BTreeMap<Hash256, Option<u64>> =
+            collect_all_authority_body_requirements(&eager)
+                .unwrap()
+                .into_iter()
+                .map(|(digest, requirement)| (digest, requirement.expected_len))
+                .collect();
+        assert!(
+            !eager_bodies.is_empty(),
+            "the control: the fixture commits bodies"
+        );
+
+        let decodes_before = decoded_on_this_thread();
+        let reopened = reopen(&directory);
+        assert!(reopened.opened_by_history_validation());
+        let lease = reopened.read_authority();
+        let snapshot = lease.snapshot();
+        assert!(
+            !snapshot.changes.is_decoded(),
+            "an open with a verified record must leave the change map on disk"
+        );
+        assert_eq!(
+            snapshot.changes.len(),
+            1,
+            "the length is read from the map header"
+        );
+        assert_eq!(
+            decoded_on_this_thread(),
+            decodes_before,
+            "nothing on the open path decoded the change map"
+        );
+        let swept = LAST_BODY_SWEEP_REQUIREMENTS.with(|last| last.borrow().clone());
+        assert_eq!(
+            swept, eager_bodies,
+            "the streamed open verifies exactly the bodies an eager walk verifies"
+        );
+        let mut eager_gitlinks = BTreeSet::new();
+        extend_authenticated_gitlinks(&mut eager_gitlinks, eager.changes.values());
+        assert_eq!(*lease.authenticated_gitlinks, eager_gitlinks);
+    }
+
+    #[test]
+    fn the_first_history_read_after_a_lazy_open_decodes_the_map_the_eager_open_holds() {
+        let directory = TempDir::new().unwrap();
+        drop(committed_local_repository(&directory));
+        let eager = load_recovered_repository_authority(
+            &LocalFileBackend::new(directory.path()),
+            repository_id().as_str(),
+            HISTORY_VALIDATION_VERSION,
+        )
+        .unwrap()
+        .expect("the committed store recovers")
+        .recovered
+        .snapshot;
+        assert!(
+            eager.changes.is_decoded(),
+            "the control: the eager entry point decodes"
+        );
+
+        let reopened = reopen(&directory);
+        let lease = reopened.read_authority();
+        assert!(!lease.snapshot().changes.is_decoded());
+        let decodes_before = decoded_on_this_thread();
+        assert_eq!(lease.snapshot().changes, eager.changes);
+        assert!(lease.snapshot().changes.is_decoded());
+        assert_eq!(decoded_on_this_thread(), decodes_before + 1);
+        // A second read costs nothing further.
+        assert_eq!(lease.snapshot().changes.len(), 1);
+        assert_eq!(decoded_on_this_thread(), decodes_before + 1);
+    }
+
+    #[test]
+    fn an_open_without_a_verified_record_decodes_eagerly_and_validates_in_full() {
+        let directory = TempDir::new().unwrap();
+        drop(committed_local_repository(&directory));
+        let mut record = read_authority_json(directory.path());
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("history_validation")
+            .expect("the committed record carried a validation to remove");
+        write_authority_json(directory.path(), &record);
+
+        let reopened = reopen(&directory);
+        assert!(!reopened.opened_by_history_validation());
+        assert!(
+            reopened.read_authority().snapshot().changes.is_decoded(),
+            "with no record to trust, the open validates the whole history and holds it"
+        );
+    }
+
+    #[test]
+    fn a_lazy_change_map_outlives_the_snapshot_file_it_came_from() {
+        let directory = TempDir::new().unwrap();
+        drop(committed_local_repository(&directory));
+        let generation_one = snapshot_file(&directory, 1);
+        assert!(
+            generation_one.exists(),
+            "the control: generation one is on disk"
+        );
+
+        let reopened = reopen(&directory);
+        let held = reopened.read_authority().snapshot().changes.clone();
+        assert!(!held.is_decoded(), "the clone shares the encoded source");
+        let workspace_id = reopened.read_authority().metadata().workspaces[0].workspace_id;
+        // A representation rewrite persists a new generation ...
+        let outcome = reopened
+            .materialize_workspace_base_graph_section(&repository_id(), &workspace_id)
+            .unwrap()
+            .expect("the fixture workspace exists");
+        let MaterializedGraphSectionOutcome::Persisted { .. } = outcome else {
+            panic!("the first explicit materialization must persist a new generation")
+        };
+        drop(reopened);
+        // ... and the next open retires the superseded file by name.
+        let again = reopen(&directory);
+        assert!(
+            !generation_one.exists(),
+            "the control: the superseded snapshot file was retired"
+        );
+        assert!(snapshot_file(&directory, 2).exists());
+
+        // The map held from before the rewrite still reads, through the handle
+        // the open kept, and reads the same history the new generation carries.
+        let decoded = held
+            .decoded()
+            .expect("a retired file stays readable through its handle");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(*decoded, *again.read_authority().snapshot().changes);
+    }
+
+    #[test]
+    fn a_snapshot_file_changed_underneath_an_open_refuses_at_the_first_history_read() {
+        let directory = TempDir::new().unwrap();
+        drop(committed_local_repository(&directory));
+        let reopened = reopen(&directory);
+        let lease = reopened.read_authority();
+        assert!(!lease.snapshot().changes.is_decoded());
+
+        let path = snapshot_file(&directory, 1);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[40] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = lease
+            .snapshot()
+            .changes
+            .decoded()
+            .expect_err("bytes that changed since the open refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("could not be decoded on first use"),
+            "{error}"
+        );
+        assert!(!lease.snapshot().changes.is_decoded());
+    }
+
+    #[test]
+    fn the_history_sweep_collects_what_the_two_walks_it_replaces_collect() {
+        let blob = b"fn main() {}\n";
+        let change = {
+            let mut change = kin_model::SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                origin: ChangeOrigin::GitCommit {
+                    oid: GitObjectId::sha1([7; 20]),
+                },
+                parents: Vec::new(),
+                timestamp: Timestamp(
+                    chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+                author: AuthorId::new("sweep"),
+                message: "a blob and a gitlink".to_string(),
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![
+                    TreeDelta::Added {
+                        artifact_id: ArtifactId(Uuid::from_u128(31)),
+                        new: LocatedEntry::new(
+                            RepoPath::from_bytes(b"src/main.rs".to_vec()).unwrap(),
+                            TreeEntry::blob(digest(blob), false),
+                        ),
+                    },
+                    TreeDelta::Added {
+                        artifact_id: ArtifactId(Uuid::from_u128(32)),
+                        new: LocatedEntry::new(
+                            RepoPath::from_bytes(b"vendor/dep".to_vec()).unwrap(),
+                            TreeEntry::Gitlink {
+                                target: GitObjectId::sha1([9; 20]),
+                            },
+                        ),
+                    },
+                ],
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+                projected_files: Vec::new(),
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+            };
+            change.id = compute_semantic_change_id(&change).unwrap();
+            change
+        };
+
+        let mut sweep = HistorySweep::default();
+        sweep.visit(&change).unwrap();
+        assert_eq!(sweep.changes_seen, 1);
+
+        let mut eager_bodies = BTreeMap::new();
+        collect_tree_delta_body_requirements(
+            &mut eager_bodies,
+            &change.tree_deltas,
+            &format!("change {}", change.id),
+        )
+        .unwrap();
+        assert!(
+            !eager_bodies.is_empty(),
+            "the control: the blob is a body requirement"
+        );
+        assert_eq!(sweep.body_requirements, eager_bodies);
+
+        let mut eager_gitlinks = BTreeSet::new();
+        extend_authenticated_gitlinks(&mut eager_gitlinks, std::iter::once(&change));
+        assert!(
+            !eager_gitlinks.is_empty(),
+            "the control: the Git-origin change carries a Gitlink"
+        );
+        assert_eq!(sweep.authenticated_gitlinks, eager_gitlinks);
+    }
 }
 
 /// FIR-2334 attribution harness.
@@ -22020,5 +22420,111 @@ mod native_admission_lineage {
             elapsed.as_millis(),
             elapsed.as_micros() / REALISTIC_FILES as u128
         );
+    }
+}
+
+/// FIR-3064 open-cost harness.
+///
+/// Opens a real on-disk repository authority and reports the resident set
+/// after each step a daemon startup takes, so the cost of an open can be read
+/// as memory rather than inferred from a stopwatch. Ignored by default and
+/// needs `KIN_FIR3064_STORE` naming a `kindb` directory, so the default suite
+/// never opens a multi-gigabyte store.
+#[cfg(test)]
+mod fir3064_open_cost {
+    use super::*;
+
+    /// Resident set of this process in KiB, read from `ps` so the number is
+    /// the one an operator reads, not an allocator's own accounting.
+    fn resident_kb() -> i64 {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps runs");
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("ps prints the resident set as a number")
+    }
+
+    fn report(label: &str, started: std::time::Instant, previous_kb: i64) -> i64 {
+        let now_kb = resident_kb();
+        println!(
+            "[TERM] {label}_ms={} rss_kb={now_kb} delta_kb={}",
+            started.elapsed().as_millis(),
+            now_kb - previous_kb
+        );
+        now_kb
+    }
+
+    #[test]
+    #[ignore = "needs KIN_FIR3064_STORE naming a real kindb directory"]
+    fn measure_what_an_open_retains() {
+        let store = std::env::var("KIN_FIR3064_STORE")
+            .expect("set KIN_FIR3064_STORE to a <repo>/.kin/kindb directory");
+        let repo = std::env::var("KIN_FIR3064_REPO")
+            .expect("set KIN_FIR3064_REPO to the repository id under that directory");
+        let repository_id = RepositoryId::new(&repo).expect("repository id");
+        let backend = Arc::new(crate::storage::backend::LocalFileBackend::new(&store));
+        let baseline_kb = resident_kb();
+        println!("[TERM] baseline rss_kb={baseline_kb}");
+
+        let started = std::time::Instant::now();
+        let manager = RepositoryAuthorityManager::open(repository_id, backend)
+            .expect("open repository authority");
+        let after_open_kb = report("authority_open", started, baseline_kb);
+        println!(
+            "[open] by_history_validation={}",
+            manager.opened_by_history_validation()
+        );
+
+        let lease = manager.read_authority();
+        let snapshot = lease.snapshot();
+        let started = std::time::Instant::now();
+        println!(
+            "[store] changes={} entities={} relations={} entity_revisions={} section_present={} change_map_decoded={}",
+            snapshot.changes.len(),
+            snapshot.entities.len(),
+            snapshot.relations.len(),
+            snapshot.entity_revisions.len(),
+            snapshot.materialized_graph.is_some(),
+            snapshot.changes.is_decoded()
+        );
+        let after_len_kb = report("changes_len", started, after_open_kb);
+
+        let Some(workspace) = lease.metadata().workspaces.first().cloned() else {
+            println!("[TERM] no workspace on this authority");
+            return;
+        };
+        let started = std::time::Instant::now();
+        let workspace_snapshot = lease
+            .workspace_graph_snapshot(&workspace.workspace_id)
+            .expect("materialize the workspace graph")
+            .expect("the workspace exists");
+        let after_workspace_kb = report("workspace_graph_snapshot", started, after_len_kb);
+        println!(
+            "[workspace] changes={} entities={} relations={} entity_revisions={} change_map_decoded={} authority_change_map_decoded={}",
+            workspace_snapshot.changes.len(),
+            workspace_snapshot.entities.len(),
+            workspace_snapshot.relations.len(),
+            workspace_snapshot.entity_revisions.len(),
+            workspace_snapshot.changes.is_decoded(),
+            snapshot.changes.is_decoded(),
+        );
+
+        let started = std::time::Instant::now();
+        let graph = InMemoryGraph::from_snapshot_without_text_index(workspace_snapshot)
+            .expect("build the served graph");
+        let after_graph_kb = report("in_memory_graph_build", started, after_workspace_kb);
+        println!(
+            "[graph] authority_change_map_decoded={}",
+            snapshot.changes.is_decoded()
+        );
+
+        let started = std::time::Instant::now();
+        drop(graph);
+        drop(lease);
+        drop(manager);
+        report("after_drop", started, after_graph_kb);
     }
 }
