@@ -220,6 +220,8 @@ kin trace <entity> [options]
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--file <file>` |  | Exact repo-relative file qualifier for stable identity resolution |
+| `--kind <kind>` |  | Exact entity-kind qualifier (for example: function or method) |
 | `--json` |  | Output machine-readable JSON for editor integrations |
 | `--compact` |  | Render a smaller, cheaper trace tuned for assistant workflows |
 | `--show-body` |  | Compatibility no-op: trace already shows the focal body by default |
@@ -229,6 +231,28 @@ kin trace <entity> [options]
 | `--max-lines <max-lines>` | `40` | Max lines to print for any single source snippet |
 | `--nearby <nearby>` | `4` | Max nearby entries to print |
 | `--transitive <transitive>` | `2` | Max transitive entries to print |
+
+The argument takes either form. An entity id, exactly as `kin search --json` prints it, names one
+entity and needs no qualifier. A name may reach several: a C function declared in a header and
+defined in a source file is two entities under one name, and so is an overload set.
+
+When a name reaches several and nothing pins one, `kin trace` prefers the definition over the
+declaration, then the earlier file path, then the earlier line, then the id. Every one of those is
+read off the entity record, so the same tree answers the same way in every store built from it.
+The trace then says which entity it chose and names the others, so you can pin one:
+
+```
+kin trace buffer_grow --file src/buffer.h --kind function
+```
+
+`--file` takes the repo-relative path the answer prints and `--kind` the lowercase kind, the same
+spellings `kin impact` takes.
+
+A query that resolves to no entity exits non-zero and puts the message on stderr, leaving stdout
+empty. That holds for the name form, for an id this repository's graph does not hold, and for a
+qualifier that excludes every match, which reports what the name alone does reach rather than
+claiming the entity is absent. `kin context`, `kin refs`, `kin xref` and `kin impact` refuse the
+same way.
 
 ### `kin impact`
 

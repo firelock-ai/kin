@@ -74,6 +74,12 @@ pub struct RefsResponse {
     /// the CLI and the MCP tool cannot disagree about one store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negative: Option<serde_json::Value>,
+    /// Set when the query resolved to no entity. Without it a caller reading the
+    /// exit code takes the guidance for an answer, which for `kin refs` is an
+    /// empty reference list: the exact shape a "safe to delete?" sweep acts on
+    /// (FIR-3071). The same text stays in `lines` for an older client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +118,10 @@ pub async fn run(entity: String, kind: String) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "refs").await?;
     let response = run_daemon_refs(&layout, &RefsRequest { entity, kind }).await?;
+    // Refuse before printing, so a miss leaves stdout empty.
+    if let Some(error) = response.error {
+        anyhow::bail!(error);
+    }
     for line in response.lines {
         println!("{}", crate::output_style::paint_refs_line(&line));
     }
@@ -199,8 +209,10 @@ pub fn build_refs_response(
         // Not an absence claim about references: the focal never resolved, so
         // nothing was walked and there is no coverage question to answer. A
         // verdict here would qualify a lookup failure as if it were a finding.
+        let lines = refs_not_found_guidance(&request.entity);
         return Ok(RefsResponse {
-            lines: refs_not_found_guidance(&request.entity),
+            error: Some(lines.join("\n")),
+            lines,
             negative: None,
         });
     };
@@ -238,7 +250,11 @@ pub fn build_refs_response(
         ));
         let neighbors = declaration_neighbors::collect(graph, target, &relation_kinds)?;
         lines.extend(empty_result_context(target, &neighbors));
-        return Ok(RefsResponse { lines, negative });
+        return Ok(RefsResponse {
+            lines,
+            negative,
+            error: None,
+        });
     }
 
     // FIR-1552. A receiver-method call the linker matched on the bare leaf name
@@ -324,6 +340,7 @@ pub fn build_refs_response(
     Ok(RefsResponse {
         lines,
         negative: None,
+        error: None,
     })
 }
 
@@ -1024,6 +1041,62 @@ mod tests {
         parse_relation_kinds, refs_not_found_guidance, BulkRefsRequest, BulkRefsResponse,
         ReferenceLinesAbsent, RefsRequest, RelationResolution,
     };
+
+    /// A miss has to be readable as a miss by a caller that only checks the exit
+    /// code. For `kin refs` the guidance reads as an empty reference list, which
+    /// is the shape a "safe to delete?" sweep acts on, so the discriminator
+    /// beside the prose is what makes the command refuse (FIR-3071).
+    #[test]
+    fn refs_miss_carries_the_discriminator_and_not_just_the_prose() {
+        let (graph, layout, _dir) = orphan_fixture();
+        let healthy = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 1,
+        }));
+
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "definitelyMissingEntity".to_string(),
+                kind: "all".to_string(),
+            },
+            &healthy,
+        )
+        .expect("refs response");
+
+        let joined = response.lines.join("\n");
+        assert!(joined.contains("not found"), "{joined}");
+        assert_eq!(response.error.as_deref(), Some(joined.as_str()));
+    }
+
+    /// The other side of the same rule: a resolved answer must not carry the
+    /// discriminator, or every `kin refs` would refuse.
+    #[test]
+    fn a_resolved_refs_answer_carries_no_error_discriminator() {
+        let (graph, layout, _dir) = orphan_fixture();
+        let healthy = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 1,
+        }));
+
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "orphan".to_string(),
+                kind: "all".to_string(),
+            },
+            &healthy,
+        )
+        .expect("refs response");
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+    }
 
     /// THE SPINE (FIR-2524 rung three). A degraded daemon must make `kin refs`
     /// inherit the MCP verdict for that degradation.

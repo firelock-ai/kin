@@ -243,6 +243,12 @@ enum Command {
     Trace {
         /// Entity name or ID
         entity: String,
+        /// Exact repo-relative file qualifier for stable identity resolution
+        #[arg(long)]
+        file: Option<String>,
+        /// Exact entity-kind qualifier (for example: function or method)
+        #[arg(long)]
+        kind: Option<String>,
         /// Output machine-readable JSON for editor integrations
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -2818,6 +2824,8 @@ fn run() -> Result<()> {
                 } => commands::contextbench_locate::run(task_file, json, debug).await,
                 Command::Trace {
                     entity,
+                    file,
+                    kind,
                     json,
                     compact,
                     show_body: _,
@@ -2837,6 +2845,8 @@ fn run() -> Result<()> {
                             max_lines,
                             limit.unwrap_or(nearby),
                             transitive,
+                            file,
+                            kind,
                         )
                         .await
                     } else {
@@ -2848,6 +2858,8 @@ fn run() -> Result<()> {
                             max_lines,
                             limit.unwrap_or(nearby),
                             transitive,
+                            file,
+                            kind,
                         )
                         .await
                     }
