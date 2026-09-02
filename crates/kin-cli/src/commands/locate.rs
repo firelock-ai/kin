@@ -639,12 +639,144 @@ pub fn query_names_entity(query: &str, name: &str) -> bool {
         return false;
     }
     let target = name.to_ascii_lowercase();
-    let last = qualified_name_tail(&target).to_string();
+    let last = qualified_name_tail(&target);
+    query_tokens(query).any(|token| {
+        let lowered = token.to_ascii_lowercase();
+        lowered == target || lowered == last
+    })
+}
+
+/// The query tokenizer, defined once.
+///
+/// [`query_names_entity`] and the query-shape rules below have to split a query
+/// identically, or a token can name a symbol under one rule and not exist under
+/// the other. Tokens come back in their ORIGINAL case, because case is the
+/// signal [`is_symbolic_search_term`] reads; a caller matching against a name
+/// lowercases per token.
+fn query_tokens(query: &str) -> impl Iterator<Item = &str> {
     query
-        .to_ascii_lowercase()
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|token| !token.is_empty())
-        .any(|token| token == target || token == last)
+}
+
+/// A prose query carries at least this many tokens.
+///
+/// Three is the longest symbol path [`query_tokens`] routinely produces
+/// (`crate::Type::method`), so the floor sits one above it. Below the floor the
+/// tier is left exactly as it shipped, which is the conservative direction:
+/// this rule can only ever DEMOTE, and a short query a human meant as a lookup
+/// has to keep the guarantee the tier was built for.
+const LOCATE_PROSE_MIN_TOKENS: usize = 4;
+
+/// A prose query carries at least this many stopwords.
+///
+/// Two rather than one, because a symbol path can carry one by accident
+/// (`http.parse_request.to.string` tokenizes with `to`) while an English
+/// question essentially never carries fewer than two.
+const LOCATE_PROSE_MIN_STOPWORDS: usize = 2;
+
+/// Whether this query reads as a SENTENCE rather than a symbol lookup.
+///
+/// The distinction the exact-name tier never drew. `walk` typed alone is a
+/// request for the symbol `walk`; "Walk me through the path" is not, and the
+/// tier cannot tell them apart because all it ever sees is that some token
+/// equalled some name.
+///
+/// Two signals, both required, both chosen so the rule fires only on an
+/// unmistakable sentence: enough tokens to BE a sentence
+/// ([`LOCATE_PROSE_MIN_TOKENS`]) and enough English connectives that the string
+/// carries grammar ([`LOCATE_PROSE_MIN_STOPWORDS`]). Erring toward "lookup"
+/// preserves shipped behavior; erring toward "prose" would move rankings this
+/// rule was never meant to touch.
+///
+/// Reads [`ENGLISH_STOPWORDS`] rather than growing a second vocabulary. That
+/// list is already defined here as the words that "carry no code-identifier
+/// meaning", which is exactly the property this needs, and it is closed-class
+/// almost throughout: an open-class list would be useless here, because
+/// open-class words are precisely what symbols get named after (`send`,
+/// `socket`, `component`, `walk`). Sharing it does couple this rule to that
+/// list, so `the_prose_shape_rule_reads_the_queries_it_was_written_for` pins
+/// the verdict on named queries rather than on a count.
+pub fn query_is_prose(query: &str) -> bool {
+    let mut tokens = 0usize;
+    let mut stopwords = 0usize;
+    for token in query_tokens(query) {
+        tokens += 1;
+        if is_english_stopword(&token.to_ascii_lowercase()) {
+            stopwords += 1;
+        }
+    }
+    tokens >= LOCATE_PROSE_MIN_TOKENS && stopwords >= LOCATE_PROSE_MIN_STOPWORDS
+}
+
+/// Whether a query token that NAMES this entity is itself symbol-shaped.
+///
+/// The refinement of [`query_names_entity`] the prose rule needs: not "did some
+/// token name it" but "did a token that LOOKS LIKE A SYMBOL name it".
+/// [`is_symbolic_search_term`] reads the original-case token, so
+/// `redisReaderGetReply` and `Cross_Encoder_Model_Cached` are symbolic while
+/// `send`, `socket`, `component` and `walk` are not.
+///
+/// Strictly stronger than [`query_names_entity`]: every pair this accepts, that
+/// one accepts too. `the_symbolic_name_rule_never_claims_a_name_the_base_rule_denies`
+/// pins that, because two predicates reading one tokenizer are two things that
+/// can drift apart.
+fn query_names_entity_symbolically(query: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let target = name.to_ascii_lowercase();
+    let tail = qualified_name_tail(&target);
+    query_tokens(query).any(|token| {
+        let lowered = token.to_ascii_lowercase();
+        (lowered == target || lowered == tail) && is_symbolic_search_term(token)
+    })
+}
+
+/// Whether this entity's name match rests on nothing but a plain English word
+/// inside a sentence.
+///
+/// FIR-3079. Measured on a fully embedded hiredis store (730 entities, 1,485 of
+/// 1,485 indexed), "when I send a command, how does it reach the socket" ranked
+/// the Win32 compatibility macro `send` (sockcompat.h:90, score 180.0) first and
+/// `socket` (sockcompat.h:82, score 165.0) second, ahead of `redisFormatCommand`
+/// (hiredis.c:572) at score 300.0. A longer question about reply parsing put
+/// `socket` at score 55.0 above a row scoring 902.1. The tier is unbeatable by
+/// design, so a 16x score deficit still won, and the query never asked for
+/// either macro.
+///
+/// Only ever demotes, and only when BOTH halves hold: the query is a sentence,
+/// and no symbol-shaped token in it named this entity. A prose question that
+/// does name a real symbol ("how does redisReaderGetReply handle a partial
+/// reply") keeps its name tier, and every lookup keeps it unconditionally,
+/// which is the case the tier was built for and the one that must not regress.
+///
+/// It cannot separate "the walk function" from "walk me through", and does not
+/// try. It resolves that ambiguity toward the prose reading, because prose is
+/// what the caller typed and prose is the reading that was broken.
+///
+/// This is an ORDERING judgment and it changes no reported fact.
+/// [`classify_locate_match`] still calls the hit a name match, because the query
+/// still contained the name, and `match_evidence.name_match` and the cosine
+/// arm's own classifier keep agreeing with it. Public because
+/// `all_fallback` applies the same judgment at its own predicates, and one
+/// definition of "prose collision" is the point.
+///
+/// Split from [`name_match_is_prose_word_collision`] so the rule is testable
+/// without touching process environment: the tests pin THIS, and the wrapper
+/// adds only the kill switch.
+pub fn is_prose_word_collision(query: &str, name: &str) -> bool {
+    query_is_prose(query) && !query_names_entity_symbolically(query, name)
+}
+
+/// [`is_prose_word_collision`] under the kill switch.
+///
+/// `KIN_LOCATE_PROSE_NAME_DEMOTION=0` restores shipped ordering exactly, so one
+/// binary can run both arms of a ranking benchmark. The knob exists because a
+/// tier change moves every ranked result, and an A/B that has to compare two
+/// builds cannot tell a ranking change from a build difference.
+pub fn name_match_is_prose_word_collision(query: &str, name: &str) -> bool {
+    locate_env_bool("KIN_LOCATE_PROSE_NAME_DEMOTION", true) && is_prose_word_collision(query, name)
 }
 
 /// Classify one located entity against the query.
@@ -655,6 +787,21 @@ pub fn query_names_entity(query: &str, name: &str) -> bool {
 /// `--explain`) reports `TextFallback`: the honest reading of "no name matched
 /// and this surface cannot say which pool answered" is the weaker claim, not the
 /// stronger one.
+///
+/// Deliberately unchanged by FIR-3079, and the reason is on the record. This
+/// answers a FACT, "did a query token equal this entity's name", and three
+/// other producers are documented as unable to disagree with it: the cosine
+/// arm's own `cosine_match_kind`, the `match_evidence.name_match` that rides
+/// beside it, and `semloc_query_has_exact_token`, which delegates here through
+/// [`query_names_entity`] precisely so one rule decides. Demoting here would
+/// make the fused arm report `text_fallback` while the cosine arm still
+/// reported `name` for the identical hit, putting a row in contradiction with
+/// its own evidence object.
+///
+/// The prose-collision judgment therefore lives in the ORDERING, in
+/// [`locate_exact_name_tier`], where a ranking decision belongs. The row still
+/// says the query contained its name, and it simply stops being unbeatable on
+/// that basis alone. See [`name_match_is_prose_word_collision`].
 fn classify_locate_match(
     query: &str,
     name: &str,
@@ -685,9 +832,22 @@ fn classify_locate_match(
 /// named. No score cap fixes that without flattening honest fallback ordering
 /// on queries that name nothing; a tier fixes it at every corpus scale and
 /// leaves scores meaningful within each tier.
-fn locate_exact_name_tier(entity: &LocateEntity) -> u8 {
+/// FIR-3079 gates the tier here, and ONLY here. A name hit whose name is a
+/// plain English word inside a sentence keeps `match_kind: name`, because the
+/// query did literally contain it, and simply loses the promotion, so it sorts
+/// on score beside everything else. Measured on a fully embedded hiredis store,
+/// that is what lets `redisFormatCommand` at score 300.0 outrank the Win32
+/// macro `send` at 180.0, and a row at 902.1 outrank the macro `socket` at
+/// 55.0, for questions that asked for neither macro.
+///
+/// The query is a parameter because the tier is a fact about a PAIR, the hit
+/// and the question, and it never was one about the hit alone. Callers that
+/// rank one query's results pass that query; the fused arm asks per variant.
+fn locate_exact_name_tier(entity: &LocateEntity, query: &str) -> u8 {
     match entity.match_kind {
-        Some(LocateMatchKind::Name) => 1,
+        Some(LocateMatchKind::Name) if !name_match_is_prose_word_collision(query, &entity.name) => {
+            1
+        }
         _ => 0,
     }
 }
@@ -17466,13 +17626,13 @@ fn entity_surface_class(name: &str, kind: &str) -> Option<&'static str> {
 /// A knob outside `[0, 1)` is a no-op rather than an amplifier: this function's
 /// job is to demote, and a value above one would silently promote every private
 /// name in the store.
-fn apply_entity_surface_penalty(ranked: &mut [(usize, LocateEntity)]) {
+fn apply_entity_surface_penalty(ranked: &mut [(usize, LocateEntity)], query: &str) {
     let penalty = locate_env_f32("KIN_LOCATE_ENTITY_SURFACE_PENALTY", 0.3);
     if !(0.0..1.0).contains(&penalty) {
         return;
     }
     for (_, entity) in ranked.iter_mut() {
-        if locate_exact_name_tier(entity) > 0 {
+        if locate_exact_name_tier(entity, query) > 0 {
             continue;
         }
         if entity_surface_class(&entity.name, &entity.kind).is_some() {
@@ -17520,12 +17680,13 @@ fn entity_projection_role_penalty(path: &str, test_query: bool) -> f32 {
 /// disagree with it.
 fn order_locate_entities(
     ranked: &mut [(usize, LocateEntity)],
+    query: &str,
     owner_mass_of: impl Fn(&LocateEntity) -> usize,
 ) {
     ranked.sort_by(|(a_rank, a), (b_rank, b)| {
         b.definition
             .cmp(&a.definition)
-            .then_with(|| locate_exact_name_tier(b).cmp(&locate_exact_name_tier(a)))
+            .then_with(|| locate_exact_name_tier(b, query).cmp(&locate_exact_name_tier(a, query)))
             .then_with(|| {
                 b.score
                     .partial_cmp(&a.score)
@@ -17670,14 +17831,14 @@ pub fn build_entity_view(
 
     // Surface penalty before the ordering, because it moves the composite score
     // the ordering then reads ([`apply_entity_surface_penalty`]).
-    apply_entity_surface_penalty(&mut ranked);
+    apply_entity_surface_penalty(&mut ranked, query);
     let owner_mass_of = |entity: &LocateEntity| {
         name_owner_mass
             .get(entity.identity_key())
             .copied()
             .unwrap_or(0)
     };
-    order_locate_entities(&mut ranked, owner_mass_of);
+    order_locate_entities(&mut ranked, query, owner_mass_of);
 
     result.entities = ranked.into_iter().map(|(_, entity)| entity).collect();
 
@@ -18005,9 +18166,33 @@ pub fn fuse_locate_results(
             .filter_map(|candidate| candidate.match_kind)
             .max_by_key(|kind| locate_match_kind_strength(*kind));
     }
+    // The fused tier asks the FIR-3079 question per variant, not once over the
+    // joined text. Match kind above is the strongest kind any variant reported,
+    // so the tier has to be the strongest tier any variant would grant: a hit
+    // keeps the promotion when at least one variant that surfaced it named it
+    // outside a sentence, or named it with a symbol-shaped token. Asking the
+    // joined text instead would let one prose variant demote a hit an explicit
+    // symbol variant asked for by name.
+    let fused_tier: FxHashMap<String, u8> = fused_entities
+        .iter()
+        .map(|(entity, lists, _)| {
+            let tier = lists
+                .iter()
+                .map(|&list| locate_exact_name_tier(entity, &variants[list]))
+                .max()
+                .unwrap_or(0);
+            (entity.identity_key().to_string(), tier)
+        })
+        .collect();
+    let tier_of = |entity: &LocateEntity| -> u8 {
+        fused_tier
+            .get(entity.identity_key())
+            .copied()
+            .unwrap_or_else(|| locate_exact_name_tier(entity, ""))
+    };
     fused_entities.sort_by(|(a, _, sa), (b, _, sb)| {
-        locate_exact_name_tier(b)
-            .cmp(&locate_exact_name_tier(a))
+        tier_of(b)
+            .cmp(&tier_of(a))
             .then_with(|| sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| locate_entity_tiebreak_path(a).cmp(locate_entity_tiebreak_path(b)))
             .then_with(|| a.identity_key().cmp(b.identity_key()))
@@ -18735,8 +18920,8 @@ mod tests {
             .enumerate()
             .map(|(rank, (name, kind, score))| (rank, surface_hit(name, kind, *score, query)))
             .collect();
-        apply_entity_surface_penalty(&mut ranked);
-        order_locate_entities(&mut ranked, |_| 0);
+        apply_entity_surface_penalty(&mut ranked, query);
+        order_locate_entities(&mut ranked, query, |_| 0);
         ranked.into_iter().map(|(_, entity)| entity).collect()
     }
 
@@ -20714,6 +20899,363 @@ mod tests {
         assert!(!query_names_entity("encoder", "cross_encoder_model_cached"));
         assert!(!query_names_entity("", "anything"));
         assert!(!query_names_entity("anything", ""));
+    }
+
+    /// The FIR-3079 rows, and the fact this fix deliberately does NOT touch.
+    ///
+    /// Every pair here was measured on a fully embedded hiredis store (730
+    /// entities, 1,485 of 1,485 indexed). The sentence "when I send a command,
+    /// how does it reach the socket" ranked the Win32 compatibility macro
+    /// `send` (sockcompat.h:90) first at score 180.0 and `socket`
+    /// (sockcompat.h:82) second at 165.0, ahead of `redisFormatCommand`
+    /// (hiredis.c:572) at 300.0. A longer reply-parsing question put `socket`
+    /// at 55.0 above a row at 902.1, a 16x deficit winning on tier alone.
+    ///
+    /// The query DID contain the word, so `match_kind` still says `name` and
+    /// this test asserts that it does. Three other producers are documented as
+    /// unable to disagree with that field (`cosine_match_kind`,
+    /// `match_evidence.name_match`, and `semloc_query_has_exact_token`, which
+    /// delegates to [`query_names_entity`]), so demoting the FACT would put a
+    /// fused row in contradiction with its own evidence object. Only the
+    /// ordering changes.
+    #[test]
+    fn a_prose_sentence_does_not_let_an_english_word_win_the_name_tier() {
+        for (query, name) in [
+            (
+                "when I send a command, how does it reach the socket",
+                "send",
+            ),
+            (
+                "when I send a command, how does it reach the socket",
+                "socket",
+            ),
+            (
+                "When a reply comes back from the Redis server, how does hiredis turn the bytes \
+                 on the socket into the reply object my code gets, and what happens along the \
+                 way if the reply is only half there?",
+                "socket",
+            ),
+            (
+                "What happens between a component asking for an update and that update appearing \
+                 on screen? Walk me through the path.",
+                "Resolved.component",
+            ),
+            (
+                "What happens between a component asking for an update and that update appearing \
+                 on screen? Walk me through the path.",
+                "Component",
+            ),
+            (
+                "When I type a character in the editor, how does it end up in the document? Walk \
+                 me through the path.",
+                "TextmateSnippet.walk",
+            ),
+            // The same VS Code question against a Rust store. Measured on a
+            // ripgrep store, that one sentence collides on TWO ordinary words
+            // and fills the entire top six with tier-1 hits, none of them an
+            // answer: `Walk` (crates/ignore/src/walk.rs:1117, 461.3) and `walk`
+            // (crates/ignore/src/lib.rs:64, 456.1) from "Walk me through", then
+            // `End` (crates/printer/src/jsont.rs:65, 455.3),
+            // `PreludeWriter::end` (crates/printer/src/standard.rs:1647, 455.0)
+            // and `Match::end` (crates/matcher/src/lib.rs:100, 450.0) from "end
+            // up in the document". `end` is an open-class word, which is why
+            // the rule keys on the SHAPE OF THE QUERY and the shape of the
+            // matching token, never on a list of colliding words.
+            (
+                "When I type a character in the editor, how does it end up in the document? Walk \
+                 me through the path.",
+                "Walk",
+            ),
+            (
+                "When I type a character in the editor, how does it end up in the document? Walk \
+                 me through the path.",
+                "Match::end",
+            ),
+            (
+                "When I type a character in the editor, how does it end up in the document? Walk \
+                 me through the path.",
+                "End",
+            ),
+        ] {
+            // The precondition: the shipped predicate DOES call this a name.
+            // Without it this test would pass on a query that never collided,
+            // which is exactly the error it caught on its first run.
+            assert!(
+                query_names_entity(query, name),
+                "control precondition: {name} is a shipped name hit for this query"
+            );
+            // The FACT is preserved, on purpose.
+            assert_eq!(
+                classify_locate_match(query, name, "", None),
+                LocateMatchKind::Name,
+                "the query did contain {name}, and match_kind reports facts"
+            );
+            // The RANKING judgment is what changed.
+            let mut entity = mk_locate_entity(name, 1.0, true);
+            entity.match_kind = Some(LocateMatchKind::Name);
+            assert_eq!(
+                locate_exact_name_tier(&entity, query),
+                0,
+                "{name} is an English word in a sentence, so it ranks on score"
+            );
+            assert!(name_match_is_prose_word_collision(query, name));
+        }
+    }
+
+    /// FIR-3079's other half, which must not regress: a LOOKUP keeps its
+    /// exact-name tier, whatever English word it is spelled with.
+    ///
+    /// The measurement says the tier is load-bearing on the same store.
+    /// `redisReaderGetReply` typed alone scores 450.0 and must outrank
+    /// `redisGetReplyFromReader` at 652.007; `send` typed alone scores 180.0 and
+    /// must outrank `win32_send` at 291.2. Both are score inversions only the
+    /// tier can win, so a rule that demoted them would undo FIR-2338 to fix
+    /// FIR-3079.
+    #[test]
+    fn a_symbol_lookup_keeps_its_exact_name_tier() {
+        for (query, name) in [
+            // Single English word typed alone: still a lookup.
+            ("send", "send"),
+            ("socket", "socket"),
+            ("walk", "Walk"),
+            ("search", "search"),
+            ("Component", "Component"),
+            // Symbol-shaped lookups, bare and qualified.
+            ("redisReaderGetReply", "redisReaderGetReply"),
+            ("redisReader::redisReaderGetReply", "redisReaderGetReply"),
+            ("SearchWorker::search", "SearchWorker::search"),
+            ("Gitignore", "Gitignore"),
+            // Prose that names a REAL symbol keeps the tier, because the token
+            // that named it is symbol-shaped.
+            (
+                "When a reply comes back, how does redisReaderGetReply handle a partial reply",
+                "redisReaderGetReply",
+            ),
+            (
+                "where is Cross_Encoder_Model_Cached decided?",
+                "cross_encoder_model_cached",
+            ),
+        ] {
+            let mut entity = mk_locate_entity(name, 1.0, true);
+            entity.match_kind = Some(LocateMatchKind::Name);
+            assert_eq!(
+                locate_exact_name_tier(&entity, query),
+                1,
+                "{query:?} is a lookup for {name}, or names it symbolically"
+            );
+            assert!(!name_match_is_prose_word_collision(query, name));
+        }
+    }
+
+    /// The shape rule itself, pinned on the exact strings that motivated it.
+    ///
+    /// Separated from the ordering tests because the thresholds are the
+    /// arguable part: a change to either constant shows up here as a specific
+    /// query changing sides rather than as a ranking that quietly moved.
+    #[test]
+    fn the_prose_shape_rule_reads_the_queries_it_was_written_for() {
+        for query in [
+            "when I send a command, how does it reach the socket",
+            "What happens between a component asking for an update and that update appearing on \
+             screen? Walk me through the path.",
+            "When ripgrep looks through a single file, what happens from reading the bytes to \
+             printing a line that matched?",
+            "where is prune_orphaned_vectors defined",
+        ] {
+            assert!(query_is_prose(query), "{query:?} is a sentence");
+        }
+        for query in [
+            "send",
+            "walk",
+            "redisReaderGetReply",
+            "redisReader::redisReaderGetReply",
+            "SearchWorker::search",
+            "call parse_request",
+            // Four tokens but only one stopword: a symbol path, not prose.
+            "http.parse_request.to.string",
+            "",
+        ] {
+            assert!(!query_is_prose(query), "{query:?} is a lookup");
+        }
+
+        // Both thresholds from both sides, so an off-by-one in either constant
+        // is visible as a named case rather than as a silently moved ranking.
+        // Token floor: three stopwords still lose to a three-token query.
+        assert!(!query_is_prose("is it the"), "3 tokens is under the floor");
+        assert!(
+            query_is_prose("is it the walk"),
+            "4 tokens clears the floor"
+        );
+        // Stopword floor: four tokens with one stopword is a symbol path.
+        assert!(
+            !query_is_prose("walk the parse_request handler"),
+            "1 stopword is under the floor"
+        );
+        assert!(
+            query_is_prose("walk the parse_request in handler"),
+            "2 stopwords clears the floor"
+        );
+    }
+
+    /// The drift guard. [`query_names_entity_symbolically`] is a REFINEMENT of
+    /// [`query_names_entity`], so it must never accept a pair the base rule
+    /// rejects; if it did, a demotion decision would rest on a name match the
+    /// rest of locate does not believe in.
+    ///
+    /// The two read one tokenizer ([`query_tokens`]) precisely so they cannot
+    /// disagree, and this is what would notice if someone split them again.
+    #[test]
+    fn the_symbolic_name_rule_never_claims_a_name_the_base_rule_denies() {
+        let mut symbolic_hits = 0usize;
+        for query in [
+            "send",
+            "when I send a command, how does it reach the socket",
+            "redisReaderGetReply",
+            "redisReader::redisReaderGetReply",
+            "how does redisReaderGetReply handle a partial reply from the server",
+            "InMemoryGraph::prune_orphaned_vectors",
+            "where is Cross_Encoder_Model_Cached decided?",
+            "Walk me through it",
+            "",
+            "unrelated words entirely",
+        ] {
+            for name in [
+                "send",
+                "socket",
+                "Walk",
+                "redisReaderGetReply",
+                "InMemoryGraph::prune_orphaned_vectors",
+                "cross_encoder_model_cached",
+                "http.parse_request",
+                "",
+            ] {
+                if query_names_entity_symbolically(query, name) {
+                    symbolic_hits += 1;
+                    assert!(
+                        query_names_entity(query, name),
+                        "{query:?} names {name:?} symbolically but not at all"
+                    );
+                }
+            }
+        }
+        // The positive control: without it every rejection would satisfy the
+        // implication and this test could not fail.
+        assert!(
+            symbolic_hits >= 4,
+            "the table must exercise the symbolic path, got {symbolic_hits} hits"
+        );
+    }
+
+    /// The ordering consequence, measured: demoting the collision hands rank
+    /// one to the higher-scoring row the tier was burying.
+    ///
+    /// On hiredis the sentence "when I send a command, how does it reach the
+    /// socket" ranked `send` at 180.0 above `redisFormatCommand` at 300.0. Once
+    /// `send` does not take the tier, both rows sit in it together and score
+    /// decides, which is the whole ask.
+    #[test]
+    fn demoting_the_collision_hands_rank_one_back_to_the_higher_score() {
+        let ranked = |query: &str| {
+            let mut entities: Vec<(usize, LocateEntity)> =
+                [("send", 180.0f32), ("redisFormatCommand", 300.0)]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, (name, score))| {
+                        let mut entity = mk_locate_entity(name, score, true);
+                        entity.match_kind = Some(classify_locate_match(query, name, "", None));
+                        (rank, entity)
+                    })
+                    .collect();
+            order_locate_entities(&mut entities, query, |_| 0);
+            entities
+                .into_iter()
+                .map(|(_, entity)| entity)
+                .collect::<Vec<_>>()
+        };
+        let prose = ranked("when I send a command, how does it reach the socket");
+        assert_eq!(
+            prose[0].name, "redisFormatCommand",
+            "score decides once the English-word collision leaves the name tier"
+        );
+        // The fact survives the demotion, which is the invariant the other lane
+        // and both all_fallback predicates depend on.
+        let demoted = prose.iter().find(|e| e.name == "send").unwrap();
+        assert_eq!(
+            demoted.match_kind,
+            Some(LocateMatchKind::Name),
+            "the row still reports that the query contained its name"
+        );
+        // The control that lets this fail: type the macro's name as a lookup
+        // and the shipped tier must still hand it rank one over the 300.0 row.
+        // FIR-2338 built that guarantee and this fix must not undo it.
+        assert_eq!(ranked("send")[0].name, "send");
+    }
+
+    /// The fused arm asks the tier question PER VARIANT, so one prose variant
+    /// cannot demote a hit an explicit symbol variant asked for by name.
+    ///
+    /// `match_kind` on a fused row is already the strongest kind any variant
+    /// reported. The tier has to match that shape or the two halves of one row
+    /// disagree: a caller who fans out "…prose…" plus "send" asked for `send`
+    /// by name in one of their own variants, and must get it.
+    #[test]
+    fn fused_ranking_keeps_a_name_tier_any_variant_earned() {
+        let with_kind = |name: &str, score: f32| {
+            let mut entity = mk_locate_entity(name, score, true);
+            entity.match_kind = Some(LocateMatchKind::Name);
+            entity
+        };
+        let prose = "when I send a command, how does it reach the socket";
+        let fallback = |name: &str, score: f32| {
+            let mut entity = mk_locate_entity(name, score, true);
+            entity.match_kind = Some(LocateMatchKind::TextFallback);
+            entity
+        };
+        // Both cases fan out to TWO variants, because `fuse_locate_results`
+        // returns the single result untouched when there are fewer than two.
+        // A first draft used one variant and its assertion passed without the
+        // fusion code running at all; the lookup control below is what caught
+        // that, and it is why both cases here are two-variant.
+        //
+        // Below the tier the fused arm orders on RRF rank, not on entity score,
+        // so a demoted collision does not get re-sorted by score the way the
+        // per-query comparator sorts it. The fused arm's contribution is
+        // narrower than that: a demoted row can no longer be lifted OVER a row
+        // RRF ranked above it. Each variant's own ranking has already applied
+        // the tier for its own text before fusion sees it.
+        let second_prose = "how do I send a request and read the answer from the server";
+        let list = || {
+            fusion_result(vec![
+                fallback("redisFormatCommand", 300.0),
+                with_kind("send", 180.0),
+            ])
+        };
+        // Prose in every variant: `send` is a collision under both, so it holds
+        // no tier anywhere and RRF decides.
+        let all_prose = fuse_locate_results(
+            vec![prose.to_string(), second_prose.to_string()],
+            vec![list(), list()],
+            60.0,
+        );
+        assert_eq!(
+            all_prose.entities[0].name, "redisFormatCommand",
+            "a demoted collision cannot be lifted over the row RRF ranked above it"
+        );
+        // The control that proves the line above is about the TIER and not
+        // about the input order: identical lists, identical RRF, one variant
+        // swapped for a LOOKUP. `send` earns the tier in that variant and takes
+        // rank one back. Without this, a rule that demoted on the joined text,
+        // or one that demoted everything, would pass the assertion above and
+        // still be wrong.
+        let with_symbol_variant = fuse_locate_results(
+            vec![prose.to_string(), "send".to_string()],
+            vec![list(), list()],
+            60.0,
+        );
+        assert_eq!(
+            with_symbol_variant.entities[0].name, "send",
+            "a variant that named the symbol outright keeps its tier"
+        );
     }
 
     /// A method the graph stores under its owner is still named by the name it
