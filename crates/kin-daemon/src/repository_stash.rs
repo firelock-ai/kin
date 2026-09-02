@@ -277,7 +277,7 @@ fn push(
     actor: &AuthorId,
 ) -> Result<StashOutcome> {
     let lease = authority.manager.read_authority();
-    if let Some(receipt) = operation_receipt(lease.metadata().receipts.as_slice(), operation_id) {
+    if let Some(receipt) = operation_receipt(lease.metadata(), operation_id) {
         drop(lease);
         return recover(authority, receipt);
     }
@@ -710,7 +710,7 @@ fn pop(
     actor: &AuthorId,
 ) -> Result<StashOutcome> {
     let lease = authority.manager.read_authority();
-    if let Some(receipt) = operation_receipt(lease.metadata().receipts.as_slice(), operation_id) {
+    if let Some(receipt) = operation_receipt(lease.metadata(), operation_id) {
         drop(lease);
         return recover(authority, receipt);
     }
@@ -1178,14 +1178,18 @@ fn resolved_admission_policy(
         })
 }
 
+/// The whole receipt for `operation_id`.
+///
+/// Delegates to kin-core, because a persisted receipt names its operation
+/// record rather than repeating it (kin-db 0.7.89, FIR-3064) and the pairing
+/// that puts the two halves back together belongs in one place. This crate had
+/// two copies of the old lookup, in this file and in `repository_stash.rs`,
+/// which is exactly the drift a shared rule prevents.
 fn operation_receipt(
-    receipts: &[RepositoryCommitReceipt],
+    metadata: &kin_db::PersistedRepositoryAuthority,
     operation_id: OperationId,
 ) -> Option<RepositoryCommitReceipt> {
-    receipts
-        .iter()
-        .find(|receipt| receipt.operation_id == operation_id)
-        .cloned()
+    kin_core::rejoined_receipt(metadata, operation_id)
 }
 
 fn local_workspace<'a>(

@@ -151,12 +151,10 @@ fn plan_and_commit(
     // than replanned. Replanning would compare the restored head against the
     // same target, find nothing left to restore, and report a false failure for
     // an operation that succeeded.
-    if let Some(receipt) = metadata
-        .receipts
-        .iter()
-        .find(|receipt| receipt.operation_id == request.operation_id)
-        .cloned()
-    {
+    //
+    // Whole rather than as persisted: a receipt names its operation record
+    // rather than repeating it (kin-db 0.7.89, FIR-3064).
+    if let Some(receipt) = kin_core::rejoined_receipt(metadata, request.operation_id) {
         let roots = roots.clone();
         drop(lease);
         return report_already_committed(
