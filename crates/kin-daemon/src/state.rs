@@ -5994,6 +5994,12 @@ impl DaemonState {
             .rollout_spine_fence_evidence(&request.lease)
             .map_err(|error| format!("load rollout evidence before reader admission: {error}"))?;
         let _publication_gate = self.spine_refresh_gate.write().await;
+        // The hydration proof below reads every committed row back before the
+        // reader is admitted; renew first so that proof runs under a fresh
+        // window rather than whatever the last publication left.
+        control
+            .renew_rollout_before_mutation(&request.lease)
+            .map_err(|error| format!("renew rollout before reader admission: {error}"))?;
         control
             .assert_rollout_lease(&request.lease)
             .map_err(|error| format!("reassert rollout before reader admission: {error}"))?;
@@ -6056,6 +6062,9 @@ impl DaemonState {
             .rollout_spine_fence_evidence(&request.lease)
             .map_err(|error| format!("load rollout evidence before release: {error}"))?;
         let _publication_gate = self.spine_refresh_gate.write().await;
+        control
+            .renew_rollout_before_mutation(&request.lease)
+            .map_err(|error| format!("renew rollout before release proof: {error}"))?;
         control
             .assert_rollout_lease(&request.lease)
             .map_err(|error| format!("reassert rollout before release: {error}"))?;
@@ -7462,6 +7471,11 @@ impl DaemonState {
     /// and refuse the retry when that lease expired, was fenced or changed
     /// hands while the failed request was in flight. A local daemon has no
     /// publication control and nothing to defend, so its gate passes.
+    ///
+    /// Only the Firestore backend installs it, so a build without that
+    /// feature has no caller and would refuse the dead code under
+    /// `-D warnings`; the tests drive it on every feature shape.
+    #[cfg(any(feature = "firestore", test))]
     pub(crate) fn hosted_transient_retry_gate(&self) -> kin_spine::TransientRetryGate {
         let control = self.publication_control.clone();
         Arc::new(move || match control.as_ref() {
