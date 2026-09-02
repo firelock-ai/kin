@@ -534,6 +534,23 @@ pub enum LocateMatchKind {
     TextFallback,
 }
 
+impl LocateMatchKind {
+    /// The serialized token, so a surface projecting this field states the same
+    /// spelling `serde` writes rather than round-tripping through JSON to read
+    /// it back. Mirrors [`LocateIdSpace::as_str`] and
+    /// [`EmbeddingState::as_str`]. The `snake_case` rename above is what these
+    /// arms have to agree with, and `locate_compact`'s
+    /// `match_kind_tokens_match_what_serde_writes` holds them to it by comparing
+    /// every variant against its own serialization.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Semantic => "semantic",
+            Self::TextFallback => "text_fallback",
+        }
+    }
+}
+
 /// Which id space a located hit's identifier belongs to.
 ///
 /// The retrieval spine is keyed by `kin_model::RetrievalKey`, which spans four
@@ -2505,6 +2522,7 @@ pub async fn run(
     snippets: bool,
     paging: LocatePaging,
     scope: LocateScope,
+    surface: super::locate_compact::LocateSurface,
 ) -> Result<()> {
     // A cursor exists only for the structured entity surface. `kin locate
     // --next` deliberately lets the caller omit `--json`, so treating the
@@ -2538,7 +2556,7 @@ pub async fn run(
     // Persist the paging cursor so `kin locate --next` can fetch the next page
     // without the caller re-supplying the query. Best-effort; never fatal.
     super::locate_cursor::persist_locate_cursor(result.next_cursor.as_deref());
-    output_result(&result, json, explain, text);
+    output_result(&result, json, explain, text, surface);
     Ok(())
 }
 
@@ -2723,7 +2741,15 @@ pub fn run_with_graph(
     max_files_explicit: bool,
 ) -> Result<()> {
     let result = run_with_graph_capture(graph, text, explain, max_files, max_files_explicit)?;
-    output_result(&result, json, explain, text);
+    // The in-process path has no `--surface` to read, and its callers are the
+    // ones that read every field, so it keeps the full shape.
+    output_result(
+        &result,
+        json,
+        explain,
+        text,
+        super::locate_compact::LocateSurface::Full,
+    );
     Ok(())
 }
 
@@ -18175,14 +18201,31 @@ fn coverage_banner(coverage: &SemanticCoverage) -> Option<String> {
     }))
 }
 
-fn output_result(result: &LocateResult, json: bool, explain: bool, query: &str) {
-    if json {
-        println!(
+fn output_result(
+    result: &LocateResult,
+    json: bool,
+    explain: bool,
+    query: &str,
+    surface: super::locate_compact::LocateSurface,
+) {
+    if !json {
+        output_text(result, explain, query);
+        return;
+    }
+    match surface {
+        super::locate_compact::LocateSurface::Full => println!(
             "{}",
             serde_json::to_string_pretty(result).unwrap_or_default()
-        );
-    } else {
-        output_text(result, explain, query);
+        ),
+        // Compact serializes without the pretty-printer. On the full shape the
+        // indentation is a third of the bytes (28,108 pretty against roughly
+        // 18,600 compact on the hiredis store), and a surface whose whole reason
+        // to exist is fitting a tool budget should not spend a third of it on
+        // whitespace no agent reads.
+        super::locate_compact::LocateSurface::Compact => println!(
+            "{}",
+            serde_json::to_string(&super::locate_compact::project(result)).unwrap_or_default()
+        ),
     }
 }
 

@@ -47,6 +47,7 @@ pub mod language_server_release;
 pub mod language_servers;
 pub mod languages;
 pub mod locate;
+pub mod locate_compact;
 pub mod locate_cursor;
 pub mod locate_debug;
 pub mod locate_sizing;
