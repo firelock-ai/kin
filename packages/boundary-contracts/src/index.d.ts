@@ -30,6 +30,7 @@ export type RepoScopedSemanticLocateArguments = RepoScopedSemanticBudgetArgument
   include_tests?: boolean;
   explain?: boolean;
   compact?: boolean;
+  surface?: "compact" | "full";
 };
 
 export type RepoScopedContextPackArguments = RepoScopedSemanticBudgetArguments & {

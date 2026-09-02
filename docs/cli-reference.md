@@ -184,6 +184,17 @@ kin locate [text] [options]
 | `--next` |  | Fetch the NEXT page of ranked entities from the previous query, reading the cursor persisted in `.kin/locate-cursor`. No retrieval re-run; pages the daemon's cached ranking. Query text is not required. Conflicts with `--cursor`. |
 | `--cursor <cursor>` |  | Fetch a specific entity page using an explicit cursor token (from a prior result's `next_cursor`). Lower-level alternative to `--next`. |
 | `--page-size <page-size>` |  | Entities per page for the graph-native `entities` surface (`KIN_LOCATE_ENTITY_CAP` otherwise). |
+| `--include-tests` | off | Rank test-role entities alongside source. Off by default: locate demotes tests unless the query text itself reads as being about them. The response says how many test paths a default run withheld. |
+| `--surface <shape>` | `full` | Which JSON shape `--json` emits. `full` is every field, the schema `POST /locate` and the MCP `semantic_locate` tool share. `compact` is the agent surface: per hit `id`, `name`, `kind`, `file`, `line`, `signature` and `score`, plus the ranked file paths, `total_ranked`, `next_cursor`, `all_fallback`, a `ranked_by` clause and a `_kin` object carrying `embedding_state` with its counts. Refused with `--diagnose`, which needs the full payload. |
+
+`--surface compact` is for a tool loop with a token budget. The full shape spends most of its bytes
+on the back-compat `files[].symbols` roll-up of entities the `entities` block already carries, and
+`--no-snippets` does not remove it: on a 730-entity store, twelve results are 38,819 bytes full and
+3,472 compact. Keep `full` for anything that parses the shared locate schema, which includes
+ContextBench and the acceptance scripts.
+
+The MCP `semantic_locate` tool is the other way round: compact is its default at entity granularity,
+and `surface: "full"` opts back out. See [mcp-tools.md](mcp-tools.md).
 
 ### `kin search`
 

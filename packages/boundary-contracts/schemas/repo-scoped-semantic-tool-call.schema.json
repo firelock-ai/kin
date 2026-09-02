@@ -34,6 +34,7 @@
             "include_tests": { "type": "boolean" },
             "explain": { "type": "boolean" },
             "compact": { "type": "boolean" },
+            "surface": { "type": "string", "enum": ["compact", "full"] },
             "max_chars": { "type": "integer", "minimum": 2000, "maximum": 60000 },
             "max_response_chars": { "type": "integer", "minimum": 2000, "maximum": 60000 },
             "repo_id": false,

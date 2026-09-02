@@ -431,6 +431,19 @@ enum Command {
         /// how many test paths a default run withheld.
         #[arg(long = "include-tests", default_value_t = false)]
         include_tests: bool,
+        /// Which JSON shape `--json` emits: `full` (every field, the default) or
+        /// `compact` (the agent surface: id, name, kind, file, line, signature
+        /// and score per hit, ranked file paths, and a `_kin` envelope naming
+        /// the embedding coverage behind the ranking).
+        ///
+        /// `full` stays the default because it is what ContextBench, the
+        /// acceptance scripts and `--diagnose` read. `compact` is roughly a
+        /// tenth the bytes: on a 730-entity store twelve results are 38,819
+        /// bytes full and 3,472 compact, because the back-compat
+        /// `files[].symbols` roll-up is 69 percent of the full payload and
+        /// `--no-snippets` does not remove it.
+        #[arg(long = "surface", value_name = "SHAPE", default_value = "full")]
+        surface: String,
     },
     /// Debug locate results: show per-signal breakdown, rank gold files,
     /// and diagnose why targets were missed.
@@ -3009,7 +3022,18 @@ fn run() -> Result<()> {
                     cursor,
                     page_size,
                     include_tests,
+                    surface,
                 } => {
+                    // Refuse an unknown shape rather than falling back to the
+                    // default: a misspelled --surface that silently emitted the
+                    // full payload would look exactly like a compact surface
+                    // that stopped compacting.
+                    let surface = commands::locate_compact::LocateSurface::parse(&surface)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "unknown --surface '{surface}'; expected 'full' or 'compact'"
+                            )
+                        })?;
                     // Inline snippets default ON for the structured/agent `--json`
                     // surface (so an agent gets code on the first locate);
                     // --diagnose stays lean unless --snippets is explicit;
@@ -3056,6 +3080,14 @@ fn run() -> Result<()> {
                     } else {
                         anyhow::bail!("provide problem text, --file, or --stdin");
                     };
+                    if diagnose && surface == commands::locate_compact::LocateSurface::Compact {
+                        // Refused rather than silently overridden. --diagnose
+                        // exists to show every stage, seed and score, and the
+                        // compact surface drops all of them; taking the flag and
+                        // ignoring it would print a diagnostic missing the
+                        // diagnosis.
+                        anyhow::bail!("--diagnose needs the full payload; drop --surface compact");
+                    }
                     if diagnose {
                         // Diagnostic mode: capture result, print JSON, then
                         // print gold file comparison to stderr.
@@ -3195,6 +3227,7 @@ fn run() -> Result<()> {
                             want_snippets,
                             paging,
                             commands::locate::LocateScope::with_tests(include_tests),
+                            surface,
                         )
                         .await
                     }
