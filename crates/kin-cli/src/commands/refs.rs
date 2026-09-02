@@ -196,7 +196,19 @@ pub fn build_refs_response(
     let target = if let Some(uuid) = addressed_by_id {
         graph.get_entity(&EntityId(uuid))?
     } else {
-        entity_ranking::select_best_entity(graph, &request.entity)?
+        // `select_best_entity` scores name quality, export status, kind and
+        // reference counts, all of which tie for a prototype and its definition,
+        // so on a C repository it answered about the header (FIR-3071). The
+        // ranked answer stands unless it is a declaration whose definition the
+        // same name also reaches, which is the one case its key cannot decide.
+        entity_ranking::select_best_entity(graph, &request.entity)?.map(|entity| {
+            let filter = kin_model::EntityFilter {
+                name_pattern: Some(entity.name.clone()),
+                ..Default::default()
+            };
+            let pool = graph.query_entities(&filter).unwrap_or_default();
+            kin_core::prefer_definition_among_same_name(entity, &pool)
+        })
     };
     // `None` means the focal was pinned by id, which is the rule the shared
     // producer switches on. Kept beside the resolution so the two cannot drift.
@@ -1041,6 +1053,75 @@ mod tests {
         parse_relation_kinds, refs_not_found_guidance, BulkRefsRequest, BulkRefsResponse,
         ReferenceLinesAbsent, RefsRequest, RelationResolution,
     };
+
+    /// MEASUREMENT, not an assertion. Prints which of a C prototype and its
+    /// definition `kin refs` resolves to, and why.
+    ///
+    /// `kin refs` ranks through `kin_ranking::entity_ranking::select_best_entity`,
+    /// whose key has no definition term and whose earlier terms include incoming
+    /// reference counts. Whether those counts separate a prototype from its
+    /// definition depends on which one the linker bound the callers to, which is
+    /// a fact about the graph rather than about this ranking, so it is measured
+    /// before anything here is changed. Run with --nocapture.
+    #[test]
+    fn measure_which_c_twin_refs_resolves_to_today() {
+        use kin_model::{EntityId, EntityStore as _, FilePathId};
+
+        fn twin(
+            base: &kin_model::Entity,
+            file: &str,
+            signature: &str,
+            line: u32,
+        ) -> kin_model::Entity {
+            let file_id = FilePathId::new(file);
+            let mut e = base.clone();
+            e.id = EntityId::from_content(&file_id.0, &e.name, "Function", line);
+            e.signature = signature.to_string();
+            e.file_origin = Some(file_id);
+            e
+        }
+
+        let (graph, _layout, _dir) = orphan_fixture();
+        let base = graph
+            .query_entities(&kin_model::EntityFilter::default())
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the fixture holds at least one entity");
+
+        let graph2 = kin_db::InMemoryGraph::new();
+        let mut decl = twin(&base, "hiredis.h", "int f(int a);", 338);
+        decl.name = "measuredTwin".to_string();
+        decl.id = EntityId::from_content("hiredis.h", "measuredTwin", "Function", 338);
+        let mut def = twin(&base, "hiredis.c", "int f(int a)", 1052);
+        def.name = "measuredTwin".to_string();
+        def.id = EntityId::from_content("hiredis.c", "measuredTwin", "Function", 1052);
+        graph2.upsert_entity(&decl).unwrap();
+        graph2.upsert_entity(&def).unwrap();
+
+        let picked = kin_ranking::entity_ranking::select_best_entity(&graph2, "measuredTwin")
+            .unwrap()
+            .map(|e| {
+                (
+                    e.file_origin
+                        .as_ref()
+                        .map(|f| f.0.clone())
+                        .unwrap_or_default(),
+                    e.signature.clone(),
+                )
+            });
+        println!("\nrefs select_best_entity picked: {picked:?}");
+        println!("  declaration id {} ({})", decl.id, decl.signature);
+        println!("  definition  id {} ({})", def.id, def.signature);
+        println!(
+            "  lower id is the {}",
+            if decl.id < def.id {
+                "DECLARATION"
+            } else {
+                "DEFINITION"
+            }
+        );
+    }
 
     /// A miss has to be readable as a miss by a caller that only checks the exit
     /// code. For `kin refs` the guidance reads as an empty reference list, which

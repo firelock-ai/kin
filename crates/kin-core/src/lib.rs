@@ -115,7 +115,7 @@ pub use workspace_semantics::diff_workspace_semantics;
 pub use diff::{compute_semantic_change_id, content_identity_from_deltas};
 pub use disambiguation::{
     carries_body, definition_identity_key, fallback_leaf_trace_matches,
-    name_resolution_certainly_misses, query_trace_matches,
+    name_resolution_certainly_misses, prefer_definition_among_same_name, query_trace_matches,
 };
 pub use identity::{
     resolve_commit_identity, unresolved_identity_message, CommitIdentity, IdentitySource,

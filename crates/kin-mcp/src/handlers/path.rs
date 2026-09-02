@@ -848,11 +848,29 @@ fn resolve_end<G: GraphStore>(
             endpoint,
         });
     }
-    let chosen =
-        match kin_ranking::entity_ranking::select_best_entity(store, name).map_err(graph_error)? {
-            Some(entity) => entity,
-            None => strongest_definition(store, pool)?,
-        };
+    // `select_best_entity` ranks by name quality, export status, declaration
+    // kind and reference counts. Every one of those ties for a C prototype and
+    // its definition, so it can and does answer with the declaration, and
+    // `strongest_definition` below was only ever reached when it answered with
+    // nothing at all. That made the definition preference this function
+    // documents unreachable in the case it was written for.
+    //
+    // The cost was not a cosmetic one. A prototype has no body, so it owns no
+    // outgoing edges: `kin path redisGetReplyFromReader redisReaderGetReply` on
+    // hiredis resolved the from end to `hiredis.h:338`, explored one entity over
+    // one edge, and reported no route between two functions where
+    // `hiredis.c:1053` calls the target directly. A wrong answer to the question
+    // asked, not a wrong entity in a listing (FIR-3071).
+    //
+    // Narrow rather than replace: the ranked answer stands unless it is a
+    // declaration AND the pool holds a definition under that same name, which
+    // is exactly the case its key cannot see.
+    let ranked =
+        kin_ranking::entity_ranking::select_best_entity(store, name).map_err(graph_error)?;
+    let chosen = match ranked {
+        Some(entity) => kin_core::prefer_definition_among_same_name(entity, &pool),
+        None => strongest_definition(store, pool)?,
+    };
     let twins = exact_name_matches(store, &chosen.name)?;
     let endpoint = endpoint_record(&chosen, "name", &twins);
     Ok(ResolvedEnd {
