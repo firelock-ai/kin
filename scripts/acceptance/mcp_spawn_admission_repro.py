@@ -68,9 +68,32 @@ EMBED_WORKER_MARKER = "embedding worker started"
 WATCH_SECONDS = 45.0
 
 
-def emit(check_id: str, verdict: str, detail: str) -> dict:
-    print(f"CHECK {check_id} {TICKET} {verdict} {detail}", flush=True)
-    return {"id": check_id, "ticket": TICKET, "verdict": verdict, "detail": detail}
+def emit(check_id: str, status: str, detail: str) -> dict:
+    print(f"CHECK {check_id} {TICKET} {status} {detail}", flush=True)
+    return {"id": check_id, "ticket": TICKET, "status": status, "detail": detail}
+
+
+def emit_row(check_id: str, status: str, detail: str) -> dict:
+    """One report row without printing a CHECK line, for the self-test."""
+    return {"id": check_id, "ticket": TICKET, "status": status, "detail": detail}
+
+
+def report_payload(results: list[dict]) -> dict:
+    """The report shape `scripts/acceptance/gate.py` reads.
+
+    The key is `results` and not `checks`, and each row's verdict is `status`.
+    That is not a style choice: the gate calls `payload.get("results")` and
+    refuses anything else by name, then reads `row.get("status")` to decide.
+    This suite shipped keyed `checks`, so main's push run for 4e37d08b3 printed
+    four PASS lines and the verdict step still errored on the file they wrote.
+    That is the fifth suite to break this gate on this key, after
+    same_owner_call, working_copy_freshness, init_budget and vcs_read_surfaces.
+
+    Written once here and read back through the gate's own loader by the
+    self-test below, which is the part that stops it drifting again. A suite
+    that only asserts its own shape is asserting against itself.
+    """
+    return {"suite": "mcp_spawn", "ticket": TICKET, "results": results}
 
 
 # ── graders ──────────────────────────────────────────────────────────────
@@ -381,11 +404,52 @@ def self_test() -> int:
     if embed_worker_ran(""):
         failures.append("embed_worker_ran: reported an embedding worker from an empty log")
 
+    # The row the gate's own error message prescribes: write this suite's report
+    # and read it back through gate.py's loader, so a key that drifts fails here
+    # rather than on main after four PASS lines have already printed.
+    import importlib.util
+    import tempfile
+
+    gate_path = Path(__file__).with_name("gate.py")
+    spec = importlib.util.spec_from_file_location("acceptance_gate", gate_path)
+    if spec is None or spec.loader is None:
+        failures.append("gate.py could not be loaded, so the report shape is unchecked")
+    else:
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        rows = [emit_row("probe", "PASS", "self-test")]
+        with tempfile.TemporaryDirectory() as tmp:
+            written = Path(tmp) / "mcp_spawn.json"
+            written.write_text(json.dumps(report_payload(rows)), encoding="utf-8")
+            try:
+                loaded = gate.load_report(str(written))
+            except Exception as err:  # noqa: BLE001
+                failures.append(f"the gate's own loader refused this suite's report: {err}")
+            else:
+                if "probe" not in loaded:
+                    failures.append("the gate's loader read the report but not its row id")
+                elif loaded["probe"].get("status") != "PASS":
+                    failures.append(
+                        "the gate reads each row's verdict from `status`; this report "
+                        f"gave it {loaded['probe'].get('status')!r}")
+            # And the inverse, so the check above cannot pass by accident: the
+            # shape this suite used to ship must still be refused.
+            stale = Path(tmp) / "stale.json"
+            stale.write_text(json.dumps({"ticket": TICKET, "checks": rows}), encoding="utf-8")
+            try:
+                gate.load_report(str(stale))
+            except Exception:
+                pass
+            else:
+                failures.append("the gate accepted a `checks`-keyed report, so this "
+                                "control proves nothing")
+
     for failure in failures:
         print(f"SELFTEST FAIL {failure}", flush=True)
     if failures:
         return 1
-    print(f"SELFTEST {TICKET} OK: {len(cases) + 4} grader cases, each against its inverse",
+    print(f"SELFTEST {TICKET} OK: {len(cases) + 6} grader cases, each against its inverse, "
+          f"including the report this gate must be able to read",
           flush=True)
     return 0
 
@@ -423,13 +487,13 @@ def main() -> int:
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as handle:
-            json.dump({"ticket": TICKET, "checks": results}, handle, indent=2)
+            json.dump(report_payload(results), handle, indent=2)
 
     print(
-        f"SUITE {TICKET} graded={sum(1 for r in results if r['verdict'] in ('PASS', 'FAIL'))}"
-        f"/{len(results)} pass={sum(1 for r in results if r['verdict'] == 'PASS')} "
-        f"fail={sum(1 for r in results if r['verdict'] == 'FAIL')} "
-        f"unreadable={sum(1 for r in results if r['verdict'] == 'UNREADABLE')}",
+        f"SUITE {TICKET} graded={sum(1 for r in results if r['status'] in ('PASS', 'FAIL'))}"
+        f"/{len(results)} pass={sum(1 for r in results if r['status'] == 'PASS')} "
+        f"fail={sum(1 for r in results if r['status'] == 'FAIL')} "
+        f"unreadable={sum(1 for r in results if r['status'] == 'UNREADABLE')}",
         flush=True,
     )
     return 0
