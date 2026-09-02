@@ -437,11 +437,14 @@ enum Command {
         /// the embedding coverage behind the ranking).
         ///
         /// `full` stays the default because it is what ContextBench, the
-        /// acceptance scripts and `--diagnose` read. `compact` is roughly a
-        /// tenth the bytes: on a 730-entity store twelve results are 38,819
-        /// bytes full and 3,472 compact, because the back-compat
-        /// `files[].symbols` roll-up is 69 percent of the full payload and
-        /// `--no-snippets` does not remove it.
+        /// acceptance scripts and `--diagnose` read. How much `compact` saves
+        /// depends on how large the store is, so both scales are given here. On
+        /// the 730-entity hiredis store twelve results are 38,819 bytes full and
+        /// 3,472 compact, about a tenth. On the microsoft/vscode and
+        /// facebook/react stores, measured 2026-09-02, the same commands come
+        /// back 3.0x to 4.9x smaller rather than ten times, because the
+        /// back-compat `files[].symbols` roll-up is 69 percent of a small
+        /// store's payload and a smaller share of a large one's.
         #[arg(long = "surface", value_name = "SHAPE", default_value = "full")]
         surface: String,
     },
