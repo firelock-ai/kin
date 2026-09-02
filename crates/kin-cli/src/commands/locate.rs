@@ -17687,6 +17687,73 @@ fn entity_projection_role_penalty(path: &str, test_query: bool) -> f32 {
     penalty
 }
 
+/// FIR-3079: demote a prose-word collision its own file does not corroborate.
+///
+/// kin#1367 takes such a row out of the exact-name tier, and on two measured
+/// questions it still leads on raw score: React's `Resolved.component` at
+/// 1052.0 against a best non-colliding 852.3, and ripgrep's
+/// `WalkBuilder::ignore` at 1052.0 against 652.0. Those two rows are
+/// indistinguishable by score, match kind and file rank, and one is wrong while
+/// the other is right. What differs is the neighbourhood: `Resolved.component`
+/// is the only row its file contributes to the whole ranking, while
+/// `WalkBuilder::ignore` sits with two siblings the retriever scored on their
+/// own. A word that hits one symbol in a file nothing else about the question
+/// reaches is a lexical accident; a word that hits a symbol in a file the
+/// retrieval also wanted for other reasons is an answer.
+///
+/// **This is a rule for those two shapes and not a general discriminator, and
+/// the honest failure modes are both measured.** It spares a WRONG row that has
+/// siblings: `TextmateSnippet.walk` carries eight of them, more than any correct
+/// row in the set. What makes that survivable is a fact about these rankings
+/// rather than a property of the rule: after kin#1367 every spared row already
+/// sits below a non-colliding leader. And it demotes a RIGHT row that is alone
+/// in its file, which `a_right_answer_alone_in_its_file_stays_on_the_page`
+/// pins: the demotion is a share of the score, never a floor, so such a row
+/// ranks lower and stays on the page.
+///
+/// Anchors admitted by [`FILE_ANCHOR_ORIGIN`] never corroborate. Corroboration
+/// means "the retrieval found something else here", and an anchor is admitted
+/// precisely because retrieval did not.
+fn apply_collision_corroboration_penalty(
+    ranked: &mut [(usize, LocateEntity)],
+    query: &str,
+    floor: f32,
+    target: usize,
+) {
+    if !locate_env_bool("KIN_LOCATE_COLLISION_CORROBORATION", true) {
+        return;
+    }
+    let is_collision = |entity: &LocateEntity| {
+        entity.match_kind == Some(LocateMatchKind::Name)
+            && is_prose_word_collision(query, &entity.name)
+    };
+    let mut corroboration: FxHashMap<String, usize> = FxHashMap::default();
+    for (_, entity) in ranked.iter() {
+        if is_collision(entity) || entity.provenance.origin == FILE_ANCHOR_ORIGIN {
+            continue;
+        }
+        let Some(file) = entity.provenance.file.as_deref() else {
+            continue;
+        };
+        *corroboration.entry(file.to_string()).or_default() += 1;
+    }
+    let target = target.max(1);
+    for (_, entity) in ranked.iter_mut() {
+        if !is_collision(entity) {
+            continue;
+        }
+        let found = entity
+            .provenance
+            .file
+            .as_deref()
+            .and_then(|file| corroboration.get(file))
+            .copied()
+            .unwrap_or(0);
+        let share = (found as f32 / target as f32).min(1.0);
+        entity.score *= floor + (1.0 - floor) * share;
+    }
+}
+
 /// The global entity ordering: definitions first, then the exact-name tier
 /// ([`locate_exact_name_tier`]: a hit the query literally named cannot be outbid
 /// by fallback scale), then composite score desc, then owner graph mass for the
@@ -17984,6 +18051,21 @@ pub fn build_entity_view(
         apply_entity_surface_penalty(&mut admitted, query);
         ranked.extend(admitted);
     }
+
+    // After the anchors, because an anchor must not corroborate a collision, and
+    // before the ordering, because the ordering reads the score this moves.
+    apply_collision_corroboration_penalty(
+        &mut ranked,
+        query,
+        // The floor is a CAP on the demotion, and it is pinned from both sides by
+        // measurement. It has to be under 0.810 or React's `Resolved.component`
+        // at 1052.0 keeps rank one over a best non-colliding 852.3, and it has to
+        // be high enough that a right answer alone in its file still lands on the
+        // six-row default page: at 0.5 the synthetic fixture's row fell from rank
+        // one to rank eight, off the page an agent reads.
+        locate_env_f32("KIN_LOCATE_COLLISION_LONE_FLOOR", 0.75),
+        locate_env_usize("KIN_LOCATE_COLLISION_CORROBORATION_TARGET", 2),
+    );
 
     let owner_mass_of = |entity: &LocateEntity| {
         name_owner_mass
@@ -22514,6 +22596,18 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
         let named = test_entity("WalkBuilder::ignore", "crates/ignore/src/walk.rs", 890, 900);
         graph.upsert_entity(&named).unwrap();
+        // The measured neighbourhood, and it is load-bearing since the
+        // corroboration rule landed: on the real store walk.rs contributes two
+        // more rows the retriever scored on their own, which is what keeps this
+        // collision at its full 1052. A fixture with the lone symbol would
+        // demote it to 789 and let this file's own anchor pass it.
+        for (sibling, lo, hi) in [
+            ("WalkBuilder::add_ignore", 910u32, 930u32),
+            ("WalkBuilder::add_custom_ignore_filename", 940, 960),
+        ] {
+            let entity = test_entity(sibling, "crates/ignore/src/walk.rs", lo, hi);
+            graph.upsert_entity(&entity).unwrap();
+        }
         let mut deep = test_entity("Walk", "crates/ignore/src/walk.rs", 1117, 1200);
         deep.kind = EntityKind::Class;
         graph.upsert_entity(&deep).unwrap();
@@ -22553,16 +22647,38 @@ mod tests {
                     score: 0.223,
                     signals: vec![],
                     spans: vec![],
-                    symbols: vec![LocateSymbol {
-                        name: "WalkBuilder::ignore".to_string(),
-                        span: Some([890, 900]),
-                        score: 1052.0,
-                        kind: "method".to_string(),
-                        definition: true,
-                        origin: "text".to_string(),
-                        cosine: None,
-                        snippet: None,
-                    }],
+                    symbols: vec![
+                        LocateSymbol {
+                            name: "WalkBuilder::ignore".to_string(),
+                            span: Some([890, 900]),
+                            score: 1052.0,
+                            kind: "method".to_string(),
+                            definition: true,
+                            origin: "text".to_string(),
+                            cosine: None,
+                            snippet: None,
+                        },
+                        LocateSymbol {
+                            name: "WalkBuilder::add_ignore".to_string(),
+                            span: Some([910, 930]),
+                            score: 652.0,
+                            kind: "method".to_string(),
+                            definition: true,
+                            origin: "text".to_string(),
+                            cosine: None,
+                            snippet: None,
+                        },
+                        LocateSymbol {
+                            name: "WalkBuilder::add_custom_ignore_filename".to_string(),
+                            span: Some([940, 960]),
+                            score: 652.0,
+                            kind: "method".to_string(),
+                            definition: true,
+                            origin: "text".to_string(),
+                            cosine: None,
+                            snippet: None,
+                        },
+                    ],
                     explain: vec![],
                     provenance: None,
                     signal_scores: None,
@@ -22602,6 +22718,332 @@ mod tests {
             "and it is admitted beneath the evidence, not above it: {} vs {}",
             walk.score,
             result.entities[0].score
+        );
+    }
+
+    /// One ranked file for the corroboration fixtures.
+    fn corroboration_file(path: &str, score: f32, symbols: Vec<LocateSymbol>) -> LocateFileEntry {
+        LocateFileEntry {
+            path: path.to_string(),
+            score,
+            signals: vec![],
+            spans: vec![],
+            symbols,
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        }
+    }
+
+    /// One projected symbol for the corroboration fixtures.
+    fn corroboration_symbol(name: &str, score: f32, span: [u32; 2]) -> LocateSymbol {
+        LocateSymbol {
+            name: name.to_string(),
+            span: Some(span),
+            score,
+            kind: "function".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        }
+    }
+
+    /// FIR-3079, the React shape: a prose-word collision leads on raw score after
+    /// kin#1367 demotes it out of the name tier, and it is the ONLY row its file
+    /// contributes to the whole ranking. Measured at 1052.0 against a best
+    /// non-colliding 852.3.
+    ///
+    /// Every file here carries exactly one entity, so the file-anchor admission
+    /// finds nothing new and this test measures the corroboration rule alone.
+    #[test]
+    fn a_lexical_accident_alone_in_its_file_loses_the_page_lead() {
+        let graph = kin_db::InMemoryGraph::new();
+        let lone = test_entity(
+            "Resolved.component",
+            "compiler/packages/babel-plugin-react-compiler/src/Flood/Types.ts",
+            10,
+            20,
+        );
+        graph.upsert_entity(&lone).unwrap();
+        let clean = test_entity(
+            "attemptEarlyBailoutIfNoScheduledUpdate",
+            "packages/react-reconciler/src/ReactFiberBeginWork.js",
+            30,
+            60,
+        );
+        graph.upsert_entity(&clean).unwrap();
+
+        let question = "what happens between a component asking for an update \
+                        and that update appearing on screen";
+        let build = |on: &str| {
+            let _guard =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_COLLISION_CORROBORATION", on);
+            let mut result = LocateResult {
+                files: vec![
+                    corroboration_file(
+                        "compiler/packages/babel-plugin-react-compiler/src/Flood/Types.ts",
+                        0.14,
+                        vec![corroboration_symbol("Resolved.component", 1052.0, [10, 20])],
+                    ),
+                    corroboration_file(
+                        "packages/react-reconciler/src/ReactFiberBeginWork.js",
+                        0.13,
+                        vec![corroboration_symbol(
+                            "attemptEarlyBailoutIfNoScheduledUpdate",
+                            852.3,
+                            [30, 60],
+                        )],
+                    ),
+                ],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                question,
+                false,
+            )
+            .unwrap();
+            result
+        };
+
+        // Control: this is the shipped ranking, and the whole point is that the
+        // collision leads it on score alone.
+        let shipped = build("0");
+        assert_eq!(
+            shipped.entities[0].name, "Resolved.component",
+            "control: without the rule the accident still leads on raw score"
+        );
+        assert_eq!(shipped.entities[0].match_kind, Some(LocateMatchKind::Name));
+
+        let fixed = build("1");
+        assert_eq!(
+            fixed.entities[0].name,
+            "attemptEarlyBailoutIfNoScheduledUpdate",
+            "the uncorroborated accident loses the lead, got {:?}",
+            fixed
+                .entities
+                .iter()
+                .map(|e| (&e.name, e.score))
+                .collect::<Vec<_>>()
+        );
+        let demoted = fixed
+            .entities
+            .iter()
+            .find(|e| e.name == "Resolved.component")
+            .expect("a share is not a floor: the row is still ranked");
+        assert_eq!(
+            demoted.match_kind,
+            Some(LocateMatchKind::Name),
+            "the demotion moves the score and never the fact"
+        );
+        assert!(
+            (demoted.score - 789.0).abs() < 1.0,
+            "three quarters of 1052, got {}",
+            demoted.score
+        );
+    }
+
+    /// The ripgrep shape, and the case the rule exists to SPARE: the same score,
+    /// the same match kind, a collision on an ordinary word, and a right answer.
+    /// Its file contributes two more rows the retriever scored on their own.
+    #[test]
+    fn a_collision_its_own_file_corroborates_keeps_rank_one() {
+        let graph = kin_db::InMemoryGraph::new();
+        for (name, lo, hi) in [
+            ("WalkBuilder::ignore", 890u32, 900u32),
+            ("WalkBuilder::add_ignore", 910, 930),
+            ("WalkBuilder::add_custom_ignore_filename", 940, 960),
+        ] {
+            let entity = test_entity(name, "crates/ignore/src/walk.rs", lo, hi);
+            graph.upsert_entity(&entity).unwrap();
+        }
+        let other = test_entity("ignore_messages", "crates/core/messages.rs", 10, 20);
+        graph.upsert_entity(&other).unwrap();
+
+        let mut result = LocateResult {
+            files: vec![
+                corroboration_file(
+                    "crates/ignore/src/walk.rs",
+                    0.223,
+                    vec![
+                        corroboration_symbol("WalkBuilder::ignore", 1052.0, [890, 900]),
+                        corroboration_symbol("WalkBuilder::add_ignore", 652.0, [910, 930]),
+                        corroboration_symbol(
+                            "WalkBuilder::add_custom_ignore_filename",
+                            652.0,
+                            [940, 960],
+                        ),
+                    ],
+                ),
+                corroboration_file(
+                    "crates/core/messages.rs",
+                    0.133,
+                    vec![corroboration_symbol("ignore_messages", 652.0, [10, 20])],
+                ),
+            ],
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut result,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "how does ripgrep decide which files to look at and honour the ignore rules",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            result.entities[0].name,
+            "WalkBuilder::ignore",
+            "a collision its file corroborates keeps rank one, got {:?}",
+            result
+                .entities
+                .iter()
+                .map(|e| (&e.name, e.score))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            (result.entities[0].score - 1052.0).abs() < 0.01,
+            "and keeps its whole score, got {}",
+            result.entities[0].score
+        );
+    }
+
+    /// The rule's own failure mode, measured rather than argued: a RIGHT answer
+    /// that is the only row its file contributes, whose name is an ordinary word
+    /// the question used, is demoted for being alone.
+    ///
+    /// The demotion is a share of the score and never a floor, so the row ranks
+    /// lower and stays on the page an agent reads. That is the claim this pins,
+    /// and it is what makes the failure mode survivable.
+    #[test]
+    fn a_right_answer_alone_in_its_file_stays_on_the_page() {
+        // The guard is not decoration. Without it this test reads whatever a
+        // concurrently running guarded test has left in the environment, and it
+        // first reported the rule as never firing for exactly that reason.
+        let _guard =
+            kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_COLLISION_CORROBORATION", "1");
+        let graph = kin_db::InMemoryGraph::new();
+        let right = test_entity("apply", "src/editor/apply.ts", 10, 40);
+        graph.upsert_entity(&right).unwrap();
+        let mut files = vec![corroboration_file(
+            "src/editor/apply.ts",
+            0.30,
+            vec![corroboration_symbol("apply", 900.0, [10, 40])],
+        )];
+        // Twelve unrelated rows straddling the demoted score, so where it lands
+        // is measured rather than assumed.
+        for i in 0..12 {
+            let path = format!("src/filler/mod{i}.ts");
+            let name = format!("filler_{i}");
+            let entity = test_entity(&name, &path, 1, 5);
+            graph.upsert_entity(&entity).unwrap();
+            files.push(corroboration_file(
+                &path,
+                0.29 - i as f32 * 0.01,
+                vec![corroboration_symbol(&name, 800.0 - i as f32 * 50.0, [1, 5])],
+            ));
+        }
+        let mut result = LocateResult {
+            files,
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut result,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "how does the editor apply an edit to the open document",
+            false,
+        )
+        .unwrap();
+        let position = result
+            .entities
+            .iter()
+            .position(|e| e.name == "apply")
+            .expect("the demoted right answer is still in the ranking");
+        let shape = result
+            .entities
+            .iter()
+            .map(|e| (e.name.clone(), e.score, e.match_kind))
+            .collect::<Vec<_>>();
+        assert!(
+            position > 0,
+            "this fixture only means something if the rule moved it: {shape:?}"
+        );
+        assert!(
+            position < DEFAULT_ENTITY_PAGE_SIZE,
+            "a share is not a floor: the demoted right answer must stay on the \
+             product's own {}-row default page, landed at {} of {shape:?}",
+            DEFAULT_ENTITY_PAGE_SIZE,
+            position + 1
+        );
+        let row = &result.entities[position];
+        assert!(
+            (row.score - 675.0).abs() < 1.0,
+            "three quarters of 900, got {}",
+            row.score
+        );
+    }
+
+    /// A lookup carries no prose, so the rule cannot fire on it and the ranking
+    /// is identical with it on and off. The control is the same fixture under a
+    /// question, which must differ.
+    #[test]
+    fn a_lookup_ranking_is_untouched_by_the_corroboration_rule() {
+        let graph = kin_db::InMemoryGraph::new();
+        let named = test_entity("ignore", "crates/ignore/src/dir.rs", 10, 20);
+        graph.upsert_entity(&named).unwrap();
+        let other = test_entity("ignore_messages", "crates/core/messages.rs", 10, 20);
+        graph.upsert_entity(&other).unwrap();
+        let build = |query: &str, on: &str| {
+            let _guard =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_COLLISION_CORROBORATION", on);
+            let mut result = LocateResult {
+                files: vec![
+                    corroboration_file(
+                        "crates/ignore/src/dir.rs",
+                        0.3,
+                        vec![corroboration_symbol("ignore", 900.0, [10, 20])],
+                    ),
+                    corroboration_file(
+                        "crates/core/messages.rs",
+                        0.2,
+                        vec![corroboration_symbol("ignore_messages", 800.0, [10, 20])],
+                    ),
+                ],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                query,
+                false,
+            )
+            .unwrap();
+            result
+                .entities
+                .iter()
+                .map(|e| (e.name.clone(), e.score))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            build("ignore", "1"),
+            build("ignore", "0"),
+            "a lookup is answered exactly as before"
+        );
+        assert_ne!(
+            build("how does it honour the ignore rules a project sets", "1"),
+            build("how does it honour the ignore rules a project sets", "0"),
+            "control: the same fixture under a question must differ"
         );
     }
 
