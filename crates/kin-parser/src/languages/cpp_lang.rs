@@ -259,10 +259,7 @@ fn extract_cpp_node(
             }
         }
         "type_definition" => {
-            // typedef ... name;
-            // The last named child before ';' is typically the alias name.
-            let name = extract_typedef_name(node, source);
-            if let Some(name) = name {
+            for name in typedef_alias_names(node, source) {
                 entities.push(ExtractedEntity {
                     kind: EntityKind::TypeAlias,
                     name,
@@ -331,7 +328,20 @@ fn extract_cpp_node(
         }
         // Recurse into preprocessor conditional blocks (#ifdef, #ifndef, #if, etc.)
         // so that code inside header guards is still extracted.
-        "preproc_ifdef" | "preproc_if" | "preproc_else" | "preproc_elif" => {
+        //
+        // `extern "C" { ... }` is a linkage_specification whose declaration_list body
+        // holds the rest of the header. A header shared with C opens that brace inside
+        // one `#ifdef __cplusplus` and closes it inside another, so tree-sitter puts
+        // every declaration between them in the body rather than at the top level. An
+        // ERROR node likewise keeps the well-formed subtrees error recovery salvaged.
+        // Walk through all of them, or a header's entire public API stays invisible.
+        "preproc_ifdef"
+        | "preproc_if"
+        | "preproc_else"
+        | "preproc_elif"
+        | "linkage_specification"
+        | "declaration_list"
+        | "ERROR" => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 extract_cpp_node(
@@ -606,26 +616,67 @@ fn has_function_declarator(node: &tree_sitter::Node) -> bool {
     false
 }
 
-/// Extract the name from a `type_definition` (typedef).
-fn extract_typedef_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
-    // The declarator field holds the alias name.
-    if let Some(decl) = node.child_by_field_name("declarator") {
-        let text = decl.utf8_text(source).unwrap_or("").to_string();
-        if !text.is_empty() {
-            return Some(text);
-        }
+/// How far to follow a declarator chain before giving up. Real C++ nests a handful of
+/// pointers and parentheses; anything deeper is malformed input, not a name.
+const MAX_DECLARATOR_DEPTH: usize = 16;
+
+/// Resolve the name a typedef declarator introduces.
+///
+/// A typedef alias arrives wrapped in whatever declarator syntax names it: `IntVec`,
+/// `*foo_p`, `arr_t[10]` or `(*Handler)(int, void *)`. Follow the chain down through
+/// pointers, arrays, functions and parentheses to the name at the bottom, so a
+/// function-pointer typedef is stored as `Handler` and not as the text of its
+/// declarator, which no query can reach.
+///
+/// Deliberately separate from [`declarator_name`], which serves receiver-type
+/// mapping: that one stops at an `identifier` and skips function declarators, while a
+/// typedef's leaf is a `type_identifier` and its function-pointer form is exactly a
+/// function declarator. Widening the shared helper would change what
+/// `record_typed_declarators` records.
+fn typedef_declarator_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut current = *node;
+    for _ in 0..MAX_DECLARATOR_DEPTH {
+        // A parenthesized declarator holds its inner declarator as an unnamed child.
+        let next = current
+            .child_by_field_name("declarator")
+            .or_else(|| current.named_child(0));
+        let Some(next) = next else {
+            let text = current.utf8_text(source).unwrap_or("").trim().to_string();
+            return if text.is_empty() { None } else { Some(text) };
+        };
+        current = next;
     }
-    // Fallback: the type_identifier child is the alias name.
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "type_identifier" {
-            let text = child.utf8_text(source).unwrap_or("").to_string();
-            if !text.is_empty() {
-                return Some(text);
+    None
+}
+
+/// Collect every alias name a `type_definition` introduces.
+///
+/// One typedef can name several: `typedef struct Foo { ... } Foo, *FooPtr;` carries two
+/// `declarator` fields, and reading only the first loses `FooPtr`.
+///
+/// A malformed typedef such as `typedef struct Foo;` parses with a MISSING, empty
+/// `type_identifier` in the declarator field, so it yields no name and no entity. That
+/// is deliberate: the alternative is an entity whose name is the empty string, which no
+/// query can reach and which the adapter conformance suite refuses.
+fn typedef_alias_names(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for i in 0..node.child_count() {
+        let Ok(child_index) = i.try_into() else {
+            continue;
+        };
+        if node.field_name_for_child(child_index) != Some("declarator") {
+            continue;
+        }
+        let Some(child) = node.child(child_index) else {
+            continue;
+        };
+        if let Some(name) = typedef_declarator_name(&child, source) {
+            if !names.contains(&name) {
+                names.push(name);
             }
         }
     }
-    None
+    names
 }
 
 fn extract_alias_declaration(
@@ -2070,6 +2121,181 @@ union Tagged {
             .any(|r| r.kind == kin_model::RelationKind::Contains
                 && r.src_name == "Tagged"
                 && r.dst_name == "Tagged::as_int"));
+    }
+
+    /// A header shared with C: one `#ifdef __cplusplus` opens the `extern "C"` brace
+    /// and a second one closes it, so tree-sitter puts the whole public API inside a
+    /// single linkage_specification.
+    const EXTERN_C_HEADER: &[u8] = br#"
+#ifndef EXAMPLE_SHARED_H
+#define EXAMPLE_SHARED_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define EXAMPLE_MAX_BUF 4096
+
+typedef void (*ExampleHandler)(int code, void *ctx);
+typedef unsigned long example_size_t;
+
+int example_open(const char *path);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+"#;
+
+    fn cpp_entities(source: &[u8], file: &str) -> Vec<ExtractedEntity> {
+        let adapter = CppAdapter;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new(file);
+        adapter.extract(&tree, source, &file_id).unwrap().entities
+    }
+
+    fn cpp_names_of(entities: &[ExtractedEntity], kind: EntityKind) -> Vec<String> {
+        entities
+            .iter()
+            .filter(|entity| entity.kind == kind)
+            .map(|entity| entity.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn extern_c_block_does_not_hide_the_public_api() {
+        let entities = cpp_entities(EXTERN_C_HEADER, "shared.h");
+        let aliases = cpp_names_of(&entities, EntityKind::TypeAlias);
+        assert!(
+            aliases.iter().any(|name| name == "ExampleHandler"),
+            "{aliases:?}"
+        );
+        assert!(
+            aliases.iter().any(|name| name == "example_size_t"),
+            "{aliases:?}"
+        );
+        assert!(
+            cpp_names_of(&entities, EntityKind::Function)
+                .iter()
+                .any(|name| name == "example_open"),
+            "the prototype inside the extern C block was dropped"
+        );
+        assert!(
+            cpp_names_of(&entities, EntityKind::Macro)
+                .iter()
+                .any(|name| name == "EXAMPLE_MAX_BUF"),
+            "the macro inside the extern C block was dropped"
+        );
+    }
+
+    #[test]
+    fn function_pointer_typedef_is_named_by_its_identifier() {
+        let entities = cpp_entities(
+            b"typedef void (*Handler)(int, void*);\ntypedef void (Plain)(int);\n",
+            "cb.hpp",
+        );
+        let aliases = cpp_names_of(&entities, EntityKind::TypeAlias);
+        assert!(aliases.iter().any(|name| name == "Handler"), "{aliases:?}");
+        assert!(aliases.iter().any(|name| name == "Plain"), "{aliases:?}");
+        assert!(
+            aliases.iter().all(|name| !name.contains('(')),
+            "a raw declarator leaked into a name: {aliases:?}"
+        );
+    }
+
+    #[test]
+    fn a_typedef_records_every_alias_it_declares() {
+        let entities = cpp_entities(b"typedef struct Node { int v; } Node, *NodePtr;", "n.hpp");
+        let aliases = cpp_names_of(&entities, EntityKind::TypeAlias);
+        assert!(
+            aliases.iter().any(|name| name == "NodePtr"),
+            "the second declarator was dropped: {aliases:?}"
+        );
+    }
+
+    /// The same unbalanced-conditional shape that makes hiredis's libuv.h a single
+    /// ERROR node in C does it in C++ too: a `#if` arm opens a function body, the
+    /// `#else` arm opens a second signature, and one brace closes both.
+    const UNBALANCED_CONDITIONAL_HEADER: &[u8] = br#"
+#ifndef EXAMPLE_EVENTS_H
+#define EXAMPLE_EVENTS_H
+
+typedef struct Events { int n; } Events;
+
+#if VERSION_MINOR < 11
+static void onTimeout(void *t, int status) {
+    (void)status;
+#else
+static void onTimeout(void *t) {
+#endif
+    (void)t;
+}
+
+static void onCleanup(void *p) { (void)p; }
+
+#endif
+"#;
+
+    #[test]
+    fn declarations_recovered_from_a_top_level_parse_error_are_kept() {
+        let tree = CppAdapter.parse(UNBALANCED_CONDITIONAL_HEADER).unwrap();
+        let root = tree.root_node();
+        assert_eq!(
+            (root.child_count(), root.child(0).map(|node| node.kind())),
+            (1, Some("ERROR")),
+            "the fixture must reproduce the single top-level ERROR node, or this test \
+             proves nothing about error recovery"
+        );
+
+        let entities = cpp_entities(UNBALANCED_CONDITIONAL_HEADER, "events.hpp");
+        assert!(
+            cpp_names_of(&entities, EntityKind::TypeAlias)
+                .iter()
+                .any(|name| name == "Events"),
+            "{:?}",
+            cpp_names_of(&entities, EntityKind::TypeAlias)
+        );
+        assert!(
+            cpp_names_of(&entities, EntityKind::Function)
+                .iter()
+                .any(|name| name == "onCleanup"),
+            "{:?}",
+            cpp_names_of(&entities, EntityKind::Function)
+        );
+    }
+
+    #[test]
+    fn a_malformed_typedef_yields_no_entity_rather_than_an_empty_name() {
+        // Each of these parses with a MISSING, empty type_identifier in the declarator
+        // field. Reading it without checking would put an unreachable, empty-named
+        // entity in the graph.
+        for source in [
+            b"typedef struct Foo;".as_slice(),
+            b"typedef int;".as_slice(),
+            b"typedef struct { int a; };".as_slice(),
+        ] {
+            let entities = cpp_entities(source, "broken.hpp");
+            assert!(
+                entities.iter().all(|entity| !entity.name.trim().is_empty()),
+                "an empty entity name leaked from {:?}",
+                std::str::from_utf8(source).unwrap()
+            );
+            assert!(
+                cpp_names_of(&entities, EntityKind::TypeAlias).is_empty(),
+                "a malformed typedef should name nothing, got {:?}",
+                cpp_names_of(&entities, EntityKind::TypeAlias)
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_typedef_alias_keeps_its_name() {
+        let entities = cpp_entities(b"typedef unsigned long my_size_t;", "t.hpp");
+        assert_eq!(
+            cpp_names_of(&entities, EntityKind::TypeAlias),
+            vec!["my_size_t"]
+        );
     }
 }
 
