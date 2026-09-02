@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (522 total, 352 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (523 total, 353 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -344,6 +344,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_COLLISION_CORROBORATION` | bool | true | correctness | locate tuning knob: collision corroboration |
 | `KIN_LOCATE_COLLISION_CORROBORATION_TARGET` | usize | 2 | correctness | locate tuning knob: collision corroboration target |
 | `KIN_LOCATE_COLLISION_LONE_FLOOR` | float>=0 | 0.75 | correctness | locate tuning knob: collision lone floor |
+| `KIN_LOCATE_COLLISION_SIBLING_SHARE` | float>=0 | 0.25 | correctness | locate tuning knob: collision sibling share |
 | `KIN_LOCATE_COMMAND_PARTIAL_MATCH_LIMIT` | usize | 4 | correctness | locate tuning knob: command partial match limit |
 | `KIN_LOCATE_COMPANION_ENTITY_LIMIT` | usize | 24 | correctness | locate tuning knob: companion entity limit |
 | `KIN_LOCATE_CONTRIB_PATH_PENALTY` | float>=0 | 0.2 | correctness | locate tuning knob: contrib path penalty |

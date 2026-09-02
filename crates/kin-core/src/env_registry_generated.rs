@@ -45,6 +45,7 @@ pub const GENERATED_KNOBS: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_COLLISION_CORROBORATION", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: collision corroboration" },
     EnvVarSpec { name: "KIN_LOCATE_COLLISION_CORROBORATION_TARGET", kind: Kind::Usize, default: "2", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: collision corroboration target" },
     EnvVarSpec { name: "KIN_LOCATE_COLLISION_LONE_FLOOR", kind: Kind::NonNegF32, default: "0.75", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: collision lone floor" },
+    EnvVarSpec { name: "KIN_LOCATE_COLLISION_SIBLING_SHARE", kind: Kind::NonNegF32, default: "0.25", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: collision sibling share" },
     EnvVarSpec { name: "KIN_LOCATE_COMMAND_PARTIAL_MATCH_LIMIT", kind: Kind::Usize, default: "4", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: command partial match limit" },
     EnvVarSpec { name: "KIN_LOCATE_COMPANION_ENTITY_LIMIT", kind: Kind::Usize, default: "24", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: companion entity limit" },
     EnvVarSpec { name: "KIN_LOCATE_CONTRIB_PATH_PENALTY", kind: Kind::NonNegF32, default: "0.2", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: contrib path penalty" },

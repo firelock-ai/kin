@@ -17727,7 +17727,26 @@ fn apply_collision_corroboration_penalty(
         entity.match_kind == Some(LocateMatchKind::Name)
             && is_prose_word_collision(query, &entity.name)
     };
+    // A sibling corroborates only if the retrieval ranked it WELL, not merely
+    // ranked it. Measured 2026-09-02: React's `Resolved.component` at 1052.0 has
+    // two siblings from its file at ranks 109 and 110 of 136, scoring 52.4 and
+    // 52.1, which is five percent of its own score and no evidence at all that
+    // the file is about the question. ripgrep's `WalkBuilder::ignore` has two at
+    // 652.0, sixty-two percent of its 1052.0. Comparing against the collision's
+    // OWN score keeps this scale-free, which is what the exact-name tier's doc
+    // comment says a score rule has to be.
+    let sibling_share = locate_env_f32("KIN_LOCATE_COLLISION_SIBLING_SHARE", 0.25);
     let mut corroboration: FxHashMap<String, usize> = FxHashMap::default();
+    let mut collision_scores: FxHashMap<String, f32> = FxHashMap::default();
+    for (_, entity) in ranked.iter() {
+        if !is_collision(entity) {
+            continue;
+        }
+        if let Some(file) = entity.provenance.file.as_deref() {
+            let best = collision_scores.entry(file.to_string()).or_insert(0.0);
+            *best = best.max(entity.score);
+        }
+    }
     for (_, entity) in ranked.iter() {
         if is_collision(entity) || entity.provenance.origin == FILE_ANCHOR_ORIGIN {
             continue;
@@ -17735,6 +17754,12 @@ fn apply_collision_corroboration_penalty(
         let Some(file) = entity.provenance.file.as_deref() else {
             continue;
         };
+        let Some(collision_score) = collision_scores.get(file) else {
+            continue;
+        };
+        if entity.score < collision_score * sibling_share {
+            continue;
+        }
         *corroboration.entry(file.to_string()).or_default() += 1;
     }
     let target = target.max(1);
@@ -22508,6 +22533,14 @@ mod tests {
     /// internals and never names the type.
     #[test]
     fn a_widely_called_method_never_takes_an_anchor_slot() {
+        // Both knobs are pinned for the same reason the other fixtures pin
+        // theirs: an unguarded test reads whatever a concurrently running
+        // guarded one has left in the process environment, and this test read
+        // KIN_LOCATE_FILE_ANCHORS=0 from a neighbour and returned an empty
+        // ranking.
+        let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHORS", "1")
+            .with("KIN_LOCATE_COLLISION_CORROBORATION", "1");
+
         let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
             id: RelationId::new(),
             kind,
@@ -22582,6 +22615,14 @@ mod tests {
     /// rank away.
     #[test]
     fn an_anchor_from_a_low_ranked_file_does_not_outrank_a_named_hit() {
+        // Both knobs are pinned for the same reason the other fixtures pin
+        // theirs: an unguarded test reads whatever a concurrently running
+        // guarded one has left in the process environment, and this test read
+        // KIN_LOCATE_FILE_ANCHORS=0 from a neighbour and returned an empty
+        // ranking.
+        let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHORS", "1")
+            .with("KIN_LOCATE_COLLISION_CORROBORATION", "1");
+
         let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
             id: RelationId::new(),
             kind,
@@ -22854,6 +22895,14 @@ mod tests {
     /// Its file contributes two more rows the retriever scored on their own.
     #[test]
     fn a_collision_its_own_file_corroborates_keeps_rank_one() {
+        // Both knobs are pinned for the same reason the other fixtures pin
+        // theirs: an unguarded test reads whatever a concurrently running
+        // guarded one has left in the process environment, and this test read
+        // KIN_LOCATE_FILE_ANCHORS=0 from a neighbour and returned an empty
+        // ranking.
+        let _guard = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHORS", "1")
+            .with("KIN_LOCATE_COLLISION_CORROBORATION", "1");
+
         let graph = kin_db::InMemoryGraph::new();
         for (name, lo, hi) in [
             ("WalkBuilder::ignore", 890u32, 900u32),
@@ -23044,6 +23093,80 @@ mod tests {
             build("how does it honour the ignore rules a project sets", "1"),
             build("how does it honour the ignore rules a project sets", "0"),
             "control: the same fixture under a question must differ"
+        );
+    }
+
+    /// The measured difference between the two collisions, as a rule: a sibling
+    /// corroborates only if the retrieval ranked it WELL.
+    ///
+    /// React's `Resolved.component` at 1052.0 has two siblings from its file at
+    /// ranks 109 and 110 of 136, scoring 52.4 and 52.1. ripgrep's
+    /// `WalkBuilder::ignore` at 1052.0 has two at 652.0. Counting rows rather
+    /// than weighing them calls both corroborated, which is how the first
+    /// version of this rule spared the row it was written for.
+    #[test]
+    fn a_sibling_corroborates_only_if_the_retrieval_ranked_it_well() {
+        let _guard =
+            kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_COLLISION_CORROBORATION", "1")
+                .with("KIN_LOCATE_FILE_ANCHORS", "0");
+        let question = "what happens between a component asking for an update \
+                        and that update appearing on screen";
+        let build = |sibling_score: f32| {
+            let graph = kin_db::InMemoryGraph::new();
+            let collision = test_entity("Resolved.component", "src/compiler/Types.ts", 10, 20);
+            graph.upsert_entity(&collision).unwrap();
+            let sibling = test_entity("convertFlowType", "src/compiler/Types.ts", 30, 40);
+            graph.upsert_entity(&sibling).unwrap();
+            let elsewhere = test_entity("prepareFreshStack", "src/reconciler/WorkLoop.js", 10, 20);
+            graph.upsert_entity(&elsewhere).unwrap();
+            let mut result = LocateResult {
+                files: vec![
+                    corroboration_file(
+                        "src/compiler/Types.ts",
+                        0.14,
+                        vec![
+                            corroboration_symbol("Resolved.component", 1052.0, [10, 20]),
+                            corroboration_symbol("convertFlowType", sibling_score, [30, 40]),
+                        ],
+                    ),
+                    corroboration_file(
+                        "src/reconciler/WorkLoop.js",
+                        0.13,
+                        vec![corroboration_symbol("prepareFreshStack", 852.3, [10, 20])],
+                    ),
+                ],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                question,
+                false,
+            )
+            .unwrap();
+            result
+                .entities
+                .iter()
+                .find(|entity| entity.name == "Resolved.component")
+                .map(|entity| entity.score)
+                .expect("the collision is always ranked, demoted or not")
+        };
+
+        // 52.4 of 1052.0 is five percent: the file is present, not relevant.
+        assert!(
+            (build(52.4) - 789.0).abs() < 1.0,
+            "a weak sibling must not rescue the collision, got {}",
+            build(52.4)
+        );
+        // 652.0 of 1052.0 is sixty-two percent: the retrieval wanted this file.
+        // One strong sibling is half the corroboration target, so the demotion
+        // is half of what it was: 0.75 + 0.25 * 0.5 = 0.875 of 1052.0.
+        assert!(
+            (build(652.0) - 920.5).abs() < 1.0,
+            "a strong sibling must lift the collision, got {}",
+            build(652.0)
         );
     }
 
