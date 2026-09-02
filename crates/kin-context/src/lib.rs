@@ -5,6 +5,7 @@
 
 pub mod builder;
 pub mod error;
+pub mod multi;
 pub mod tokens;
 
 pub use builder::{
@@ -14,4 +15,10 @@ pub use builder::{
     SAME_FILE_FALLBACK_MAX,
 };
 pub use error::{ContextError, Result};
+pub use multi::{
+    build_multi_focal_pack, method_line, neighborhood_depth_for, render_multi_focal_lines,
+    water_fill, FocalContribution, FocalResolution, MultiFocalOptions, MultiFocalReport,
+    PackElision, RouteReport, RouteSearch, ELISION_REASON_TOKEN_BUDGET, FOCAL_GROUP, ROUTE_GROUP,
+    ROUTE_MARKER, ROUTE_MAX_HOPS, ROUTE_VISIT_MAX,
+};
 pub use tokens::estimate_tokens;

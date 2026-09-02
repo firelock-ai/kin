@@ -296,21 +296,58 @@ kin refs [entity] [options]
 
 ### `kin context`
 
-Build a context pack for an entity
+Build a context pack for one entity, several, or a question
 
 ```
-kin context <entity> [options]
+kin context <entity>... [options]
+kin context --question "<text>" [options]
 ```
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<entity>` | yes | Entity name or ID |
+| `<entity>...` | unless `--question` | Entity names or IDs. A name with twins in the store can pin the one it means: `Name@file`, `Name@file:line`, `Name#Kind` |
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--question <text>` |  | Build the pack from the entities this question ranks for, through kin's own locate ranking |
 | `-b, --budget <budget>` | `8k` | Token budget (8k, 16k, 32k, or custom number) |
 | `--assistant <assistant>` |  | Assistant hint for tuning context pack strategy |
-| `--json` |  | Emit the resolved target and the whole context pack as JSON |
+| `--max-focals <n>` | `5` | Most focal entities a question may resolve to |
+| `--json` |  | Emit the resolved targets and the whole context pack as JSON |
+
+A question that names several things needs a pack that carries all of them.
+"When I type a character in the editor, how does it end up in the document"
+names three, and a pack built around any one of them answers something
+narrower. Naming several focals, or asking a question and letting the ranking
+name them, builds one pack from all of them: every focal first, then the graph
+route between focals the graph connects, then each focal's neighbourhood
+water-filled into what is left, so a short neighbourhood never holds budget a
+long one needed.
+
+```
+kin context handleKeyboardInput TextDocument --budget 1500
+kin context --question "when I type a character, how does it reach the document" --budget 1500
+kin context 'apply@src/model.c' TextDocument      # pin the twin you mean
+```
+
+The output states its method in one line: which focals, how each resolved
+(named, pinned, by id, or located from the question with its score), what each
+contributed, the route material between connected focals, what the pack
+measured, and the store's semantic coverage. `--json` carries the same facts
+under `multi_focal`, plus `routes`, `route_search` and the per-section
+`budget_elisions`.
+
+**Budgets differ between the two shapes, on purpose.** A multi-focal pack comes
+in at or under `--budget`: it is rendered, measured with the estimator kin
+builds packs with, and rows are dropped until it fits. A single-focal pack can
+exceed its budget, because every section there keeps a row whatever the budget
+says, and the rendering says so. Both report `measured_tokens` in `--json`, which
+is what the bytes actually cost.
+
+`route_search.bounded` is worth reading before concluding two entities are
+unrelated. It is true when a route search stopped at its own bound, in which
+case an absent route says nobody looked far enough rather than that the graph
+joins nothing.
 
 ## More graph queries
 

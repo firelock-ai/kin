@@ -85,7 +85,7 @@ const TRANSITIVE_RELEVANCE_FLOOR: f64 = 1.0;
 /// This gate governs **membership** in the dependency sections only; ordering
 /// within a section still uses [`relation_weight`], and the broader BFS expansion
 /// weighting is unchanged.
-fn is_dependency_edge(kind: &RelationKind) -> bool {
+pub(crate) fn is_dependency_edge(kind: &RelationKind) -> bool {
     match kind {
         // Real code dependencies / usage / wiring.
         RelationKind::Calls
@@ -1413,7 +1413,7 @@ fn format_traffic_entry(intent: &IntentSummary, proximity: TrafficProximity) -> 
 /// implementation. The MCP context-pack handlers therefore read the real body
 /// through the graph-owned projection and report a gap when it is unavailable,
 /// rather than falling back to this string.
-fn project_full_body(entity: &Entity) -> String {
+pub(crate) fn project_full_body(entity: &Entity) -> String {
     let mut content = String::new();
     content.push_str(&format!(
         "// {} ({:?}, {})\n",
@@ -1427,7 +1427,7 @@ fn project_full_body(entity: &Entity) -> String {
     content
 }
 
-fn project_signature_only(entity: &Entity) -> String {
+pub(crate) fn project_signature_only(entity: &Entity) -> String {
     let mut content = String::new();
     content.push_str(&entity.signature);
     if let Some(ref summary) = entity.doc_summary {
@@ -1437,7 +1437,7 @@ fn project_signature_only(entity: &Entity) -> String {
     content
 }
 
-fn project_name_and_kind(entity: &Entity) -> String {
+pub(crate) fn project_name_and_kind(entity: &Entity) -> String {
     format!(
         "{} ({:?}): {}\n",
         entity.name, entity.kind, entity.signature

@@ -613,12 +613,27 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "max_chars": max_chars_property(),
                         "entity_id": { "type": "string", "description": "Focal entity UUID" },
+                        "entities": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "minItems": 1,
+                            "maxItems": 8,
+                            "description": "Several focal entities, by name or UUID, when the question is about how they connect. A name with twins in the store can pin the one it means: Name@file, Name@file:line, Name#Kind. The pack carries every focal, the graph route between connected ones first, then each focal's neighborhood, and it comes in under token_budget."
+                        },
+                        "question": {
+                            "type": "string",
+                            "description": "Resolve the focals from this question through Kin's own ranking, instead of naming them. Needs the repo daemon, which is where the ranking runs."
+                        },
                         "token_budget": { "type": "integer", "description": "Token budget (8000, 16000, or 32000)", "default": 16000 },
                         "depth": { "type": "integer", "description": "Dependency traversal depth", "default": 2 },
                         "include_traffic": { "type": "boolean", "description": "Include active nearby agent traffic in response", "default": true },
                         "compact": { "type": "boolean", "description": "If true, all entities returned as SignatureOnly (~2-5KB). If false (default), focal gets FullBody, deps get SignatureOnly, transitive get NameAndKind.", "default": false }
                     },
-                    "required": ["entity_id"]
+                    "anyOf": [
+                        { "required": ["entity_id"] },
+                        { "required": ["entities"] },
+                        { "required": ["question"] }
+                    ]
                 }),
             },
             ToolDefinition {

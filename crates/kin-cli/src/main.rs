@@ -212,17 +212,26 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Build a context pack for an entity
+    /// Build a context pack for one entity, several, or a question
     Context {
-        /// Entity name or ID
-        entity: String,
+        /// Entity names or IDs. A name that has twins in the store can pin the
+        /// one it means: `Name@file`, `Name@file:line`, `Name#Kind`
+        #[arg(value_name = "ENTITY")]
+        entities: Vec<String>,
+        /// Build the pack from the entities this question ranks for, through
+        /// kin's own locate ranking
+        #[arg(long, value_name = "TEXT")]
+        question: Option<String>,
         /// Token budget (8k, 16k, 32k, or custom number)
         #[arg(short, long, default_value = "8k")]
         budget: String,
         /// Assistant hint for tuning context pack strategy
         #[arg(long)]
         assistant: Option<String>,
-        /// Emit the resolved target and the whole context pack as JSON
+        /// Most focal entities a question may resolve to
+        #[arg(long, value_name = "N")]
+        max_focals: Option<usize>,
+        /// Emit the resolved targets and the whole context pack as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -2812,11 +2821,16 @@ fn run() -> Result<()> {
                     json,
                 } => commands::impact::run(entity, depth, file, kind, signature, json).await,
                 Command::Context {
-                    entity,
+                    entities,
+                    question,
                     budget,
                     assistant,
+                    max_focals,
                     json,
-                } => commands::context::run(entity, budget, assistant, json).await,
+                } => {
+                    commands::context::run(entities, question, budget, assistant, max_focals, json)
+                        .await
+                }
                 Command::ContextbenchLocate {
                     task_file,
                     json,
