@@ -17,6 +17,7 @@ pub mod embed_model;
 pub mod entity_identity;
 pub mod entity_ref;
 pub mod model_residency;
+pub mod open_files;
 pub mod output_style;
 pub mod profile;
 pub mod progress;

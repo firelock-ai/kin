@@ -2712,6 +2712,11 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // Raise this process's open-file soft limit before anything opens a file.
+    // macOS ships that limit at 256, which is below what one admission needs,
+    // so on a stock Mac `kin init` died on the first real repository a person
+    // tried. Silent either way, and it never lowers a limit an operator raised.
+    kin_core::file_limit::raise_open_file_limit();
     // Select this process's resource profile before anything reads it: the GPU
     // kernel plan and the Metal submission depth are each resolved once per
     // process, and mutating the environment is only safe while the process is

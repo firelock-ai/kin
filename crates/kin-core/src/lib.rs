@@ -21,6 +21,7 @@ pub mod entry_points;
 pub mod env_registry;
 pub mod error;
 pub mod exact_tree;
+pub mod file_limit;
 pub mod git_init;
 pub mod hooks;
 pub mod hydration_semantics;
