@@ -132,6 +132,29 @@ export function planPromotion(
   return { promote, waiting, foreign, overdue, alarm };
 }
 
+// One gate refusal, rendered safely into one Markdown table cell.
+//
+// The reason is data: it comes from whatever the proof gate said, which is a
+// sentence assembled from a record on an append-only branch. Two characters in
+// it break the table it lands in, and escaping only one of them is worse than
+// escaping neither.
+//
+// Backslash FIRST, then pipe, and both in a single pass so the escapes this
+// adds cannot themselves be escaped. A reason containing `a\|b` escaped for the
+// pipe alone becomes `a\\|b`, which Markdown renders as a literal backslash
+// followed by an unescaped delimiter, and the row silently gains a column.
+// Found by CodeQL on this pull request, not by a test, which is why the test
+// beneath it now uses that exact input.
+//
+// Whitespace collapses last. A gate message may carry a newline, and a newline
+// inside a table row ends the row.
+function tableCell(text) {
+  return String(text ?? '')
+    .replace(/[\\|]/g, '\\$&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export function buildBody(overdue, { alarmAfterMinutes = DEFAULT_ALARM_AFTER_MINUTES } = {}) {
   const lines = [
     `These releases are published, are not GitHub Latest, and have been waiting more than ${alarmAfterMinutes} minutes for first-contact proof.`,
@@ -143,7 +166,7 @@ export function buildBody(overdue, { alarmAfterMinutes = DEFAULT_ALARM_AFTER_MIN
   ];
   for (const entry of overdue) {
     const waited = entry.minutes === null ? 'unknown' : `${Math.floor(entry.minutes)} min`;
-    lines.push(`| \`${entry.tag}\` | ${waited} | ${entry.reason.replace(/\|/g, '\\|')} |`);
+    lines.push(`| \`${entry.tag}\` | ${waited} | ${tableCell(entry.reason)} |`);
   }
   lines.push(
     '',

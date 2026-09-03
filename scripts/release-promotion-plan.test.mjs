@@ -150,10 +150,41 @@ test('buildBody names every overdue tag and what the gate said about it', () => 
   assert.match(body, /incomplete stranger arm/);
   assert.match(body, /400 min/);
   assert.match(body, /unknown/);
-  // The reason is data from a gate, and a pipe in it would silently break the
-  // table it is rendered into.
-  assert.match(buildBody([{ tag: 'v1.0.0', reason: 'a | b', minutes: 400 }]), /a \\\| b/);
   assert.match(body, /closes itself/);
+});
+
+// The reason is data. It comes from whatever the proof gate said about a record
+// on an append-only branch, and two characters in it break the table it lands
+// in. CodeQL found the first version of this escaping incomplete on the pull
+// request that introduced it, so the inputs here are the ones that broke it.
+test('buildBody renders a gate refusal into one table cell whatever it contains', () => {
+  const row = (reason) =>
+    buildBody([{ tag: 'v1.0.0', reason, minutes: 400 }])
+      .split('\n')
+      .find((line) => line.startsWith('| `v1.0.0`'));
+
+  // A bare pipe: one escape, one cell.
+  assert.equal(row('a | b'), '| `v1.0.0` | 400 min | a \\| b |');
+
+  // A backslash BEFORE a pipe. Escaping the pipe alone turns this into a
+  // literal backslash followed by an unescaped delimiter, and the row silently
+  // gains a column. Both characters have to be escaped in one pass.
+  assert.equal(row('a\\|b'), '| `v1.0.0` | 400 min | a\\\\\\|b |');
+
+  // A newline inside a table row ends the row.
+  assert.equal(row('line one\nline two'), '| `v1.0.0` | 400 min | line one line two |');
+
+  // Every rendered row has exactly the four pipes of a three-column row, so a
+  // cell can never smuggle in a fifth.
+  for (const reason of ['a | b', 'a\\|b', 'line one\nline two', '|||', '\\\\']) {
+    const rendered = row(reason);
+    const unescaped = rendered.replace(/\\./g, '');
+    assert.equal(
+      unescaped.split('|').length - 1,
+      4,
+      `reason ${JSON.stringify(reason)} rendered ${JSON.stringify(rendered)}`,
+    );
+  }
 });
 
 test('the alarm title names the condition and never a tag', () => {
