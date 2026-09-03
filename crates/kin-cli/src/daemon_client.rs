@@ -12497,6 +12497,33 @@ mod tests {
             .expect("spawn a live stand-in for a kin command still starting a daemon")
     }
 
+    /// How long a just-spawned child may take to exec its image before the test
+    /// calls the wait a failure. Generous against a loaded CI runner; the wait
+    /// returns the moment the image changes, so a fast box pays a few
+    /// milliseconds.
+    #[cfg(unix)]
+    const EXEC_SETTLE_BOUND: Duration = Duration::from_secs(10);
+
+    /// Polls the image reader until the process at `pid` is running an image that
+    /// is not kin-named, or the bound passes. Between fork and exec a child still
+    /// wears its parent's image, and this test binary is kin-named, so a reader
+    /// that asks too early sees a kin process where a foreign one is about to be.
+    /// The wait uses the same reader the assertion does, so what it waits for is
+    /// exactly what the assertion then reads.
+    #[cfg(unix)]
+    fn wait_until_image_is_not_ours(pid: u32) -> bool {
+        let deadline = std::time::Instant::now() + EXEC_SETTLE_BOUND;
+        loop {
+            if startup_lock_holder_is_foreign(pid) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Instant in an ordinary run; a process that waits when a parent test asked
     /// for one. It never touches a store, a lock or a daemon.
     #[cfg(unix)]
@@ -12540,6 +12567,21 @@ mod tests {
             .spawn()
             .expect("spawn a live process running an image that is not ours");
         let foreign_pid = foreign.id();
+        // `spawn` returns as soon as the child exists, and on Linux the child
+        // exists before it has exec'd: until then `/proc/<pid>/exe` still names
+        // this test binary, which is kin-named, so a reader that looks at once
+        // sees a kin image on a process that is about to become `sleep`. That
+        // window reddened two shards on 2026-09-03. Wait for the exec to land
+        // before asking the question the assertion is about.
+        if !wait_until_image_is_not_ours(foreign_pid) {
+            // Reap before failing, or the sleep outlives the test as a leak.
+            let _ = foreign.kill();
+            let _ = foreign.wait();
+            panic!(
+                "the spawned sleep never left this test binary's image within {:?}",
+                EXEC_SETTLE_BOUND
+            );
+        }
         std::fs::write(&lock, format!("pid={foreign_pid} acquired_at=now\n")).unwrap();
         assert!(
             startup_lock_holder_is_foreign(foreign_pid),
