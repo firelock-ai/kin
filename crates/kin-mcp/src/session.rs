@@ -305,6 +305,69 @@ impl CommitRefusal {
     }
 }
 
+/// Most operations one transaction may hold, across every stage call it takes.
+///
+/// A transaction is an in-memory `Vec` that the daemon also mirrors to disk in
+/// whole on every stage, so an uncapped staged set is both a memory and an IO
+/// amplifier: N stage calls of one operation each cost O(N^2) bytes written.
+/// The cap is what makes that rewrite bounded work rather than unbounded work,
+/// which is the honest fix while the persisted shape stays a whole-map JSON
+/// document.
+///
+/// Sized against real work rather than against the attack: a thousand-file
+/// refactor is a large but reachable change, and nothing in this repository's
+/// own acceptance suites stages more than a handful.
+pub const MAX_STAGED_OPERATIONS_PER_TRANSACTION: usize = 1_024;
+
+/// Most bytes one transaction's staged set may hold, measured on the serialized
+/// operations because that is what the whole-map rewrite actually writes.
+///
+/// Source-edit operations carry a whole file's new text in `body`, so the byte
+/// ceiling and the count ceiling bound different attacks: a thousand tiny
+/// operations, and one operation carrying a gigabyte.
+pub const MAX_STAGED_BYTES_PER_TRANSACTION: usize = 32 * 1024 * 1024;
+
+/// Most unfinished transactions one session may hold at once.
+///
+/// The per-transaction ceilings above bound one transaction; without this a
+/// session opens transactions in a loop and multiplies them. Together the three
+/// put a session's worst case at 8 x 32 MiB of staged bytes, which is a number
+/// an operator can reason about instead of "however much the caller sends".
+pub const MAX_ACTIVE_TRANSACTIONS_PER_SESSION: usize = 8;
+
+/// The serialized size of one staged operation, which is what a whole-map
+/// rewrite pays for it.
+///
+/// An operation that cannot serialize is charged its `body` length rather than
+/// zero: a payload the byte ceiling cannot measure must not therefore be free.
+pub fn staged_operation_bytes(operation: &McpMutationOperation) -> usize {
+    serde_json::to_vec(operation).map_or_else(
+        |_| operation.body.as_ref().map_or(0, String::len),
+        |bytes| bytes.len(),
+    )
+}
+
+/// The serialized size of a whole staged set.
+pub fn staged_operations_bytes(operations: &[McpMutationOperation]) -> usize {
+    operations.iter().map(staged_operation_bytes).sum()
+}
+
+/// Whether a transaction in this state still holds work: it can accept a stage,
+/// or it is fenced mid-commit. Committed and aborted transactions hold nothing.
+pub fn is_unfinished_transaction_state(state: &str) -> bool {
+    matches!(state, "active" | "validated" | "committing")
+}
+
+/// Whether a transaction in this state may be collected as an orphan.
+///
+/// `committing` is deliberately excluded even though it is unfinished. That
+/// state IS the restart fence: its payload digest is what lets a resumed commit
+/// tell an idempotent receipt recovery from a changed payload, and collecting it
+/// would strand exactly the case the fence exists to survive.
+pub fn is_expirable_transaction_state(state: &str) -> bool {
+    matches!(state, "active" | "validated")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpTransaction {
     pub transaction_id: String,
@@ -321,6 +384,19 @@ pub struct McpTransaction {
     /// transactions carry no digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_payload_hash: Option<String>,
+    /// When this transaction last had a lifecycle call made against it.
+    ///
+    /// Every transaction is owned by a session, and a session that dies is
+    /// reaped by the daemon's sweeper while its transactions are not, so an
+    /// abandoned transaction used to sit in the durable map for the life of the
+    /// install. This is what lets the daemon collect an orphan without touching
+    /// one whose owner is still working: it is refreshed by begin, stage,
+    /// validate and clear, so only a transaction nobody has spoken to ages.
+    ///
+    /// Defaulted to now on deserialize so a map persisted before this field
+    /// existed is read as freshly active rather than as instantly expired.
+    #[serde(default = "Timestamp::now")]
+    pub last_activity_at: Timestamp,
 }
 
 /// Linearized outcome of an in-process intent registration attempt.
@@ -1444,6 +1520,27 @@ impl SessionRegistry {
                  through a long read phase."
             ));
         }
+        let mut map = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        // The per-transaction ceilings bound one transaction's staged set. This
+        // is what stops a caller from multiplying that bound by opening
+        // transactions in a loop, and it counts only the unfinished ones: a
+        // committed or aborted transaction holds nothing and must not consume a
+        // slot the session needs to keep working.
+        let unfinished = map
+            .values()
+            .filter(|tx| tx.session_id == session_id && is_unfinished_transaction_state(&tx.state))
+            .count();
+        if unfinished >= MAX_ACTIVE_TRANSACTIONS_PER_SESSION {
+            return Err(format!(
+                "transaction_limit_exceeded: session {session_id} already holds {unfinished} \
+                 unfinished transaction(s), the per-session maximum of \
+                 {MAX_ACTIVE_TRANSACTIONS_PER_SESSION}. Commit or abort one with \
+                 kin_transaction_commit or kin_transaction_abort before beginning another."
+            ));
+        }
         let transaction_id = EntityId::new().to_string();
         let transaction = McpTransaction {
             transaction_id: transaction_id.clone(),
@@ -1452,12 +1549,10 @@ impl SessionRegistry {
             state: "active".to_string(),
             staged_operations: Vec::new(),
             commit_payload_hash: None,
+            last_activity_at: Timestamp::now(),
         };
 
-        self.transactions
-            .lock()
-            .expect("transactions lock poisoned")
-            .insert(transaction_id, transaction.clone());
+        map.insert(transaction_id, transaction.clone());
 
         Ok(transaction)
     }
@@ -1478,7 +1573,33 @@ impl SessionRegistry {
                     transaction_id, tx.state
                 ));
             }
+            // Both ceilings are checked against what the set WOULD hold, before
+            // anything is appended, so a refusal leaves the transaction exactly
+            // as the caller last saw it and a corrected stage can follow.
+            let staged = tx.staged_operations.len();
+            let incoming = operations.len();
+            if staged.saturating_add(incoming) > MAX_STAGED_OPERATIONS_PER_TRANSACTION {
+                return Err(format!(
+                    "staged_operation_limit_exceeded: transaction {transaction_id} holds \
+                     {staged} staged operation(s) and this call would add {incoming}, past the \
+                     per-transaction maximum of {MAX_STAGED_OPERATIONS_PER_TRANSACTION}. Nothing \
+                     was staged. Commit this transaction and begin another for the remainder."
+                ));
+            }
+            // Measured on the serialized operations because a whole-map rewrite
+            // is what the daemon pays per stage, and that is what it writes.
+            let staged_bytes = staged_operations_bytes(&tx.staged_operations);
+            let incoming_bytes = staged_operations_bytes(&operations);
+            if staged_bytes.saturating_add(incoming_bytes) > MAX_STAGED_BYTES_PER_TRANSACTION {
+                return Err(format!(
+                    "staged_byte_limit_exceeded: transaction {transaction_id} holds \
+                     {staged_bytes} staged byte(s) and this call would add {incoming_bytes}, past \
+                     the per-transaction maximum of {MAX_STAGED_BYTES_PER_TRANSACTION}. Nothing \
+                     was staged. Commit this transaction and begin another for the remainder."
+                ));
+            }
             tx.staged_operations.extend(operations);
+            tx.last_activity_at = Timestamp::now();
             Ok(tx.clone())
         } else {
             Err(format!("Transaction not found: {}", transaction_id))
@@ -1501,6 +1622,7 @@ impl SessionRegistry {
                 ));
             }
             tx.state = "validated".to_string();
+            tx.last_activity_at = Timestamp::now();
             Ok(tx.clone())
         } else {
             Err(format!("Transaction not found: {}", transaction_id))
@@ -1564,6 +1686,7 @@ impl SessionRegistry {
         let cleared = std::mem::take(&mut tx.staged_operations);
         tx.state = "active".to_string();
         tx.commit_payload_hash = None;
+        tx.last_activity_at = Timestamp::now();
         Ok(cleared)
     }
 
@@ -2286,6 +2409,184 @@ mod tests {
                 }],
             )
             .unwrap()
+    }
+
+    /// One tiny staged operation, so a count-cap test measures the count
+    /// rather than the bytes.
+    fn tiny_operation(index: usize) -> McpMutationOperation {
+        McpMutationOperation {
+            verb: "update".to_string(),
+            target: format!("entity-{index}"),
+            payload: None,
+            body: Some("x".to_string()),
+            description: String::new(),
+            destination: None,
+        }
+    }
+
+    #[test]
+    fn staging_refuses_past_the_operation_count_cap_and_keeps_the_set_intact() {
+        let registry = SessionRegistry::new();
+        registry.register("sess-1", "test");
+        let tx = registry.begin_transaction("sess-1", "src/lib.rs").unwrap();
+
+        // The control: the cap itself stages. A ceiling that refuses AT the
+        // ceiling is a different bug wearing this test's costume.
+        let filled: Vec<_> = (0..MAX_STAGED_OPERATIONS_PER_TRANSACTION)
+            .map(tiny_operation)
+            .collect();
+        let staged = registry
+            .stage_transaction(&tx.transaction_id, filled)
+            .expect("staging exactly the cap must succeed");
+        assert_eq!(
+            staged.staged_operations.len(),
+            MAX_STAGED_OPERATIONS_PER_TRANSACTION
+        );
+
+        let error = registry
+            .stage_transaction(&tx.transaction_id, vec![tiny_operation(9_999)])
+            .expect_err("one operation past the cap must be refused");
+        assert!(
+            error.contains("staged_operation_limit_exceeded"),
+            "a refusal must be findable by name, not by prose: {error}"
+        );
+        assert!(
+            error.contains(&MAX_STAGED_OPERATIONS_PER_TRANSACTION.to_string()),
+            "a refusal must name the ceiling it enforced: {error}"
+        );
+        let stored = registry.get_transaction(&tx.transaction_id).unwrap();
+        assert_eq!(
+            stored.staged_operations.len(),
+            MAX_STAGED_OPERATIONS_PER_TRANSACTION,
+            "a refused stage must leave the transaction exactly as the caller \
+             last saw it, so a corrected stage can follow"
+        );
+    }
+
+    #[test]
+    fn staging_refuses_past_the_byte_cap_however_few_operations_carry_it() {
+        let registry = SessionRegistry::new();
+        registry.register("sess-1", "test");
+        let tx = registry.begin_transaction("sess-1", "src/lib.rs").unwrap();
+
+        // The control: a real whole-file body stages, so this proves the byte
+        // ceiling rather than a refusal of every operation carrying a body.
+        registry
+            .stage_transaction(
+                &tx.transaction_id,
+                vec![McpMutationOperation {
+                    verb: "replace".to_string(),
+                    target: "src/big.rs".to_string(),
+                    payload: None,
+                    body: Some("z".repeat(64 * 1024)),
+                    description: String::new(),
+                    destination: None,
+                }],
+            )
+            .expect("a 64 KiB file body is ordinary work and must stage");
+
+        let error = registry
+            .stage_transaction(
+                &tx.transaction_id,
+                vec![McpMutationOperation {
+                    verb: "replace".to_string(),
+                    target: "src/huge.rs".to_string(),
+                    payload: None,
+                    body: Some("z".repeat(MAX_STAGED_BYTES_PER_TRANSACTION + 1)),
+                    description: String::new(),
+                    destination: None,
+                }],
+            )
+            .expect_err("one operation past the byte cap must be refused");
+        assert!(
+            error.contains("staged_byte_limit_exceeded"),
+            "a refusal must be findable by name: {error}"
+        );
+        let stored = registry.get_transaction(&tx.transaction_id).unwrap();
+        assert_eq!(
+            stored.staged_operations.len(),
+            1,
+            "a refused stage must not append: {error}"
+        );
+    }
+
+    #[test]
+    fn a_session_cannot_open_unbounded_transactions_and_finishing_one_frees_a_slot() {
+        let registry = SessionRegistry::new();
+        registry.register("sess-1", "test");
+        let mut opened = Vec::new();
+        for _ in 0..MAX_ACTIVE_TRANSACTIONS_PER_SESSION {
+            opened.push(
+                registry
+                    .begin_transaction("sess-1", "src/lib.rs")
+                    .expect("beginning up to the cap must succeed"),
+            );
+        }
+        let error = registry
+            .begin_transaction("sess-1", "src/lib.rs")
+            .expect_err("one transaction past the cap must be refused");
+        assert!(
+            error.contains("transaction_limit_exceeded"),
+            "a refusal must be findable by name: {error}"
+        );
+
+        // A second session is unaffected: this is a per-session ceiling, and a
+        // global one would let any agent lock out every other agent.
+        registry.register("sess-2", "test");
+        registry
+            .begin_transaction("sess-2", "src/lib.rs")
+            .expect("the ceiling is per session, not per daemon");
+
+        // The control: the slot is held by unfinished work, so finishing frees
+        // it. Without this the cap would be a lifetime quota.
+        registry
+            .abort_transaction(&opened[0].transaction_id)
+            .unwrap();
+        registry
+            .begin_transaction("sess-1", "src/lib.rs")
+            .expect("aborting an unfinished transaction must free its slot");
+    }
+
+    #[test]
+    fn staging_refreshes_the_activity_stamp_the_daemon_collects_orphans_on() {
+        let registry = SessionRegistry::new();
+        registry.register("sess-1", "test");
+        let tx = registry.begin_transaction("sess-1", "src/lib.rs").unwrap();
+        // Backdate through the registry's own map so the refresh is what moves
+        // the stamp, rather than the clock being read twice in one microsecond.
+        // Parsed from the wire form because that is also the shape a persisted
+        // transaction is restored through.
+        let backdated: Timestamp = serde_json::from_str("\"2020-01-01T00:00:00Z\"")
+            .expect("a wire timestamp must parse into the stamp the record carries");
+        registry.replace_transactions(vec![McpTransaction {
+            last_activity_at: backdated.clone(),
+            ..tx.clone()
+        }]);
+
+        let staged = registry
+            .stage_transaction(&tx.transaction_id, vec![tiny_operation(0)])
+            .unwrap();
+        assert!(
+            staged.last_activity_at > backdated,
+            "a stage is activity, and a transaction being worked on must not age"
+        );
+        assert!(
+            is_expirable_transaction_state(&staged.state),
+            "an active transaction is collectable when orphaned"
+        );
+        assert!(
+            !is_expirable_transaction_state("committing"),
+            "the commit fence is never collected, or a resumed commit is stranded"
+        );
+        assert!(
+            is_unfinished_transaction_state("committing"),
+            "a fenced commit still holds work, so it still occupies a session slot"
+        );
+        assert!(
+            !is_unfinished_transaction_state("committed")
+                && !is_unfinished_transaction_state("aborted"),
+            "a terminal transaction holds nothing and must not occupy a slot"
+        );
     }
 
     #[test]

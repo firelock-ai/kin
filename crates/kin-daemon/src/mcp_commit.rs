@@ -6353,6 +6353,7 @@ mod tests {
                 destination: None,
             }],
             commit_payload_hash: None,
+            last_activity_at: kin_model::timestamp::Timestamp::now(),
         };
         assert_eq!(
             transaction_payload_hash(&transaction(left)).unwrap(),

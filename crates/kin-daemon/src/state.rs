@@ -17110,6 +17110,7 @@ mod tests {
                 state: "active".to_string(),
                 staged_operations: Vec::new(),
                 commit_payload_hash: None,
+                last_activity_at: kin_model::timestamp::Timestamp::now(),
             },
         );
         write_persisted_mcp_transactions(&layout, &store);
