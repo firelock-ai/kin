@@ -43,7 +43,18 @@ jobs:
     name: Promote proven releases to Latest
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    environment: release
+    # release-tag, not release, and the difference is load-bearing rather than
+    # cosmetic. The `release` environment's deployment branch policy admits
+    # `tag: v*.*.*` ONLY, so a job reaching it from a scheduled run on main is
+    # refused by the server before a step executes, every fifteen minutes,
+    # forever. `release-tag` admits `branch: main`, which is exactly the policy
+    # an automatic controller running from protected main needs, and it is what
+    # release-cut.yml's three credentialed jobs already use for the same reason.
+    #
+    # Found by reading the two policies rather than by reasoning about the
+    # names. Nothing in this file would have hinted at it, and the failure would
+    # have arrived on a release night.
+    environment: release-tag
     permissions:
       # One release flip and one body edit.
       contents: write

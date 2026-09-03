@@ -1306,6 +1306,37 @@ def assert_stranger_driver_credential_is_either(release_cut: str) -> None:
         )
 
 
+# The `release` environment's deployment branch policy admits tag: v*.*.* and
+# nothing else, so a job that reaches it from a branch is refused by the server
+# before a step runs. That is invisible in the workflow file and fatal on a
+# schedule, where the refusal repeats every cycle forever.
+#
+# The policies themselves live in repository settings and cannot be read from
+# the tree, so this asserts the rule the tree CAN carry: a workflow that fires
+# on a schedule or a repository_dispatch runs from a branch, and must not
+# declare the tag-only environment.
+TAG_ONLY_ENVIRONMENT = "release"
+BRANCH_ENVIRONMENT = "release-tag"
+
+
+def assert_branch_triggered_workflows_avoid_the_tag_environment(
+    workflows: dict[Path, str],
+) -> None:
+    for path, source in workflows.items():
+        head = source.split("\njobs:", 1)[0]
+        if "schedule:" not in head and "repository_dispatch:" not in head:
+            continue
+        for line in active_lines(source):
+            if line == f"environment: {TAG_ONLY_ENVIRONMENT}":
+                raise AssertionError(
+                    f"{path.name} can fire from a branch and declares "
+                    f"environment: {TAG_ONLY_ENVIRONMENT}, whose deployment "
+                    f"branch policy admits tags alone; use "
+                    f"{BRANCH_ENVIRONMENT}, which admits main, or the job is "
+                    "refused before any step runs"
+                )
+
+
 def expect_assertion(
     label: str,
     expected_error: str,
@@ -16598,6 +16629,19 @@ def main() -> None:
     # The two-tier proof contract, and a falsification arm per direction it
     # could collapse. Each mutant is the smallest edit that would actually be
     # made by someone "tidying up", not a syntactic wreck.
+    assert_branch_triggered_workflows_avoid_the_tag_environment(workflow_sources)
+    expect_assertion(
+        "a scheduled workflow reaches the tag-only release environment",
+        "whose deployment branch policy admits tags alone",
+        lambda mutant={
+            **workflow_sources,
+            WORKFLOWS / "release-promote.yml": (
+                WORKFLOWS / "release-promote.yml"
+            ).read_text(encoding="utf-8").replace(
+                "environment: release-tag", "environment: release", 1
+            ),
+        }: assert_branch_triggered_workflows_avoid_the_tag_environment(mutant),
+    )
     assert_stranger_driver_credential_is_either(release_cut)
     expect_assertion(
         "the cut demands an API key even when a local model drives",
