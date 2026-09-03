@@ -5043,6 +5043,48 @@ mod tests {
         );
     }
 
+    /// The holder is what separates the daemon's own bootstrap from an
+    /// operator's rollout, and this is the case that makes it carry that weight
+    /// alone. The test above differs from a startup lease in BOTH the holder and
+    /// the request id, so it cannot see the holder clause at all: the request id
+    /// refuses the input one step earlier, and deleting the holder check leaves
+    /// it green. An operator picks its own request id and nothing stops it
+    /// choosing the startup one, which is precisely why the holder is checked.
+    #[test]
+    fn an_operator_rollout_reusing_the_startup_request_id_is_still_not_startup() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let daemon = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let bootstrap = daemon
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&daemon, &bootstrap);
+
+        // Every startup identifier matches except the holder.
+        let operator = daemon
+            .acquire_rollout(rollout_request(
+                "deploy",
+                STARTUP_BOOTSTRAP_REQUEST_ID,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(operator.request_id, STARTUP_BOOTSTRAP_REQUEST_ID);
+        assert_ne!(operator.holder, STARTUP_BOOTSTRAP_HOLDER);
+        clock.advance(MAX_ROLLOUT_LEASE_SECONDS as i64 + 1);
+
+        let unchanged = daemon.status().unwrap();
+        assert!(
+            daemon.bootstrap_runtime_if_absent().unwrap().is_none(),
+            "startup recovery must not adopt a lease an operator holds"
+        );
+        assert_eq!(daemon.status().unwrap(), unchanged);
+        assert_eq!(
+            daemon.status().unwrap().active_lease.unwrap().fence,
+            operator.fence
+        );
+    }
+
     #[test]
     fn duplicate_rollout_retry_cannot_run_a_second_generation_fence() {
         let store = Arc::new(InMemoryPublicationControlStore::default());
