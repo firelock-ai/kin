@@ -2611,6 +2611,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Measured across eleven consecutive main pushes on 2026-09-03: the
+      # disk, not the code, is what ends this job. A hosted ubuntu runner carries tens of gigabytes of Android, .NET,
+      # GHC and CodeQL toolchains that no kin build touches, and tarpaulin's
+      # instrumented debug build of the whole workspace does not fit in what is
+      # left. The two deaths are one cause. `rust-lld` mmaps its output, so a
+      # write with no blocks behind it arrives as `ld terminated with signal 7
+      # [Bus error]` and reads as a compiler crash; or the runner's worker hits
+      # `No space left on device` writing its own log and takes the job with
+      # it. The `df` on both sides is what lets the next reader see a near miss
+      # instead of inferring one from a linker signal.
+      #
+      # `continue-on-error` because a reclaim that does not apply on some future
+      # runner image is not a reason to stop a build. The script already exits 0
+      # on every path it can reach; this covers the paths it cannot.
+      - name: Free runner disk
+        continue-on-error: true
+        run: bash scripts/ci-free-disk.sh
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
@@ -2641,16 +2659,58 @@ jobs:
         with:
           tool: cargo-tarpaulin
 
+      # The exit-0 contract here is unchanged from main. Tarpaulin is
+      # non-blocking for the public alpha and this change neither hardens nor
+      # softens that; hardening it belongs after a run proves tarpaulin can
+      # finish, which none of the 39 sampled runs did. What is new is that a
+      # failure now says WHICH failure it was. A tarpaulin nonzero next to a
+      # near-empty disk is a runner infrastructure failure and says so by name,
+      # rc=124 is the 30m bound rather than a defect, and anything else keeps
+      # the alpha warning.
+      #
+      # This can only speak when the step itself survives. When the disk kills
+      # the runner's worker process instead, no step-level line is ever written,
+      # which is why freeing the disk above is the fix and this is the report.
       - name: Run coverage
         run: |
-          if ! timeout 30m cargo tarpaulin --out xml --out stdout; then
-            echo "::warning::Tarpaulin is currently non-blocking in CI for the public alpha."
+          # Two GiB. Below this the next link or report write is what fails, so
+          # a tarpaulin nonzero here is the disk and not the code.
+          disk_floor_kb=2097152
+          rc=0
+          timeout 30m cargo tarpaulin --out xml --out stdout || rc=$?
+          free_kb="$(df -Pk . | awk 'NR == 2 { print $4 }')"
+          if [ -z "$free_kb" ]; then
+            echo "::warning::could not read free disk after the coverage run"
+            free_kb=-1
+          else
+            awk -v k="$free_kb" 'BEGIN { printf "coverage: %.1f GiB free after the run\n", k / 1048576 }'
+          fi
+          if [ "$rc" -ne 0 ]; then
+            if [ "$free_kb" -ge 0 ] && [ "$free_kb" -lt "$disk_floor_kb" ]; then
+              echo "::error::runner out of disk: tarpaulin exited $rc with under 2 GiB free. This is a runner infrastructure failure, not a coverage regression."
+            elif [ "$rc" -eq 124 ]; then
+              echo "::warning::Tarpaulin exceeded its 30m bound (rc=124) with disk to spare, so the bound is what stopped it."
+            else
+              echo "::warning::Tarpaulin is currently non-blocking in CI for the public alpha (rc=$rc)."
+            fi
           fi
 
+      # `continue-on-error` here so an upload that fails concludes with a named
+      # cause rather than leaving a null step behind a dead job.
+      #
+      # `disable_search` because without it this step is not merely useless when
+      # tarpaulin wrote nothing, it is wrong. Read on the green run at
+      # c99d9065a: `not_found_files: ["cobertura.xml"]`, and then the action
+      # walked the tree, decided eleven paths whose names happen to contain
+      # "coverage" were coverage files, and uploaded those. Two were fingerprint
+      # JSON out of target/debug and three were Rust sources. The setting
+      # confines this step to the file it was pointed at.
       - name: Upload coverage reports to Codecov
+        continue-on-error: true
         uses: codecov/codecov-action@v7
         with:
           files: cobertura.xml
+          disable_search: true
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: firelock-ai/kin
           fail_ci_if_error: false
