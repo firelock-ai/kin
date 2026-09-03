@@ -141,6 +141,58 @@ test('one archive sha256 claimed by two targets is refused', () => {
   assert.throws(() => mergeRecords(entries(twin, macos()), SHA), /claimed by kin-linux-aarch64 and kin-macos-aarch64/);
 });
 
+test('one commit read on a macOS and a Linux runner is one tooling', () => {
+  // Regression, run 33700686594 on 2026-09-03. The publisher ran for the first
+  // time ever and refused three green legs of 54dc78e3b because the macOS
+  // runner's checkout is /Users/runner/work/kin/kin and the Linux runners' is
+  // /home/runner/work/kin/kin. These are the exact values read off that run's
+  // three leg records; both sha256 fields were already identical.
+  const ported = '0c469d2871a1a6b02944a2ddc5f12482a1556af4179f8f66bbfa018443ee2878';
+  const at = (home) => ({
+    source: `${home}/runner/work/kin/kin @ 54dc78e3b7ab41b1cac12bf95aa345fbf57eca39`,
+    validator_ported_from_sha256: ported,
+    workflow_sha256_at_ref: ported,
+  });
+  const mac = macos();
+  mac.tooling = at('/Users');
+  const linux = record([leg('kin-linux-aarch64', 'd'.repeat(64))], { tooling: at('/home') });
+  const { merged } = mergeRecords(entries(mac, linux), SHA);
+  assert.equal(merged.legs.length, 2);
+  // No runner's own directory may stand for a record spanning three of them,
+  // and the ref they agreed on is what identified the tooling in the first place.
+  assert.equal(merged.tooling.source, '2 checkouts @ 54dc78e3b7ab41b1cac12bf95aa345fbf57eca39');
+  assert.equal(merged.tooling.validator_ported_from_sha256, ported);
+  assert.equal(merged.tooling.workflow_sha256_at_ref, ported);
+});
+
+test('one checkout keeps its source verbatim, so a single-host merge is unchanged', () => {
+  const { merged } = mergeRecords(entries(macos()), SHA);
+  assert.equal(merged.tooling.source, '/w @ HEAD');
+});
+
+test('two working trees name no ref, so they are not assumed to be one tooling', () => {
+  const other = macos();
+  const mine = record([leg('kin-linux-aarch64', 'd'.repeat(64))], {
+    tooling: { ...other.tooling, source: '/elsewhere (working tree)' },
+  });
+  other.tooling = { ...other.tooling, source: '/w (working tree)' };
+  assert.throws(() => mergeRecords(entries(other, mine), SHA), /different tooling/);
+});
+
+test('a differing ref is still different tooling, and the message names both', () => {
+  const other = macos();
+  const mine = record([leg('kin-linux-aarch64', 'd'.repeat(64))], {
+    tooling: { ...other.tooling, source: '/home/runner/work/kin/kin @ HEAD~1' },
+  });
+  other.tooling = { ...other.tooling, source: '/Users/runner/work/kin/kin @ HEAD' };
+  assert.throws(
+    () => mergeRecords(entries(other, mine), SHA),
+    (error) => /different tooling/.test(error.message)
+      && error.message.includes('HEAD~1')
+      && error.message.includes('HEAD'),
+  );
+});
+
 test('records from different tooling do not merge into one answer', () => {
   const other = arm();
   other.tooling = { ...other.tooling, validator_ported_from_sha256: 'f'.repeat(64) };

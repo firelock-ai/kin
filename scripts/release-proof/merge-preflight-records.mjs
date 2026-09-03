@@ -102,6 +102,40 @@ export function admitLegRecord(record, candidate, where) {
   return legs;
 }
 
+// `tooling.source` is `<checkout> @ <ref>`, and the checkout is where the
+// tooling was READ, not what it is. Hosted, one candidate is judged on three
+// runners, and a macOS runner's checkout is /Users/runner/work/kin/kin while a
+// Linux runner's is /home/runner/work/kin/kin. Comparing the raw field called
+// three legs of one commit "different tooling" and refused to merge them, which
+// on 2026-09-03 failed run 33700686594 with all three legs green on
+// 54dc78e3b7ab41b1cac12bf95aa345fbf57eca39 and both sha256 fields identical.
+//
+// The identity is the ref and the hashes. A source with no ` @ ` is a working
+// tree, which names no ref, so it stays compared whole: two working trees are
+// not known to be the same bytes.
+function toolingIdentity(tooling) {
+  if (tooling === null || typeof tooling !== 'object') return JSON.stringify(tooling ?? null);
+  const source = typeof tooling.source === 'string' ? tooling.source : null;
+  const at = source === null ? -1 : source.lastIndexOf(' @ ');
+  return JSON.stringify({ ...tooling, source: at === -1 ? source : source.slice(at + 3) });
+}
+
+// Identical sources stay verbatim, so a merge of records from one checkout
+// writes exactly the bytes it wrote before. Where they differ only by checkout
+// directory, no single one of them is true of the merged record, so it names
+// how many checkouts agreed and the ref they agreed on. Deterministic either
+// way: the publisher reads a differing document under a sha that already has
+// one as tampering.
+function mergedTooling(toolings) {
+  const first = toolings[0];
+  const sources = new Set(toolings.map((entry) => (entry && typeof entry === 'object' ? entry.source : null)));
+  if (sources.size === 1) return first;
+  const source = typeof first?.source === 'string' ? first.source : '';
+  const at = source.lastIndexOf(' @ ');
+  const ref = at === -1 ? source : source.slice(at + 3);
+  return { ...first, source: `${sources.size} checkouts @ ${ref}` };
+}
+
 export function mergeRecords(records, candidate) {
   if (!COMMIT_SHA.test(candidate ?? '')) {
     throw new Error(`"${candidate}" is not a 40-character commit sha`);
@@ -149,8 +183,12 @@ export function mergeRecords(records, candidate) {
     tooling.push(JSON.stringify(record.tooling ?? null));
     if (record.cpu_embed !== true) cpuEmbed = false;
   });
-  if (new Set(tooling).size !== 1) {
-    throw new Error('the leg records were produced by different tooling; refusing to merge them into one answer');
+  const identities = new Set(tooling.map((entry) => toolingIdentity(JSON.parse(entry))));
+  if (identities.size !== 1) {
+    throw new Error(
+      'the leg records were produced by different tooling; refusing to merge them into one answer: ' +
+      [...identities].sort().join(' vs '),
+    );
   }
   const archives = new Map();
   for (const leg of legs) {
@@ -172,7 +210,7 @@ export function mergeRecords(records, candidate) {
     verdict: 'PASS',
     allow_dirty: false,
     cpu_embed: cpuEmbed,
-    tooling: JSON.parse(tooling[0]),
+    tooling: mergedTooling(tooling.map((entry) => JSON.parse(entry))),
     provenance: admittedByEntry.flatMap(({ record }) => (Array.isArray(record.provenance) ? record.provenance : [])),
     skipped: admittedByEntry.flatMap(({ record }) => (Array.isArray(record.skipped) ? record.skipped : [])),
     legs,
