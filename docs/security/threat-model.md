@@ -157,6 +157,17 @@ The daemon-side counterpart of projection, materializing graph-owned files into
 a workspace for a session or an exec request, runs within the same-user
 daemon trust boundary described above.
 
+Preload interposition is not the only projection surface Kin ships. The macOS
+release builds `kin-vfs` with `--features nfs` and the Linux release with
+`--features fuse` (`.github/workflows/release.yml`), so `kin mode nfs` and
+`kin mode fuse` present the graph through a mount the operating system serves
+rather than through a library in one process. A mount is not per-process: the
+NFS export in particular authenticates no client, so every account on the
+machine can read what it serves for as long as it runs. What that export does
+and does not enforce, including the read-only default and where writes are
+contained, is owned by `kin-vfs` and stated in its
+`docs/security/nfs-export.md`.
+
 ## Blob-Store Integrity
 
 Kin stores file and artifact content in a content-addressed blob store (the
