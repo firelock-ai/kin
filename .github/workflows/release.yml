@@ -2524,7 +2524,16 @@ jobs:
       # gap nobody outside this run can see, and a prerelease with no
       # explanation reads as an accident rather than as a decision.
       - name: Record the missing first-contact proof on the release itself
-        if: ${{ steps.proof.outputs.stranger_state == 'pending' }}
+        # Stable tags only. A prerelease TAG is a prerelease because that is
+        # what it is, not because proof is missing, and it never becomes Latest
+        # whatever its record says. Telling a reader that an rc "stays a
+        # prerelease until its record lands" would promise something no path in
+        # this chain delivers.
+        if: >-
+          ${{
+            steps.proof.outputs.stranger_state == 'pending' &&
+            !contains(github.ref_name, '-')
+          }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

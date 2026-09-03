@@ -1189,6 +1189,26 @@ def assert_latest_requires_the_stranger(release: str) -> None:
             "release.yml must record promoted=false when it holds a release, so "
             "a downstream job can tell 'held' from 'this step never ran'"
         )
+    # The pending notice explains why a STABLE release is not Latest. A
+    # prerelease tag is a prerelease because that is what it is, and it never
+    # becomes Latest whatever its record says, so telling its reader that it
+    # "stays a prerelease until its record lands" promises something no path in
+    # this chain delivers.
+    anchor = "      - name: Record the missing first-contact proof on the release itself\n"
+    if release.count(anchor) != 1:
+        raise AssertionError(
+            "release.yml must declare exactly one step recording a missing "
+            "first-contact proof on the release"
+        )
+    start = release.index(anchor)
+    notice = release[start : release.index("\n      - name: ", start + len(anchor))]
+    condition = "\n".join(active_lines(notice))
+    for required in ("stranger_state == 'pending'", "!contains(github.ref_name, '-')"):
+        if required not in condition:
+            raise AssertionError(
+                "the first-contact notice must be written only for a held "
+                f"STABLE release; its condition is missing {required}"
+            )
 
 
 def assert_latest_claims_gate_on_promotion(release: str) -> None:
@@ -16554,6 +16574,16 @@ def main() -> None:
         lambda mutant=release.replace(
             'if [ "$STRANGER_STATE" != complete ]; then',
             'if [ "$STRANGER_STATE" = never ]; then',
+            1,
+        ): assert_latest_requires_the_stranger(mutant),
+    )
+    expect_assertion(
+        "the pending notice is written onto a prerelease tag too",
+        "written only for a held",
+        lambda mutant=release.replace(
+            "            steps.proof.outputs.stranger_state == 'pending' &&\n"
+            "            !contains(github.ref_name, '-')\n",
+            "            steps.proof.outputs.stranger_state == 'pending'\n",
             1,
         ): assert_latest_requires_the_stranger(mutant),
     )
