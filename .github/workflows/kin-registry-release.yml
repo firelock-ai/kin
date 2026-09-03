@@ -231,6 +231,7 @@ jobs:
           set +e
           output="$(python3 .kin-actions/scripts/update-cargo-registry-deps.py \
             --manifest Cargo.toml \
+            --manifest fuzz/Cargo.toml \
             "${crate_args[@]}" 2>&1)"
           code=$?
           set -e
@@ -290,6 +291,7 @@ jobs:
             > "$validator"
           generated="$(python3 "$validator" \
             --manifest Cargo.toml \
+            --manifest fuzz/Cargo.toml \
             --version-mode manual \
             --bump-own-version false \
             --ephemeral-path .kin-actions)"
@@ -309,6 +311,7 @@ jobs:
             > "$validator"
           admission="$(python3 "$validator" \
             --manifest Cargo.toml \
+            --manifest fuzz/Cargo.toml \
             --version-mode manual \
             --bump-own-version false \
             --expected-tree "$EXPECTED_TREE" \
