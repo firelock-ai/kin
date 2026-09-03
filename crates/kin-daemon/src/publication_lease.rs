@@ -344,10 +344,58 @@ pub enum RolloutReleaseDisposition {
     CompletedExact,
 }
 
+/// The rollout lease occupying a publication-control record, as an operator
+/// needs to read it. Whether the lease is still live decides what to do about
+/// it: a live lease has a holder that will finish or lapse on its own, while an
+/// expired one has no holder left to wait for and needs the release route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockingRolloutLease {
+    pub holder: String,
+    pub fence: u64,
+    pub expires_at: DateTime<Utc>,
+    pub expired: bool,
+}
+
+impl BlockingRolloutLease {
+    /// Read a rollout lease as of `now`. Every path that refuses because of a
+    /// rollout builds its refusal from here, so none of them can drift into
+    /// calling a lapsed lease active.
+    pub(crate) fn observe(active: &ActivePublicationLease, now: DateTime<Utc>) -> Self {
+        Self {
+            holder: active.holder.clone(),
+            fence: active.fence,
+            expires_at: active.expires_at,
+            expired: active.expires_at <= now,
+        }
+    }
+}
+
+impl std::fmt::Display for BlockingRolloutLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.expired {
+            write!(
+                formatter,
+                "rollout fence {} held by {}, whose lease expired at {} and was never released",
+                self.fence,
+                self.holder,
+                self.expires_at.to_rfc3339()
+            )
+        } else {
+            write!(
+                formatter,
+                "rollout fence {} held by {} until {}",
+                self.fence,
+                self.holder,
+                self.expires_at.to_rfc3339()
+            )
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeSpineAuthority {
     Completed(kin_spine::SpineRolloutFenceEvidence),
-    RolloutActive,
+    RolloutActive(BlockingRolloutLease),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -653,9 +701,13 @@ impl PublicationControl {
             .as_ref()
             .filter(|active| active.kind == LeaseKind::Rollout)
         {
+            // Say whether the lease is still live. "Remains active" about a
+            // lease that lapsed hours ago sends an operator to wait on a holder
+            // that no longer exists.
             return Err(PublicationControlError::Admission(format!(
-                "scope {} rollout fence {} remains active and must be released or recovered before reader admission",
-                self.scope, active.fence
+                "scope {} is blocked by a {} and must be released or recovered before reader admission",
+                self.scope,
+                BlockingRolloutLease::observe(active, now)
             )));
         }
         validate_reader_admission(&record.reader, now)?;
@@ -706,13 +758,20 @@ impl PublicationControl {
     ) -> Result<RuntimeSpineAuthority, PublicationControlError> {
         let stored = self.load_required()?;
         self.validate_record(&stored.record)?;
-        if stored
+        let now = self.clock.now();
+        if let Some(active) = stored
             .record
             .active_lease
             .as_ref()
-            .is_some_and(|active| active.kind == LeaseKind::Rollout)
+            .filter(|active| active.kind == LeaseKind::Rollout)
         {
-            return Ok(RuntimeSpineAuthority::RolloutActive);
+            // Report the lease rather than the bare fact that one exists. A
+            // rollout whose lease lapsed hours ago has nobody left to wait for,
+            // and an operator told only that a rollout "remains active" waits
+            // for a holder that is already gone.
+            return Ok(RuntimeSpineAuthority::RolloutActive(
+                BlockingRolloutLease::observe(active, now),
+            ));
         }
         require_complete_record_authority_fence(&stored.record)?;
         record_spine_rollout_fence_evidence(&stored.record)?
@@ -738,12 +797,25 @@ impl PublicationControl {
     /// rollout must use the authenticated rollout API. The only existing-record
     /// recovery performed here is resuming this exact startup lease after a
     /// crash or retry.
+    ///
+    /// A crash mid-bootstrap is the one case where the next image differs from
+    /// the recorded reader. The failed image wrote its own identity into the
+    /// record before it died, so requiring an identity match would leave the
+    /// record owned forever by a daemon that no longer exists, and no
+    /// replacement image could ever start. An expired startup lease therefore
+    /// resumes on the surviving startup identifiers alone. Nothing is taken on
+    /// trust: the takeover runs through `acquire_rollout`, which refuses while
+    /// the lease is still live, raises the fence so the previous holder's proof
+    /// is stale, and re-fences every graph object; completion then re-admits
+    /// the reader under the running image. A completed record has no active
+    /// lease at all, so this never reopens a fleet that already settled.
     pub fn bootstrap_runtime_if_absent(
         &self,
     ) -> Result<Option<ActivePublicationLease>, PublicationControlError> {
         let existing = self.store.load()?;
         if let Some(stored) = existing.as_ref() {
             self.validate_record(&stored.record)?;
+            let now = self.clock.now();
             let resumes_startup = stored.record.active_lease.as_ref().is_some_and(|active| {
                 active.kind == LeaseKind::Rollout
                     && active.holder == STARTUP_BOOTSTRAP_HOLDER
@@ -751,7 +823,8 @@ impl PublicationControl {
                     && active.target_repositories == self.fleet_repositories
                     && active.previous_repositories == self.fleet_repositories
                     && active.fence_repositories == self.fleet_repositories
-                    && stored.record.reader.identity == self.runtime_reader_identity
+                    && (stored.record.reader.identity == self.runtime_reader_identity
+                        || active.expires_at <= now)
             });
             if !resumes_startup {
                 let _ = self.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
@@ -4811,6 +4884,162 @@ mod tests {
         assert!(
             refusal.to_string().contains(READER_A) && refusal.to_string().contains(READER_B),
             "{refusal}"
+        );
+    }
+
+    /// The hosted cutover of 2026-09-03 failed here. A daemon image died
+    /// mid-bootstrap on 2026-09-02 holding the startup rollout lease, and for
+    /// the next twenty hours every replacement image was refused by that lease
+    /// even though it had expired five minutes after it was taken. Requiring
+    /// the recorded reader identity to match made the record permanently owned
+    /// by a daemon that no longer existed, because a replacement image never
+    /// carries the digest of the one it replaces.
+    #[test]
+    fn a_dead_startup_bootstrap_lease_does_not_brick_the_next_image() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+
+        let crashed = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let stranded = crashed
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        assert_eq!(stranded.holder, STARTUP_BOOTSTRAP_HOLDER);
+        let abandoned = crashed.status().unwrap();
+        assert_eq!(abandoned.reader.identity, READER_A);
+        assert!(abandoned.active_lease.is_some());
+
+        // The holder is gone, so nothing renews the lease.
+        clock.advance(HOSTED_ROLLOUT_LEASE_SECONDS as i64 + 1);
+
+        let replacement = control(Arc::clone(&store), Arc::clone(&clock), READER_B);
+        match replacement.runtime_spine_authority().unwrap() {
+            RuntimeSpineAuthority::RolloutActive(blocking) => {
+                assert!(blocking.expired, "{blocking}");
+                assert_eq!(blocking.fence, stranded.fence);
+                assert!(
+                    blocking.to_string().contains("never released"),
+                    "{blocking}"
+                );
+            }
+            other => panic!("the dead rollout must be reported: {other:?}"),
+        }
+
+        let resumed = replacement
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("an expired startup lease must be takeover-eligible");
+        assert!(
+            resumed.fence > stranded.fence,
+            "the takeover must raise the fence past {}",
+            stranded.fence
+        );
+
+        // Raising the fence is what makes the takeover safe. A predecessor that
+        // wakes up cannot mutate anything under its old proof.
+        let stale = crashed.assert_rollout_lease(&proof(&stranded)).unwrap_err();
+        assert!(
+            stale.to_string().contains("does not identify active"),
+            "{stale}"
+        );
+
+        release(&replacement, &resumed);
+        let settled = replacement.status().unwrap();
+        assert!(settled.active_lease.is_none());
+        assert_eq!(settled.reader.identity, READER_B);
+        replacement
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap();
+
+        // The image that crashed is now the one refused, which is the direction
+        // this fence must point.
+        let displaced = crashed
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap_err();
+        assert!(displaced.to_string().contains(READER_B), "{displaced}");
+    }
+
+    /// The read path and `acquire_rollout` must agree about what a live lease
+    /// means. Expiry is the only thing that makes a startup lease recoverable;
+    /// while it runs, a foreign image waits exactly as it did before.
+    #[test]
+    fn a_live_startup_bootstrap_lease_still_refuses_a_foreign_image() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let running = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let pending = running
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        let before = running.status().unwrap();
+
+        // Late in the window but still held: the holder may still be fencing.
+        clock.advance(HOSTED_ROLLOUT_LEASE_SECONDS as i64 - 60);
+
+        let intruder = control(Arc::clone(&store), Arc::clone(&clock), READER_B);
+        match intruder.runtime_spine_authority().unwrap() {
+            RuntimeSpineAuthority::RolloutActive(blocking) => {
+                assert!(!blocking.expired, "{blocking}");
+            }
+            other => panic!("the live rollout must be reported: {other:?}"),
+        }
+        assert!(intruder.bootstrap_runtime_if_absent().unwrap().is_none());
+        assert_eq!(intruder.status().unwrap(), before);
+
+        // The holder still owns its lease and finishes exactly as it would have.
+        release(&running, &pending);
+        let settled = running.status().unwrap();
+        assert!(settled.active_lease.is_none());
+        assert_eq!(settled.reader.identity, READER_A);
+    }
+
+    /// Startup recovery is for the daemon's own bootstrap lease only. An
+    /// operator's rollout stays the operator's to resume or replace, but the
+    /// refusal still has to say the lease died rather than calling it active.
+    #[test]
+    fn an_expired_operator_rollout_reads_as_expired_and_is_left_alone() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let daemon = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let bootstrap = daemon
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&daemon, &bootstrap);
+
+        let operator = daemon
+            .acquire_rollout(rollout_request("deploy", "operator-rollout", None))
+            .unwrap();
+        match daemon.runtime_spine_authority().unwrap() {
+            RuntimeSpineAuthority::RolloutActive(blocking) => {
+                assert!(!blocking.expired, "{blocking}");
+                assert_eq!(blocking.holder, "deploy");
+            }
+            other => panic!("the operator rollout must be reported: {other:?}"),
+        }
+
+        clock.advance(MAX_ROLLOUT_LEASE_SECONDS as i64 + 1);
+        match daemon.runtime_spine_authority().unwrap() {
+            RuntimeSpineAuthority::RolloutActive(blocking) => {
+                assert!(blocking.expired, "{blocking}");
+                assert!(
+                    blocking.to_string().contains("never released"),
+                    "{blocking}"
+                );
+            }
+            other => panic!("the dead operator rollout must be reported: {other:?}"),
+        }
+        let refusal = daemon
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap_err();
+        assert!(refusal.to_string().contains("never released"), "{refusal}");
+
+        let unchanged = daemon.status().unwrap();
+        assert!(daemon.bootstrap_runtime_if_absent().unwrap().is_none());
+        assert_eq!(daemon.status().unwrap(), unchanged);
+        assert_eq!(
+            daemon.status().unwrap().active_lease.unwrap().fence,
+            operator.fence
         );
     }
 
