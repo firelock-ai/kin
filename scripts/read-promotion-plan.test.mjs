@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -139,4 +140,52 @@ test('renderAlarm refuses to act on an issue the plan does not name', () => {
       /names none, so there is nothing to act on/,
     );
   }
+});
+
+// release-promote.yml calls both of these as scripts. A module whose direct-run
+// guard does not fire exits 0 having done nothing, which is the failure
+// check-release-proof-artifacts.mjs carries its own comment about: the naive
+// `import.meta.url` versus `argv[1]` comparison disagrees when a file is reached
+// through a symlinked directory, and the workflow step then passes while
+// planning nothing. So run them the way the workflow does, and require the
+// refusal rather than silence.
+test('both plan CLIs run as scripts and refuse rather than doing nothing', () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const runs = [
+    ['release-promotion-plan.mjs', [], /no plan path given/],
+    ['read-promotion-plan.mjs', [], /unknown command ""/],
+  ];
+  for (const [script, argv, expected] of runs) {
+    let status = 0;
+    let stderr = '';
+    try {
+      execFileSync('node', [path.join(here, script), ...argv], {
+        encoding: 'utf8',
+        env: { ...process.env, KIN_PROMOTION_PLAN: '', GITHUB_REPOSITORY: '' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      status = error.status;
+      stderr = error.stderr ?? '';
+    }
+    assert.equal(status, 1, `${script} must exit 1, not ${status}`);
+    assert.match(stderr, expected);
+  }
+});
+
+// The exact bytes release-promote.yml reads back, produced by the shipped CLI
+// rather than by calling the function in process.
+test('the promotions CLI emits the tab-separated lines the workflow reads', () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const dir = tmp();
+  const plan = path.join(dir, 'plan.json');
+  fs.writeFileSync(
+    plan,
+    JSON.stringify({ promote: [{ tag: 'v9.9.9', driver: 'local' }], overdue: [], alarm: 'none', openIssue: null }),
+  );
+  const out = execFileSync('node', [path.join(here, 'read-promotion-plan.mjs'), 'promotions'], {
+    encoding: 'utf8',
+    env: { ...process.env, KIN_PROMOTION_PLAN: plan },
+  });
+  assert.equal(out, 'v9.9.9\tlocal\n');
 });
