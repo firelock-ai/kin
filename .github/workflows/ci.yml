@@ -203,13 +203,17 @@ jobs:
     # build share no artifacts (separate target profiles), so serialising them
     # only added wall clock. They run concurrently now.
     #
-    # This job and the two Windows authority jobs below stay on the merge queue
-    # and on every commit that reaches main. Together they are the merge group's
-    # only proof of the native Windows admission contract, so taking them off
-    # the queue to reclaim runner minutes would trade a reviewable pre-landing
-    # signal for a required context that first fails on main. The authority test
-    # enforces that, and it now admits exactly one job-level condition, the
-    # pull-request filter below, and refuses any other.
+    # This job and the two Windows authority jobs below run on every commit that
+    # reaches main and not on pull requests. Since the 2026-08-27 classic flip
+    # there is no merge group, so main's push run is the only proof of the
+    # native Windows admission contract and the first place a regression in it
+    # shows: a pull request is graded for Windows compilation by the cross-check
+    # in the fast gate, and a runtime break lands green and reddens main (kin
+    # #1432 did exactly that on 2026-09-03). That is the founder's chosen shape,
+    # thin-green landing plus continuous grading of main, taken because the
+    # longest of these legs measured 11.7 minutes against a ten-minute
+    # open-to-merge bar. The authority test admits exactly one job-level
+    # condition here, the pull-request filter below, and refuses any other.
     #
     # They came off pull requests with the rest of the heavy set. The longest of
     # the three measured 11.7 minutes, which no admission gate can carry against
