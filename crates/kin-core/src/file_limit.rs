@@ -48,32 +48,23 @@ pub struct OpenFileLimit {
     pub hard: Option<u64>,
 }
 
+/// The soft limit to ask for, or `None` when the one in force is already at
+/// least as high as anything this would achieve.
+///
+/// Separated from the syscalls so the decision is testable. Every path that
+/// would not improve the limit returns `None`, so a process an operator already
+/// tuned is left exactly as it was found.
+fn target_soft_limit(current: OpenFileLimit) -> Option<u64> {
+    let ceiling = match current.hard {
+        Some(hard) => hard.min(TARGET_OPEN_FILES),
+        None => TARGET_OPEN_FILES,
+    };
+    (ceiling > current.soft).then_some(ceiling)
+}
+
 #[cfg(unix)]
 mod imp {
-    use super::{OpenFileLimit, TARGET_OPEN_FILES};
-
-    /// The soft limit to ask for, or `None` when the one in force is already at
-    /// least as high as anything this would achieve.
-    ///
-    /// Separated from the syscalls so the decision is testable. Every path that
-    /// would not improve the limit returns `None`, so a process an operator
-    /// already tuned is left exactly as it was found.
-    ///
-    /// It lives inside this module rather than beside the public surface for a
-    /// reason that cost a red main. `raise` is its only caller and `raise` is
-    /// cfg-gated, so at the outer level this function was dead code on every
-    /// platform without an `rlimit`, and the workspace builds with
-    /// `-D warnings`. Windows found that; the pull request could not, because
-    /// kin's Windows jobs do not run on a pull request. Keeping a helper inside
-    /// the same cfg as its caller makes that class impossible rather than
-    /// remembered.
-    fn target_soft_limit(current: OpenFileLimit) -> Option<u64> {
-        let ceiling = match current.hard {
-            Some(hard) => hard.min(TARGET_OPEN_FILES),
-            None => TARGET_OPEN_FILES,
-        };
-        (ceiling > current.soft).then_some(ceiling)
-    }
+    use super::OpenFileLimit;
 
     /// Read this process's open-file limit, or `None` when the kernel refuses
     /// to say.
@@ -120,7 +111,7 @@ mod imp {
         let Some(current) = read() else {
             return;
         };
-        let Some(target) = target_soft_limit(current) else {
+        let Some(target) = super::target_soft_limit(current) else {
             return;
         };
         let hard = match current.hard {
@@ -139,59 +130,7 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
-
-        #[test]
-        fn a_stock_macos_limit_is_raised_to_the_target() {
-            assert_eq!(
-                target_soft_limit(OpenFileLimit {
-                    soft: 256,
-                    hard: None
-                }),
-                Some(TARGET_OPEN_FILES)
-            );
-        }
-
-        #[test]
-        fn a_hard_limit_below_the_target_caps_the_request() {
-            assert_eq!(
-                target_soft_limit(OpenFileLimit {
-                    soft: 256,
-                    hard: Some(4096)
-                }),
-                Some(4096)
-            );
-        }
-
-        #[test]
-        fn a_limit_an_operator_already_raised_is_left_alone() {
-            assert_eq!(
-                target_soft_limit(OpenFileLimit {
-                    soft: 1_048_576,
-                    hard: None
-                }),
-                None
-            );
-            assert_eq!(
-                target_soft_limit(OpenFileLimit {
-                    soft: TARGET_OPEN_FILES,
-                    hard: Some(TARGET_OPEN_FILES)
-                }),
-                None
-            );
-        }
-
-        /// A pinned hard limit is the case the error path exists for: nothing
-        /// can be asked for, so nothing is.
-        #[test]
-        fn a_soft_limit_pinned_at_its_hard_limit_asks_for_nothing() {
-            assert_eq!(
-                target_soft_limit(OpenFileLimit {
-                    soft: 256,
-                    hard: Some(256)
-                }),
-                None
-            );
-        }
+        use crate::file_limit::TARGET_OPEN_FILES;
 
         /// The ladder must be able to reach the floor, or a machine with a low
         /// `kern.maxfilesperproc` would spin rather than settle.
@@ -225,20 +164,6 @@ mod imp {
     }
 
     pub fn raise() {}
-
-    #[cfg(test)]
-    mod tests {
-        /// The no-op contract, asserted rather than assumed, because
-        /// `kin_cli::open_files` renders its guidance from exactly these two
-        /// answers: a limit of `None` prints the remedy with no limit line, and
-        /// a raise that cannot panic is what lets it be called unconditionally
-        /// at startup.
-        #[test]
-        fn a_platform_without_rlimit_reports_no_limit_and_raises_nothing() {
-            super::raise();
-            assert!(super::read().is_none());
-        }
-    }
 }
 
 /// Raise this process's open-file soft limit toward its hard limit.
@@ -257,6 +182,64 @@ pub fn raise_open_file_limit() {
 /// number in an error message is the number that was in force.
 pub fn open_file_limit() -> Option<OpenFileLimit> {
     imp::read()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stock_macos_limit_is_raised_to_the_target() {
+        assert_eq!(
+            target_soft_limit(OpenFileLimit {
+                soft: 256,
+                hard: None
+            }),
+            Some(TARGET_OPEN_FILES)
+        );
+    }
+
+    #[test]
+    fn a_hard_limit_below_the_target_caps_the_request() {
+        assert_eq!(
+            target_soft_limit(OpenFileLimit {
+                soft: 256,
+                hard: Some(4096)
+            }),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn a_limit_an_operator_already_raised_is_left_alone() {
+        assert_eq!(
+            target_soft_limit(OpenFileLimit {
+                soft: 1_048_576,
+                hard: None
+            }),
+            None
+        );
+        assert_eq!(
+            target_soft_limit(OpenFileLimit {
+                soft: TARGET_OPEN_FILES,
+                hard: Some(TARGET_OPEN_FILES)
+            }),
+            None
+        );
+    }
+
+    /// A pinned hard limit is the case the error path exists for: nothing can
+    /// be asked for, so nothing is.
+    #[test]
+    fn a_soft_limit_pinned_at_its_hard_limit_asks_for_nothing() {
+        assert_eq!(
+            target_soft_limit(OpenFileLimit {
+                soft: 256,
+                hard: Some(256)
+            }),
+            None
+        );
+    }
 }
 
 /// The margin between the target and what an admission was measured to need,
