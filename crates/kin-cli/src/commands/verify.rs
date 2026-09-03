@@ -311,7 +311,7 @@ pub fn execute_verify_run(
     request: &VerifyRunRequest,
 ) -> Result<VerifyRunResponse> {
     let plan = build_verification_plan(graph, &request.entity, request.depth)?;
-    let test_runner = parse_runner(&request.runner);
+    let test_runner = parse_runner(&request.runner)?;
     let cmd_str = build_runner_command(&test_runner, &plan.entity.name, &plan.tests);
     let mut lines = Vec::new();
 
@@ -835,15 +835,62 @@ where
     }
 }
 
-fn parse_runner(runner: &str) -> TestRunner {
+fn parse_runner(runner: &str) -> Result<TestRunner> {
     match runner {
-        "cargo" => TestRunner::Cargo,
-        "jest" => TestRunner::Jest,
-        "pytest" => TestRunner::Pytest,
-        "go" => TestRunner::Go,
-        "junit" => TestRunner::JUnit,
-        other => TestRunner::Custom(other.to_string()),
+        "cargo" => Ok(TestRunner::Cargo),
+        "jest" => Ok(TestRunner::Jest),
+        "pytest" => Ok(TestRunner::Pytest),
+        "go" => Ok(TestRunner::Go),
+        "junit" => Ok(TestRunner::JUnit),
+        other => {
+            if let Some(refusal) = custom_runner_refusal(other) {
+                bail!("{refusal}");
+            }
+            Ok(TestRunner::Custom(other.to_string()))
+        }
     }
+}
+
+/// Characters a custom runner may carry, and why the set is this short.
+///
+/// A runner name arrives on the `POST /verify/run` body, and the command this
+/// module builds from it is handed to `/bin/sh -c`. Every character a shell
+/// reads as syntax is absent here on purpose: `;`, `&`, `|`, `$`, backtick,
+/// `(`, `)`, `<`, `>`, `\`, quotes and newline. What is left still spells the
+/// runners this is for, `npm test`, `env FOO=1 pytest`, `./scripts/test.sh`,
+/// because a runner is a program and its flags rather than a shell script.
+const CUSTOM_RUNNER_EXTRA_CHARS: &str = " ._-/=+:,@";
+
+/// Why this runner cannot be run, in the caller's terms, or `None` when it can.
+///
+/// Paired with the quoting in [`build_runner_command`] rather than trusted
+/// alone. Either one closes the injection; both are here so that a later edit
+/// to one of them cannot silently reopen it.
+fn custom_runner_refusal(runner: &str) -> Option<String> {
+    if runner.trim().is_empty() {
+        return Some(
+            "refusing an empty test runner: name one of cargo, jest, pytest, go, junit, or a \
+             program to run"
+                .to_string(),
+        );
+    }
+    let bad: Vec<char> = runner
+        .chars()
+        .filter(|c| !c.is_ascii_alphanumeric() && !CUSTOM_RUNNER_EXTRA_CHARS.contains(*c))
+        .collect();
+    if bad.is_empty() {
+        return None;
+    }
+    let rendered = bad
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "refusing the test runner {runner:?}: it carries {rendered}, which a shell reads as \
+         syntax rather than as part of a program name. A custom runner may carry letters, \
+         digits and{CUSTOM_RUNNER_EXTRA_CHARS}. Put anything else in a script and name the script."
+    ))
 }
 
 fn build_runner_command(test_runner: &TestRunner, entity_name: &str, tests: &[TestCase]) -> String {
@@ -904,7 +951,20 @@ fn build_runner_command(test_runner: &TestRunner, entity_name: &str, tests: &[Te
             };
             format!("mvn test -Dtest={}", shell_quote(&pattern))
         }
-        TestRunner::Custom(command) => format!("{} {}", command, shell_quote(entity_name)),
+        // Quoted word by word, exactly as every arm above quotes its one
+        // interpolated value. A custom runner is a program and its flags, so
+        // each word is one argv slot and nothing in it reaches the shell as
+        // syntax. `parse_runner` has already refused the characters that would
+        // matter; this is the second of the two defences, and it is the one
+        // that holds if a future caller reaches here without the first.
+        TestRunner::Custom(command) => {
+            let quoted = command
+                .split_whitespace()
+                .map(shell_quote)
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{} {}", quoted, shell_quote(entity_name))
+        }
     }
 }
 
@@ -983,6 +1043,82 @@ mod tests {
 
         assert!(output.status.success());
         assert_eq!(output.stdout, b"path-independent");
+    }
+
+    #[test]
+    fn parse_runner_refuses_a_runner_carrying_shell_syntax() {
+        // The exact shape a `POST /verify/run` body can carry: a runner field
+        // whose job is to end the runner word and start a second command.
+        let refusal = parse_runner("notarealrunner; touch pwned")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("refusing the test runner"),
+            "the refusal must name itself: {refusal}"
+        );
+        assert!(
+            refusal.contains("';'"),
+            "the refusal must name the character it rejected: {refusal}"
+        );
+
+        for hostile in [
+            "pytest && curl http://example.invalid",
+            "pytest | sh",
+            "pytest $(id)",
+            "pytest `id`",
+            "pytest\nid",
+            "pytest > /tmp/out",
+        ] {
+            assert!(
+                parse_runner(hostile).is_err(),
+                "a runner carrying shell syntax must be refused: {hostile:?}"
+            );
+        }
+
+        // The runners this route is actually for still parse.
+        assert!(matches!(parse_runner("cargo").unwrap(), TestRunner::Cargo));
+        assert!(matches!(
+            parse_runner("env /bin/echo").unwrap(),
+            TestRunner::Custom(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_custom_runner_cannot_reach_the_shell_through_the_built_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pwned");
+        let hostile = format!("notarealrunner; touch {}", marker.display());
+
+        // The quoting layer on its own, reached the way it would be if a later
+        // caller built a command without going through `parse_runner`.
+        let command = build_runner_command(&TestRunner::Custom(hostile), "Entity", &[]);
+        assert!(
+            !command.contains("; touch"),
+            "the runner field reached the shell line unquoted: {command}"
+        );
+
+        let _ = verification_command(dir.path(), &command).output().unwrap();
+        assert!(
+            !marker.exists(),
+            "the runner field executed a second command: {} exists",
+            marker.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_multi_word_custom_runner_still_runs_its_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = parse_runner("env /bin/echo").unwrap();
+        let command = build_runner_command(&runner, "Entity", &[]);
+
+        let output = verification_command(dir.path(), &command).output().unwrap();
+        assert!(
+            output.status.success(),
+            "a legitimate multi-word runner must still run: {command}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Entity");
     }
 
     #[tokio::test]
