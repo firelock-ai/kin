@@ -1995,7 +1995,14 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/transfer-plan", post(command_transfer_plan))
         .route(
             "/mcp/tools/call",
-            post(mcp_tools_call).layer(DefaultBodyLimit::max(MCP_LOCAL_CALL_MAX_BODY_BYTES)),
+            // Two ceilings, and the order is load-bearing. `from_fn` is applied
+            // last so it wraps outermost and runs first, refusing a declared
+            // oversize length before the body extractor reads anything; the
+            // streaming limit inside it stays as the backstop for a request
+            // that declares no length or declares a false one.
+            post(mcp_tools_call)
+                .layer(DefaultBodyLimit::max(MCP_LOCAL_CALL_MAX_BODY_BYTES))
+                .layer(middleware::from_fn(refuse_oversized_declared_mcp_body)),
         )
         .route(
             "/repos/{repo_id}/mcp/tools/call",
@@ -13155,7 +13162,18 @@ fn hosted_trace_data_flow_result(
 /// this daemon to allocate and rank thirty-two billion rows, and every other
 /// client on the daemon waits behind it. Bounding the work is what closes that,
 /// and the clamp being disclosed is what keeps the answer honest.
-const MCP_LOCAL_CALL_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+///
+/// Deliberately ABOVE axum's inherited 2 MiB default rather than equal to it.
+/// This started at 2 MiB, matching the framework, and falsification caught that
+/// for what it was: a declared ceiling identical to the default it replaces
+/// changes nothing at runtime, and no test can tell the two apart, because
+/// dropping the declaration leaves the framework refusing the same body at the
+/// same size with the same status. Four MiB is also the better product number.
+/// A `kin_transaction_stage` body carries a whole file's new text, and 2 MiB
+/// refuses a large generated, vendored or lockfile-shaped source that a real
+/// refactor has every right to stage. Eight such calls still fit inside one
+/// transaction's 32 MiB staged-byte ceiling.
+const MCP_LOCAL_CALL_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Primary rows one page may hold. The largest legitimate caller in this tree
 /// asks for 60; a thousand is sixteen times that and still bounds the `* 8`
 /// candidate fetch at eight thousand rows.
@@ -13174,6 +13192,48 @@ const MCP_LOCAL_CONTEXT_MAX_DEPTH: u64 = 8;
 /// acceptance suite drives 200,000 to observe an uncut pack, so the ceiling
 /// sits five times above that rather than at the hosted 32,000.
 const MCP_LOCAL_CONTEXT_MAX_TOKEN_BUDGET: u64 = 1_000_000;
+
+/// Refuse a call whose DECLARED body length is already over the ceiling, before
+/// a byte of it is read.
+///
+/// The streaming limit below this is not enough on its own, and the difference
+/// is the point. `DefaultBodyLimit` wraps the body in `http_body_util::Limited`,
+/// which errors only once the bytes it has already taken exceed the budget
+/// (`limited.rs`, `poll_frame`); its `size_hint` is reported and never consulted
+/// as a gate, and axum performs no request-side `Content-Length` check of its
+/// own anywhere. So a caller announcing a gigabyte was served by reading a
+/// ceiling's worth of it first and refusing after. That is a bound on memory,
+/// which is worth having, but it is not a bound on work: the daemon still paid
+/// for every byte up to the ceiling on a request it was always going to reject.
+///
+/// A declared length is a claim rather than a fact, so this does NOT replace the
+/// streaming limit. A request that declares nothing, declares a lie, or arrives
+/// chunked still meets `DefaultBodyLimit`. This layer only ends the case where
+/// the caller told us up front that it would not fit.
+async fn refuse_oversized_declared_mcp_body(
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if let Some(declared) = declared {
+        if declared > MCP_LOCAL_CALL_MAX_BODY_BYTES as u64 {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "mcp tool call declares a {declared}-byte body, over the \
+                     {MCP_LOCAL_CALL_MAX_BODY_BYTES}-byte limit this route accepts; \
+                     nothing was read"
+                ),
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
+}
 
 /// The component name a clamp disclosure is published under, so a client can
 /// find it without matching prose.
@@ -37286,18 +37346,76 @@ mod tests {
         serde_json::from_str(text).expect("payload must be JSON")
     }
 
+    /// axum's own default body limit, which every `Json` extractor inherits
+    /// when no `DefaultBodyLimit` layer is declared (`axum-core-0.5.6`,
+    /// `src/ext_traits/request.rs:319`). Named here because the route's ceiling
+    /// is only observable if it differs from this.
+    const AXUM_DEFAULT_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+
     #[tokio::test]
     async fn mcp_tools_call_refuses_a_body_over_the_declared_ceiling() {
+        // Declares an oversize length and sends NO body, which is the whole
+        // design of this test and of the layer it grades.
+        //
+        // It first built the oversized body to prove the refusal, and under
+        // falsification that cost 8 GiB resident on a loaded box: raising the
+        // ceiling raised the body with it, because the probe was derived from
+        // the value under test. Both faults have the same cure. A refusal that
+        // allocates what it refuses is a delayed ceiling rather than a ceiling,
+        // so the route now reads the declared length first, and a test that
+        // sends nothing is the only kind that can prove it did.
+        assert!(
+            MCP_LOCAL_CALL_MAX_BODY_BYTES > AXUM_DEFAULT_BODY_LIMIT_BYTES,
+            "a declared ceiling equal to the framework default it replaces \
+             changes nothing at runtime and no test can tell the two apart"
+        );
+        let over_ceiling = MCP_LOCAL_CALL_MAX_BODY_BYTES as u64 + 1;
+
         let state = test_state();
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let app = router(state);
 
-        // The control first: the same envelope under the ceiling is admitted,
-        // so a 413 below is the ceiling and not the route being broken.
-        let small = app
+        let response = app
             .clone()
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .header("content-length", over_ceiling.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an oversize DECLARED length must be refused before the body is \
+             read; an empty body can never trip the streaming limit, so a 413 \
+             here can only have come from reading the declaration"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains(&MCP_LOCAL_CALL_MAX_BODY_BYTES.to_string())
+                && text.contains(&over_ceiling.to_string()),
+            "the refusal must name both the ceiling it enforced and what was \
+             declared, or a caller cannot tell it from the daemon being \
+             broken: {text}"
+        );
+        assert!(
+            text.contains("nothing was read"),
+            "the refusal says it read nothing, which is the property under \
+             test: {text}"
+        );
+
+        // The control: a call declaring a length inside the ceiling is admitted
+        // past this layer, so the 413 above is the declaration and not the
+        // route refusing everything.
+        let response = app
             .oneshot(
                 Request::post("/mcp/tools/call")
                     .header("content-type", "application/json")
@@ -37310,22 +37428,47 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(
-            small.status(),
+            response.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
             "an ordinary call must not trip the body ceiling"
         );
+    }
 
-        let oversized = json!({
-            "name": "semantic_search",
-            "arguments": { "query": "x".repeat(MCP_LOCAL_CALL_MAX_BODY_BYTES + 1024) }
-        })
-        .to_string();
-        assert!(oversized.len() > MCP_LOCAL_CALL_MAX_BODY_BYTES);
+    #[tokio::test]
+    async fn a_chunked_body_that_declares_no_length_still_meets_the_streaming_limit() {
+        // The attacker's case, and the reason the declared-length layer is not
+        // enough on its own. A declared length is a claim: omit the header and
+        // the fast refusal never fires, so the streaming limit underneath it is
+        // the only thing left. `Body::from_stream` has an unknown size hint and
+        // therefore sends no `Content-Length`, which is exactly that shape.
+        //
+        // The assertion that matters is not just the 413. It is how MUCH was
+        // served before it: a limit that reads the whole body and refuses at
+        // the end bounds nothing, so this counts the bytes the stream actually
+        // handed over and requires them to stop within one chunk of the
+        // ceiling.
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let chunk = 64 * 1024usize;
+        // Four times the ceiling, so a limit that never fired would be obvious
+        // in the count rather than merely slow.
+        let chunks = (MCP_LOCAL_CALL_MAX_BODY_BYTES / chunk) * 4;
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&served);
+        let stream = futures_util::stream::iter((0..chunks).map(move |_| {
+            counter.fetch_add(chunk, std::sync::atomic::Ordering::Relaxed);
+            Ok::<_, std::io::Error>(vec![b'x'; chunk])
+        }));
+
         let response = app
             .oneshot(
                 Request::post("/mcp/tools/call")
                     .header("content-type", "application/json")
-                    .body(Body::from(oversized))
+                    .body(Body::from_stream(stream))
                     .unwrap(),
             )
             .await
@@ -37333,16 +37476,15 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
-            "the default route declares its own body ceiling"
+            "a body that declares no length must still meet the streaming limit, \
+             or omitting one header buys an unbounded request"
         );
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let text = String::from_utf8_lossy(&body);
+        let served = served.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
-            text.contains(&MCP_LOCAL_CALL_MAX_BODY_BYTES.to_string()),
-            "the refusal must name the ceiling it enforced, or a caller cannot \
-             tell it from the daemon being broken: {text}"
+            served <= MCP_LOCAL_CALL_MAX_BODY_BYTES + chunk,
+            "the limit must stop within one chunk of the ceiling; it took {served} \
+             bytes against a {MCP_LOCAL_CALL_MAX_BODY_BYTES}-byte ceiling, so it is \
+             reading the whole body and refusing afterwards"
         );
     }
 

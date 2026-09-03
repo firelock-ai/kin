@@ -335,16 +335,43 @@ pub const MAX_STAGED_BYTES_PER_TRANSACTION: usize = 32 * 1024 * 1024;
 /// an operator can reason about instead of "however much the caller sends".
 pub const MAX_ACTIVE_TRANSACTIONS_PER_SESSION: usize = 8;
 
+/// A `std::io::Write` sink that keeps the byte count and discards the bytes.
+///
+/// This is what lets the byte ceiling measure an operation without allocating
+/// it. Serializing to a `Vec` to learn a size means a refusal allocates the very
+/// thing it is refusing, which is not a ceiling so much as a delayed one.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The serialized size of one staged operation, which is what a whole-map
-/// rewrite pays for it.
+/// rewrite pays for it, measured without allocating that serialization.
+///
+/// Counted through a discarding writer rather than `serde_json::to_vec`, so
+/// measuring a 33 MiB operation in order to refuse it costs no 33 MiB buffer.
+/// The exact serialized size still matters and cannot be summed from the
+/// obvious string fields: an `Entity` payload carries
+/// `EntityMetadata.extra`, an unbounded `HashMap<String, Value>`, so a
+/// hand-rolled field sum would under-count exactly where a caller can hide
+/// bytes.
 ///
 /// An operation that cannot serialize is charged its `body` length rather than
 /// zero: a payload the byte ceiling cannot measure must not therefore be free.
 pub fn staged_operation_bytes(operation: &McpMutationOperation) -> usize {
-    serde_json::to_vec(operation).map_or_else(
-        |_| operation.body.as_ref().map_or(0, String::len),
-        |bytes| bytes.len(),
-    )
+    let mut counter = ByteCounter(0);
+    match serde_json::to_writer(&mut counter, operation) {
+        Ok(()) => counter.0,
+        Err(_) => operation.body.as_ref().map_or(0, String::len),
+    }
 }
 
 /// The serialized size of a whole staged set.
@@ -2489,6 +2516,16 @@ mod tests {
             )
             .expect("a 64 KiB file body is ordinary work and must stage");
 
+        // Fixed size, not `MAX_STAGED_BYTES_PER_TRANSACTION + 1`. Deriving the
+        // probe from the value under test made this test unfailable: raising
+        // the ceiling grew the probe with it, and the 64 KiB already staged
+        // kept the total over the line at every value. Falsification caught it.
+        // The guard below is what turns a raised ceiling red.
+        let over_cap = 33 * 1024 * 1024;
+        assert!(
+            over_cap > MAX_STAGED_BYTES_PER_TRANSACTION,
+            "the probe must exceed the ceiling or this test grades nothing"
+        );
         let error = registry
             .stage_transaction(
                 &tx.transaction_id,
@@ -2496,7 +2533,7 @@ mod tests {
                     verb: "replace".to_string(),
                     target: "src/huge.rs".to_string(),
                     payload: None,
-                    body: Some("z".repeat(MAX_STAGED_BYTES_PER_TRANSACTION + 1)),
+                    body: Some("z".repeat(over_cap)),
                     description: String::new(),
                     destination: None,
                 }],
@@ -2518,6 +2555,15 @@ mod tests {
     fn a_session_cannot_open_unbounded_transactions_and_finishing_one_frees_a_slot() {
         let registry = SessionRegistry::new();
         registry.register("sess-1", "test");
+        // Pins the ceiling. Without this the test cannot fail on a raised cap:
+        // the loop below opens however many the constant says and the next one
+        // is refused at any value, so the mutation moves the input with it.
+        // Falsification caught that. Raising the ceiling turns THIS red.
+        const PROBE_BEYOND_CAP: usize = 9;
+        assert!(
+            PROBE_BEYOND_CAP > MAX_ACTIVE_TRANSACTIONS_PER_SESSION,
+            "the probe must exceed the ceiling or this test grades nothing"
+        );
         let mut opened = Vec::new();
         for _ in 0..MAX_ACTIVE_TRANSACTIONS_PER_SESSION {
             opened.push(
