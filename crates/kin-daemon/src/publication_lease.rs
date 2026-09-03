@@ -5095,6 +5095,47 @@ mod tests {
         assert!(displaced.to_string().contains(READER_B), "{displaced}");
     }
 
+    /// The clear fires only when the admission consumes exactly the identity the
+    /// record authorizes next. `a_pipeline_authorized_image_admits_itself_at_startup`
+    /// is not enough to guard this: every admit_reader call it drives happens to
+    /// admit the identity that was actually authorized, so an unconditional clear
+    /// looks identical to the guarded one throughout that test. This is the case
+    /// that tells them apart: the OUTGOING daemon is re-admitted, under an
+    /// unrelated operator rollout, while the record still authorizes someone else
+    /// next. Nothing about who reads is changing here, so nothing about who is
+    /// authorized next may change either, or unrelated daemon activity could
+    /// silently erase the pipeline's authorization before the successor ever
+    /// starts.
+    #[test]
+    fn an_unrelated_admission_of_the_current_reader_leaves_the_authorization_alone() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let outgoing = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = outgoing
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&outgoing, &first);
+
+        authorize_next_reader_for(&outgoing, READER_B);
+
+        // An operator rollout that re-admits the SAME image. Its own release
+        // path runs admit_reader with `outgoing`'s own identity, READER_A, which
+        // is not the identity the record now authorizes next.
+        let reaffirm = outgoing
+            .acquire_rollout(rollout_request("deploy", "reaffirm-reader-a", None))
+            .unwrap();
+        release(&outgoing, &reaffirm);
+
+        let after = outgoing.status().unwrap();
+        assert_eq!(after.reader.identity, READER_A);
+        assert_eq!(
+            after.next_reader_identity.as_deref(),
+            Some(READER_B),
+            "an admission of a different identity than the one authorized must not consume it"
+        );
+    }
+
     /// The write holds no rollout lease, and that is the property that makes
     /// the promotion free. A rollout lease closes reader admission for every
     /// image, so requiring one here would have put a readiness gap on the
@@ -5118,7 +5159,10 @@ mod tests {
         authorize_next_reader_for(&daemon, READER_B);
         let authorized = daemon.status().unwrap();
         assert_eq!(authorized.next_reader_identity.as_deref(), Some(READER_B));
-        assert!(authorized.active_lease.is_none(), "the write must take none");
+        assert!(
+            authorized.active_lease.is_none(),
+            "the write must take none"
+        );
         assert_eq!(authorized.last_fence, settled.last_fence);
 
         // And a rollout somebody else holds neither blocks the write nor is

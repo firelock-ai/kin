@@ -32197,10 +32197,9 @@ mod tests {
             Some("publication-test-token".to_string()),
         );
         let authorize = |app: Router, token: Option<&'static str>| async move {
-            let mut request = Request::post(
-                "/authority/publication-control/rollout/authorize-next-reader",
-            )
-            .header("content-type", "application/json");
+            let mut request =
+                Request::post("/authority/publication-control/rollout/authorize-next-reader")
+                    .header("content-type", "application/json");
             if let Some(token) = token {
                 request = request.header("authorization", format!("Bearer {token}"));
             }
