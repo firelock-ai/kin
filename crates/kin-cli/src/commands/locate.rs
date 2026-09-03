@@ -7296,6 +7296,12 @@ fn apply_lexical_parity_floor(
     }
 
     let mut admitted: Vec<(String, f32)> = Vec::new();
+    // A lift of a file already in `fused` REPLACES what retrieval computed:
+    // `parity` carries the name match and `tiebreak * original` carries five
+    // per cent of everything else. That is a rescue when a handful of files
+    // take it and it is the ranking when hundreds do, so the lifts are staged
+    // here and spent under one budget below rather than applied in place.
+    let mut present_lifts: Vec<(usize, f32, f32, &String)> = Vec::new();
     for (path, record) in &matches {
         // The floor anchors on a term matching an entity NAME, which a tracked
         // artifact can never satisfy, and this is deliberately still where that
@@ -7320,13 +7326,46 @@ fn apply_lexical_parity_floor(
             if let Some(&idx) = existing.get(path) {
                 let original = fused[idx].1;
                 if parity > original {
-                    let tiebreak = locate_env_f32("KIN_LOCATE_LEXICAL_FLOOR_TIEBREAK", 0.05);
-                    fused[idx].1 = parity + tiebreak * original;
+                    present_lifts.push((idx, parity, original, path));
                 }
             }
         } else if admit_ok {
             admitted.push((path.clone(), parity));
         }
+    }
+    // Spend one budget across the ranked window: strongest lexical evidence
+    // first, then the pre-floor score, so retrieval decides among files whose
+    // name match is equally good. The sort is also what makes the budget
+    // deterministic, since `matches` is a HashMap and its iteration order is
+    // not; without a budget every lift was applied and the order could not
+    // matter.
+    // The budget binds on a PROSE question only, which is the same gate the
+    // file-anchor route uses (`locate.rs`, `anchors_enabled`). On a bare
+    // identifier lookup the query IS a name, so every file whose entity carries
+    // that name has earned the floor, and bounding it there costs a real
+    // definition: measured on microsoft/vscode, a `Cursor` lookup lost one of
+    // its two `Cursor` class rows at every budget tried.
+    let lift_budget = if locate_query_is_symbol_lookup(text) {
+        usize::MAX
+    } else {
+        locate_env_usize("KIN_LOCATE_LEXICAL_FLOOR_BUDGET", 12)
+    };
+    present_lifts.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .2
+                    .partial_cmp(&left.2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.3.cmp(right.3))
+    });
+    let tiebreak = locate_env_f32("KIN_LOCATE_LEXICAL_FLOOR_TIEBREAK", 0.05);
+    for (idx, parity, original, _) in present_lifts.into_iter().take(lift_budget) {
+        fused[idx].1 = parity + tiebreak * original;
     }
     fused.extend(admitted);
 
@@ -23755,6 +23794,200 @@ mod tests {
             fused, before,
             "empty graph yields no lexical matches, so the floor must not change fusion"
         );
+    }
+
+    /// One budget for the parity floor, spent across the ranked window.
+    ///
+    /// A present-file lift REPLACES what retrieval computed: the parity score
+    /// carries the name match and only `tiebreak * original` (five per cent)
+    /// carries everything else. Unbounded, that turns the floor from a rescue
+    /// into the ranking. Measured on the microsoft/vscode store with the
+    /// catalogue's own typing question, the floor re-scored 234 of 748 files
+    /// and `browser/view/viewController.ts` went from rank 23 to rank 245
+    /// without its score moving, because the query term "editor" names an
+    /// entity in most of `src/vs/editor/` and `ViewController` matches none of
+    /// the surviving terms.
+    ///
+    /// The fixture deliberately reuses the catalogue's own question text, so
+    /// the reason `type_operations.rs` cannot be rescued is visible: "type" is
+    /// an `is_common_english_word`, and the floor filters those out, so the
+    /// verb naming the whole operation is never a floor term.
+    #[test]
+    fn one_lexical_floor_budget_is_spent_across_the_ranked_window() {
+        const QUESTION: &str = "When I type a character in the editor, how does it end up in the document? Walk me through the path.";
+        const JUNK: usize = 16;
+
+        // `Editor` is an exact part-set match for the term "editor" (quality
+        // 5.0, full lexical strength); `EditorWidget` is a superset match
+        // (quality 3.0, 0.6 strength); `Unrelated` and `TypeOperations` match
+        // no surviving term at all.
+        let graph = kin_db::InMemoryGraph::new();
+        let mut line = 100;
+        let mut define = |name: &str, path: &str| {
+            let entity = test_entity(name, path, line, line + 4);
+            line += 10;
+            graph.upsert_entity(&entity).unwrap();
+        };
+        define("Unrelated", "src/plain.rs");
+        define("Editor", "src/hot_editor.rs");
+        define("Editor", "src/warm_editor.rs");
+        define("TypeOperations", "src/type_operations.rs");
+        define("EditorWidget", "src/weak_editor.rs");
+        let junk: Vec<String> = (0..JUNK)
+            .map(|i| format!("src/junk_{i:02}_editor.rs"))
+            .collect();
+        for path in &junk {
+            define("Editor", path);
+        }
+
+        // The fused ranking the floor is handed. `plain.rs` is the highest
+        // scored file the floor does NOT lift, so it fixes `nonlexical_top`
+        // and every full-strength parity is 0.70 * 1.05 = 0.735. The junk band
+        // is the measured shape: a long tail of name matches carrying almost
+        // no retrieval evidence.
+        let base = || {
+            let mut fused = vec![
+                ("src/plain.rs".to_string(), 0.70_f32),
+                ("src/hot_editor.rs".to_string(), 0.60_f32),
+                ("src/warm_editor.rs".to_string(), 0.40_f32),
+                ("src/type_operations.rs".to_string(), 0.30_f32),
+                ("src/weak_editor.rs".to_string(), 0.20_f32),
+            ];
+            for (i, path) in junk.iter().enumerate() {
+                fused.push((path.clone(), 0.016_f32 - 0.001_f32 * i as f32));
+            }
+            fused
+        };
+        let order = |fused: &[(String, f32)]| -> Vec<String> {
+            fused
+                .iter()
+                .map(|(path, _)| {
+                    path.trim_start_matches("src/")
+                        .trim_end_matches(".rs")
+                        .to_string()
+                })
+                .collect()
+        };
+        let place = |fused: &[(String, f32)], name: &str| -> usize {
+            order(fused).iter().position(|p| p == name).expect(name)
+        };
+
+        // CONTROL, and it is the defect. Unbounded, every "editor" name takes
+        // the floor and `type_operations`, which retrieval ranked FOURTH,
+        // finishes last behind eighteen files it outscored by up to 300 to 1.
+        {
+            let _budget =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_LEXICAL_FLOOR_BUDGET", "1024");
+            let mut fused = base();
+            apply_lexical_parity_floor(&mut fused, &graph, QUESTION);
+            assert_eq!(
+                order(&fused).last().map(String::as_str),
+                Some("type_operations"),
+                "unbounded, the floor is the ranking: {:?}",
+                order(&fused)
+            );
+            assert!(
+                place(&fused, "junk_15_editor") < place(&fused, "type_operations"),
+                "the weakest junk file outranks the file retrieval put fourth"
+            );
+        }
+
+        // THE SHIPPED DEFAULT. Twelve lifts, spent on the strongest lexical
+        // evidence and then on the pre-floor score, so the junk tail past the
+        // budget keeps its fused score and stays below `type_operations`.
+        {
+            let _budget = kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_LEXICAL_FLOOR_BUDGET");
+            let mut fused = base();
+            apply_lexical_parity_floor(&mut fused, &graph, QUESTION);
+            let o = order(&fused);
+            assert_eq!(
+                &o[..2],
+                &["hot_editor", "warm_editor"],
+                "the two best-evidenced name matches lead: {o:?}"
+            );
+            assert_eq!(
+                &o[12..14],
+                &["plain", "type_operations"],
+                "exactly twelve files took the floor, and the ranking resumes \
+                 behind them: {o:?}"
+            );
+            for i in 10..JUNK {
+                let name = format!("junk_{i:02}_editor");
+                assert!(
+                    place(&fused, "type_operations") < place(&fused, &name),
+                    "{name} is past the budget and must keep its fused score: {o:?}"
+                );
+            }
+            assert!(
+                place(&fused, "type_operations") < place(&fused, "weak_editor"),
+                "the 0.6-strength match is past the budget too: {o:?}"
+            );
+        }
+
+        // A smaller budget, to pin that the constant is what binds.
+        {
+            let _budget =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_LEXICAL_FLOOR_BUDGET", "2");
+            let mut fused = base();
+            apply_lexical_parity_floor(&mut fused, &graph, QUESTION);
+            let o = order(&fused);
+            assert_eq!(
+                &o[..4],
+                &["hot_editor", "warm_editor", "plain", "type_operations"],
+                "at budget 2 only the two best-evidenced files are rescued: {o:?}"
+            );
+        }
+
+        // The spend order is by lexical evidence FIRST and pre-floor score
+        // second, not the other way round. At budget 3 the third slot goes to
+        // a full-strength match scoring 0.016, not to the 0.6-strength match
+        // scoring 0.20.
+        {
+            let _budget =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_LEXICAL_FLOOR_BUDGET", "3");
+            let mut fused = base();
+            apply_lexical_parity_floor(&mut fused, &graph, QUESTION);
+            let scores: HashMap<&str, f32> = fused.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+            assert!(
+                scores["src/junk_00_editor.rs"] > 0.7,
+                "the third slot goes to the full-strength match: {scores:?}"
+            );
+            assert_eq!(
+                scores["src/weak_editor.rs"], 0.20,
+                "the 0.6-strength match keeps its fused score: {scores:?}"
+            );
+        }
+
+        // The budget binds on a prose question only. The same fixture and the
+        // same budget under a bare identifier lookup keeps the unbounded floor,
+        // because there the query IS a name and every name match has earned it.
+        {
+            let _budget =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_LEXICAL_FLOOR_BUDGET", "2");
+            let mut fused = base();
+            apply_lexical_parity_floor(&mut fused, &graph, "editor");
+            assert_eq!(
+                order(&fused).last().map(String::as_str),
+                Some("type_operations"),
+                "a symbol lookup keeps the unbounded floor"
+            );
+        }
+
+        // ZERO IS NOT OFF. `locate_env_usize` filters values at `> 0` and falls
+        // back to the default, so `KIN_LOCATE_LEXICAL_FLOOR_BUDGET=0` reads as
+        // unset. Pinned here because an operator reaching for "0" to disable a
+        // budget gets the default instead, and this is the shared helper every
+        // `KIN_LOCATE_*` count knob goes through.
+        {
+            let _zero =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_LEXICAL_FLOOR_BUDGET", "0");
+            let mut zeroed = base();
+            apply_lexical_parity_floor(&mut zeroed, &graph, QUESTION);
+            let _unset = kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_LEXICAL_FLOOR_BUDGET");
+            let mut defaulted = base();
+            apply_lexical_parity_floor(&mut defaulted, &graph, QUESTION);
+            assert_eq!(order(&zeroed), order(&defaulted), "0 reads as unset");
+        }
     }
 
     #[test]
