@@ -54,6 +54,25 @@ pub(crate) fn change_maps_decoded_on_this_thread() -> usize {
     CHANGE_MAPS_DECODED_ON_THIS_THREAD.with(|count| count.get())
 }
 
+#[cfg(test)]
+thread_local! {
+    static LEAF_DIGESTS_COMPUTED_ON_THIS_THREAD: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// How many history-root leaf digests this thread computed from a change,
+/// rather than reading from the memo.
+///
+/// This is the instrument behind "a fold hashes only the changes it has not
+/// seen". It counts ONLY the compute branch: the verification recompute that
+/// `cfg(test)` runs on every memo HIT deliberately does not increment it, or
+/// the safety check would hide the saving it exists to protect. Per thread,
+/// because the suite runs in parallel.
+#[cfg(test)]
+pub(crate) fn leaf_digests_computed_on_this_thread() -> usize {
+    LEAF_DIGESTS_COMPUTED_ON_THIS_THREAD.with(|count| count.get())
+}
+
 /// Where an undecoded change map's frame can be read again.
 pub(crate) enum HistorySource {
     /// The snapshot file the open read, held open so a superseded generation
@@ -237,6 +256,52 @@ pub struct ChangeMap {
     /// Serializes concurrent first uses so two readers do not both decode a
     /// gigabyte to keep one.
     decode_gate: Mutex<()>,
+    /// Memoized history-root leaf digests, keyed by change identity.
+    ///
+    /// `history_root` folds this map through `canonical_leaf_hash`, which
+    /// serializes each leaf's canonical payload in full. The map is ONE leaf
+    /// per change, and on a converted Linux subtree a single change's leaf is
+    /// 410,546,852 bytes, so a commit re-serialized the entire history to
+    /// arrive at a 32-byte value for changes that had not moved.
+    ///
+    /// Sound on two facts, both of which are stated here because the memo is a
+    /// persisted authority root and a stale entry would be a repository that
+    /// no longer recognizes its own history:
+    ///
+    /// 1. **A change's identity determines its content.** `SemanticChangeId`
+    ///    is a content hash, `admit_changes` refuses an id already present with
+    ///    different content, and `AuthorityFrame::apply` refuses a frame that
+    ///    re-adds an id the base holds. So a digest filed under an id can never
+    ///    describe different bytes than the change now under that id.
+    /// 2. **Production never mutates a change in place.** Searched with a
+    ///    positive control over 295 `.changes` sites: the only production
+    ///    writes are `insert`, at `repository.rs` in `admit_changes` and at
+    ///    `authority_frame.rs` in `apply`. No `get_mut`, `iter_mut`,
+    ///    `values_mut`, `entry` or `retain` on the map exists outside tests.
+    ///
+    /// Fact 2 is an invariant of code rather than of types, so it is checked
+    /// rather than trusted: under `cfg(test)` every memo HIT is recomputed and
+    /// compared, so any future in-place mutation fails the first test that
+    /// folds a root rather than shipping a wrong one.
+    ///
+    /// Shared across clones on purpose. A successor is a clone of its base, so
+    /// a per-clone memo would be empty at every commit and would never save
+    /// anything. An entry for a change a given clone does not hold is never
+    /// read, because the fold walks the map and looks each entry up.
+    leaf_digests: Arc<Mutex<LeafDigestMemo>>,
+}
+
+/// Memoized leaf digests and the domain they were computed under.
+///
+/// The domain is part of the hash (`canonical_leaf_hash` writes it before the
+/// value), so a second domain folding this same map must not read digests
+/// computed for the first. Recorded and compared rather than assumed, because
+/// today there is exactly one such domain and a future second one would
+/// otherwise silently reuse the wrong bytes.
+#[derive(Default)]
+pub(crate) struct LeafDigestMemo {
+    domain: Option<&'static str>,
+    digests: HashMap<SemanticChangeId, [u8; 32]>,
 }
 
 impl ChangeMap {
@@ -251,6 +316,7 @@ impl ChangeMap {
             decoded: OnceLock::new(),
             encoded: Some(Arc::new(encoded)),
             decode_gate: Mutex::new(()),
+            leaf_digests: Arc::default(),
         }
     }
 
@@ -309,6 +375,60 @@ impl ChangeMap {
             .expect("the change map was set under the decode gate"))
     }
 
+    /// This map's history-root leaf digests, sorted, computing only the ones
+    /// not already memoized.
+    ///
+    /// `DomainRoot::unordered` sorts its leaf digests before folding them, so
+    /// the fold is a pure function of the digest MULTISET and cannot observe
+    /// which of them were computed and which were remembered. That is what
+    /// makes this byte-identical to folding from scratch rather than merely
+    /// close to it.
+    ///
+    /// `domain` is compared against the domain the memo was built under and a
+    /// mismatch clears it, because the domain is part of every digest.
+    pub(crate) fn sorted_leaf_digests<E>(
+        &self,
+        domain: &'static str,
+        compute: impl Fn(&SemanticChangeId, &SemanticChange) -> Result<[u8; 32], E>,
+    ) -> Result<Vec<[u8; 32]>, E> {
+        let entries = self.force();
+        let mut memo = self.leaf_digests.lock();
+        if memo.domain != Some(domain) {
+            memo.domain = Some(domain);
+            memo.digests.clear();
+        }
+        let mut digests = Vec::with_capacity(entries.len());
+        for (id, change) in entries {
+            match memo.digests.get(id) {
+                Some(remembered) => {
+                    // Fact 2 on the field is an invariant of code, so it is
+                    // checked here rather than trusted. A change mutated in
+                    // place would make this fire on the first test that folds
+                    // a root, instead of shipping a wrong authority root.
+                    #[cfg(test)]
+                    {
+                        let recomputed = compute(id, change)?;
+                        assert_eq!(
+                            recomputed, *remembered,
+                            "a memoized history leaf digest no longer describes the change under \
+                             its id; a change was mutated in place"
+                        );
+                    }
+                    digests.push(*remembered);
+                }
+                None => {
+                    let digest = compute(id, change)?;
+                    #[cfg(test)]
+                    LEAF_DIGESTS_COMPUTED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+                    memo.digests.insert(*id, digest);
+                    digests.push(digest);
+                }
+            }
+        }
+        digests.sort_unstable();
+        Ok(digests)
+    }
+
     fn force(&self) -> &ChangeMapInner {
         match self.decoded() {
             Ok(decoded) => decoded,
@@ -337,6 +457,7 @@ impl From<ChangeMapInner> for ChangeMap {
             decoded: OnceLock::from(inner),
             encoded: None,
             decode_gate: Mutex::new(()),
+            leaf_digests: Arc::default(),
         }
     }
 }
@@ -382,11 +503,20 @@ impl Clone for ChangeMap {
     /// converted store's authority costs a pointer rather than a history.
     fn clone(&self) -> Self {
         match (self.decoded.get(), &self.encoded) {
-            (Some(decoded), _) => Self::from(decoded.clone()),
+            (Some(decoded), _) => Self {
+                decoded: OnceLock::from(decoded.clone()),
+                encoded: None,
+                decode_gate: Mutex::new(()),
+                // Shared, for the reason on the field: a successor is a clone
+                // of its base, so a fresh memo here would be empty at every
+                // commit and the memo would never save anything.
+                leaf_digests: Arc::clone(&self.leaf_digests),
+            },
             (None, Some(encoded)) => Self {
                 decoded: OnceLock::new(),
                 encoded: Some(Arc::clone(encoded)),
                 decode_gate: Mutex::new(()),
+                leaf_digests: Arc::clone(&self.leaf_digests),
             },
             (None, None) => Self::new(),
         }

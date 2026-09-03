@@ -8239,7 +8239,23 @@ fn history_root(
     authority: &PersistedRepositoryAuthority,
 ) -> Result<Hash256, KinDbError> {
     let mut root = DomainRoot::new(b"kin-repository-history-root-v1\0");
-    root.unordered("changes", &snapshot.changes.iter().collect::<Vec<_>>())?;
+    // Memoized per change rather than recomputed. `DomainRoot::unordered`
+    // SORTS its leaf digests before folding them, so the fold is a pure
+    // function of the digest multiset and cannot observe which digests were
+    // computed here and which were remembered from an earlier fold. That is
+    // what makes this byte-identical to the fold it replaces rather than merely
+    // close to it, and it is the whole reason a memo is admissible on a
+    // persisted authority root at all.
+    //
+    // The leaf is the (id, change) PAIR, exactly as `unordered` built it from
+    // `snapshot.changes.iter().collect::<Vec<_>>()`, so the bytes handed to
+    // `canonical_leaf_hash` are unchanged.
+    let changes = snapshot
+        .changes
+        .sorted_leaf_digests("changes", |id, change| {
+            canonical_leaf_hash("changes", &(id, change))
+        })?;
+    root.fold("changes", &changes);
     root.unordered("admission_policies", &authority.admission_policies)?;
     Ok(root.finish())
 }
@@ -20672,6 +20688,151 @@ mod tests {
             .find(|operation| operation.operation_id == operation_id)
             .expect("every receipt in the fixture names an operation the log holds")
             .clone()
+    }
+
+    fn leaf_digests_computed_on_this_thread() -> usize {
+        crate::storage::change_map::leaf_digests_computed_on_this_thread()
+    }
+
+    /// FIR-3064: the history root folds memoized per-change leaf digests, and
+    /// the root it produces is the root a scratch fold produces.
+    ///
+    /// `history_root` hands each change to `canonical_leaf_hash`, which
+    /// serializes that change's whole canonical payload. On a converted Linux
+    /// subtree one change's leaf is 410,546,852 bytes, so a commit
+    /// re-serialized the entire history to arrive at 32 bytes for changes that
+    /// had not moved.
+    ///
+    /// The ORACLE is the fold this replaced, `DomainRoot::unordered` over the
+    /// collected pairs, kept live by the other five roots and run here from
+    /// scratch. Comparing against it rather than against a checked-in constant
+    /// is the point: a constant would have been produced by the binary under
+    /// test, which is the hole FIR-3104 names.
+    #[test]
+    fn a_memoized_history_root_equals_the_root_a_scratch_fold_produces() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .expect("the fixture commits");
+        let mut snapshot = load_recovered_repository_authority(
+            &LocalFileBackend::new(directory.path()),
+            repository_id().as_str(),
+            HISTORY_VALIDATION_VERSION,
+        )
+        .unwrap()
+        .expect("the committed store recovers")
+        .recovered
+        .snapshot;
+        let authority = snapshot
+            .repository_authority
+            .clone()
+            .expect("a committed store carries its envelope");
+        assert_eq!(
+            snapshot.changes.len(),
+            1,
+            "the control: the fixture's history is the one change this counts against"
+        );
+
+        // The oracle, and the root under test, over one change.
+        let scratch = scratch_history_root(&snapshot, &authority);
+        let computes_before = leaf_digests_computed_on_this_thread();
+        let memoized = history_root(&snapshot, &authority).expect("the root folds");
+        let first_computes = leaf_digests_computed_on_this_thread() - computes_before;
+        assert_eq!(
+            memoized, scratch,
+            "the memoized root must be the scratch root"
+        );
+        assert_eq!(
+            first_computes, 1,
+            "a first fold computes every leaf, and this one computed {first_computes}"
+        );
+
+        // A second fold of the same history computes nothing.
+        let before_second = leaf_digests_computed_on_this_thread();
+        assert_eq!(
+            history_root(&snapshot, &authority).expect("the root folds again"),
+            scratch,
+            "a warm memo must not change the root"
+        );
+        assert_eq!(
+            leaf_digests_computed_on_this_thread() - before_second,
+            0,
+            "a second fold of unchanged history must compute no leaf at all"
+        );
+
+        // Grow the history and only the new changes are hashed. This is the
+        // property the whole change exists for: O(new), not O(store).
+        for index in 1..=3u8 {
+            let change = a_change_with_a_distinct_id(index);
+            snapshot.changes.insert(change.id, change);
+        }
+        assert_eq!(
+            snapshot.changes.len(),
+            4,
+            "the control: three changes landed"
+        );
+        let grown_scratch = scratch_history_root(&snapshot, &authority);
+        let before_grown = leaf_digests_computed_on_this_thread();
+        let grown = history_root(&snapshot, &authority).expect("the grown root folds");
+        let grown_computes = leaf_digests_computed_on_this_thread() - before_grown;
+        assert_eq!(
+            grown, grown_scratch,
+            "the root over grown history must still be the scratch root"
+        );
+        assert_eq!(
+            grown_computes, 3,
+            "only the three new leaves may be computed, and this computed {grown_computes}"
+        );
+        assert_ne!(
+            grown, memoized,
+            "the control: growing the history must move the root, or the two roots above \
+             agreeing would prove nothing"
+        );
+    }
+
+    /// A change with a distinct identity, for folding.
+    ///
+    /// The id is synthetic rather than content-derived, and that is enough
+    /// here: `history_root` folds whatever the map holds and never re-derives
+    /// an id, so what this test needs from a change is that its identity
+    /// differs from its siblings'. `mod fir2334_attribution`'s
+    /// `synthetic_change` builds content-addressed ones but is private to that
+    /// module, so it is not reachable from here.
+    fn a_change_with_a_distinct_id(index: u8) -> kin_model::SemanticChange {
+        kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([index; 32])),
+            origin: ChangeOrigin::Native,
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("memhistory-leaf-digest-fold"),
+            message: format!("a change with a distinct id {index}"),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            external_reference_deltas: Vec::new(),
+        }
+    }
+
+    /// The history fold as it stood before the memo: every leaf hashed here and
+    /// now, through the same `DomainRoot::unordered` the other five roots use.
+    fn scratch_history_root(
+        snapshot: &GraphSnapshot,
+        authority: &PersistedRepositoryAuthority,
+    ) -> Hash256 {
+        let mut root = DomainRoot::new(b"kin-repository-history-root-v1\0");
+        root.unordered("changes", &snapshot.changes.iter().collect::<Vec<_>>())
+            .expect("the oracle folds changes");
+        root.unordered("admission_policies", &authority.admission_policies)
+            .expect("the oracle folds admission policies");
+        root.finish()
     }
 
     fn root_folds_on_this_thread() -> usize {
