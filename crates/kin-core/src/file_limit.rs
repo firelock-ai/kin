@@ -240,16 +240,23 @@ mod tests {
             None
         );
     }
-
-    /// The measured ceiling of a full admission, with the margin named in the
-    /// module docs. If someone lowers the target below what an admission was
-    /// measured to need, this is what says so.
-    #[test]
-    fn the_target_clears_the_measured_admission_peak() {
-        const MEASURED_ADMISSION_PEAK: u64 = 544;
-        assert!(
-            TARGET_OPEN_FILES >= MEASURED_ADMISSION_PEAK * 8,
-            "the target leaves less than eight times the measured admission peak"
-        );
-    }
 }
+
+/// The margin between the target and what an admission was measured to need,
+/// enforced at compile time.
+///
+/// 544 is the open-file peak of a full admission on a 237-file, 2,287-commit
+/// repository, and it was the peak at every soft limit above the threshold
+/// including 1,048,576, so it is a ceiling rather than a sample. Lowering
+/// [`TARGET_OPEN_FILES`] below eight times it stops the build and says why.
+///
+/// A compile error rather than a test, because both sides are constants: there
+/// is no runtime at which this could be false but a build in which it is true.
+/// The peak is written in place rather than named as its own constant, because
+/// dead-code analysis does not traverse an underscore-prefixed item, so a
+/// constant used only here reads as unused under `-D warnings`.
+const _TARGET_CLEARS_THE_MEASURED_ADMISSION_PEAK: () = {
+    if TARGET_OPEN_FILES < 544 * 8 {
+        panic!("TARGET_OPEN_FILES leaves less than eight times the measured admission peak");
+    }
+};
