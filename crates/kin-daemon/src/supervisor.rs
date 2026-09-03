@@ -505,15 +505,14 @@ async fn post_registration(
     supervisor_url: &str,
     payload: &RepoDaemonRegistration,
 ) -> Result<(), reqwest::Error> {
-    client
-        .post(format!(
-            "{}/daemons/register",
-            supervisor_url.trim_end_matches('/')
-        ))
-        .json(payload)
-        .send()
-        .await?
-        .error_for_status()?;
+    with_supervisor_auth(client.post(format!(
+        "{}/daemons/register",
+        supervisor_url.trim_end_matches('/')
+    )))
+    .json(payload)
+    .send()
+    .await?
+    .error_for_status()?;
     Ok(())
 }
 
@@ -522,16 +521,15 @@ async fn post_heartbeat(
     supervisor_url: &str,
     payload: &RepoDaemonRegistration,
 ) -> Result<(), reqwest::Error> {
-    client
-        .post(format!(
-            "{}/daemons/{}/heartbeat",
-            supervisor_url.trim_end_matches('/'),
-            payload.repo_id
-        ))
-        .json(payload)
-        .send()
-        .await?
-        .error_for_status()?;
+    with_supervisor_auth(client.post(format!(
+        "{}/daemons/{}/heartbeat",
+        supervisor_url.trim_end_matches('/'),
+        payload.repo_id
+    )))
+    .json(payload)
+    .send()
+    .await?
+    .error_for_status()?;
     Ok(())
 }
 
@@ -540,16 +538,15 @@ async fn delete_registration(
     supervisor_url: &str,
     payload: &RepoDaemonRegistration,
 ) -> Result<(), reqwest::Error> {
-    client
-        .delete(format!(
-            "{}/daemons/{}?instance_id={}",
-            supervisor_url.trim_end_matches('/'),
-            payload.repo_id,
-            payload.instance_id
-        ))
-        .send()
-        .await?
-        .error_for_status()?;
+    with_supervisor_auth(client.delete(format!(
+        "{}/daemons/{}?instance_id={}",
+        supervisor_url.trim_end_matches('/'),
+        payload.repo_id,
+        payload.instance_id
+    )))
+    .send()
+    .await?
+    .error_for_status()?;
     Ok(())
 }
 
@@ -1152,17 +1149,58 @@ fn ensure_loopback_token(dir: &Path) -> std::io::Result<String> {
 }
 
 /// Whether the supervisor should ENFORCE the per-install loopback token.
-/// Opt-in via `KIN_SUPERVISOR_REQUIRE_TOKEN`, mirroring the repo daemon's
-/// `KIN_DAEMON_REQUIRE_TOKEN`. The Host/Origin guard is always active regardless.
+///
+/// Enforcement is default-on, byte for byte the policy `api::loopback_token_enforced`
+/// holds for the repo daemon: `KIN_SUPERVISOR_REQUIRE_TOKEN` is the documented
+/// escape hatch and takes a falsy value (`0`/`false`/`no`/`off`) to run without
+/// bearer auth, and anything else, including unset, enforces.
+///
+/// It used to be the inverse, opt-in, and that made this the softer of two
+/// adjacent surfaces rather than the harder one. The supervisor is machine-wide:
+/// unauthenticated it lists every repository this user has open and accepts
+/// `/shutdown` from any local process. Loopback is not a user boundary, and
+/// every client that reaches these routes already reads the auto-provisioned
+/// `supervisor.token` beside them, so a fresh install authenticates with no
+/// operator setup. The Host/Origin guard is always active regardless of this
+/// flag.
 fn loopback_token_enforced() -> bool {
     std::env::var("KIN_SUPERVISOR_REQUIRE_TOKEN")
         .map(|value| {
-            matches!(
+            !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
+                "0" | "false" | "no" | "off"
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
+}
+
+/// The bearer token this process presents to a supervisor it calls.
+///
+/// The mirror of [`resolve_serve_auth_token`] on the client side, and the same
+/// order the CLI's `daemon_client::supervisor_auth_token` uses: an explicit
+/// `KIN_SUPERVISOR_AUTH_TOKEN` wins, otherwise the already-provisioned
+/// per-install token is adopted. Read rather than provisioned, because a
+/// registering worker must never be the process that creates the supervisor's
+/// credential.
+fn supervisor_client_auth_token() -> Option<String> {
+    std::env::var(SUPERVISOR_AUTH_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string(supervisor_token_path(&supervisor_dir()))
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+/// Attach the supervisor bearer token to a request, when there is one to send.
+fn with_supervisor_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match supervisor_client_auth_token() {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
 }
 
 /// Resolve the auth token the serving supervisor enforces: an explicit
@@ -4117,16 +4155,32 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "supervisor token file must be 0600");
         }
 
-        // Default: enforcement OFF — the file is provisioned but not required, so
-        // existing unauthenticated local clients keep working.
-        assert!(resolve_serve_auth_token(&dir).is_none());
+        // Default: enforcement ON, the same default the repo daemon holds. The
+        // provisioned token is returned and required, so the machine-wide
+        // control plane is not readable by every local process.
+        assert_eq!(
+            resolve_serve_auth_token(&dir).as_deref(),
+            Some(token.as_str()),
+            "the supervisor must enforce its loopback token by default"
+        );
 
-        // Opt-in via KIN_SUPERVISOR_REQUIRE_TOKEN returns the provisioned token.
+        // A truthy KIN_SUPERVISOR_REQUIRE_TOKEN is the same as the default.
         tokens.apply("KIN_SUPERVISOR_REQUIRE_TOKEN", Some("1"));
         assert_eq!(
             resolve_serve_auth_token(&dir).as_deref(),
             Some(token.as_str())
         );
+
+        // The documented escape hatch: a falsy value opts out, matching
+        // `KIN_DAEMON_REQUIRE_TOKEN`.
+        for opted_out in ["0", "false", "no", "off", " OFF "] {
+            tokens.apply("KIN_SUPERVISOR_REQUIRE_TOKEN", Some(opted_out));
+            assert!(
+                resolve_serve_auth_token(&dir).is_none(),
+                "{opted_out:?} must opt out of supervisor bearer auth"
+            );
+        }
+        tokens.apply("KIN_SUPERVISOR_REQUIRE_TOKEN", None::<&str>);
 
         // An explicit KIN_SUPERVISOR_AUTH_TOKEN override always wins.
         tokens.apply("KIN_SUPERVISOR_AUTH_TOKEN", Some("explicit-override"));
@@ -4134,6 +4188,57 @@ mod tests {
             resolve_serve_auth_token(&dir).as_deref(),
             Some("explicit-override")
         );
+    }
+
+    /// The two routes an unauthenticated local process must not reach.
+    ///
+    /// `supervisor_bearer_token_protects_control_routes` above covers `/repos`.
+    /// These two are the ones with teeth: `/shutdown` stops the supervisor for
+    /// every repository this user has open, and `/daemons/register` is what
+    /// writes the endpoint the CLI later routes to.
+    #[tokio::test]
+    async fn supervisor_mutating_routes_refuse_an_unauthenticated_caller() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let app = router_with_auth_and_shutdown(
+            Arc::new(SupervisorState::new()),
+            Some("supervisor-token".to_string()),
+            Some(shutdown_tx),
+        );
+
+        for path in ["/shutdown", "/daemons/register"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "POST {path} answered an unauthenticated caller"
+            );
+        }
+        assert!(
+            !*shutdown_rx.borrow(),
+            "an unauthenticated caller reached /shutdown"
+        );
+
+        // Positive control: the same router answers a caller that presents the
+        // token, so the assertions above read auth rather than a dead router.
+        let authorized = app
+            .oneshot(
+                Request::get("/repos")
+                    .header(header::AUTHORIZATION, "Bearer supervisor-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
     }
 
     #[test]

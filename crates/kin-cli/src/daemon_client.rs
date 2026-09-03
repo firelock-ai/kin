@@ -564,6 +564,64 @@ fn daemon_auth_token_from_layout(layout: &KinLayout) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
+/// Whether a daemon endpoint names this machine's own loopback interface.
+///
+/// The one question that decides whether a locally provisioned bearer token may
+/// be attached to a request, and whether an endpoint handed over by another
+/// process may be routed to at all. Answered on the parsed URL rather than on a
+/// prefix match, because `http://127.0.0.1.example.com/` and
+/// `http://localhost@evil.example/` both start with the strings a prefix test
+/// looks for and neither is loopback.
+///
+/// A scheme other than http or https is not an endpoint this client speaks, and
+/// userinfo in the authority is a way to make the host look like something it is
+/// not, so both answer false.
+pub(crate) fn endpoint_is_loopback(base_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
+}
+
+/// Refuse to hand the locally provisioned daemon token to an endpoint that is
+/// not this machine's own.
+///
+/// `<repo>/.kin/daemon.token` authenticates the daemon on this machine and
+/// nothing else. `KIN_DAEMON_URL` carried no scheme or host check, and the
+/// supervisor's route table is written by whoever registers, so both could name
+/// a host somebody else answers on; the token then went out on the first
+/// request, to a server that also gets to shape every answer the CLI reads back.
+///
+/// The one token that may travel is an explicit `KIN_DAEMON_AUTH_TOKEN`, because
+/// pairing a credential with an endpoint by hand is exactly what that variable
+/// is for. A remote endpoint without one is refused by name rather than
+/// authenticated with a local secret.
+fn refuse_local_token_leaving_loopback(base_url: &str, auth_token: &str) -> Result<()> {
+    if endpoint_is_loopback(base_url) {
+        return Ok(());
+    }
+    if daemon_auth_token_from_env().as_deref() == Some(auth_token) {
+        return Ok(());
+    }
+    bail!(
+        "refusing to send the local daemon token to {base_url}, which is not loopback. \
+         <repo>/.kin/daemon.token authenticates the daemon on this machine only. Point \
+         KIN_DAEMON_URL at http://127.0.0.1, http://localhost or an https loopback address, or \
+         pair the remote endpoint with its own credential in KIN_DAEMON_AUTH_TOKEN."
+    )
+}
+
 fn daemon_client_headers(
     auth_token: Option<String>,
     session_id: Option<&str>,
@@ -656,6 +714,9 @@ impl DaemonClient {
         session_id: Option<&str>,
     ) -> Result<Self> {
         let base_url = base_url.into();
+        if let Some(token) = auth_token.as_deref() {
+            refuse_local_token_leaving_loopback(&base_url, token)?;
+        }
         let headers = daemon_client_headers(auth_token, session_id)?;
         let request_timeout = std::env::var("KIN_DAEMON_HTTP_TIMEOUT_SECS")
             .ok()
@@ -3922,6 +3983,50 @@ fn supervisor_auth_token() -> Option<String> {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
+}
+
+/// Attach the supervisor bearer token to an async request, when there is one.
+fn with_supervisor_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match supervisor_auth_token() {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
+}
+
+/// The blocking twin of [`with_supervisor_auth`].
+fn with_supervisor_auth_blocking(
+    request: reqwest::blocking::RequestBuilder,
+) -> reqwest::blocking::RequestBuilder {
+    match supervisor_auth_token() {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
+}
+
+/// The endpoint a supervisor route may send this process to, or `None`.
+///
+/// The supervisor stores whatever endpoint a registration reports and a
+/// heartbeat overwrites it, so this value is written by another process rather
+/// than derived here. Its sibling `supervisor_route_for_repo` never trusted it:
+/// that one keeps the port and rebuilds a loopback URL. This is the path that
+/// used the string verbatim, and then built an authenticated client on it, so a
+/// process that repointed a repository's route collected the repository's
+/// bearer token and answered every question the CLI asked afterwards.
+///
+/// A repo daemon always registers `http://127.0.0.1:<port>`
+/// (`supervisor::repo_registration_payload`), so nothing legitimate is refused
+/// here. A refusal is loud rather than silent, because a route that names
+/// another host is not a stale record.
+fn trusted_supervisor_endpoint(endpoint: &str) -> Option<String> {
+    if endpoint_is_loopback(endpoint) {
+        return Some(endpoint.to_string());
+    }
+    tracing::warn!(
+        %endpoint,
+        "refusing a supervisor route that does not name loopback; no request was sent to it and \
+         no daemon token left this process"
+    );
+    None
 }
 
 /// Remove the supervisor's pid/port endpoint files. Called after a confirmed
@@ -7638,20 +7743,19 @@ fn supervisor_instance_id(pid: u32, port: u16) -> String {
 
 async fn supervisor_route_for_repo(kin_root: &Path, supervisor_url: &str) -> Option<String> {
     let repo_id = repo_id_for_kin_root(kin_root)?;
-    let route: SupervisorRouteResponse = daemon_health_client()
-        .get(format!(
-            "{}/repos/{}/route",
-            supervisor_url.trim_end_matches('/'),
-            urlencoding::encode(&repo_id)
-        ))
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .await
-        .ok()?;
+    let route: SupervisorRouteResponse = with_supervisor_auth(daemon_health_client().get(format!(
+        "{}/repos/{}/route",
+        supervisor_url.trim_end_matches('/'),
+        urlencoding::encode(&repo_id)
+    )))
+    .send()
+    .await
+    .ok()?
+    .error_for_status()
+    .ok()?
+    .json()
+    .await
+    .ok()?;
 
     let port = route
         .endpoint
@@ -7685,22 +7789,22 @@ fn supervisor_route_for_repo_if_running(kin_root: &Path) -> Option<String> {
         .timeout(Duration::from_secs(2))
         .build()
         .ok()?;
-    let route: SupervisorRouteResponse = client
-        .get(format!(
-            "{}/repos/{}/route",
-            supervisor_url.trim_end_matches('/'),
-            urlencoding::encode(&repo_id)
-        ))
-        .send()
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .ok()?;
+    let route: SupervisorRouteResponse = with_supervisor_auth_blocking(client.get(format!(
+        "{}/repos/{}/route",
+        supervisor_url.trim_end_matches('/'),
+        urlencoding::encode(&repo_id)
+    )))
+    .send()
+    .ok()?
+    .error_for_status()
+    .ok()?
+    .json()
+    .ok()?;
 
+    let endpoint = trusted_supervisor_endpoint(&route.endpoint)?;
     let working_dir = kin_root.parent()?;
     let health: HealthResponse = client
-        .get(format!("{}/health", route.endpoint.trim_end_matches('/')))
+        .get(format!("{}/health", endpoint.trim_end_matches('/')))
         .send()
         .ok()?
         .error_for_status()
@@ -7708,7 +7812,7 @@ fn supervisor_route_for_repo_if_running(kin_root: &Path) -> Option<String> {
         .json()
         .ok()?;
     validate_health_repo(&health, working_dir).ok()?;
-    Some(route.endpoint)
+    Some(endpoint)
 }
 
 async fn supervisor_route_for_repo_if_running_async(kin_root: &Path) -> Option<String> {
@@ -7719,24 +7823,24 @@ async fn supervisor_route_for_repo_if_running_async(kin_root: &Path) -> Option<S
         .timeout(Duration::from_secs(2))
         .build()
         .ok()?;
-    let route: SupervisorRouteResponse = client
-        .get(format!(
-            "{}/repos/{}/route",
-            supervisor_url.trim_end_matches('/'),
-            urlencoding::encode(&repo_id)
-        ))
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .await
-        .ok()?;
+    let route: SupervisorRouteResponse = with_supervisor_auth(client.get(format!(
+        "{}/repos/{}/route",
+        supervisor_url.trim_end_matches('/'),
+        urlencoding::encode(&repo_id)
+    )))
+    .send()
+    .await
+    .ok()?
+    .error_for_status()
+    .ok()?
+    .json()
+    .await
+    .ok()?;
 
+    let endpoint = trusted_supervisor_endpoint(&route.endpoint)?;
     let working_dir = kin_root.parent()?;
     let health: HealthResponse = client
-        .get(format!("{}/health", route.endpoint.trim_end_matches('/')))
+        .get(format!("{}/health", endpoint.trim_end_matches('/')))
         .send()
         .await
         .ok()?
@@ -7746,7 +7850,7 @@ async fn supervisor_route_for_repo_if_running_async(kin_root: &Path) -> Option<S
         .await
         .ok()?;
     validate_health_repo(&health, working_dir).ok()?;
-    Some(route.endpoint)
+    Some(endpoint)
 }
 
 async fn register_repo_daemon_with_supervisor(
@@ -7817,15 +7921,14 @@ async fn post_supervisor_registration(
     supervisor_url: &str,
     registration: &SupervisorRegistration,
 ) -> Result<(), reqwest::Error> {
-    daemon_health_client()
-        .post(format!(
-            "{}/daemons/register",
-            supervisor_url.trim_end_matches('/')
-        ))
-        .json(registration)
-        .send()
-        .await?
-        .error_for_status()?;
+    with_supervisor_auth(daemon_health_client().post(format!(
+        "{}/daemons/register",
+        supervisor_url.trim_end_matches('/')
+    )))
+    .json(registration)
+    .send()
+    .await?
+    .error_for_status()?;
     Ok(())
 }
 
@@ -13143,6 +13246,124 @@ mod tests {
             assert!(
                 !message.contains("no Kin daemon is reachable"),
                 "from_override={from_override}: {message}"
+            );
+        }
+    }
+
+    /// What counts as this machine's own daemon, and what only looks like it.
+    #[test]
+    fn only_a_real_loopback_endpoint_reads_as_loopback() {
+        for trusted in [
+            "http://127.0.0.1:4219",
+            "http://127.0.0.1",
+            "http://127.7.7.7:4219",
+            "http://localhost:4219",
+            "http://LOCALHOST:4219",
+            "http://[::1]:4219",
+            "https://127.0.0.1:4219",
+            "https://localhost",
+        ] {
+            assert!(
+                endpoint_is_loopback(trusted),
+                "{trusted} names this machine and must be trusted"
+            );
+        }
+
+        for hostile in [
+            "http://attacker.example:4219",
+            "http://10.0.0.5:4219",
+            // Every one of these starts with a string a prefix test looks for.
+            "http://127.0.0.1.attacker.example:4219",
+            "http://localhost.attacker.example:4219",
+            "http://localhost@attacker.example:4219",
+            "http://127.0.0.1:4219@attacker.example",
+            // Not an endpoint this client speaks.
+            "file:///etc/passwd",
+            "ftp://127.0.0.1",
+            "127.0.0.1:4219",
+            "",
+        ] {
+            assert!(
+                !endpoint_is_loopback(hostile),
+                "{hostile} is not this machine and must not be trusted"
+            );
+        }
+    }
+
+    /// The repo-local daemon token authenticates one daemon on this machine.
+    /// A `KIN_DAEMON_URL` naming somewhere else must not collect it.
+    #[test]
+    #[serial_test::serial]
+    fn the_local_daemon_token_never_leaves_loopback() {
+        let _paired = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_AUTH_TOKEN");
+
+        // Control: the same token on a loopback endpoint is the ordinary path.
+        assert!(DaemonClient::from_base_url_with_explicit_authority(
+            "http://127.0.0.1:4219",
+            Some("repo-local-token".to_string()),
+            None,
+        )
+        .is_ok());
+
+        let refusal = DaemonClient::from_base_url_with_explicit_authority(
+            "http://attacker.example:4219",
+            Some("repo-local-token".to_string()),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refusal.contains("refusing to send the local daemon token"),
+            "the refusal must name what it refused: {refusal}"
+        );
+        assert!(
+            refusal.contains("attacker.example"),
+            "the refusal must name the endpoint: {refusal}"
+        );
+
+        // A remote endpoint an operator paired with its own credential is the
+        // documented way to reach one, and it still works.
+        let mut paired =
+            kin_core::test_env::EnvVarGuard::set("KIN_DAEMON_AUTH_TOKEN", "paired-remote-token");
+        assert!(
+            DaemonClient::from_base_url_with_explicit_authority(
+                "https://daemon.example:4219",
+                Some("paired-remote-token".to_string()),
+                None,
+            )
+            .is_ok(),
+            "a remote endpoint paired with KIN_DAEMON_AUTH_TOKEN must still be reachable"
+        );
+
+        // The pairing is per token, not a blanket opt-out: the repo-local token
+        // still cannot ride to that endpoint.
+        assert!(DaemonClient::from_base_url_with_explicit_authority(
+            "https://daemon.example:4219",
+            Some("repo-local-token".to_string()),
+            None,
+        )
+        .is_err());
+
+        paired.apply("KIN_DAEMON_AUTH_TOKEN", None::<&str>);
+    }
+
+    /// A supervisor route is written by whichever process registered, so the
+    /// endpoint it hands back is another process's claim rather than a fact.
+    #[test]
+    fn a_supervisor_route_naming_another_host_is_refused() {
+        assert_eq!(
+            trusted_supervisor_endpoint("http://127.0.0.1:4219").as_deref(),
+            Some("http://127.0.0.1:4219"),
+            "the endpoint a repo daemon actually registers must route"
+        );
+        for hostile in [
+            "http://attacker.example:4219",
+            "http://10.0.0.5:4219",
+            "http://127.0.0.1.attacker.example:4219",
+        ] {
+            assert!(
+                trusted_supervisor_endpoint(hostile).is_none(),
+                "{hostile} must not become this command's daemon"
             );
         }
     }
