@@ -16700,7 +16700,9 @@ async fn publication_control_authorize_next_reader(
     // Redacted, unlike admit-reader's echo of the caller's own record. The
     // caller wants to read back the identity it just wrote, and nothing on this
     // route needs a lease token in the response to do that.
-    Ok(Json(crate::publication_lease::PublicationControlStatus::from(record)))
+    Ok(Json(
+        crate::publication_lease::PublicationControlStatus::from(record),
+    ))
 }
 
 async fn publication_control_release_rollout(
