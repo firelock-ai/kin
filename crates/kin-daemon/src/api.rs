@@ -37369,7 +37369,18 @@ mod tests {
             "a declared ceiling equal to the framework default it replaces \
              changes nothing at runtime and no test can tell the two apart"
         );
-        let over_ceiling = MCP_LOCAL_CALL_MAX_BODY_BYTES as u64 + 1;
+        // Fixed, not `MCP_LOCAL_CALL_MAX_BODY_BYTES + 1`. A probe computed from
+        // the value under test cannot grade that value: raising the ceiling
+        // raises the probe with it and the refusal still arrives. This test was
+        // written that way twice, and falsification caught it both times. The
+        // guard below is what turns a raised ceiling red.
+        const DECLARED_OVER_CEILING: u64 = 5 * 1024 * 1024;
+        assert!(
+            DECLARED_OVER_CEILING > MCP_LOCAL_CALL_MAX_BODY_BYTES as u64,
+            "the declared length must exceed the ceiling or this test grades \
+             nothing"
+        );
+        let over_ceiling = DECLARED_OVER_CEILING;
 
         let state = test_state();
         state
