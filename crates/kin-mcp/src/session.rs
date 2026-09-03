@@ -1534,8 +1534,12 @@ impl SessionRegistry {
             .filter(|tx| tx.session_id == session_id && is_unfinished_transaction_state(&tx.state))
             .count();
         if unfinished >= MAX_ACTIVE_TRANSACTIONS_PER_SESSION {
+            // Names no session id. The refusal goes back to the caller that
+            // just sent one, so repeating it tells that caller nothing, and it
+            // is the whole of what puts a session identifier into daemon logs
+            // and panic output on this path.
             return Err(format!(
-                "transaction_limit_exceeded: session {session_id} already holds {unfinished} \
+                "transaction_limit_exceeded: this session already holds {unfinished} \
                  unfinished transaction(s), the per-session maximum of \
                  {MAX_ACTIVE_TRANSACTIONS_PER_SESSION}. Commit or abort one with \
                  kin_transaction_commit or kin_transaction_abort before beginning another."
