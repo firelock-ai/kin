@@ -276,8 +276,23 @@ function apiReason(response) {
 // path gives, so an empty environment makes every read here say "no record yet"
 // and "no branch yet" and walks the run all the way to the write before failing
 // there. The read side wears the costume of a normal first run. Asking for the
-// repo and requiring push turns that into one named refusal at the door.
-async function assertCanWrite(token, repo) {
+// repo turns that into one named refusal at the door.
+//
+// The push half of that door reads `permissions` off the repository object, and
+// that block reports the AUTHENTICATED USER's permissions. A GitHub App
+// installation token is not a user, so it does not get one, and requiring
+// `push === true` refused the exact token release-cut.yml mints for this call:
+// on 2026-09-03 runs 33701924830 and 33702001129 both died here while the same
+// App, same installation, same `permission-contents: write`, had already moved
+// the candidate branch by PATCHing a ref in the arm job of run 33695497452.
+//
+// So an explicit `push: false` is still a refusal, because a token that says it
+// cannot push cannot, and that is the read-only-user case this door was added
+// for. An ABSENT block says nothing either way and is reported rather than
+// treated as a denial: the write is a few lines further on and GitHub refuses it
+// by name if the token really cannot push, which is a worse error than this one
+// but a far better error than refusing a token that works.
+async function assertCanWrite(token, repo, log = console.log) {
   if (!token) {
     throw new Error(
       `no GitHub token: GH_TOKEN and GITHUB_TOKEN are unset and "gh auth token" returned nothing, so nothing can be recorded on ${repo}. Run "gh auth login" or export GH_TOKEN.`,
@@ -292,15 +307,42 @@ async function assertCanWrite(token, repo) {
   if (!info.ok) {
     throw new Error(`this token was refused by ${repo}: HTTP ${info.status} ${apiReason(info)}`);
   }
-  if (info.body?.permissions?.push !== true) {
-    throw new Error(
-      `this token can read ${repo} but has no push permission, so the record would be refused at the write. Use a token with write access to ${repo}.`,
-    );
+  // The block is only about THIS token when it agrees with what this request
+  // already proved. The read above succeeded, so a block claiming `pull: false`
+  // is describing something other than the caller and none of its other fields
+  // mean anything either.
+  //
+  // Measured on 2026-09-03, run 33705610718: an installation token minted with
+  // `permission-contents: write` got back
+  // {"admin":false,"maintain":false,"push":false,"triage":false,"pull":false}
+  // on a request it had just performed successfully. The block is the
+  // repo-COLLABORATOR projection, an installation is not a collaborator, so it
+  // reads all false. `contents: write` is a different axis and does not appear
+  // here at all. That is why no reading of `push` off this object is correct:
+  // the object is not wrong about the answer, it is answering a different
+  // question.
+  const permissions = info.body?.permissions;
+  const describesThisToken =
+    permissions !== null && typeof permissions === 'object' && permissions.pull === true;
+  if (describesThisToken) {
+    // A real read-only token: it can read, the block says so, and it says push
+    // is not available. That is the case this door was added for and it still
+    // refuses at the door rather than at the write.
+    if (permissions.push !== true) {
+      throw new Error(
+        `this token can read ${repo} but has no push permission, so the record would be refused at the write. Use a token with write access to ${repo}.`,
+      );
+    }
+    return;
   }
+  const saw = permissions === undefined ? 'no permissions block' : JSON.stringify(permissions);
+  log(
+    `${repo} returned ${saw}, which does not describe the token that just read it, so it cannot say whether this token may write; proceeding, and the write refuses by name if it may not.`,
+  );
 }
 
 async function publish({ sha, name, file, repo, requireArchive }, { token = resolveToken(), log = console.log } = {}) {
-  await assertCanWrite(token, repo);
+  await assertCanWrite(token, repo, log);
   if (requireArchive) {
     await assertArchiveJudged(token, repo, sha, requireArchive);
   }

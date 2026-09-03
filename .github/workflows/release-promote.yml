@@ -1,0 +1,184 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Release Promotion
+
+# Finishes a release whose first-contact proof arrived after its tag.
+#
+# The release chain has two tiers. release-tag.yml mints a tag on the machine
+# preflight alone, so a candidate is never held hostage to a driver; release.yml
+# publishes it as a prerelease and writes into its body that first-contact proof
+# is pending. GitHub Latest, which is what an installer resolves when a stranger
+# types the install line, still requires the complete stranger record.
+#
+# Without this workflow that second tier would be a dead end: the record lands
+# on the evidence branch hours later and nothing would notice. A push to the
+# release-evidence branch cannot trigger anything either, because that branch is
+# an orphan carrying no workflow files, so GitHub resolves no workflow from the
+# pushed ref. Hence a sweep.
+on:
+  # Offset from the train (7,22,37,52), recovery and the cut (3,18,33,48) and
+  # the sentinel (11,41), so this reads a settled rail rather than one
+  # mid-reconcile.
+  schedule:
+    - cron: "9,24,39,54 * * * *"
+  # For a captain who has just published a record and does not want to wait a
+  # quarter of an hour. Typed rather than a workflow_dispatch: a dispatch takes
+  # a ref, and this job reaches a credential that can flip a release.
+  repository_dispatch:
+    types: [release_promote]
+
+permissions:
+  contents: read
+
+# The same group release.yml holds, so a promotion can never run while a release
+# run is mid-flight on the tag it would flip. Serialized rather than cancelled,
+# because a cancelled promotion leaves a proven release un-promoted and silent.
+concurrency:
+  group: kin-release-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote proven releases to Latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # release-tag, not release, and the difference is load-bearing rather than
+    # cosmetic. The `release` environment's deployment branch policy admits
+    # `tag: v*.*.*` ONLY, so a job reaching it from a scheduled run on main is
+    # refused by the server before a step executes, every fifteen minutes,
+    # forever. `release-tag` admits `branch: main`, which is exactly the policy
+    # an automatic controller running from protected main needs, and it is what
+    # release-cut.yml's three credentialed jobs already use for the same reason.
+    #
+    # Found by reading the two policies rather than by reasoning about the
+    # names. Nothing in this file would have hinted at it, and the failure would
+    # have arrived on a release night.
+    environment: release-tag
+    permissions:
+      # One release flip and one body edit.
+      contents: write
+      # The alarm, which is the only thing standing between a forgotten release
+      # and a rail that is quietly one version behind forever.
+      issues: write
+    steps:
+      - name: Checkout release policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Judge every held release, and write down what was decided before
+      # anything is changed. The plan is a file rather than a set of step
+      # outputs so a reader of a finished run can see exactly what this tick
+      # believed, including the releases it decided NOT to touch.
+      #
+      # The judging lives in scripts/release-promotion-plan.mjs rather than in
+      # this file. A sixty-line inline validator inside a YAML string is not
+      # reachable by `node --check` or by any test, and the first draft of this
+      # step carried a syntax error nothing here would have caught.
+      - name: Plan the promotions
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIN_PROMOTION_PLAN: ${{ runner.temp }}/promotion-plan.json
+        run: |
+          set -euo pipefail
+          node scripts/release-promotion-plan.mjs
+          test -s "$KIN_PROMOTION_PLAN"
+          {
+            echo "### Release promotion plan"
+            echo
+            echo '```json'
+            cat "$KIN_PROMOTION_PLAN"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Promote every release whose proof is now complete
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIN_PROMOTION_PLAN: ${{ runner.temp }}/promotion-plan.json
+        run: |
+          set -euo pipefail
+          # zsh is not the shell here, but the same discipline applies: read the
+          # list one line at a time rather than word-splitting it.
+          while IFS=$'\t' read -r tag driver; do
+            [ -n "$tag" ] || continue
+            echo "::notice::promoting $tag to GitHub Latest; first-contact proof complete, driven on the ${driver} endpoint"
+            version="${tag#v}"
+            channel="$(node scripts/release-order.mjs channel "$version")"
+            # The same npm and rollback checks release.yml makes before it flips
+            # a release, run again here because this path reaches Latest too and
+            # a second door with a lower bar is not a second door, it is the bar.
+            for package in @kinlab/kin @kinlab/kin-mcp; do
+              npm_version="$(node scripts/release-order.mjs npm-channel "$package" "$channel")"
+              if [ "$npm_version" != "$version" ]; then
+                echo "::error::npm ${package}@${channel} serves ${npm_version}; ${tag} stays a prerelease"
+                exit 1
+              fi
+            done
+            current_tag="$(node scripts/release-order.mjs github-latest "$GITHUB_REPOSITORY")"
+            node scripts/release-order.mjs assert-not-rollback \
+              "$version" "${current_tag#v}" "GitHub Latest"
+
+            # Take the pending notice back out. A promoted release that still
+            # says its proof is pending is a false claim in the other direction,
+            # and the marker is what a later sweep keys on.
+            gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body --jq '.body' \
+              | node scripts/read-promotion-plan.mjs strip-notice > "$RUNNER_TEMP/promoted-body.md"
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" \
+              --notes-file "$RUNNER_TEMP/promoted-body.md"
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+
+            # Read it back. A 200 from the edit is not the same fact as a
+            # release that is actually Latest.
+            actual="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq '.prerelease')"
+            latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
+            if [ "$actual" != "false" ] || [ "$latest" != "$tag" ]; then
+              echo "::error::${tag} did not become Latest: prerelease=${actual}, latest=${latest}"
+              exit 1
+            fi
+            echo "${tag} is GitHub Latest"
+          done < <(node scripts/read-promotion-plan.mjs promotions)
+
+      # The alarm runs whatever the promotion did, because the releases it
+      # reports are exactly the ones the promotion could NOT touch.
+      - name: Report releases still waiting for first-contact proof
+        if: ${{ always() && steps.plan.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIN_PROMOTION_PLAN: ${{ runner.temp }}/promotion-plan.json
+        run: |
+          set -euo pipefail
+          node scripts/read-promotion-plan.mjs alarm \
+            --body "$RUNNER_TEMP/alarm-body.md" > "$RUNNER_TEMP/alarm-decision.txt"
+          IFS=$'\t' read -r action number title < "$RUNNER_TEMP/alarm-decision.txt"
+          case "$action" in
+            open)
+              # The label is how the next sweep finds this issue in a bounded
+              # read rather than paging every open issue, so it has to exist
+              # before the issue does. `--force` makes this idempotent; a
+              # missing label would otherwise fail the create and leave the
+              # alarm silent, which is the one outcome this job exists to
+              # prevent.
+              gh label create release-proof --repo "$GITHUB_REPOSITORY" --force \
+                --color B60205 \
+                --description "A published release is waiting for first-contact proof"
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+                --label release-proof --body-file "$RUNNER_TEMP/alarm-body.md"
+              ;;
+            update)
+              gh issue comment "$number" --repo "$GITHUB_REPOSITORY" \
+                --body-file "$RUNNER_TEMP/alarm-body.md"
+              ;;
+            close)
+              gh issue close "$number" --repo "$GITHUB_REPOSITORY" \
+                --comment "Every published release now carries complete first-contact proof, or is already GitHub Latest."
+              ;;
+            none)
+              echo "no release is overdue for first-contact proof"
+              ;;
+            *)
+              echo "::error::the promotion plan asked for an alarm action this job does not know: ${action}"
+              exit 1
+              ;;
+          esac

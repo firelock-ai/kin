@@ -505,6 +505,11 @@ fn main() {
     }
 
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
+    // Raise this process's open-file soft limit before the runtime exists and
+    // before anything opens a store. A daemon inherits the limit of whatever
+    // started it, which on a stock Mac is 256, and it does the same storage
+    // work the CLI does. The CLI applies the SAME raise, so the two agree.
+    kin_core::file_limit::raise_open_file_limit();
     // Select this process's resource profile before the runtime exists: the
     // environment is mutated while the process is still single-threaded, and
     // ahead of the reads below that derive the embed worker's batch size and

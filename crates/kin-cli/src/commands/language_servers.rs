@@ -23,6 +23,7 @@
 //! download into a shared global prefix, and Kin does not spend a user's
 //! bandwidth or mutate their toolchain on a probe's say-so.
 
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -158,6 +159,71 @@ impl LanguageServerRecipe {
         which::which(self.program).is_ok()
     }
 
+    /// Whether this recipe redirects with `GOBIN` rather than an installer flag.
+    ///
+    /// `go install` has no prefix argument at all. Its destination is the
+    /// `GOBIN` environment variable, defaulting to `$(go env GOPATH)/bin`, so
+    /// the Go row's redirect is an environment entry where every npm row's is
+    /// an argument. The two cannot share one shape, and a Go recipe pushed
+    /// through the npm shape would hand `go` a `--prefix` flag it rejects.
+    fn redirects_through_gobin(&self) -> bool {
+        self.program == "go"
+    }
+
+    /// The environment the managed route runs its installer under.
+    ///
+    /// Empty for every npm recipe, which redirects with `--prefix`. For Go it
+    /// is `GOBIN` pointed at [`kin_core::tool_prefix::managed_tool_bin_dir`],
+    /// a directory both binaries already append to `PATH` at startup through
+    /// `augment_path_with_managed_tools`. That is the whole answer to the gap
+    /// wiring the adapter does not close: an ordinary `go install` writes into
+    /// `$(go env GOPATH)/bin`, which nothing puts on `PATH`, and the daemon
+    /// starts a language server with a bare `Command::new("gopls")`.
+    pub(crate) fn managed_prefix_env(&self) -> Vec<(String, String)> {
+        if self.redirects_through_gobin() {
+            return vec![(
+                "GOBIN".to_string(),
+                kin_core::tool_prefix::managed_tool_bin_dir()
+                    .display()
+                    .to_string(),
+            )];
+        }
+        Vec::new()
+    }
+
+    /// The directory the managed route needs to exist before it runs.
+    pub(crate) fn managed_prefix_dir(&self) -> PathBuf {
+        if self.redirects_through_gobin() {
+            kin_core::tool_prefix::managed_tool_bin_dir()
+        } else {
+            kin_core::tool_prefix::managed_node_prefix()
+        }
+    }
+
+    /// Where the managed route's binary lands, as the report says it back.
+    ///
+    /// Not the same as [`Self::managed_prefix_dir`] for npm, which installs
+    /// into a prefix and links executables into `node_modules/.bin` beneath it.
+    /// Naming the wrong one is a run that reports success over a binary nothing
+    /// can reach.
+    pub(crate) fn managed_prefix_bin_dir(&self) -> PathBuf {
+        if self.redirects_through_gobin() {
+            kin_core::tool_prefix::managed_tool_bin_dir()
+        } else {
+            kin_core::tool_prefix::managed_node_bin_dir()
+        }
+    }
+
+    /// What vouches for the bytes the managed route installs.
+    fn managed_route_source(&self) -> String {
+        if self.redirects_through_gobin() {
+            return format!(
+                "{GOPLS_MODULE}, built from source and verified against the Go checksum database"
+            );
+        }
+        format!("{}, integrity checked by npm", self.program)
+    }
+
     /// The arguments for the same installer pointed at a prefix Kin owns.
     ///
     /// `-g` is dropped and `--prefix` inserted, which turns a global install
@@ -165,6 +231,13 @@ impl LanguageServerRecipe {
     /// arguments are untouched, pin included, because the whole hazard the
     /// TypeScript pin exists for is a copy that quietly drops it.
     pub(crate) fn managed_prefix_args(&self, prefix: &Path) -> Vec<String> {
+        // The Go route redirects through the environment, so its arguments are
+        // the recipe's own, module pin included. Rewriting them would be the
+        // exact copy that drops a pin, in a route whose whole reason to exist
+        // is that the default destination is unreachable.
+        if self.redirects_through_gobin() {
+            return self.args.iter().map(|arg| (*arg).to_string()).collect();
+        }
         let mut args: Vec<String> = vec!["install".to_string()];
         args.push("--prefix".to_string());
         args.push(prefix.display().to_string());
@@ -185,12 +258,19 @@ impl LanguageServerRecipe {
     pub(crate) fn route_command_line(&self, route: InstallRoute) -> String {
         match route {
             InstallRoute::Installer => self.command_line(),
-            InstallRoute::ManagedPrefix => format!(
-                "{} {}",
-                self.program,
-                self.managed_prefix_args(&kin_core::tool_prefix::managed_node_prefix())
-                    .join(" ")
-            ),
+            InstallRoute::ManagedPrefix => {
+                // The environment is part of the command for the Go route,
+                // because GOBIN is the whole redirect. A printed `go install`
+                // with the environment stripped is a command that installs
+                // somewhere else, handed to an operator as the thing that ran.
+                let environment: String = self
+                    .managed_prefix_env()
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value} "))
+                    .collect();
+                let arguments = self.managed_prefix_args(&self.managed_prefix_dir());
+                format!("{environment}{} {}", self.program, arguments.join(" "))
+            }
             InstallRoute::PinnedRelease => match self.fallback {
                 Fallback::PinnedRelease(release) => format!(
                     "download {} {} from the {} release binaries",
@@ -241,6 +321,20 @@ pub(crate) fn resolve_route(recipe: &LanguageServerRecipe) -> Option<InstallRout
 /// because `typescript-language-server` declares no peer dependency on
 /// typescript at all.
 const TYPESCRIPT_PACKAGE: &str = "typescript@^5";
+
+/// The gopls module `go install` builds, pinned to a tag.
+///
+/// Pinned for the reason the typescript package is. `@latest` resolves to
+/// whatever upstream tagged that morning, so two machines set up a week apart
+/// index one repository with two different servers and nothing records which of
+/// them produced an edge. The failure is invisible from the install side: both
+/// runs exit zero, both put `gopls` on PATH, and only the graph disagrees.
+///
+/// A source pin rather than a binary one, because gopls is distributed as a Go
+/// module rather than as prebuilt release assets. `go install` builds it with
+/// the host's own toolchain, so this route adds nothing to Kin's release
+/// archive and redistributes nothing.
+const GOPLS_MODULE: &str = "golang.org/x/tools/gopls@v0.22.0";
 
 /// Every language this build can enrich, with the server that enriches it.
 ///
@@ -294,6 +388,15 @@ pub(crate) const LANGUAGE_SERVERS: &[LanguageServerRecipe] = &[
         fallback: Fallback::ManagedPrefix,
         disclosure: "downloads the typescript-language-server and typescript npm packages into \
                      your global npm prefix",
+    },
+    LanguageServerRecipe {
+        language: LanguageId::Go,
+        binaries: &["gopls"],
+        program: "go",
+        args: &["install", GOPLS_MODULE],
+        fallback: Fallback::ManagedPrefix,
+        disclosure: "builds gopls from source with your Go toolchain and installs it into your \
+                     Go bin directory",
     },
 ];
 
@@ -452,6 +555,17 @@ pub(crate) fn install_fix_line(missing_names: &[&str]) -> String {
 pub(crate) fn route_disclosure(recipe: &LanguageServerRecipe, route: InstallRoute) -> String {
     match route {
         InstallRoute::Installer => recipe.disclosure.to_string(),
+        // The Go route is not a redirected npm install and must not describe
+        // itself as one. It builds from source with the operator's own
+        // toolchain, and the reason it redirects is a PATH gap rather than a
+        // permission one. Different spend, different repair, different sentence.
+        InstallRoute::ManagedPrefix if recipe.redirects_through_gobin() => format!(
+            "builds gopls from source with your Go toolchain and installs it into {}, a \
+             directory Kin owns under KIN_HOME and already appends to PATH. An ordinary `go \
+             install` writes into your Go bin directory instead, which this host's PATH does \
+             not carry, and the daemon starts a language server with a bare `gopls`",
+            kin_core::tool_prefix::managed_tool_bin_dir().display()
+        ),
         InstallRoute::ManagedPrefix => format!(
             "runs the same install against {}, a prefix Kin owns under KIN_HOME, because this \
              host's global npm prefix refuses this user",
@@ -739,14 +853,79 @@ pub(crate) fn npm_prefix_blocker(prefix: &NpmGlobalPrefix) -> Option<String> {
     ))
 }
 
+/// Where a bare `go install` would put the binary.
+///
+/// `GOBIN` when the toolchain has one, otherwise `$(go env GOPATH)/bin`. Asked
+/// of the toolchain rather than assembled from `$HOME`, because GOPATH is
+/// configurable and a guess would name the wrong directory in the one message
+/// whose whole job is to name the right one. `None` when there is no `go` to
+/// ask, which is the same host state `installer_available` already reports.
+fn go_default_bin_dir() -> Option<PathBuf> {
+    let output = Command::new("go")
+        .args(["env", "GOBIN", "GOPATH"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let gobin = lines.next().unwrap_or_default().trim();
+    if !gobin.is_empty() {
+        return Some(PathBuf::from(gobin));
+    }
+    let gopath = lines.next().unwrap_or_default().trim();
+    if gopath.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(gopath).join("bin"))
+}
+
+/// Whether a binary installed into `dir` would be reachable from `path`.
+///
+/// Pure over its inputs, so the rule that decides Go's route is decidable with
+/// no host, no toolchain and no subprocess, exactly as [`choose_route`] is.
+pub(crate) fn directory_is_on_path(dir: &Path, path: Option<&OsString>) -> bool {
+    path.is_some_and(|value| std::env::split_paths(value).any(|entry| entry == dir))
+}
+
+/// The reason a bare `go install` cannot close this gap, stated before it runs.
+///
+/// `go install` has no prefix flag and nothing resolves for it afterwards. It
+/// writes into `$(go env GOPATH)/bin`, which nothing puts on `PATH` by default,
+/// and `kin_lsp::lifecycle::LspServer::start` runs the bare string `gopls` with
+/// no `which` and no GOPATH fallback. So the ordinary install succeeds and the
+/// daemon still starts nothing: the same exit-zero-over-an-open-gap the npm
+/// prefix blocker exists for, arriving through a different door.
+pub(crate) fn go_default_bin_blocker(dir: &Path, path: Option<&OsString>) -> Option<String> {
+    if directory_is_on_path(dir, path) {
+        return None;
+    }
+    Some(format!(
+        "`go install` writes gopls into {}, which is not on this process's PATH, and the daemon \
+         starts a language server with a bare `gopls` and no GOPATH fallback, so a server \
+         installed there is one nothing can start",
+        dir.display()
+    ))
+}
+
 /// Why this install cannot succeed, known before it is attempted.
 ///
-/// Only the npm recipes have one today, and it is the one a container hits:
-/// the Node base images set the global prefix to `/usr/local`, whose
-/// `lib/node_modules` is owned by root, and a Kin running as an unprivileged
-/// user cannot write there. Attempting it anyway spends the download and ends
-/// in npm's own EACCES trace, which reads as a Kin defect and names no remedy.
+/// The npm recipes have the one a container hits: the Node base images set the
+/// global prefix to `/usr/local`, whose `lib/node_modules` is owned by root, and
+/// a Kin running as an unprivileged user cannot write there. Attempting it
+/// anyway spends the download and ends in npm's own EACCES trace, which reads as
+/// a Kin defect and names no remedy.
+///
+/// Go's is the same failure with a different cause: the install succeeds and
+/// lands somewhere nothing reads. Both are "running this installer against its
+/// own default target cannot close the gap", which is what
+/// `HostRoutes::default_target_blocked` means and what routes each of them to a
+/// destination Kin owns.
 fn install_blocker(recipe: &LanguageServerRecipe) -> Option<String> {
+    if recipe.redirects_through_gobin() {
+        return go_default_bin_blocker(&go_default_bin_dir()?, std::env::var_os("PATH").as_ref());
+    }
     if recipe.program != "npm" {
         return None;
     }
@@ -916,8 +1095,10 @@ fn proxy_environment_lines(program: &str) -> Vec<String> {
                 .to_string(),
         );
     } else {
-        // rustup reads the lowercase spellings only, and its downloader takes
-        // the certificate bundle from the OS store.
+        // rustup reads the lowercase spellings only and takes its certificate
+        // bundle from the OS store; the Go toolchain reads either case and its
+        // module fetches honour the same pair. Neither reads npm's config, so
+        // quoting npm's keys at them is advice that does nothing.
         lines
             .push("    export https_proxy=\"$HTTPS_PROXY\" http_proxy=\"$HTTP_PROXY\"".to_string());
     }
@@ -1062,23 +1243,25 @@ pub(crate) fn run_install(
                     .iter()
                     .map(|a| (*a).to_string())
                     .collect::<Vec<_>>(),
+                &[],
                 &recipe.command_line(),
             )
             .map(|()| Vec::new())
         }
         InstallRoute::ManagedPrefix => {
-            let prefix = kin_core::tool_prefix::managed_node_prefix();
+            let prefix = recipe.managed_prefix_dir();
             std::fs::create_dir_all(&prefix).map_err(|error| InstallProblem::Failed {
                 reason: format!("could not create {}: {error}", prefix.display()),
             })?;
             let args = recipe.managed_prefix_args(&prefix);
             let command = recipe.route_command_line(route);
-            run_program(recipe, recipe.program, &args, &command).map(|()| {
+            let environment = recipe.managed_prefix_env();
+            run_program(recipe, recipe.program, &args, &environment, &command).map(|()| {
                 vec![
-                    format!("source:   {}, integrity checked by npm", recipe.program),
+                    format!("source:   {}", recipe.managed_route_source()),
                     format!(
                         "installed to: {}",
-                        kin_core::tool_prefix::managed_node_bin_dir().display()
+                        recipe.managed_prefix_bin_dir().display()
                     ),
                 ]
             })
@@ -1134,11 +1317,16 @@ fn run_program(
     recipe: &LanguageServerRecipe,
     program: &str,
     args: &[String],
+    environment: &[(String, String)],
     command_line: &str,
 ) -> Result<(), InstallProblem> {
     let _ = recipe;
+    // Set rather than inherited, because one route's redirect lives here: `go
+    // install` takes no prefix argument and writes wherever GOBIN says. The npm
+    // routes pass an empty slice and keep the environment they already had.
     let mut child = Command::new(program)
         .args(args)
+        .envs(environment.iter().cloned())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| InstallProblem::Failed {
@@ -1314,6 +1502,42 @@ mod tests {
         assert_eq!(
             recipe_for(LanguageId::Rust).unwrap().command_line(),
             "rustup component add rust-analyzer"
+        );
+        assert_eq!(
+            recipe_for(LanguageId::Go).unwrap().command_line(),
+            "go install golang.org/x/tools/gopls@v0.22.0"
+        );
+    }
+
+    /// The gopls module must never be installed unpinned.
+    ///
+    /// `@latest` resolves to whatever upstream tagged that morning, so two
+    /// machines set up a week apart index one repository with two different
+    /// servers and nothing records which of them produced an edge. The same
+    /// argument the TypeScript pin exists for, and the same failure shape: both
+    /// installs exit zero, both put the binary on PATH, and only the graph
+    /// disagrees. `go install` with no `@version` is a hard error rather than a
+    /// silent latest, so the case this guards is a bare `@latest` somebody
+    /// wrote to stop thinking about the tag.
+    #[test]
+    fn the_gopls_module_is_pinned_to_a_tag_rather_than_to_latest() {
+        let recipe = recipe_for(LanguageId::Go).expect("go must have a recipe");
+        let module = recipe
+            .args
+            .iter()
+            .find(|arg| arg.starts_with("golang.org/x/tools/gopls"))
+            .expect("the go recipe must install the gopls module");
+        let (_, version) = module
+            .split_once('@')
+            .unwrap_or_else(|| panic!("{module}: `go install` needs an explicit @version"));
+        assert_ne!(
+            version, "latest",
+            "{module}: an unpinned gopls gives two machines two different servers with nothing \
+             recording why"
+        );
+        assert!(
+            version.starts_with('v') && version[1..].starts_with(|c: char| c.is_ascii_digit()),
+            "{module}: the gopls module must carry an explicit vX.Y.Z tag, got `{version}`"
         );
     }
 
@@ -2086,6 +2310,108 @@ mod tests {
         assert!(
             !args.contains(&"-g".to_string()),
             "a redirected install must not also be global"
+        );
+    }
+
+    /// The Go managed route installs where Kin has already put PATH.
+    ///
+    /// This is the half of the ticket that wiring the adapter does not close.
+    /// `kin_lsp::lifecycle::LspServer::start` runs the bare string `gopls`, an
+    /// ordinary `go install` writes into `$(go env GOPATH)/bin`, and nothing
+    /// puts that directory on PATH. Both Kin binaries call
+    /// `augment_path_with_managed_tools` at startup, which appends
+    /// `managed_tool_bin_dir`, so pointing GOBIN there is what makes an
+    /// installed server one the daemon can actually start.
+    #[test]
+    fn the_go_managed_route_points_gobin_at_a_directory_kin_puts_on_path() {
+        let go = recipe_for(LanguageId::Go).expect("go must have a recipe");
+        let bin = kin_core::tool_prefix::managed_tool_bin_dir();
+
+        assert_eq!(
+            go.managed_prefix_env(),
+            vec![("GOBIN".to_string(), bin.display().to_string())],
+            "GOBIN is the only redirect `go install` has"
+        );
+        assert_eq!(go.managed_prefix_bin_dir(), bin);
+        assert!(
+            kin_core::tool_prefix::managed_tool_dirs().contains(&bin),
+            "the directory GOBIN names has to be one PATH actually gains, or this route reports \
+             success over a server nothing can start"
+        );
+
+        // The command an operator reads back has to be the command that ran,
+        // environment included. A printed `go install` with GOBIN stripped
+        // sends them to install into the directory this route exists to avoid.
+        let line = go.route_command_line(InstallRoute::ManagedPrefix);
+        assert_eq!(
+            line,
+            format!("GOBIN={} go install {GOPLS_MODULE}", bin.display()),
+            "the redirect and the pin both have to survive the rewrite"
+        );
+
+        // The control, and the reason this is not a blanket change: the npm
+        // route keeps the shape it had, with no environment and the same
+        // `--prefix` rewrite.
+        let typescript = recipe_for(LanguageId::TypeScript).expect("typescript must have a recipe");
+        assert!(typescript.managed_prefix_env().is_empty());
+        assert_eq!(
+            typescript.managed_prefix_bin_dir(),
+            kin_core::tool_prefix::managed_node_bin_dir()
+        );
+        assert!(
+            typescript
+                .route_command_line(InstallRoute::ManagedPrefix)
+                .starts_with("npm install --prefix "),
+            "the npm route must be untouched by the Go branch"
+        );
+    }
+
+    /// A Go bin directory off PATH routes the install to the prefix Kin owns.
+    ///
+    /// The blocker is what makes `choose_route` prefer the managed route here.
+    /// Without it the recipe's own installer wins on every host that has Go:
+    /// the build succeeds, gopls lands in `$(go env GOPATH)/bin`, and the daemon
+    /// still starts nothing, which is the gap wearing a green install's
+    /// clothes. Asserted over an explicit PATH rather than this process's, so
+    /// the test states the host it grades instead of inheriting whichever
+    /// machine ran it.
+    #[test]
+    fn a_go_bin_directory_off_path_routes_the_install_to_the_prefix_kin_owns() {
+        let dir = Path::new("/home/u/go/bin");
+
+        let elsewhere = OsString::from("/usr/local/bin:/usr/bin");
+        let blocker = go_default_bin_blocker(dir, Some(&elsewhere))
+            .expect("a Go bin directory off PATH must be named before the install runs");
+        assert!(blocker.contains("/home/u/go/bin"), "{blocker}");
+        assert!(
+            blocker.contains("not on this process's PATH"),
+            "the reason has to name the mechanism rather than only refuse: {blocker}"
+        );
+
+        // Controls, in both directions. A host that already carries the
+        // directory must keep its own toolchain's install, and a check that
+        // reported a blocker for every host would route everyone through Kin's
+        // prefix and prove nothing.
+        let carrying = OsString::from("/usr/bin:/home/u/go/bin");
+        assert_eq!(go_default_bin_blocker(dir, Some(&carrying)), None);
+        assert!(directory_is_on_path(dir, Some(&carrying)));
+        assert!(!directory_is_on_path(dir, None));
+
+        let go = recipe_for(LanguageId::Go).expect("go must have a recipe");
+        assert_eq!(
+            choose_route(go, host(true, true, false)),
+            Some(InstallRoute::ManagedPrefix),
+            "a Go toolchain whose bin directory PATH does not carry must reach the managed route"
+        );
+        assert_eq!(
+            choose_route(go, host(true, false, false)),
+            Some(InstallRoute::Installer),
+            "a host whose PATH already carries it keeps its own toolchain's install"
+        );
+        assert_eq!(
+            choose_route(go, host(false, false, false)),
+            None,
+            "no Go toolchain means no route: Kin does not install a language toolchain unasked"
         );
     }
 

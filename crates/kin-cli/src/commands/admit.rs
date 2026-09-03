@@ -166,6 +166,67 @@ pub fn graph_moved(report: &AdmitReport) -> bool {
     census_moved(report) || report.tree_moved == Some(true)
 }
 
+/// The one wording that means this pass did not admit the working copy.
+///
+/// A constant rather than a literal in two places, because the exit-status
+/// guard below keys on it: if the summary's wording drifts and the guard's copy
+/// does not, the guard silently stops recognizing a failure it is printing.
+pub const ADMIT_FAILURE_PREFIX: &str = "Complete exact-tree admission failed: ";
+
+/// The cause this admission must exit non-zero for, or `None` when it admitted.
+///
+/// Extracted from `run` so the decision is asserted directly rather than through
+/// a daemon round trip, and widened past the check it used to be (FIR-3098).
+///
+/// A stranger on the v0.6.4 candidate watched `kin admit` print
+/// `Complete exact-tree admission failed: ...` and exit 0. The check on
+/// `report.admitted` was already here and already correct; the hole was the arm
+/// beside it. `report` is `Option<AdmitReport>` carrying `#[serde(default)]`, so
+/// a response that omits the object deserializes to `None` and fell through to
+/// `Ok(())` while the failure the daemon had already rendered sat in `lines` on
+/// its way to the operator's terminal.
+///
+/// So the rule is no longer "the report says it failed". It is that success is
+/// the one answer this may not give unless something established it:
+///
+///   a report that says the pass failed        -> its recorded cause
+///   no report at all                          -> no outcome was established
+///   a summary line that announces the failure -> that line
+///
+/// The third arm is deliberately redundant with the first. It keys on the text
+/// the operator actually read, so any future response shape that renders a
+/// failure into `lines` without a matching report is caught by what it says
+/// rather than by what it forgot to set.
+pub fn admission_failure(response: &AdmitResponse) -> Option<String> {
+    if let Some(report) = response.report.as_ref() {
+        if !report.admitted {
+            return Some(
+                report
+                    .failure
+                    .as_deref()
+                    .or(report.reconcile.last_admission_error.as_deref())
+                    .unwrap_or("no cause recorded")
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(line) = response
+        .lines
+        .iter()
+        .find(|line| line.starts_with(ADMIT_FAILURE_PREFIX))
+    {
+        return Some(line[ADMIT_FAILURE_PREFIX.len()..].to_string());
+    }
+    if response.report.is_none() {
+        return Some(
+            "the daemon returned no admission report, so whether the working copy was admitted \
+             is unknown; read `kin graph status` for the state it left behind"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Render the operator-facing summary for one admission report.
 ///
 /// Kept separate from transport so the wording is asserted directly rather than
@@ -182,7 +243,7 @@ pub fn summary_lines(report: &AdmitReport) -> Vec<String> {
             .as_deref()
             .or(report.reconcile.last_admission_error.as_deref())
             .unwrap_or("no cause recorded");
-        lines.push(format!("Complete exact-tree admission failed: {cause}"));
+        lines.push(format!("{ADMIT_FAILURE_PREFIX}{cause}"));
         if graph_moved(report) {
             // Authority crossed before the failure. Calling that unchanged is
             // the one wording an operator cannot recover from, because it
@@ -462,18 +523,11 @@ pub async fn run() -> Result<()> {
     for line in &response.lines {
         println!("{line}");
     }
-    match response.report.as_ref() {
-        Some(report) if !report.admitted => {
-            let cause = report
-                .failure
-                .as_deref()
-                .or(report.reconcile.last_admission_error.as_deref())
-                .unwrap_or("no cause recorded");
-            Err(anyhow::anyhow!(
-                "complete exact-tree admission failed: {cause}"
-            ))
-        }
-        _ => Ok(()),
+    match admission_failure(&response) {
+        Some(cause) => Err(anyhow::anyhow!(
+            "complete exact-tree admission failed: {cause}"
+        )),
+        None => Ok(()),
     }
 }
 
@@ -510,6 +564,117 @@ mod tests {
         settled.entities_after = 39;
         settled.tree_moved = tree_moved;
         settled
+    }
+
+    /// One response as the daemon actually sends it, so a test cannot assert a
+    /// shape the wire never carries.
+    fn response(report: Option<AdmitReport>) -> AdmitResponse {
+        let lines = report.as_ref().map(summary_lines).unwrap_or_default();
+        AdmitResponse {
+            lines,
+            mutated: false,
+            report,
+        }
+    }
+
+    /// FIR-3098, the arm that already worked. Kept as the control: without it a
+    /// guard that returned `Some` for everything would pass every test below.
+    #[test]
+    fn a_failed_report_exits_nonzero_with_its_recorded_cause() {
+        let cause = admission_failure(&response(Some(report(false))))
+            .expect("a report that says the pass failed must exit nonzero");
+        assert!(
+            cause.contains("host entry changed after exact-tree admission"),
+            "the recorded cause is the news: {cause}"
+        );
+    }
+
+    /// FIR-3098, the hole. A stranger on the v0.6.4 candidate watched
+    /// `kin admit` print `Complete exact-tree admission failed:` and exit 0.
+    ///
+    /// The check on `report.admitted` was already present and already right, at
+    /// the candidate sha as well as on main, so the exit status did not come
+    /// from a missing check. It came from the arm beside it: `report` carries
+    /// `#[serde(default)]`, so a response that omits the object decodes to
+    /// `None` and fell through to `Ok(())` while the failure the daemon had
+    /// already rendered travelled to the terminal in `lines`. That is why the
+    /// rule is now about what was established rather than about one field.
+    #[test]
+    fn a_failure_line_with_no_report_still_exits_nonzero() {
+        let rendered = summary_lines(&report(false));
+        let wire = AdmitResponse {
+            lines: rendered.clone(),
+            mutated: false,
+            report: None,
+        };
+        assert!(
+            rendered
+                .first()
+                .is_some_and(|line| line.starts_with(ADMIT_FAILURE_PREFIX)),
+            "fixture check: the failure the operator reads is in the lines"
+        );
+        let cause = admission_failure(&wire)
+            .expect("a printed failure must never exit zero, whatever the report field holds");
+        assert!(
+            cause.contains("host entry changed after exact-tree admission"),
+            "{cause}"
+        );
+    }
+
+    /// A response that established no outcome at all is not a success either.
+    ///
+    /// No report and no lines is the shape a future transport change, or a
+    /// daemon that answered before it ran the pass, would produce. Success is
+    /// the one answer that must not be given for it.
+    #[test]
+    fn a_response_with_no_outcome_exits_nonzero() {
+        let cause = admission_failure(&AdmitResponse {
+            lines: Vec::new(),
+            mutated: false,
+            report: None,
+        })
+        .expect("a response that established nothing must not read as success");
+        assert!(cause.contains("no admission report"), "{cause}");
+    }
+
+    /// The control every assertion above depends on. A guard that refused
+    /// everything would satisfy all three and break `kin admit` completely.
+    #[test]
+    fn a_real_admission_exits_zero() {
+        assert_eq!(admission_failure(&response(Some(report(true)))), None);
+        assert_eq!(
+            admission_failure(&response(Some(content_only_pass(Some(true))))),
+            None
+        );
+    }
+
+    /// The failure wording is a cross-surface contract, so it is pinned to a
+    /// literal rather than to the constant.
+    ///
+    /// This asserted `summary_lines(..).starts_with(ADMIT_FAILURE_PREFIX)` and
+    /// survived the mutation written to break it, because after the refactor one
+    /// constant feeds both the producer and the assertion: changing it moves the
+    /// two together and the comparison stays true for any value. A test that
+    /// cannot fail is not evidence.
+    ///
+    /// What the drift would actually break is a reader that cannot see this
+    /// constant. `scripts/acceptance/scratch_file_commit_repro.py` carries its
+    /// own copy of this string and grades a run as failed only when it appears,
+    /// so a silent rewording here would leave that suite reporting a refused
+    /// admission as a clean one. Pinning the literal is what makes changing the
+    /// wording a deliberate act that updates both surfaces.
+    #[test]
+    fn the_failure_prefix_is_the_wording_the_acceptance_grader_matches() {
+        const WIRE: &str = "Complete exact-tree admission failed: ";
+        assert_eq!(
+            ADMIT_FAILURE_PREFIX, WIRE,
+            "scripts/acceptance/scratch_file_commit_repro.py matches this literal"
+        );
+        let first = summary_lines(&report(false))
+            .first()
+            .cloned()
+            .expect("a failed pass renders a cause line first");
+        assert!(first.starts_with(WIRE), "{first}");
     }
 
     /// FIR-2961. The stranger edited one tracked file, ran `kin admit`, and was

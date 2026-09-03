@@ -1,13 +1,13 @@
 {
   "source_repository": "firelock-ai/kin-ecosystem",
-  "source_commit": "3ace010dbe6d3db43d8da2c38fa6290d0834a180",
+  "source_commit": "2a0d6d265ca2035c0683d2dbc291968610e0b4b3",
   "note": "Byte-identical copies of the umbrella proof tooling so the hosted preflight runs from kin alone; bin/kin-lane is a single-host lock shim written for this tree, not a copy. scripts/release-proof/vendored.test.mjs refuses a file whose sha256 left this manifest.",
   "files": {
     "bin/kin-release-preflight": {"source": "bin/kin-release-preflight", "sha256": "d42617e79966bf6d3548e00a9d303c38cf4689f6ff33610b6d9526019a028854"},
     "bin/kin-release-preflight.d/Dockerfile": {"source": "bin/kin-release-preflight.d/Dockerfile", "sha256": "e6c0e30c2bf46fc889484fb7e32c73163c3cf315d60351be3acd2428d22d12f6"},
     "bin/kin-release-preflight.d/proof-flow.sh": {"source": "bin/kin-release-preflight.d/proof-flow.sh", "sha256": "3a44e377a8c6bfcdfb688608ae5b9ba64293e3a955b711afe20ee237e2516b2b"},
     "bin/kin-release-preflight.d/validate.mjs": {"source": "bin/kin-release-preflight.d/validate.mjs", "sha256": "53badad40150ee0a4d8c817af77f48f04ad2ae89616dce33686532b82afa35b9"},
-    "bin/kin-evidence-publish": {"source": "bin/kin-evidence-publish", "sha256": "38ae34733b38feb3344ed8cecfa9ab52219e463b4beb99d3f9c39889dd662d46"},
+    "bin/kin-evidence-publish": {"source": "bin/kin-evidence-publish", "sha256": "4e85d110c89b37ee80f0cb3739b89acf3e361f2dee1009c02d80fdf850092222"},
     "bin/kin-acceptance-suite": {"source": "bin/kin-acceptance-suite", "sha256": "7ce214e6563e227695cf02411762ca5e8d01edf8898634db465ee30f455918f7"}
   }
 }

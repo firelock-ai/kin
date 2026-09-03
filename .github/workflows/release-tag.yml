@@ -26,8 +26,27 @@ on:
   # Unlike workflow_dispatch, repository_dispatch always executes the workflow
   # from the last commit on the default branch and only when this file exists
   # there. The typed event preserves break glass without branch-selectable code.
+  #
+  # Two types, and the difference is which ALGORITHM runs, never who may run it:
+  #
+  #   release_tag           break glass. The caller names an exact tag and sha,
+  #                         which must be current main HEAD. Tagging a chosen
+  #                         commit on purpose is a legitimate act and this is
+  #                         unchanged.
+  #   release_tag_evaluate  evaluate now. The scheduled algorithm on demand:
+  #                         main HEAD, the version range, both proof records,
+  #                         every required context unique. It names nothing.
+  #
+  # The second exists because the schedule is not reliable enough to be the
+  # only way to reach the automatic path. On 2026-09-02 GitHub's cron produced
+  # one scheduled run on this repository between 09:58Z and 14:22Z, and the
+  # only manual trigger was break glass, which refuses a proven candidate that
+  # is no longer main's tip: "break-glass release sha a047b784e is not current
+  # origin/main HEAD" at 12:11Z. That is the guard working and the wrong tool
+  # being the only one available. A manual trigger for the automatic path must
+  # run the same algorithm, not a second one.
   repository_dispatch:
-    types: [release_tag]
+    types: [release_tag, release_tag_evaluate]
 
 # The App installation token carries the only write capability (creating the
 # tag ref). The workflow's own GITHUB_TOKEN stays read-only: contents:read for
@@ -111,10 +130,16 @@ jobs:
             echo "trusted automatic trigger: $EVENT_NAME"
             exit 0
           fi
-          if [ "$EVENT_ACTION" != release_tag ]; then
-            echo "::error::unsupported repository dispatch action '$EVENT_ACTION'"
-            exit 1
-          fi
+          # Both typed actions face the identical authority checks below: the
+          # same actor allowlist, the same main-only ref, the same exact-hex
+          # workflow sha. The type chooses the algorithm, never the permission.
+          case "$EVENT_ACTION" in
+            release_tag|release_tag_evaluate) ;;
+            *)
+              echo "::error::unsupported repository dispatch action '$EVENT_ACTION'"
+              exit 1
+              ;;
+          esac
           if [ "$DEFAULT_BRANCH" != main ]; then
             echo "::error::release-tag requires main as the repository default branch (got '$DEFAULT_BRANCH')"
             exit 1
@@ -149,6 +174,7 @@ jobs:
         id: resolve
         env:
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
           RAW_TAG: ${{ github.event.client_payload.tag }}
           RAW_SHA: ${{ github.event.client_payload.sha }}
           # Reading the proof loop's published candidates needs no more than the
@@ -165,9 +191,26 @@ jobs:
           tag=""
           case "$EVENT_NAME" in
             repository_dispatch)
-              automatic=false
-              tag="$RAW_TAG"
-              sha="$(printf '%s' "$RAW_SHA" | tr '[:upper:]' '[:lower:]')"
+              if [ "$EVENT_ACTION" = release_tag_evaluate ]; then
+                # Evaluate now. This arm is deliberately identical to the
+                # schedule's: read protected main HEAD and let the range
+                # selection below decide, so a manual ask for the automatic
+                # path cannot become a second algorithm that drifts from it.
+                #
+                # A payload naming a tag or a sha is REFUSED rather than
+                # ignored. A caller who passed one meant break glass, and
+                # silently dropping it would tag whatever the selection chose
+                # while the caller believed they had named the commit.
+                if [ -n "$RAW_TAG" ] || [ -n "$RAW_SHA" ]; then
+                  echo "::error::release_tag_evaluate runs the automatic selection and takes no tag or sha (got tag='$RAW_TAG' sha='$RAW_SHA'). Dispatch release_tag to name an exact commit."
+                  exit 1
+                fi
+                sha="$(git rev-parse refs/remotes/origin/main)"
+              else
+                automatic=false
+                tag="$RAW_TAG"
+                sha="$(printf '%s' "$RAW_SHA" | tr '[:upper:]' '[:lower:]')"
+              fi
               ;;
             workflow_run|schedule)
               # Both automatic arms read the same freshly fetched protected
@@ -1669,6 +1712,36 @@ jobs:
 
       # The proof-loop refusal, on the artifact it is actually about.
       #
+      # WHAT THIS GATE REQUIRES BEFORE A TAG, AND WHAT IT NO LONGER DOES.
+      #
+      # It requires the machine proof: a preflight record that judged THIS
+      # candidate's own bytes, PASS on every leg, with an archive sha256 per leg.
+      # That record can always exist before a tag, because rc-build produces the
+      # archives and release-cut publishes the judgement with nobody at the
+      # button.
+      #
+      # It no longer requires the stranger. Until 2026-09-02 it did, and the
+      # consequence was that a release the account's weekly limit stopped could
+      # not be cut at all: run rc0551 died on `"rateLimitType": "seven_day"` with
+      # a proven candidate waiting, and the only signal was a hold alarm. A gate
+      # whose failure mode is "no tag, forever, quietly" is not protecting the
+      # release, it is preventing it.
+      #
+      # What replaces it is not less proof, it is proof at the point the claim is
+      # made. A tag is not a claim of first-contact coverage; GitHub Latest is,
+      # because that is the version an installer resolves. release.yml's
+      # finalize_release still requires the complete stranger record before it
+      # flips a release out of prerelease, so a release with no first-contact
+      # proof exists, is installable by anyone who names it, and never becomes
+      # the one a stranger gets by default. The record cannot claim coverage it
+      # does not have, and the release stops being hostage to a driver.
+      #
+      # `require: preflight` narrows exactly one condition: an ABSENT
+      # stranger.env becomes a reported pending state. A stranger record that
+      # exists is judged here exactly as it always was, and an unreadable one
+      # still fails closed, so this relaxation cannot be used to ship a record
+      # that is wrong rather than missing.
+      #
       # On 2026-08-20 the train merged its own bump kin#986, tagged v0.5.44 and
       # promoted it to Latest with no preflight record for that candidate and no
       # stranger run on its bytes. The gate that closed that hole lived in
@@ -1724,15 +1797,23 @@ jobs:
           # reports it, because a stack trace buries the sentence that says
           # which record was missing and an operator reading a blocked release
           # needs that sentence first.
+          # The whole result goes to a file and only the sha goes to stdout, so
+          # the comparison below still reads one thing and cannot mistake a
+          # second line for a candidate.
+          record="$RUNNER_TEMP/release-proof.json"
           proven="$(KIN_RELEASE_GATE="file://${gate}" \
             CANDIDATE_SHA="$SHA" \
             GITHUB_REPOSITORY="$REPO" \
+            KIN_RELEASE_REQUIRE=preflight \
+            KIN_RELEASE_RECORD="$record" \
             node --input-type=module -e '
+              import { writeFileSync } from "node:fs";
               const { main } = await import(process.env.KIN_RELEASE_GATE);
               try {
                 const result = await main({
                   log: (line) => process.stderr.write(line + "\n"),
                 });
+                writeFileSync(process.env.KIN_RELEASE_RECORD, JSON.stringify(result));
                 process.stdout.write(result.sha);
               } catch (error) {
                 process.stderr.write("::error::" + error.message + "\n");
@@ -1752,6 +1833,37 @@ jobs:
             echo "::error::the tagged tree is not the proven tree; these paths differ between $proven and $SHA:"
             printf '%s\n' "$delta"
             exit 1
+          fi
+          # What the release is allowed to say about itself, decided here and
+          # written down, rather than re-derived by every later reader.
+          #
+          # An unreadable result file is a refusal, not an unknown: this step
+          # wrote it one command ago, so a file that will not parse means the
+          # gate did something other than what this job believes it did.
+          state="$(STATE_RECORD="$record" node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const r = JSON.parse(readFileSync(process.env.STATE_RECORD, "utf8"));
+            const s = r.stranger ?? {};
+            const driver = s.driver?.endpoint ?? "unrecorded";
+            process.stdout.write([s.state ?? "unknown", driver, (s.arms ?? []).join("+") || "none"].join(" "));
+          ')"
+          read -r stranger_state stranger_driver stranger_arms <<< "$state"
+          case "$stranger_state" in
+            complete|pending) ;;
+            *) echo "::error::the proof gate reported stranger state '${stranger_state}', which this job does not know how to record"; exit 1 ;;
+          esac
+          {
+            echo "stranger_state=$stranger_state"
+            echo "stranger_driver=$stranger_driver"
+            echo "stranger_arms=$stranger_arms"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$stranger_state" = pending ]; then
+            # A warning, not an error. The release proceeds and says what it is
+            # missing; a red run here would put the rail back where it was.
+            echo "::warning::first-contact proof is PENDING for $SHA: no stranger.env exists, so $TAG will be published as a prerelease and will not become GitHub Latest until the stranger record lands"
+          else
+            echo "::notice::first-contact proof complete for $SHA on arms ${stranger_arms}, driven on the ${stranger_driver} endpoint"
           fi
           echo "release proof records verified for $SHA, and the tagged tree is the proven tree"
 

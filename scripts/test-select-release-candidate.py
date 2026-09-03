@@ -40,6 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SELECTOR_PATH = ROOT / "scripts" / "select-release-candidate.py"
 CUT_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "release-cut.yml"
 RELEASE_TAG_PATH = ROOT / ".github" / "workflows" / "release-tag.yml"
+RC_BUILD_PATH = ROOT / ".github" / "workflows" / "rc-build.yml"
 REPO = "firelock-ai/kin"
 VERSION = "0.6.5"
 NEWEST = "a" * 40
@@ -54,6 +55,61 @@ CI_RUN = 33_000_000_001
 ACCEPTANCE_RUN = 33_000_000_002
 SAST_RUN = 33_000_000_003
 SECRET_RUN = 33_000_000_004
+
+
+def job_block(source: str, job: str) -> str:
+    """One job's own YAML, from its two-space key to the next one.
+
+    Both workflows carry more than one `artifact:` matrix, so a whole-file
+    search reads rows from a job the assertion is not about: rc-build.yml's
+    capability matrix carries a windows row the build matrix deliberately does
+    not. Slicing by job is what keeps a contract test honest about its subject.
+    """
+
+    match = re.search(rf"(?ms)^  {re.escape(job)}:\n(.*?)(?=^  [a-z][a-z0-9_-]*:\n|\Z)", source)
+    if match is None:
+        raise AssertionError(f"no job named {job} in this workflow")
+    return match.group(1)
+
+
+def matrix_artifacts(block: str) -> list[str]:
+    return re.findall(r"(?m)^ +artifact: ([A-Za-z0-9._-]+)$", block)
+
+
+def job_names(source: str) -> list[str]:
+    return re.findall(r"(?m)^  ([a-z][a-z0-9_-]*):\n", source)
+
+
+def job_needs(block: str) -> list[str]:
+    match = re.search(r"(?m)^    needs: (.+)$", block)
+    if match is None:
+        return []
+    value = match.group(1).strip()
+    if value.startswith("["):
+        return [name.strip() for name in value.strip("[]").split(",") if name.strip()]
+    return [value]
+
+
+def job_if(block: str) -> str:
+    """The job-level `if`, block scalar or inline, flattened to one line."""
+
+    match = re.search(r"(?m)^    if: (.*)$", block)
+    if match is None:
+        return ""
+    first = match.group(1).strip()
+    if not first.startswith(">-") and not first.startswith("|"):
+        return first
+    body = block.split(match.group(0), 1)[1].splitlines()
+    lines = []
+    for line in body:
+        if not line.strip():
+            continue
+        if not line.startswith("      "):
+            break
+        if line.strip().startswith("#"):
+            continue
+        lines.append(line.strip())
+    return " ".join(lines)
 
 
 def load_module(name: str, path: Path):
@@ -188,7 +244,7 @@ def rc_build(
     created_at: str = "2026-09-02T20:00:00Z",
 ) -> dict[str, Any]:
     if artifacts is None:
-        artifacts = [f"{selector.PREFLIGHT_ARTIFACT_PREFIX}{name}" for name in selector.PREFLIGHT_ARTIFACTS]
+        artifacts = list(selector.RC_BUILD_ARTIFACTS)
     return {
         "id": run_id,
         "head_sha": sha,
@@ -420,6 +476,62 @@ class GradeShaTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class ReadRcBuildsTests(unittest.TestCase):
+    """The read that decides what `_usable` is allowed to see.
+
+    `_usable` never sees an expired artifact, because the read filters them out
+    before the judgment. That filter is the whole of the expiry refusal, so it
+    is asserted here rather than assumed by a fixture that hands over an empty
+    list.
+    """
+
+    BRANCH = f"release/v{VERSION}-candidate"
+
+    def read(self, runs: list[dict[str, Any]], artifacts: dict[int, list[dict[str, Any]]]):
+        def fetch(endpoint: str) -> Any:
+            if endpoint == selector.rc_build_runs_endpoint(REPO, self.BRANCH, 1):
+                return {"total_count": len(runs), "workflow_runs": runs}
+            for run_id, listing in artifacts.items():
+                if endpoint == selector.run_artifacts_endpoint(REPO, run_id, 1):
+                    return {"total_count": len(listing), "artifacts": listing}
+            raise AssertionError(f"unexpected endpoint {endpoint}")
+
+        return selector.read_rc_builds(fetch, REPO, self.BRANCH)
+
+    def run_row(self, run_id: int, *, status: str = "completed", conclusion: str | None = "success"):
+        return {
+            "id": run_id,
+            "head_sha": MIDDLE,
+            "head_branch": self.BRANCH,
+            "event": "workflow_dispatch",
+            "status": status,
+            "conclusion": conclusion,
+            "created_at": "2026-09-02T22:52:23Z",
+        }
+
+    def test_every_live_archive_is_read_and_the_run_is_usable(self) -> None:
+        listing = [{"name": name, "expired": False} for name in selector.RC_BUILD_ARTIFACTS]
+        builds = self.read([self.run_row(1)], {1: listing})
+        self.assertEqual(builds[0]["artifacts"], sorted(selector.RC_BUILD_ARTIFACTS))
+        self.assertTrue(selector._usable(builds[0]))
+
+    def test_an_expired_archive_is_dropped_and_costs_the_run_its_usability(self) -> None:
+        listing = [
+            {"name": name, "expired": name == "kin-macos-aarch64"}
+            for name in selector.RC_BUILD_ARTIFACTS
+        ]
+        builds = self.read([self.run_row(1)], {1: listing})
+        self.assertNotIn("kin-macos-aarch64", builds[0]["artifacts"])
+        self.assertFalse(selector._usable(builds[0]))
+
+    def test_an_unsuccessful_run_costs_no_artifact_read_and_is_not_usable(self) -> None:
+        for status, conclusion in (("completed", "failure"), ("in_progress", None)):
+            with self.subTest(status=status, conclusion=conclusion):
+                builds = self.read([self.run_row(1, status=status, conclusion=conclusion)], {})
+                self.assertEqual(builds[0]["artifacts"], [])
+                self.assertFalse(selector._usable(builds[0]))
+
+
 class JudgeTests(unittest.TestCase):
     def assertDecision(self, decision: Any, expected: str, needle: str = "") -> None:
         self.assertEqual(decision.decision, expected, decision.reason)
@@ -444,18 +556,65 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(decision.candidate, MIDDLE)
         self.assertEqual(grader.calls, [])
 
-    def test_a_half_evidenced_candidate_waits_for_the_stranger_and_prints_its_command(self) -> None:
+    def test_a_half_evidenced_candidate_asks_for_the_stranger_and_names_its_archive(self) -> None:
         grader = Grader({})
         decision = selector.judge(
-            snapshot(candidate=MIDDLE, evidence={MIDDLE: [selector.PREFLIGHT_RECORD]}),
+            snapshot(
+                candidate=MIDDLE,
+                evidence={MIDDLE: [selector.PREFLIGHT_RECORD]},
+                rc_builds=[rc_build(MIDDLE)],
+            ),
             grader,
         )
-        self.assertDecision(decision, selector.STAND_DOWN, "the stranger record is the missing half")
+        self.assertDecision(decision, selector.STRANGER, "the stranger record is the missing half")
+        # The rc-build run travels with the decision, because the stranger has
+        # to run on the very bytes the published preflight judged.
+        self.assertEqual(decision.rc_run, 34_000_000_001)
         command = decision.details["stranger_command"]
         self.assertIn("bin/kin-stranger prepare", command)
         self.assertIn("--arms green,brown,vcs", command)
         self.assertIn(f"--candidate-sha {MIDDLE}", command)
-        self.assertEqual(grader.calls, [])
+        self.assertEqual(grader.calls, [], "a filed preflight must cost no grading")
+
+    def test_a_half_evidenced_candidate_whose_archives_expired_refuses(self) -> None:
+        """The record names an archive sha256; a rebuild is not guaranteed to reproduce it."""
+
+        decision = selector.judge(
+            snapshot(candidate=MIDDLE, evidence={MIDDLE: [selector.PREFLIGHT_RECORD]}, rc_builds=[]),
+            Grader({}),
+        )
+        self.assertDecision(decision, selector.REFUSE, "no rc-build still holds the archives it judged")
+        self.assertEqual(decision.candidate, MIDDLE)
+
+    def test_an_expired_rc_build_is_not_a_usable_archive_source(self) -> None:
+        stale = rc_build(MIDDLE, artifacts=[])
+        decision = selector.judge(
+            snapshot(candidate=MIDDLE, evidence={MIDDLE: [selector.PREFLIGHT_RECORD]}, rc_builds=[stale]),
+            Grader({}),
+        )
+        self.assertDecision(decision, selector.REFUSE, "no rc-build still holds")
+
+    def test_one_expired_archive_costs_the_run_its_usability(self) -> None:
+        """A partially aged-out run cannot feed the leg whose archive is gone."""
+
+        survivor = rc_build(MIDDLE, artifacts=["kin-linux-aarch64", "kin-linux-x86_64"])
+        self.assertFalse(selector._usable(survivor))
+        grader = Grader({MIDDLE: green_grade(MIDDLE)})
+        decision = selector.judge(snapshot(candidate=MIDDLE, rc_builds=[survivor]), grader)
+        self.assertDecision(decision, selector.ARM)
+
+    def test_both_records_beat_the_stranger_decision(self) -> None:
+        """Once stranger.env lands the candidate belongs to the mint, not to another run."""
+
+        decision = selector.judge(
+            snapshot(
+                candidate=MIDDLE,
+                evidence={MIDDLE: [selector.PREFLIGHT_RECORD, selector.STRANGER_RECORD]},
+                rc_builds=[rc_build(MIDDLE)],
+            ),
+            Grader({}),
+        )
+        self.assertDecision(decision, selector.STAND_DOWN, "awaits the mint")
 
     def test_the_newest_green_sha_is_armed(self) -> None:
         grader = Grader({NEWEST: green_grade(NEWEST)})
@@ -523,21 +682,63 @@ class JudgeTests(unittest.TestCase):
         self.assertDecision(decision, selector.STAND_DOWN, "in_progress")
         self.assertEqual(decision.rc_run, 34_000_000_001)
 
-    def test_a_successful_rc_build_with_every_leg_record_is_proof(self) -> None:
+    def test_a_successful_rc_build_holding_every_archive_is_proof(self) -> None:
         grader = Grader({MIDDLE: green_grade(MIDDLE)})
         decision = selector.judge(snapshot(candidate=MIDDLE, rc_builds=[rc_build(MIDDLE)]), grader)
         self.assertDecision(decision, selector.PROOF)
         self.assertEqual(decision.rc_run, 34_000_000_001)
         self.assertIn("bin/kin-stranger run", decision.details["stranger_command"])
 
-    def test_an_rc_build_missing_a_leg_record_is_not_proof(self) -> None:
-        """A run from before the preflight job existed proves less than a record would claim."""
+    def test_an_rc_build_missing_an_archive_is_not_proof(self) -> None:
+        """The preflight downloads one archive per row; a run short of one cannot feed it."""
 
-        partial = rc_build(MIDDLE, artifacts=[f"{selector.PREFLIGHT_ARTIFACT_PREFIX}kin-macos-aarch64"])
+        partial = rc_build(MIDDLE, artifacts=["kin-macos-aarch64"])
         grader = Grader({MIDDLE: green_grade(MIDDLE)})
         decision = selector.judge(snapshot(candidate=MIDDLE, rc_builds=[partial]), grader)
         self.assertDecision(decision, selector.ARM)
         self.assertEqual(decision.candidate, MIDDLE)
+
+    def test_a_failed_rc_build_holding_every_archive_is_not_proof(self) -> None:
+        """A red run's artifacts are not evidence; only a successful build is."""
+
+        failed = rc_build(MIDDLE, conclusion="failure")
+        grader = Grader({MIDDLE: green_grade(MIDDLE)})
+        decision = selector.judge(snapshot(candidate=MIDDLE, rc_builds=[failed]), grader)
+        self.assertDecision(decision, selector.ARM)
+        self.assertEqual(decision.candidate, MIDDLE)
+
+    def test_the_deadlocked_shape_of_2026_09_02_is_usable(self) -> None:
+        """Regression: run 33692452573 for febf5d851, the shape that burned the loop.
+
+        The rc-build succeeded and carried exactly the three archive names, none
+        expired. The selector asked for `kin-release-preflight-` prefixed names,
+        which only release-cut.yml's own preflight job ever uploads and only on
+        the `proof` decision this reading could never produce, so the loop armed
+        a fresh build every cycle and killed the candidate at the attempt limit.
+        These are the live names read from that run's artifacts endpoint.
+        """
+
+        live = rc_build(
+            MIDDLE,
+            run_id=33_692_452_573,
+            artifacts=["kin-macos-aarch64", "kin-linux-x86_64", "kin-linux-aarch64"],
+        )
+        self.assertTrue(selector._usable(live), live["artifacts"])
+        grader = Grader({MIDDLE: green_grade(MIDDLE)})
+        decision = selector.judge(snapshot(candidate=MIDDLE, rc_builds=[live]), grader)
+        self.assertDecision(decision, selector.PROOF, "still holds its archives")
+        self.assertEqual(decision.rc_run, 33_692_452_573)
+
+    def test_a_run_carrying_only_leg_record_names_is_not_usable(self) -> None:
+        """The inverse control: leg-record names alone are not candidate archives.
+
+        release-cut.yml uploads `kin-release-preflight-<artifact>` into its OWN
+        run. If those names ever appear on an rc-build run, they are still not
+        the archives the preflight downloads by bare name.
+        """
+
+        legs = rc_build(MIDDLE, artifacts=[f"kin-release-preflight-{name}" for name in selector.RC_BUILD_ARTIFACTS])
+        self.assertFalse(selector._usable(legs))
 
     def test_exhausted_rc_build_attempts_kill_the_candidate_and_pick_the_next(self) -> None:
         spent = [
@@ -777,6 +978,139 @@ class ContractTests(unittest.TestCase):
             )
             self.assertIn(path, body, f"{name} is bound to a different workflow path")
 
+    def test_the_usable_artifacts_are_the_names_rc_build_actually_uploads(self) -> None:
+        """The deadlock, as an assertion.
+
+        `_usable` judges an rc-build run, so the names it requires have to be
+        the names that run uploads. They were once the leg-record names
+        release-cut.yml uploads into its own run, which no rc-build can carry,
+        so no candidate could ever be proven and the preflight that would have
+        produced those records was gated on the decision they blocked.
+        """
+
+        source = RC_BUILD_PATH.read_text(encoding="utf-8")
+        build = job_block(source, "build")
+        self.assertEqual(
+            sorted(matrix_artifacts(build)),
+            sorted(selector.RC_BUILD_ARTIFACTS),
+            "rc-build.yml's build matrix and the selector's usable set have drifted",
+        )
+        # The row value is only the artifact name if the upload step names it
+        # unadorned. A prefix added here would make every row a different
+        # artifact than the selector asks for, silently.
+        self.assertIn("          name: ${{ matrix.artifact }}\n", build)
+
+    def test_the_preflight_downloads_exactly_the_artifacts_the_selector_requires(self) -> None:
+        """The consumer side: each leg pulls one archive from the run by bare name."""
+
+        source = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
+        preflight = job_block(source, "preflight")
+        self.assertEqual(
+            sorted(matrix_artifacts(preflight)),
+            sorted(selector.RC_BUILD_ARTIFACTS),
+            "release-cut.yml's preflight matrix and the selector's usable set have drifted",
+        )
+        self.assertIn('--name "$ARTIFACT"', preflight)
+
+    def test_the_leg_records_are_uploaded_by_the_cut_not_by_the_candidate_build(self) -> None:
+        """Where the prefixed names live, so nobody re-derives the wrong owner.
+
+        A reader who believes rc-build.yml uploads the leg records writes the
+        selector's usable set as the prefixed names again. rc-build.yml uploads
+        one thing, and release-cut.yml's preflight job uploads the other.
+        """
+
+        cut = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn("          name: kin-release-preflight-${{ matrix.artifact }}\n", cut)
+        self.assertIn("          pattern: kin-release-preflight-*\n", cut)
+        rc = RC_BUILD_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("name: kin-release-preflight-", rc)
+
+    def test_every_job_downstream_of_a_skipped_arm_survives_that_skip(self) -> None:
+        """The second deadlock, as an assertion.
+
+        `arm` runs only on the `arm` decision, so it is skipped on the proof
+        path, and a skip propagates along the dependency chain to every job
+        that does not override it. `preflight` overrides it with `always()`;
+        `publish`, one link further down, did not, so on 2026-09-03 run
+        33699387471 decided `proof`, all three preflight legs passed and filed
+        their leg records, and the publisher skipped at once with zero steps.
+        It had never been evaluated before, because no cycle had ever reached
+        `proof`.
+
+        The rule this pins: any job that can be reached from `arm` through
+        `needs` has to carry a status function, or an upstream skip decides it.
+        """
+
+        source = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
+        blocks = {name: job_block(source, name) for name in job_names(source)}
+        self.assertIn("arm", blocks, "release-cut.yml no longer has an arm job")
+        self.assertIn(
+            "needs.select.outputs.decision == 'arm'",
+            job_if(blocks["arm"]),
+            "arm is no longer the conditional job this rule is about",
+        )
+
+        downstream: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for name, block in blocks.items():
+                if name in downstream or name == "arm":
+                    continue
+                if any(need == "arm" or need in downstream for need in job_needs(block)):
+                    downstream.add(name)
+                    changed = True
+
+        self.assertTrue(downstream, "nothing needs arm, so this rule guards nothing")
+        for name in sorted(downstream):
+            self.assertIn(
+                "always()",
+                job_if(blocks[name]),
+                f"job {name!r} is downstream of the conditional arm job without always(), "
+                "so an arm skip skips it whatever its own condition says",
+            )
+
+    def test_the_publisher_still_refuses_a_preflight_that_did_not_pass(self) -> None:
+        """`always()` must not become a gate that publishes anything.
+
+        The publisher survives an unrelated upstream skip, and nothing more: it
+        still has to read the preflight matrix's own result as success, and it
+        still only runs on the proof decision.
+        """
+
+        condition = job_if(job_block(CUT_WORKFLOW_PATH.read_text(encoding="utf-8"), "publish"))
+        self.assertIn("needs.preflight.result == 'success'", condition)
+        self.assertIn("needs.select.outputs.decision == 'proof'", condition)
+
+    def test_the_publisher_records_the_token_scope_before_it_decides(self) -> None:
+        """A refusal has to name its own evidence, and cannot be caused by naming it.
+
+        The publisher proves its token against GET /repos before writing, and
+        the push half of that check reads a block reporting the authenticated
+        USER's permissions. What an App installation token gets there was
+        guessed wrong twice on 2026-09-03 while four cycles refused with a
+        message naming the verdict and never the evidence. So the scope is
+        recorded first, and the recording is barred from failing the job:
+        a diagnostic that can break the thing it explains is worse than none.
+        """
+
+        publish = job_block(CUT_WORKFLOW_PATH.read_text(encoding="utf-8"), "publish")
+        record = publish.find("- name: Record what the evidence token can do")
+        write = publish.find("- name: Publish preflight.json for the candidate")
+        self.assertNotEqual(record, -1, "the publish job no longer records the token scope")
+        self.assertNotEqual(write, -1, "the publish job no longer publishes")
+        self.assertLess(
+            record,
+            write,
+            "the token scope is recorded after the write it exists to explain, so a refusal "
+            "at the write leaves no record of what the token looked like",
+        )
+        diagnostic = publish[record:write]
+        self.assertIn("if: always()", diagnostic)
+        self.assertIn("exit 0", diagnostic)
+        self.assertNotIn("set -euo pipefail", diagnostic)
+
     def test_the_workflow_calls_the_selector_and_binds_its_trigger(self) -> None:
         workflow = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
         for needle in (
@@ -787,6 +1121,76 @@ class ContractTests(unittest.TestCase):
             "scripts/release-proof/bin/kin-evidence-publish",
         ):
             self.assertIn(needle, workflow, f"release-cut.yml must run {needle}")
+
+    def test_the_stranger_is_gated_on_a_variable_rather_than_a_runner_query(self) -> None:
+        """A job whose labels match no online runner queues; it does not skip.
+
+        GITHUB_TOKEN cannot list runners (`administration` is not among the
+        permissions a workflow token can hold) and the release App carries
+        contents, issues and pull-requests only, so live availability is not
+        readable from inside the run. The switch is therefore explicit, and
+        every path has to be covered: one job when it is set, one when it is not.
+        """
+
+        workflow = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
+        jobs = dict(re.findall(r"(?ms)^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:\n|\Z)", workflow))
+        self.assertIn("stranger", jobs)
+        self.assertIn("stranger-standby", jobs)
+        self.assertIn("vars.KIN_STRANGER_RUNNER != ''", jobs["stranger"])
+        self.assertIn("vars.KIN_STRANGER_RUNNER == ''", jobs["stranger-standby"])
+        self.assertIn("runs-on: ${{ vars.KIN_STRANGER_RUNNER }}", jobs["stranger"])
+        # The standby path is the one that keeps a release moving without a
+        # runner, so it has to carry the whole command rather than a pointer.
+        for needle in ("bin/kin-stranger prepare", "--arms green,brown,vcs", "--candidate-sha", "::warning::"):
+            self.assertIn(needle, jobs["stranger-standby"], f"the standby path must print {needle}")
+
+    def test_the_stranger_refuses_before_spending_an_arm_on_a_missing_credential(self) -> None:
+        workflow = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
+        jobs = dict(re.findall(r"(?ms)^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:\n|\Z)", workflow))
+        stranger = jobs["stranger"]
+        self.assertIn("KIN_STRANGER_ANTHROPIC_API_KEY", stranger)
+        self.assertIn('if [ -z "${STRANGER_KEY:-}" ]; then', stranger)
+        # An interrupted run resumes rather than re-preparing: `prepare` refuses
+        # a reused container without --force because a reused container tests an
+        # upgrade path, which is a different question.
+        self.assertIn("bin/kin-stranger resume", stranger)
+        # Read the executable lines only. A bare substring search cannot tell a
+        # comment explaining why --force is wrong from a command using it, and
+        # would fail on the explanation that keeps the decision reviewable.
+        active = [
+            line for line in stranger.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertFalse(
+            [line for line in active if "--force" in line],
+            "the stranger job must never force a reused container: that tests an upgrade path",
+        )
+
+    def test_the_stranger_never_publishes_and_the_publisher_never_drives(self) -> None:
+        """The App key must not reach the machine running a Claude driver on candidate bytes."""
+
+        workflow = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
+        jobs = dict(re.findall(r"(?ms)^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:\n|\Z)", workflow))
+        self.assertNotIn("KIN_RELEASE_BOT_PRIVATE_KEY", jobs["stranger"])
+        self.assertNotIn("kin-evidence-publish", jobs["stranger"])
+        self.assertNotIn("environment:", jobs["stranger"])
+        self.assertIn("environment: release-tag", jobs["publish-stranger"])
+        self.assertIn("kin-evidence-publish", jobs["publish-stranger"])
+        self.assertNotIn("ANTHROPIC_API_KEY", jobs["publish-stranger"])
+        # --require-archive is what binds the record to the bytes the preflight
+        # judged, checked at write time rather than by the gate at release time.
+        # Read the executable lines only: the comment above that step explains
+        # the flag, and a bare substring search is satisfied by the explanation
+        # alone, so removing the flag itself left this assertion green.
+        publisher_active = [
+            line for line in jobs["publish-stranger"].splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertTrue(
+            [line for line in publisher_active if "--require-archive" in line],
+            "the stranger record must be published with --require-archive, which binds it "
+            "to an archive the published preflight actually judged",
+        )
 
     def test_the_workflow_keeps_the_release_app_off_the_proof_runners(self) -> None:
         """The preflight job downloads and judges; only the publish job may write."""

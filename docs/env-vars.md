@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (525 total, 355 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (526 total, 356 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -430,6 +430,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_INFERRED_ORIGIN_WEIGHT` | float>=0 | 0.7 | correctness | locate tuning knob: inferred origin weight |
 | `KIN_LOCATE_INNER_METHOD_TOPK` | usize | 5 | correctness | locate tuning knob: inner method topk |
 | `KIN_LOCATE_LEXICAL_FLOOR_ADMIT_STRENGTH` | float>=0 | 0.6 | correctness | locate tuning knob: lexical floor admit strength |
+| `KIN_LOCATE_LEXICAL_FLOOR_BUDGET` | usize | 12 | correctness | locate tuning knob: lexical floor budget |
 | `KIN_LOCATE_LEXICAL_FLOOR_COMMON_FRAC` | float>=0 | 0.02 | correctness | locate tuning knob: lexical floor common frac |
 | `KIN_LOCATE_LEXICAL_FLOOR_LIFT` | float>=0 | 1.05 | correctness | locate tuning knob: lexical floor lift |
 | `KIN_LOCATE_LEXICAL_FLOOR_LIFT_PRESENT` | bool | true | correctness | locate tuning knob: lexical floor lift present |

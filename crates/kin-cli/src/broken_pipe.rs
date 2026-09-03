@@ -265,11 +265,21 @@ fn redirect_to_dev_null(fd: libc::c_int) {
 /// `Err`, `Error: {err:?}`, through [`print_stderr`], so a refusal nobody
 /// reads any more still exits 1 rather than becoming a second broken-pipe
 /// panic.
+///
+/// One class earns a second paragraph after that render. A command that ran out
+/// of open file descriptors reports a kernel refusal naming a descriptor and a
+/// store path, and neither is the problem or the fix, so
+/// [`crate::open_files::remedy`] follows it with the limit, its value and the
+/// command that raises it. This is the whole CLI's error boundary, so every
+/// command gets it, not just the admission that found the class.
 pub fn exit_status(error: &anyhow::Error) -> i32 {
     if is_cut_off(error) {
         return CUT_OFF_STATUS;
     }
     print_stderr(format_args!("Error: {error:?}\n"));
+    if let Some(remedy) = crate::open_files::remedy(error) {
+        print_stderr(format_args!("{remedy}"));
+    }
     1
 }
 

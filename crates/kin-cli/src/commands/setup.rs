@@ -23651,7 +23651,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             "both scopes have to be named or the reader guesses: {text}"
         );
         assert!(
-            text.contains("rust, python, typescript, javascript"),
+            text.contains("rust, python, typescript, javascript, go"),
             "it has to name what it would have checked: {text}"
         );
         assert!(
@@ -23671,7 +23671,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             "{text}"
         );
         assert!(
-            text.contains("rust, python, typescript, javascript"),
+            text.contains("rust, python, typescript, javascript, go"),
             "naming the set is what separates this from a silent exit: {text}"
         );
         assert!(

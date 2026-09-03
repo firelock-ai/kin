@@ -43,6 +43,30 @@ export const STRANGER_RECORD = 'stranger.env';
 // these names into run.env, so this is a contract with the proof harness rather
 // than a prose convention in a release note.
 export const REQUIRED_STRANGER_ARMS = Object.freeze(['green', 'brown', 'vcs']);
+// What a caller may require. 'all' is the historical contract and stays the
+// default, so a caller that says nothing is judged exactly as it was before
+// this mode existed. 'preflight' is the release TAG's contract: the machine
+// proof must exist, and a missing first-contact record is reported as pending
+// rather than thrown, because a tag that cannot be cut cannot be proven either
+// and the fleet spent 2026-09-02 discovering that a stranger the account's
+// weekly limit stopped is a release nobody can ship.
+//
+// The narrowing is exactly one condition wide. An unreadable stranger record, a
+// record about another build, a record with an incomplete arm and a record on
+// bytes no preflight leg judged all still refuse in BOTH modes. Only ABSENCE
+// becomes pending, and only under 'preflight'. "We could not tell" must never
+// widen into "proceed".
+export const REQUIRE_MODES = Object.freeze(['all', 'preflight']);
+// The stranger record's own statement of which driver produced it.
+// bin/kin-stranger writes driver_endpoint on every run; records written before
+// that key existed carry only `endpoint`, which says the same thing under a
+// name a gate would have to know to look for.
+export const DRIVER_ENDPOINT_FIELD = 'driver_endpoint';
+export const LEGACY_DRIVER_ENDPOINT_FIELD = 'endpoint';
+// The endpoint whose proof this release chain was designed around. Every other
+// value is a real record and a weaker one, and the difference has to reach the
+// operator rather than being flattened into "a stranger ran".
+export const REFERENCE_DRIVER_ENDPOINT = 'account';
 // The release train's version bump branch, and the ONLY branch whose head ever
 // carried proof records. It bounds the bridge below. release-train.yml declares
 // the same literal, and the authority suite pins the two together so they
@@ -179,6 +203,85 @@ export function judgePreflight(record, sha) {
 // it let a partial local-model run look like release evidence. Require the
 // harness's explicit coverage fields, refuse any incomplete arm, and preserve
 // the complete arm set in the returned result for callers and logs.
+// Which driver produced this record, said out loud.
+//
+// A local-model stranger and an opus stranger both write a stranger.env with
+// the same keys, the same arms and the same archive sha256. Before this
+// function the gate read those two records identically and logged one sentence
+// for both, so a release proven by a 4-bit model on this laptop and a release
+// proven by the account were indistinguishable to every downstream reader. The
+// findings such a run reports are real; what does not carry over is the
+// ABSENCE of findings, and a record that cannot say which driver produced it
+// cannot support that distinction at all.
+//
+// Absence and emptiness are different answers on purpose. A record with neither
+// key was written by a tool too old to say, which is a knowable historical
+// fact; a record carrying `driver_endpoint=` claims to answer and does not, and
+// a field that answers with nothing is worse than one that is missing, because
+// only the second is obviously unanswered.
+export function readDriverEndpoint(env, sha) {
+  const where = evidencePath(sha, STRANGER_RECORD);
+  const present = (field) =>
+    Object.prototype.hasOwnProperty.call(env ?? {}, field);
+  const read = (field) => {
+    const raw = env[field];
+    if (typeof raw !== 'string') {
+      throw new Error(
+        `${where} carries a non-text ${field}, so which driver produced it is unknown`,
+      );
+    }
+    const value = raw.trim();
+    if (!value) {
+      throw new Error(
+        `${where} carries an empty ${field}; a record that claims to name its ` +
+        'driver and names nothing is not evidence about which driver ran',
+      );
+    }
+    return value;
+  };
+
+  const hasCurrent = present(DRIVER_ENDPOINT_FIELD);
+  const hasLegacy = present(LEGACY_DRIVER_ENDPOINT_FIELD);
+  if (!hasCurrent && !hasLegacy) {
+    // Not an error. Every record published before bin/kin-stranger learned the
+    // key is shaped this way, and refusing them would rewrite history rather
+    // than describe it.
+    return { endpoint: null, field: null, reference: false };
+  }
+  const current = hasCurrent ? read(DRIVER_ENDPOINT_FIELD) : null;
+  const legacy = hasLegacy ? read(LEGACY_DRIVER_ENDPOINT_FIELD) : null;
+  if (current !== null && legacy !== null && current !== legacy) {
+    throw new Error(
+      `${where} records ${DRIVER_ENDPOINT_FIELD}=${current} and ` +
+      `${LEGACY_DRIVER_ENDPOINT_FIELD}=${legacy}; the record disagrees with ` +
+      'itself about which driver produced it, so neither value can be believed',
+    );
+  }
+  const endpoint = current ?? legacy;
+  return {
+    endpoint,
+    field: current !== null ? DRIVER_ENDPOINT_FIELD : LEGACY_DRIVER_ENDPOINT_FIELD,
+    reference: endpoint === REFERENCE_DRIVER_ENDPOINT,
+  };
+}
+
+// One sentence naming the driver, for a log line and for a release note.
+// Written here rather than at each caller so the mint, the promotion gate and
+// the release body cannot describe the same record three different ways.
+export function describeDriver(driver) {
+  if (!driver || driver.endpoint === null) {
+    return 'by a driver the record does not name (written before the harness recorded one)';
+  }
+  if (driver.reference) {
+    return `on the ${driver.endpoint} endpoint`;
+  }
+  return (
+    `on the ${driver.endpoint} endpoint, which is a WEAKER stranger than the ` +
+    `${REFERENCE_DRIVER_ENDPOINT} one: its findings stand, an empty finding ` +
+    'list from it does not'
+  );
+}
+
 export function judgeStranger(env, sha, archives) {
   const where = evidencePath(sha, STRANGER_RECORD);
   const archive = env?.archive_sha256;
@@ -246,7 +349,7 @@ export function judgeStranger(env, sha, archives) {
       'so the stranger proof did not finish',
     );
   }
-  return { archive, arms: requested };
+  return { archive, arms: requested, driver: readDriverEndpoint(env, sha) };
 }
 
 // Fails closed. An unreadable record is not a passing check, so a transport
@@ -452,17 +555,36 @@ async function locateCandidate({ sha, resolveFromCommit, options, log }) {
   };
 }
 
-// Two callers, one judge.
+// Three callers, one judge.
+//
+// `require` is the only thing that differs between them, and it moves exactly
+// one condition: whether an ABSENT stranger record is a refusal or a reported
+// pending state. Everything else about the stranger record is judged the same
+// way in both modes, because the failure this gate exists to stop is a release
+// claiming coverage it does not have, and a wrong record is that failure while
+// a missing one is a known gap.
 export async function main({
   sha = process.env.CANDIDATE_SHA,
   resolveFromCommit = process.env.RESOLVE_FROM_COMMIT,
   repository = process.env.GITHUB_REPOSITORY,
+  require: requireMode = process.env.KIN_RELEASE_REQUIRE || 'all',
   env = process.env,
   fetchImpl = fetch,
   log = console.log,
 } = {}) {
   if (!repository) {
     throw new Error('no repository given; set GITHUB_REPOSITORY');
+  }
+  // An unknown mode refuses rather than defaulting. A typo that silently fell
+  // back to 'all' would look like a working gate on the day someone meant to
+  // relax it, and a typo that silently fell back to 'preflight' would ship an
+  // unproven release; refusing is the only answer that is wrong in neither
+  // direction.
+  if (!REQUIRE_MODES.includes(requireMode)) {
+    throw new Error(
+      `unknown require mode "${requireMode}"; this gate knows ` +
+      `${REQUIRE_MODES.join(' and ')}`,
+    );
   }
   const token = env.GH_TOKEN || env.GITHUB_TOKEN;
   const options = { repository, token, fetchImpl };
@@ -486,14 +608,46 @@ export async function main({
   }
   const { archives } = judgePreflight(preflight, sha);
 
-  const strangerText = await fetchEvidence(sha, STRANGER_RECORD, options);
-  const { archive, arms } = judgeStranger(parseRunEnv(strangerText), sha, archives);
+  let strangerText;
+  try {
+    strangerText = await fetchEvidence(sha, STRANGER_RECORD, options);
+  } catch (error) {
+    // Only absence, and only under 'preflight'. `evidenceAbsent` is set by
+    // fetchEvidence on a 404 alone; a transport failure and an unreadable
+    // response deliberately carry no flag, so they land in the rethrow below
+    // in both modes.
+    if (!error.evidenceAbsent || requireMode !== 'preflight') {
+      throw error;
+    }
+    const stranger = {
+      state: 'pending',
+      arms: [],
+      archive: null,
+      driver: { endpoint: null, field: null, reference: false },
+    };
+    log(
+      `Verified the machine proof for ${sha}: preflight PASS across ` +
+      `${archives.length} leg(s). FIRST-CONTACT PROOF IS PENDING: no ` +
+      `${STRANGER_RECORD} exists under this candidate, so nothing here has ` +
+      `been through the ${REQUIRED_STRANGER_ARMS.join(', ')} arms and this ` +
+      'release may not be described as first-contact proven',
+    );
+    return { sha, archives, archive: null, stranger };
+  }
+
+  const { archive, arms, driver } = judgeStranger(
+    parseRunEnv(strangerText),
+    sha,
+    archives,
+  );
+  const stranger = { state: 'complete', arms, archive, driver };
 
   log(
     `Verified release proof artifacts for ${sha}: preflight PASS across ` +
-    `${archives.length} leg(s), stranger completed ${arms.join(', ')} on archive sha256 ${archive}`,
+    `${archives.length} leg(s), stranger completed ${arms.join(', ')} on archive sha256 ${archive}, ` +
+    `driven ${describeDriver(driver)}`,
   );
-  return { sha, archives, archive };
+  return { sha, archives, archive, stranger };
 }
 
 // Run only when this file IS the entry point, comparing REAL paths.

@@ -11,16 +11,22 @@ import { fileURLToPath } from 'node:url';
 
 import {
   BUMP_BRANCH,
+  DRIVER_ENDPOINT_FIELD,
   EVIDENCE_REF,
+  LEGACY_DRIVER_ENDPOINT_FIELD,
   PREFLIGHT_RECORD,
   PREFLIGHT_SCHEMA,
+  REFERENCE_DRIVER_ENDPOINT,
+  REQUIRE_MODES,
   STRANGER_RECORD,
+  describeDriver,
   evidencePath,
   fetchEvidence,
   judgePreflight,
   judgeStranger,
   main,
   parseRunEnv,
+  readDriverEndpoint,
   resolveCandidateSha,
 } from './check-release-proof-artifacts.mjs';
 
@@ -196,7 +202,30 @@ test('judgeStranger accepts a run on bytes a preflight leg judged', () => {
   assert.deepEqual(judgeStranger(strangerEnv(), SHA, [ARCHIVE_A, ARCHIVE_B]), {
     archive: ARCHIVE_A,
     arms: ['green', 'brown', 'vcs'],
+    // The fixture is a record from before bin/kin-stranger wrote a driver key,
+    // which is what every already-published record on the evidence branch looks
+    // like. Unrecorded, not assumed to be the account.
+    driver: { endpoint: null, field: null, reference: false },
   });
+});
+
+test('judgeStranger carries the driver its record names', () => {
+  const local = judgeStranger(
+    strangerEnv({ [DRIVER_ENDPOINT_FIELD]: 'local', [LEGACY_DRIVER_ENDPOINT_FIELD]: 'local' }),
+    SHA,
+    [ARCHIVE_A],
+  );
+  assert.deepEqual(local.driver, {
+    endpoint: 'local',
+    field: DRIVER_ENDPOINT_FIELD,
+    reference: false,
+  });
+  const account = judgeStranger(
+    strangerEnv({ [DRIVER_ENDPOINT_FIELD]: REFERENCE_DRIVER_ENDPOINT }),
+    SHA,
+    [ARCHIVE_A],
+  );
+  assert.equal(account.driver.reference, true);
 });
 
 test('judgeStranger refuses a record that names no bytes or never finished', () => {
@@ -289,6 +318,84 @@ test('judgeStranger refuses a record that never declares its coverage fields', (
   throwsWith(
     () => judgeStranger(withoutIncomplete, SHA, [ARCHIVE_A]),
     /carries no arms_incomplete, so its arm coverage is unknown/,
+  );
+});
+
+// ── which driver produced the record ──────────────────────────────────────
+//
+// A local-model stranger and an account stranger write the same keys, the same
+// arms and the same archive sha256. Everything below exists so those two
+// records cannot reach an operator as the same sentence.
+
+test('readDriverEndpoint reads the current key, the legacy key, and neither', () => {
+  assert.deepEqual(
+    readDriverEndpoint(strangerEnv({ [DRIVER_ENDPOINT_FIELD]: 'local' }), SHA),
+    { endpoint: 'local', field: DRIVER_ENDPOINT_FIELD, reference: false },
+  );
+  // Every record published before bin/kin-stranger learned driver_endpoint
+  // carries only `endpoint`. Reading it is what stops this gate calling the
+  // whole existing evidence branch unrecorded.
+  assert.deepEqual(
+    readDriverEndpoint(strangerEnv({ [LEGACY_DRIVER_ENDPOINT_FIELD]: 'account' }), SHA),
+    {
+      endpoint: 'account',
+      field: LEGACY_DRIVER_ENDPOINT_FIELD,
+      reference: true,
+    },
+  );
+  assert.deepEqual(readDriverEndpoint(strangerEnv(), SHA), {
+    endpoint: null,
+    field: null,
+    reference: false,
+  });
+});
+
+test('readDriverEndpoint refuses a record that disagrees with itself', () => {
+  throwsWith(
+    () => readDriverEndpoint(
+      strangerEnv({
+        [DRIVER_ENDPOINT_FIELD]: 'account',
+        [LEGACY_DRIVER_ENDPOINT_FIELD]: 'local',
+      }),
+      SHA,
+    ),
+    /disagrees with itself about which driver produced it/,
+  );
+});
+
+// A key that is present and empty is worse than a key that is missing: only the
+// second is obviously unanswered. Both keys are checked, because a record that
+// answers with nothing under either name is the same failure.
+test('readDriverEndpoint refuses a key that claims to answer and does not', () => {
+  throwsWith(
+    () => readDriverEndpoint(strangerEnv({ [DRIVER_ENDPOINT_FIELD]: '' }), SHA),
+    new RegExp(`carries an empty ${DRIVER_ENDPOINT_FIELD}`),
+  );
+  throwsWith(
+    () => readDriverEndpoint(strangerEnv({ [DRIVER_ENDPOINT_FIELD]: '   ' }), SHA),
+    new RegExp(`carries an empty ${DRIVER_ENDPOINT_FIELD}`),
+  );
+  throwsWith(
+    () => readDriverEndpoint(strangerEnv({ [LEGACY_DRIVER_ENDPOINT_FIELD]: '' }), SHA),
+    new RegExp(`carries an empty ${LEGACY_DRIVER_ENDPOINT_FIELD}`),
+  );
+});
+
+test('describeDriver says weaker for anything but the reference endpoint', () => {
+  assert.match(
+    describeDriver({ endpoint: REFERENCE_DRIVER_ENDPOINT, reference: true }),
+    new RegExp(`on the ${REFERENCE_DRIVER_ENDPOINT} endpoint`),
+  );
+  const local = describeDriver({ endpoint: 'local', reference: false });
+  assert.match(local, /WEAKER stranger/);
+  // The exact claim that does NOT carry over from a weaker driver, spelled out
+  // rather than left to the reader: findings stand, an empty finding list does
+  // not. A sentence that only said "weaker" would let a quiet local run be read
+  // as a clean build.
+  assert.match(local, /an empty finding list from it does not/);
+  assert.match(
+    describeDriver({ endpoint: null, field: null, reference: false }),
+    /does not name/,
   );
 });
 
@@ -407,6 +514,166 @@ test('main holds a candidate whose preflight ran but whose stranger did not', as
     }),
     new RegExp(`evidence/${SHA}/${STRANGER_RECORD} does not exist`),
   );
+});
+
+// ── the two require modes ─────────────────────────────────────────────────
+//
+// Until 2026-09-02 a missing stranger.env meant no tag, forever, with no signal
+// but a hold alarm. The founder's instruction was to make the stranger
+// non-blocking without letting a release claim coverage it does not have, and
+// these cases are the line between those two.
+
+test('require preflight proceeds on the machine proof and reports the gap', async () => {
+  const lines = [];
+  const result = await main({
+    sha: SHA,
+    repository: REPO,
+    require: 'preflight',
+    env: {},
+    log: (line) => lines.push(line),
+    fetchImpl: stubFetch({
+      [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
+    }),
+  });
+  assert.equal(result.sha, SHA);
+  assert.deepEqual(result.archives, [ARCHIVE_A, ARCHIVE_B]);
+  assert.equal(result.stranger.state, 'pending');
+  // No archive, because no stranger ran on one. A pending result that carried
+  // the preflight's archive would let a caller believe bytes had been through
+  // the arms.
+  assert.equal(result.archive, null);
+  assert.deepEqual(result.stranger.arms, []);
+  const said = lines.join('\n');
+  assert.match(said, /FIRST-CONTACT PROOF IS PENDING/);
+  assert.match(said, /may not be described as first-contact proven/);
+});
+
+// The narrowing is one condition wide. Under 'preflight' a stranger record that
+// EXISTS is judged exactly as it always was, so relaxing the tag gate cannot be
+// used to ship a record that is wrong rather than missing.
+test('require preflight still judges a stranger record that exists', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      require: 'preflight',
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch({
+        [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
+        [STRANGER_RECORD]: ok(strangerRecordText({ arms_incomplete: 'brown' })),
+      }),
+    }),
+    /records incomplete stranger arm\(s\) brown/,
+  );
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      require: 'preflight',
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch({
+        [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
+        [STRANGER_RECORD]: ok(strangerRecordText({ archive_sha256: ARCHIVE_UNJUDGED })),
+      }),
+    }),
+    /the stranger ran, but not on these bytes/,
+  );
+});
+
+// "We could not tell" must never become "proceed". fetchEvidence flags a 404
+// and deliberately flags nothing else, and this is the case that proves the
+// relaxation keys on that flag rather than on any failure to read.
+test('require preflight fails closed on an unreadable stranger record', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      require: 'preflight',
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch({
+        [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
+        [STRANGER_RECORD]: {
+          ok: false,
+          status: 500,
+          statusText: 'Internal Server Error',
+          text: async () => '',
+        },
+      }),
+    }),
+    /HTTP 500 Internal Server Error/,
+  );
+});
+
+// The preflight half is not relaxed at all. A candidate with no machine proof
+// is refused in both modes, because that record is the one this gate can always
+// have before a tag exists.
+test('require preflight still refuses a candidate with no preflight record', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      require: 'preflight',
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch({}),
+    }),
+    /the proof loop has not recorded this candidate/,
+  );
+});
+
+test('main defaults to requiring both records', async () => {
+  assert.deepEqual([...REQUIRE_MODES], ['all', 'preflight']);
+  // No require given: the historical contract, so a caller written before this
+  // mode existed is judged the way it always was.
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch({
+        [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
+      }),
+    }),
+    new RegExp(`evidence/${SHA}/${STRANGER_RECORD} does not exist`),
+  );
+});
+
+test('main refuses an unknown require mode rather than picking one', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      require: 'stranger-only',
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch({
+        [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
+      }),
+    }),
+    /unknown require mode "stranger-only"/,
+  );
+});
+
+test('a complete run reports its state and its driver to the caller', async () => {
+  const lines = [];
+  const result = await main({
+    sha: SHA,
+    repository: REPO,
+    require: 'preflight',
+    env: {},
+    log: (line) => lines.push(line),
+    fetchImpl: stubFetch({
+      [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
+      [STRANGER_RECORD]: ok(strangerRecordText({ [DRIVER_ENDPOINT_FIELD]: 'local' })),
+    }),
+  });
+  assert.equal(result.stranger.state, 'complete');
+  assert.equal(result.stranger.driver.endpoint, 'local');
+  assert.match(lines.join('\n'), /WEAKER stranger/);
 });
 
 test('main holds when the records exist but describe a different build', async () => {

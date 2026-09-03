@@ -1606,6 +1606,110 @@ def check_11(suite):
     return res
 
 
+def grade_ceiling_walk(payload, ceiling, must_fit):
+    """A deep trace has to answer inside the ceiling it was given, or say it could not.
+
+    `must_fit` is the difference between the two arms and it is what makes this
+    able to fail. At the belt's own ceiling the answer has to FIT, and a
+    `response_over_budget` note there is a failure even when the bytes happen to
+    land under, because that note is the response saying it could not reach the
+    number it advertises. Measured on this fixture with the restatement pointer
+    disabled, the same walk ships 11,603 characters and carries that note; with
+    it, 8,719 and no note. At a ceiling too small for the part of a response the
+    budget never trims, the note is the honest answer and is allowed.
+    """
+    if not isinstance(payload, dict):
+        return ["the walk returned no payload"], None
+    shipped = len(json.dumps(payload, separators=(",", ":")))
+    reasons = [
+        entry.get("reason")
+        for entry in (payload.get("degradations") or [])
+        if isinstance(entry, dict)
+    ]
+    cut = isinstance(payload.get("elisions"), dict) and "chain" in payload["elisions"]
+    if not cut:
+        # Not a pass. A walk the ceiling never pressed says nothing about
+        # whether the ceiling holds, and reporting it green is the shape every
+        # check in this file exists to refuse.
+        return None, (shipped, reasons, cut)
+    if must_fit:
+        problems = []
+        if shipped > ceiling:
+            problems.append(
+                "the walk shipped %d characters against the %d ceiling it advertises"
+                % (shipped, ceiling)
+            )
+        if OVER_BUDGET_REASON in reasons:
+            problems.append(
+                "the walk discloses %s at its own advertised ceiling, so it did not reach it"
+                % OVER_BUDGET_REASON
+            )
+        return problems, (shipped, reasons, cut)
+    if shipped <= ceiling:
+        return [], (shipped, reasons, cut)
+    if OVER_BUDGET_REASON in reasons:
+        # Over, and it said so. That is the honest arm: the part of a response
+        # the budget never trims can exceed a small ceiling on its own.
+        return [], (shipped, reasons, cut)
+    return (
+        [
+            "the walk shipped %d characters against a %d ceiling and disclosed no %s"
+            % (shipped, ceiling, OVER_BUDGET_REASON)
+        ],
+        (shipped, reasons, cut),
+    )
+
+
+def check_12(suite):
+    """FIR-3107: a deep trace answers inside the ceiling the agent belt advertises.
+
+    The demo drove Kin's real MCP server on 2026-09-02 and `trace_data_flow`
+    returned 15,875 characters against the 12,000 its own schema advertises. It
+    had already cut every list it could: the part of a response the budget never
+    trims, the `_kin` envelope and the `negative` object, was 9,210 characters of
+    that ceiling, and roughly 7,700 of it was four verbatim copies of one
+    limiting-factor sentence.
+
+    Two arms. At the belt's own 12,000 the answer has to fit. At a ceiling small
+    enough that the fixed part cannot fit inside it, the answer may ship over,
+    and then it has to say so rather than ship over in silence. Neither arm
+    passes on a walk the ceiling never pressed.
+    """
+    res = Result("12", "FIR-3107", "a deep trace answers inside the ceiling it advertises")
+    args = {
+        "focal": "entry",
+        "depth": 8,
+        "direction": "calls",
+        "limit_per_step": 25,
+        "include_body": False,
+    }
+    # 12,000 is the number `agent-default` injects and advertises, so it is the
+    # one a client sizes on. 3,000 is below the fixed part of this response.
+    for ceiling, must_fit in ((12000, True), (3000, False)):
+        try:
+            payload = suite.mcp("trace_data_flow", dict(args, max_chars=ceiling))
+        except McpError as exc:
+            res.unknown("the walk at %d was unreadable: %s" % (ceiling, exc))
+            return res
+        problems, seen = grade_ceiling_walk(payload, ceiling, must_fit)
+        if problems is None:
+            res.unknown(
+                "the walk at %d was never cut, so the fixture does not press the ceiling "
+                "and this says nothing about whether it holds" % ceiling
+            )
+            return res
+        if problems:
+            for problem in problems:
+                res.bad(problem)
+            return res
+        shipped, reasons, _ = seen
+        res.ok(
+            "at a %d ceiling the cut walk shipped %d characters, disclosing %s"
+            % (ceiling, shipped, sorted(r for r in reasons if r) or ["nothing"])
+        )
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -1619,6 +1723,7 @@ CHECKS = [
     ("9", check_9),
     ("10", check_10),
     ("11", check_11),
+    ("12", check_12),
 ]
 
 

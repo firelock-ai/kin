@@ -2389,6 +2389,14 @@ jobs:
       }}
     runs-on: ubuntu-latest
     environment: release
+    # Whether this release actually became GitHub Latest, for the jobs whose
+    # whole meaning is "this IS Latest". They gate on it rather than on this
+    # job's conclusion, because a release held as a prerelease for want of
+    # first-contact proof is a SUCCESSFUL run of this job and a release that
+    # must not move GHCR's `latest` or be sealed as a completed stable release.
+    outputs:
+      promoted: ${{ steps.promote.outputs.promoted }}
+      stranger_state: ${{ steps.proof.outputs.stranger_state }}
     permissions:
       contents: write
       # Resolving the pull request behind the tagged commit, which is how the
@@ -2431,7 +2439,23 @@ jobs:
       # tree, which is exactly the approximation this rekey removes. With it,
       # a bridged answer can only ever shape a refusal; it can no longer admit
       # one.
+      #
+      # WHY THIS GATE READS `preflight` AND STILL BLOCKS LATEST.
+      #
+      # `require: preflight` does not lower this job's bar. It changes what an
+      # ABSENT stranger record does: instead of throwing here, it comes back as
+      # a reported pending state that the steps below act on. Every other
+      # stranger failure -- unreadable, about another build, an incomplete arm,
+      # bytes no preflight leg judged -- still throws exactly as before.
+      #
+      # The distinction the release chain now makes is between a tag and Latest.
+      # A tag is an artifact somebody must name to install. Latest is what an
+      # installer resolves when a stranger types the install line, so Latest is
+      # the claim of first-contact coverage and Latest is where the stranger
+      # record is required. A pending release is published, installable, and
+      # marked prerelease until its record lands.
       - name: Require proof-loop artifacts for the tagged candidate
+        id: proof
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_SHA: ${{ github.sha }}
@@ -2443,14 +2467,20 @@ jobs:
           # The gate's narration goes to stderr so stdout carries exactly the
           # sha it verified and nothing the comparison below could mistake for
           # one, and a refusal is reported as the sentence naming what was
-          # missing rather than as a stack trace.
+          # missing rather than as a stack trace. The rest of the result goes to
+          # a file for the same reason.
+          record="$RUNNER_TEMP/release-proof.json"
           proven="$(KIN_RELEASE_GATE="file://${gate}" \
+            KIN_RELEASE_REQUIRE=preflight \
+            KIN_RELEASE_RECORD="$record" \
             node --input-type=module -e '
+              import { writeFileSync } from "node:fs";
               const { main } = await import(process.env.KIN_RELEASE_GATE);
               try {
                 const result = await main({
                   log: (line) => process.stderr.write(line + "\n"),
                 });
+                writeFileSync(process.env.KIN_RELEASE_RECORD, JSON.stringify(result));
                 process.stdout.write(result.sha);
               } catch (error) {
                 process.stderr.write("::error::" + error.message + "\n");
@@ -2465,14 +2495,99 @@ jobs:
             echo "::error::the proof gate verified $proven but this job promotes $CANDIDATE_SHA; refusing to flip a tag to Latest on evidence about a different commit"
             exit 1
           fi
+          state="$(STATE_RECORD="$record" node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const r = JSON.parse(readFileSync(process.env.STATE_RECORD, "utf8"));
+            const s = r.stranger ?? {};
+            const driver = s.driver?.endpoint ?? "unrecorded";
+            process.stdout.write([s.state ?? "unknown", driver, (s.arms ?? []).join("+") || "none"].join(" "));
+          ')"
+          read -r stranger_state stranger_driver stranger_arms <<< "$state"
+          case "$stranger_state" in
+            complete|pending) ;;
+            *) echo "::error::the proof gate reported stranger state '${stranger_state}', which this job does not know how to act on"; exit 1 ;;
+          esac
+          {
+            echo "stranger_state=$stranger_state"
+            echo "stranger_driver=$stranger_driver"
+            echo "stranger_arms=$stranger_arms"
+          } >> "$GITHUB_OUTPUT"
           echo "release proof records verified for $CANDIDATE_SHA, the commit this job promotes"
+          if [ "$stranger_state" = pending ]; then
+            echo "::warning::first-contact proof is PENDING for ${GITHUB_REF_NAME}; this release stays a prerelease and will not become GitHub Latest until its stranger.env lands"
+          else
+            echo "::notice::first-contact proof complete on arms ${stranger_arms}, driven on the ${stranger_driver} endpoint"
+          fi
 
-      - name: Promote stable tag after public and npm proof
-        if: ${{ !contains(github.ref_name, '-') }}
+      # The release says what it is missing, in the release, where a human
+      # reading it will see it. A gap that lives only in a CI annotation is a
+      # gap nobody outside this run can see, and a prerelease with no
+      # explanation reads as an accident rather than as a decision.
+      - name: Record the missing first-contact proof on the release itself
+        # Stable tags only. A prerelease TAG is a prerelease because that is
+        # what it is, not because proof is missing, and it never becomes Latest
+        # whatever its record says. Telling a reader that an rc "stays a
+        # prerelease until its record lands" would promise something no path in
+        # this chain delivers.
+        if: >-
+          ${{
+            steps.proof.outputs.stranger_state == 'pending' &&
+            !contains(github.ref_name, '-')
+          }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          marker='<!-- kin-first-contact-proof -->'
+          body="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq '.body')"
+          # Idempotent: a recovery re-run of this job must not stack the notice.
+          if printf '%s' "$body" | grep -qF "$marker"; then
+            echo "the release already carries the first-contact notice"
+            exit 0
+          fi
+          # Unquoted heredoc on purpose: the marker has exactly one definition
+          # and the notice interpolates it, so the grep above and the text below
+          # cannot drift into an idempotency check that never matches. There is
+          # no other expansion in this text.
+          cat > "$RUNNER_TEMP/release-body.md" <<NOTE
+          ${marker}
+          > **First-contact proof pending.** This release cleared the machine preflight on its
+          > own bytes. It has NOT been through the stranger arms (green, brown, vcs) that
+          > measure what a first-time user actually meets. It stays a prerelease and is not
+          > GitHub Latest until that record lands. Install it only if you meant this exact
+          > version.
+
+          NOTE
+          printf '%s\n' "$body" >> "$RUNNER_TEMP/release-body.md"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --notes-file "$RUNNER_TEMP/release-body.md"
+
+      # Latest is the claim of first-contact coverage, so this is where the
+      # stranger record is required. `promoted` is written on BOTH paths,
+      # because a downstream job reading an unset output cannot tell "held" from
+      # "this step never ran".
+      - name: Promote stable tag after public and npm proof
+        id: promote
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STRANGER_STATE: ${{ steps.proof.outputs.stranger_state }}
+        run: |
+          set -euo pipefail
+          if [ "$STRANGER_STATE" != complete ]; then
+            echo "promoted=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::holding ${GITHUB_REF_NAME} as a prerelease: first-contact proof is ${STRANGER_STATE}"
+            {
+              echo "### GitHub Latest held"
+              echo
+              echo "\`${GITHUB_REF_NAME}\` is published and installable, and is NOT GitHub Latest."
+              echo "Its stranger record is \`${STRANGER_STATE}\`, so nothing here has been through the"
+              echo "green, brown and vcs first-contact arms. Latest moves on its own once that record"
+              echo "lands under this commit on the release-evidence branch."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "promoted=true" >> "$GITHUB_OUTPUT"
           version="${GITHUB_REF_NAME#v}"
           channel="$(node scripts/release-order.mjs channel "$version")"
           for package in @kinlab/kin @kinlab/kin-mcp; do
@@ -2495,13 +2610,19 @@ jobs:
       - name: Verify final release channel
         env:
           GH_TOKEN: ${{ github.token }}
+          PROMOTED: ${{ steps.promote.outputs.promoted }}
         run: |
           set -euo pipefail
           actual="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.prerelease')"
           expected=true
           case "$GITHUB_REF_NAME" in
             *-*) ;;
-            *) expected=false ;;
+            # A stable tag whose first-contact proof is still pending stays a
+            # prerelease ON PURPOSE, so this verification expects what the
+            # promote step above actually decided rather than what the tag's
+            # shape alone would imply. Read off that step's own output, so a
+            # promotion that silently failed to happen still fails here.
+            *) [ "${PROMOTED:-}" = true ] && expected=false ;;
           esac
           if [ "$actual" != "$expected" ]; then
             echo "::error::release prerelease=$actual, expected $expected after proof"
@@ -2531,6 +2652,7 @@ jobs:
         needs.build_daemon_image.result == 'success' &&
         needs.attest_daemon_image.result == 'success' &&
         needs.config.outputs.release_channel == 'latest' &&
+        needs.finalize_release.outputs.promoted == 'true' &&
         startsWith(github.ref, 'refs/tags/v') &&
         !contains(github.ref_name, '-')
       }}
@@ -3103,6 +3225,7 @@ jobs:
         needs.publish_boundary_contracts.result == 'success' &&
         needs.version_tag_image.result == 'success' &&
         needs.config.outputs.release_channel == 'latest' &&
+        needs.finalize_release.outputs.promoted == 'true' &&
         startsWith(github.ref, 'refs/tags/v') &&
         !contains(github.ref_name, '-')
       }}

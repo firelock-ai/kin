@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github" / "workflows"
 README = ROOT / "README.md"
 RELEASE = WORKFLOWS / "release.yml"
+RELEASE_CUT = WORKFLOWS / "release-cut.yml"
 RELEASE_RECOVERY = WORKFLOWS / "release-recovery.yml"
 RELEASE_TAG = WORKFLOWS / "release-tag.yml"
 RC_BUILD = WORKFLOWS / "rc-build.yml"
@@ -700,6 +701,15 @@ CI_JOB_DISPLAY_NAMES = {
     "fast-gate-lint": "Fast gate lint and policy",
     "fast-gate-tests": "Fast gate test shard",
     "fast-gate-tests-aggregate": "Fast gate build and tests",
+    # The pull request's only Windows evidence. All four native Windows jobs
+    # carry `github.event_name != 'pull_request'`, so on 2026-09-02 a helper
+    # that was dead code under `cfg(not(unix))` read green through its whole
+    # pull request and turned every Windows job on main red for an hour. This
+    # cross-compiles the shipped package set for x86_64-pc-windows-gnu, which
+    # reproduces that class because `cfg(unix)` is false for both Windows
+    # targets and msvc cannot cross-compile off Windows. It publishes a name no
+    # ruleset requires and blocks through the aggregate's `needs:` below.
+    "windows-cross-check": "Windows cross-check",
     # The served MCP surface, graded on the pull request that moves it. Five
     # assertions read that surface and all five run only on main's push, so a
     # profile change that moved a served name and trimmed three schema knobs and
@@ -861,7 +871,26 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
         "arm": "Arm the release candidate",
         "preflight": "Preflight ${{ matrix.artifact }}",
         "publish": "Publish the candidate's preflight record",
+        # The stranger runs on a runner the fleet owns, gated by the
+        # KIN_STRANGER_RUNNER variable, because three concurrent arms need 15
+        # CPUs and 36 GB and a job whose labels match no online runner queues
+        # rather than skipping. It reads the driver's API key and nothing else;
+        # the record it produces is filed by publish-stranger, so the release
+        # App never reaches the machine executing candidate bytes.
+        "stranger": "Run the stranger on the candidate archive",
+        "publish-stranger": "Publish the candidate's stranger record",
+        "stranger-standby": "Report the stranger a runner cannot take",
         "report": "Report the cut's decision",
+    },
+    # The second tier of the proof contract. A tag now mints on the machine
+    # preflight alone and the release is published as a prerelease; this sweep
+    # is what takes it to GitHub Latest once its stranger record lands, and what
+    # alarms while it has not. None of its jobs runs on a pull_request or
+    # merge_group event, so none can claim a required context; it is registered
+    # here because this census is what would otherwise let a new workflow's job
+    # NAME appear unreviewed.
+    ".github/workflows/release-promote.yml": {
+        "promote": "Promote proven releases to Latest",
     },
     ".github/workflows/release-recovery.yml": {
         "reconcile": "Reconcile failed release",
@@ -1112,6 +1141,209 @@ EXTERNAL_REQUIRED_CONTEXT_SPOOF = textwrap.dedent(
 def require(content: str, needle: str, context: str) -> None:
     if needle not in content:
         raise AssertionError(f"{context} is missing required policy: {needle}")
+
+
+# ── the two-tier proof contract ───────────────────────────────────────────
+#
+# Until 2026-09-02 both decision points required the same thing: a preflight
+# record AND a complete stranger record, or no release at all. That made every
+# release hostage to a driver, and on run rc0551 the account's weekly limit
+# turned a proven candidate into a tag that could not be cut, with a hold alarm
+# as the only signal.
+#
+# The contract now has two tiers, and these assertions are what stop the tiers
+# collapsing back into one in either direction. Collapsing UP puts the outage
+# back. Collapsing DOWN promotes a release to GitHub Latest with no first-contact
+# proof, which is the 2026-08-20 failure this whole gate exists for.
+#
+# Every assertion reads active lines, never raw text, because each of these
+# files carries prose ABOUT the thing being asserted and a check satisfied by
+# its own explanatory comment cannot fail.
+TAG_TIER_MODE = "KIN_RELEASE_REQUIRE=preflight"
+PROMOTION_STATE = "complete"
+
+
+def assert_tag_tier_requires_only_the_machine_proof(release_tag: str) -> None:
+    """The mint must ask for the preflight tier, so a missing stranger cannot hold a tag."""
+
+    lines = active_lines(release_tag)
+    if not any(TAG_TIER_MODE in line for line in lines):
+        raise AssertionError(
+            "release-tag.yml must run the proof gate with "
+            f"{TAG_TIER_MODE}; without it a candidate whose stranger has not "
+            "run yet cannot be tagged at all, which is the outage this tier "
+            "exists to end"
+        )
+    # Reading the state is not optional. A mint that relaxed the requirement and
+    # then said nothing would cut tags that silently claim nothing, and the
+    # release would carry no record of what it is missing.
+    if not any("stranger_state=" in line for line in lines):
+        raise AssertionError(
+            "release-tag.yml must record the stranger state it proceeded on"
+        )
+
+
+def assert_latest_requires_the_stranger(release: str) -> None:
+    """GitHub Latest is the claim of first-contact coverage, so it needs the record."""
+
+    lines = active_lines(release)
+    gate = f'"$STRANGER_STATE" != {PROMOTION_STATE}'
+    if not any(gate in line for line in lines):
+        raise AssertionError(
+            "release.yml must refuse to promote a release to GitHub Latest "
+            f"unless its stranger state is {PROMOTION_STATE}; Latest is what an "
+            "installer resolves, so it is the claim first-contact proof backs"
+        )
+    if not any("promoted=false" in line for line in lines):
+        raise AssertionError(
+            "release.yml must record promoted=false when it holds a release, so "
+            "a downstream job can tell 'held' from 'this step never ran'"
+        )
+    # The pending notice explains why a STABLE release is not Latest. A
+    # prerelease tag is a prerelease because that is what it is, and it never
+    # becomes Latest whatever its record says, so telling its reader that it
+    # "stays a prerelease until its record lands" promises something no path in
+    # this chain delivers.
+    anchor = "      - name: Record the missing first-contact proof on the release itself\n"
+    if release.count(anchor) != 1:
+        raise AssertionError(
+            "release.yml must declare exactly one step recording a missing "
+            "first-contact proof on the release"
+        )
+    start = release.index(anchor)
+    notice = release[start : release.index("\n      - name: ", start + len(anchor))]
+    condition = "\n".join(active_lines(notice))
+    for required in ("stranger_state == 'pending'", "!contains(github.ref_name, '-')"):
+        if required not in condition:
+            raise AssertionError(
+                "the first-contact notice must be written only for a held "
+                f"STABLE release; its condition is missing {required}"
+            )
+
+
+def assert_latest_claims_gate_on_promotion(release: str) -> None:
+    """Every job whose meaning is "this IS Latest" must gate on the promotion, not the job."""
+
+    needed = "needs.finalize_release.outputs.promoted == 'true'"
+    for job in ("promote_ghcr_latest", "seal_release_completion"):
+        start = release.index(f"\n  {job}:")
+        end = release.index("\n    steps:", start)
+        if needed not in "\n".join(active_lines(release[start:end])):
+            raise AssertionError(
+                f"{job} must gate on {needed}; it claims that this release IS "
+                "Latest, and finalize_release now succeeds without promoting "
+                "when first-contact proof is pending"
+            )
+
+
+def assert_require_modes_match_the_gate(
+    release_tag: str, release: str, proof_gate: str
+) -> None:
+    """The mode both workflows ask for must be one the gate module actually knows.
+
+    This is the coupling that would otherwise fail on a release night. A mode
+    renamed in the module and not in the workflows refuses at run time with
+    "unknown require mode", which is correct behaviour and a stopped release.
+    """
+
+    declared = re.search(
+        r"export const REQUIRE_MODES = Object\.freeze\(\[([^\]]*)\]\)",
+        proof_gate,
+    )
+    if declared is None:
+        raise AssertionError(
+            "the proof gate must declare REQUIRE_MODES for the workflows to be "
+            "checked against"
+        )
+    modes = set(re.findall(r"'([^']+)'", declared.group(1)))
+    asked = set()
+    for source in (release_tag, release):
+        for line in active_lines(source):
+            found = re.search(r"KIN_RELEASE_REQUIRE=([A-Za-z-]+)", line)
+            if found:
+                asked.add(found.group(1))
+    if not asked:
+        raise AssertionError(
+            "no workflow asks the proof gate for a require mode, so this "
+            "coupling checks nothing"
+        )
+    unknown = sorted(asked - modes)
+    if unknown:
+        raise AssertionError(
+            f"the release workflows ask the proof gate for mode(s) {unknown} "
+            f"that it does not declare (it knows {sorted(modes)}); move both "
+            "sides together"
+        )
+
+
+def assert_stranger_driver_credential_is_either(release_cut: str) -> None:
+    """The cut must accept a local model OR a key, and must still refuse with neither.
+
+    The key is required only on the account path. Naming a local model points
+    the driver at an endpoint on the runner and `driver_env_argv` then UNSETS
+    ANTHROPIC_API_KEY for the driver child, so demanding a secret the run
+    throws away is how a rail stays blocked on a founder step it does not need.
+
+    Both halves are asserted, because the refusal is the load-bearing one: an
+    absent credential sends every driver request out unauthenticated and the
+    transcript records only a server error, hours in.
+    """
+
+    lines = active_lines(release_cut)
+    joined = "\n".join(lines)
+    if "vars.KIN_STRANGER_LOCAL_MODEL" not in joined:
+        raise AssertionError(
+            "release-cut.yml must let a local model drive the stranger; without "
+            "it the cut demands an API key the local path immediately discards"
+        )
+    if '--local-model' not in joined:
+        raise AssertionError(
+            "release-cut.yml names a local model and never passes --local-model "
+            "to the harness, so the run would drive the account anyway"
+        )
+    # The refusal must still exist, and it must still be reachable when neither
+    # credential is configured.
+    if 'if [ -n "${LOCAL_MODEL:-}" ]; then' not in joined:
+        raise AssertionError(
+            "release-cut.yml must branch on the local model before it demands a key"
+        )
+    if 'elif [ -z "${STRANGER_KEY:-}" ]; then' not in joined:
+        raise AssertionError(
+            "release-cut.yml must still refuse when NEITHER a local model nor a "
+            "key is configured; a driver with no credential fails hours in with "
+            "a bare server error"
+        )
+
+
+# The `release` environment's deployment branch policy admits tag: v*.*.* and
+# nothing else, so a job that reaches it from a branch is refused by the server
+# before a step runs. That is invisible in the workflow file and fatal on a
+# schedule, where the refusal repeats every cycle forever.
+#
+# The policies themselves live in repository settings and cannot be read from
+# the tree, so this asserts the rule the tree CAN carry: a workflow that fires
+# on a schedule or a repository_dispatch runs from a branch, and must not
+# declare the tag-only environment.
+TAG_ONLY_ENVIRONMENT = "release"
+BRANCH_ENVIRONMENT = "release-tag"
+
+
+def assert_branch_triggered_workflows_avoid_the_tag_environment(
+    workflows: dict[Path, str],
+) -> None:
+    for path, source in workflows.items():
+        head = source.split("\njobs:", 1)[0]
+        if "schedule:" not in head and "repository_dispatch:" not in head:
+            continue
+        for line in active_lines(source):
+            if line == f"environment: {TAG_ONLY_ENVIRONMENT}":
+                raise AssertionError(
+                    f"{path.name} can fire from a branch and declares "
+                    f"environment: {TAG_ONLY_ENVIRONMENT}, whose deployment "
+                    f"branch policy admits tags alone; use "
+                    f"{BRANCH_ENVIRONMENT}, which admits main, or the job is "
+                    "refused before any step runs"
+                )
 
 
 def expect_assertion(
@@ -4578,7 +4810,10 @@ FAST_GATE_SHARD_STEPS = (
 FAST_GATE_SHARD_MATRIX = "shard: [1, 2, 3]"
 FAST_GATE_SHARD_INDEPENDENT_LEGS = "fail-fast: false"
 FAST_GATE_AGGREGATE_ALWAYS_RUNS = "if: ${{ !cancelled() }}"
-FAST_GATE_AGGREGATE_NEEDS = "needs: [changes, fast-gate-tests]"
+# The Windows cross-check is in here rather than left advisory because the job
+# publishes no required context of its own. Without this line a red Windows leg
+# sits beside six green required contexts and the pull request merges.
+FAST_GATE_AGGREGATE_NEEDS = "needs: [changes, fast-gate-tests, windows-cross-check]"
 FAST_GATE_AGGREGATE_SUCCESS_GATE = 'if [ "$SHARDS" != "success" ]; then'
 
 
@@ -10077,6 +10312,7 @@ def main() -> None:
             )
 
     release = RELEASE.read_text(encoding="utf-8")
+    release_cut = RELEASE_CUT.read_text(encoding="utf-8")
     release_recovery = RELEASE_RECOVERY.read_text(encoding="utf-8")
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
     release_train = RELEASE_TRAIN.read_text(encoding="utf-8")
@@ -10649,14 +10885,28 @@ def main() -> None:
         "github.event.workflow_run.event == 'push'",
         "github.event.workflow_run.head_branch == 'main'",
         "repository_dispatch:",
-        "types: [release_tag]",
+        # Two typed dispatches, pinned as one literal so adding a third is a
+        # reviewed edit here rather than a quiet trigger widening. release_tag
+        # is break glass and names an exact commit; release_tag_evaluate runs
+        # the scheduled algorithm on demand and names nothing. Both face the
+        # same actor allowlist and main-only ref below.
+        "types: [release_tag, release_tag_evaluate]",
         "github.event.action",
         "github.event.repository.default_branch",
         "github.event.client_payload.tag",
         "github.event.client_payload.sha",
         "EVENT_SHA: ${{ github.sha }}",
         'EVENT_NAME" != repository_dispatch',
-        'EVENT_ACTION" != release_tag',
+        # The dispatch action allowlist. It was a single `!=` test while there
+        # was one type; with two it is a case whose only admitting arm is this
+        # literal, so an unlisted action still falls to the refusing arm.
+        "release_tag|release_tag_evaluate) ;;",
+        "unsupported repository dispatch action",
+        # Evaluate runs the automatic selection, so it must never accept a
+        # caller-named commit. Ignoring one would tag a different commit than
+        # the caller believed they had chosen.
+        'EVENT_ACTION" = release_tag_evaluate',
+        "release_tag_evaluate runs the automatic selection and takes no tag or sha",
         'DEFAULT_BRANCH" != main',
         'REF" != "refs/heads/$DEFAULT_BRANCH"',
         "environment: release-tag",
@@ -16388,6 +16638,107 @@ def main() -> None:
                 assert_ruleset_mirror_stays_a_superset(mutant)
             ),
         )
+    # The two-tier proof contract, and a falsification arm per direction it
+    # could collapse. Each mutant is the smallest edit that would actually be
+    # made by someone "tidying up", not a syntactic wreck.
+    assert_branch_triggered_workflows_avoid_the_tag_environment(workflow_sources)
+    expect_assertion(
+        "a scheduled workflow reaches the tag-only release environment",
+        "whose deployment branch policy admits tags alone",
+        lambda mutant={
+            **workflow_sources,
+            WORKFLOWS / "release-promote.yml": (
+                WORKFLOWS / "release-promote.yml"
+            ).read_text(encoding="utf-8").replace(
+                "environment: release-tag", "environment: release", 1
+            ),
+        }: assert_branch_triggered_workflows_avoid_the_tag_environment(mutant),
+    )
+    assert_stranger_driver_credential_is_either(release_cut)
+    expect_assertion(
+        "the cut demands an API key even when a local model drives",
+        "must let a local model drive the stranger",
+        lambda mutant=release_cut.replace("vars.KIN_STRANGER_LOCAL_MODEL", "vars.KIN_STRANGER_UNUSED"): (
+            assert_stranger_driver_credential_is_either(mutant)
+        ),
+    )
+    expect_assertion(
+        "the cut accepts a driverless run with no credential at all",
+        "must still refuse when NEITHER",
+        lambda mutant=release_cut.replace(
+            'elif [ -z "${STRANGER_KEY:-}" ]; then', 'elif false; then', 1
+        ): assert_stranger_driver_credential_is_either(mutant),
+    )
+    assert_tag_tier_requires_only_the_machine_proof(release_tag)
+    assert_latest_requires_the_stranger(release)
+    assert_latest_claims_gate_on_promotion(release)
+    assert_require_modes_match_the_gate(release_tag, release, proof_gate)
+    expect_assertion(
+        "the mint goes back to requiring a stranger before a tag",
+        "must run the proof gate with",
+        lambda mutant=release_tag.replace(
+            "            KIN_RELEASE_REQUIRE=preflight \\\n", "", 1
+        ): assert_tag_tier_requires_only_the_machine_proof(mutant),
+    )
+    expect_assertion(
+        "promotion to Latest stops asking about the stranger",
+        "must refuse to promote a release to GitHub Latest",
+        lambda mutant=release.replace(
+            'if [ "$STRANGER_STATE" != complete ]; then',
+            'if [ "$STRANGER_STATE" = never ]; then',
+            1,
+        ): assert_latest_requires_the_stranger(mutant),
+    )
+    expect_assertion(
+        "the pending notice is written onto a prerelease tag too",
+        "written only for a held",
+        lambda mutant=release.replace(
+            "            steps.proof.outputs.stranger_state == 'pending' &&\n"
+            "            !contains(github.ref_name, '-')\n",
+            "            steps.proof.outputs.stranger_state == 'pending'\n",
+            1,
+        ): assert_latest_requires_the_stranger(mutant),
+    )
+    expect_assertion(
+        "GHCR latest moves on a release that was held as a prerelease",
+        "must gate on needs.finalize_release.outputs.promoted",
+        lambda mutant=release.replace(
+            "        needs.config.outputs.release_channel == 'latest' &&\n"
+            "        needs.finalize_release.outputs.promoted == 'true' &&\n"
+            "        startsWith(github.ref, 'refs/tags/v') &&\n"
+            "        !contains(github.ref_name, '-')\n"
+            "      }}\n"
+            "    runs-on: ubuntu-latest\n"
+            "    environment: release\n"
+            "    # Least privilege for one registry-side tag move",
+            "        needs.config.outputs.release_channel == 'latest' &&\n"
+            "        startsWith(github.ref, 'refs/tags/v') &&\n"
+            "        !contains(github.ref_name, '-')\n"
+            "      }}\n"
+            "    runs-on: ubuntu-latest\n"
+            "    environment: release\n"
+            "    # Least privilege for one registry-side tag move",
+            1,
+        ): assert_latest_claims_gate_on_promotion(mutant),
+    )
+    expect_assertion(
+        "a workflow asks for a mode the gate module does not know",
+        "that it does not declare",
+        lambda mutant=release_tag.replace(
+            "KIN_RELEASE_REQUIRE=preflight", "KIN_RELEASE_REQUIRE=machine", 1
+        ): assert_require_modes_match_the_gate(mutant, release, proof_gate),
+    )
+    # The coupling must also be able to notice that nothing asks at all, or it
+    # would pass forever on a tree where the mode was deleted from both sides.
+    expect_assertion(
+        "no workflow asks the gate for a mode at all",
+        "so this coupling checks nothing",
+        lambda: assert_require_modes_match_the_gate(
+            release_tag.replace("KIN_RELEASE_REQUIRE=preflight", "", 1),
+            release.replace("KIN_RELEASE_REQUIRE=preflight", "", 1),
+            proof_gate,
+        ),
+    )
     assert_soft_decline_is_legible(release_tag)
     assert_recovery_escalation_classifies(
         RELEASE_RECOVERY.read_text(encoding="utf-8")

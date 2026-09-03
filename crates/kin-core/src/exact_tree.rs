@@ -214,7 +214,10 @@ pub fn plan_observed_tree_deltas(
     }) {
         return Err(KinError::Other(format!(
             "identity-underdetermined repository transition for artifact {artifact_id:?} at {}: \
-             the same exact entry also appears at {}; use an explicit identity-bearing copy/move",
+             the same exact entry also appears at {}, so a copy and a move-plus-replacement are \
+             equally supported and choosing one would guess this artifact's identity. Commit the \
+             two paths in separate commits, or make their contents differ, so one transition \
+             names one identity",
             old.path, duplicate
         )));
     }
@@ -259,7 +262,9 @@ pub fn plan_observed_tree_deltas(
     }) {
         return Err(KinError::Other(format!(
             "ambiguous repository identity transition for artifact {artifact_id:?} at {}: \
-             exact entry also appears at {}; use an explicit identity-bearing move",
+             the same exact entry appears at {}, so nothing chooses which of them this artifact \
+             moved to. Commit the destinations in separate commits, or make their contents \
+             differ, so one path claims the identity",
             old.path,
             candidates
                 .iter()
@@ -291,23 +296,27 @@ pub fn plan_observed_tree_deltas(
         });
     }
 
-    if !old_by_id.is_empty() && !new_by_path.is_empty() {
-        let removed = old_by_id
-            .values()
-            .map(|old| old.path.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let added = new_by_path
-            .keys()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(KinError::Other(format!(
-            "identity-underdetermined repository transition: unmatched removals [{removed}] and \
-             additions [{added}] may be move-plus-edit operations; use explicit identity-bearing \
-             add/remove/move commands"
-        )));
-    }
+    // What is left is a removal whose content appears nowhere in the observation
+    // beside an addition whose content matches no tracked artifact. Nothing
+    // links the two, and this used to refuse the whole transition on the theory
+    // that they MIGHT be one move-plus-edit.
+    //
+    // The refusal preserved no identity, which is why it is gone (FIR-3097).
+    // Every refusal above it is backed by evidence: a byte-identical entry in
+    // two places makes two identity assignments equally supported, so choosing
+    // one would be a guess. Here there is no evidence in either direction, and
+    // the planner reads hashes rather than content, so it cannot acquire any. A
+    // user who hit this had exactly one way forward, recreating the deleted file
+    // and splitting the work across two commits, and that lands the same
+    // Removed plus Added this now plans directly. The refusal cost a wedge and
+    // bought nothing, and it prescribed `add`, `remove` and `move` commands that
+    // exist on no Kin surface: `plan_artifact_move` and `plan_artifact_copy` are
+    // called only by this file's own tests.
+    //
+    // So an unmatched removal beside additions is a delete plus adds. When
+    // content similarity can be measured here, and when an identity-bearing move
+    // reaches a product surface, a similarity-gated refusal becomes worth having
+    // because it would then have both evidence and a remedy.
 
     deltas.extend(
         old_by_id
@@ -417,26 +426,159 @@ mod tests {
         assert!(error.to_string().contains("ambiguous repository identity"));
     }
 
+    /// An unmatched removal beside an unmatched addition is a delete plus an
+    /// add, and it plans rather than refusing (FIR-3097).
+    ///
+    /// This asserted the refusal until 2026-09-02. It is inverted rather than
+    /// deleted because the identity claim underneath it is the thing worth
+    /// pinning: the old artifact is Removed and the new path gets a FRESH
+    /// identity. Nothing is silently carried across, so the planner is not
+    /// guessing a move here any more than it was before; it is recording the
+    /// only transition the observation actually supports.
     #[test]
-    fn observation_fails_closed_on_move_plus_edit() {
+    fn observation_admits_an_unmatched_removal_beside_an_addition() {
         let id = ArtifactId::new();
+        let old_path = RepoPath::from_utf8("old").unwrap();
+        let new_path = RepoPath::from_utf8("new").unwrap();
         let previous = resolved(vec![(
             id,
-            RepoPath::from_utf8("old").unwrap(),
+            old_path.clone(),
             TreeEntry::blob(Hash256::from_bytes([0x61; 32]), false),
         )]);
 
-        let error = plan_observed_tree_deltas(
+        let deltas = plan_observed_tree_deltas(
             &previous,
             BTreeMap::from([(
-                RepoPath::from_utf8("new").unwrap(),
+                new_path.clone(),
                 TreeEntry::blob(Hash256::from_bytes([0x62; 32]), false),
             )]),
         )
-        .unwrap_err();
+        .expect("an unmatched removal beside an addition is a delete plus an add");
 
-        assert!(error.to_string().contains("identity-underdetermined"));
-        assert_eq!(previous.get(&id).unwrap().path.as_utf8(), Some("old"));
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| matches!(delta, TreeDelta::Removed { artifact_id, .. } if *artifact_id == id)),
+            "the deleted artifact must be Removed by its own identity: {deltas:?}"
+        );
+        let added = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                TreeDelta::Added { artifact_id, new } => Some((*artifact_id, new.path.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(added.len(), 1, "one addition was observed: {deltas:?}");
+        assert_eq!(added[0].1, new_path);
+        assert_ne!(
+            added[0].0, id,
+            "the addition must mint a fresh identity, never inherit the removed one"
+        );
+
+        let next = previous.apply(&deltas).unwrap();
+        assert!(next.get(&id).is_none(), "the removed artifact is gone");
+        assert!(next.artifact_at_path(&new_path).is_some());
+    }
+
+    /// The stranger's shape, verbatim (FIR-3097): one scratch file created and
+    /// deleted between two commits, beside the real work.
+    ///
+    /// `kin commit` takes no paths and has no staging area, so it observes the
+    /// whole working tree every time and this is what any scratch file produces.
+    /// The v0.6.4 candidate refused it in 20 ms and told the user to reach for
+    /// `add`, `remove` and `move` commands that do not exist, and the only way
+    /// out anybody found was to recreate the file and split the work across two
+    /// commits, which lands exactly the deltas asserted here.
+    #[test]
+    fn observation_admits_a_deleted_scratch_file_beside_new_files() {
+        let scratch_id = ArtifactId::new();
+        let kept_id = ArtifactId::new();
+        let scratch = RepoPath::from_utf8("_smoke.py").unwrap();
+        let kept = RepoPath::from_utf8("notekeeper/notes.py").unwrap();
+        let kept_entry = TreeEntry::blob(Hash256::from_bytes([0x01; 32]), false);
+        let previous = resolved(vec![
+            (
+                scratch_id,
+                scratch.clone(),
+                TreeEntry::blob(Hash256::from_bytes([0x02; 32]), false),
+            ),
+            (kept_id, kept.clone(), kept_entry),
+        ]);
+
+        let additions = [
+            ".gitignore",
+            "notekeeper/__init__.py",
+            "notekeeper/parsing.py",
+        ];
+        let mut observed = BTreeMap::from([(kept.clone(), kept_entry)]);
+        for (index, path) in additions.into_iter().enumerate() {
+            observed.insert(
+                RepoPath::from_utf8(path).unwrap(),
+                TreeEntry::blob(Hash256::from_bytes([0x10 + index as u8; 32]), false),
+            );
+        }
+
+        let deltas = plan_observed_tree_deltas(&previous, observed)
+            .expect("a deleted scratch file beside new files is a delete plus adds");
+        let next = previous.apply(&deltas).unwrap();
+
+        assert!(next.get(&scratch_id).is_none(), "the scratch file is gone");
+        assert_eq!(
+            next.get(&kept_id).map(|artifact| artifact.path.clone()),
+            Some(kept),
+            "an untouched file keeps its identity and its path"
+        );
+        for path in additions {
+            assert!(
+                next.artifact_at_path(&RepoPath::from_utf8(path).unwrap())
+                    .is_some(),
+                "{path} was admitted"
+            );
+        }
+    }
+
+    /// Neither surviving refusal may prescribe a command that does not exist.
+    ///
+    /// The whole reason FIR-3097 wedged a first-time user is that the message
+    /// named `add`, `remove` and `move`; `kin --help` lists sixty-odd
+    /// subcommands and none of them. This keys on both halves, the fiction that
+    /// must be absent and the real remedy that must be present, because a
+    /// message asserted only by what it lacks passes when it says nothing.
+    #[test]
+    fn identity_refusals_name_a_remedy_that_exists() {
+        let id = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x55; 32]), false);
+        let old = RepoPath::from_utf8("old").unwrap();
+
+        let ambiguous = plan_observed_tree_deltas(
+            &resolved(vec![(id, old.clone(), entry)]),
+            BTreeMap::from([
+                (RepoPath::from_utf8("copy-a").unwrap(), entry),
+                (RepoPath::from_utf8("copy-b").unwrap(), entry),
+            ]),
+        )
+        .unwrap_err()
+        .to_string();
+
+        let duplicate = plan_observed_tree_deltas(
+            &resolved(vec![(id, old.clone(), entry)]),
+            BTreeMap::from([(old, entry), (RepoPath::from_utf8("new").unwrap(), entry)]),
+        )
+        .unwrap_err()
+        .to_string();
+
+        for message in [&ambiguous, &duplicate] {
+            assert!(
+                !message.contains("add/remove/move")
+                    && !message.contains("identity-bearing copy/move")
+                    && !message.contains("identity-bearing move"),
+                "a refusal must not prescribe a command Kin does not ship: {message}"
+            );
+            assert!(
+                message.contains("separate commits"),
+                "a refusal must name what the operator can actually do: {message}"
+            );
+        }
     }
 
     #[test]

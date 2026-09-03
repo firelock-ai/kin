@@ -1112,6 +1112,7 @@ jobs:
         run: |
           bash scripts/release-policy-gate.sh <<'RELEASE_POLICY'
           python3 scripts/test-release-workflow-authority.py
+          python3 scripts/test-release-tag-evaluate-dispatch.py
           python3 scripts/test-select-release-candidate.py
           python3 scripts/test-guard-duplicate-release-run.py
           node --test \
@@ -1121,6 +1122,8 @@ jobs:
             scripts/check-kin-vfs-compat.test.mjs \
             scripts/check-rc-build-drift.test.mjs \
             scripts/check-release-proof-artifacts.test.mjs \
+            scripts/release-promotion-plan.test.mjs \
+            scripts/read-promotion-plan.test.mjs \
             scripts/release-train-body.test.mjs \
             scripts/check-release-version.test.mjs \
             scripts/release-intent.test.mjs \
@@ -1288,15 +1291,107 @@ jobs:
       - name: Report quarantined flakes
         run: python3 scripts/check-quarantine.py --report-junit target/nextest/default/junit.xml
 
+  # Windows compilation, graded on the pull request that breaks it.
+  #
+  # kin's four native Windows jobs all carry
+  # `if: ${{ github.event_name != 'pull_request' }}` (lines 201, 454, 533 and
+  # 638), so a pull request cannot see a Windows break at all: it lands, and
+  # main's push run reports it afterwards. On 2026-09-02 that cost an hour of
+  # red main. kin#1405 added an open-file helper at module scope whose only
+  # caller sat inside `#[cfg(unix)] mod imp`, so on Windows the function was
+  # dead code, and this workflow compiles with `-D warnings` (line 40):
+  #
+  #     error: function `target_soft_limit` is never used
+  #       --> crates\kin-core\src\file_limit.rs:57:4
+  #        = note: `-D dead-code` implied by `-D warnings`
+  #
+  # All four Windows jobs failed to compile on ddc3e0621 while its own pull
+  # request read green; c99d9065a before it was green on every one; kin#1410
+  # fixed it at eb321488c. This job is what turns that class into a red pull
+  # request instead, and it is cheap enough to sit on the admission path: the
+  # native legs measured 1.8 to 12.6 minutes and the installer 32.7, against a
+  # pull request whose longest job is a fast-gate shard at 8.9 to 10.1.
+  #
+  # Why `gnu` rather than `msvc`. The class is `cfg(unix)`, which is false for
+  # both Windows targets, so either target reproduces it. Only one of them can
+  # run here: `x86_64-pc-windows-msvc` cannot be cross-compiled off Windows,
+  # because ring and the tree-sitter grammars build C and there are no MSVC
+  # headers, which is the wall kin#1410's author hit cross-compiling from
+  # macOS. `x86_64-pc-windows-gnu` needs only mingw-w64, and that pull request
+  # proved this exact package set checks clean under it.
+  #
+  # What this is not. It checks rather than links, and gnu is not the C runtime
+  # Kin ships, so it proves compilation and name resolution for the Windows cfg
+  # set and nothing about the msvc link or about behavior. The native jobs still
+  # own that, on the merge queue and on every commit that reaches main.
+  #
+  # It publishes no required context. `fast-gate-tests-aggregate` below needs it
+  # and admits no result but `success`, so a pull request cannot merge around
+  # it, and that `needs:` line is pinned in
+  # scripts/test-release-workflow-authority.py, which is what stops this job
+  # being dropped quietly.
+  windows-cross-check:
+    name: Windows cross-check
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      # Restore on every event and save only from main, as every cache step in
+      # this file does. No `shared-key`, so this keys on the job id: a
+      # cross-target `target` directory holds nothing another job wants, and
+      # sharing one would only evict what those jobs do want.
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # FIR-2744, and see the note on the first cache step in this file.
+          add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      # ring, the tree-sitter grammars, sqlite and oniguruma compile C for the
+      # target, so a cross check needs the target's own C toolchain exactly as
+      # the musl steps in `check` need musl-tools. Through the bounded wrapper
+      # rather than a bare `apt-get`, so a stalled mirror fails in minutes with
+      # its own error line instead of holding the job to its timeout.
+      - name: Install the mingw-w64 cross toolchain
+        run: scripts/ci-apt-install.sh mingw-w64
+
+      # The package set the Windows release build ships, which is the set both
+      # musl steps in `check` check for their targets too. Not `--workspace`:
+      # `kin-notifier-macos` is a macOS-only member and `tests/integration` is a
+      # test crate, and neither is in a shipped Windows binary. `cargo check`
+      # with no target flags takes libs and bins, and both matter here, because
+      # the two call sites kin#1410 exists for are in `kin-cli/src/main.rs` and
+      # `kin-daemon/src/bin/kin-daemon.rs` while the dead helper was in the
+      # `kin-core` lib beneath them.
+      - name: Check the Windows target compiles
+        run: |
+          cargo check --locked --target x86_64-pc-windows-gnu \
+            -p kin-cli -p kin-daemon
+
   # The required context, and the only job that publishes it. It always runs, on
   # every event, because a required context that is never reported is a silent
   # hang. It names which case it passed on rather than passing quietly, and it
   # admits `success` from the shards and nothing else: a skipped or cancelled
   # shard left part of the selection unrun, and a required context that goes
   # green on that is worse than no context at all.
+  #
+  # It grades the Windows cross-check on the same terms, and that is how a
+  # Windows compile break blocks a pull request at all. The job itself publishes
+  # a name no ruleset requires, so without this `needs:` a red Windows leg would
+  # sit beside six green required contexts and merge.
   fast-gate-tests-aggregate:
     name: Fast gate build and tests
-    needs: [changes, fast-gate-tests]
+    needs: [changes, fast-gate-tests, windows-cross-check]
     if: ${{ !cancelled() }}
     # Deliberately a literal `ubuntu-latest` rather than the heavy-runner switch,
     # for the reason `check-aggregate` is not on one either. This job compiles
@@ -1311,6 +1406,7 @@ jobs:
         env:
           DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
           SHARDS: ${{ needs.fast-gate-tests.result }}
+          WINDOWS: ${{ needs.windows-cross-check.result }}
         run: |
           set -euo pipefail
           if [ "$DOCS_ONLY" = "true" ]; then
@@ -1324,7 +1420,15 @@ jobs:
             echo "'cancelled' mean a shard did not run at all." >&2
             exit 1
           fi
-          echo "every fast-gate shard succeeded"
+          if [ "$WINDOWS" != "success" ]; then
+            echo "::error title=the Windows cross-check did not pass::windows-cross-check reported '$WINDOWS'"
+            echo "kin's four native Windows jobs are all off the pull-request" >&2
+            echo "path, so this is the only leg that can report a Windows" >&2
+            echo "compile break before it reaches main. 'skipped' and" >&2
+            echo "'cancelled' mean it never graded the target at all." >&2
+            exit 1
+          fi
+          echo "every fast-gate shard succeeded, and the Windows target compiles"
 
   # The served MCP surface, graded on the pull request that moves it.
   #
@@ -1684,6 +1788,7 @@ jobs:
         run: |
           bash scripts/release-policy-gate.sh <<'RELEASE_POLICY'
           python3 scripts/test-release-workflow-authority.py
+          python3 scripts/test-release-tag-evaluate-dispatch.py
           python3 scripts/test-select-release-candidate.py
           python3 scripts/test-guard-duplicate-release-run.py
           node --test \
@@ -1693,6 +1798,8 @@ jobs:
             scripts/check-kin-vfs-compat.test.mjs \
             scripts/check-rc-build-drift.test.mjs \
             scripts/check-release-proof-artifacts.test.mjs \
+            scripts/release-promotion-plan.test.mjs \
+            scripts/read-promotion-plan.test.mjs \
             scripts/release-train-body.test.mjs \
             scripts/check-release-version.test.mjs \
             scripts/release-intent.test.mjs \
@@ -2504,6 +2611,35 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The runner is not small; the build is enormous, and the margin was
+      # under half a gigabyte. Measured on main's push run 33711619735, the
+      # first to carry this step: 145G of disk with 86.1 GiB free before the
+      # reclaim, 30.4 GiB free after tarpaulin finished, so the instrumented
+      # build of the whole workspace consumes about 85.7 GiB. Without the
+      # reclaim it was landing inside 0.4 GiB of the wall, which is why eleven
+      # consecutive main pushes on 2026-09-03 failed in two shapes rather than
+      # one, and why some of them squeaked through. Whether a run crossed the
+      # line came down to how much the image already held.
+      #
+      # Both shapes are that one cause. `rust-lld` mmaps its output, so a write
+      # with no blocks behind it arrives as `ld terminated with signal 7 [Bus
+      # error]` and reads as a compiler crash; or the runner's own worker hits
+      # `No space left on device` writing its diagnostic log and takes the job
+      # down with no failed step in it.
+      #
+      # Reclaiming the toolchains no kin build touches buys 30 GiB, which is
+      # about 35% headroom over the build. That is a margin, not a fix in
+      # perpetuity: it erodes as the workspace grows, and the `df` lines on both
+      # sides are what let the next reader see the next near miss coming instead
+      # of inferring it from a linker signal.
+      #
+      # `continue-on-error` because a reclaim that does not apply on some future
+      # runner image is not a reason to stop a build. The script already exits 0
+      # on every path it can reach; this covers the paths it cannot.
+      - name: Free runner disk
+        continue-on-error: true
+        run: bash scripts/ci-free-disk.sh
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
@@ -2534,16 +2670,58 @@ jobs:
         with:
           tool: cargo-tarpaulin
 
+      # The exit-0 contract here is unchanged from main. Tarpaulin is
+      # non-blocking for the public alpha and this change neither hardens nor
+      # softens that; hardening it belongs after a run proves tarpaulin can
+      # finish, which none of the 39 sampled runs did. What is new is that a
+      # failure now says WHICH failure it was. A tarpaulin nonzero next to a
+      # near-empty disk is a runner infrastructure failure and says so by name,
+      # rc=124 is the 30m bound rather than a defect, and anything else keeps
+      # the alpha warning.
+      #
+      # This can only speak when the step itself survives. When the disk kills
+      # the runner's worker process instead, no step-level line is ever written,
+      # which is why freeing the disk above is the fix and this is the report.
       - name: Run coverage
         run: |
-          if ! timeout 30m cargo tarpaulin --out xml --out stdout; then
-            echo "::warning::Tarpaulin is currently non-blocking in CI for the public alpha."
+          # Two GiB. Below this the next link or report write is what fails, so
+          # a tarpaulin nonzero here is the disk and not the code.
+          disk_floor_kb=2097152
+          rc=0
+          timeout 30m cargo tarpaulin --out xml --out stdout || rc=$?
+          free_kb="$(df -Pk . | awk 'NR == 2 { print $4 }')"
+          if [ -z "$free_kb" ]; then
+            echo "::warning::could not read free disk after the coverage run"
+            free_kb=-1
+          else
+            awk -v k="$free_kb" 'BEGIN { printf "coverage: %.1f GiB free after the run\n", k / 1048576 }'
+          fi
+          if [ "$rc" -ne 0 ]; then
+            if [ "$free_kb" -ge 0 ] && [ "$free_kb" -lt "$disk_floor_kb" ]; then
+              echo "::error::runner out of disk: tarpaulin exited $rc with under 2 GiB free. This is a runner infrastructure failure, not a coverage regression."
+            elif [ "$rc" -eq 124 ]; then
+              echo "::warning::Tarpaulin exceeded its 30m bound (rc=124) with disk to spare, so the bound is what stopped it."
+            else
+              echo "::warning::Tarpaulin is currently non-blocking in CI for the public alpha (rc=$rc)."
+            fi
           fi
 
+      # `continue-on-error` here so an upload that fails concludes with a named
+      # cause rather than leaving a null step behind a dead job.
+      #
+      # `disable_search` because without it this step is not merely useless when
+      # tarpaulin wrote nothing, it is wrong. Read on the green run at
+      # c99d9065a: `not_found_files: ["cobertura.xml"]`, and then the action
+      # walked the tree, decided eleven paths whose names happen to contain
+      # "coverage" were coverage files, and uploaded those. Two were fingerprint
+      # JSON out of target/debug and three were Rust sources. The setting
+      # confines this step to the file it was pointed at.
       - name: Upload coverage reports to Codecov
+        continue-on-error: true
         uses: codecov/codecov-action@v7
         with:
           files: cobertura.xml
+          disable_search: true
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: firelock-ai/kin
           fail_ci_if_error: false
