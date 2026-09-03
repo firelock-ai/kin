@@ -24,6 +24,9 @@ use kin_model::{Entity, EntityId, SemanticFingerprint};
 #[derive(Debug, Clone)]
 pub struct LkgEntry {
     pub fingerprint: SemanticFingerprint,
+    // FALSIFICATION ARM, not for landing: today's shape under a new name, so
+    // the guard has to catch an entry that reaches the entity it recorded.
+    pub entity: Entity,
 }
 
 /// Tracks LKG state for all entities. The reconciler consults this when
@@ -49,6 +52,7 @@ impl LkgStore {
             entity.id,
             LkgEntry {
                 fingerprint: entity.fingerprint.clone(),
+                entity: entity.clone(),
             },
         );
     }
