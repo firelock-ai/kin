@@ -16,6 +16,7 @@ pub mod provenance;
 pub(crate) mod repository_authority;
 pub mod review;
 pub mod sessions;
+pub mod tool_search;
 pub mod verification;
 pub mod work;
 
@@ -50,6 +51,10 @@ pub async fn handle_tool_call<G: GraphStore>(
         "kin_artifact_read" => {
             artifacts::handle_artifact_read(arguments, store, repository_authority)
         }
+        // The registry itself. Answered from the tool definitions compiled into
+        // this binary rather than from the store, because what it returns has to
+        // be what THIS server would serve; see `handlers::tool_search`.
+        tool_search::TOOL_NAME => tool_search::handle_tool_search(arguments),
         // Entities
         "semantic_search" => entities::handle_semantic_search(arguments, store),
         "semantic_locate" => entities::handle_semantic_locate(arguments, store),

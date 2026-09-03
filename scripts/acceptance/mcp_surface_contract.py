@@ -106,6 +106,45 @@ AGENT_QUERY_NAMES = (
 # on it too.
 AGENT_QUERY_LIST_CEILING_PERCENT = 65
 
+# The tool-search profile and the exact always-on set it serves, read out of
+# crates/kin-mcp/src/tools.rs::agent_search_tool_names on 2026-09-03. Written
+# out for the same reason AGENT_QUERY_NAMES is: a check that derived the set
+# from the binary under test would agree with any surface that binary served.
+AGENT_SEARCH_PROFILE = "agent-search"
+AGENT_SEARCH_NAMES = (
+    "get_context_pack",
+    "kin_graph_status",
+    "kin_tool_search",
+    "semantic_locate",
+    "trace_data_flow",
+)
+
+# The name of the tool that reaches everything the profile withholds.
+TOOL_SEARCH_NAME = "kin_tool_search"
+
+# Four tools the 2026-09-03 measurement moved behind the search: impact_analysis
+# was offered 24 times and called none, get_entity_source 24 and once,
+# find_references five calls of which four came from the one arm with no flow
+# walker, and no arm reached for a transaction tool at all. Named here so the
+# exact-set assertion above has a second, independently written control.
+WITHHELD_BY_DESIGN = (
+    "impact_analysis",
+    "find_references",
+    "get_entity_source",
+    "kin_transaction_commit",
+)
+
+# The most bytes agent-search's tools/list may cost, measured on the profile AS
+# SERVED. Mirrors kin_mcp::tools::AGENT_SEARCH_LIST_CEILING_BYTES, which holds
+# the same ceiling as a crate test; this one holds it on the wire, where a
+# spawned server resolves the profile and writes the listing a client reads.
+#
+# Grounded in a measurement. The three retrieval tools measured 4,928 bytes on
+# kin-mcp 0.6.4, so this leaves the search tool's schema, kin_graph_status and
+# normal prose growth inside a ceiling that is still a third of agent-query's
+# 15,345 bytes.
+AGENT_SEARCH_LIST_CEILING_BYTES = 8_000
+
 # The tool names the two shipped proofs assert literally. Read out of
 # .github/workflows/install-proof.yml and scripts/prove-windows-npm-first-run.mjs
 # on 2026-09-02; both assert this one name and no other. Adding a name to either
@@ -284,6 +323,151 @@ def grade_search_call(payload):
     if missing:
         return ["semantic_search did not return the seeded entity: %s absent" % ", ".join(missing)]
     return []
+
+
+def search_payload(frame):
+    """The JSON one `kin_tool_search` call returned, or None when it did not.
+
+    None is never a pass here: every grader that reads a lookup reports the
+    unreadable one by name, because a search that answered nothing and a search
+    that answered wrongly are the same failure to an agent.
+    """
+    if frame is None or frame.get("error"):
+        return None
+    result = frame.get("result")
+    if not isinstance(result, dict) or result.get("isError") is True:
+        return None
+    for block in result.get("content") or []:
+        text = block.get("text") if isinstance(block, dict) else None
+        if not isinstance(text, str):
+            continue
+        try:
+            return json.loads(text)
+        except ValueError:
+            return None
+    return None
+
+
+def canonical(value):
+    """One serialization for both sides of a byte-for-byte comparison.
+
+    The wire pretty-prints a tool-call payload and writes tools/list compact, so
+    a raw byte compare would report a formatting difference as a schema change.
+    Both sides are re-serialized the same way here, which is the claim that
+    matters: the schema search returns IS the schema `full` serves.
+    """
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def grade_search_profile(search):
+    """Assertion 1: the always-on set is static, so grade it exactly."""
+    tools = search.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return ["the agent-search profile listed no tools"]
+    served = sorted(name for name in (tool.get("name") for tool in tools) if name)
+    problems = []
+    if served != sorted(AGENT_SEARCH_NAMES):
+        problems.append(
+            "agent-search serves %s, not the always-on set this suite grades (%s)"
+            % (served, sorted(AGENT_SEARCH_NAMES))
+        )
+    if TOOL_SEARCH_NAME not in served:
+        problems.append(
+            "agent-search serves no %s, so every withheld tool is unreachable from it"
+            % TOOL_SEARCH_NAME
+        )
+    search_bytes = listing_bytes(search)
+    if search_bytes > AGENT_SEARCH_LIST_CEILING_BYTES:
+        problems.append(
+            "agent-search's tools/list is %d bytes, over the %d-byte ceiling"
+            % (search_bytes, AGENT_SEARCH_LIST_CEILING_BYTES)
+        )
+    # A second, independently written statement of the same intent. The equality
+    # above is one line, and a future edit that "fixes" a failure by rewriting
+    # AGENT_SEARCH_NAMES to whatever is served would pass it. These four are the
+    # tools the measurement moved behind the search; they are reachable through
+    # it and must not be served beside it.
+    still_served = [name for name in WITHHELD_BY_DESIGN if name in served]
+    if still_served:
+        problems.append(
+            "agent-search serves %s, which the measurement moved behind the search"
+            % still_served
+        )
+    return problems
+
+
+def grade_tool_reachability(registry, lookups):
+    """Assertion 2: every tool in the registry is findable through the search.
+
+    The new silent failure this surface makes possible. A tool that no profile
+    serves and no search finds is gone from the product with no line of code
+    saying so, and nothing else in this suite would catch it.
+    """
+    registered = sorted(
+        name for name in (tool.get("name") for tool in registry.get("tools") or []) if name
+    )
+    if not registered:
+        return ["the full profile listed no tools, so nothing graded reachability"]
+    problems = []
+    for name in registered:
+        payload = lookups.get(name)
+        if payload is None:
+            problems.append(
+                "%s: the served search returned no readable answer for its own name" % name
+            )
+            continue
+        named = payload.get("matched_names")
+        if not isinstance(named, list) or name not in named:
+            problems.append(
+                "%s is registered and the served search does not find it, so it is unreachable"
+                % name
+            )
+    return problems
+
+
+def grade_schema_fidelity(registry, lookups):
+    """Assertion 3: the schema search returns equals the one `full` serves.
+
+    This closes the drift reachability would otherwise hide. A search that
+    returned a summary, a trimmed schema, or a belt short form would satisfy
+    reachability while handing an agent a definition it cannot call from.
+    """
+    served = {
+        tool.get("name"): tool
+        for tool in registry.get("tools") or []
+        if isinstance(tool, dict) and tool.get("name")
+    }
+    if not served:
+        return ["the full profile listed no tools, so there was no schema to compare against"]
+    problems = []
+    for name, definition in sorted(served.items()):
+        payload = lookups.get(name)
+        if payload is None:
+            problems.append("%s: the served search returned no readable answer" % name)
+            continue
+        matches = payload.get("matches")
+        found = None
+        if isinstance(matches, list):
+            found = next(
+                (
+                    match
+                    for match in matches
+                    if isinstance(match, dict) and match.get("name") == name
+                ),
+                None,
+            )
+        if found is None:
+            problems.append(
+                "%s was named by the search but its full definition was not returned, so a "
+                "found tool is not callable" % name
+            )
+            continue
+        if canonical(found) != canonical(definition):
+            problems.append(
+                "%s: the schema the search returns is not the schema the full profile serves"
+                % name
+            )
+    return problems
 
 
 def grade_trace_shape_knob(listing):
@@ -603,6 +787,30 @@ def run_checks(suite, verbose=False):
     )
 
     try:
+        registry, _, _ = suite.serve("full", [])
+    except McpError as error:
+        registry = None
+        for ident, source, title in [entry for entry in CHECK_TITLES if entry[0] in ("5", "6")]:
+            res = Result(ident, source, title)
+            res.unknown("the full profile was unreadable, so the registry is unknown: %s" % error)
+            results.append(res)
+
+    if registry is not None:
+        record(
+            "5", "response_budget:2", "every advertised budget is one a client accepts",
+            grade_advertised_budgets(served, registry),
+            "the served budgets sit under what a real client accepts, and every tool "
+            "that registers one advertises one",
+        )
+        record(
+            "6", "the general form",
+            "no name is served that the registry does not carry",
+            grade_served_names_are_registered(served, registry),
+            "every served name is a registered name across %d served and %d registered tools"
+            % (len(served.get("tools") or []), len(registry.get("tools") or [])),
+        )
+
+    try:
         query, _, query_stderr = suite.serve(AGENT_QUERY_PROFILE, [])
     except McpError as error:
         query, query_stderr, query_error = None, "", error
@@ -630,29 +838,68 @@ def run_checks(suite, verbose=False):
                 "unknown" % AGENT_QUERY_PROFILE
             )
 
+    # The tool-search surface. One server, one tools/list and one tools/call per
+    # registered tool, because reachability and fidelity are claims about EVERY
+    # tool and a sample would pass while one fell out of the index. The calls
+    # read no graph, so they cost a frame each.
+    registered_names = sorted(
+        name for name in (tool.get("name") for tool in (registry or {}).get("tools") or []) if name
+    )
+    search_ids = ("8", "9", "10")
     try:
-        registry, _, _ = suite.serve("full", [])
+        search, lookup_frames, search_stderr = suite.serve(
+            AGENT_SEARCH_PROFILE,
+            [(TOOL_SEARCH_NAME, {"need": name}) for name in registered_names],
+        )
     except McpError as error:
-        registry = None
-        for ident, source, title in [entry for entry in CHECK_TITLES if entry[0] in ("5", "6")]:
+        search, search_stderr, lookup_frames = None, "", []
+        for ident, source, title in [e for e in CHECK_TITLES if e[0] in search_ids]:
             res = Result(ident, source, title)
-            res.unknown("the full profile was unreadable, so the registry is unknown: %s" % error)
+            res.unknown("the agent-search profile was unreadable: %s" % error)
             results.append(res)
 
-    if registry is not None:
+    if search is not None:
         record(
-            "5", "response_budget:2", "every advertised budget is one a client accepts",
-            grade_advertised_budgets(served, registry),
-            "the served budgets sit under what a real client accepts, and every tool "
-            "that registers one advertises one",
+            "8", "FIR-3112", "the always-on profile serves its exact set under its byte ceiling",
+            grade_search_profile(search),
+            "agent-search served %d tools in %d bytes, under the %d-byte ceiling"
+            % (
+                len(search.get("tools") or []),
+                listing_bytes(search),
+                AGENT_SEARCH_LIST_CEILING_BYTES,
+            ),
         )
-        record(
-            "6", "the general form",
-            "no name is served that the registry does not carry",
-            grade_served_names_are_registered(served, registry),
-            "every served name is a registered name across %d served and %d registered tools"
-            % (len(served.get("tools") or []), len(registry.get("tools") or [])),
-        )
+        if AGENT_SEARCH_PROFILE not in (search_stderr or ""):
+            results[-1].unknown(
+                "the server printed no notice naming %r, so which surface was measured is "
+                "unknown" % AGENT_SEARCH_PROFILE
+            )
+
+        lookups = {
+            name: search_payload(frame)
+            for name, frame in zip(registered_names, lookup_frames)
+        }
+        if registry is None or not registered_names:
+            for ident, source, title in [e for e in CHECK_TITLES if e[0] in ("9", "10")]:
+                res = Result(ident, source, title)
+                res.unknown(
+                    "the registry was unreadable, so reachability and fidelity graded nothing"
+                )
+                results.append(res)
+        else:
+            record(
+                "9", "FIR-3112", "every registered tool is findable through the served search",
+                grade_tool_reachability(registry, lookups),
+                "all %d registered tools came back from the served search by name"
+                % len(registered_names),
+            )
+            record(
+                "10", "FIR-3112",
+                "the schema the search returns is the schema the full profile serves",
+                grade_schema_fidelity(registry, lookups),
+                "all %d schemas matched the full profile's byte for byte"
+                % len(registered_names),
+            )
 
     if verbose:
         for res in results:
@@ -671,6 +918,9 @@ CHECK_TITLES = [
     ("5", "response_budget:2", "every advertised budget is one a client accepts"),
     ("6", "the general form", "no name is served that the registry does not carry"),
     ("7", "FIR-3107", "the query profile serves its exact set and costs far fewer bytes"),
+    ("8", "FIR-3112", "the always-on profile serves its exact set under its byte ceiling"),
+    ("9", "FIR-3112", "every registered tool is findable through the served search"),
+    ("10", "FIR-3112", "the schema the search returns is the schema the full profile serves"),
 ]
 
 
@@ -782,7 +1032,7 @@ def self_test():
 
     # And one break per grader.
     expect("control on the full profile",
-           grade_profile_notice("Kin MCP: serving the 'full' tool profile (66 tools) from --tool-profile."),
+           grade_profile_notice("Kin MCP: serving the 'full' tool profile (67 tools) from --tool-profile."),
            True)
     expect("control on no notice at all", grade_profile_notice(""), True)
 
@@ -832,6 +1082,123 @@ def self_test():
     expect("query profile when it saves nothing",
            grade_query_profile(profile_listing(AGENT_QUERY_NAMES, padding=400), default_listing),
            True)
+
+    # ── the tool-search surface ─────────────────────────────────────────────
+    #
+    # A registry of three, a served profile, and the lookups a correct search
+    # would return for each name. Small enough to read, and every break below is
+    # a thing this design can actually do.
+    def definition(name, prop="query"):
+        return {
+            "name": name,
+            "description": "What %s does." % name,
+            "annotations": {"title": name, "readOnlyHint": True},
+            "inputSchema": {"type": "object", "properties": {prop: {"type": "string"}}},
+        }
+
+    search_registry = {
+        "tools": [
+            definition("semantic_locate"),
+            definition("trace_data_flow", "focal"),
+            definition("impact_analysis", "entity_ids"),
+        ]
+    }
+
+    def lookup(name, matches=None, named=None):
+        """The payload a correct search returns when asked for one name."""
+        found = (
+            [tool for tool in search_registry["tools"] if tool["name"] == name]
+            if matches is None
+            else matches
+        )
+        return {
+            "need": name,
+            "matches": found,
+            "matched_names": [name] if named is None else named,
+            "matches_withheld": 0,
+            "registry": {"tools": len(search_registry["tools"])},
+        }
+
+    good_lookups = {tool["name"]: lookup(tool["name"]) for tool in search_registry["tools"]}
+    good_search = profile_listing(AGENT_SEARCH_NAMES)
+
+    expect("search profile on a good listing", grade_search_profile(good_search), False)
+    expect("reachability on good lookups",
+           grade_tool_reachability(search_registry, good_lookups), False)
+    expect("fidelity on good lookups",
+           grade_schema_fidelity(search_registry, good_lookups), False)
+    if search_payload(
+        {"result": {"content": [{"type": "text", "text": "{\"a\": 1}"}]}}
+    ) != {"a": 1}:
+        problems.append("payload reader did not read a well-formed tool result")
+
+    # The always-on set moved.
+    grown = profile_listing(list(AGENT_SEARCH_NAMES) + ["impact_analysis"])
+    expect("search profile when a withheld tool joined it",
+           grade_search_profile(grown), True)
+    shrunk = profile_listing([n for n in AGENT_SEARCH_NAMES if n != TOOL_SEARCH_NAME])
+    expect("search profile when the search tool itself went missing",
+           grade_search_profile(shrunk), True)
+    renamed_search = profile_listing(AGENT_SEARCH_NAMES)
+    renamed_search["tools"][0]["name"] = "context_pack"
+    expect("search profile when a served name moved",
+           grade_search_profile(renamed_search), True)
+    # The ceiling, which is the whole point of the profile.
+    expect("search profile when the listing outgrew its ceiling",
+           grade_search_profile(profile_listing(AGENT_SEARCH_NAMES, padding=3_000)), True)
+    expect("search profile on an empty listing", grade_search_profile({"tools": []}), True)
+
+    # A tool the search stopped finding: the new silent failure.
+    lost = dict(good_lookups)
+    lost["impact_analysis"] = lookup("impact_analysis", matches=[], named=[])
+    expect("reachability when a tool falls out of the index",
+           grade_tool_reachability(search_registry, lost), True)
+    unanswered = dict(good_lookups)
+    unanswered["impact_analysis"] = None
+    expect("reachability when the search did not answer",
+           grade_tool_reachability(search_registry, unanswered), True)
+    expect("reachability when a tool was never looked up",
+           grade_tool_reachability(search_registry, {}), True)
+    expect("reachability on an empty registry",
+           grade_tool_reachability({"tools": []}, good_lookups), True)
+
+    # A schema that drifted from what `full` serves, which reachability alone
+    # would pass: the tool is found, and the definition cannot be called from.
+    drifted = dict(good_lookups)
+    trimmed = json.loads(json.dumps(definition("impact_analysis", "entity_ids")))
+    trimmed["inputSchema"]["properties"] = {}
+    drifted["impact_analysis"] = lookup("impact_analysis", matches=[trimmed], named=["impact_analysis"])
+    expect("fidelity when the returned schema was trimmed",
+           grade_schema_fidelity(search_registry, drifted), True)
+    summarized = dict(good_lookups)
+    short = json.loads(json.dumps(definition("impact_analysis", "entity_ids")))
+    short["description"] = "Impact."
+    summarized["impact_analysis"] = lookup(
+        "impact_analysis", matches=[short], named=["impact_analysis"]
+    )
+    expect("fidelity when the search returned a short form",
+           grade_schema_fidelity(search_registry, summarized), True)
+    named_only = dict(good_lookups)
+    named_only["impact_analysis"] = lookup(
+        "impact_analysis", matches=[], named=["impact_analysis"]
+    )
+    expect("fidelity when a match was named but not returned",
+           grade_schema_fidelity(search_registry, named_only), True)
+    expect("fidelity when the search did not answer",
+           grade_schema_fidelity(search_registry, unanswered), True)
+    expect("fidelity on an empty registry",
+           grade_schema_fidelity({"tools": []}, good_lookups), True)
+
+    # The reader itself: an error frame, an isError result and a body that is
+    # not JSON must all read as "no answer" rather than as an empty one.
+    for label, frame in (
+        ("an RPC error", {"error": {"code": -32602}}),
+        ("an isError result", {"result": {"isError": True, "content": []}}),
+        ("a body that is not JSON", {"result": {"content": [{"type": "text", "text": "nope"}]}}),
+        ("no frame at all", None),
+    ):
+        if search_payload(frame) is not None:
+            problems.append("payload reader read %s as an answer" % label)
 
     # An empty listing must never read as a clean surface.
     expect("names on an empty listing", grade_proof_asserted_names({"tools": []}), True)

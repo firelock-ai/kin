@@ -2586,6 +2586,17 @@ fn evaluate_mcp_client_against(
                         path.display()
                     ),
                 ),
+                // Same reasoning one step further: an operator who narrowed the
+                // entry to the measured always-on set chose a supported surface,
+                // and every other tool is still reachable from it through
+                // `kin_tool_search`.
+                Some("agent-search") => (
+                    HealthStatus::Healthy,
+                    format!(
+                        "{servers_key}.kin present with the always-on agent-search profile ({})",
+                        path.display()
+                    ),
+                ),
                 // An entry that names no profile is served the curated
                 // agent-default surface by `kin mcp start` itself, so it is
                 // correctly wired even though `kin setup` would have stated it.
@@ -2602,7 +2613,7 @@ fn evaluate_mcp_client_against(
                 Some(other) => (
                     HealthStatus::Misconfigured,
                     format!(
-                        "{servers_key}.kin present but KIN_MCP_TOOL_PROFILE is {other} (expected agent-default, agent-query, or unset to take agent-default as the default) in {}",
+                        "{servers_key}.kin present but KIN_MCP_TOOL_PROFILE is {other} (expected agent-default, agent-query, agent-search, or unset to take agent-default as the default) in {}",
                         path.display()
                     ),
                 ),
