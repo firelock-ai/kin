@@ -38,6 +38,17 @@ pub enum ProjectionError {
     #[error("placement ambiguity: entity {0} has multiple valid placements")]
     PlacementAmbiguity(String),
 
+    #[error(
+        "entity {entity} names file_origin {file_id}, which is not addressable \
+         as a repository path, so the graph cannot answer whether the \
+         repository already holds it: {reason}"
+    )]
+    PlacementOriginUnaddressable {
+        entity: String,
+        file_id: String,
+        reason: String,
+    },
+
     #[error("blob error: {0}")]
     Blob(#[from] kin_blobs::BlobError),
 
