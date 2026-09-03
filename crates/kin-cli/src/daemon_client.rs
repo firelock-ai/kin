@@ -5585,11 +5585,89 @@ fn startup_lock_is_stale(path: &Path, stale_after: Duration) -> bool {
         .unwrap_or(false)
 }
 
+/// The process identifier a startup lock names, when its holder wrote one.
+///
+/// The writer's line is `pid=<n> acquired_at=<instant>`. `None` means the file
+/// says nothing readable about an owner, which is not the same as saying nobody
+/// owns it, and every caller here reads it that way.
+fn startup_lock_holder(path: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.split_whitespace()
+        .find_map(|field| field.strip_prefix("pid="))?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// Free a startup lock whose recorded holder is provably gone, and say whether
+/// it did.
+///
+/// `daemon.start.lock` is a create-new sentinel rather than an advisory lock, so
+/// unlike the supervisor's file lock it outlives the process that took it. A kin
+/// command killed while it starts a daemon leaves the file behind, which is
+/// what a caller that caps a question and kills the process group does, and
+/// until this, the only recovery was the mtime rule below, which needs twice the
+/// startup timeout. Every command in that repository meanwhile waits the whole
+/// timeout for a holder that cannot finish, and on a store whose daemon is not
+/// already serving, that wait is the entire answer the caller gets.
+///
+/// Conservative by construction: only an affirmative death frees the lock. An
+/// unreadable file, an unparseable pid and an indeterminate probe all keep the
+/// wait, because taking a lock a live starter holds would let two spawns race
+/// for one repository. The pid is re-read immediately before the unlink so a
+/// holder that took the lock since the decision is not unlinked under it.
+fn clear_abandoned_startup_lock(path: &Path) -> bool {
+    let Some(holder) = startup_lock_holder(path) else {
+        return false;
+    };
+    if holder == std::process::id() || process_liveness(holder) != ProcessLiveness::Dead {
+        return false;
+    }
+    if startup_lock_holder(path) != Some(holder) {
+        return false;
+    }
+    debug!(
+        path = %path.display(),
+        holder,
+        "cleared a startup lock whose holder process is gone"
+    );
+    std::fs::remove_file(path).is_ok()
+}
+
+/// The line a caller prints while another kin command holds the startup lock.
+///
+/// Named rather than generic: a reader who waits needs to know that the wait is
+/// on another command in this repository and which one, because that is the
+/// difference between a hang to report and a queue to sit in.
+fn startup_lock_wait_line(holder: Option<u32>, waited: Duration) -> String {
+    let waited = waited.as_secs_f64();
+    match holder {
+        Some(pid) => format!(
+            "waiting for another kin command (pid {pid}) to finish starting this repository's \
+             daemon ({waited:.1}s)"
+        ),
+        None => format!(
+            "waiting for another kin command to finish starting this repository's daemon \
+             ({waited:.1}s)"
+        ),
+    }
+}
+
+/// How long a caller waits on a held startup lock before it says so.
+///
+/// A handoff between two commands is routine and usually over in well under a
+/// second, so announcing every one of them would be noise. Past this, the wait
+/// is long enough that a caller with a budget needs to know what it is in.
+const STARTUP_LOCK_NOTICE_AFTER: Duration = Duration::from_secs(1);
+
 async fn acquire_startup_lock(kin_root: &Path) -> Result<StartupLock> {
     let path = kin_root.join("daemon.start.lock");
     let timeout = Duration::from_secs(startup_lock_timeout_secs());
     let stale_after = timeout.saturating_mul(2).max(Duration::from_secs(10));
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut notice: Option<crate::progress::Progress> = None;
+    let mut announced_at: Option<Instant> = None;
 
     loop {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
@@ -5600,9 +5678,19 @@ async fn acquire_startup_lock(kin_root: &Path) -> Result<StartupLock> {
                     std::process::id(),
                     std::time::SystemTime::now()
                 );
+                if let Some(notice) = notice.as_ref() {
+                    notice.finish_with(format_args!(
+                        "the other kin command finished after {:.1}s; starting this repository's \
+                         daemon now",
+                        started.elapsed().as_secs_f64()
+                    ));
+                }
                 return Ok(StartupLock { path, _file: file });
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if clear_abandoned_startup_lock(&path) {
+                    continue;
+                }
                 if startup_lock_is_stale(&path, stale_after) {
                     debug!(
                         path = %path.display(),
@@ -5612,6 +5700,9 @@ async fn acquire_startup_lock(kin_root: &Path) -> Result<StartupLock> {
                     continue;
                 }
                 if Instant::now() >= deadline {
+                    if let Some(notice) = notice.as_ref() {
+                        notice.finish();
+                    }
                     bail!(
                         "timed out waiting for daemon startup lock at {} after {}s: another kin \
                          command in this repository still holds it. Wait for it to finish, or \
@@ -5620,6 +5711,18 @@ async fn acquire_startup_lock(kin_root: &Path) -> Result<StartupLock> {
                         path.display(),
                         timeout.as_secs()
                     );
+                }
+                let waited = started.elapsed();
+                if waited >= STARTUP_LOCK_NOTICE_AFTER
+                    && announced_at.is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+                {
+                    notice
+                        .get_or_insert_with(crate::progress::Progress::stderr)
+                        .update(format_args!(
+                            "{}",
+                            startup_lock_wait_line(startup_lock_holder(&path), waited)
+                        ));
+                    announced_at = Some(Instant::now());
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -12166,6 +12269,104 @@ mod tests {
 
         assert!(startup_lock_is_stale(&lock, Duration::ZERO));
         assert!(!startup_lock_is_stale(&lock, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn startup_lock_holder_reads_the_pid_its_own_writer_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("daemon.start.lock");
+        // Exactly what `acquire_startup_lock` writes.
+        std::fs::write(
+            &lock,
+            format!(
+                "pid={} acquired_at={:?}\n",
+                4321,
+                std::time::SystemTime::now()
+            ),
+        )
+        .unwrap();
+        assert_eq!(startup_lock_holder(&lock), Some(4321));
+
+        // A file that says nothing readable about an owner says exactly that,
+        // and the caller must not read it as "nobody holds this".
+        std::fs::write(&lock, "written by something else\n").unwrap();
+        assert_eq!(startup_lock_holder(&lock), None);
+        std::fs::write(&lock, "pid=not-a-number\n").unwrap();
+        assert_eq!(startup_lock_holder(&lock), None);
+        assert_eq!(startup_lock_holder(&dir.path().join("absent")), None);
+    }
+
+    /// A startup lock outlives its holder, so the holder's liveness is what
+    /// decides whether the next command may take it. Both directions are here:
+    /// clearing every lock races two spawns for one repository, clearing none
+    /// strands the next question behind a process that has already exited.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_startup_lock_whose_holder_is_gone_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("daemon.start.lock");
+
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a live stand-in for a command still starting a daemon");
+        std::fs::write(&lock, format!("pid={} acquired_at=now\n", live.id())).unwrap();
+        assert!(
+            !clear_abandoned_startup_lock(&lock),
+            "a lock a live process holds must survive"
+        );
+        assert!(lock.exists(), "and must still be on disk");
+        let _ = live.kill();
+        let _ = live.wait();
+
+        std::fs::write(
+            &lock,
+            format!("pid={} acquired_at=now\n", std::process::id()),
+        )
+        .unwrap();
+        assert!(
+            !clear_abandoned_startup_lock(&lock),
+            "our own pid is alive by definition"
+        );
+
+        let mut gone = std::process::Command::new("sleep")
+            .arg("0")
+            .spawn()
+            .expect("spawn a stand-in for a command that died mid-start");
+        let dead = gone.id();
+        gone.wait().expect("reap the stand-in");
+        std::fs::write(&lock, format!("pid={dead} acquired_at=now\n")).unwrap();
+        assert!(
+            clear_abandoned_startup_lock(&lock),
+            "a lock whose holder has exited is free"
+        );
+        assert!(
+            !lock.exists(),
+            "and is unlinked so the next command can take it"
+        );
+
+        // Nothing to clear is not the same as clearing something.
+        assert!(!clear_abandoned_startup_lock(&lock));
+    }
+
+    #[test]
+    fn the_startup_lock_wait_line_names_what_the_wait_is_on() {
+        let line = startup_lock_wait_line(Some(4321), Duration::from_millis(2500));
+        assert!(
+            line.contains("waiting for another kin command (pid 4321)"),
+            "the line names the holder: {line}"
+        );
+        assert!(
+            line.contains("starting this repository's daemon"),
+            "and what it is doing: {line}"
+        );
+        assert!(line.contains("(2.5s)"), "and how long this has run: {line}");
+
+        let anonymous = startup_lock_wait_line(None, Duration::from_secs(1));
+        assert!(
+            anonymous.contains("waiting for another kin command to finish starting"),
+            "a lock with no readable holder still says what the wait is: {anonymous}"
+        );
     }
 
     // ── startup deadline is patience, not a death sentence ─────────────────
