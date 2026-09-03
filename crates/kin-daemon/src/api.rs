@@ -16681,12 +16681,15 @@ async fn publication_control_admit_reader(
 /// Name the image identity that may admit itself at its next startup.
 ///
 /// This is the one route on this surface that does not act on the daemon
-/// serving it. The promotion calls it against the healthy outgoing daemon
-/// before the new image is applied, so nothing ever has to reach an unready or
-/// restarting pod, and the successor admits itself at its own startup under the
-/// authorization written here. The daemon still admits only itself: admit-reader
-/// refuses any reader but the one running, which is why the promotion writes an
-/// authorization rather than the reader.
+/// serving it, and the one that takes no lease proof. The promotion calls it
+/// against the healthy outgoing daemon before the new image is applied, so
+/// nothing ever has to reach an unready or restarting pod, and it holds nothing
+/// while doing so, so the running daemon's readiness is untouched. The daemon
+/// still admits only itself: admit-reader refuses any reader but the one
+/// running, which is why the promotion writes an authorization rather than the
+/// reader. The administrator token is the whole authorization to write here,
+/// which is why this route must stay under the publication-control prefix that
+/// demands it.
 async fn publication_control_authorize_next_reader(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<crate::publication_lease::AuthorizeNextReaderRequest>,
@@ -32091,37 +32094,6 @@ mod tests {
              reader: {admitted}"
         );
 
-        // The rest of the promotion's own sequence: name the successor under
-        // the lease it already holds, then release. A promotion that held its
-        // lease until the successor started would close production readiness
-        // for the whole apply, so the authorization has to be on the record
-        // rather than on the lease.
-        let (status, authorized) = publication_post(
-            app.clone(),
-            "/authority/publication-control/rollout/authorize-next-reader",
-            serde_json::json!({
-                "scope": scope,
-                "token": token,
-                "fence": fence,
-                "identity": READER_B
-            }),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "the promotion must be able to name its successor: {authorized}"
-        );
-        assert_eq!(
-            authorized["next_reader_identity"].as_str(),
-            Some(READER_B),
-            "{authorized}"
-        );
-        assert!(
-            !authorized.to_string().contains("\"token\""),
-            "authorizing must not disclose live lease capability: {authorized}"
-        );
-
         let (status, released) = publication_post(
             app.clone(),
             "/authority/publication-control/rollout/release",
@@ -32130,8 +32102,58 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "release must succeed: {released}");
 
-        // The successor starts long after this lease is gone, so the record and
-        // not the lease is what has to still carry the authorization.
+        // The point of the whole sequence: a reader is admitted afterwards and
+        // semantic readiness is open. Asserting only the three 200s would pass
+        // on routes that returned 200 and changed nothing.
+        let readiness = app
+            .clone()
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            readiness.status(),
+            StatusCode::OK,
+            "the daemon must be reader-ready once the rollout has released"
+        );
+
+        // The promotion's own call, in the state production is actually in when
+        // it runs: settled, ready, no lease anywhere. It presents no proof
+        // because there is none to present.
+        let (status, authorized) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/authorize-next-reader",
+            serde_json::json!({ "scope": scope, "identity": READER_B }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the promotion must name its successor with no lease at all: {authorized}"
+        );
+        assert_eq!(
+            authorized["next_reader_identity"].as_str(),
+            Some(READER_B),
+            "{authorized}"
+        );
+        assert!(
+            authorized["active_lease"].is_null(),
+            "naming the successor must take no lease: {authorized}"
+        );
+
+        // And it costs the running daemon nothing. This is the property that
+        // paid for dropping the lease: readiness is open on the same daemon
+        // immediately after the call, so a promotion opens no gap at all.
+        let readiness = app
+            .clone()
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            readiness.status(),
+            StatusCode::OK,
+            "naming a successor must not close the running daemon's readiness"
+        );
+
         let control_status = app
             .clone()
             .oneshot(
@@ -32146,26 +32168,76 @@ mod tests {
         let status_body = axum::body::to_bytes(control_status.into_body(), 256 * 1024)
             .await
             .unwrap();
+        let status_text = String::from_utf8(status_body.to_vec()).unwrap();
         let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
-        assert!(status_json["active_lease"].is_null());
         assert_eq!(
             status_json["next_reader_identity"].as_str(),
             Some(READER_B),
-            "releasing the lease must not drop the authorization: {status_json}"
+            "the successor starts long after this call, so the record has to carry it: {status_json}"
         );
+        assert!(
+            !status_text.contains("\"token\""),
+            "read-only publication status must not disclose live lease capability: {status_text}"
+        );
+    }
 
-        // The point of the whole sequence: a reader is admitted afterwards and
-        // semantic readiness is open. Asserting only the three 200s would pass
-        // on routes that returned 200 and changed nothing.
-        let readiness = app
-            .clone()
-            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+    /// The route sits on the administrator surface, not the daemon one. It is
+    /// the only publication-control route a caller reaches while holding no
+    /// lease, so nothing else stands between an ordinary daemon credential and
+    /// a write that decides which image opens readiness on the whole fleet.
+    #[tokio::test]
+    async fn authorizing_the_next_reader_demands_the_administrator_token() {
+        const READER_B: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let app = router_with_publication_control_auth(
+            test_state(),
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        );
+        let authorize = |app: Router, token: Option<&'static str>| async move {
+            let mut request = Request::post(
+                "/authority/publication-control/rollout/authorize-next-reader",
+            )
+            .header("content-type", "application/json");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            app.oneshot(
+                request
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "scope": "gcs://fixture/v2",
+                            "identity": READER_B
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .status()
+        };
+
+        // An ordinary daemon token is authenticated and unauthorized here, so
+        // 403 rather than 401: telling a caller holding a live credential that
+        // it holds none sends it to rotate a working token.
         assert_eq!(
-            readiness.status(),
-            StatusCode::OK,
-            "the daemon must be reader-ready once the rollout has released"
+            authorize(app.clone(), Some("daemon-test-token")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            authorize(app.clone(), Some("not-a-token")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(authorize(app.clone(), None).await, StatusCode::UNAUTHORIZED);
+
+        // The control the refusals need: the administrator token passes the
+        // guard. Without it every assertion above would also hold on a route
+        // that refuses everyone, including the caller it exists for.
+        let admin = authorize(app, Some("publication-test-token")).await;
+        assert!(
+            admin != StatusCode::UNAUTHORIZED && admin != StatusCode::FORBIDDEN,
+            "the administrator token must pass the auth guard, got {admin}"
         );
     }
 
