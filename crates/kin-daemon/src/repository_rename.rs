@@ -826,7 +826,11 @@ mod tests {
     use super::*;
     use std::sync::{Arc, OnceLock};
 
-    use kin_model::{AuthorId, RelationDelta, RelationId, RelationKind, Timestamp};
+    use kin_model::work::{
+        Annotation, AnnotationId, AnnotationKind, IdentityRef, SemanticAnchor, StalenessState,
+        WorkScope,
+    };
+    use kin_model::{AuthorId, RelationDelta, RelationId, RelationKind, Timestamp, WorkStore};
 
     fn install_test_registry_override() {
         static REGISTRY_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
@@ -1300,5 +1304,111 @@ mod tests {
         assert_eq!(roots_after, roots_before);
         assert_eq!(fixture.state.graph.compute_root_hash(), graph_root_before);
         assert_eq!(fixture.state.graph.resolved_tree(), tree_before);
+    }
+
+    /// `kin-model/src/work.rs` promises that annotations are anchored to entity
+    /// identities rather than line numbers, "so they are designed to stay
+    /// attached across renames and moves". Nothing tested that end to end.
+    ///
+    /// The promise only holds because `retain_target_identity` overwrites the
+    /// reparsed entity's id with the pre-rename one. `EntityId::from_content`
+    /// keys a UUIDv5 on file path, kind, name and start line, so the parser
+    /// mints a different id for the renamed declaration and an annotation
+    /// scoped to the old id would have nothing to resolve against. Asserting
+    /// the id equals itself would prove none of that, so this drives the real
+    /// rename and asks the graph what is still attached afterwards.
+    #[test]
+    fn rename_keeps_an_annotation_attached_to_the_renamed_entity() {
+        let fixture = exact_rename_fixture();
+        let before = fixture
+            .state
+            .graph
+            .get_entity(&fixture.target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.name, "target");
+
+        let annotation = Annotation {
+            annotation_id: AnnotationId::new(),
+            kind: AnnotationKind::Reasoning,
+            body: "target returns 7 because the caller doubles it".to_string(),
+            scopes: vec![WorkScope::Entity(fixture.target_id)],
+            anchored_fingerprint: Some(SemanticAnchor {
+                ast_hash: before.fingerprint.ast_hash,
+                signature_hash: before.fingerprint.signature_hash,
+            }),
+            authored_by: IdentityRef::assistant("rename-annotation-test"),
+            created_at: Timestamp::now(),
+            staleness: StalenessState::Fresh,
+        };
+        fixture.state.graph.create_annotation(&annotation).unwrap();
+
+        let ids_before = fixture
+            .state
+            .graph
+            .to_snapshot()
+            .entities
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        let request = RenameRequest {
+            symbol: "target".to_string(),
+            new_name: "renamed_target".to_string(),
+            file: Some(fixture.target_file.0.clone()),
+            line: Some(1),
+            column: None,
+            json: true,
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("rename-annotation-test"),
+        };
+        let report = execute(&fixture.state, &request).unwrap().report.unwrap();
+        assert_eq!(report.entity_id, fixture.target_id);
+
+        // The rename really happened, so the assertion below is about a renamed
+        // entity rather than an untouched one.
+        let after = fixture
+            .state
+            .graph
+            .get_entity(&fixture.target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.name, "renamed_target");
+
+        // Bind the test to identity rather than to the rename merely succeeding.
+        // The annotation resolves by exact `WorkScope` equality, so it survives
+        // only while the entity keeps the id it was anchored to. Comparing the
+        // whole id set catches a re-key, a duplicate added under the new name,
+        // and a drop, none of which the name assertion above would notice. This
+        // mirrors the relation-set guard the rename already runs on itself.
+        let ids_after = fixture
+            .state
+            .graph
+            .to_snapshot()
+            .entities
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids_after, ids_before);
+        assert!(ids_after.contains(&fixture.target_id));
+
+        let attached = fixture
+            .state
+            .graph
+            .get_annotations_for_scope(&WorkScope::Entity(fixture.target_id))
+            .unwrap();
+        assert_eq!(
+            attached
+                .iter()
+                .map(|ann| ann.annotation_id)
+                .collect::<Vec<_>>(),
+            vec![annotation.annotation_id],
+            "the annotation anchored before the rename must still resolve from the entity scope"
+        );
+        assert_eq!(attached[0].body, annotation.body);
+        assert_eq!(
+            attached[0].scopes,
+            vec![WorkScope::Entity(fixture.target_id)]
+        );
     }
 }
