@@ -1708,6 +1708,11 @@ fn is_allowed_runtime_override(key: &OsStr) -> bool {
         "KIN_DAEMON_IDLE_TIMEOUT_SECS",
         "KIN_SUPERVISOR_IDLE_TIMEOUT_SECS",
         "KIN_DAEMON_READY_TIMEOUT_SECS",
+        // The wait for another command's daemon start, which defaults from the
+        // ready timeout above and is the same kind of per-command patience. A
+        // test about that wait cannot bound it without carrying this, and a
+        // 300 s default is not a bound a test can sit through.
+        "KIN_DAEMON_STARTUP_LOCK_TIMEOUT_SECS",
         "KIN_BYPASS_EMBEDDING_COVERAGE_CHECK",
         "KIN_EMBED_BACKEND",
         // A runtime-bound command that sets this and is not carried proves the
