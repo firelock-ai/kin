@@ -37352,6 +37352,25 @@ mod tests {
     /// is only observable if it differs from this.
     const AXUM_DEFAULT_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
+    /// The route's declared ceiling has to EXCEED the framework default it
+    /// replaces, or the declaration changes nothing at runtime and no test can
+    /// tell the two apart. That is not a hypothetical: this route shipped at
+    /// exactly 2 MiB, and the falsification arm that drops the declaration
+    /// survived because removing it left the framework refusing the same body
+    /// at the same size with the same status.
+    ///
+    /// Asserted at COMPILE time, unlike the probe guards inside the tests
+    /// below. Those have to survive to run, because a falsification arm that
+    /// raises a ceiling should produce a red test rather than a build break.
+    /// Nothing mutates this relationship, so the earliest possible failure is
+    /// the right one, and clippy is correct that a folded `assert!` belongs
+    /// here rather than in a test body.
+    const _: () = assert!(
+        MCP_LOCAL_CALL_MAX_BODY_BYTES > AXUM_DEFAULT_BODY_LIMIT_BYTES,
+        "the route's declared body ceiling must exceed axum's inherited default, \
+         or declaring it changes nothing"
+    );
+
     #[tokio::test]
     async fn mcp_tools_call_refuses_a_body_over_the_declared_ceiling() {
         // Declares an oversize length and sends NO body, which is the whole
@@ -37364,11 +37383,6 @@ mod tests {
         // allocates what it refuses is a delayed ceiling rather than a ceiling,
         // so the route now reads the declared length first, and a test that
         // sends nothing is the only kind that can prove it did.
-        assert!(
-            MCP_LOCAL_CALL_MAX_BODY_BYTES > AXUM_DEFAULT_BODY_LIMIT_BYTES,
-            "a declared ceiling equal to the framework default it replaces \
-             changes nothing at runtime and no test can tell the two apart"
-        );
         // Fixed, not `MCP_LOCAL_CALL_MAX_BODY_BYTES + 1`. A probe computed from
         // the value under test cannot grade that value: raising the ceiling
         // raises the probe with it and the refusal still arrives. This test was
