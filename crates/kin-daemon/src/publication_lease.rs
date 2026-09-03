@@ -18,13 +18,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use kin_db::{
-    Generation, KinDbError, SnapshotAuthority, SnapshotCursor, SnapshotRecoveryState,
-    SnapshotSaveOutcome, StorageBackend,
-};
+use kin_db::{Generation, KinDbError, SnapshotCursor, SnapshotSaveOutcome, StorageBackend};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
+
+use crate::storage_delegate::{DelegatingBackend, StorageBackendDelegate};
 
 pub const PUBLICATION_CONTROL_SCHEMA: &str = "kin.graph-publication-control.v2";
 pub const DEFAULT_ROLLOUT_LEASE_SECONDS: u64 = 300;
@@ -3220,8 +3219,17 @@ impl Drop for StoragePublicationGuard {
 }
 
 impl PublicationGatedStorageBackend {
-    pub fn new(inner: Box<dyn StorageBackend>, control: Arc<PublicationControl>) -> Self {
-        Self { inner, control }
+    /// Build the gate already wrapped for use as a `StorageBackend`.
+    ///
+    /// The wrapper is not optional and the constructor is why. This type
+    /// implements [`StorageBackendDelegate`], not `StorageBackend`, so there is
+    /// no way to hand a bare `PublicationGatedStorageBackend` to a caller that
+    /// wants storage and no way for it to inherit a kin-db trait default.
+    pub fn new(
+        inner: Box<dyn StorageBackend>,
+        control: Arc<PublicationControl>,
+    ) -> DelegatingBackend<Self> {
+        DelegatingBackend::new(Self { inner, control })
     }
 
     fn with_publication<T>(
@@ -3342,77 +3350,58 @@ impl PublicationGatedStorageBackend {
     }
 }
 
-impl StorageBackend for PublicationGatedStorageBackend {
-    fn load_snapshot(&self, repo_id: &str) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
-        self.inner.load_snapshot(repo_id)
+/// The publication gate changes ten of the thirty-two `StorageBackend`
+/// methods and inherits nothing.
+///
+/// Until FIR-3147 this was a direct `impl StorageBackend`, so the fourteen
+/// methods it did not name fell through to kin-db's defaults. Those defaults
+/// all answer "this backend cannot do that", which made a fully capable hosted
+/// backend report itself incapable of vector artifacts, prepared workspace
+/// graphs, authority frames, incremental deltas and history validation.
+/// `false`, `None` and `Missing` are indistinguishable from a cold store, so
+/// every caller correctly fell back and did the expensive thing, and nothing
+/// errored. `DaemonState::open_with_backend_and_publication_control` installs
+/// this wrapper before the first manager receives the erased backend, so the
+/// whole process inherited the degraded set.
+///
+/// The methods below are the entire policy. Everything else forwards through
+/// [`StorageBackendDelegate`], which is why the type no longer implements
+/// `StorageBackend` itself: with no impl there is no default to fall into.
+///
+/// Forwarding is not the right answer for all fourteen, which is why this is a
+/// disposition and not a sweep. The fence covers full `graph.kndb` generations
+/// only, so anything that moves graph authority keeps taking a lease or keeps
+/// refusing. `save_snapshot_streamed` reaches authority through
+/// `save_snapshot_validated`, so it buffers exactly as kin-db's default does
+/// and calls this type's gated version; forwarding it would have published a
+/// snapshot under no lease at all. `supports_incremental_deltas` and
+/// `supports_authority_frames` stay false, now by declaration, because
+/// forwarding either would advertise a path `save_delta` and
+/// `save_authority_frame` refuse one call later. `compact_deltas` refuses
+/// because its default composes `save_snapshot` and `clear_deltas`, and
+/// `clear_deltas` is refused here.
+///
+/// Everything now forwarded is a read or a sidecar. Vector artifacts, prepared
+/// workspace graphs and the source-blob family are content- or
+/// generation-bound with their own compare-and-swap, they are never the graph
+/// authority this fence serializes, and `save_source_blob` has forwarded
+/// ungated on exactly that reasoning since the gate was written.
+impl StorageBackendDelegate for PublicationGatedStorageBackend {
+    fn delegate(&self) -> &dyn StorageBackend {
+        self.inner.as_ref()
     }
 
-    fn load_snapshot_authority(
-        &self,
-        repo_id: &str,
-    ) -> Result<Option<SnapshotAuthority>, KinDbError> {
-        self.inner.load_snapshot_authority(repo_id)
+    /// Declared rather than inherited. A hosted backend may well have a
+    /// durable delta path; this decorator refuses to serialize one, so
+    /// advertising it would only attract calls `save_delta` rejects.
+    fn supports_incremental_deltas(&self) -> bool {
+        false
     }
 
-    fn load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
-        self.inner.load_recovery_state(repo_id)
-    }
-
-    /// Forward the publication probe to the backend's own metadata-only
-    /// implementation.
-    ///
-    /// This looks like boilerplate and is not. `StorageBackend` gives
-    /// `load_snapshot_cursor` a default that recovers the whole authority and
-    /// throws the reconstructed graph away, because that is the only thing a
-    /// backend with no metadata read can do. GCS has one: it lists the delta
-    /// prefix and HEADs `graph.kndb`, and reads no body at all. A decorator
-    /// that omits this method silently downgrades every caller beneath it to
-    /// the full-recovery default, and this decorator wraps the hosted backend
-    /// for the whole process.
-    ///
-    /// `DaemonState::probe_repo_publication` runs this on every hosted request
-    /// to decide whether its cached generation is still current, and describes
-    /// itself as one metadata-only backend read. Without this forward it was
-    /// downloading and decoding the entire snapshot instead, once per request.
-    ///
-    /// Measured on `kin-ecosystem-kin-graphs-dev` over the 24 hours ending
-    /// 2026-09-03T20:00Z: 15,520 `ListObjects`, and `ReadObject` running 14,184
-    /// ahead of `GetObjectMetadata`. One excess body read per list is the
-    /// signature of the default; the override would have produced one excess
-    /// HEAD per list instead.
-    fn load_snapshot_cursor(&self, repo_id: &str) -> Result<Option<SnapshotCursor>, KinDbError> {
-        self.inner.load_snapshot_cursor(repo_id)
-    }
-
-    fn save_source_blob(
-        &self,
-        repo_id: &str,
-        digest: [u8; 32],
-        data: &[u8],
-    ) -> Result<(), KinDbError> {
-        self.inner.save_source_blob(repo_id, digest, data)
-    }
-
-    fn load_source_blob(
-        &self,
-        repo_id: &str,
-        digest: [u8; 32],
-    ) -> Result<Option<Vec<u8>>, KinDbError> {
-        self.inner.load_source_blob(repo_id, digest)
-    }
-
-    fn load_source_blob_bounded(
-        &self,
-        repo_id: &str,
-        digest: [u8; 32],
-        max_bytes: u64,
-    ) -> Result<Option<Vec<u8>>, KinDbError> {
-        self.inner
-            .load_source_blob_bounded(repo_id, digest, max_bytes)
-    }
-
-    fn source_blob_len(&self, repo_id: &str, digest: [u8; 32]) -> Result<Option<u64>, KinDbError> {
-        self.inner.source_blob_len(repo_id, digest)
+    /// Declared for the same reason as `supports_incremental_deltas`:
+    /// `save_authority_frame` refuses, so the capability must read false.
+    fn supports_authority_frames(&self) -> bool {
+        false
     }
 
     fn save_snapshot(
@@ -3446,7 +3435,7 @@ impl StorageBackend for PublicationGatedStorageBackend {
         &self,
         repo_id: &str,
         data: &[u8],
-        expected_cursor: SnapshotCursor,
+        expected: SnapshotCursor,
         history_validator_version: Option<u32>,
     ) -> SnapshotSaveOutcome {
         let snapshot_schema = match snapshot_schema_from_bytes(data) {
@@ -3454,8 +3443,50 @@ impl StorageBackend for PublicationGatedStorageBackend {
             Err(error) => return SnapshotSaveOutcome::NotCommitted(error),
         };
         self.with_classified_publication(repo_id, snapshot_schema, |inner| {
-            inner.save_snapshot_validated(repo_id, data, expected_cursor, history_validator_version)
+            inner.save_snapshot_validated(repo_id, data, expected, history_validator_version)
         })
+    }
+
+    /// Buffer the frame and publish it through this type's own gated
+    /// `save_snapshot_validated`, which is what kin-db's default does and the
+    /// only reason the streamed path was ever fenced.
+    ///
+    /// The buffering is a real cost on a large tree and it is the cost this
+    /// decorator already paid, because the default was what ran here. Handing
+    /// the producer to the inner backend instead would let a snapshot reach
+    /// hosted authority with no publication lease, which is the one thing this
+    /// type exists to prevent.
+    fn save_snapshot_streamed(
+        &self,
+        repo_id: &str,
+        produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(u64, [u8; 32]), KinDbError>,
+        expected: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> SnapshotSaveOutcome {
+        let mut buffer: Vec<u8> = Vec::new();
+        if let Err(error) = produce(&mut buffer) {
+            return SnapshotSaveOutcome::NotCommitted(error);
+        }
+        StorageBackendDelegate::save_snapshot_validated(
+            self,
+            repo_id,
+            &buffer,
+            expected,
+            history_validator_version,
+        )
+    }
+
+    fn save_authority_frame(
+        &self,
+        repo_id: &str,
+        frame: &[u8],
+        expected: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> SnapshotSaveOutcome {
+        let _ = (frame, expected, history_validator_version);
+        SnapshotSaveOutcome::NotCommitted(KinDbError::StorageError(format!(
+            "hosted graph publication refuses authority frame authority for repo {repo_id}: the fleet resource fence covers full graph.kndb generations only"
+        )))
     }
 
     fn save_delta(
@@ -3470,34 +3501,20 @@ impl StorageBackend for PublicationGatedStorageBackend {
         )))
     }
 
-    fn load_deltas_since(
-        &self,
-        repo_id: &str,
-        since_gen: Generation,
-    ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
-        self.inner.load_deltas_since(repo_id, since_gen)
-    }
-
     fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
         Err(KinDbError::StorageError(format!(
             "hosted graph publication refuses delta cleanup for repo {repo_id}: the fleet resource fence covers full graph.kndb generations only"
         )))
     }
 
-    fn save_overlay(&self, repo_id: &str, session_id: &str, data: &[u8]) -> Result<(), KinDbError> {
-        self.inner.save_overlay(repo_id, session_id, data)
-    }
-
-    fn load_overlay(&self, repo_id: &str, session_id: &str) -> Result<Option<Vec<u8>>, KinDbError> {
-        self.inner.load_overlay(repo_id, session_id)
-    }
-
-    fn delete_overlay(&self, repo_id: &str, session_id: &str) -> Result<(), KinDbError> {
-        self.inner.delete_overlay(repo_id, session_id)
-    }
-
-    fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
-        self.inner.list_repos()
+    /// Compaction merges a delta journal into a new full snapshot and clears
+    /// the journal, and `clear_deltas` is refused here, so kin-db's default
+    /// would fail partway with the merge already committed. Refuse the whole
+    /// operation instead of half-running it.
+    fn compact_deltas(&self, repo_id: &str) -> Result<Generation, KinDbError> {
+        Err(KinDbError::StorageError(format!(
+            "hosted graph publication refuses delta compaction for repo {repo_id}: the fleet resource fence covers full graph.kndb generations only"
+        )))
     }
 }
 
@@ -4495,6 +4512,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+    use kin_db::SnapshotRecoveryState;
 
     const READER_A: &str =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -5959,7 +5977,7 @@ mod tests {
             Arc::clone(&control),
         );
         let ordinary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            writer.with_publication(
+            writer.decorator().with_publication(
                 "kin",
                 kin_db::GraphSnapshot::CURRENT_VERSION,
                 |_| -> Result<(), KinDbError> {
@@ -5974,7 +5992,7 @@ mod tests {
         );
 
         let classified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            writer.with_classified_publication(
+            writer.decorator().with_classified_publication(
                 "kin",
                 kin_db::GraphSnapshot::CURRENT_VERSION,
                 |_| -> SnapshotSaveOutcome {
@@ -7726,5 +7744,317 @@ mod tests {
         control
             .reassert_bound_mutation_lease()
             .expect("an unbound lease defends nothing");
+    }
+
+    /// A backend with the capabilities `LocalFileBackend` does not have, so the
+    /// gate's answer can be compared against a backend that really can.
+    ///
+    /// `GcsBackend` implements all three vector-artifact methods, which is what
+    /// makes this the capability the hosted path actually lost.
+    #[derive(Default)]
+    struct VectorCapableBackend;
+
+    impl StorageBackend for VectorCapableBackend {
+        fn load_snapshot(
+            &self,
+            _repo_id: &str,
+        ) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
+            Ok(None)
+        }
+
+        fn save_snapshot(
+            &self,
+            _repo_id: &str,
+            _data: &[u8],
+            _expected_gen: Generation,
+        ) -> Result<Generation, KinDbError> {
+            Ok(1)
+        }
+
+        fn save_delta(
+            &self,
+            _repo_id: &str,
+            _delta_data: &[u8],
+            _base_gen: Generation,
+        ) -> Result<Generation, KinDbError> {
+            Ok(1)
+        }
+
+        fn load_deltas_since(
+            &self,
+            _repo_id: &str,
+            _since_gen: Generation,
+        ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
+            Ok(Vec::new())
+        }
+
+        fn clear_deltas(&self, _repo_id: &str) -> Result<(), KinDbError> {
+            Ok(())
+        }
+
+        fn save_overlay(
+            &self,
+            _repo_id: &str,
+            _session_id: &str,
+            _data: &[u8],
+        ) -> Result<(), KinDbError> {
+            Ok(())
+        }
+
+        fn load_overlay(
+            &self,
+            _repo_id: &str,
+            _session_id: &str,
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            Ok(None)
+        }
+
+        fn delete_overlay(&self, _repo_id: &str, _session_id: &str) -> Result<(), KinDbError> {
+            Ok(())
+        }
+
+        fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
+            Ok(Vec::new())
+        }
+
+        fn supports_vector_artifacts(&self) -> bool {
+            true
+        }
+
+        fn load_vector_artifact(
+            &self,
+            _repo_id: &str,
+            _binding: kin_db::VectorArtifactBinding,
+        ) -> Result<kin_db::VectorArtifactLoadOutcome, KinDbError> {
+            Ok(kin_db::VectorArtifactLoadOutcome::Corrupt {
+                cursor: kin_db::VectorArtifactCursor::INITIAL,
+                error: KinDbError::StorageError("reached the wrapped backend".to_string()),
+            })
+        }
+    }
+
+    /// A real local store with one published snapshot, so the repository
+    /// namespace exists.
+    ///
+    /// The snapshot is written straight to the backend rather than through the
+    /// gate, because the reader admission this fixture bootstraps pins the
+    /// schema to `GraphSnapshot::CURRENT_VERSION` while the bytes
+    /// `GraphSnapshot::empty()` produces declare their own body version, and
+    /// `LocalFileBackend` validates the pair. Setting up off the gate keeps the
+    /// assertions below about the gate and nothing else.
+    fn local_backend_with_a_snapshot() -> (
+        tempfile::TempDir,
+        kin_db::LocalFileBackend,
+        Generation,
+        Vec<u8>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let backend = kin_db::LocalFileBackend::new(root.path());
+        let bytes = kin_db::GraphSnapshot::empty().to_bytes().unwrap();
+        let generation = backend.save_snapshot("kin", &bytes, 0).unwrap();
+        (root, backend, generation, bytes)
+    }
+
+    /// Build a gate over `inner` with no rollout in flight, so writes may take
+    /// a publication lease and reads are unobstructed.
+    fn open_gate(
+        inner: Box<dyn StorageBackend>,
+    ) -> (
+        Arc<PublicationControl>,
+        crate::storage_delegate::DelegatingBackend<PublicationGatedStorageBackend>,
+    ) {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let control = control(store, clock, READER_A);
+        let bootstrap = control
+            .acquire_rollout(rollout_request(
+                "deploy",
+                "bootstrap-capability",
+                Some(reader(READER_A, 300)),
+            ))
+            .unwrap();
+        release(&control, &bootstrap);
+        let writer = PublicationGatedStorageBackend::new(inner, Arc::clone(&control));
+        (control, writer)
+    }
+
+    /// FIR-3147. The gate used to inherit `Ok(None)` and `Ok(false)` here, and
+    /// a caller cannot tell that apart from a store that has never prepared
+    /// anything, so hosted rebuilt on every open and nothing logged.
+    ///
+    /// `LocalFileBackend` is one of the two backends that really implements
+    /// prepared state, so it is what makes this a capability test rather than a
+    /// forwarding test: the assertion fails if the gate answers on its own
+    /// behalf, whatever the wrapped backend can do.
+    #[test]
+    fn prepared_workspace_state_survives_the_publication_gate() {
+        let (_root, backend, _generation, _bytes) = local_backend_with_a_snapshot();
+        let (_control, writer) = open_gate(Box::new(backend));
+        let artifact = kin_db::storage::PreparedWorkspaceGraphArtifact {
+            binding: b"binding-bytes".to_vec(),
+            payload: b"payload-bytes".to_vec(),
+        };
+
+        assert!(
+            writer
+                .record_prepared_workspace_graph("kin", "workspace", &artifact)
+                .unwrap(),
+            "a backend with a durable place for prepared state must be allowed to use it"
+        );
+        assert_eq!(
+            writer
+                .load_prepared_workspace_graph("kin", "workspace")
+                .unwrap(),
+            Some(artifact),
+            "prepared state written through the gate must read back through the gate"
+        );
+    }
+
+    /// FIR-3147, the second capability. `supports_vector_artifacts` defaulted
+    /// to `false`, so the hosted daemon never asked for an index it had already
+    /// written, and `load_vector_artifact` defaulted to `Missing`, which is
+    /// what an empty store returns.
+    #[test]
+    fn vector_artifact_capability_survives_the_publication_gate() {
+        let (_control, writer) = open_gate(Box::new(VectorCapableBackend));
+
+        assert!(
+            writer.supports_vector_artifacts(),
+            "the gate must report the wrapped backend's capability, not its own"
+        );
+
+        let binding = kin_db::VectorArtifactBinding::for_repository(
+            "kin",
+            SnapshotCursor::from_backend_generation(1),
+            [0u8; 32],
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                writer.load_vector_artifact("kin", binding).unwrap(),
+                kin_db::VectorArtifactLoadOutcome::Corrupt { .. }
+            ),
+            "any outcome other than Missing proves the call reached the wrapped backend, \
+             because the inherited default could only ever answer Missing"
+        );
+    }
+
+    /// History validation is recorded rather than redone, on a backend that has
+    /// somewhere to bind the record.
+    #[test]
+    fn history_validation_is_recorded_through_the_publication_gate() {
+        let (_root, backend, generation, bytes) = local_backend_with_a_snapshot();
+        let (_control, writer) = open_gate(Box::new(backend));
+        let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes));
+
+        assert!(
+            writer
+                .record_history_validation("kin", generation, &sha, 1)
+                .unwrap(),
+            "a backend that can bind a validation record must be allowed to bind one"
+        );
+    }
+
+    /// The gate declares what it refuses instead of inheriting it, so the
+    /// refusals have to keep naming the fence.
+    #[test]
+    fn authority_frames_and_compaction_refuse_outside_the_graph_generation_fence() {
+        let (_control, writer) = open_gate(Box::new(NoopBackend::default()));
+
+        assert!(
+            !writer.supports_incremental_deltas(),
+            "advertising deltas would only attract calls save_delta refuses"
+        );
+        assert!(
+            !writer.supports_authority_frames(),
+            "advertising frames would only attract calls save_authority_frame refuses"
+        );
+
+        let frame = writer.save_authority_frame(
+            "kin",
+            b"frame",
+            SnapshotCursor::from_backend_generation(0),
+            None,
+        );
+        let SnapshotSaveOutcome::NotCommitted(error) = frame else {
+            panic!("an authority frame must not commit through the hosted gate: {frame:?}");
+        };
+        assert!(error.to_string().contains("full graph.kndb"), "{error}");
+
+        let compaction = writer.compact_deltas("kin").unwrap_err();
+        assert!(
+            compaction.to_string().contains("full graph.kndb"),
+            "{compaction}"
+        );
+    }
+
+    /// A streamed publication is graph authority, so it still takes a lease.
+    /// Forwarding it to the wrapped backend, which is what a blanket sweep over
+    /// the unforwarded methods would have done, would have published a snapshot
+    /// under no lease at all.
+    #[test]
+    fn a_streamed_snapshot_still_publishes_under_the_publication_fence() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let control = control(store, clock, READER_A);
+        let bootstrap = control
+            .acquire_rollout(rollout_request(
+                "deploy",
+                "bootstrap-streamed",
+                Some(reader(READER_A, 300)),
+            ))
+            .unwrap();
+        release(&control, &bootstrap);
+
+        let seen_validator_version = Arc::new(Mutex::new(None));
+        let writer = PublicationGatedStorageBackend::new(
+            Box::new(NoopBackend {
+                last_history_validator_version: Arc::clone(&seen_validator_version),
+                ..NoopBackend::default()
+            }),
+            Arc::clone(&control),
+        );
+        let bytes = snapshot_bytes(kin_db::GraphSnapshot::CURRENT_VERSION);
+        let mut produce = |writer: &mut dyn std::io::Write| {
+            std::io::Write::write_all(writer, &bytes)
+                .map_err(|error| KinDbError::StorageError(error.to_string()))?;
+            Ok((bytes.len() as u64, [0u8; 32]))
+        };
+
+        let committed = writer.save_snapshot_streamed(
+            "kin",
+            &mut produce,
+            SnapshotCursor::from_backend_generation(0),
+            Some(9),
+        );
+        assert!(
+            matches!(committed, SnapshotSaveOutcome::Committed { .. }),
+            "a streamed publication with no rollout in flight must commit: {committed:?}"
+        );
+        assert_eq!(
+            *seen_validator_version.lock().unwrap(),
+            Some(Some(9)),
+            "the streamed frame must reach the wrapped backend through the gated validated save"
+        );
+
+        let rollout = control
+            .acquire_rollout(rollout_request("deploy", "rollout-streamed", None))
+            .unwrap();
+        let blocked = writer.save_snapshot_streamed(
+            "kin",
+            &mut produce,
+            SnapshotCursor::from_backend_generation(1),
+            Some(10),
+        );
+        let SnapshotSaveOutcome::NotCommitted(error) = blocked else {
+            panic!("an active rollout must block a streamed publication: {blocked:?}");
+        };
+        assert!(error.to_string().contains("rollout lease"), "{error}");
+        assert_eq!(
+            *seen_validator_version.lock().unwrap(),
+            Some(Some(9)),
+            "a blocked streamed publication must not reach the wrapped backend"
+        );
+        release(&control, &rollout);
     }
 }
