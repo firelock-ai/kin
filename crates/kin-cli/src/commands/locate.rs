@@ -32190,11 +32190,20 @@ mod tests {
         lists
     }
 
-    /// Every primacy knob removed, so one test cannot read another's setting.
+    /// Every knob `reciprocal_rank_fusion_entities` reads, removed, so one test
+    /// cannot read another's setting.
+    ///
+    /// The guard serializes MUTATING tests against each other and restores on
+    /// drop, but it cannot stop a test that merely READS a variable another test
+    /// set. Under `cargo nextest` each test owns a process and the whole class is
+    /// structurally invisible; under a shared-process `cargo test` it is not, and
+    /// on this repo that runner grades main's push rather than the pull request.
+    /// So pin every input rather than only the two this term introduces.
     fn primacy_knobs_unset() -> kin_core::test_env::EnvVarGuard {
         kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT")
             .without("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_HEADROOM")
             .without("KIN_LOCATE_SEMANTIC_PRIMACY_K")
+            .without("KIN_LOCATE_RRF_RAW_WEIGHT")
     }
 
     fn fused_place(fused: &[(String, String, f32)], key: &str) -> usize {
