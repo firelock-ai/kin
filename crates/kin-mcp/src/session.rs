@@ -2559,9 +2559,19 @@ mod tests {
         // the loop below opens however many the constant says and the next one
         // is refused at any value, so the mutation moves the input with it.
         // Falsification caught that. Raising the ceiling turns THIS red.
-        const PROBE_BEYOND_CAP: usize = 9;
+        //
+        // A `let` rather than a `const`, matching the two sibling guards in this
+        // branch, and the difference is not cosmetic. Two constants compared in
+        // an `assert!` fold at compile time, which clippy's
+        // `assertions_on_constants` correctly objects to and which would be
+        // better written `const _: () = assert!(..)`. That form is a stronger
+        // guard and the wrong one here: it turns a raised ceiling into a build
+        // break rather than a red test, and a build break is exactly what the
+        // falsification harness refuses to count as a kill, because a mutation
+        // that does not compile has not exercised the guard it was aimed at.
+        let probe_beyond_cap = 9usize;
         assert!(
-            PROBE_BEYOND_CAP > MAX_ACTIVE_TRANSACTIONS_PER_SESSION,
+            probe_beyond_cap > MAX_ACTIVE_TRANSACTIONS_PER_SESSION,
             "the probe must exceed the ceiling or this test grades nothing"
         );
         let mut opened = Vec::new();

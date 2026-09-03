@@ -37374,13 +37374,19 @@ mod tests {
         // raises the probe with it and the refusal still arrives. This test was
         // written that way twice, and falsification caught it both times. The
         // guard below is what turns a raised ceiling red.
-        const DECLARED_OVER_CEILING: u64 = 5 * 1024 * 1024;
+        // A `let`, for the reason the sibling guard in session.rs spells out: a
+        // constant-folded `assert!` belongs in a `const` block, and that form
+        // turns a raised ceiling into a build break rather than the red test
+        // this guard exists to produce. Clippy does not flag this one today
+        // only because the `as u64` cast defeats its folding, which is not a
+        // reason to write it differently from its sibling.
+        let declared_over_ceiling = 5 * 1024 * 1024u64;
         assert!(
-            DECLARED_OVER_CEILING > MCP_LOCAL_CALL_MAX_BODY_BYTES as u64,
+            declared_over_ceiling > MCP_LOCAL_CALL_MAX_BODY_BYTES as u64,
             "the declared length must exceed the ceiling or this test grades \
              nothing"
         );
-        let over_ceiling = DECLARED_OVER_CEILING;
+        let over_ceiling = declared_over_ceiling;
 
         let state = test_state();
         state
