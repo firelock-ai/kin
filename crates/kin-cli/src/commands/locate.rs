@@ -3799,13 +3799,14 @@ fn run_with_graph_capture_budgeted(
     // every track's fusion below so a sweep moves them together.
     let rrf_k = locate_env_f32("KIN_LOCATE_RRF_K", 60.0);
 
-    // Entity-granular fusion experiment (default OFF; byte-identical when unset).
-    // When KIN_LOCATE_ENTITY_FUSION=1, fuse at ENTITY granularity (entity-derived
-    // signals keyed by entity id, the rest by path) and PROJECT to files at the
-    // fusion boundary, so the file-keyed post-fusion pipeline (boosts/demotes/
-    // floors/adaptive_cap) below runs unchanged. When unset, the original
-    // track-regime path fusion runs verbatim — see the flip-plan in
-    // crates/kin-cli/docs/locate-entity-fusion-flip-plan.md for scope and A/B.
+    // Entity-granular fusion. ON for accuracy-v2 and accuracy-v1
+    // (`RetrievalProfile::entity_fusion_default`), OFF for compat-v0, so an unset
+    // variable resolves to the profile default and NOT to the `else` arm. Fuses at
+    // ENTITY granularity (entity-derived signals keyed by entity id, the rest by
+    // path) and PROJECTS to files at the fusion boundary, so the file-keyed
+    // post-fusion pipeline (boosts/demotes/floors/adaptive_cap) below runs
+    // unchanged. The `else` arm is the historical track-regime path fusion, now
+    // reachable only with KIN_PROFILE=compat-v0 or KIN_LOCATE_ENTITY_FUSION=0.
     let mut direct_entity_ordered = false;
     let mut fused = if locate_env_bool("KIN_LOCATE_ENTITY_FUSION", quality.entity_fusion_default())
     {
@@ -12889,11 +12890,17 @@ fn entity_seed_keyed(
 /// `(key, path, fused_score)` sorted descending (ties broken by key for
 /// determinism).
 ///
-/// It intentionally omits the path fuser's graph-neighborhood tiebreaker and
-/// semantic-primacy term: both are keyed by fixed signal-list *index positions*
-/// over file keys, which do not carry over to entity keys. Per the scoring-map
-/// recommendation, the entity path is a clean rank-space fuser rather than a
-/// re-derivation of the index-positional path tunings.
+/// It omits the path fuser's graph-neighborhood tiebreaker, which counts a key's
+/// appearances across signal indices {1, 2, 4, 6}. Those four lists stay
+/// PATH-keyed here while 7 and 9 are ENTITY-keyed, so that count would span two
+/// key spaces and never coincide.
+///
+/// It does carry the path fuser's semantic-primacy term, off by default and
+/// applied by [`apply_entity_semantic_primacy`]. Index positions survive the
+/// re-keying: `entity_granular_fused_files` builds `keyed_lists` by enumerating
+/// `ranked_lists` in order, so index 9 is the embedding list in both, keyed by
+/// entity id. Without that term a key only the vector arm found carries a bare
+/// rank contribution, which is the exact case the term was written for.
 fn reciprocal_rank_fusion_entities(
     keyed_lists: &[Vec<(String, String, f32)>],
     k: f32,
@@ -12941,6 +12948,7 @@ fn reciprocal_rank_fusion_entities(
             )
         })
         .collect();
+    apply_entity_semantic_primacy(&mut combined, keyed_lists);
     combined.sort_by(|a, b| {
         b.2.partial_cmp(&a.2)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -12949,7 +12957,93 @@ fn reciprocal_rank_fusion_entities(
     combined
 }
 
-/// Entity-granular fusion (behind `KIN_LOCATE_ENTITY_FUSION`, default OFF).
+/// Signal-list index of the embedding arm, in `ranked_lists` and in the
+/// `keyed_lists` [`entity_granular_fused_files`] derives from it in the same
+/// order.
+const EMBEDDING_SIGNAL_INDEX: usize = 9;
+
+/// Semantic-primacy lift for the entity fuser, applied in place to the unlifted
+/// combine before it is sorted.
+///
+/// Mirrors the path fuser's term in [`reciprocal_rank_fusion_weighted`]: a key the
+/// embedding arm ranked gains `weight / (k + rank + 1)`, with a small `k` so a top
+/// embedding rank is not compressed the way RRF's `k = 60` compresses it. It
+/// corrects a combine that rewards breadth. A key two arms found carries two rank
+/// terms plus the 0.02 cross-signal bonus while a key one arm found carries one,
+/// about 0.034 apart at a middling rank, and a key only the vector arm found has
+/// no way to earn that back however strong the match.
+///
+/// `KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT` defaults to 0.0, so the term is
+/// dark until a measured A/B earns it a default. The saturation constant is
+/// `KIN_LOCATE_SEMANTIC_PRIMACY_K`, the same name the path fuser reads, so one
+/// sweep moves both fusers together.
+///
+/// # What pins the top of the ranking
+///
+/// A key may consume at most `KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_HEADROOM` of its
+/// gap to the unlifted top score, so a capped key lands at
+/// `top * h + score * (1 - h)`, which is strictly below `top` for every `h < 1`
+/// and every `score < top`. A key already at `top` has no gap and takes no lift,
+/// so its score stays bit-identical. Fusion rank one therefore cannot move, and
+/// because [`entity_granular_fused_files`] projects each file onto its best
+/// entity's score, the top FILE out of fusion cannot move either.
+///
+/// Capping the gap rather than clamping to a fixed ceiling is what keeps the cap
+/// order-preserving: `top * h + score * (1 - h)` is strictly increasing in
+/// `score`, so two capped keys cannot collapse onto one value and be reordered by
+/// the key tiebreak.
+///
+/// # The weight is not monotone, and a sweep must not assume it is
+///
+/// Once a key's lift exceeds its headroom the cap binds, and every capped key
+/// keeps its unlifted order. So a large enough weight caps the whole embedding
+/// set and returns it to the order it already had, undoing the rescue. Simulated
+/// over this combine, an embedding-only key rises through the ranking as the
+/// weight grows, peaks, then falls back to its unlifted place. Sweep a range and
+/// read the peak; do not push the weight up expecting more effect.
+fn apply_entity_semantic_primacy(
+    combined: &mut [(String, String, f32)],
+    keyed_lists: &[Vec<(String, String, f32)>],
+) {
+    let weight = locate_env_f32("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT", 0.0);
+    if weight <= 0.0 {
+        return;
+    }
+    let k = locate_env_f32("KIN_LOCATE_SEMANTIC_PRIMACY_K", 8.0);
+    // Clamped strictly below 1.0: at exactly 1.0 a lifted key reaches `top` and
+    // the sort's key tiebreak could put it first, which is the invariant this
+    // whole term is bounded by.
+    let headroom = locate_env_f32("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_HEADROOM", 0.9).min(0.99);
+    let Some(embedding_list) = keyed_lists.get(EMBEDDING_SIGNAL_INDEX) else {
+        return;
+    };
+    let embed_rank: FxHashMap<&str, usize> = embedding_list
+        .iter()
+        .enumerate()
+        .map(|(rank, (key, _, _))| (key.as_str(), rank))
+        .collect();
+    if embed_rank.is_empty() {
+        return;
+    }
+    let top = combined
+        .iter()
+        .map(|(_, _, score)| *score)
+        .fold(0.0f32, f32::max);
+    for (key, _, score) in combined.iter_mut() {
+        let Some(&rank) = embed_rank.get(key.as_str()) else {
+            continue;
+        };
+        let lift = weight / (k + rank as f32 + 1.0);
+        let allowed = ((top - *score) * headroom).max(0.0);
+        let applied = lift.min(allowed);
+        if applied > 0.0 {
+            *score += applied;
+        }
+    }
+}
+
+/// Entity-granular fusion (behind `KIN_LOCATE_ENTITY_FUSION`, ON for accuracy-v2
+/// and accuracy-v1, OFF for compat-v0).
 ///
 /// Builds entity-keyed ranked lists — the two entity-derived signals
 /// (`entity_resolve` idx 7 and `embedding` idx 9) keyed by entity id from the
@@ -12959,8 +13053,7 @@ fn reciprocal_rank_fusion_entities(
 /// file list then feeds the existing file-keyed post-fusion pipeline unchanged.
 ///
 /// This is the architecture-bet ON path: entity ranking survives INTO fusion
-/// rather than terminating at discovery. Deliberate first-cut limits, to be
-/// validated by a controlled A/B before it becomes the default:
+/// rather than terminating at discovery. Deliberate first-cut limits:
 /// 1. Projection happens at the fusion boundary, so dominance/floors/adaptive_cap
 ///    stay file-granular (re-keying the ~40-function post-fusion pipeline to
 ///    entities is out of scope under freeze and risks the proven determinism).
@@ -32037,12 +32130,216 @@ mod tests {
     // ───────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn entity_fusion_is_disabled_by_default() {
-        // The architecture bet must stay OFF until controlled A/B validation flips it.
-        // No test in this module sets the var, so the default governs.
+    fn the_shipped_profile_fuses_at_entity_granularity() {
+        // The selector reads the PROFILE default, not a literal `false`. Asserting
+        // against `false` proved only that no test in this module exported the
+        // variable, so it stayed green through both landings that flipped the
+        // shipped default ON while its own comment became untrue.
+        let _unset = kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_ENTITY_FUSION");
+        let quality = crate::retrieval_profile::RetrievalProfile::default();
         assert!(
-            !locate_env_bool("KIN_LOCATE_ENTITY_FUSION", false),
-            "KIN_LOCATE_ENTITY_FUSION must default OFF"
+            locate_env_bool("KIN_LOCATE_ENTITY_FUSION", quality.entity_fusion_default()),
+            "the shipped profile fuses at entity granularity; the selector reads this value"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Semantic primacy on the entity path.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// The measured starvation shape at unit-test scale.
+    ///
+    /// `e:widget` is found by two graph arms and holds the top on merit. `e:mixed0`
+    /// and `e:mixed1` carry a graph signal AND a deep embedding rank. Eight `e:junk`
+    /// keys carry both signals in the middle of each list. `e:cursors` and
+    /// `e:type_ops` are found by the vector arm ALONE, at the two BEST embedding
+    /// ranks, and still land below keys they beat semantically. That inversion is
+    /// the defect: the combine pays for breadth, and one arm cannot buy it.
+    fn embedding_starvation_lists() -> Vec<Vec<(String, String, f32)>> {
+        let ent = |key: &str, path: &str, score: f32| (key.to_string(), path.to_string(), score);
+        let mut lists: Vec<Vec<(String, String, f32)>> = vec![Vec::new(); 10];
+
+        // idx 1: multihop.
+        lists[1].push(ent("e:widget", "src/widget.ts", 100.0));
+        lists[1].push(ent("e:mixed0", "src/mixed0.ts", 20.0));
+        lists[1].push(ent("e:mixed1", "src/mixed1.ts", 19.0));
+        for i in 0..8u32 {
+            lists[1].push(ent(
+                &format!("e:junk{i}"),
+                &format!("src/junk{i}.ts"),
+                12.0 - i as f32,
+            ));
+        }
+        lists[1].push(ent("e:graphonly", "src/graphonly.ts", 4.0));
+
+        // idx 2: tests. The widget's second graph signal.
+        lists[2].push(ent("e:widget", "src/widget.ts", 40.0));
+
+        // idx 9: embedding.
+        lists[9].push(ent("e:cursors", "src/cursor.ts", 0.95));
+        lists[9].push(ent("e:type_ops", "src/cursorTypeOperations.ts", 0.90));
+        for i in 0..8u32 {
+            lists[9].push(ent(
+                &format!("e:junk{i}"),
+                &format!("src/junk{i}.ts"),
+                0.60 - 0.02 * i as f32,
+            ));
+        }
+        lists[9].push(ent("e:mixed0", "src/mixed0.ts", 0.30));
+        lists[9].push(ent("e:mixed1", "src/mixed1.ts", 0.28));
+        lists
+    }
+
+    /// Every primacy knob removed, so one test cannot read another's setting.
+    fn primacy_knobs_unset() -> kin_core::test_env::EnvVarGuard {
+        kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT")
+            .without("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_HEADROOM")
+            .without("KIN_LOCATE_SEMANTIC_PRIMACY_K")
+    }
+
+    fn fused_place(fused: &[(String, String, f32)], key: &str) -> usize {
+        fused
+            .iter()
+            .position(|(k, _, _)| k == key)
+            .unwrap_or_else(|| panic!("{key} absent from the fused ranking"))
+    }
+
+    fn fused_score(fused: &[(String, String, f32)], key: &str) -> f32 {
+        fused[fused_place(fused, key)].2
+    }
+
+    fn fused_keys(fused: &[(String, String, f32)]) -> Vec<&str> {
+        fused.iter().map(|(k, _, _)| k.as_str()).collect()
+    }
+
+    #[test]
+    fn entity_fusion_semantic_primacy_ships_dark() {
+        // The term must be inert until a measured A/B earns it a default, and
+        // "inert" has to mean bit-identical, not close. This assertion is what a
+        // default flip has to come and change on purpose.
+        let lists = embedding_starvation_lists();
+        let unset = {
+            let _g = primacy_knobs_unset();
+            reciprocal_rank_fusion_entities(&lists, 60.0)
+        };
+        let explicit_zero = {
+            let _g = primacy_knobs_unset().with("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT", "0");
+            reciprocal_rank_fusion_entities(&lists, 60.0)
+        };
+        assert_eq!(unset.len(), explicit_zero.len());
+        for (a, b) in unset.iter().zip(explicit_zero.iter()) {
+            assert_eq!(a.0, b.0, "unset must order exactly as an explicit 0");
+            assert_eq!(
+                a.2.to_bits(),
+                b.2.to_bits(),
+                "unset must score bit-identically to an explicit 0 for {}",
+                a.0
+            );
+        }
+        assert!(
+            fused_place(&unset, "e:type_ops") > fused_place(&unset, "e:mixed1"),
+            "at the shipped default the starved key stays starved: {:?}",
+            fused_keys(&unset)
+        );
+    }
+
+    #[test]
+    fn entity_fusion_semantic_primacy_rescues_an_embedding_only_key() {
+        let lists = embedding_starvation_lists();
+
+        // THE BASELINE IS ASSERTED GREEN FIRST. A red baseline would let every arm
+        // below report PASS without proving anything.
+        let baseline = {
+            let _g = primacy_knobs_unset();
+            reciprocal_rank_fusion_entities(&lists, 60.0)
+        };
+        assert_eq!(
+            fused_keys(&baseline).first().copied(),
+            Some("e:widget"),
+            "baseline rank one: {:?}",
+            fused_keys(&baseline)
+        );
+        assert!(
+            fused_place(&baseline, "e:type_ops") > fused_place(&baseline, "e:mixed0")
+                && fused_place(&baseline, "e:type_ops") > fused_place(&baseline, "e:mixed1"),
+            "THE DEFECT: the key at embedding rank 1 sits below two keys at embedding \
+             ranks 10 and 11 that carry a second signal: {:?}",
+            fused_keys(&baseline)
+        );
+
+        let lifted = {
+            let _g = primacy_knobs_unset().with("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT", "0.5");
+            reciprocal_rank_fusion_entities(&lists, 60.0)
+        };
+        assert!(
+            fused_place(&lifted, "e:type_ops") < fused_place(&lifted, "e:mixed0")
+                && fused_place(&lifted, "e:type_ops") < fused_place(&lifted, "e:mixed1"),
+            "THE RESCUE: the embedding-only key must clear the keys it outranks \
+             semantically: {:?}",
+            fused_keys(&lifted)
+        );
+        assert_eq!(
+            fused_keys(&lifted).first().copied(),
+            Some("e:widget"),
+            "the rescue must not move rank one: {:?}",
+            fused_keys(&lifted)
+        );
+        assert_eq!(
+            lifted[0].2.to_bits(),
+            baseline[0].2.to_bits(),
+            "rank one's score must be bit-identical, not merely close"
+        );
+        assert_eq!(
+            fused_score(&lifted, "e:graphonly").to_bits(),
+            fused_score(&baseline, "e:graphonly").to_bits(),
+            "a key the embedding arm never ranked must not move at all"
+        );
+    }
+
+    #[test]
+    fn entity_fusion_semantic_primacy_cannot_take_rank_one() {
+        let lists = embedding_starvation_lists();
+        let baseline = {
+            let _g = primacy_knobs_unset();
+            reciprocal_rank_fusion_entities(&lists, 60.0)
+        };
+        let top = baseline[0].2;
+        let cursors_baseline = fused_score(&baseline, "e:cursors");
+
+        // At weight 5.0 the raw lift at embedding rank 0 is 5.0 / (8 + 0 + 1),
+        // larger than the whole gap from `e:cursors` to the top. An unguarded term
+        // hands rank one to a key ONE arm found. The headroom cap is the only thing
+        // between this fixture and that outcome, which is what the next two
+        // assertions are for.
+        let uncapped = cursors_baseline + 5.0 / 9.0;
+        assert!(
+            uncapped > top,
+            "fixture must put the unguarded lift above the top ({uncapped} vs {top})"
+        );
+
+        let lifted = {
+            let _g = primacy_knobs_unset().with("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT", "5.0");
+            reciprocal_rank_fusion_entities(&lists, 60.0)
+        };
+        assert_eq!(
+            fused_keys(&lifted).first().copied(),
+            Some("e:widget"),
+            "the cap pins rank one: {:?}",
+            fused_keys(&lifted)
+        );
+        assert_eq!(
+            lifted[0].2.to_bits(),
+            top.to_bits(),
+            "rank one's score must be bit-identical under any weight"
+        );
+        let cursors_lifted = fused_score(&lifted, "e:cursors");
+        assert!(
+            cursors_lifted < top,
+            "no lifted key may reach the top ({cursors_lifted} vs {top})"
+        );
+        assert!(
+            cursors_lifted < uncapped,
+            "the cap must actually bind ({cursors_lifted} vs {uncapped} uncapped)"
         );
     }
 

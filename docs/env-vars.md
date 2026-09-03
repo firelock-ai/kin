@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (526 total, 356 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (528 total, 358 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -401,6 +401,8 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_WEIGHT` | float>=0 | 8.0 | correctness | locate tuning knob: entity dominant resolve weight |
 | `KIN_LOCATE_ENTITY_DOMINANT_RRF_THRESHOLD` | usize | 3 | correctness | locate tuning knob: entity dominant rrf threshold |
 | `KIN_LOCATE_ENTITY_FUSION` | bool | context-dependent | correctness | locate tuning knob: entity fusion |
+| `KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_HEADROOM` | float>=0 | 0.9 | correctness | locate tuning knob: entity semantic primacy headroom |
+| `KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT` | float>=0 | 0.0 | correctness | locate tuning knob: entity semantic primacy weight |
 | `KIN_LOCATE_ENTITY_SURFACE_PENALTY` | float>=0 | 0.3 | correctness | locate tuning knob: entity surface penalty |
 | `KIN_LOCATE_EXPLAIN_DEF_FLOOR_PCT` | float>=0 | 0.0 | correctness | locate tuning knob: explain def floor pct |
 | `KIN_LOCATE_EXPLAIN_DEF_TOPK` | usize | 0 | correctness | locate tuning knob: explain def topk |

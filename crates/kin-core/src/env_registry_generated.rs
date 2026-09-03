@@ -99,6 +99,8 @@ pub const GENERATED_KNOBS: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_WEIGHT", kind: Kind::NonNegF32, default: "8.0", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: entity dominant resolve weight" },
     EnvVarSpec { name: "KIN_LOCATE_ENTITY_DOMINANT_RRF_THRESHOLD", kind: Kind::Usize, default: "3", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: entity dominant rrf threshold" },
     EnvVarSpec { name: "KIN_LOCATE_ENTITY_FUSION", kind: Kind::Bool, default: "context-dependent", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: entity fusion" },
+    EnvVarSpec { name: "KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_HEADROOM", kind: Kind::NonNegF32, default: "0.9", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: entity semantic primacy headroom" },
+    EnvVarSpec { name: "KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT", kind: Kind::NonNegF32, default: "0.0", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: entity semantic primacy weight" },
     EnvVarSpec { name: "KIN_LOCATE_ENTITY_SURFACE_PENALTY", kind: Kind::NonNegF32, default: "0.3", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: entity surface penalty" },
     EnvVarSpec { name: "KIN_LOCATE_EXPLAIN_DEF_FLOOR_PCT", kind: Kind::NonNegF32, default: "0.0", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: explain def floor pct" },
     EnvVarSpec { name: "KIN_LOCATE_EXPLAIN_DEF_TOPK", kind: Kind::Usize, default: "0", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: explain def topk" },
