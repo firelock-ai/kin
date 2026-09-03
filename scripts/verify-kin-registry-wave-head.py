@@ -31,7 +31,16 @@ ATTESTATION_CREATOR_ID = 308181894
 COMMIT_MARKER = "Kin-Registry-Dependency-Wave: v1"
 RECEIVER_WORKFLOW_NAME = "Kin Registry Release Receiver"
 RECEIVER_WORKFLOW_PATH = ".github/workflows/kin-registry-release.yml"
-ALLOWED_PATHS = frozenset({"Cargo.toml", "Cargo.lock"})
+# fuzz/Cargo.lock: the detached fuzz workspace's own lock (fuzz/Cargo.toml
+# declares its own empty [workspace] table). kin-parser's workspace = true
+# dependency inheritance still pulls its kin-model pin from THIS repo's root
+# Cargo.toml, so a registry wave that moves the root pins can desync fuzz's
+# lock against them; kin#1444 is the second time that broke the Fuzz workflow.
+# The receiver now regenerates fuzz/Cargo.lock in the same job that updates
+# the root pins (kin-registry-release.yml), so it has to be an admitted path
+# here too, or that regeneration would itself be refused as an unexpected
+# change.
+ALLOWED_PATHS = frozenset({"Cargo.toml", "Cargo.lock", "fuzz/Cargo.lock"})
 LOWER_SHA = re.compile(r"^[0-9a-f]{40}$")
 VERSION_EVIDENCE = re.compile(r"^(?:absent|[0-9A-Za-z.+-]+)$")
 

@@ -255,6 +255,30 @@ jobs:
           esac
           echo "title=$title" >> "$GITHUB_OUTPUT"
 
+      # fuzz/Cargo.toml declares its own empty [workspace] table (see the
+      # comment there), so it carries a separate fuzz/Cargo.lock that the
+      # update above never touches: kin#1444 is the second wave the Fuzz
+      # workflow's `cargo metadata --locked` caught for exactly this reason,
+      # after kin#1213 re-locked it by hand. kin-parser's `kin-model =
+      # { workspace = true }` still inherits from THIS checkout's now-updated
+      # root Cargo.toml (Cargo walks up from crates/kin-parser, which has no
+      # [workspace] of its own, to find it), so a plain `cargo update` against
+      # the detached manifest re-resolves it correctly with the registry
+      # config already written above. No nightly toolchain needed: nightly is
+      # only required to build cargo-fuzz's libFuzzer targets, never to
+      # resolve a lockfile. This has to run before the snapshot below, not
+      # after: every later re-check in this pipeline (apply_candidate's
+      # re-validation in mutate-wave, and the final verify-generated-head
+      # check against the pushed PR head) compares against the tree recorded
+      # by that snapshot, so fuzz/Cargo.lock has to already be in the working
+      # tree it snapshots, not added on afterward.
+      - name: Update the detached fuzz workspace lock to match
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          cargo update --manifest-path fuzz/Cargo.toml
+          git add fuzz/Cargo.lock
+
       - name: Snapshot the exact generated dependency delta
         id: generated
         if: steps.update.outputs.changed == 'true'
@@ -476,6 +500,7 @@ jobs:
           add-paths: |
             Cargo.lock
             Cargo.toml
+            fuzz/Cargo.lock
           delete-branch: true
           signoff: true
           labels: release:consumer-bump,proof-impacting
