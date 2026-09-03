@@ -2599,3 +2599,40 @@ mod query_producer_evidence_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// FIR-2892 FALSIFICATION ARM. THIS PULL REQUEST MUST NEVER BE MERGED.
+//
+// FIR-2892 asks for one thing nobody has ever observed: a required check
+// reading RED on a pull request because a raw filesystem read was planted on
+// an answer path. kin#1448 put both zero-file-search guards into the required
+// "Fast gate lint and policy" context and proved from the run's step list that
+// they execute on a pull request, but every falsification of the checker
+// itself was run locally. This branch supplies the missing observation and is
+// closed unmerged the moment it has.
+//
+// Planted at end of file on purpose: FIR-1509 was a scanner desync that left
+// the tail of exactly this kind of module unscanned.
+// ---------------------------------------------------------------------------
+use std::fs::{self, OpenOptions};
+
+/// Arm A, the positive control. A raw working-copy read on an answer path.
+/// Both guards MUST report this line.
+#[allow(dead_code)]
+pub fn fir2892_caught_arm(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+/// Arm B, the negative control, and a hosted demonstration of FIR-3151. The
+/// same read, written with the `OpenOptions` builder and a grouped import.
+/// `OpenOptions` is in neither guard's deny set, so this is expected to produce
+/// NO violation line even though it reads an arbitrary path into a String.
+#[allow(dead_code)]
+pub fn fir3151_uncaught_arm(path: &std::path::Path) -> Option<String> {
+    use std::io::Read as _;
+    let _keeps_the_grouped_import_used: Option<fs::Metadata> = None;
+    let mut file = OpenOptions::new().read(true).open(path).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+    Some(buf)
+}
