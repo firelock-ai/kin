@@ -98,6 +98,27 @@ Enforcement of the per-install token is **on by default**:
   and is always enforced, even while `KIN_DAEMON_REQUIRE_TOKEN` is opted out;
   this is also the token required to bind a non-loopback address.
 
+### The machine-wide supervisor
+
+The supervisor is a second HTTP control plane, one per user rather than one per
+repository, and it holds the same policy. It provisions `~/.kin/supervisor.token`
+on first run and enforces it by default; `KIN_SUPERVISOR_REQUIRE_TOKEN` set to a
+falsy value (`0`, `false`, `no`, `off`) is the escape hatch, and
+`KIN_SUPERVISOR_AUTH_TOKEN` is the explicit override that always wins. Only
+`/health` and `/readiness` are public. Everything else, including `/repos`,
+`/daemons`, `/daemons/register` and `/shutdown`, needs the bearer token, because
+unauthenticated those routes name every repository the user has open and let any
+local process stop the supervisor for all of them.
+
+The CLI trusts a route the supervisor hands back only when it names loopback. The
+supervisor stores whatever endpoint a registration reports, so that value is
+another process's claim rather than a fact, and a route naming another host is
+refused before any request is sent to it. The same rule governs `KIN_DAEMON_URL`:
+the auto-provisioned `<repo>/.kin/daemon.token` is attached only to a loopback
+endpoint, and a remote endpoint must be paired with its own
+`KIN_DAEMON_AUTH_TOKEN` or the client refuses by name rather than sending a local
+credential to a host it cannot vouch for.
+
 ### Resulting trust boundary
 
 In its default configuration the daemon's effective trust boundary is **any
@@ -135,6 +156,17 @@ process** and runs with that process's privileges. Two consequences follow:
 The daemon-side counterpart of projection, materializing graph-owned files into
 a workspace for a session or an exec request, runs within the same-user
 daemon trust boundary described above.
+
+Preload interposition is not the only projection surface Kin ships. The macOS
+release builds `kin-vfs` with `--features nfs` and the Linux release with
+`--features fuse` (`.github/workflows/release.yml`), so `kin mode nfs` and
+`kin mode fuse` present the graph through a mount the operating system serves
+rather than through a library in one process. A mount is not per-process: the
+NFS export in particular authenticates no client, so every account on the
+machine can read what it serves for as long as it runs. What that export does
+and does not enforce, including the read-only default and where writes are
+contained, is owned by `kin-vfs` and stated in its
+`docs/security/nfs-export.md`.
 
 ## Blob-Store Integrity
 

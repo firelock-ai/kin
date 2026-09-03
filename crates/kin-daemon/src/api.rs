@@ -1993,7 +1993,17 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/push", post(command_push))
         .route("/commands/pull", post(command_pull))
         .route("/commands/transfer-plan", post(command_transfer_plan))
-        .route("/mcp/tools/call", post(mcp_tools_call))
+        .route(
+            "/mcp/tools/call",
+            // Two ceilings, and the order is load-bearing. `from_fn` is applied
+            // last so it wraps outermost and runs first, refusing a declared
+            // oversize length before the body extractor reads anything; the
+            // streaming limit inside it stays as the backstop for a request
+            // that declares no length or declares a false one.
+            post(mcp_tools_call)
+                .layer(DefaultBodyLimit::max(MCP_LOCAL_CALL_MAX_BODY_BYTES))
+                .layer(middleware::from_fn(refuse_oversized_declared_mcp_body)),
+        )
         .route(
             "/repos/{repo_id}/mcp/tools/call",
             post(repo_mcp_tools_call).layer(DefaultBodyLimit::max(REPO_SCOPED_CALL_MAX_BODY_BYTES)),
@@ -2062,6 +2072,10 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route(
             "/authority/publication-control/rollout/admit-reader",
             post(publication_control_admit_reader),
+        )
+        .route(
+            "/authority/publication-control/rollout/authorize-next-reader",
+            post(publication_control_authorize_next_reader),
         )
         .route(
             "/authority/publication-control/rollout/release",
@@ -8914,6 +8928,16 @@ fn mcp_session_registry_snapshot(
     state: &DaemonState,
 ) -> Result<kin_mcp::SessionRegistry, (StatusCode, String)> {
     let sessions = state.coordinator.list_sessions().map_err(internal_error)?;
+    // Read before `sessions` is handed to the registry, because the transaction
+    // sweep below needs to know which owners are still alive. Lowercased on
+    // both sides of the comparison: a transaction records the session id string
+    // its caller sent, and every id-resolving path in this file parses that
+    // string as a UUID rather than matching it byte for byte, so an agent that
+    // sent an upper-case id must not read as an orphan here.
+    let live_session_ids: HashSet<String> = sessions
+        .iter()
+        .map(|session| session.session_id.to_string().to_ascii_lowercase())
+        .collect();
     let now = kin_model::Timestamp::now();
     let mut intents: Vec<_> = state
         .graph
@@ -8934,12 +8958,67 @@ fn mcp_session_registry_snapshot(
     // Restore in-flight transactions so a registry built fresh for this request
     // sees what earlier requests staged; sessions/intents persist via the graph,
     // but transactions live only in DaemonState.
+    expire_orphaned_mcp_transactions(state, &live_session_ids);
     let transactions = lock_recover(&state.mcp_transactions)
         .values()
         .cloned()
         .collect();
     registry.replace_transactions(transactions);
     Ok(registry)
+}
+
+/// Collect transactions whose owning session is gone.
+///
+/// A transaction is owned by a session, and the daemon's sweeper reaps an idle
+/// session while leaving its transactions where they are, so an agent that dies
+/// mid-edit used to leave its staged set in the durable map for the life of the
+/// install. Nothing could ever act on it again: `kin_transaction_stage` and
+/// `kin_transaction_commit` both resolve through the owner, and the owner does
+/// not exist.
+///
+/// Two conditions, and both are needed. The owner must be absent from the live
+/// session set, which on its own is the whole leak and is what makes this safe:
+/// a session still working is never touched however long its transaction has sat
+/// between calls, so a long read phase between a begin and its first stage
+/// cannot be collected out from under an agent. And the transaction must be idle
+/// past the same window the session sweeper judges a session on, so a
+/// transaction begun moments before its owner's record is read is not collected
+/// on a race.
+///
+/// `committing` is never collected: that state is the restart fence, and its
+/// digest is what tells a resumed commit an idempotent receipt recovery from a
+/// changed payload.
+fn expire_orphaned_mcp_transactions(state: &DaemonState, live_session_ids: &HashSet<String>) {
+    let idle_window = state.coordinator.session_idle_ttl();
+    let Ok(idle_window) = chrono::Duration::from_std(idle_window) else {
+        return;
+    };
+    let now = kin_model::Timestamp::now();
+    let mut store = lock_recover(&state.mcp_transactions);
+    let mut expired: Vec<String> = Vec::new();
+    store.retain(|transaction_id, transaction| {
+        if !kin_mcp::session::is_expirable_transaction_state(&transaction.state) {
+            return true;
+        }
+        if live_session_ids.contains(&transaction.session_id.to_ascii_lowercase()) {
+            return true;
+        }
+        if now.0.signed_duration_since(transaction.last_activity_at.0) < idle_window {
+            return true;
+        }
+        expired.push(transaction_id.clone());
+        false
+    });
+    if expired.is_empty() {
+        return;
+    }
+    warn!(
+        count = expired.len(),
+        transaction_ids = %expired.join(","),
+        idle_window_secs = idle_window.num_seconds(),
+        "collected in-flight MCP transactions whose owning session is gone"
+    );
+    crate::state::write_persisted_mcp_transactions(&state.layout, &store);
 }
 
 /// Persist the registry's transactions back into `DaemonState` after a tool call
@@ -13065,6 +13144,270 @@ fn hosted_trace_data_flow_result(
     Ok(result)
 }
 
+/// The ceilings the default `/mcp/tools/call` route declares, the local twin of
+/// the `REPO_SCOPED_*` block this file already carries for the hosted route.
+///
+/// They exist for the same reason and they are NOT the same numbers, which is
+/// the whole of the difference worth understanding. The hosted route serves
+/// many tenants from one process, so it REFUSES anything past its ceiling and
+/// sets that ceiling at what a hosted answer is worth. This route serves one
+/// user's own agents against one repository, where a refusal is a broken tool
+/// rather than a protected neighbour, so it CLAMPS and says so in the response.
+/// The values are therefore set above every legitimate caller in this
+/// repository rather than at the hosted number: `scripts/acceptance/`
+/// deliberately drives `limit: 60` and `token_budget: 200000`, both of which the
+/// hosted ceilings (50 and 32,000) would cut, and both of which grade on main
+/// rather than on a pull request, so taking the hosted numbers here would have
+/// broken the acceptance suite one landing after this one.
+///
+/// What they do bound is the shape that has no legitimate caller at all. A
+/// `semantic_locate` fetches `page_size * 8` candidates and ranks every one, so
+/// a prompt-injected agent asking for a `page_size` of four billion is asking
+/// this daemon to allocate and rank thirty-two billion rows, and every other
+/// client on the daemon waits behind it. Bounding the work is what closes that,
+/// and the clamp being disclosed is what keeps the answer honest.
+///
+/// Deliberately ABOVE axum's inherited 2 MiB default rather than equal to it.
+/// This started at 2 MiB, matching the framework, and falsification caught that
+/// for what it was: a declared ceiling identical to the default it replaces
+/// changes nothing at runtime, and no test can tell the two apart, because
+/// dropping the declaration leaves the framework refusing the same body at the
+/// same size with the same status. Four MiB is also the better product number.
+/// A `kin_transaction_stage` body carries a whole file's new text, and 2 MiB
+/// refuses a large generated, vendored or lockfile-shaped source that a real
+/// refactor has every right to stage. Eight such calls still fit inside one
+/// transaction's 32 MiB staged-byte ceiling.
+const MCP_LOCAL_CALL_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Primary rows one page may hold. The largest legitimate caller in this tree
+/// asks for 60; a thousand is sixteen times that and still bounds the `* 8`
+/// candidate fetch at eight thousand rows.
+const MCP_LOCAL_LOCATE_MAX_PAGE_SIZE: u64 = 1_000;
+/// Query variants one fan-out may carry. Each variant is an independent
+/// retrieval run, so this is the one locate argument that multiplies whole
+/// pipeline passes rather than rows, and a 2 MiB body holds tens of thousands
+/// of them.
+const MCP_LOCAL_LOCATE_MAX_ADDITIONAL_QUERIES: usize = 16;
+/// Neighbourhood hops a context pack may walk. Same value as the hosted twin:
+/// the acceptance suite's deepest pack is exactly 8, so nothing legitimate is
+/// cut by holding the hosted number here.
+const MCP_LOCAL_CONTEXT_MAX_DEPTH: u64 = 8;
+/// Tokens a context pack may spend. The pack builder adds rows until the budget
+/// is met, so an unbounded budget is a walk over the whole graph. The
+/// acceptance suite drives 200,000 to observe an uncut pack, so the ceiling
+/// sits five times above that rather than at the hosted 32,000.
+const MCP_LOCAL_CONTEXT_MAX_TOKEN_BUDGET: u64 = 1_000_000;
+
+/// Refuse a call whose DECLARED body length is already over the ceiling, before
+/// a byte of it is read.
+///
+/// The streaming limit below this is not enough on its own, and the difference
+/// is the point. `DefaultBodyLimit` wraps the body in `http_body_util::Limited`,
+/// which errors only once the bytes it has already taken exceed the budget
+/// (`limited.rs`, `poll_frame`); its `size_hint` is reported and never consulted
+/// as a gate, and axum performs no request-side `Content-Length` check of its
+/// own anywhere. So a caller announcing a gigabyte was served by reading a
+/// ceiling's worth of it first and refusing after. That is a bound on memory,
+/// which is worth having, but it is not a bound on work: the daemon still paid
+/// for every byte up to the ceiling on a request it was always going to reject.
+///
+/// A declared length is a claim rather than a fact, so this does NOT replace the
+/// streaming limit. A request that declares nothing, declares a lie, or arrives
+/// chunked still meets `DefaultBodyLimit`. This layer only ends the case where
+/// the caller told us up front that it would not fit.
+async fn refuse_oversized_declared_mcp_body(
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if let Some(declared) = declared {
+        if declared > MCP_LOCAL_CALL_MAX_BODY_BYTES as u64 {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "mcp tool call declares a {declared}-byte body, over the \
+                     {MCP_LOCAL_CALL_MAX_BODY_BYTES}-byte limit this route accepts; \
+                     nothing was read"
+                ),
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
+}
+
+/// The component name a clamp disclosure is published under, so a client can
+/// find it without matching prose.
+const REQUEST_BOUNDS_COMPONENT: &str = "request_bounds";
+/// The reason a clamp disclosure is published under.
+const ARGUMENT_CLAMPED_REASON: &str = "argument_clamped";
+
+/// One argument this route cut down before it ran, kept so the response can
+/// name it rather than answer a narrower question in silence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpLocalClamp {
+    argument: &'static str,
+    requested: u64,
+    clamped_to: u64,
+}
+
+/// Clamp the bounded arguments of one default-route call in place, returning
+/// what was cut.
+///
+/// Only numbers are touched, and only numbers that parse as unsigned integers
+/// above their ceiling. A caller that sent a string where an integer belongs is
+/// left exactly as it was, so the type validation downstream still produces its
+/// own error rather than having this pass quietly repair the argument first.
+fn clamp_mcp_local_call_arguments(
+    name: &str,
+    arguments: &mut HashMap<String, serde_json::Value>,
+) -> Vec<McpLocalClamp> {
+    fn clamp_u64(
+        arguments: &mut HashMap<String, serde_json::Value>,
+        key: &'static str,
+        ceiling: u64,
+        clamps: &mut Vec<McpLocalClamp>,
+    ) {
+        let Some(requested) = arguments.get(key).and_then(serde_json::Value::as_u64) else {
+            return;
+        };
+        if requested <= ceiling {
+            return;
+        }
+        arguments.insert(key.to_string(), json!(ceiling));
+        clamps.push(McpLocalClamp {
+            argument: key,
+            requested,
+            clamped_to: ceiling,
+        });
+    }
+
+    let mut clamps = Vec::new();
+    match name {
+        "semantic_locate" => {
+            for key in ["limit", "page_size"] {
+                clamp_u64(arguments, key, MCP_LOCAL_LOCATE_MAX_PAGE_SIZE, &mut clamps);
+            }
+            // Truncated rather than refused, for the same reason the numbers
+            // are clamped: the fan-out's first variants are the ones the caller
+            // wrote first, so a cut set still answers the question asked.
+            if let Some(queries) = arguments
+                .get_mut("queries")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                let requested = queries.len();
+                if requested > MCP_LOCAL_LOCATE_MAX_ADDITIONAL_QUERIES {
+                    queries.truncate(MCP_LOCAL_LOCATE_MAX_ADDITIONAL_QUERIES);
+                    clamps.push(McpLocalClamp {
+                        argument: "queries",
+                        requested: requested as u64,
+                        clamped_to: MCP_LOCAL_LOCATE_MAX_ADDITIONAL_QUERIES as u64,
+                    });
+                }
+            }
+        }
+        "get_context_pack" => {
+            clamp_u64(arguments, "depth", MCP_LOCAL_CONTEXT_MAX_DEPTH, &mut clamps);
+            clamp_u64(
+                arguments,
+                "token_budget",
+                MCP_LOCAL_CONTEXT_MAX_TOKEN_BUDGET,
+                &mut clamps,
+            );
+        }
+        _ => {}
+    }
+    clamps
+}
+
+/// Publish the clamps this route applied on the answer they shaped.
+///
+/// A clamp nobody is told about is the failure this exists to close: the caller
+/// asked one question, a narrower one was answered, and the response reads
+/// exactly like a complete answer to the question asked. So a clamped answer
+/// that cannot carry its disclosure is refused rather than served, which is the
+/// same call [`disclose_graph_authority_retry`] makes one screen up. An
+/// unclamped answer passes through untouched, and so does a handler's own
+/// error, which is already telling the caller something truer than this would.
+fn disclose_mcp_local_clamps(
+    result: kin_mcp::ToolCallResult,
+    tool: &str,
+    clamps: &[McpLocalClamp],
+) -> kin_mcp::ToolCallResult {
+    if clamps.is_empty() || result.is_error == Some(true) {
+        return result;
+    }
+    let entries: Vec<serde_json::Value> = clamps
+        .iter()
+        .map(|clamp| {
+            json!({
+                "component": REQUEST_BOUNDS_COMPONENT,
+                "reason": ARGUMENT_CLAMPED_REASON,
+                "argument": clamp.argument,
+                "requested": clamp.requested,
+                "clamped_to": clamp.clamped_to,
+                "detail": format!(
+                    "argument '{}' was {} and this route bounds it at {}, so the answer below \
+                     was computed at {}. Nothing here is wrong, and it is narrower than what was \
+                     asked for: page the rest with `cursor` rather than by asking for a wider \
+                     window.",
+                    clamp.argument, clamp.requested, clamp.clamped_to, clamp.clamped_to,
+                ),
+                "remediation": "request at or below the bound, and page for the remainder",
+            })
+        })
+        .collect();
+
+    let Some(kin_mcp::ContentBlock::Text { text }) = result.content.first() else {
+        return clamp_disclosure_failure(tool, clamps);
+    };
+    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(text) else {
+        return clamp_disclosure_failure(tool, clamps);
+    };
+    if !payload.is_object() {
+        return clamp_disclosure_failure(tool, clamps);
+    }
+    match payload
+        .get_mut("degradations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(existing) => existing.extend(entries),
+        None => payload["degradations"] = serde_json::Value::Array(entries),
+    }
+    match serde_json::to_string_pretty(&payload) {
+        Ok(rendered) => kin_mcp::ToolCallResult {
+            content: vec![kin_mcp::ContentBlock::Text { text: rendered }],
+            is_error: result.is_error,
+        },
+        Err(_) => clamp_disclosure_failure(tool, clamps),
+    }
+}
+
+/// The refusal a clamped answer takes when its payload cannot carry the
+/// disclosure. Both tools this route clamps answer with a JSON object, so
+/// reaching here means the surface is already broken in a way the caller needs
+/// told about rather than smoothed over.
+fn clamp_disclosure_failure(tool: &str, clamps: &[McpLocalClamp]) -> kin_mcp::ToolCallResult {
+    let named = clamps
+        .iter()
+        .map(|clamp| {
+            format!(
+                "{} {} -> {}",
+                clamp.argument, clamp.requested, clamp.clamped_to
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    kin_mcp::ToolCallResult::error(format!(
+        "{tool} was answered under this route's argument bounds ({named}) but its payload could \
+         not carry the {REQUEST_BOUNDS_COMPONENT}:{ARGUMENT_CLAMPED_REASON} disclosure, so this \
+         daemon will not publish it as though it had answered the question as asked"
+    ))
+}
+
 /// POST /mcp/tools/call.
 ///
 /// The route bounds every retrieval response it serves, on the same budget and
@@ -13083,19 +13426,44 @@ fn hosted_trace_data_flow_result(
 async fn mcp_tools_call(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
-    Json(mut request): Json<McpToolCallRequest>,
+    request: std::result::Result<Json<McpToolCallRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Taken as a `Result` so the body ceiling this route declares refuses by
+    // name. Left as a bare extractor, an oversize body became the framework's
+    // own 413 with no mention of which ceiling was hit or what this daemon
+    // accepts, which is indistinguishable to a caller from the daemon being
+    // broken.
+    let Json(mut request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            let named = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                format!(
+                    "mcp tool call body exceeds the {MCP_LOCAL_CALL_MAX_BODY_BYTES}-byte limit \
+                     this route accepts: {}",
+                    rejection.body_text()
+                )
+            } else {
+                format!("invalid mcp tool call envelope: {}", rejection.body_text())
+            };
+            return Err((rejection.status(), named));
+        }
+    };
     // Resolve an accepted alias to the registered name before anything keyed on
     // a tool name reads it. `agent-default` served the declaration filter as
     // `find_declarations` for four landings, so that name is still accepted; the
     // dispatcher, the budget shape and the negative spec all stay keyed on the
     // registered name. Every other name passes through.
     kin_mcp::agent_belt::canonicalize_tool_name(&mut request.name);
+    // Bound the WORK before the call runs, and record what was cut so the
+    // answer can say so. Applied after canonicalization, because the clamps are
+    // keyed on the registered tool name like everything else on this route.
+    let clamps = clamp_mcp_local_call_arguments(&request.name, &mut request.arguments);
     let budget =
         kin_mcp::budget::ResponseBudget::from_arguments(&request.arguments).less_envelope_reserve();
     let tool = request.name.clone();
     let Json(result) = mcp_tools_call_inner(headers, State(state), Json(request)).await?;
-    Ok(Json(bound_mcp_tool_result(result, &tool, &budget)))
+    let bounded = bound_mcp_tool_result(result, &tool, &budget);
+    Ok(Json(disclose_mcp_local_clamps(bounded, &tool, &clamps)))
 }
 
 /// Apply the response budget to one tool result's payload text.
@@ -16308,6 +16676,33 @@ async fn publication_control_admit_reader(
         .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
     let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
     Ok(Json(record))
+}
+
+/// Name the image identity that may admit itself at its next startup.
+///
+/// This is the one route on this surface that does not act on the daemon
+/// serving it, and the one that takes no lease proof. The promotion calls it
+/// against the healthy outgoing daemon before the new image is applied, so
+/// nothing ever has to reach an unready or restarting pod, and it holds nothing
+/// while doing so, so the running daemon's readiness is untouched. The daemon
+/// still admits only itself: admit-reader refuses any reader but the one
+/// running, which is why the promotion writes an authorization rather than the
+/// reader. The administrator token is the whole authorization to write here,
+/// which is why this route must stay under the publication-control prefix that
+/// demands it.
+async fn publication_control_authorize_next_reader(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<crate::publication_lease::AuthorizeNextReaderRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let record = publication_control(&state)?
+        .authorize_next_reader(request)
+        .map_err(publication_control_error)?;
+    // Redacted, unlike admit-reader's echo of the caller's own record. The
+    // caller wants to read back the identity it just wrote, and nothing on this
+    // route needs a lease token in the response to do that.
+    Ok(Json(
+        crate::publication_lease::PublicationControlStatus::from(record),
+    ))
 }
 
 async fn publication_control_release_rollout(
@@ -31564,6 +31959,8 @@ mod tests {
     async fn publication_control_api_drives_the_rollout_to_release() {
         const READER_A: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const READER_B: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let fleet = vec![
             "kin".to_string(),
             "kin-db".to_string(),
@@ -31719,6 +32116,129 @@ mod tests {
             readiness.status(),
             StatusCode::OK,
             "the daemon must be reader-ready once the rollout has released"
+        );
+
+        // The promotion's own call, in the state production is actually in when
+        // it runs: settled, ready, no lease anywhere. It presents no proof
+        // because there is none to present.
+        let (status, authorized) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/authorize-next-reader",
+            serde_json::json!({ "scope": scope, "identity": READER_B }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the promotion must name its successor with no lease at all: {authorized}"
+        );
+        assert_eq!(
+            authorized["next_reader_identity"].as_str(),
+            Some(READER_B),
+            "{authorized}"
+        );
+        assert!(
+            authorized["active_lease"].is_null(),
+            "naming the successor must take no lease: {authorized}"
+        );
+
+        // And it costs the running daemon nothing. This is the property that
+        // paid for dropping the lease: readiness is open on the same daemon
+        // immediately after the call, so a promotion opens no gap at all.
+        let readiness = app
+            .clone()
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            readiness.status(),
+            StatusCode::OK,
+            "naming a successor must not close the running daemon's readiness"
+        );
+
+        let control_status = app
+            .clone()
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .header("authorization", "Bearer publication-test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control_status.status(), StatusCode::OK);
+        let status_body = axum::body::to_bytes(control_status.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let status_text = String::from_utf8(status_body.to_vec()).unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+        assert_eq!(
+            status_json["next_reader_identity"].as_str(),
+            Some(READER_B),
+            "the successor starts long after this call, so the record has to carry it: {status_json}"
+        );
+        assert!(
+            !status_text.contains("\"token\""),
+            "read-only publication status must not disclose live lease capability: {status_text}"
+        );
+    }
+
+    /// The route sits on the administrator surface, not the daemon one. It is
+    /// the only publication-control route a caller reaches while holding no
+    /// lease, so nothing else stands between an ordinary daemon credential and
+    /// a write that decides which image opens readiness on the whole fleet.
+    #[tokio::test]
+    async fn authorizing_the_next_reader_demands_the_administrator_token() {
+        const READER_B: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let app = router_with_publication_control_auth(
+            test_state(),
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        );
+        let authorize = |app: Router, token: Option<&'static str>| async move {
+            let mut request =
+                Request::post("/authority/publication-control/rollout/authorize-next-reader")
+                    .header("content-type", "application/json");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            app.oneshot(
+                request
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "scope": "gcs://fixture/v2",
+                            "identity": READER_B
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+
+        // An ordinary daemon token is authenticated and unauthorized here, so
+        // 403 rather than 401: telling a caller holding a live credential that
+        // it holds none sends it to rotate a working token.
+        assert_eq!(
+            authorize(app.clone(), Some("daemon-test-token")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            authorize(app.clone(), Some("not-a-token")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(authorize(app.clone(), None).await, StatusCode::UNAUTHORIZED);
+
+        // The control the refusals need: the administrator token passes the
+        // guard. Without it every assertion above would also hold on a route
+        // that refuses everyone, including the caller it exists for.
+        let admin = authorize(app, Some("publication-test-token")).await;
+        assert!(
+            admin != StatusCode::UNAUTHORIZED && admin != StatusCode::FORBIDDEN,
+            "the administrator token must pass the auth guard, got {admin}"
         );
     }
 
@@ -36964,6 +37484,427 @@ mod tests {
         };
         assert!(text.contains("handler"));
         assert!(text.contains("src/lib.py"));
+    }
+
+    /// A tool result carrying one JSON object, the shape both clamped tools
+    /// answer in.
+    fn json_tool_result(payload: serde_json::Value) -> kin_mcp::ToolCallResult {
+        kin_mcp::ToolCallResult::text(payload.to_string())
+    }
+
+    /// The payload a disclosed result carries, so an assertion reads the object
+    /// rather than the rendered string.
+    fn tool_result_payload(result: &kin_mcp::ToolCallResult) -> serde_json::Value {
+        let kin_mcp::ContentBlock::Text { text } = result
+            .content
+            .first()
+            .expect("a tool result under test must carry a content block");
+        serde_json::from_str(text).expect("payload must be JSON")
+    }
+
+    /// axum's own default body limit, which every `Json` extractor inherits
+    /// when no `DefaultBodyLimit` layer is declared (`axum-core-0.5.6`,
+    /// `src/ext_traits/request.rs:319`). Named here because the route's ceiling
+    /// is only observable if it differs from this.
+    const AXUM_DEFAULT_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+
+    /// The route's declared ceiling has to EXCEED the framework default it
+    /// replaces, or the declaration changes nothing at runtime and no test can
+    /// tell the two apart. That is not a hypothetical: this route shipped at
+    /// exactly 2 MiB, and the falsification arm that drops the declaration
+    /// survived because removing it left the framework refusing the same body
+    /// at the same size with the same status.
+    ///
+    /// Asserted at COMPILE time, unlike the probe guards inside the tests
+    /// below. Those have to survive to run, because a falsification arm that
+    /// raises a ceiling should produce a red test rather than a build break.
+    /// Nothing mutates this relationship, so the earliest possible failure is
+    /// the right one, and clippy is correct that a folded `assert!` belongs
+    /// here rather than in a test body.
+    const _: () = assert!(
+        MCP_LOCAL_CALL_MAX_BODY_BYTES > AXUM_DEFAULT_BODY_LIMIT_BYTES,
+        "the route's declared body ceiling must exceed axum's inherited default, \
+         or declaring it changes nothing"
+    );
+
+    #[tokio::test]
+    async fn mcp_tools_call_refuses_a_body_over_the_declared_ceiling() {
+        // Declares an oversize length and sends NO body, which is the whole
+        // design of this test and of the layer it grades.
+        //
+        // It first built the oversized body to prove the refusal, and under
+        // falsification that cost 8 GiB resident on a loaded box: raising the
+        // ceiling raised the body with it, because the probe was derived from
+        // the value under test. Both faults have the same cure. A refusal that
+        // allocates what it refuses is a delayed ceiling rather than a ceiling,
+        // so the route now reads the declared length first, and a test that
+        // sends nothing is the only kind that can prove it did.
+        // Fixed, not `MCP_LOCAL_CALL_MAX_BODY_BYTES + 1`. A probe computed from
+        // the value under test cannot grade that value: raising the ceiling
+        // raises the probe with it and the refusal still arrives. This test was
+        // written that way twice, and falsification caught it both times. The
+        // guard below is what turns a raised ceiling red.
+        // A `let`, for the reason the sibling guard in session.rs spells out: a
+        // constant-folded `assert!` belongs in a `const` block, and that form
+        // turns a raised ceiling into a build break rather than the red test
+        // this guard exists to produce. Clippy does not flag this one today
+        // only because the `as u64` cast defeats its folding, which is not a
+        // reason to write it differently from its sibling.
+        let declared_over_ceiling = 5 * 1024 * 1024u64;
+        assert!(
+            declared_over_ceiling > MCP_LOCAL_CALL_MAX_BODY_BYTES as u64,
+            "the declared length must exceed the ceiling or this test grades \
+             nothing"
+        );
+        let over_ceiling = declared_over_ceiling;
+
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .header("content-length", over_ceiling.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an oversize DECLARED length must be refused before the body is \
+             read; an empty body can never trip the streaming limit, so a 413 \
+             here can only have come from reading the declaration"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains(&MCP_LOCAL_CALL_MAX_BODY_BYTES.to_string())
+                && text.contains(&over_ceiling.to_string()),
+            "the refusal must name both the ceiling it enforced and what was \
+             declared, or a caller cannot tell it from the daemon being \
+             broken: {text}"
+        );
+        assert!(
+            text.contains("nothing was read"),
+            "the refusal says it read nothing, which is the property under \
+             test: {text}"
+        );
+
+        // The control: a call declaring a length inside the ceiling is admitted
+        // past this layer, so the 413 above is the declaration and not the
+        // route refusing everything.
+        let response = app
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": "semantic_search", "arguments": { "query": "x" } })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an ordinary call must not trip the body ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_that_declares_no_length_still_meets_the_streaming_limit() {
+        // The attacker's case, and the reason the declared-length layer is not
+        // enough on its own. A declared length is a claim: omit the header and
+        // the fast refusal never fires, so the streaming limit underneath it is
+        // the only thing left. `Body::from_stream` has an unknown size hint and
+        // therefore sends no `Content-Length`, which is exactly that shape.
+        //
+        // The assertion that matters is not just the 413. It is how MUCH was
+        // served before it: a limit that reads the whole body and refuses at
+        // the end bounds nothing, so this counts the bytes the stream actually
+        // handed over and requires them to stop within one chunk of the
+        // ceiling.
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let chunk = 64 * 1024usize;
+        // Four times the ceiling, so a limit that never fired would be obvious
+        // in the count rather than merely slow.
+        let chunks = (MCP_LOCAL_CALL_MAX_BODY_BYTES / chunk) * 4;
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&served);
+        let stream = futures_util::stream::iter((0..chunks).map(move |_| {
+            counter.fetch_add(chunk, std::sync::atomic::Ordering::Relaxed);
+            Ok::<_, std::io::Error>(vec![b'x'; chunk])
+        }));
+
+        let response = app
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .body(Body::from_stream(stream))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a body that declares no length must still meet the streaming limit, \
+             or omitting one header buys an unbounded request"
+        );
+        let served = served.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            served <= MCP_LOCAL_CALL_MAX_BODY_BYTES + chunk,
+            "the limit must stop within one chunk of the ceiling; it took {served} \
+             bytes against a {MCP_LOCAL_CALL_MAX_BODY_BYTES}-byte ceiling, so it is \
+             reading the whole body and refusing afterwards"
+        );
+    }
+
+    #[test]
+    fn the_default_route_clamps_the_arguments_that_buy_unbounded_work() {
+        let mut locate = HashMap::from([
+            ("query".to_string(), json!("where does the daemon start")),
+            ("page_size".to_string(), json!(4_000_000_000u64)),
+            ("limit".to_string(), json!(5)),
+            (
+                "queries".to_string(),
+                json!(vec!["variant"; MCP_LOCAL_LOCATE_MAX_ADDITIONAL_QUERIES + 4]),
+            ),
+        ]);
+        let clamps = clamp_mcp_local_call_arguments("semantic_locate", &mut locate);
+        assert_eq!(
+            locate.get("page_size").and_then(serde_json::Value::as_u64),
+            Some(MCP_LOCAL_LOCATE_MAX_PAGE_SIZE)
+        );
+        assert_eq!(
+            locate.get("limit").and_then(serde_json::Value::as_u64),
+            Some(5),
+            "an argument already inside the bound is left exactly as it was"
+        );
+        assert_eq!(
+            locate
+                .get("queries")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(MCP_LOCAL_LOCATE_MAX_ADDITIONAL_QUERIES)
+        );
+        assert!(clamps.iter().any(|clamp| clamp.argument == "page_size"
+            && clamp.requested == 4_000_000_000
+            && clamp.clamped_to == MCP_LOCAL_LOCATE_MAX_PAGE_SIZE));
+        assert!(clamps.iter().any(|clamp| clamp.argument == "queries"));
+        assert!(
+            !clamps.iter().any(|clamp| clamp.argument == "limit"),
+            "nothing was cut on `limit`, so nothing may be reported on it"
+        );
+
+        let mut pack = HashMap::from([
+            ("entity_id".to_string(), json!(Uuid::nil().to_string())),
+            ("depth".to_string(), json!(u64::MAX)),
+            ("token_budget".to_string(), json!(200_000)),
+        ]);
+        let clamps = clamp_mcp_local_call_arguments("get_context_pack", &mut pack);
+        assert_eq!(
+            pack.get("depth").and_then(serde_json::Value::as_u64),
+            Some(MCP_LOCAL_CONTEXT_MAX_DEPTH)
+        );
+        assert_eq!(
+            pack.get("token_budget").and_then(serde_json::Value::as_u64),
+            Some(200_000),
+            "the acceptance suite drives a 200,000-token pack on purpose, and a \
+             ceiling that cut it would break a suite that grades on main"
+        );
+        assert_eq!(clamps.len(), 1);
+
+        // A string where an integer belongs is left alone, so the type check
+        // downstream still produces its own error rather than having this pass
+        // quietly repair the argument first.
+        let mut typed = HashMap::from([("page_size".to_string(), json!("enormous"))]);
+        assert!(clamp_mcp_local_call_arguments("semantic_locate", &mut typed).is_empty());
+        assert_eq!(typed.get("page_size"), Some(&json!("enormous")));
+
+        // The control: a tool this route does not bound is untouched, so the
+        // clamp cannot be mistaken for a blanket rewrite of every call.
+        let mut other = HashMap::from([("limit".to_string(), json!(u64::MAX))]);
+        assert!(clamp_mcp_local_call_arguments("semantic_search", &mut other).is_empty());
+        assert_eq!(
+            other.get("limit").and_then(serde_json::Value::as_u64),
+            Some(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn a_clamped_answer_names_its_clamp_in_the_degradations_channel() {
+        let clamps = vec![McpLocalClamp {
+            argument: "page_size",
+            requested: 4_000_000_000,
+            clamped_to: MCP_LOCAL_LOCATE_MAX_PAGE_SIZE,
+        }];
+
+        // An existing degradation is kept: this channel already carries the
+        // retrieval capability reports, and a clamp that replaced them would
+        // hide a degraded index behind a bounds notice.
+        let existing = json!({
+            "entities": [],
+            "degradations": [{ "component": "vector_index", "reason": "empty" }]
+        });
+        let disclosed =
+            disclose_mcp_local_clamps(json_tool_result(existing), "semantic_locate", &clamps);
+        let payload = tool_result_payload(&disclosed);
+        let reported = payload["degradations"]
+            .as_array()
+            .expect("degradations must stay an array");
+        assert_eq!(reported.len(), 2);
+        assert_eq!(reported[0]["component"], json!("vector_index"));
+        assert_eq!(reported[1]["component"], json!(REQUEST_BOUNDS_COMPONENT));
+        assert_eq!(reported[1]["reason"], json!(ARGUMENT_CLAMPED_REASON));
+        assert_eq!(reported[1]["argument"], json!("page_size"));
+        assert_eq!(reported[1]["requested"], json!(4_000_000_000u64));
+        assert_eq!(
+            reported[1]["clamped_to"],
+            json!(MCP_LOCAL_LOCATE_MAX_PAGE_SIZE)
+        );
+
+        // A payload with no degradations key gets one.
+        let disclosed = disclose_mcp_local_clamps(
+            json_tool_result(json!({ "entities": [] })),
+            "semantic_locate",
+            &clamps,
+        );
+        assert_eq!(
+            tool_result_payload(&disclosed)["degradations"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        // The control: nothing was clamped, so nothing is stamped and the
+        // payload is returned as it was built.
+        let untouched = disclose_mcp_local_clamps(
+            json_tool_result(json!({ "entities": [] })),
+            "semantic_locate",
+            &[],
+        );
+        assert!(tool_result_payload(&untouched)
+            .get("degradations")
+            .is_none());
+    }
+
+    #[test]
+    fn a_clamped_answer_that_cannot_carry_its_disclosure_is_refused() {
+        let clamps = vec![McpLocalClamp {
+            argument: "token_budget",
+            requested: u64::MAX,
+            clamped_to: MCP_LOCAL_CONTEXT_MAX_TOKEN_BUDGET,
+        }];
+        let refused = disclose_mcp_local_clamps(
+            kin_mcp::ToolCallResult::text("not json at all".to_string()),
+            "get_context_pack",
+            &clamps,
+        );
+        assert_eq!(
+            refused.is_error,
+            Some(true),
+            "a narrower answer that cannot say it is narrower must not be served \
+             as though it answered the question asked"
+        );
+        let kin_mcp::ContentBlock::Text { text } = refused.content.first().unwrap();
+        assert!(text.contains("token_budget"), "{text}");
+        assert!(text.contains(REQUEST_BOUNDS_COMPONENT), "{text}");
+
+        // The control: a handler's own error passes through untouched, because
+        // it is already telling the caller something truer than this would.
+        let handler_error = kin_mcp::ToolCallResult::error("Entity not found: 0000".to_string());
+        let passed = disclose_mcp_local_clamps(handler_error, "get_context_pack", &clamps);
+        let kin_mcp::ContentBlock::Text { text } = passed.content.first().unwrap();
+        assert_eq!(text, "Entity not found: 0000");
+    }
+
+    #[test]
+    fn an_orphaned_transaction_is_collected_and_a_live_one_never_is() {
+        let state = test_state();
+        let live = Uuid::new_v4().to_string();
+        let dead = Uuid::new_v4().to_string();
+        let stale: kin_model::Timestamp =
+            serde_json::from_str("\"2020-01-01T00:00:00Z\"").expect("a wire timestamp must parse");
+
+        // A `fn` rather than a closure: a closure's annotated reference
+        // parameters take one inferred lifetime from their first call, and this
+        // is called with both a long-lived binding and a temporary.
+        fn transaction(
+            id: &str,
+            session: &str,
+            state_name: &str,
+            at: kin_model::Timestamp,
+        ) -> kin_mcp::McpTransaction {
+            kin_mcp::McpTransaction {
+                transaction_id: id.to_string(),
+                session_id: session.to_string(),
+                scope: "src/lib.rs".to_string(),
+                state: state_name.to_string(),
+                staged_operations: Vec::new(),
+                commit_payload_hash: None,
+                last_activity_at: at,
+            }
+        }
+        {
+            let mut store = lock_recover(&state.mcp_transactions);
+            store.insert(
+                "orphan-stale".to_string(),
+                transaction("orphan-stale", &dead, "active", stale.clone()),
+            );
+            store.insert(
+                "orphan-fresh".to_string(),
+                transaction("orphan-fresh", &dead, "active", kin_model::Timestamp::now()),
+            );
+            store.insert(
+                "owner-live".to_string(),
+                transaction("owner-live", &live, "active", stale.clone()),
+            );
+            store.insert(
+                "fenced".to_string(),
+                transaction("fenced", &dead, "committing", stale),
+            );
+        }
+
+        let live_sessions = HashSet::from([live.to_ascii_lowercase()]);
+        expire_orphaned_mcp_transactions(&state, &live_sessions);
+
+        let store = lock_recover(&state.mcp_transactions);
+        assert!(
+            !store.contains_key("orphan-stale"),
+            "a transaction idle past the window whose owner is gone can never be \
+             acted on again, so it is the leak this collects"
+        );
+        assert!(
+            store.contains_key("owner-live"),
+            "a live session's transaction is never collected however long it has \
+             sat between calls, or a long read phase loses its own work"
+        );
+        assert!(
+            store.contains_key("orphan-fresh"),
+            "both conditions are required: a transaction begun moments ago must \
+             survive a race against its owner's record being read"
+        );
+        assert!(
+            store.contains_key("fenced"),
+            "a committing transaction is the restart fence and is never \
+             collected, or a resumed commit is stranded"
+        );
     }
 
     async fn mcp_call(

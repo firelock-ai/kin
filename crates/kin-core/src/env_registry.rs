@@ -241,7 +241,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     // ---- supervisor -----------------------------------------------------------
     EnvVarSpec { name: "KIN_SUPERVISOR_URL", kind: Kind::Url, default: "", sensitivity: Sensitivity::Operational, summary: "explicit supervisor endpoint URL" },
     EnvVarSpec { name: "KIN_SUPERVISOR_BIND_HOST", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "host/interface the supervisor binds to" },
-    EnvVarSpec { name: "KIN_SUPERVISOR_REQUIRE_TOKEN", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "require a bearer token for supervisor requests" },
+    EnvVarSpec { name: "KIN_SUPERVISOR_REQUIRE_TOKEN", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "require a bearer token for supervisor requests; set falsy to opt out" },
     EnvVarSpec { name: "KIN_SUPERVISOR_IDLE_TIMEOUT_SECS", kind: Kind::Secs, default: "3600", sensitivity: Sensitivity::Operational, summary: "supervisor auto-shutdown idle period; 0 disables idle shutdown" },
     EnvVarSpec { name: "KIN_SUPERVISOR_STARTUP_GENERATION", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "internal versioned supervisor launch capability generation" },
     EnvVarSpec { name: "KIN_SUPERVISOR_REAP_CPU", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "enable the CPU-heuristic zombie reaper; set falsey to disable" },
@@ -309,7 +309,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_ALLOW_PARENT_STORE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "allow discovering a store in a parent directory" },
     EnvVarSpec { name: "KIN_BINARY_PATH", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "override the kin binary path for bench dispatch" },
     EnvVarSpec { name: "KIN_BUILD_GRAPH_TIMEOUT_SECS", kind: Kind::Secs, default: "60", sensitivity: Sensitivity::Operational, summary: "timeout for building a historical ref-view graph" },
-    EnvVarSpec { name: "KIN_MCP_TOOL_PROFILE", kind: Kind::Str, default: "agent-default", sensitivity: Sensitivity::Operational, summary: "MCP tool surface: agent-default (curated, the default), agent-query (the same belt with no session or transaction tools), full (every tool), benchmark, context-bench" },
+    EnvVarSpec { name: "KIN_MCP_TOOL_PROFILE", kind: Kind::Str, default: "agent-default", sensitivity: Sensitivity::Operational, summary: "MCP tool surface: agent-default (curated, the default), agent-query (the same belt with no session or transaction tools), agent-search (the measured always-on set, the rest reached through kin_tool_search), full (every tool), benchmark, context-bench" },
     EnvVarSpec { name: "KIN_MCP_REPO", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "bind `kin mcp start` to this repository instead of the launch directory" },
     EnvVarSpec { name: "KIN_MCP_CACHE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "cache directory override for the npm MCP wrapper's managed Kin binary" },
     EnvVarSpec { name: "KIN_MCP_KIN_BINARY", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "explicit native Kin binary used by the @kinlab/kin-mcp wrapper" },

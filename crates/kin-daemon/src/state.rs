@@ -6501,11 +6501,10 @@ impl DaemonState {
                 .map_err(|error| format!("load hosted spine runtime authority: {error}"))?
             {
                 crate::publication_lease::RuntimeSpineAuthority::Completed(evidence) => evidence,
-                crate::publication_lease::RuntimeSpineAuthority::RolloutActive => {
-                    return Err(
-                        "hosted spine rollout remains active; cached authority is not readable"
-                            .to_string(),
-                    )
+                crate::publication_lease::RuntimeSpineAuthority::RolloutActive(blocking) => {
+                    return Err(format!(
+                        "hosted spine {blocking}; cached authority is not readable"
+                    ))
                 }
             };
             let expected = self.expected_hosted_spine_rollout_fence()?;
@@ -17110,6 +17109,7 @@ mod tests {
                 state: "active".to_string(),
                 staged_operations: Vec::new(),
                 commit_payload_hash: None,
+                last_activity_at: kin_model::timestamp::Timestamp::now(),
             },
         );
         write_persisted_mcp_transactions(&layout, &store);

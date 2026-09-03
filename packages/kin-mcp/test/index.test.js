@@ -10,7 +10,10 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  archiveExtraction,
+  assertSecureReleaseBaseUrl,
   childEnv,
+  DEFAULT_RELEASE_BASE_URL,
   ensureKinBinary,
   resolveCachedBinaryPath,
   resolveDaemonBinaryPath,
@@ -19,6 +22,46 @@ import {
   runKinMcp,
   isTruthyEnv
 } from '../src/index.js';
+
+// The archive layout is a property of the target; the extractor is a property
+// of the host. Reading `process.platform` inside the target branch conflated
+// them, and the native Windows leg went red on three tests that unpack a Unix
+// archive on a Windows runner, where /usr/bin/tar does not exist. All four
+// combinations are asserted here rather than only the two a single runner can
+// reach, so neither leg has to be the place this is discovered.
+test('the extractor is chosen by the host and the layout by the target', () => {
+  const winEnv = { SystemRoot: 'C:\\Windows' };
+  const sys32Tar = path.win32.join('C:\\Windows', 'System32', 'tar.exe');
+
+  // Windows target.
+  assert.deepEqual(archiveExtraction('win32', winEnv, 'a.zip', 'win32'), {
+    executable: sys32Tar,
+    args: ['-xf', 'a.zip', '-C', '.']
+  });
+  assert.deepEqual(archiveExtraction('win32', {}, 'a.zip', 'linux'), {
+    executable: '/usr/bin/unzip',
+    args: ['-q', 'a.zip', '-d', '.']
+  });
+
+  // Unix target. On a Windows host this is the cross-target case, and it must
+  // not reach for /usr/bin.
+  assert.deepEqual(archiveExtraction('linux', winEnv, 'a.tar.gz', 'win32'), {
+    executable: sys32Tar,
+    args: ['-xf', 'a.tar.gz', '-C', '.']
+  });
+
+  // On a Unix host it is an absolute system tar, never a bare name PATH would
+  // resolve. Asserted as a property so the test does not care which of the two
+  // trusted directories this machine keeps tar in.
+  if (process.platform !== 'win32') {
+    const unix = archiveExtraction('linux', {}, 'a.tar.gz', 'linux');
+    assert.ok(
+      unix.executable === '/usr/bin/tar' || unix.executable === '/bin/tar',
+      `expected an absolute system tar, got ${unix.executable}`
+    );
+    assert.deepEqual(unix.args, ['-xf', 'a.tar.gz', '-C', '.']);
+  }
+});
 
 test('MCP auto-init boolean accepts the generated env-contract vocabulary', () => {
   for (const token of ['1', 'true', 'TRUE', 'TrUe', 'yes', 'YES', 'on', 'ON', ' on ']) {
@@ -527,6 +570,48 @@ test('ensureKinBinary installs the flat native Windows zip and .exe pair', async
   }
 });
 
+// The Unix arm of the same rule the Windows test above proves. `tar` was
+// resolved through PATH, so a planted `tar` unpacked the archive whose SHA-256
+// had just been verified: the integrity check protected bytes an attacker's
+// program then read. The hostile `tar` here exits 97, so this test is red
+// against a PATH lookup and green against an absolute one.
+test(
+  'ensureKinBinary unpacks the Unix archive with an absolute tar under a hostile PATH',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-hostile-tar-'));
+    const assetName = 'kin-linux-x86_64';
+    const version = '9.9.9-test';
+    const { archiveBytes, archiveName, checksum, kinBytes, daemonBytes } =
+      await buildReleaseArchive(tmpDir, assetName);
+    const server = startReleaseServer(version, archiveName, archiveBytes, checksum);
+
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const env = await environmentWithHostileTar(tmpDir, {
+      KIN_MCP_CACHE_DIR: tmpDir,
+      KIN_MCP_RELEASE_BASE_URL: baseUrl
+    });
+
+    try {
+      const binaryPath = await ensureKinBinary({
+        env,
+        platform: 'linux',
+        arch: 'x64',
+        version
+      });
+
+      assert.equal(await fs.readFile(binaryPath, 'utf8'), kinBytes.toString('utf8'));
+      const daemonPath = resolveDaemonBinaryPath(binaryPath);
+      assert.equal(await fs.readFile(daemonPath, 'utf8'), daemonBytes.toString('utf8'));
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  }
+);
+
 test('ensureKinBinary fails with a precise message when the archive omits kin-daemon', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-nodaemon-'));
   const assetName = 'kin-linux-x86_64';
@@ -822,4 +907,48 @@ test('auto-init keeps MCP stdout protocol-only from process start', async () => 
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('the release base URL must be https, or loopback for a local mirror', () => {
+  // The shipped default and any https mirror are fine.
+  assert.equal(
+    assertSecureReleaseBaseUrl(DEFAULT_RELEASE_BASE_URL),
+    DEFAULT_RELEASE_BASE_URL
+  );
+  assert.equal(
+    assertSecureReleaseBaseUrl('https://mirror.example/kin'),
+    'https://mirror.example/kin'
+  );
+
+  // A loopback mirror has no network path to sit on, so plain http is allowed
+  // there and only there. The wrapper's own tests drive one.
+  for (const loopback of [
+    'http://127.0.0.1:1',
+    'http://127.0.0.1:8080/kin',
+    'http://localhost:8080',
+    'http://[::1]:8080'
+  ]) {
+    assert.equal(assertSecureReleaseBaseUrl(loopback), loopback);
+  }
+
+  // The archive and its checksum come from this same base URL, so plain http
+  // to anywhere else means the integrity check grades the attacker's bytes
+  // against the attacker's digest, and what lands is chmod 0755 and executed.
+  for (const insecure of [
+    'http://mirror.example/kin',
+    'http://127.0.0.1.attacker.example/kin',
+    'http://localhost.attacker.example/kin',
+    'ftp://127.0.0.1/kin'
+  ]) {
+    assert.throws(
+      () => assertSecureReleaseBaseUrl(insecure),
+      /refusing to download the Kin release over/,
+      insecure
+    );
+  }
+
+  assert.throws(
+    () => assertSecureReleaseBaseUrl('not a url'),
+    /is not a URL/
+  );
 });

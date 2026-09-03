@@ -190,6 +190,28 @@ pub struct PublicationControlRecord {
     pub reader_spine_rollout_fence_payload_sha256: Option<String>,
     #[serde(default)]
     pub reader_spine_rollout_fence_update_time: Option<String>,
+    /// Image identity the promotion pipeline has authorized to admit itself at
+    /// its next startup, written under a rollout lease through
+    /// `authorize_next_reader`.
+    ///
+    /// A settled record admits only the reader it names, so without this a
+    /// promoted image is refused forever and the fleet is upgradable exactly
+    /// once. The authorization lives on the record rather than on the lease so
+    /// that releasing the lease does not drop it: the pipeline holds its lease
+    /// for a few calls before the apply, and production readiness closes for
+    /// seconds rather than for the whole rollout. It is consumed by the
+    /// admission it authorizes, so it is single-use.
+    ///
+    /// `skip_serializing_if` unlike its siblings here, and deliberately. This
+    /// struct carries `deny_unknown_fields`, so a key an older daemon does not
+    /// know refuses the whole record at deserialization, before any validation
+    /// that could explain it. The first image carrying this field rewrites the
+    /// record at its own startup rollout, and a rollback from that deploy would
+    /// otherwise meet a record its predecessor can no longer read. Absent when
+    /// unset, the settled record stays exactly the shape the outgoing image
+    /// already reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_reader_identity: Option<String>,
     pub active_lease: Option<ActivePublicationLease>,
     pub last_completed_lease: Option<CompletedPublicationLease>,
     #[serde(default)]
@@ -215,6 +237,7 @@ pub struct PublicationControlStatus {
     pub spine_rollout_fence_update_time: Option<String>,
     pub reader_spine_rollout_fence_payload_sha256: Option<String>,
     pub reader_spine_rollout_fence_update_time: Option<String>,
+    pub next_reader_identity: Option<String>,
     pub active_lease: Option<ActivePublicationLeaseStatus>,
 }
 
@@ -253,6 +276,7 @@ impl From<PublicationControlRecord> for PublicationControlStatus {
             reader_spine_rollout_fence_payload_sha256: record
                 .reader_spine_rollout_fence_payload_sha256,
             reader_spine_rollout_fence_update_time: record.reader_spine_rollout_fence_update_time,
+            next_reader_identity: record.next_reader_identity,
             active_lease: record
                 .active_lease
                 .map(|active| ActivePublicationLeaseStatus {
@@ -331,6 +355,24 @@ pub struct AdmitReaderRequest {
     pub legacy_writer_drain_proof_sha256: Option<String>,
 }
 
+/// Name the image identity that may admit itself at its next startup.
+///
+/// No lease proof, deliberately. A rollout lease closes reader admission for
+/// every image including the one currently serving production, so requiring one
+/// here would buy serialization at the price of a readiness gap on every
+/// promotion, and the promotion would have to acquire and then release a
+/// rollout it has no other use for. The record's own CAS loop already makes the
+/// write atomic. What the lease bought is ordering between two overlapping
+/// promotions, and that resolves to the last write: the digest that did not win
+/// is refused at its bootstrap with a message naming what the record admits and
+/// what it authorizes, which is visible and recoverable rather than a deadlock.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizeNextReaderRequest {
+    pub scope: String,
+    pub identity: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseRolloutLeaseRequest {
@@ -344,10 +386,58 @@ pub enum RolloutReleaseDisposition {
     CompletedExact,
 }
 
+/// The rollout lease occupying a publication-control record, as an operator
+/// needs to read it. Whether the lease is still live decides what to do about
+/// it: a live lease has a holder that will finish or lapse on its own, while an
+/// expired one has no holder left to wait for and needs the release route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockingRolloutLease {
+    pub holder: String,
+    pub fence: u64,
+    pub expires_at: DateTime<Utc>,
+    pub expired: bool,
+}
+
+impl BlockingRolloutLease {
+    /// Read a rollout lease as of `now`. Every path that refuses because of a
+    /// rollout builds its refusal from here, so none of them can drift into
+    /// calling a lapsed lease active.
+    pub(crate) fn observe(active: &ActivePublicationLease, now: DateTime<Utc>) -> Self {
+        Self {
+            holder: active.holder.clone(),
+            fence: active.fence,
+            expires_at: active.expires_at,
+            expired: active.expires_at <= now,
+        }
+    }
+}
+
+impl std::fmt::Display for BlockingRolloutLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.expired {
+            write!(
+                formatter,
+                "rollout fence {} held by {}, whose lease expired at {} and was never released",
+                self.fence,
+                self.holder,
+                self.expires_at.to_rfc3339()
+            )
+        } else {
+            write!(
+                formatter,
+                "rollout fence {} held by {} until {}",
+                self.fence,
+                self.holder,
+                self.expires_at.to_rfc3339()
+            )
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeSpineAuthority {
     Completed(kin_spine::SpineRolloutFenceEvidence),
-    RolloutActive,
+    RolloutActive(BlockingRolloutLease),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -653,18 +743,32 @@ impl PublicationControl {
             .as_ref()
             .filter(|active| active.kind == LeaseKind::Rollout)
         {
+            // Say whether the lease is still live. "Remains active" about a
+            // lease that lapsed hours ago sends an operator to wait on a holder
+            // that no longer exists.
             return Err(PublicationControlError::Admission(format!(
-                "scope {} rollout fence {} remains active and must be released or recovered before reader admission",
-                self.scope, active.fence
+                "scope {} is blocked by a {} and must be released or recovered before reader admission",
+                self.scope,
+                BlockingRolloutLease::observe(active, now)
             )));
         }
         validate_reader_admission(&record.reader, now)?;
         require_complete_record_authority_fence(&record)?;
         validate_reader_against_authority_fence(&record.reader, &record.last_authority_fence)?;
         if record.reader.identity != self.runtime_reader_identity {
+            // Name the outstanding authorization too. Two promotions that
+            // overlap resolve to the last write, and without this the digest
+            // that lost is told only that it is not the admitted reader, which
+            // is equally true of an image nobody ever promoted.
+            let authorized = match record.next_reader_identity.as_deref() {
+                Some(next) if next != self.runtime_reader_identity => {
+                    format!("; the record authorizes {next} to admit itself next")
+                }
+                _ => String::new(),
+            };
             return Err(PublicationControlError::Admission(format!(
-                "scope {} admits reader {}, but this daemon is {}",
-                self.scope, record.reader.identity, self.runtime_reader_identity
+                "scope {} admits reader {}, but this daemon is {}{}",
+                self.scope, record.reader.identity, self.runtime_reader_identity, authorized
             )));
         }
         if snapshot_schema < record.reader.min_snapshot_schema
@@ -706,13 +810,20 @@ impl PublicationControl {
     ) -> Result<RuntimeSpineAuthority, PublicationControlError> {
         let stored = self.load_required()?;
         self.validate_record(&stored.record)?;
-        if stored
+        let now = self.clock.now();
+        if let Some(active) = stored
             .record
             .active_lease
             .as_ref()
-            .is_some_and(|active| active.kind == LeaseKind::Rollout)
+            .filter(|active| active.kind == LeaseKind::Rollout)
         {
-            return Ok(RuntimeSpineAuthority::RolloutActive);
+            // Report the lease rather than the bare fact that one exists. A
+            // rollout whose lease lapsed hours ago has nobody left to wait for,
+            // and an operator told only that a rollout "remains active" waits
+            // for a holder that is already gone.
+            return Ok(RuntimeSpineAuthority::RolloutActive(
+                BlockingRolloutLease::observe(active, now),
+            ));
         }
         require_complete_record_authority_fence(&stored.record)?;
         record_spine_rollout_fence_evidence(&stored.record)?
@@ -738,12 +849,34 @@ impl PublicationControl {
     /// rollout must use the authenticated rollout API. The only existing-record
     /// recovery performed here is resuming this exact startup lease after a
     /// crash or retry.
+    ///
+    /// One further transition is admitted, and only one: an image the promotion
+    /// pipeline named in `next_reader_identity` while it held a rollout lease on
+    /// the outgoing daemon. That authorization is written by the holder of the
+    /// administrator token, against a healthy reachable daemon, before the new
+    /// image is ever applied. The record's own reader still wins when it names
+    /// this image, so a restart of an admitted daemon opens readiness without
+    /// re-fencing the fleet. Nothing here lets an image admit itself on its own
+    /// say-so.
+    ///
+    /// A crash mid-bootstrap is the one case where the next image differs from
+    /// the recorded reader. The failed image wrote its own identity into the
+    /// record before it died, so requiring an identity match would leave the
+    /// record owned forever by a daemon that no longer exists, and no
+    /// replacement image could ever start. An expired startup lease therefore
+    /// resumes on the surviving startup identifiers alone. Nothing is taken on
+    /// trust: the takeover runs through `acquire_rollout`, which refuses while
+    /// the lease is still live, raises the fence so the previous holder's proof
+    /// is stale, and re-fences every graph object; completion then re-admits
+    /// the reader under the running image. A completed record has no active
+    /// lease at all, so this never reopens a fleet that already settled.
     pub fn bootstrap_runtime_if_absent(
         &self,
     ) -> Result<Option<ActivePublicationLease>, PublicationControlError> {
         let existing = self.store.load()?;
         if let Some(stored) = existing.as_ref() {
             self.validate_record(&stored.record)?;
+            let now = self.clock.now();
             let resumes_startup = stored.record.active_lease.as_ref().is_some_and(|active| {
                 active.kind == LeaseKind::Rollout
                     && active.holder == STARTUP_BOOTSTRAP_HOLDER
@@ -751,9 +884,20 @@ impl PublicationControl {
                     && active.target_repositories == self.fleet_repositories
                     && active.previous_repositories == self.fleet_repositories
                     && active.fence_repositories == self.fleet_repositories
-                    && stored.record.reader.identity == self.runtime_reader_identity
+                    && (stored.record.reader.identity == self.runtime_reader_identity
+                        || active.expires_at <= now)
             });
-            if !resumes_startup {
+            // The settled record admits only the reader it names, which is why
+            // a promoted image was refused forever before this branch existed.
+            // The pipeline says who comes next; this is the daemon reading that
+            // authorization and running one startup rollout to admit itself. An
+            // authorization naming any other digest is not ours to take, and a
+            // record that already admits this image needs no rollout at all.
+            let admits_authorized_reader = stored.record.active_lease.is_none()
+                && stored.record.reader.identity != self.runtime_reader_identity
+                && stored.record.next_reader_identity.as_deref()
+                    == Some(self.runtime_reader_identity.as_str());
+            if !resumes_startup && !admits_authorized_reader {
                 let _ = self.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
                 return Ok(None);
             }
@@ -842,6 +986,7 @@ impl PublicationControl {
                         spine_rollout_fence_update_time: None,
                         reader_spine_rollout_fence_payload_sha256: None,
                         reader_spine_rollout_fence_update_time: None,
+                        next_reader_identity: None,
                         active_lease: Some(lease.clone()),
                         last_completed_lease: None,
                         last_completed_rollout: None,
@@ -1507,7 +1652,17 @@ impl PublicationControl {
                 &active.target_repositories,
             )?;
             let current_reader_evidence = reader_spine_rollout_fence_evidence(&stored.record)?;
-            if stored.record.reader.identity == request.reader.identity
+            // The pipeline's authorization is single-use, and this is the
+            // admission that uses it. Clearing it in the same CAS as the
+            // admission is what makes it single-use: no later step has to
+            // remember, and no crash can strand a spent authorization on the
+            // record. It fires only when the admitted identity is the one
+            // named, so an operator admitting the running daemon over an
+            // authorization for its successor leaves that authorization alone.
+            let consumes_authorization = stored.record.next_reader_identity.as_deref()
+                == Some(request.reader.identity.as_str());
+            if !consumes_authorization
+                && stored.record.reader.identity == request.reader.identity
                 && stored.record.reader.min_snapshot_schema == request.reader.min_snapshot_schema
                 && stored.record.reader.max_snapshot_schema == request.reader.max_snapshot_schema
                 && current_reader_evidence.as_ref() == Some(&active_spine_evidence)
@@ -1523,6 +1678,9 @@ impl PublicationControl {
             record.reader_spine_rollout_fence_payload_sha256 =
                 Some(active_spine_evidence.payload_sha256);
             record.reader_spine_rollout_fence_update_time = Some(active_spine_evidence.update_time);
+            if consumes_authorization {
+                record.next_reader_identity = None;
+            }
             match self.store.update(&stored.version, &record) {
                 Ok(_) => return Ok(record),
                 Err(error) if error.is_cas_conflict() => continue,
@@ -1531,6 +1689,48 @@ impl PublicationControl {
         }
         Err(PublicationControlError::Conflict(
             "publication record changed during every reader admission attempt".to_string(),
+        ))
+    }
+
+    /// Record the image identity the promotion will start next.
+    ///
+    /// The promotion cannot admit the successor itself. `admit_reader` runs
+    /// through `prepare_hosted_spine_rollout`, which refuses any reader but the
+    /// daemon serving the request, so a healthy outgoing daemon can only ever
+    /// admit itself. What it can do is say who comes next. The successor then
+    /// admits itself at its own startup, and legitimacy still rests with the
+    /// holder of the administrator token rather than with any image that can
+    /// reach the bucket.
+    ///
+    /// This holds nothing. It takes no rollout lease, so it opens no readiness
+    /// gap on the daemon it is called against, and the promotion makes exactly
+    /// one call before the apply. The administrator token authenticates the
+    /// caller and the record's CAS makes the write atomic; ordering between two
+    /// overlapping promotions is last-write-wins by design, and the losing
+    /// digest is refused at its bootstrap rather than left waiting.
+    pub fn authorize_next_reader(
+        &self,
+        request: AuthorizeNextReaderRequest,
+    ) -> Result<PublicationControlRecord, PublicationControlError> {
+        self.validate_scope(&request.scope)?;
+        validate_image_identity(&request.identity)?;
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let stored = self.load_required()?;
+            self.validate_record(&stored.record)?;
+            if stored.record.next_reader_identity.as_deref() == Some(request.identity.as_str()) {
+                return Ok(stored.record);
+            }
+            let mut record = stored.record;
+            record.revision = checked_revision(record.revision)?;
+            record.next_reader_identity = Some(request.identity.clone());
+            match self.store.update(&stored.version, &record) {
+                Ok(_) => return Ok(record),
+                Err(error) if error.is_cas_conflict() => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(PublicationControlError::Conflict(
+            "publication record changed during every next-reader authorization attempt".to_string(),
         ))
     }
 
@@ -1991,6 +2191,13 @@ impl PublicationControl {
             )));
         }
         validate_reader_shape(&record.reader)?;
+        if let Some(next_reader_identity) = record.next_reader_identity.as_deref() {
+            validate_image_identity(next_reader_identity).map_err(|error| {
+                PublicationControlError::Admission(format!(
+                    "stored next reader identity is invalid: {error}"
+                ))
+            })?;
+        }
         let record_spine_evidence = record_spine_rollout_fence_evidence(record)?;
         let reader_spine_evidence = reader_spine_rollout_fence_evidence(record)?;
         match record.last_authority_fenced_at {
@@ -4267,6 +4474,8 @@ mod tests {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const READER_B: &str =
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const READER_C: &str =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const SCOPE: &str = "gcs://fixture/v2";
 
     #[cfg(feature = "gcs")]
@@ -4814,6 +5023,632 @@ mod tests {
         );
     }
 
+    /// Name the successor exactly as the promotion does: one call, holding
+    /// nothing. There is no lease to acquire and none to release, which is the
+    /// whole reason this costs production no readiness.
+    fn authorize_next_reader_for(control: &Arc<PublicationControl>, identity: &str) {
+        control
+            .authorize_next_reader(AuthorizeNextReaderRequest {
+                scope: SCOPE.to_string(),
+                identity: identity.to_string(),
+            })
+            .unwrap();
+    }
+
+    /// The upgrade path this authorization exists for. A settled record admits
+    /// only the image that wrote it, so the hosted fleet could be upgraded
+    /// exactly once: the promoted daemon was refused, served 503, and the
+    /// rollout gate rolled it back after the apply had already moved web and
+    /// the control plane. The promotion now names its successor on the record
+    /// while the outgoing daemon is still healthy and reachable, and the
+    /// successor admits itself at its own startup.
+    #[test]
+    fn a_pipeline_authorized_image_admits_itself_at_startup() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let outgoing = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = outgoing
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&outgoing, &first);
+        let settled_fence = outgoing.status().unwrap().last_fence;
+
+        authorize_next_reader_for(&outgoing, READER_B);
+
+        // Naming the successor takes nothing and admits nobody. The outgoing
+        // daemon is still the reader and still ready, and the fence has not
+        // moved, so production sees no gap at all between this call and the
+        // apply that follows it.
+        let authorized = outgoing.status().unwrap();
+        assert!(authorized.active_lease.is_none());
+        assert_eq!(authorized.last_fence, settled_fence);
+        assert_eq!(authorized.next_reader_identity.as_deref(), Some(READER_B));
+        assert_eq!(
+            authorized.reader.identity, READER_A,
+            "naming the successor must not admit it"
+        );
+        outgoing
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap();
+
+        let incoming = control(Arc::clone(&store), Arc::clone(&clock), READER_B);
+        let startup = incoming
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("an authorized image must run its own startup rollout");
+        assert_eq!(startup.holder, STARTUP_BOOTSTRAP_HOLDER);
+        assert!(
+            startup.fence > settled_fence,
+            "the startup rollout must raise the fence past {settled_fence}"
+        );
+        release(&incoming, &startup);
+
+        let settled = incoming.status().unwrap();
+        assert_eq!(settled.reader.identity, READER_B);
+        incoming
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap();
+        let displaced = outgoing
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap_err();
+        assert!(displaced.to_string().contains(READER_B), "{displaced}");
+    }
+
+    /// The clear fires only when the admission consumes exactly the identity the
+    /// record authorizes next. `a_pipeline_authorized_image_admits_itself_at_startup`
+    /// is not enough to guard this: every admit_reader call it drives happens to
+    /// admit the identity that was actually authorized, so an unconditional clear
+    /// looks identical to the guarded one throughout that test. This is the case
+    /// that tells them apart: the OUTGOING daemon is re-admitted, under an
+    /// unrelated operator rollout, while the record still authorizes someone else
+    /// next. Nothing about who reads is changing here, so nothing about who is
+    /// authorized next may change either, or unrelated daemon activity could
+    /// silently erase the pipeline's authorization before the successor ever
+    /// starts.
+    #[test]
+    fn an_unrelated_admission_of_the_current_reader_leaves_the_authorization_alone() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let outgoing = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = outgoing
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&outgoing, &first);
+
+        authorize_next_reader_for(&outgoing, READER_B);
+
+        // An operator rollout that re-admits the SAME image. Its own release
+        // path runs admit_reader with `outgoing`'s own identity, READER_A, which
+        // is not the identity the record now authorizes next.
+        let reaffirm = outgoing
+            .acquire_rollout(rollout_request("deploy", "reaffirm-reader-a", None))
+            .unwrap();
+        release(&outgoing, &reaffirm);
+
+        let after = outgoing.status().unwrap();
+        assert_eq!(after.reader.identity, READER_A);
+        assert_eq!(
+            after.next_reader_identity.as_deref(),
+            Some(READER_B),
+            "an admission of a different identity than the one authorized must not consume it"
+        );
+    }
+
+    /// The write holds no rollout lease, and that is the property that makes
+    /// the promotion free. A rollout lease closes reader admission for every
+    /// image, so requiring one here would have put a readiness gap on the
+    /// running daemon at the start of every upgrade, to serialize a single
+    /// field the record's own CAS already writes atomically.
+    #[test]
+    fn authorizing_the_next_reader_needs_no_rollout_lease() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let daemon = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = daemon
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&daemon, &first);
+
+        // A settled record carries no lease at all, so there is no proof any
+        // caller could have presented.
+        let settled = daemon.status().unwrap();
+        assert!(settled.active_lease.is_none());
+        authorize_next_reader_for(&daemon, READER_B);
+        let authorized = daemon.status().unwrap();
+        assert_eq!(authorized.next_reader_identity.as_deref(), Some(READER_B));
+        assert!(
+            authorized.active_lease.is_none(),
+            "the write must take none"
+        );
+        assert_eq!(authorized.last_fence, settled.last_fence);
+
+        // And a rollout somebody else holds neither blocks the write nor is
+        // disturbed by it.
+        let operator = daemon
+            .acquire_rollout(rollout_request("deploy", "unrelated-rollout", None))
+            .unwrap();
+        authorize_next_reader_for(&daemon, READER_C);
+        let during = daemon.status().unwrap();
+        assert_eq!(during.next_reader_identity.as_deref(), Some(READER_C));
+        assert_eq!(
+            during.active_lease.as_ref().unwrap().fence,
+            operator.fence,
+            "the write must not disturb a rollout it does not hold"
+        );
+    }
+
+    /// Two promotions that overlap resolve to the last write. That is the whole
+    /// cost of dropping the lease, and it is a recoverable one: the digest that
+    /// lost is refused at its own bootstrap, and the refusal says what the
+    /// record admits and what it now authorizes, so an operator reads the cause
+    /// off the message rather than off two workflow logs.
+    #[test]
+    fn two_authorizations_resolve_to_the_last_write() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let outgoing = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = outgoing
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&outgoing, &first);
+
+        authorize_next_reader_for(&outgoing, READER_B);
+        authorize_next_reader_for(&outgoing, READER_C);
+        assert_eq!(
+            outgoing.status().unwrap().next_reader_identity.as_deref(),
+            Some(READER_C),
+            "the last write wins"
+        );
+
+        let loser = control(Arc::clone(&store), Arc::clone(&clock), READER_B);
+        let unchanged = loser.status().unwrap();
+        assert!(
+            loser.bootstrap_runtime_if_absent().unwrap().is_none(),
+            "the digest that lost must not admit itself"
+        );
+        assert_eq!(loser.status().unwrap(), unchanged);
+        let refusal = loser
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains(READER_A) && refusal.contains(READER_B) && refusal.contains(READER_C),
+            "the loser's refusal must name the admitted reader, itself and the winner: {refusal}"
+        );
+
+        // The winner is unaffected, which is what makes last-write-wins a
+        // resolution rather than a stalemate.
+        let winner = control(Arc::clone(&store), Arc::clone(&clock), READER_C);
+        let startup = winner
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("the digest that won must run its startup rollout");
+        release(&winner, &startup);
+        assert_eq!(winner.status().unwrap().reader.identity, READER_C);
+    }
+
+    /// The authorization names one digest. An image nobody named is refused
+    /// exactly as it was before the authorization existed, which is what keeps
+    /// legitimacy with the holder of the administrator token rather than with
+    /// any image that can reach the bucket.
+    #[test]
+    fn an_authorization_naming_another_image_does_not_admit_this_one() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let outgoing = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = outgoing
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&outgoing, &first);
+
+        authorize_next_reader_for(&outgoing, READER_B);
+        let before = outgoing.status().unwrap();
+
+        let unnamed = control(Arc::clone(&store), Arc::clone(&clock), READER_C);
+        assert!(
+            unnamed.bootstrap_runtime_if_absent().unwrap().is_none(),
+            "an authorization for another digest must not admit this image"
+        );
+        assert_eq!(unnamed.status().unwrap(), before);
+        let refusal = unnamed
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap_err();
+        assert!(
+            refusal.to_string().contains(READER_A) && refusal.to_string().contains(READER_C),
+            "{refusal}"
+        );
+    }
+
+    /// Single-use, and spent by the admission that used it. An authorization
+    /// left on the record after its image is in is a standing invitation for a
+    /// digest nobody is promoting any more, and it is why a rollback needs its
+    /// own compensating call rather than the leftovers of this one.
+    #[test]
+    fn a_consumed_authorization_does_not_survive_its_own_admission() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let outgoing = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = outgoing
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&outgoing, &first);
+
+        authorize_next_reader_for(&outgoing, READER_B);
+
+        let incoming = control(Arc::clone(&store), Arc::clone(&clock), READER_B);
+        let startup = incoming
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("an authorized image must run its own startup rollout");
+        release(&incoming, &startup);
+
+        let settled = incoming.status().unwrap();
+        assert_eq!(settled.reader.identity, READER_B);
+        assert_eq!(
+            settled.next_reader_identity, None,
+            "the admission it authorized must consume it"
+        );
+
+        // So a rollback to the outgoing image is refused on the record that
+        // image wrote itself, and the promotion has to re-authorize it. That
+        // one call is the compensation, and it is the same one call as the
+        // promotion itself.
+        let rolled_back = outgoing
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap_err();
+        assert!(rolled_back.to_string().contains(READER_B), "{rolled_back}");
+        authorize_next_reader_for(&incoming, READER_A);
+        let recovered = outgoing
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("the compensating authorization must let the outgoing image back in");
+        release(&outgoing, &recovered);
+        assert_eq!(outgoing.status().unwrap().reader.identity, READER_A);
+        outgoing
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap();
+    }
+
+    /// kin#1421's boundary, held for the new path. An expired startup lease is
+    /// takeover-eligible because no other actor can recover it. Any other
+    /// expired rollout is not, and an authorized digest may not walk in under
+    /// one: the record has to be settled before this branch will touch it.
+    #[test]
+    fn an_expired_rollout_lease_does_not_admit_the_image_the_promotion_authorized() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let outgoing = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = outgoing
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&outgoing, &first);
+
+        authorize_next_reader_for(&outgoing, READER_B);
+        let operator = outgoing
+            .acquire_rollout(rollout_request("deploy", "operator-rollout", None))
+            .unwrap();
+        clock.advance(MAX_ROLLOUT_LEASE_SECONDS as i64 + 1);
+        let before = outgoing.status().unwrap();
+
+        let incoming = control(Arc::clone(&store), Arc::clone(&clock), READER_B);
+        assert!(
+            incoming.bootstrap_runtime_if_absent().unwrap().is_none(),
+            "a dead rollout is its own holder's to recover, not an opening"
+        );
+        assert_eq!(incoming.status().unwrap(), before);
+        assert_eq!(
+            incoming.status().unwrap().active_lease.unwrap().fence,
+            operator.fence
+        );
+        let refusal = incoming
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap_err();
+        assert!(refusal.to_string().contains("never released"), "{refusal}");
+    }
+
+    /// The field decides which image opens readiness on the hosted fleet, so it
+    /// carries an image digest or it carries nothing. A tag is not an identity:
+    /// the same tag names different bytes on different days.
+    #[test]
+    fn authorizing_a_next_reader_that_is_not_a_digest_is_refused() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let daemon = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = daemon
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&daemon, &first);
+
+        let refused = daemon
+            .authorize_next_reader(AuthorizeNextReaderRequest {
+                scope: SCOPE.to_string(),
+                identity: "latest".to_string(),
+            })
+            .unwrap_err();
+        assert!(refused.to_string().contains("sha256:"), "{refused}");
+        assert_eq!(daemon.status().unwrap().next_reader_identity, None);
+    }
+
+    /// A record this daemon writes still has to be readable by the image it
+    /// replaces. `PublicationControlRecord` carries `deny_unknown_fields`, so a
+    /// key an older daemon does not know refuses the whole record before any
+    /// validation could explain it, and the rollback the promotion depends on
+    /// would meet an unreadable record rather than a refusal. The authorization
+    /// is therefore absent from the bytes unless it is actually set.
+    #[test]
+    fn a_cleared_authorization_leaves_no_key_an_older_daemon_would_refuse() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let daemon = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = daemon
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&daemon, &first);
+
+        let settled = serde_json::to_value(daemon.status().unwrap()).unwrap();
+        assert!(
+            settled.get("next_reader_identity").is_none(),
+            "a settled record must carry no authorization key at all: {settled}"
+        );
+
+        // The control the absence above needs: the key does appear when it is
+        // set, so the assertion is about absence and not about a field name
+        // this test spelled wrong.
+        authorize_next_reader_for(&daemon, READER_B);
+        let authorized = serde_json::to_value(daemon.status().unwrap()).unwrap();
+        assert_eq!(
+            authorized
+                .get("next_reader_identity")
+                .and_then(serde_json::Value::as_str),
+            Some(READER_B),
+            "{authorized}"
+        );
+    }
+
+    /// Nothing in the API leaves an authorization naming the reader it admitted,
+    /// because the admission spends it. A record edited outside the API still
+    /// can, and re-fencing every graph object on each restart of a daemon the
+    /// record already admits is a real cost paid for nothing, so the record's
+    /// own reader wins over an authorization that names the same image.
+    #[test]
+    fn an_authorization_naming_the_admitted_reader_takes_no_rollout() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let daemon = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = daemon
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&daemon, &first);
+
+        let stored = store
+            .load()
+            .unwrap()
+            .expect("the settled record must be readable");
+        let mut edited = stored.record.clone();
+        edited.revision += 1;
+        edited.next_reader_identity = Some(READER_A.to_string());
+        store.update(&stored.version, &edited).unwrap();
+
+        let before = daemon.status().unwrap();
+        assert_eq!(before.next_reader_identity.as_deref(), Some(READER_A));
+        assert!(
+            daemon.bootstrap_runtime_if_absent().unwrap().is_none(),
+            "a daemon the record already admits must not run another rollout"
+        );
+        assert_eq!(daemon.status().unwrap(), before);
+        daemon
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap();
+    }
+
+    /// The hosted cutover of 2026-09-03 failed here. A daemon image died
+    /// mid-bootstrap on 2026-09-02 holding the startup rollout lease, and for
+    /// the next twenty hours every replacement image was refused by that lease
+    /// even though it had expired five minutes after it was taken. Requiring
+    /// the recorded reader identity to match made the record permanently owned
+    /// by a daemon that no longer existed, because a replacement image never
+    /// carries the digest of the one it replaces.
+    #[test]
+    fn a_dead_startup_bootstrap_lease_does_not_brick_the_next_image() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+
+        let crashed = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let stranded = crashed
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        assert_eq!(stranded.holder, STARTUP_BOOTSTRAP_HOLDER);
+        let abandoned = crashed.status().unwrap();
+        assert_eq!(abandoned.reader.identity, READER_A);
+        assert!(abandoned.active_lease.is_some());
+
+        // The holder is gone, so nothing renews the lease.
+        clock.advance(HOSTED_ROLLOUT_LEASE_SECONDS as i64 + 1);
+
+        let replacement = control(Arc::clone(&store), Arc::clone(&clock), READER_B);
+        match replacement.runtime_spine_authority().unwrap() {
+            RuntimeSpineAuthority::RolloutActive(blocking) => {
+                assert!(blocking.expired, "{blocking}");
+                assert_eq!(blocking.fence, stranded.fence);
+                assert!(
+                    blocking.to_string().contains("never released"),
+                    "{blocking}"
+                );
+            }
+            other => panic!("the dead rollout must be reported: {other:?}"),
+        }
+
+        let resumed = replacement
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("an expired startup lease must be takeover-eligible");
+        assert!(
+            resumed.fence > stranded.fence,
+            "the takeover must raise the fence past {}",
+            stranded.fence
+        );
+
+        // Raising the fence is what makes the takeover safe. A predecessor that
+        // wakes up cannot mutate anything under its old proof.
+        let stale = crashed.assert_rollout_lease(&proof(&stranded)).unwrap_err();
+        assert!(
+            stale.to_string().contains("does not identify active"),
+            "{stale}"
+        );
+
+        release(&replacement, &resumed);
+        let settled = replacement.status().unwrap();
+        assert!(settled.active_lease.is_none());
+        assert_eq!(settled.reader.identity, READER_B);
+        replacement
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap();
+
+        // The image that crashed is now the one refused, which is the direction
+        // this fence must point.
+        let displaced = crashed
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap_err();
+        assert!(displaced.to_string().contains(READER_B), "{displaced}");
+    }
+
+    /// The read path and `acquire_rollout` must agree about what a live lease
+    /// means. Expiry is the only thing that makes a startup lease recoverable;
+    /// while it runs, a foreign image waits exactly as it did before.
+    #[test]
+    fn a_live_startup_bootstrap_lease_still_refuses_a_foreign_image() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let running = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let pending = running
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        let before = running.status().unwrap();
+
+        // Late in the window but still held: the holder may still be fencing.
+        clock.advance(HOSTED_ROLLOUT_LEASE_SECONDS as i64 - 60);
+
+        let intruder = control(Arc::clone(&store), Arc::clone(&clock), READER_B);
+        match intruder.runtime_spine_authority().unwrap() {
+            RuntimeSpineAuthority::RolloutActive(blocking) => {
+                assert!(!blocking.expired, "{blocking}");
+            }
+            other => panic!("the live rollout must be reported: {other:?}"),
+        }
+        assert!(intruder.bootstrap_runtime_if_absent().unwrap().is_none());
+        assert_eq!(intruder.status().unwrap(), before);
+
+        // The holder still owns its lease and finishes exactly as it would have.
+        release(&running, &pending);
+        let settled = running.status().unwrap();
+        assert!(settled.active_lease.is_none());
+        assert_eq!(settled.reader.identity, READER_A);
+    }
+
+    /// Startup recovery is for the daemon's own bootstrap lease only. An
+    /// operator's rollout stays the operator's to resume or replace, but the
+    /// refusal still has to say the lease died rather than calling it active.
+    #[test]
+    fn an_expired_operator_rollout_reads_as_expired_and_is_left_alone() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let daemon = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let bootstrap = daemon
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&daemon, &bootstrap);
+
+        let operator = daemon
+            .acquire_rollout(rollout_request("deploy", "operator-rollout", None))
+            .unwrap();
+        match daemon.runtime_spine_authority().unwrap() {
+            RuntimeSpineAuthority::RolloutActive(blocking) => {
+                assert!(!blocking.expired, "{blocking}");
+                assert_eq!(blocking.holder, "deploy");
+            }
+            other => panic!("the operator rollout must be reported: {other:?}"),
+        }
+
+        clock.advance(MAX_ROLLOUT_LEASE_SECONDS as i64 + 1);
+        match daemon.runtime_spine_authority().unwrap() {
+            RuntimeSpineAuthority::RolloutActive(blocking) => {
+                assert!(blocking.expired, "{blocking}");
+                assert!(
+                    blocking.to_string().contains("never released"),
+                    "{blocking}"
+                );
+            }
+            other => panic!("the dead operator rollout must be reported: {other:?}"),
+        }
+        let refusal = daemon
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap_err();
+        assert!(refusal.to_string().contains("never released"), "{refusal}");
+
+        let unchanged = daemon.status().unwrap();
+        assert!(daemon.bootstrap_runtime_if_absent().unwrap().is_none());
+        assert_eq!(daemon.status().unwrap(), unchanged);
+        assert_eq!(
+            daemon.status().unwrap().active_lease.unwrap().fence,
+            operator.fence
+        );
+    }
+
+    /// The holder is what separates the daemon's own bootstrap from an
+    /// operator's rollout, and this is the case that makes it carry that weight
+    /// alone. The test above differs from a startup lease in BOTH the holder and
+    /// the request id, so it cannot see the holder clause at all: the request id
+    /// refuses the input one step earlier, and deleting the holder check leaves
+    /// it green. An operator picks its own request id and nothing stops it
+    /// choosing the startup one, which is precisely why the holder is checked.
+    #[test]
+    fn an_operator_rollout_reusing_the_startup_request_id_is_still_not_startup() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let daemon = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let bootstrap = daemon
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&daemon, &bootstrap);
+
+        // Every startup identifier matches except the holder.
+        let operator = daemon
+            .acquire_rollout(rollout_request(
+                "deploy",
+                STARTUP_BOOTSTRAP_REQUEST_ID,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(operator.request_id, STARTUP_BOOTSTRAP_REQUEST_ID);
+        assert_ne!(operator.holder, STARTUP_BOOTSTRAP_HOLDER);
+        clock.advance(MAX_ROLLOUT_LEASE_SECONDS as i64 + 1);
+
+        let unchanged = daemon.status().unwrap();
+        assert!(
+            daemon.bootstrap_runtime_if_absent().unwrap().is_none(),
+            "startup recovery must not adopt a lease an operator holds"
+        );
+        assert_eq!(daemon.status().unwrap(), unchanged);
+        assert_eq!(
+            daemon.status().unwrap().active_lease.unwrap().fence,
+            operator.fence
+        );
+    }
+
     #[test]
     fn duplicate_rollout_retry_cannot_run_a_second_generation_fence() {
         let store = Arc::new(InMemoryPublicationControlStore::default());
@@ -4938,6 +5773,7 @@ mod tests {
             spine_rollout_fence_update_time: None,
             reader_spine_rollout_fence_payload_sha256: None,
             reader_spine_rollout_fence_update_time: None,
+            next_reader_identity: None,
             active_lease: None,
             last_completed_lease: None,
             last_completed_rollout: None,

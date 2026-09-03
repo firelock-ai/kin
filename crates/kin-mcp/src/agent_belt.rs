@@ -255,6 +255,16 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
             "kin_graph_status",
             "The graph this call is answered from: entity and relation counts, and how many are embedded, pending or unindexed. Call it when a search returns less than you expect. `sampling=last_settled_selected_graph` means the last settled reading, aged in `stale`.",
         ),
+        // The one fact an agent cannot discover for itself: that the list it was
+        // handed is partial on purpose, and how to reach the rest. Every other
+        // short form here describes a capability; this one describes the surface.
+        (
+            crate::handlers::tool_search::TOOL_NAME,
+            "Find the Kin tools this profile does not serve. The served list is small on purpose \
+             and everything else is reached only through here. Describe the job in plain \
+             language; each match comes back as a complete, callable definition. Omit `need` to \
+             list every tool.",
+        ),
         (
             "kin_provenance_query",
             "Answer who changed an entity and whether it was approved: change count, latest change, approvals on it, a page of changes newest first, and recent audit events. Call it before relying on code whose history matters.",
@@ -408,6 +418,14 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
             &["entity_id", "depth", "token_budget", "max_chars"] as &[&str],
         ),
         ("kin_provenance_query", &["entity_id", "limit"] as &[&str]),
+        // Both, written out rather than left absent. The tool registers exactly
+        // these two, so this trims nothing today; it is here because the belt's
+        // rule is that a served tool declares which properties survive, and a
+        // property added later would otherwise join the belt unreviewed.
+        (
+            crate::handlers::tool_search::TOOL_NAME,
+            &["need", "limit"] as &[&str],
+        ),
     ])
 }
 
@@ -679,6 +697,14 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
             ("graph_neighborhood", "direction"),
             "`out` for what the focal depends on, `in` for what depends on it, `both` merges.",
         ),
+        (
+            (crate::handlers::tool_search::TOOL_NAME, "need"),
+            "The job in plain language. Omit it to list every registered tool.",
+        ),
+        (
+            (crate::handlers::tool_search::TOOL_NAME, "limit"),
+            "Matches returned as full definitions (default 5, ceiling 25). See `matched_names`.",
+        ),
     ])
 }
 
@@ -794,13 +820,34 @@ mod tests {
         );
     }
 
-    /// And nothing in the table that the profile does not serve, which would be
-    /// a short form nobody reads and a name nobody notices going stale.
+    /// Every tool the search profile serves needs one too, for the same reason
+    /// and with more at stake: that profile serves five tools, so one carrying
+    /// its several-thousand-character registered form would be most of the list.
+    #[test]
+    fn every_agent_search_tool_has_a_short_description() {
+        let descriptions = short_descriptions();
+        let missing: Vec<&str> = crate::tools::agent_search_tool_names()
+            .iter()
+            .copied()
+            .filter(|name| !descriptions.contains_key(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these agent-search tools have no short description: {missing:?}; add an entry for \
+             each in short_descriptions() and schema_keep_lists() in \
+             crates/kin-mcp/src/agent_belt.rs, at most {AGENT_DEFAULT_DESCRIPTION_BUDGET} \
+             characters per description."
+        );
+    }
+
+    /// And nothing in the table that no belt profile serves, which would be a
+    /// short form nobody reads and a name nobody notices going stale.
     #[test]
     fn the_short_description_table_has_no_orphans() {
         let served: std::collections::HashSet<&str> = crate::tools::agent_default_tool_names()
             .iter()
             .copied()
+            .chain(crate::tools::agent_search_tool_names().iter().copied())
             .collect();
         let orphans: Vec<&str> = short_descriptions()
             .keys()
@@ -809,9 +856,10 @@ mod tests {
             .collect();
         assert!(
             orphans.is_empty(),
-            "short_descriptions() in crates/kin-mcp/src/agent_belt.rs has entries for tools the \
-             profile no longer serves: {orphans:?}; remove them, or put the names back in \
-             agent_default_tool_names() if the removal was accidental"
+            "short_descriptions() in crates/kin-mcp/src/agent_belt.rs has entries for tools no \
+             belt profile serves: {orphans:?}; remove them, or put the names back in \
+             agent_default_tool_names() or agent_search_tool_names() if the removal was \
+             accidental"
         );
     }
 

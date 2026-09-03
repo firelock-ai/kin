@@ -68,11 +68,9 @@ use crate::commands::setup::{check_binary_in_path, home_dir, kin_dir, shim_filen
 
 /// Every `kin-vfs` subcommand Kin drives, named once.
 ///
-/// The mount features are compiled out of the shipped driver, and the work that
-/// makes them real is landing in `kin-vfs` under these names. Keeping them in
-/// one place means a rename downstream is one edit here, and the probe that
-/// asks a driver which subcommands it carries reads the same constants the
-/// engage path spawns.
+/// Keeping them in one place means a rename downstream is one edit here, and
+/// the probe that asks a driver which subcommands it carries reads the same
+/// constants the engage path spawns.
 pub(crate) mod driver {
     /// Present in every build. Used as the control that proves a parsed help
     /// listing is readable at all, so an unparseable help cannot masquerade as
@@ -90,12 +88,23 @@ pub(crate) mod driver {
 }
 
 /// Where a driver carrying the mount features comes from, for every message
-/// that has to explain an absent one. Naming the build is the honest remedy
-/// while the shipped binary has neither feature.
+/// that has to explain an absent one.
+///
+/// The shipped driver is not featureless. `.github/workflows/release.yml`
+/// builds macOS with `--features nfs` and Linux with `--features fuse` in its
+/// "Build kin-vfs (native)" step, and only the cross-built targets get neither.
+/// So a driver reaching one of these messages is an older install, a
+/// cross-built target, or a `kin-vfs` from somewhere other than this install,
+/// which makes updating the first remedy and building one the second. This
+/// text used to say the shipped binary carried neither feature, which sent a
+/// reporter off to build a driver they already had.
 pub(crate) const MOUNT_FEATURE_REMEDY: &str =
-    "the shipped kin-vfs is built without the mount features; build one that has them with \
+    "the shipped kin-vfs carries the mount feature its platform supports, nfs on macOS and \
+     fuse on Linux, so a driver without one is an older install or a target that ships \
+     neither; run `kin update`, or build one with \
      `cargo build --release -p kin-vfs-cli --features nfs` (or `--features fuse`) from the \
-     kin-vfs repository, then point Kin at it with KIN_VFS_BIN=/path/to/kin-vfs";
+     kin-vfs repository and point Kin at it with KIN_VFS_BIN=/path/to/kin-vfs. What the NFS \
+     export does and does not enforce is in kin-vfs docs/security/nfs-export.md";
 
 /// A projection: one way graph truth is presented as files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -2065,18 +2074,46 @@ fn engage_shim(shim: &ShimPresence, modes: &[ModeProbe]) -> Result<()> {
     Ok(())
 }
 
+/// The `nfs-start` argv for a driver advertising these flags.
+///
+/// Pure so the shape is testable without a driver, and one place to read what
+/// Kin asks a driver to do.
+pub(crate) fn nfs_start_args(root: &str, takes_repo: bool, takes_writable: bool) -> Vec<&str> {
+    let mut args = vec![driver::NFS_START];
+    if takes_repo {
+        args.push("--repo");
+        args.push(root);
+    }
+    if takes_writable {
+        args.push("--writable");
+    }
+    args
+}
+
 fn engage_nfs(driver: &DriverProbe, repo_root: &Path) -> Result<()> {
     let Some(path) = driver.path.as_deref().filter(|_| driver.runs()) else {
         anyhow::bail!("no kin-vfs driver to start the NFS mount with");
     };
     let root = repo_root.to_string_lossy().into_owned();
 
+    // The export is read-only unless asked, because NFSv3 authenticates no
+    // client and every account on the machine can reach it, so an unasked-for
+    // writable export commits another account's writes to this repository
+    // under this user's name. `kin mode nfs` is a request for a projection
+    // this repository is worked in, so Kin asks for writes explicitly rather
+    // than leaving the user a mount they cannot edit through.
+    //
+    // Probed rather than assumed, exactly as `--repo` is: a driver predating
+    // the flag already served writable and would refuse an argument it does
+    // not know, taking the whole mount down with it.
+    let takes_writable = subcommand_supports_flag(path, driver::NFS_START, "--writable");
+
     // One command where the driver takes a repository: `nfs-start --repo`
     // registers it on first use and serves it. Registering separately is the
     // older two-step shape, and doing both would register a repository the
     // server is about to register again.
     if subcommand_supports_flag(path, driver::NFS_START, "--repo") {
-        let out = run_driver(path, &[driver::NFS_START, "--repo", &root])?;
+        let out = run_driver(path, &nfs_start_args(&root, true, takes_writable))?;
         println!("{} {}", style("\u{2713}").green(), first_line(&out));
         return Ok(());
     }
@@ -2085,7 +2122,7 @@ fn engage_nfs(driver: &DriverProbe, repo_root: &Path) -> Result<()> {
         let out = run_driver(path, &[driver::WORKSPACES, "add", "--path", &root])?;
         println!("{} {}", style("\u{2713}").green(), first_line(&out));
     }
-    let out = run_driver(path, &[driver::NFS_START])?;
+    let out = run_driver(path, &nfs_start_args(&root, false, takes_writable))?;
     println!("{} {}", style("\u{2713}").green(), first_line(&out));
     Ok(())
 }
@@ -3148,6 +3185,53 @@ Options:
             "a longer flag must not answer for a shorter one"
         );
         assert!(!help_lists_flag("", "--repo"));
+    }
+
+    /// kin-vfs 0.4.24 flipped the NFS export's default. `nfs-start` served
+    /// writable and took `--read-only`; it now serves read-only and takes
+    /// `--writable`, because NFSv3 authenticates no client and every account
+    /// on the machine can reach the export. `kin mode nfs` has to produce a
+    /// writable mount from both, which means asking the new driver for writes
+    /// and asking the old one for nothing: an argument a driver does not know
+    /// fails the start outright rather than degrading to a read-only mount.
+    #[test]
+    fn a_writable_mount_is_asked_for_only_from_a_driver_that_offers_the_flag() {
+        // The flag set of the real `nfs-start` at each version.
+        const BEFORE: &str = "Usage: kin-vfs nfs-start [OPTIONS]\n\nOptions:\n      --repo <REPO>\n      --port <PORT>\n      --mount-point <MOUNT_POINT>\n      --read-only\n  -h, --help\n";
+        const AFTER: &str = "Usage: kin-vfs nfs-start [OPTIONS]\n\nOptions:\n      --repo <REPO>\n      --port <PORT>\n      --mount-point <MOUNT_POINT>\n      --writable\n  -h, --help\n";
+
+        assert!(help_lists_flag(AFTER, "--writable"));
+        assert!(
+            !help_lists_flag(BEFORE, "--writable"),
+            "a driver predating the flag must not be handed it"
+        );
+        // The control: both bodies are readable, so a miss above is the flag
+        // being absent rather than the match failing on every input.
+        assert!(help_lists_flag(BEFORE, "--read-only") && help_lists_flag(AFTER, "--repo"));
+
+        let argv = |help: &str| {
+            nfs_start_args(
+                "/w/repo",
+                help_lists_flag(help, "--repo"),
+                help_lists_flag(help, "--writable"),
+            )
+        };
+        assert_eq!(
+            argv(AFTER),
+            ["nfs-start", "--repo", "/w/repo", "--writable"]
+        );
+        assert_eq!(argv(BEFORE), ["nfs-start", "--repo", "/w/repo"]);
+
+        // The two-step shape, where the repository is registered separately.
+        assert_eq!(
+            nfs_start_args("/w/repo", false, true),
+            ["nfs-start", "--writable"]
+        );
+        assert_eq!(nfs_start_args("/w/repo", false, false), ["nfs-start"]);
+
+        // A help that could not be read offers nothing, so the start is the
+        // oldest shape rather than a guess at what the driver accepts.
+        assert_eq!(argv(""), ["nfs-start"]);
     }
 
     /// The mount test must be able to answer both ways on any host, or it is a

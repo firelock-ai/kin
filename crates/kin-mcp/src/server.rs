@@ -337,7 +337,18 @@ where
             // bounded moment for a warm daemon to bind, then an honest
             // still-starting answer: never minutes of silence, and never a
             // remedy-flavored "no daemon" error while one is on its way up.
-            if method == Some("tools/call") {
+            //
+            // The tool registry is exempt, because it reads no graph. Waiting on
+            // the binding would answer "the daemon is still starting" to the one
+            // question no daemon can answer better, and admitting a daemon spawn
+            // for it would undo FIR-3099: an agent that asked only what tools
+            // exist would open the store and schedule a full embedding pass.
+            let call_reads_the_graph = value
+                .pointer("/params/name")
+                .and_then(|name| name.as_str())
+                .map(crate::agent_belt::canonical_tool_name)
+                != Some(crate::handlers::tool_search::TOOL_NAME);
+            if method == Some("tools/call") && call_reads_the_graph {
                 if let Some(startup) = startup.as_ref() {
                     // The first ask for a graph answer, and the only thing that
                     // admits starting a daemon (FIR-3099). Before this line
@@ -1347,6 +1358,21 @@ async fn handle_tools_call_daemon(
         }
     }
 
+    // The tool registry is answered here rather than forwarded. It is the
+    // registry compiled into THIS binary, which is what `tools/list` on this
+    // server is built from, so a daemon on a different build would hand an agent
+    // a schema this server cannot dispatch. The answer reads no graph, so there
+    // is nothing the daemon could add. The envelope is the daemon one because on
+    // this route the SERVER is daemon-backed, which is what `runtime` reports;
+    // `Envelope::daemon_unreachable` keeps the same value for the same reason.
+    if call_params.name == crate::handlers::tool_search::TOOL_NAME {
+        let result = crate::handlers::tool_search::handle_tool_search(&call_params.arguments)
+            .unwrap_or_else(|error| ToolCallResult::error(error.to_string()));
+        let enveloped =
+            envelope::finalize_bounded(result, Envelope::daemon(), &call_params.name, &budget);
+        return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
+    }
+
     // Graph status carries its own selected-graph coverage observation. Mark
     // the beginning before forwarding so a refusal published during the call
     // cannot be discharged by counters that may have preceded it.
@@ -2296,6 +2322,63 @@ mod tests {
         let resp = process_daemon_message(msg, &config).await.unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
+    }
+
+    /// The tool registry is answered by this binary on the daemon route, from
+    /// the definitions `tools/list` is built from.
+    ///
+    /// The daemon route forwards every name it does not special-case to the
+    /// daemon's generic MCP endpoint. Forwarding this one would answer from
+    /// whatever registry the daemon build carries, which is how an agent gets a
+    /// schema for a tool this server cannot dispatch. There is no daemon in this
+    /// test, so a forwarded call could not answer at all.
+    #[tokio::test]
+    async fn the_tool_registry_is_answered_locally_on_the_daemon_route() {
+        let config = McpServerConfig {
+            allowed_tools: Some(crate::tools::name_set(
+                crate::tools::agent_search_tool_names(),
+            )),
+            agent_belt: true,
+            ..McpServerConfig::default()
+        };
+
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{"name":"{}","arguments":{{"need":"impact_analysis"}}}}}}"#,
+            crate::handlers::tool_search::TOOL_NAME
+        );
+        let resp = process_daemon_message(&msg, &config).await.unwrap();
+        let result = resp.result.expect("the registry call is answered");
+        assert_ne!(
+            result.get("isError"),
+            Some(&serde_json::json!(true)),
+            "the registry call came back an error: {result:#?}"
+        );
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("a text content block")
+            .to_string();
+        assert!(
+            text.contains("impact_analysis"),
+            "a withheld tool was not reachable through the served search: {text}"
+        );
+
+        // The control: a tool this profile does not serve is still refused, so
+        // the short circuit above did not become a way around the profile.
+        let refused = process_daemon_message(
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"impact_analysis","arguments":{}}}"#,
+            &config,
+        )
+        .await
+        .unwrap()
+        .result
+        .expect("a refusal is still a result frame");
+        assert!(
+            refused["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not enabled in this MCP profile"),
+            "the profile filter stopped refusing withheld tools: {refused:#?}"
+        );
     }
 
     #[tokio::test]
@@ -3521,6 +3604,100 @@ mod tests {
         assert!(
             !text.contains("not enabled in this MCP profile"),
             "the still-starting guard must answer before the fall-through path: {text}"
+        );
+    }
+
+    /// Asking what tools exist neither waits for the daemon nor starts one.
+    ///
+    /// Two properties in one session, both of which the registry search would
+    /// break if it were treated as an ordinary graph call. It must not be
+    /// answered "the daemon is still starting", because no daemon can answer it
+    /// better; and it must not admit a daemon spawn, because that is the
+    /// FIR-3099 property that keeps a session which asked for no graph answer
+    /// from opening the store and scheduling a full embedding pass.
+    ///
+    /// This config carries an empty allow-list, so a call that reaches ordinary
+    /// handling answers "not enabled in this MCP profile". Reaching that text is
+    /// what proves the exemption ran rather than the wait, and `kin_graph_status`
+    /// beside it is the control that must still be told the daemon is starting.
+    #[tokio::test(start_paused = true)]
+    async fn the_tool_registry_neither_waits_for_the_daemon_nor_starts_one() {
+        let startup = StartupDaemonBinding::new();
+
+        let responses = drive_daemon_loop_with_startup(
+            &[
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                tool_call(2, crate::handlers::tool_search::TOOL_NAME),
+                tool_call(3, "kin_graph_status"),
+            ],
+            None,
+            None,
+            Some(std::sync::Arc::clone(&startup)),
+        )
+        .await;
+
+        let search = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(2))
+            .expect("the registry call must be answered, not dropped");
+        let search_text = tool_error_text(search);
+        assert!(
+            !search_text.contains("still starting"),
+            "the registry call waited on a daemon it does not read: {search_text}"
+        );
+        assert!(
+            search_text.contains("not enabled in this MCP profile"),
+            "the registry call did not reach ordinary handling, so the exemption is untested: \
+             {search_text}"
+        );
+
+        let status = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(3))
+            .expect("the control call must be answered");
+        assert!(
+            tool_error_text(status).contains("still starting"),
+            "the control lost its still-starting answer, so this test would pass with the wait \
+             removed for every tool: {}",
+            tool_error_text(status)
+        );
+
+        // The spawn admission, on its own session, because the control call
+        // above admits one by design and would mask this.
+        let search_only = StartupDaemonBinding::new();
+        drive_daemon_loop_with_startup(
+            &[
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                tool_call(2, crate::handlers::tool_search::TOOL_NAME),
+            ],
+            None,
+            None,
+            Some(std::sync::Arc::clone(&search_only)),
+        )
+        .await;
+        assert!(
+            !search_only.daemon_spawn_admitted(),
+            "asking what tools exist admitted a daemon spawn, which opens the store and \
+             schedules an embedding pass for a session that asked for no graph answer"
+        );
+
+        // And the control for that half: a graph call in the same shape does
+        // admit one, so the assertion above is about this tool rather than
+        // about a path nothing reaches.
+        let graph_call = StartupDaemonBinding::new();
+        drive_daemon_loop_with_startup(
+            &[
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                tool_call(2, "kin_graph_status"),
+            ],
+            None,
+            None,
+            Some(std::sync::Arc::clone(&graph_call)),
+        )
+        .await;
+        assert!(
+            graph_call.daemon_spawn_admitted(),
+            "no tool admits a daemon spawn any more, so the exemption above proves nothing"
         );
     }
 

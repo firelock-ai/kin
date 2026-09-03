@@ -364,15 +364,29 @@ pub fn unserved_tools_named_in(
 /// SEVEN withheld tools. Whether `agent-default` should carry a dead-code tool
 /// is a different question and FIR-2480 owns it; this makes the surface stop
 /// contradicting itself whatever that answer turns out to be.
-fn unserved_cross_reference_note(named: &[String]) -> String {
-    let (subject, object) = if named.len() == 1 {
-        ("This tool is", "it")
+/// `search_is_served` decides which route the note names. On a profile that
+/// serves [`crate::handlers::tool_search`], telling the reader to restart the
+/// server on `full` would be the worse of two available answers and the one the
+/// agent cannot act on mid-session: the tool it was pointed at is one call away.
+/// Every other profile keeps the wording it had, so `agent-default`'s served
+/// bytes do not move.
+fn unserved_cross_reference_note(named: &[String], search_is_served: bool) -> String {
+    let (subject, object, possessive, schema) = if named.len() == 1 {
+        ("This tool is", "it", "its", "schema")
     } else {
-        ("These tools are", "them")
+        ("These tools are", "them", "their", "schemas")
+    };
+    let reach = if search_is_served {
+        format!(
+            "Call {search} for {possessive} full {schema}, then call {object} on the next turn, \
+             or set KIN_MCP_TOOL_PROFILE=full (or --tool-profile full) to serve {object} here.",
+            search = crate::handlers::tool_search::TOOL_NAME,
+        )
+    } else {
+        format!("Set KIN_MCP_TOOL_PROFILE=full (or --tool-profile full) to reach {object}.")
     };
     format!(
-        " {subject} named above but not served by this tool profile: {}. \
-         Set KIN_MCP_TOOL_PROFILE=full (or --tool-profile full) to reach {object}.",
+        " {subject} named above but not served by this tool profile: {}. {reach}",
         named.join(", ")
     )
 }
@@ -386,11 +400,12 @@ pub fn annotate_unserved_cross_references(
     registered: &[String],
     served: &std::collections::HashSet<String>,
 ) {
+    let search_is_served = served.contains(crate::handlers::tool_search::TOOL_NAME);
     for tool in &mut list.tools {
         let named = unserved_tools_named_in(&tool.description, registered, served);
         if !named.is_empty() {
             tool.description
-                .push_str(&unserved_cross_reference_note(&named));
+                .push_str(&unserved_cross_reference_note(&named, search_is_served));
         }
     }
 }
@@ -410,27 +425,40 @@ pub fn served_tools_list(
     agent_belt: bool,
 ) -> ToolsListResult {
     let mut tools = tool_definitions();
+    // Captured before the filter, because the annotation below has to tell a
+    // registered tool this profile withholds from a phrase that is simply
+    // prose. After the retain, the withheld ones are gone and that distinction
+    // is unrecoverable.
+    let registered: Vec<String> = tools.tools.iter().map(|tool| tool.name.clone()).collect();
     if let Some(allowed) = allowed {
-        // Captured before the filter, because the annotation below has to tell a
-        // registered tool this profile withholds from a phrase that is simply
-        // prose. After the retain, the withheld ones are gone and that
-        // distinction is unrecoverable.
-        let registered: Vec<String> = tools.tools.iter().map(|tool| tool.name.clone()).collect();
         tools.tools.retain(|tool| allowed.contains(&tool.name));
-        // A served description that sends the reader to a tool this profile does
-        // not serve is a surface contradicting itself, and it is not rare: the
-        // default profile has five of them naming seven withheld tools
-        // (FIR-3031). Answered here rather than in any description, because this
-        // is the one place the served set is known.
-        annotate_unserved_cross_references(&mut tools, &registered, allowed);
     }
-    // After the filter and the annotation, so the short forms are the last word
-    // and cannot be re-lengthened by a note computed from the long ones. The
-    // annotation is a no-op on the default profile anyway, because a short form
-    // names only tools that profile serves, but the ORDER is what guarantees
-    // that rather than the current wording.
+    // The belt runs BEFORE the annotation, because the note has to be computed
+    // from the description a client actually receives.
+    //
+    // It ran after for one release, on the argument that a short form should be
+    // the last word and not be re-lengthened by a note computed from a long one.
+    // That held only while every short form happened to name tools its own
+    // profile served, which was true of `agent-default` and is not true of
+    // `agent-search`: three of its five short forms name a withheld tool
+    // (`semantic_locate` names `semantic_search`, `trace_data_flow` names
+    // `trace_path`, `get_context_pack` names `get_entity_source`), and the note
+    // computed from the long forms was thrown away by the very next line. That
+    // is the FIR-3031 defect back on a new profile, in silence.
+    //
+    // Computing it from the final text also removes the failure the old order
+    // was defending against, since a note can no longer import a name the served
+    // description never mentions.
     if agent_belt {
         crate::agent_belt::compact_for_agent_default(&mut tools);
+    }
+    // A served description that sends the reader to a tool this profile does not
+    // serve is a surface contradicting itself, and it is not rare: the default
+    // profile's long forms have five of them naming seven withheld tools
+    // (FIR-3031). Answered here rather than in any description, because this is
+    // the one place the served set is known.
+    if let Some(allowed) = allowed {
+        annotate_unserved_cross_references(&mut tools, &registered, allowed);
     }
     tools
 }
@@ -1592,6 +1620,28 @@ fn registered_tools() -> ToolsListResult {
                     "additionalProperties": false
                 }),
             },
+            ToolDefinition {
+                name: crate::handlers::tool_search::TOOL_NAME.into(),
+                description: crate::handlers::tool_search::TOOL_SEARCH_DESC.into(),
+                annotations: read_only("Tool search"),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "need": {
+                            "type": "string",
+                            "description": "What you are trying to do, in plain language, such as \"what breaks if I change this\" or \"read one file's exact bytes\". Omit it to enumerate the whole registry."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 25,
+                            "default": 5,
+                            "description": "How many matches come back as full definitions. Every match beyond it is still named under `matched_names` and counted under `matches_withheld`, so raising this recovers schemas rather than tools."
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
         ],
     }
 }
@@ -1709,6 +1759,67 @@ pub fn agent_query_tool_names() -> &'static [&'static str] {
         "graph_neighborhood",
         crate::handlers::file_entities::TOOL_NAME,
         "kin_provenance_query",
+    ]
+}
+
+/// The most bytes the tool-search profile's `tools/list` may cost, measured on
+/// the profile AS SERVED.
+///
+/// Grounded in a measurement rather than a round number. The three retrieval
+/// tools measured 4,928 bytes on `kin-mcp 0.6.4`, so this leaves the search
+/// tool's own schema, `kin_graph_status` and normal prose growth inside a
+/// ceiling that is still a third of `agent-query`'s 15,345 and a sixth of the
+/// 29,134 the 21-tool default costs.
+///
+/// Measured as served, not on `full`, because a profile rewrites descriptions on
+/// the way out: [`annotate_unserved_cross_references`] appends a cross-reference
+/// sentence to any served description naming a withheld tool, and this profile
+/// withholds 62 of 67, so a ceiling computed before that annotation would be
+/// measuring a listing no client receives.
+pub const AGENT_SEARCH_LIST_CEILING_BYTES: usize = 8_000;
+
+/// Tool names for the always-on set the tool-search profile serves.
+///
+/// The smallest surface this crate serves, and the first one designed from
+/// measurement rather than from what a code-graph agent ought to want. Across 40
+/// real agentic runs on 2026-09-03 (one model, four questions, three
+/// repositories, five arms, `agent-query` throughout), `semantic_locate`,
+/// `trace_data_flow` and `get_context_pack` took 96 of the 103 tool calls made,
+/// while `impact_analysis` was offered 24 times and called none, and nine of the
+/// fourteen tools `agent-query` serves were never called once. A four-tool arm
+/// answered every question the fourteen-tool control answered, in fewer calls,
+/// for 36 percent fewer tokens, and left fewer cited references unresolved.
+///
+/// Say the shape of that result precisely: it is a COST result. Answered rate,
+/// calls to answer and expected-entity slots did not separate the candidate sets
+/// at all, and nothing in it reproduces the outside claims that a smaller tool
+/// surface raises accuracy.
+///
+/// Everything else is reached through [`crate::handlers::tool_search`], which is
+/// what makes this a smaller list rather than a smaller product: an agent on
+/// this profile can still reach all 67 registered tools, one lookup away, with
+/// their full schemas.
+///
+/// ## Why `kin_graph_status` stays
+///
+/// It was offered 40 times and called zero, and on that number alone it belongs
+/// behind search. It stays because the condition for moving it is not met today.
+/// The proposal was to carry its trust signal on the `degradations` and
+/// `_kin.verdict` channel every response already has, which holds only if that
+/// channel reports graph trust on a HEALTHY response as well as a damaged one.
+/// [`crate::verdict::Verdict::compute`] reads seven inputs, and the freshness
+/// one is `Reading::Silent` by construction, so a stale graph does not reach
+/// `_kin.verdict` through it at all. Until it does, this is the only tool that
+/// answers "can this graph be trusted", it costs about 610 bytes, and an agent
+/// with no way to learn the graph is thin is the exact failure this design must
+/// not introduce.
+pub fn agent_search_tool_names() -> &'static [&'static str] {
+    &[
+        "semantic_locate",
+        "trace_data_flow",
+        "get_context_pack",
+        "kin_graph_status",
+        crate::handlers::tool_search::TOOL_NAME,
     ]
 }
 
@@ -1881,6 +1992,94 @@ mod tests {
                 .contains("not served by this tool profile"),
             "and it must say the default profile does not serve it: {}",
             find_references.description
+        );
+    }
+
+    /// The same rule on the bytes a client actually receives, for every belt
+    /// profile.
+    ///
+    /// The test above grades the annotator against the REGISTERED descriptions.
+    /// That was the whole surface while the annotation was the last step, and it
+    /// stopped being so when the belt began rewriting descriptions: a note
+    /// computed from a long form and then overwritten by a short one satisfies
+    /// that test and reaches no client. `agent-search` is where it showed:
+    /// `semantic_locate`'s short form names `semantic_search`,
+    /// `trace_data_flow`'s names `trace_path`, `get_context_pack`'s names
+    /// `get_entity_source`, and that profile serves none of the three.
+    ///
+    /// So this one reads [`served_tools_list`], which is the function the stdio
+    /// handler calls, and grades the description as served.
+    #[test]
+    fn no_served_description_on_any_belt_profile_points_at_a_withheld_tool_in_silence() {
+        let registered: Vec<String> = tool_definitions()
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        let mut annotated_total = 0usize;
+
+        for (profile, names) in [
+            ("agent-default", agent_default_tool_names()),
+            ("agent-query", agent_query_tool_names()),
+            ("agent-search", agent_search_tool_names()),
+        ] {
+            let allowed = name_set(names);
+            let served = served_tools_list(Some(&allowed), true);
+            assert_eq!(
+                served.tools.len(),
+                names.len(),
+                "{profile} did not serve every name it lists"
+            );
+            for tool in &served.tools {
+                // The note is appended, so its own text names the tools it
+                // reports. Read the description the producer wrote.
+                let base = tool
+                    .description
+                    .split(" This tool is named above but not served")
+                    .next()
+                    .and_then(|head| {
+                        head.split(" These tools are named above but not served")
+                            .next()
+                    })
+                    .unwrap_or(&tool.description);
+                let named = unserved_tools_named_in(base, &registered, &allowed);
+                if named.is_empty() {
+                    continue;
+                }
+                annotated_total += 1;
+                for name in &named {
+                    assert!(
+                        tool.description.contains("not served by this tool profile")
+                            && tool.description.contains(name),
+                        "{profile} serves {} pointing at withheld `{name}` with no note saying \
+                         where it is: {}",
+                        tool.name,
+                        tool.description
+                    );
+                }
+                // And the note names the route the reader can actually take.
+                // Matched on the phrase rather than on the bare name, so a
+                // description that merely mentions the search tool cannot pass
+                // for one that tells the reader to call it.
+                let points_at_search = tool.description.contains(&format!(
+                    "Call {} for",
+                    crate::handlers::tool_search::TOOL_NAME
+                ));
+                assert_eq!(
+                    points_at_search,
+                    allowed.contains(crate::handlers::tool_search::TOOL_NAME),
+                    "{profile}'s note on {} should send the reader to the search tool exactly \
+                     when the profile serves it: {}",
+                    tool.name,
+                    tool.description
+                );
+            }
+        }
+
+        assert!(
+            annotated_total >= 3,
+            "the sweep annotated {annotated_total} served descriptions across three profiles, \
+             so it is not reaching the surface it grades"
         );
     }
 
@@ -2390,8 +2589,8 @@ mod tests {
         let list = tool_definitions();
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
         // + 1 get_entity_sources + 2 exact artifact tools
-        // + 1 list_file_entities + 1 trace_path = 66
-        assert_eq!(list.tools.len(), 66);
+        // + 1 list_file_entities + 1 trace_path + 1 kin_tool_search = 67
+        assert_eq!(list.tools.len(), 67);
     }
 
     /// The reference lists each category's members on a line opening with this
@@ -2864,6 +3063,237 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
             serialized.contains("semantic_locate") && serialized.contains("trace_data_flow"),
             "the query listing lost the retrieval tools it exists to serve"
         );
+    }
+
+    /// The always-on set is static, so grade it exactly: these names, this many,
+    /// each one registered and read-only, and the listing under its ceiling.
+    ///
+    /// Assertion 1 of the surface contract a dynamic list needs. It lives here
+    /// as well as in `scripts/acceptance/mcp_surface_contract.py` because kin's
+    /// `Product Acceptance` job carries
+    /// `if: ${{ github.event_name != 'pull_request' }}`, so an acceptance rule
+    /// does not run on the pull request that breaks it, while a crate test does
+    /// through `ci.yml`. The acceptance case grades the same thing on the wire,
+    /// where a spawned server resolves a profile.
+    #[test]
+    fn agent_search_serves_exactly_the_always_on_set_under_its_ceiling() {
+        let names = agent_search_tool_names();
+        let unique: BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "agent-search lists a name twice");
+        assert_eq!(
+            unique,
+            BTreeSet::from([
+                "get_context_pack",
+                "kin_graph_status",
+                crate::handlers::tool_search::TOOL_NAME,
+                "semantic_locate",
+                "trace_data_flow",
+            ]),
+            "the always-on set moved; that is a public surface change and it ships with its \
+             docs and its acceptance case in the same commit"
+        );
+
+        let registry = tool_definitions();
+        for name in names {
+            let tool = registry
+                .tools
+                .iter()
+                .find(|tool| tool.name == *name)
+                .unwrap_or_else(|| {
+                    panic!("agent-search tool '{name}' is not in tool_definitions()")
+                });
+            assert!(
+                tool.annotations.read_only_hint,
+                "agent-search serves '{name}', which the registry does not annotate read-only"
+            );
+        }
+
+        let served = served_tools_list(Some(&name_set(names)), true);
+        assert_eq!(served.tools.len(), names.len());
+        let bytes = serde_json::to_string(&served)
+            .expect("a tool listing serializes")
+            .len();
+        // Printed, not merely asserted: the measured number is the artifact this
+        // profile exists to move, and the next person to edit a description
+        // should be able to read what it cost.
+        println!(
+            "tools/list bytes: agent-search {bytes} over {} tools, ceiling \
+             {AGENT_SEARCH_LIST_CEILING_BYTES}",
+            served.tools.len(),
+        );
+        assert!(
+            bytes <= AGENT_SEARCH_LIST_CEILING_BYTES,
+            "agent-search's tools/list is {bytes} bytes, over the \
+             {AGENT_SEARCH_LIST_CEILING_BYTES}-byte ceiling"
+        );
+
+        // The controls. A listing under a ceiling proves nothing if it was
+        // empty, and a saving means nothing if the profile still carries the
+        // tools it exists to withhold.
+        assert!(
+            bytes > 2_000,
+            "the search listing is {bytes} bytes, too small to be a real surface"
+        );
+        let query_bytes = serde_json::to_string(&served_tools_list(
+            Some(&name_set(agent_query_tool_names())),
+            true,
+        ))
+        .expect("a tool listing serializes")
+        .len();
+        assert!(
+            bytes * 2 < query_bytes,
+            "agent-search is {bytes} bytes against agent-query's {query_bytes}, which is not the \
+             order-of-magnitude cut this profile exists to buy"
+        );
+        let serialized = serde_json::to_string(&served).expect("a tool listing serializes");
+        for withheld in ["impact_analysis", "find_references", "get_entity_source"] {
+            assert!(
+                !serialized.contains(&format!("\"name\":\"{withheld}\"")),
+                "the search listing still serves `{withheld}`"
+            );
+        }
+    }
+
+    /// Every registry tool is reachable through the search tool.
+    ///
+    /// Assertion 2, and the new silent failure this surface creates: a tool that
+    /// nothing serves and nothing finds is gone from the product without a line
+    /// of code saying so. Driven over the whole registry rather than a sample,
+    /// because a sample passes while one tool falls out of the index.
+    #[test]
+    fn every_registry_tool_is_reachable_through_the_search_tool() {
+        let registry = tool_definitions();
+        let mut unreachable: Vec<String> = Vec::new();
+        for tool in &registry.tools {
+            let mut args = std::collections::HashMap::new();
+            args.insert("need".to_string(), json!(tool.name));
+            let result = crate::handlers::tool_search::handle_tool_search(&args)
+                .expect("the search answers");
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            let payload: serde_json::Value =
+                serde_json::from_str(text).expect("the search payload is JSON");
+            let named = payload["matched_names"]
+                .as_array()
+                .expect("matched_names is an array")
+                .iter()
+                .any(|name| name == &json!(tool.name));
+            if !named {
+                unreachable.push(tool.name.clone());
+            }
+        }
+        assert!(
+            unreachable.is_empty(),
+            "these registered tools are served by no agent profile and found by no search, so \
+             they are unreachable: {unreachable:?}"
+        );
+        assert!(
+            registry.tools.len() > agent_search_tool_names().len(),
+            "the registry is no larger than the always-on set, so this sweep proves nothing"
+        );
+    }
+
+    /// The served description carries the one fact an agent cannot discover:
+    /// that the list is partial on purpose, and how to reach the rest.
+    ///
+    /// Without it the profile is indistinguishable from a Kin that can only do
+    /// five things, which is the reading that would make a smaller surface a
+    /// smaller product.
+    #[test]
+    fn the_search_tool_says_the_served_list_is_partial() {
+        let served = served_tools_list(Some(&name_set(agent_search_tool_names())), true);
+        let search = served
+            .tools
+            .iter()
+            .find(|tool| tool.name == crate::handlers::tool_search::TOOL_NAME)
+            .expect("the search tool is served on its own profile");
+        let description = search.description.to_ascii_lowercase();
+        assert!(
+            description.contains("does not serve") || description.contains("small on purpose"),
+            "the served description does not say the list is partial: {}",
+            search.description
+        );
+        assert!(
+            description.contains("through here") || description.contains("registry"),
+            "the served description does not say where the rest is: {}",
+            search.description
+        );
+    }
+
+    /// On a profile that serves the search tool, the cross-reference note points
+    /// at it rather than at a server restart.
+    ///
+    /// The FIR-3031 rule is that no served description may name a withheld tool
+    /// in silence. On this profile the honest answer to "where is it" changed:
+    /// the tool is one call away, and telling an agent mid-session to restart
+    /// the server on `full` is advice it cannot act on.
+    #[test]
+    fn the_cross_reference_note_names_the_search_tool_where_it_is_served() {
+        let registered: Vec<String> = tool_definitions()
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+
+        let search_set = name_set(agent_search_tool_names());
+        let mut with_search = tool_definitions();
+        with_search
+            .tools
+            .retain(|tool| search_set.contains(&tool.name));
+        annotate_unserved_cross_references(&mut with_search, &registered, &search_set);
+        let annotated: Vec<&ToolDefinition> = with_search
+            .tools
+            .iter()
+            .filter(|tool| tool.description.contains("not served by this tool profile"))
+            .collect();
+        assert!(
+            !annotated.is_empty(),
+            "no served description on agent-search names a withheld tool, so this test is not \
+             reaching the annotation it grades"
+        );
+        for tool in &annotated {
+            assert!(
+                tool.description
+                    .contains(crate::handlers::tool_search::TOOL_NAME),
+                "{}'s note does not name the tool that would fetch the withheld schema: {}",
+                tool.name,
+                tool.description
+            );
+        }
+
+        // The control: `agent-default` does not serve the search tool, so its
+        // note keeps the wording it had and its served bytes do not move.
+        let default_set = name_set(agent_default_tool_names());
+        let mut without_search = tool_definitions();
+        without_search
+            .tools
+            .retain(|tool| default_set.contains(&tool.name));
+        annotate_unserved_cross_references(&mut without_search, &registered, &default_set);
+        let default_annotated: Vec<&ToolDefinition> = without_search
+            .tools
+            .iter()
+            .filter(|tool| tool.description.contains("not served by this tool profile"))
+            .collect();
+        assert!(
+            !default_annotated.is_empty(),
+            "agent-default annotates nothing, so the control proves nothing"
+        );
+        for tool in &default_annotated {
+            assert!(
+                tool.description
+                    .contains("Set KIN_MCP_TOOL_PROFILE=full (or --tool-profile full) to reach"),
+                "{}'s note on agent-default changed wording: {}",
+                tool.name,
+                tool.description
+            );
+            assert!(
+                !tool
+                    .description
+                    .contains(crate::handlers::tool_search::TOOL_NAME),
+                "{}'s note on agent-default points at a tool that profile does not serve: {}",
+                tool.name,
+                tool.description
+            );
+        }
     }
 
     #[test]

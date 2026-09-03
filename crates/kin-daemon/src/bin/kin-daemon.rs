@@ -319,9 +319,11 @@ fn create_state(
                     Ok(kin_daemon::publication_lease::RuntimeSpineAuthority::Completed(
                         evidence,
                     )) => runtime.block_on(state.adopt_hosted_spine_rollout_fence(evidence)),
-                    Ok(kin_daemon::publication_lease::RuntimeSpineAuthority::RolloutActive) => {
-                        Err("a hosted rollout remains active; semantic readiness stays closed while the authenticated publication-control API resumes or replaces it".to_string())
-                    }
+                    Ok(kin_daemon::publication_lease::RuntimeSpineAuthority::RolloutActive(
+                        blocking,
+                    )) => Err(format!(
+                        "a hosted {blocking}; semantic readiness stays closed while the authenticated publication-control API resumes or replaces it"
+                    )),
                     Err(error) => Err(error.to_string()),
                 }
             };

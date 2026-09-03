@@ -41,6 +41,7 @@
 //! stays independent of repository size.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use kin_index::{
     bare_entity_name, link_cross_file_incremental_with_completeness, FileParseCompletenessMap,
@@ -191,7 +192,15 @@ pub struct LiveCrossFileLinker {
     artifact_id_by_file: HashMap<String, ArtifactId>,
     file_by_artifact_id: HashMap<ArtifactId, String>,
     /// Entity identity to the file that declares it, same reason.
-    file_by_entity: HashMap<EntityId, String>,
+    ///
+    /// The path is shared rather than copied. One entry exists per entity in the
+    /// repository and it is held for the process lifetime, so an owned `String`
+    /// here was one heap allocation of the same path per entity: on a tree with
+    /// 6,160 files and 264,615 entities that is 264,615 copies of 6,160 distinct
+    /// strings. An `Arc<str>` is one allocation per distinct file, and both
+    /// readers below want either the path itself or an equality against another
+    /// entity's path, which share unchanged.
+    file_by_entity: HashMap<EntityId, Arc<str>>,
     /// Files retained because they still name something the graph lacks.
     pending: HashMap<String, PendingFile>,
     /// Reverse index: destination name -> files waiting on it. This is what
@@ -330,8 +339,12 @@ impl LiveCrossFileLinker {
             .insert(file_path.to_string(), artifact_id);
         self.file_by_artifact_id
             .insert(artifact_id, file_path.to_string());
+        // One allocation for the path, shared by every entity this file
+        // declares, rather than one per entity.
+        let shared_path: Arc<str> = Arc::from(file_path);
         for entity in entities {
-            self.file_by_entity.insert(entity.id, file_path.to_string());
+            self.file_by_entity
+                .insert(entity.id, Arc::clone(&shared_path));
         }
     }
 
@@ -460,7 +473,7 @@ impl LiveCrossFileLinker {
                         continue;
                     };
                     // Only edges sourced by a file this pass resolved.
-                    if !batched_paths.contains(src_file) {
+                    if !batched_paths.contains(&**src_file) {
                         continue;
                     }
                     if self.file_by_entity.get(&dst) == Some(src_file) {

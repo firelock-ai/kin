@@ -39,7 +39,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_MCP_KIN_BINARY` | path | *(unset)* | operational | explicit native Kin binary used by the @kinlab/kin-mcp wrapper |
 | `KIN_MCP_RELEASE_BASE_URL` | url | GitHub Releases | operational | release mirror base URL used by the @kinlab/kin-mcp wrapper |
 | `KIN_MCP_REPO` | path | *(unset)* | operational | bind `kin mcp start` to this repository instead of the launch directory |
-| `KIN_MCP_TOOL_PROFILE` | string | agent-default | operational | MCP tool surface: agent-default (curated, the default), agent-query (the same belt with no session or transaction tools), full (every tool), benchmark, context-bench |
+| `KIN_MCP_TOOL_PROFILE` | string | agent-default | operational | MCP tool surface: agent-default (curated, the default), agent-query (the same belt with no session or transaction tools), agent-search (the measured always-on set, the rest reached through kin_tool_search), full (every tool), benchmark, context-bench |
 | `KIN_NO_PROVISION` | bool | false | operational | forbid network provisioning by the @kinlab/kin launcher |
 | `KIN_NO_SETUP` | bool | false | operational | skip the installer's post-install setup wizard when set truthy |
 | `KIN_REGISTRY_REPAIR` | bool | false | operational | allow the POSIX installer to repair safe registry ownership modes |
@@ -158,7 +158,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_SUPERVISOR_REDEPLOY_DISABLE` | bool | false | operational | disable supervisor auto-redeploy |
 | `KIN_SUPERVISOR_REDEPLOY_GRACE` | seconds>=0 | *(unset)* | operational | grace period before a supervisor redeploy |
 | `KIN_SUPERVISOR_REEXEC_DISABLE` | bool | false | operational | disable supervisor self-reexec on binary mtime change |
-| `KIN_SUPERVISOR_REQUIRE_TOKEN` | bool | false | operational | require a bearer token for supervisor requests |
+| `KIN_SUPERVISOR_REQUIRE_TOKEN` | bool | true | operational | require a bearer token for supervisor requests; set falsy to opt out |
 | `KIN_SUPERVISOR_STARTUP_GENERATION` | string | *(unset)* | operational | internal versioned supervisor launch capability generation |
 | `KIN_SUPERVISOR_URL` | url | *(unset)* | operational | explicit supervisor endpoint URL |
 

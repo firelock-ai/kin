@@ -5136,10 +5136,25 @@ def assert_windows_npm_archive_authority(
             f"{label} absolute System32 extraction authority",
         )
         for policy in (
+            # The TARGET decides the archive layout.
             "if (platform === 'win32') {",
-            "if (process.platform === 'win32') {",
+            # The HOST decides the extractor, and it arrives as a parameter
+            # defaulting to the real platform rather than being read inline.
+            # That default is what keeps production honest; the parameter is
+            # what makes the cross-target case testable from one machine. It
+            # used to read `process.platform` here, and a Unix archive unpacked
+            # on a Windows host was then reachable only on the native Windows
+            # leg, which does not grade a pull request. It reddened main once.
+            "host = process.platform",
+            "if (host === 'win32') {",
             "executable: windowsSystemTarPath(env)",
             "executable: '/usr/bin/unzip'",
+            # The Unix arm names its extractor absolutely too, falling back to
+            # the same System32 bsdtar on a Windows host rather than to a PATH
+            # lookup. A bare `tar` here is what this line pins shut: PATH
+            # belongs to whoever started the process, and the archive being
+            # unpacked is the one whose SHA-256 was just verified.
+            "host === 'win32' ? windowsSystemTarPath(env) : unixSystemToolPath('tar')",
         ):
             require(extraction, policy, f"{label} Windows ZIP extraction authority")
 
@@ -5165,6 +5180,9 @@ def assert_windows_npm_archive_authority(
             "'/usr/bin/zip'",
             "subarray(0, 4).toString('hex')",
             "'504b0304'",
+            # The host/target matrix, asserted on every runner rather than only
+            # on the one whose platform the branch happens to name.
+            "the extractor is chosen by the host and the layout by the target",
         ):
             require(active_test, policy, f"{label} genuine Windows ZIP regression")
 
@@ -17014,7 +17032,7 @@ jobs:
         "always()",
         "needs.publish.result == 'success'",
         "uses: ./.github/workflows/install-proof.yml",
-        "expected_vfs_commit: ff59dfeb8fc9ad6a0b7f1e7d4505763e00792428",
+        "expected_vfs_commit: 4ff5262bb345d2d08846b0e8e09abc9fad639aed",
     ):
         require(install_proof_job, policy, "mandatory public install proof")
 

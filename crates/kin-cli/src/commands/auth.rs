@@ -147,8 +147,84 @@ fn fallback_credential_root() -> Result<PathBuf> {
 
 fn fallback_credential_path(base_url: &str) -> Result<PathBuf> {
     let root = fallback_credential_root()?;
-    fs::create_dir_all(&root)?;
+    create_private_dir(&root)
+        .with_context(|| format!("could not create {} owner-only", root.display()))?;
     Ok(root.join(format!("{}.json.age", account_key(base_url))))
+}
+
+/// Create the credential directory owner-only, and tighten it if it already
+/// exists wider than that.
+///
+/// The plain `create_dir_all` this replaces took the process umask, so on a
+/// typical host the directory holding a KinLab bearer token, the account email
+/// and the display name was 0755. The file inside is 0600, so this closed no
+/// hole on its own, but a world-readable directory over a credential store is
+/// not a posture to ship, and the tightening pass is what fixes a machine that
+/// already has the wide one.
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        let mode = fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+/// Write `bytes` to `path`, owner-only from the moment the file exists.
+///
+/// `fs::write` then `set_permissions` leaves a window in which the file carries
+/// the umask's mode, which on a common umask is 0644. The mode belongs at
+/// creation, which is the idiom `kin-registry`'s `atomic_file` and
+/// `kin-core::init` already use.
+fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        // An existing file keeps the mode it had, so set it too rather than
+        // trusting the create-time mode alone.
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes)
+    }
+}
+
+/// What `kin auth login` prints when it takes the plaintext tier.
+///
+/// There are three tiers, and the docs named two. Falling back to the third
+/// silently is the part that matters: a headless Linux host is both the place
+/// most likely to have no keyring and the place without macOS's private
+/// `Application Support`, so the user most exposed by the plaintext tier was the
+/// one least likely to know they had it.
+fn plaintext_tier_warning(path: &std::path::Path) -> String {
+    format!(
+        "Kin: no OS keyring is available, so your KinLab credential was stored as PLAINTEXT \
+         JSON at {} (file 0600, directory 0700). It carries the bearer token, your account \
+         email and your display name. Set KINLAB_AUTH_PASSPHRASE and run `kin auth login` again \
+         to store it age-encrypted instead.",
+        path.display()
+    )
 }
 
 /// The same path without creating the directory, for read-only probes that
@@ -174,12 +250,7 @@ fn write_encrypted_file(path: &PathBuf, plaintext: &[u8]) -> Result<()> {
     let recipient = ScryptRecipient::new(passphrase);
     let encrypted =
         encrypt(&recipient, plaintext).context("failed to encrypt KinLab credential file")?;
-    fs::write(path, encrypted)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
+    write_owner_only(path, &encrypted)?;
     Ok(())
 }
 
@@ -225,12 +296,8 @@ fn store_credential(base_url: &str, credential: &StoredCredential) -> Result<()>
 
     let path = fallback_credential_path(base_url)?;
     let plaintext_path = path.with_extension("json");
-    fs::write(&plaintext_path, &serialized)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&plaintext_path, fs::Permissions::from_mode(0o600))?;
-    }
+    write_owner_only(&plaintext_path, &serialized)?;
+    eprintln!("{}", plaintext_tier_warning(&plaintext_path));
     Ok(())
 }
 
@@ -937,6 +1004,103 @@ mod tests {
         assert_eq!(
             stored_credential_provider(base_url),
             Some("github".to_string())
+        );
+    }
+
+    /// The third credential tier, the one the docs did not name.
+    ///
+    /// With no keyring and no passphrase, `kin auth login` writes the bearer
+    /// token, the account email and the display name as plaintext JSON. That
+    /// tier stays, because the alternative is a login that cannot complete on a
+    /// headless host, but it is owner-only in an owner-only directory and it
+    /// says so on stderr.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn the_plaintext_tier_is_owner_only_and_announced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base_url = "https://kinlab.example.com";
+        let store = tempfile::tempdir().expect("a private credential store");
+        let root = store.path().join("auth");
+        let _root = TestCredentialRoot::set(&root);
+        let _passphrase = kin_core::test_env::EnvVarGuard::unset("KINLAB_AUTH_PASSPHRASE");
+
+        store_credential(
+            base_url,
+            &StoredCredential {
+                base_url: base_url.to_string(),
+                token: "kinlab-bearer-token".to_string(),
+                expires_at: "2026-03-21T00:00:00Z".to_string(),
+                user_email: "troy@firelock.ai".to_string(),
+                user_display_name: "Troy Fortin".to_string(),
+                provider: None,
+            },
+        )
+        .unwrap();
+
+        // The credential path and the warning built from it are both derived
+        // from `account_key`, which CodeQL's `rust/cleartext-logging` treats as
+        // a sensitive value. Neither is a secret, it is a SHA-256 of the base
+        // URL, but a panic message that interpolates either one is a sink as far
+        // as that rule is concerned. So these assertions compare the value and
+        // report the property, never the value. The array of needles below is
+        // beside its assertion, so a failure still names what was missing.
+        let credential_file = fallback_credential_probe_path(base_url)
+            .unwrap()
+            .with_extension("json");
+        assert!(
+            credential_file.exists(),
+            "the plaintext tier must write where the reader looks"
+        );
+        assert_eq!(
+            fs::metadata(&credential_file).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a plaintext credential file must be owner-only"
+        );
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the credential directory must be owner-only"
+        );
+
+        let warning = plaintext_tier_warning(&credential_file);
+        for needle in ["PLAINTEXT", "0600", "0700", "KINLAB_AUTH_PASSPHRASE"] {
+            assert!(
+                warning.contains(needle),
+                "the plaintext-tier warning must name {needle}"
+            );
+        }
+        assert!(
+            warning.contains(&credential_file.display().to_string()),
+            "the plaintext-tier warning must name the credential file it wrote"
+        );
+    }
+
+    /// A machine that already has the wide directory gets it tightened, so the
+    /// fix reaches an existing install rather than only a fresh one.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn an_existing_world_readable_credential_directory_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let store = tempfile::tempdir().expect("a private credential store");
+        let root = store.path().join("auth");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        // The control: the wide mode is really there before the call.
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        let _root = TestCredentialRoot::set(&root);
+        fallback_credential_path("https://kinlab.example.com").unwrap();
+
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
         );
     }
 }
