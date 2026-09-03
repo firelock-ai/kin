@@ -701,6 +701,15 @@ CI_JOB_DISPLAY_NAMES = {
     "fast-gate-lint": "Fast gate lint and policy",
     "fast-gate-tests": "Fast gate test shard",
     "fast-gate-tests-aggregate": "Fast gate build and tests",
+    # The pull request's only Windows evidence. All four native Windows jobs
+    # carry `github.event_name != 'pull_request'`, so on 2026-09-02 a helper
+    # that was dead code under `cfg(not(unix))` read green through its whole
+    # pull request and turned every Windows job on main red for an hour. This
+    # cross-compiles the shipped package set for x86_64-pc-windows-gnu, which
+    # reproduces that class because `cfg(unix)` is false for both Windows
+    # targets and msvc cannot cross-compile off Windows. It publishes a name no
+    # ruleset requires and blocks through the aggregate's `needs:` below.
+    "windows-cross-check": "Windows cross-check",
     # The served MCP surface, graded on the pull request that moves it. Five
     # assertions read that surface and all five run only on main's push, so a
     # profile change that moved a served name and trimmed three schema knobs and
@@ -4801,7 +4810,10 @@ FAST_GATE_SHARD_STEPS = (
 FAST_GATE_SHARD_MATRIX = "shard: [1, 2, 3]"
 FAST_GATE_SHARD_INDEPENDENT_LEGS = "fail-fast: false"
 FAST_GATE_AGGREGATE_ALWAYS_RUNS = "if: ${{ !cancelled() }}"
-FAST_GATE_AGGREGATE_NEEDS = "needs: [changes, fast-gate-tests]"
+# The Windows cross-check is in here rather than left advisory because the job
+# publishes no required context of its own. Without this line a red Windows leg
+# sits beside six green required contexts and the pull request merges.
+FAST_GATE_AGGREGATE_NEEDS = "needs: [changes, fast-gate-tests, windows-cross-check]"
 FAST_GATE_AGGREGATE_SUCCESS_GATE = 'if [ "$SHARDS" != "success" ]; then'
 
 
