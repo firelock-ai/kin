@@ -241,7 +241,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     // ---- supervisor -----------------------------------------------------------
     EnvVarSpec { name: "KIN_SUPERVISOR_URL", kind: Kind::Url, default: "", sensitivity: Sensitivity::Operational, summary: "explicit supervisor endpoint URL" },
     EnvVarSpec { name: "KIN_SUPERVISOR_BIND_HOST", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "host/interface the supervisor binds to" },
-    EnvVarSpec { name: "KIN_SUPERVISOR_REQUIRE_TOKEN", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "require a bearer token for supervisor requests" },
+    EnvVarSpec { name: "KIN_SUPERVISOR_REQUIRE_TOKEN", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "require a bearer token for supervisor requests; set falsy to opt out" },
     EnvVarSpec { name: "KIN_SUPERVISOR_IDLE_TIMEOUT_SECS", kind: Kind::Secs, default: "3600", sensitivity: Sensitivity::Operational, summary: "supervisor auto-shutdown idle period; 0 disables idle shutdown" },
     EnvVarSpec { name: "KIN_SUPERVISOR_STARTUP_GENERATION", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "internal versioned supervisor launch capability generation" },
     EnvVarSpec { name: "KIN_SUPERVISOR_REAP_CPU", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "enable the CPU-heuristic zombie reaper; set falsey to disable" },

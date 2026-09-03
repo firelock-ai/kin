@@ -158,7 +158,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_SUPERVISOR_REDEPLOY_DISABLE` | bool | false | operational | disable supervisor auto-redeploy |
 | `KIN_SUPERVISOR_REDEPLOY_GRACE` | seconds>=0 | *(unset)* | operational | grace period before a supervisor redeploy |
 | `KIN_SUPERVISOR_REEXEC_DISABLE` | bool | false | operational | disable supervisor self-reexec on binary mtime change |
-| `KIN_SUPERVISOR_REQUIRE_TOKEN` | bool | false | operational | require a bearer token for supervisor requests |
+| `KIN_SUPERVISOR_REQUIRE_TOKEN` | bool | true | operational | require a bearer token for supervisor requests; set falsy to opt out |
 | `KIN_SUPERVISOR_STARTUP_GENERATION` | string | *(unset)* | operational | internal versioned supervisor launch capability generation |
 | `KIN_SUPERVISOR_URL` | url | *(unset)* | operational | explicit supervisor endpoint URL |
 

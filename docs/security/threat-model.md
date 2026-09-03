@@ -98,6 +98,27 @@ Enforcement of the per-install token is **on by default**:
   and is always enforced, even while `KIN_DAEMON_REQUIRE_TOKEN` is opted out;
   this is also the token required to bind a non-loopback address.
 
+### The machine-wide supervisor
+
+The supervisor is a second HTTP control plane, one per user rather than one per
+repository, and it holds the same policy. It provisions `~/.kin/supervisor.token`
+on first run and enforces it by default; `KIN_SUPERVISOR_REQUIRE_TOKEN` set to a
+falsy value (`0`, `false`, `no`, `off`) is the escape hatch, and
+`KIN_SUPERVISOR_AUTH_TOKEN` is the explicit override that always wins. Only
+`/health` and `/readiness` are public. Everything else, including `/repos`,
+`/daemons`, `/daemons/register` and `/shutdown`, needs the bearer token, because
+unauthenticated those routes name every repository the user has open and let any
+local process stop the supervisor for all of them.
+
+The CLI trusts a route the supervisor hands back only when it names loopback. The
+supervisor stores whatever endpoint a registration reports, so that value is
+another process's claim rather than a fact, and a route naming another host is
+refused before any request is sent to it. The same rule governs `KIN_DAEMON_URL`:
+the auto-provisioned `<repo>/.kin/daemon.token` is attached only to a loopback
+endpoint, and a remote endpoint must be paired with its own
+`KIN_DAEMON_AUTH_TOKEN` or the client refuses by name rather than sending a local
+credential to a host it cannot vouch for.
+
 ### Resulting trust boundary
 
 In its default configuration the daemon's effective trust boundary is **any
