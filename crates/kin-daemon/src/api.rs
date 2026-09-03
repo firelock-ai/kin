@@ -2074,6 +2074,10 @@ fn api_routes() -> Router<Arc<DaemonState>> {
             post(publication_control_admit_reader),
         )
         .route(
+            "/authority/publication-control/rollout/authorize-next-reader",
+            post(publication_control_authorize_next_reader),
+        )
+        .route(
             "/authority/publication-control/rollout/release",
             post(publication_control_release_rollout),
         )
@@ -16672,6 +16676,28 @@ async fn publication_control_admit_reader(
         .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
     let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
     Ok(Json(record))
+}
+
+/// Name the image identity that may admit itself at its next startup.
+///
+/// This is the one route on this surface that does not act on the daemon
+/// serving it. The promotion calls it against the healthy outgoing daemon
+/// before the new image is applied, so nothing ever has to reach an unready or
+/// restarting pod, and the successor admits itself at its own startup under the
+/// authorization written here. The daemon still admits only itself: admit-reader
+/// refuses any reader but the one running, which is why the promotion writes an
+/// authorization rather than the reader.
+async fn publication_control_authorize_next_reader(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<crate::publication_lease::AuthorizeNextReaderRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let record = publication_control(&state)?
+        .authorize_next_reader(request)
+        .map_err(publication_control_error)?;
+    // Redacted, unlike admit-reader's echo of the caller's own record. The
+    // caller wants to read back the identity it just wrote, and nothing on this
+    // route needs a lease token in the response to do that.
+    Ok(Json(crate::publication_lease::PublicationControlStatus::from(record)))
 }
 
 async fn publication_control_release_rollout(
@@ -31928,6 +31954,8 @@ mod tests {
     async fn publication_control_api_drives_the_rollout_to_release() {
         const READER_A: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const READER_B: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let fleet = vec![
             "kin".to_string(),
             "kin-db".to_string(),
@@ -32063,6 +32091,37 @@ mod tests {
              reader: {admitted}"
         );
 
+        // The rest of the promotion's own sequence: name the successor under
+        // the lease it already holds, then release. A promotion that held its
+        // lease until the successor started would close production readiness
+        // for the whole apply, so the authorization has to be on the record
+        // rather than on the lease.
+        let (status, authorized) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/authorize-next-reader",
+            serde_json::json!({
+                "scope": scope,
+                "token": token,
+                "fence": fence,
+                "identity": READER_B
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the promotion must be able to name its successor: {authorized}"
+        );
+        assert_eq!(
+            authorized["next_reader_identity"].as_str(),
+            Some(READER_B),
+            "{authorized}"
+        );
+        assert!(
+            !authorized.to_string().contains("\"token\""),
+            "authorizing must not disclose live lease capability: {authorized}"
+        );
+
         let (status, released) = publication_post(
             app.clone(),
             "/authority/publication-control/rollout/release",
@@ -32070,6 +32129,30 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "release must succeed: {released}");
+
+        // The successor starts long after this lease is gone, so the record and
+        // not the lease is what has to still carry the authorization.
+        let control_status = app
+            .clone()
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .header("authorization", "Bearer publication-test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control_status.status(), StatusCode::OK);
+        let status_body = axum::body::to_bytes(control_status.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+        assert!(status_json["active_lease"].is_null());
+        assert_eq!(
+            status_json["next_reader_identity"].as_str(),
+            Some(READER_B),
+            "releasing the lease must not drop the authorization: {status_json}"
+        );
 
         // The point of the whole sequence: a reader is admitted afterwards and
         // semantic readiness is open. Asserting only the three 200s would pass
