@@ -18,8 +18,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
 use crate::state::{
-    ChangeType, DaemonEvent, DaemonState, LspEnrichmentRequest, ProjectionChangedSet, RECON_IDLE,
-    RECON_PARKED, RECON_PROCESSING,
+    ChangeType, DaemonEvent, DaemonState, LspEnrichmentRequest, RECON_IDLE, RECON_PARKED,
+    RECON_PROCESSING,
 };
 
 pub(crate) const DISABLE_FILESYSTEM_RECONCILE_ENV: &str = "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE";
@@ -2956,7 +2956,6 @@ pub async fn run_loop_armed(
         // zero however much work it did, which is the honest account of a loop
         // that is spending the machine and moving nothing.
         let mut admitted_events: u64 = 0;
-        let mut projection_changed = ProjectionChangedSet::default();
 
         let mut lsp_changed: Vec<(kin_model::FilePathId, Vec<kin_model::EntityId>)> = Vec::new();
         let graph_mutation = state.begin_graph_authority_mutation();
@@ -3152,7 +3151,6 @@ pub async fn run_loop_armed(
                         match enrichment_pipeline.index_any_content(&file_id, &content, blob_hash) {
                             Ok(indexed) => match persist_non_entity_enrichment(&state, indexed) {
                                 Ok((file_id, cleanup)) => {
-                                    projection_changed.remove(file_id.clone());
                                     for id in cleanup.removed_entities {
                                         state.emit_event(DaemonEvent::EntityChanged {
                                             entity_id: id,
@@ -3233,7 +3231,6 @@ pub async fn run_loop_armed(
                                     session_id: None,
                                 });
                             }
-                            projection_changed.remove(file_id.clone());
                             graph_changed |= cleanup.changed;
                             if tree_changed || cleanup.changed {
                                 state.bump_version();
@@ -3266,7 +3263,6 @@ pub async fn run_loop_armed(
                     match finalize_tree_removal(&state, file_id.as_ref(), tree_changed) {
                         Ok(cleanup) => {
                             if let Some(file_id) = &file_id {
-                                projection_changed.remove(file_id.clone());
                                 for id in cleanup.removed_entities {
                                     state.emit_event(DaemonEvent::EntityChanged {
                                         entity_id: id,
@@ -3362,7 +3358,6 @@ pub async fn run_loop_armed(
                         {
                             warn!(error = %e, "failed to persist projection truth after reconcile");
                         }
-                        projection_changed.record_reconcile_outcome(&outcome);
                         graph_changed = true;
                     }
 
@@ -3475,9 +3470,7 @@ pub async fn run_loop_armed(
                             }
                         }
                         match clear_incompatible_facets(&state, file_id, EnrichmentFacet::None) {
-                            Ok(_) => {
-                                projection_changed.remove(file_id.clone());
-                            }
+                            Ok(_) => {}
                             Err(error) => {
                                 warn!(
                                     file = %file_id,
@@ -3552,19 +3545,10 @@ pub async fn run_loop_armed(
             });
         }
 
-        // Refresh projection cache so VFS reads serve fresh content.
-        // Persistence is handled by the background save task — the reconcile
-        // loop just marks the graph dirty and refreshes touched projection rows.
+        // Persistence is handled by the background save task, so the reconcile
+        // loop just marks the graph dirty.
         if graph_changed {
             state.mark_dirty();
-            let projection_result = if projection_changed.is_empty() {
-                state.rebuild_projection().await
-            } else {
-                state.refresh_projection(&projection_changed).await
-            };
-            if let Err(e) = projection_result {
-                error!(error = %e, "failed to refresh projection after reconciliation");
-            }
         }
 
         // The pass boundary, after every event this pass produced. A consumer
@@ -8307,7 +8291,6 @@ async fn sync_filesystem_with_graph_publishing_inner(
     // never controls repository membership.
     let mut reconciler = state.reconciler.write().await;
     let mut graph_changed = true;
-    let mut projection_changed = ProjectionChangedSet::default();
     let enrichment_pipeline = IndexPipeline::new();
     state.bump_version();
 
@@ -8375,7 +8358,6 @@ async fn sync_filesystem_with_graph_publishing_inner(
                     match enrichment_pipeline.index_any_content(&file_id, &content, blob_hash) {
                         Ok(indexed) => match persist_non_entity_enrichment(state, indexed) {
                             Ok((file_id, cleanup)) => {
-                                projection_changed.remove(file_id.clone());
                                 for id in cleanup.removed_entities {
                                     state.emit_event(DaemonEvent::EntityChanged {
                                         entity_id: id,
@@ -8437,7 +8419,6 @@ async fn sync_filesystem_with_graph_publishing_inner(
                                 session_id: None,
                             });
                         }
-                        projection_changed.remove(file_id.clone());
                         graph_changed |= cleanup.changed;
                         debug!(
                             file = %file_id,
@@ -8464,7 +8445,6 @@ async fn sync_filesystem_with_graph_publishing_inner(
                 match finalize_tree_removal(state, file_id.as_ref(), tree_changed) {
                     Ok(cleanup) => {
                         if let Some(file_id) = &file_id {
-                            projection_changed.remove(file_id.clone());
                             for id in cleanup.removed_entities {
                                 state.emit_event(DaemonEvent::EntityChanged {
                                     entity_id: id,
@@ -8536,16 +8516,13 @@ async fn sync_filesystem_with_graph_publishing_inner(
                     {
                         warn!(error = %e, "failed to persist projection truth after sync");
                     }
-                    projection_changed.record_reconcile_outcome(&outcome);
 
                     if let ReconcileOutcome::FileRemoved {
                         removed, file_id, ..
                     } = &outcome
                     {
                         match clear_incompatible_facets(state, file_id, EnrichmentFacet::None) {
-                            Ok(_) => {
-                                projection_changed.remove(file_id.clone());
-                            }
+                            Ok(_) => {}
                             Err(error) => warn!(
                                 file = %file_id,
                                 error = %error,
@@ -8589,17 +8566,6 @@ async fn sync_filesystem_with_graph_publishing_inner(
         state.bump_version();
     }
     drop(graph_mutation);
-
-    if graph_changed {
-        let projection_result = if projection_changed.is_empty() {
-            state.rebuild_projection().await
-        } else {
-            state.refresh_projection(&projection_changed).await
-        };
-        if let Err(e) = projection_result {
-            error!(error = %e, "failed to refresh projection after sync");
-        }
-    }
 
     Ok(())
 }

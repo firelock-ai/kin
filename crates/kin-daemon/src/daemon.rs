@@ -4296,31 +4296,6 @@ pub async fn run_with_authority_on(
         shutdown_escalation_grace(),
     );
 
-    // Spawn projection rebuild in background — VFS needs it but locate doesn't.
-    // The reconcile loop and API server can start immediately.
-    //
-    // Registered with the self-limit supervisor as disclose-only. The whole pass
-    // is a single `rebuild_projection().await`: there is no loop and so nowhere
-    // between start and finish for it to read a halt. Making it stoppable means
-    // threading cancellation through `ProjectionState::from_resolved_tree`,
-    // which is an API change rather than a registration. Until then the honest
-    // thing is to let a user see it working and how long since it advanced, and
-    // to never claim it was stopped.
-    let projection_state = Arc::clone(&state);
-    let projection_pass = state
-        .background_work
-        .disclosed_pass(crate::background_work::PASS_PROJECTION);
-    tokio::spawn(async move {
-        projection_pass.working(Instant::now());
-        if let Err(error) = projection_state.rebuild_projection().await {
-            tracing::error!(error = %error, "failed to rebuild projection state on startup");
-        } else {
-            projection_pass.advanced(1, Instant::now());
-            tracing::info!("projection state rebuilt in background");
-        }
-        projection_pass.idle();
-    });
-
     // Spawn the orphan session sweeper (Phase 7).
     let sweep_state = Arc::clone(&state);
     let sweep_interval = config.sweep_interval;
