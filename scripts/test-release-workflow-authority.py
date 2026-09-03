@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github" / "workflows"
 README = ROOT / "README.md"
 RELEASE = WORKFLOWS / "release.yml"
+RELEASE_CUT = WORKFLOWS / "release-cut.yml"
 RELEASE_RECOVERY = WORKFLOWS / "release-recovery.yml"
 RELEASE_TAG = WORKFLOWS / "release-tag.yml"
 RC_BUILD = WORKFLOWS / "rc-build.yml"
@@ -1263,6 +1264,45 @@ def assert_require_modes_match_the_gate(
             f"the release workflows ask the proof gate for mode(s) {unknown} "
             f"that it does not declare (it knows {sorted(modes)}); move both "
             "sides together"
+        )
+
+
+def assert_stranger_driver_credential_is_either(release_cut: str) -> None:
+    """The cut must accept a local model OR a key, and must still refuse with neither.
+
+    The key is required only on the account path. Naming a local model points
+    the driver at an endpoint on the runner and `driver_env_argv` then UNSETS
+    ANTHROPIC_API_KEY for the driver child, so demanding a secret the run
+    throws away is how a rail stays blocked on a founder step it does not need.
+
+    Both halves are asserted, because the refusal is the load-bearing one: an
+    absent credential sends every driver request out unauthenticated and the
+    transcript records only a server error, hours in.
+    """
+
+    lines = active_lines(release_cut)
+    joined = "\n".join(lines)
+    if "vars.KIN_STRANGER_LOCAL_MODEL" not in joined:
+        raise AssertionError(
+            "release-cut.yml must let a local model drive the stranger; without "
+            "it the cut demands an API key the local path immediately discards"
+        )
+    if '--local-model' not in joined:
+        raise AssertionError(
+            "release-cut.yml names a local model and never passes --local-model "
+            "to the harness, so the run would drive the account anyway"
+        )
+    # The refusal must still exist, and it must still be reachable when neither
+    # credential is configured.
+    if 'if [ -n "${LOCAL_MODEL:-}" ]; then' not in joined:
+        raise AssertionError(
+            "release-cut.yml must branch on the local model before it demands a key"
+        )
+    if 'elif [ -z "${STRANGER_KEY:-}" ]; then' not in joined:
+        raise AssertionError(
+            "release-cut.yml must still refuse when NEITHER a local model nor a "
+            "key is configured; a driver with no credential fails hours in with "
+            "a bare server error"
         )
 
 
@@ -10229,6 +10269,7 @@ def main() -> None:
             )
 
     release = RELEASE.read_text(encoding="utf-8")
+    release_cut = RELEASE_CUT.read_text(encoding="utf-8")
     release_recovery = RELEASE_RECOVERY.read_text(encoding="utf-8")
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
     release_train = RELEASE_TRAIN.read_text(encoding="utf-8")
@@ -16557,6 +16598,21 @@ def main() -> None:
     # The two-tier proof contract, and a falsification arm per direction it
     # could collapse. Each mutant is the smallest edit that would actually be
     # made by someone "tidying up", not a syntactic wreck.
+    assert_stranger_driver_credential_is_either(release_cut)
+    expect_assertion(
+        "the cut demands an API key even when a local model drives",
+        "must let a local model drive the stranger",
+        lambda mutant=release_cut.replace("vars.KIN_STRANGER_LOCAL_MODEL", "vars.KIN_STRANGER_UNUSED"): (
+            assert_stranger_driver_credential_is_either(mutant)
+        ),
+    )
+    expect_assertion(
+        "the cut accepts a driverless run with no credential at all",
+        "must still refuse when NEITHER",
+        lambda mutant=release_cut.replace(
+            'elif [ -z "${STRANGER_KEY:-}" ]; then', 'elif false; then', 1
+        ): assert_stranger_driver_credential_is_either(mutant),
+    )
     assert_tag_tier_requires_only_the_machine_proof(release_tag)
     assert_latest_requires_the_stranger(release)
     assert_latest_claims_gate_on_promotion(release)

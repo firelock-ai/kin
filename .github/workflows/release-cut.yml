@@ -578,9 +578,16 @@ jobs:
     needs: select
     if: needs.select.outputs.decision == 'stranger' && vars.KIN_STRANGER_RUNNER != ''
     runs-on: ${{ vars.KIN_STRANGER_RUNNER }}
-    # Three concurrent arms at phase caps of 3600 s and 7200 s, plus image and
-    # container setup. Six hours is headroom, not an expectation.
-    timeout-minutes: 360
+    # Three concurrent arms plus image and container setup. The arms run
+    # concurrently, so the wall clock is one phase 1 plus one phase 2, not three
+    # of each.
+    #
+    # A local endpoint gets a longer ceiling because it has longer phase
+    # budgets. bin/kin-stranger scales a local run's caps to 10800 s and 21600 s
+    # from a measured turn rate 4.7 to 9.7 times an account turn, so nine hours
+    # of arm can sit under a six-hour job and be cut by the job instead. Ten
+    # hours is headroom over that, and neither number is an expectation.
+    timeout-minutes: ${{ vars.KIN_STRANGER_LOCAL_MODEL != '' && 600 || 360 }}
     permissions:
       actions: read
       contents: read
@@ -590,6 +597,7 @@ jobs:
       - name: Refuse before spending an arm on a missing credential
         env:
           STRANGER_KEY: ${{ secrets.KIN_STRANGER_ANTHROPIC_API_KEY }}
+          LOCAL_MODEL: ${{ vars.KIN_STRANGER_LOCAL_MODEL }}
           UMBRELLA: ${{ vars.KIN_STRANGER_UMBRELLA }}
         run: |
           set -euo pipefail
@@ -597,8 +605,20 @@ jobs:
           # driver request out unauthenticated and the transcript records only a
           # server error, hours in; an absent umbrella fails at the first docker
           # exec with the same delay. Neither is worth discovering late.
-          if [ -z "${STRANGER_KEY:-}" ]; then
-            echo "::error::the repository secret KIN_STRANGER_ANTHROPIC_API_KEY is not set, so the stranger driver has no credential. Set it, or clear the KIN_STRANGER_RUNNER variable so the cut prints the local command instead."
+          #
+          # The key is required only on the ACCOUNT path. Naming
+          # vars.KIN_STRANGER_LOCAL_MODEL points the driver at an Anthropic
+          # Messages endpoint on the runner itself, and driver_env_argv then
+          # UNSETS ANTHROPIC_API_KEY for the driver child, because Claude Code
+          # prefers that key over ANTHROPIC_AUTH_TOKEN and a host carrying one
+          # would hand a local server a real credential and read back a 401
+          # nobody could place. Requiring a secret the run then throws away is
+          # how a rail stays blocked on a founder step it does not need.
+          if [ -n "${LOCAL_MODEL:-}" ]; then
+            echo "local endpoint: this cut drives the arms with '${LOCAL_MODEL}' on the runner, not the account"
+            echo "KIN_STRANGER_LOCAL_MODEL=${LOCAL_MODEL}" >> "$GITHUB_ENV"
+          elif [ -z "${STRANGER_KEY:-}" ]; then
+            echo "::error::no driver credential: the repository secret KIN_STRANGER_ANTHROPIC_API_KEY is not set and the variable KIN_STRANGER_LOCAL_MODEL names no local model. Set one of them, or clear KIN_STRANGER_RUNNER so the cut prints the local command instead."
             exit 1
           fi
           umbrella="${UMBRELLA:-$HOME/GitHub/kin-ecosystem}"
@@ -648,6 +668,10 @@ jobs:
           # untouched and Claude Code prefers it over ANTHROPIC_AUTH_TOKEN.
           # Exporting the secret is the whole integration; the harness needs no
           # change, which is why this job adds no --driver flag.
+          #
+          # On the local path the same variable is still exported and the same
+          # function still unsets it for the driver child, so this line is safe
+          # either way and there is exactly one place the key can reach.
           ANTHROPIC_API_KEY: ${{ secrets.KIN_STRANGER_ANTHROPIC_API_KEY }}
           CANDIDATE: ${{ needs.select.outputs.candidate }}
           VERSION: ${{ needs.select.outputs.version }}
@@ -670,9 +694,17 @@ jobs:
             # two-arm runs were refused at the mint, and evidence is
             # append-only, so a record missing an arm cannot be replaced.
             bin/kin-stranger prepare --run "$run_id" --arms green,brown,vcs
+            # One argv element per flag, built as an array, so an empty local
+            # model contributes nothing rather than an empty string the tool
+            # would read as a model named "".
+            local_flags=()
+            if [ -n "${KIN_STRANGER_LOCAL_MODEL:-}" ]; then
+              local_flags=(--local-model "$KIN_STRANGER_LOCAL_MODEL")
+            fi
             bin/kin-stranger run --run "$run_id" \
               --archive "$KIN_STRANGER_ARCHIVE" \
-              --candidate-sha "$CANDIDATE"
+              --candidate-sha "$CANDIDATE" \
+              "${local_flags[@]+"${local_flags[@]}"}"
           fi
           record="${root}/run.env"
           if [ ! -s "$record" ]; then
@@ -822,6 +854,19 @@ jobs:
             echo "gh variable set KIN_STRANGER_RUNNER --repo ${GITHUB_REPOSITORY} --body '<runner label>'"
             echo "gh secret set KIN_STRANGER_ANTHROPIC_API_KEY --repo ${GITHUB_REPOSITORY}"
             echo '```'
+            echo ""
+            echo "The secret is one of two ways to give the driver a credential, and the other"
+            echo "needs no secret at all. Naming a model the runner already serves points the"
+            echo "driver at an Anthropic Messages endpoint on that machine, and the harness then"
+            echo "unsets \`ANTHROPIC_API_KEY\` for the driver child, so no key is involved:"
+            echo ""
+            echo '```'
+            echo "gh variable set KIN_STRANGER_LOCAL_MODEL --repo ${GITHUB_REPOSITORY} --body '<model id the runner serves>'"
+            echo '```'
+            echo ""
+            echo "A local-model stranger is a WEAKER stranger. Its findings stand on their own"
+            echo "evidence; an empty finding list from it does not, and the record says which"
+            echo "driver produced it so no reader has to guess."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::warning::${CANDIDATE} has its preflight record and needs the stranger; no KIN_STRANGER_RUNNER is set, so the command is in this run's summary and a captain has to run it"
 
