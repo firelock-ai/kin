@@ -506,7 +506,41 @@ def main():
     if len(sys.argv) != 2:
         print(__doc__)
         return 2
+    # This harness REWRITES source files in place: it plants a probe, runs the
+    # guards, and restores the original in a `finally`. Two refusals guard the
+    # target, because the damage from a wrong one is done before any verdict
+    # exists, and both exit 2 so a refusal can never be read as a verdict.
+    #
+    # An empty argument is the one that actually happened. A caller built the
+    # path with `poisoned=$(cat <file>)`, the file did not exist, `cat` failed,
+    # and the empty string reached here looking exactly like a path. Argument
+    # COUNT is 2 either way, and `os.path.abspath("")` is the current working
+    # directory, so the harness poisoned the live checkout instead of a copy.
+    # It restored everything and exited 0; a killed run would have left a probe
+    # in real source. An empty value that looks exactly like a valid one is the
+    # shape to refuse, not to survive.
+    if not sys.argv[1].strip():
+        print(
+            "falsify-zero-file-search: refusing an empty root. os.path.abspath('') is the "
+            "current working directory, so an empty argument would poison whatever tree you "
+            "are standing in. Pass the copy explicitly.",
+            file=sys.stderr,
+        )
+        return 2
     root = os.path.abspath(sys.argv[1])
+    # A git working tree is never a legitimate target. Every caller copies
+    # `crates` and `scripts` into a scratch directory first, which carries no
+    # `.git`, so this separates the intended target from the one mistake that
+    # costs real source. `.git` is a directory in a clone and a file in a
+    # worktree, so test existence rather than directory-ness.
+    if os.path.exists(os.path.join(root, ".git")):
+        print(
+            f"falsify-zero-file-search: refusing {root}: it is a git working tree and this "
+            "harness rewrites source files in place. Copy `crates` and `scripts` into a "
+            "scratch directory and pass that, which is what CI does.",
+            file=sys.stderr,
+        )
+        return 2
     guard = load_guard(root)
     exempt = whole_file_exempt(root)
     shell_modules = shell_guard_modules(root)
