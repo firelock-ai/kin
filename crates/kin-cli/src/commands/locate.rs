@@ -12895,12 +12895,11 @@ fn entity_seed_keyed(
 /// PATH-keyed here while 7 and 9 are ENTITY-keyed, so that count would span two
 /// key spaces and never coincide.
 ///
-/// It does carry the path fuser's semantic-primacy term, off by default and
-/// applied by [`apply_entity_semantic_primacy`]. Index positions survive the
-/// re-keying: `entity_granular_fused_files` builds `keyed_lists` by enumerating
-/// `ranked_lists` in order, so index 9 is the embedding list in both, keyed by
-/// entity id. Without that term a key only the vector arm found carries a bare
-/// rank contribution, which is the exact case the term was written for.
+/// It also omits the path fuser's semantic-primacy term, which
+/// [`entity_granular_fused_files`] applies to this function's OUTPUT instead. The
+/// term has to be keyed by the file-level embedding ranking, and that list is not
+/// available here: index 9 of `keyed_lists` holds the embedding SEED entities,
+/// which are a different and much smaller population than `ranked_lists[9]`.
 fn reciprocal_rank_fusion_entities(
     keyed_lists: &[Vec<(String, String, f32)>],
     k: f32,
@@ -12948,7 +12947,6 @@ fn reciprocal_rank_fusion_entities(
             )
         })
         .collect();
-    apply_entity_semantic_primacy(&mut combined, keyed_lists);
     combined.sort_by(|a, b| {
         b.2.partial_cmp(&a.2)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -12957,9 +12955,13 @@ fn reciprocal_rank_fusion_entities(
     combined
 }
 
-/// Signal-list index of the embedding arm, in `ranked_lists` and in the
-/// `keyed_lists` [`entity_granular_fused_files`] derives from it in the same
-/// order.
+/// Signal-list index of the embedding arm in `ranked_lists`.
+///
+/// Note that the `keyed_lists` [`entity_granular_fused_files`] derives from
+/// `ranked_lists` does NOT hold the same content at this index: when the
+/// embedding seeds resolve, index 9 is replaced by the entity-keyed SEED list.
+/// So a term that needs the file-level embedding ranking must read
+/// `ranked_lists[9]`, not `keyed_lists[9]`.
 const EMBEDDING_SIGNAL_INDEX: usize = 9;
 
 /// Semantic-primacy lift for the entity fuser, applied in place to the unlifted
@@ -13002,35 +13004,29 @@ const EMBEDDING_SIGNAL_INDEX: usize = 9;
 /// weight grows, peaks, then falls back to its unlifted place. Sweep a range and
 /// read the peak; do not push the weight up expecting more effect.
 fn apply_entity_semantic_primacy(
-    combined: &mut [(String, String, f32)],
-    keyed_lists: &[Vec<(String, String, f32)>],
+    fused: &mut [(String, String, f32)],
+    embedding_ranked: &[(String, f32)],
 ) {
     let weight = locate_env_f32("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT", 0.0);
-    if weight <= 0.0 {
+    if weight <= 0.0 || embedding_ranked.is_empty() {
         return;
     }
     let k = locate_env_f32("KIN_LOCATE_SEMANTIC_PRIMACY_K", 8.0);
-    // Clamped strictly below 1.0: at exactly 1.0 a lifted key reaches `top` and
+    // Clamped strictly below 1.0: at exactly 1.0 a lifted entry reaches `top` and
     // the sort's key tiebreak could put it first, which is the invariant this
     // whole term is bounded by.
     let headroom = locate_env_f32("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_HEADROOM", 0.9).min(0.99);
-    let Some(embedding_list) = keyed_lists.get(EMBEDDING_SIGNAL_INDEX) else {
-        return;
-    };
-    let embed_rank: FxHashMap<&str, usize> = embedding_list
+    let embed_rank: FxHashMap<&str, usize> = embedding_ranked
         .iter()
         .enumerate()
-        .map(|(rank, (key, _, _))| (key.as_str(), rank))
+        .map(|(rank, (path, _))| (path.as_str(), rank))
         .collect();
-    if embed_rank.is_empty() {
-        return;
-    }
-    let top = combined
+    let top = fused
         .iter()
         .map(|(_, _, score)| *score)
         .fold(0.0f32, f32::max);
-    for (key, _, score) in combined.iter_mut() {
-        let Some(&rank) = embed_rank.get(key.as_str()) else {
+    for (_, path, score) in fused.iter_mut() {
+        let Some(&rank) = embed_rank.get(path.as_str()) else {
             continue;
         };
         let lift = weight / (k + rank as f32 + 1.0);
@@ -13040,6 +13036,11 @@ fn apply_entity_semantic_primacy(
             *score += applied;
         }
     }
+    fused.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 }
 
 /// Entity-granular fusion (behind `KIN_LOCATE_ENTITY_FUSION`, ON for accuracy-v2
@@ -13089,7 +13090,19 @@ fn entity_granular_fused_files(
         keyed_lists.push(keyed);
     }
     let rrf_k = locate_env_f32("KIN_LOCATE_RRF_K", 60.0);
-    let fused_entities = reciprocal_rank_fusion_entities(&keyed_lists, rrf_k);
+    let mut fused_entities = reciprocal_rank_fusion_entities(&keyed_lists, rrf_k);
+    // Semantic primacy is keyed by the FILE-level embedding ranking, which is
+    // `ranked_lists[9]`. `keyed_lists[9]` cannot serve: when the embedding seeds
+    // resolve it holds the entity-keyed seed list instead, a different and much
+    // smaller population, so a term keyed off it never reaches a file the vector
+    // arm ranked but the seeds missed.
+    apply_entity_semantic_primacy(
+        &mut fused_entities,
+        ranked_lists
+            .get(EMBEDDING_SIGNAL_INDEX)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    );
     // Project entity ranking → files: each file takes its best entity's score.
     let mut best_per_file: HashMap<String, f32> = HashMap::new();
     for (_, path, score) in &fused_entities {
@@ -32147,58 +32160,57 @@ mod tests {
     // Semantic primacy on the entity path.
     // ───────────────────────────────────────────────────────────────────────
 
-    /// The measured starvation shape at unit-test scale.
+    /// The measured starvation shape at unit-test scale, as the fused entity list
+    /// looks when it reaches [`apply_entity_semantic_primacy`].
     ///
-    /// `e:widget` is found by two graph arms and holds the top on merit. `e:mixed0`
-    /// and `e:mixed1` carry a graph signal AND a deep embedding rank. Eight `e:junk`
-    /// keys carry both signals in the middle of each list. `e:cursors` and
-    /// `e:type_ops` are found by the vector arm ALONE, at the two BEST embedding
-    /// ranks, and still land below keys they beat semantically. That inversion is
-    /// the defect: the combine pays for breadth, and one arm cannot buy it.
-    fn embedding_starvation_lists() -> Vec<Vec<(String, String, f32)>> {
-        let ent = |key: &str, path: &str, score: f32| (key.to_string(), path.to_string(), score);
-        let mut lists: Vec<Vec<(String, String, f32)>> = vec![Vec::new(); 10];
-
-        // idx 1: multihop.
-        lists[1].push(ent("e:widget", "src/widget.ts", 100.0));
-        lists[1].push(ent("e:mixed0", "src/mixed0.ts", 20.0));
-        lists[1].push(ent("e:mixed1", "src/mixed1.ts", 19.0));
-        for i in 0..8u32 {
-            lists[1].push(ent(
-                &format!("e:junk{i}"),
-                &format!("src/junk{i}.ts"),
-                12.0 - i as f32,
-            ));
-        }
-        lists[1].push(ent("e:graphonly", "src/graphonly.ts", 4.0));
-
-        // idx 2: tests. The widget's second graph signal.
-        lists[2].push(ent("e:widget", "src/widget.ts", 40.0));
-
-        // idx 9: embedding.
-        lists[9].push(ent("e:cursors", "src/cursor.ts", 0.95));
-        lists[9].push(ent("e:type_ops", "src/cursorTypeOperations.ts", 0.90));
-        for i in 0..8u32 {
-            lists[9].push(ent(
-                &format!("e:junk{i}"),
-                &format!("src/junk{i}.ts"),
-                0.60 - 0.02 * i as f32,
-            ));
-        }
-        lists[9].push(ent("e:mixed0", "src/mixed0.ts", 0.30));
-        lists[9].push(ent("e:mixed1", "src/mixed1.ts", 0.28));
-        lists
+    /// `e:widget` holds the top on merit. `e:mixed0` and `e:mixed1` carry a graph
+    /// signal and a deep embedding rank. `e:type_ops` is found by the vector arm
+    /// ALONE, at a much better embedding rank, and still lands below both. That
+    /// inversion is the defect: the combine pays for breadth, and one arm cannot
+    /// buy it.
+    fn starved_fusion_output() -> Vec<(String, String, f32)> {
+        vec![
+            ("e:widget".into(), "src/widget.ts".into(), 0.152787f32),
+            ("e:mixed0".into(), "src/mixed0.ts".into(), 0.077002),
+            ("e:mixed1".into(), "src/mixed1.ts".into(), 0.074998),
+            ("e:cursors".into(), "src/cursor.ts".into(), 0.063893),
+            (
+                "e:type_ops".into(),
+                "src/cursorTypeOperations.ts".into(),
+                0.061129,
+            ),
+            ("e:graphonly".into(), "src/graphonly.ts".into(), 0.024625),
+        ]
     }
 
-    /// Every knob `reciprocal_rank_fusion_entities` reads, removed, so one test
-    /// cannot read another's setting.
+    /// The FILE-level embedding ranking, which is what the term keys on. Note
+    /// `src/graphonly.ts` is absent: the vector arm never ranked it, so it must
+    /// not move at all.
+    fn embedding_ranked_files() -> Vec<(String, f32)> {
+        // The rivals sit DEEP, as they do on a real store, because the term
+        // separates by embedding rank and barely separates two files a few places
+        // apart. `src/graphonly.ts` is absent: the vector arm never ranked it, so
+        // it must not move at all.
+        let mut v = vec![
+            ("src/cursor.ts".to_string(), 0.95),
+            ("src/cursorTypeOperations.ts".to_string(), 0.90),
+        ];
+        for i in 0..8u32 {
+            v.push((format!("src/filler{i}.ts"), 0.60 - 0.02 * i as f32));
+        }
+        v.push(("src/mixed0.ts".to_string(), 0.30));
+        v.push(("src/mixed1.ts".to_string(), 0.28));
+        v
+    }
+
+    /// Every knob the term reads, removed, so one test cannot read another's
+    /// setting.
     ///
     /// The guard serializes MUTATING tests against each other and restores on
     /// drop, but it cannot stop a test that merely READS a variable another test
     /// set. Under `cargo nextest` each test owns a process and the whole class is
     /// structurally invisible; under a shared-process `cargo test` it is not, and
     /// on this repo that runner grades main's push rather than the pull request.
-    /// So pin every input rather than only the two this term introduces.
     fn primacy_knobs_unset() -> kin_core::test_env::EnvVarGuard {
         kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT")
             .without("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_HEADROOM")
@@ -32206,142 +32218,134 @@ mod tests {
             .without("KIN_LOCATE_RRF_RAW_WEIGHT")
     }
 
-    fn fused_place(fused: &[(String, String, f32)], key: &str) -> usize {
+    fn place_of(fused: &[(String, String, f32)], key: &str) -> usize {
         fused
             .iter()
             .position(|(k, _, _)| k == key)
             .unwrap_or_else(|| panic!("{key} absent from the fused ranking"))
     }
 
-    fn fused_score(fused: &[(String, String, f32)], key: &str) -> f32 {
-        fused[fused_place(fused, key)].2
+    fn score_of(fused: &[(String, String, f32)], key: &str) -> f32 {
+        fused[place_of(fused, key)].2
     }
 
-    fn fused_keys(fused: &[(String, String, f32)]) -> Vec<&str> {
+    fn keys_of(fused: &[(String, String, f32)]) -> Vec<&str> {
         fused.iter().map(|(k, _, _)| k.as_str()).collect()
     }
 
     #[test]
     fn entity_fusion_semantic_primacy_ships_dark() {
         // The term must be inert until a measured A/B earns it a default, and
-        // "inert" has to mean bit-identical, not close. This assertion is what a
-        // default flip has to come and change on purpose.
-        let lists = embedding_starvation_lists();
-        let unset = {
+        // "inert" has to mean bit-identical, not close. This is what a default
+        // flip has to come and change on purpose.
+        let base = starved_fusion_output();
+        let emb = embedding_ranked_files();
+        let mut unset = base.clone();
+        {
             let _g = primacy_knobs_unset();
-            reciprocal_rank_fusion_entities(&lists, 60.0)
-        };
-        let explicit_zero = {
-            let _g = primacy_knobs_unset().with("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT", "0");
-            reciprocal_rank_fusion_entities(&lists, 60.0)
-        };
-        assert_eq!(unset.len(), explicit_zero.len());
-        for (a, b) in unset.iter().zip(explicit_zero.iter()) {
-            assert_eq!(a.0, b.0, "unset must order exactly as an explicit 0");
+            apply_entity_semantic_primacy(&mut unset, &emb);
+        }
+        for (a, b) in unset.iter().zip(base.iter()) {
+            assert_eq!(a.0, b.0, "the shipped default must not reorder");
             assert_eq!(
                 a.2.to_bits(),
                 b.2.to_bits(),
-                "unset must score bit-identically to an explicit 0 for {}",
+                "the shipped default must not move {} by even one bit",
                 a.0
             );
         }
         assert!(
-            fused_place(&unset, "e:type_ops") > fused_place(&unset, "e:mixed1"),
+            place_of(&unset, "e:type_ops") > place_of(&unset, "e:mixed1"),
             "at the shipped default the starved key stays starved: {:?}",
-            fused_keys(&unset)
+            keys_of(&unset)
         );
     }
 
     #[test]
     fn entity_fusion_semantic_primacy_rescues_an_embedding_only_key() {
-        let lists = embedding_starvation_lists();
+        let base = starved_fusion_output();
+        let emb = embedding_ranked_files();
 
-        // THE BASELINE IS ASSERTED GREEN FIRST. A red baseline would let every arm
-        // below report PASS without proving anything.
-        let baseline = {
-            let _g = primacy_knobs_unset();
-            reciprocal_rank_fusion_entities(&lists, 60.0)
-        };
+        // THE BASELINE IS ASSERTED GREEN FIRST. A red baseline would let every
+        // arm below report PASS without proving anything.
         assert_eq!(
-            fused_keys(&baseline).first().copied(),
+            keys_of(&base).first().copied(),
             Some("e:widget"),
             "baseline rank one: {:?}",
-            fused_keys(&baseline)
+            keys_of(&base)
         );
         assert!(
-            fused_place(&baseline, "e:type_ops") > fused_place(&baseline, "e:mixed0")
-                && fused_place(&baseline, "e:type_ops") > fused_place(&baseline, "e:mixed1"),
-            "THE DEFECT: the key at embedding rank 1 sits below two keys at embedding \
-             ranks 10 and 11 that carry a second signal: {:?}",
-            fused_keys(&baseline)
+            place_of(&base, "e:type_ops") > place_of(&base, "e:mixed0")
+                && place_of(&base, "e:type_ops") > place_of(&base, "e:mixed1"),
+            "THE DEFECT: the key at embedding rank 1 sits below two keys at \
+             embedding ranks 2 and 3 that carry a second signal: {:?}",
+            keys_of(&base)
         );
 
-        let lifted = {
+        let mut lifted = base.clone();
+        {
             let _g = primacy_knobs_unset().with("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT", "0.5");
-            reciprocal_rank_fusion_entities(&lists, 60.0)
-        };
+            apply_entity_semantic_primacy(&mut lifted, &emb);
+        }
         assert!(
-            fused_place(&lifted, "e:type_ops") < fused_place(&lifted, "e:mixed0")
-                && fused_place(&lifted, "e:type_ops") < fused_place(&lifted, "e:mixed1"),
+            place_of(&lifted, "e:type_ops") < place_of(&lifted, "e:mixed0")
+                && place_of(&lifted, "e:type_ops") < place_of(&lifted, "e:mixed1"),
             "THE RESCUE: the embedding-only key must clear the keys it outranks \
              semantically: {:?}",
-            fused_keys(&lifted)
+            keys_of(&lifted)
         );
         assert_eq!(
-            fused_keys(&lifted).first().copied(),
+            keys_of(&lifted).first().copied(),
             Some("e:widget"),
             "the rescue must not move rank one: {:?}",
-            fused_keys(&lifted)
+            keys_of(&lifted)
         );
         assert_eq!(
-            lifted[0].2.to_bits(),
-            baseline[0].2.to_bits(),
+            score_of(&lifted, "e:widget").to_bits(),
+            score_of(&base, "e:widget").to_bits(),
             "rank one's score must be bit-identical, not merely close"
         );
         assert_eq!(
-            fused_score(&lifted, "e:graphonly").to_bits(),
-            fused_score(&baseline, "e:graphonly").to_bits(),
-            "a key the embedding arm never ranked must not move at all"
+            score_of(&lifted, "e:graphonly").to_bits(),
+            score_of(&base, "e:graphonly").to_bits(),
+            "a file the embedding arm never ranked must not move at all"
         );
     }
 
     #[test]
     fn entity_fusion_semantic_primacy_cannot_take_rank_one() {
-        let lists = embedding_starvation_lists();
-        let baseline = {
-            let _g = primacy_knobs_unset();
-            reciprocal_rank_fusion_entities(&lists, 60.0)
-        };
-        let top = baseline[0].2;
-        let cursors_baseline = fused_score(&baseline, "e:cursors");
+        let base = starved_fusion_output();
+        let emb = embedding_ranked_files();
+        let top = base[0].2;
+        let cursors_baseline = score_of(&base, "e:cursors");
 
         // At weight 5.0 the raw lift at embedding rank 0 is 5.0 / (8 + 0 + 1),
-        // larger than the whole gap from `e:cursors` to the top. An unguarded term
-        // hands rank one to a key ONE arm found. The headroom cap is the only thing
-        // between this fixture and that outcome, which is what the next two
-        // assertions are for.
+        // larger than the whole gap from `e:cursors` to the top. An unguarded
+        // term hands rank one to a file ONE arm found. The headroom cap is the
+        // only thing between this fixture and that outcome.
         let uncapped = cursors_baseline + 5.0 / 9.0;
         assert!(
             uncapped > top,
             "fixture must put the unguarded lift above the top ({uncapped} vs {top})"
         );
 
-        let lifted = {
+        let mut lifted = base.clone();
+        {
             let _g = primacy_knobs_unset().with("KIN_LOCATE_ENTITY_SEMANTIC_PRIMACY_WEIGHT", "5.0");
-            reciprocal_rank_fusion_entities(&lists, 60.0)
-        };
+            apply_entity_semantic_primacy(&mut lifted, &emb);
+        }
         assert_eq!(
-            fused_keys(&lifted).first().copied(),
+            keys_of(&lifted).first().copied(),
             Some("e:widget"),
             "the cap pins rank one: {:?}",
-            fused_keys(&lifted)
+            keys_of(&lifted)
         );
         assert_eq!(
             lifted[0].2.to_bits(),
             top.to_bits(),
             "rank one's score must be bit-identical under any weight"
         );
-        let cursors_lifted = fused_score(&lifted, "e:cursors");
+        let cursors_lifted = score_of(&lifted, "e:cursors");
         assert!(
             cursors_lifted < top,
             "no lifted key may reach the top ({cursors_lifted} vs {top})"
@@ -32349,6 +32353,60 @@ mod tests {
         assert!(
             cursors_lifted < uncapped,
             "the cap must actually bind ({cursors_lifted} vs {uncapped} uncapped)"
+        );
+    }
+
+    #[test]
+    fn embedding_seeds_displace_the_file_embedding_signal_from_entity_fusion() {
+        // CHARACTERIZATION, and the reason a semantic-primacy term cannot rescue
+        // an embedding-only file on this path however it is keyed.
+        //
+        // `entity_granular_fused_files` REPLACES index 9 of its `keyed_lists`
+        // with the entity-keyed embedding SEED list whenever those seeds resolve.
+        // The file-level embedding ranking at `ranked_lists[9]` is then not fused
+        // at all, so a file only the vector arm ranked never enters the fused
+        // candidate set through the embedding route, and no rank-space term over
+        // that list has anything to lift.
+        //
+        // If this ever goes red because `src/vector.rs` starts reaching the
+        // projection, the displacement has been fixed and a primacy term becomes
+        // worth measuring again.
+        let graph = kin_db::InMemoryGraph::new();
+        let seed = test_entity("seeded", "src/seeded.rs", 1, 10);
+        graph.upsert_entity(&seed).unwrap();
+        let embedding_seeds = HashMap::from([(seed.id, disc(10.0))]);
+        let empty: HashMap<kin_model::EntityId, EntityDiscovery> = HashMap::new();
+
+        let mut ranked_lists: Vec<Vec<(String, f32)>> = vec![Vec::new(); 10];
+        ranked_lists[1] = vec![("src/anchor.rs".to_string(), 100.0)];
+        ranked_lists[9] = vec![("src/vector.rs".to_string(), 0.9)];
+
+        let _g = primacy_knobs_unset();
+        let fused = entity_granular_fused_files(
+            &ranked_lists,
+            &empty,
+            &embedding_seeds,
+            &graph,
+            LocateScope::SOURCE_ONLY,
+        )
+        .unwrap();
+        let paths: Vec<&str> = fused.iter().map(|(p, _)| p.as_str()).collect();
+
+        // Baseline asserted green first: the seeds resolved and the path-keyed
+        // signals fused, so the fixture is doing what the test assumes.
+        assert!(
+            paths.contains(&"src/seeded.rs"),
+            "the embedding SEED must reach the projection: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"src/anchor.rs"),
+            "a path-keyed signal must reach the projection: {paths:?}"
+        );
+        // The finding.
+        assert!(
+            !paths.contains(&"src/vector.rs"),
+            "a file present ONLY in the file-level embedding ranking is displaced \
+             from entity fusion by the seeds: {paths:?}"
         );
     }
 
