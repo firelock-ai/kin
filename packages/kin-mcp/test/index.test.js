@@ -10,7 +10,9 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  assertSecureReleaseBaseUrl,
   childEnv,
+  DEFAULT_RELEASE_BASE_URL,
   ensureKinBinary,
   resolveCachedBinaryPath,
   resolveDaemonBinaryPath,
@@ -822,4 +824,48 @@ test('auto-init keeps MCP stdout protocol-only from process start', async () => 
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('the release base URL must be https, or loopback for a local mirror', () => {
+  // The shipped default and any https mirror are fine.
+  assert.equal(
+    assertSecureReleaseBaseUrl(DEFAULT_RELEASE_BASE_URL),
+    DEFAULT_RELEASE_BASE_URL
+  );
+  assert.equal(
+    assertSecureReleaseBaseUrl('https://mirror.example/kin'),
+    'https://mirror.example/kin'
+  );
+
+  // A loopback mirror has no network path to sit on, so plain http is allowed
+  // there and only there. The wrapper's own tests drive one.
+  for (const loopback of [
+    'http://127.0.0.1:1',
+    'http://127.0.0.1:8080/kin',
+    'http://localhost:8080',
+    'http://[::1]:8080'
+  ]) {
+    assert.equal(assertSecureReleaseBaseUrl(loopback), loopback);
+  }
+
+  // The archive and its checksum come from this same base URL, so plain http
+  // to anywhere else means the integrity check grades the attacker's bytes
+  // against the attacker's digest, and what lands is chmod 0755 and executed.
+  for (const insecure of [
+    'http://mirror.example/kin',
+    'http://127.0.0.1.attacker.example/kin',
+    'http://localhost.attacker.example/kin',
+    'ftp://127.0.0.1/kin'
+  ]) {
+    assert.throws(
+      () => assertSecureReleaseBaseUrl(insecure),
+      /refusing to download the Kin release over/,
+      insecure
+    );
+  }
+
+  assert.throws(
+    () => assertSecureReleaseBaseUrl('not a url'),
+    /is not a URL/
+  );
 });

@@ -16,6 +16,46 @@ export const PACKAGE_VERSION = packageJson.version;
 export const DEFAULT_RELEASE_BASE_URL =
   'https://github.com/firelock-ai/kin/releases/download';
 
+/**
+ * The base URL the release archive and its checksum are both fetched from.
+ *
+ * They come from the same host by construction: `checksumUrl` is derived from
+ * `archiveUrl`. Over plain http anyone on the path serves both, so the
+ * integrity check compares their bytes against their digest, and what lands is
+ * chmod 0755 and executed. https is required, with one exception: a loopback
+ * address, where there is no network path to sit on and a local mirror is a
+ * real thing people run.
+ *
+ * This closes the passive-network attacker only. An attacker who can set this
+ * variable can still point it at an https host they control, because the
+ * checksum travels beside the artifact; see docs/security/signing-and-update-trust.md.
+ */
+export function assertSecureReleaseBaseUrl(baseUrl) {
+  let parsed;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new Error(
+      `KIN_MCP_RELEASE_BASE_URL is not a URL: ${baseUrl}`
+    );
+  }
+  if (parsed.protocol === 'https:') {
+    return baseUrl;
+  }
+  const host = parsed.hostname.replace(/^\[|\]$/g, '');
+  const isLoopback =
+    host === 'localhost' || host === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+  if (parsed.protocol === 'http:' && isLoopback) {
+    return baseUrl;
+  }
+  throw new Error(
+    `refusing to download the Kin release over ${parsed.protocol}// from ${baseUrl}. ` +
+      'The archive and its checksum come from this same base URL, so plain http lets anyone ' +
+      'on the path serve both and the integrity check passes on their bytes. Use https, or a ' +
+      'loopback address for a local mirror.'
+  );
+}
+
 export function resolveReleaseTag(version = PACKAGE_VERSION) {
   return version.startsWith('v') ? version : `v${version}`;
 }
@@ -300,9 +340,8 @@ async function installKinBinary({ binaryPath, env, platform, arch, version }) {
     arch
   );
   const tag = resolveReleaseTag(version);
-  const baseUrl = (env.KIN_MCP_RELEASE_BASE_URL || DEFAULT_RELEASE_BASE_URL).replace(
-    /\/$/,
-    ''
+  const baseUrl = assertSecureReleaseBaseUrl(
+    (env.KIN_MCP_RELEASE_BASE_URL || DEFAULT_RELEASE_BASE_URL).replace(/\/$/, '')
   );
   const archiveUrl = `${baseUrl}/${tag}/${archiveName}`;
   const checksumUrl = `${archiveUrl}.sha256`;

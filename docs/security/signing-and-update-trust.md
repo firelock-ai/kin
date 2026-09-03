@@ -268,6 +268,26 @@ asserts `kin-daemon` is present in the archive before moving any files, so a
 daemon-less archive aborts cleanly instead of leaving a half-installed
 environment.
 
+### What the installer writes outside its own prefix
+
+Worth knowing before you pipe it to a shell. It needs no sudo, pipes nothing into
+a second shell, and never relaxes TLS, but it is not confined to its install
+prefix:
+
+- **A PATH line in your shell startup file.** `scripts/install.sh` writes to
+  `~/.zshenv` or `~/.bashrc` depending on the host's actual shell, and it will
+  create `~/.bash_profile` if that is the file it needs.
+- **Agent MCP configuration.** The `kin setup` step the installer runs writes MCP
+  server entries into the agent configuration files it finds, so an editor or CLI
+  agent on the machine gains a Kin server it did not have.
+- **A per-user LaunchAgent on macOS.** The daemon installs a plist under
+  `~/Library/LaunchAgents`. It is per-user, not a system LaunchDaemon, and the
+  loader refuses a plist that is not a singly-linked regular file owned by you.
+  Nothing in this repository ships a scheduled background updater: there is no
+  `StartInterval` or `StartCalendarInterval` in either service template.
+
+`kin update` writes only inside its own 0700 root.
+
 ### Unattended pinned updater contract
 
 An unattended mutating `kin update` requires the complete
