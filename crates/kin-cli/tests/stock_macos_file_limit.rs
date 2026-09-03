@@ -177,18 +177,43 @@ fn a_pinned_hard_limit_names_the_limit_and_the_remedy() {
 no longer reaches the descriptor ceiling and the success arm beside it now proves nothing. \
 Enlarge DISTINCT_BODIES until this refuses again, or retire both arms deliberately: stderr={stderr}"
     );
-    assert!(
-        stderr.contains("ran out of open file descriptors"),
-        "the refusal must name what ran out: {stderr}"
+    // The guidance is the whole value of this fix, so it is asserted as the
+    // exact lines the product prints rather than as loose substrings. A
+    // substring is too weak twice over here: the store path in the failure
+    // already carries `sha256`, so a bare "256" passes on the wrong text, and a
+    // bare "ulimit -n" passes on a remedy that forgot to say what to raise it
+    // to, which is the one number the reader does not have.
+    //
+    // The remedy is composed from `TARGET_OPEN_FILES`, the same constant the
+    // message is built from, so changing the target cannot leave this arm
+    // asserting a number that no longer appears anywhere.
+    let value_line = format!(
+        "open files: soft limit {STOCK_MACOS_SOFT_LIMIT}, hard limit {STOCK_MACOS_SOFT_LIMIT}."
     );
-    // Matched with its label, not bare: the store path in the failure already
-    // carries `sha256`, so a bare "256" would pass on the wrong substring.
-    assert!(
-        stderr.contains(&format!("soft limit {STOCK_MACOS_SOFT_LIMIT}")),
-        "the refusal must name the limit in force: {stderr}"
-    );
-    assert!(
-        stderr.contains("ulimit -n"),
-        "the refusal must name the command that fixes it: {stderr}"
-    );
+    let shell_remedy = format!("ulimit -n {}", kin_core::file_limit::TARGET_OPEN_FILES);
+    for expected in [
+        "kin: ran out of open file descriptors.",
+        value_line.as_str(),
+        "Kin raises the soft limit at startup and cannot go past the hard limit.",
+        shell_remedy.as_str(),
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "the refusal must carry `{expected}` verbatim: {stderr}"
+        );
+    }
+
+    // The machine-wide remedy is macOS-only in the product, and this is the
+    // platform the class was found on.
+    #[cfg(target_os = "macos")]
+    {
+        let machine_remedy = format!(
+            "sudo launchctl limit maxfiles {} unlimited",
+            kin_core::file_limit::TARGET_OPEN_FILES
+        );
+        assert!(
+            stderr.contains(&machine_remedy),
+            "the refusal must carry `{machine_remedy}` verbatim: {stderr}"
+        );
+    }
 }
