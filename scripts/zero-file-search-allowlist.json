@@ -298,7 +298,7 @@
     },
     {
       "file": "crates/kin-daemon/src/supervisor.rs",
-      "reason": "Supervisor process lifecycle boundary. The supervisor owns the daemon process, not any query answer, and each excused body is one of four classes. Endpoint records: the pid and port files, written through a temp-and-rename and removed only by the process that owns them, plus the url and canonical-path helpers that read them back. Singleton locks: the lifecycle guard file and its owner stamp, which decide whether another supervisor is already live. Install and process identity: the loopback auth token, same-binary comparison against the running executable, the log length and mtime probes, re-exec of the supervisor binary, and the reaper that kills rogue daemons. Registration payload and health: the repository record sent to the control plane and the local status report. None of these reads repository content, and no query result derives from any of them. Function-scoped rather than whole-file so the rest of the module, and anything added to it, stays scanned; the single expression pin is a struct field holding the lock file handle.",
+      "reason": "Supervisor process lifecycle boundary. The supervisor owns the daemon process, not any query answer, and each excused body is one of four classes. Endpoint records: the pid and port files, written through a temp-and-rename and removed only by the process that owns them, plus the url and canonical-path helpers that read them back. Singleton locks: the lifecycle guard file and its owner stamp, which decide whether another supervisor is already live. Install and process identity: the loopback auth token, same-binary comparison against the running executable, the log length and mtime probes, re-exec of the supervisor binary, and the reaper that kills rogue daemons. Registration payload and health: the repository record sent to the control plane and the local status report. None of these reads repository content, and no query result derives from any of them. Function-scoped rather than whole-file so the rest of the module, and anything added to it, stays scanned; the single expression pin is a struct field holding the lock file handle. supervisor_client_auth_token is function-pinned because it reads the supervisor's own bearer token file under ~/.kin so a client can authenticate to the supervisor (kin#1426 made the token required by default): config IO for the daemon's own credential, which serves no locate, search, context, trace, review, xref or rename answer and never reads repository content.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_fn": [
@@ -320,7 +320,8 @@
         "file_mtime_secs",
         "same_binary",
         "daemon_log_len",
-        "reexec_self"
+        "reexec_self",
+        "supervisor_client_auth_token"
       ],
       "allow_match": [
         "file: std::fs::File,"
