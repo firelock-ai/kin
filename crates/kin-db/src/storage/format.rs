@@ -12,7 +12,9 @@ use std::sync::Arc;
 use crate::storage::body_walk::{map_entry_count, top_level_element_ranges};
 use crate::storage::change_map::{ChangeMap, ChangeMapInner, EncodedChanges, HistorySource};
 use crate::storage::change_validation::{validate_semantic_change_entries, AdmittedChangeMap};
-use crate::storage::repository::{GitProjectionTreeReplay, PersistedRepositoryAuthority};
+use crate::storage::repository::{
+    GitProjectionTreeReplay, PersistedRepositoryAuthority, RootRecomputation,
+};
 use crate::types::*;
 
 /// Statistics from a snapshot compaction pass.
@@ -1623,7 +1625,32 @@ impl GraphSnapshot {
         &self,
         replay: GitProjectionTreeReplay,
     ) -> Result<(), crate::error::KinDbError> {
-        self.validate_admission_with_envelope(replay, AuthorityEnvelope::Validated)
+        self.validate_admission_with_envelope(
+            replay,
+            RootRecomputation::Required,
+            AuthorityEnvelope::Validated,
+        )
+    }
+
+    /// [`validate_storage_admission_with`], minus the root recomputation the
+    /// caller has already run over this exact snapshot and envelope.
+    ///
+    /// The obligation is spelled out on [`RootRecomputation::Proven`], and the
+    /// one caller entitled to state it is `prepare_successor`, which folded the
+    /// bundle it is asking this gate not to fold again. Every other entry point
+    /// here passes [`RootRecomputation::Required`], so a caller reading a
+    /// bundle it did not itself fold still has it checked against the contents.
+    ///
+    /// [`validate_storage_admission_with`]: Self::validate_storage_admission_with
+    pub(crate) fn validate_storage_admission_with_proven_roots(
+        &self,
+        replay: GitProjectionTreeReplay,
+    ) -> Result<(), crate::error::KinDbError> {
+        self.validate_admission_with_envelope(
+            replay,
+            RootRecomputation::Proven,
+            AuthorityEnvelope::Validated,
+        )
     }
 
     /// The same storage admission a snapshot carrying no authority envelope
@@ -1640,6 +1667,7 @@ impl GraphSnapshot {
     ) -> Result<(), crate::error::KinDbError> {
         self.validate_admission_with_envelope(
             GitProjectionTreeReplay::Required,
+            RootRecomputation::Required,
             AuthorityEnvelope::Ignored,
         )
     }
@@ -1647,6 +1675,7 @@ impl GraphSnapshot {
     fn validate_admission_with_envelope(
         &self,
         replay: GitProjectionTreeReplay,
+        roots: RootRecomputation,
         envelope: AuthorityEnvelope,
     ) -> Result<(), crate::error::KinDbError> {
         let mut timer = crate::storage::repository::PublicationPhaseTimer::start();
@@ -1666,7 +1695,7 @@ impl GraphSnapshot {
         };
         let changes_ms = timer.lap_ms();
         self.validate_storage_admission_after_changes(
-            replay, &admitted, envelope, changes_ms, timer,
+            replay, roots, &admitted, envelope, changes_ms, timer,
         )
     }
 
@@ -1684,6 +1713,7 @@ impl GraphSnapshot {
     ) -> Result<(), crate::error::KinDbError> {
         self.validate_admission_carrying_with_envelope(
             replay,
+            RootRecomputation::Required,
             admitted,
             AuthorityEnvelope::Validated,
         )
@@ -1701,12 +1731,18 @@ impl GraphSnapshot {
         replay: GitProjectionTreeReplay,
         admitted: &AdmittedChangeMap<'_>,
     ) -> Result<(), crate::error::KinDbError> {
-        self.validate_admission_carrying_with_envelope(replay, admitted, AuthorityEnvelope::Ignored)
+        self.validate_admission_carrying_with_envelope(
+            replay,
+            RootRecomputation::Required,
+            admitted,
+            AuthorityEnvelope::Ignored,
+        )
     }
 
     fn validate_admission_carrying_with_envelope(
         &self,
         replay: GitProjectionTreeReplay,
+        roots: RootRecomputation,
         admitted: &AdmittedChangeMap<'_>,
         envelope: AuthorityEnvelope,
     ) -> Result<(), crate::error::KinDbError> {
@@ -1716,12 +1752,13 @@ impl GraphSnapshot {
             ));
         }
         let timer = crate::storage::repository::PublicationPhaseTimer::start();
-        self.validate_storage_admission_after_changes(replay, admitted, envelope, 0, timer)
+        self.validate_storage_admission_after_changes(replay, roots, admitted, envelope, 0, timer)
     }
 
     fn validate_storage_admission_after_changes(
         &self,
         replay: GitProjectionTreeReplay,
+        roots: RootRecomputation,
         admitted: &AdmittedChangeMap<'_>,
         envelope: AuthorityEnvelope,
         changes_ms: u128,
@@ -1770,7 +1807,7 @@ impl GraphSnapshot {
             AuthorityEnvelope::Ignored => None,
         };
         if let Some(authority) = envelope_to_validate {
-            authority.validate_against_snapshot_with(self, replay, admitted)?;
+            authority.validate_against_snapshot_with(self, replay, roots, admitted)?;
         }
         let repository_authority_ms = timer.lap_ms();
         tracing::debug!(
