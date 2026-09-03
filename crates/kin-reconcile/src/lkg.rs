@@ -3,17 +3,27 @@
 
 use std::collections::HashMap;
 
-use kin_model::{Entity, EntityId, Relation, SemanticFingerprint};
+use kin_model::{Entity, EntityId, SemanticFingerprint};
 
-/// Last Known Good state for an entity.
+/// Last Known Good state for an entity: the fingerprint the reconciler last
+/// admitted for it.
 ///
-/// When a file edit produces a broken AST, the entity retains its LKG
-/// fingerprint, signature, and relations. The broken parse is noted but
-/// does not propagate to dependents.
+/// The entry holds a fingerprint and nothing else because a fingerprint is all
+/// any reader has ever taken out of this store. [`LkgStore::has_changed`]
+/// compares three of its hashes and there is no other read.
+///
+/// It used to hold a whole owned [`Entity`] and a `Vec<Relation>` beside it. A
+/// serving daemon seeds one entry per entity in the repository and keeps the
+/// store for its life, so that was a second complete copy of every entity: the
+/// name, the signature, the doc summary and two separate allocations of the
+/// same file path, none of which anything read. The relations vector had no
+/// reader at all and every live call site passed an empty one. The reconcile
+/// path also clones this whole store before deriving a transaction, so the copy
+/// was duplicated again on every file edit; a fingerprint is plain data, so that
+/// snapshot now allocates nothing.
 #[derive(Debug, Clone)]
 pub struct LkgEntry {
-    pub entity: Entity,
-    pub relations: Vec<Relation>,
+    pub fingerprint: SemanticFingerprint,
 }
 
 /// Tracks LKG state for all entities. The reconciler consults this when
@@ -30,9 +40,17 @@ impl LkgStore {
     }
 
     /// Record the current good state of an entity.
-    pub fn record(&mut self, entity: Entity, relations: Vec<Relation>) {
-        self.entries
-            .insert(entity.id, LkgEntry { entity, relations });
+    ///
+    /// Takes the entity by reference and keeps a copy of its fingerprint, so a
+    /// caller that already owns an entity does not have to clone it to record
+    /// one.
+    pub fn record(&mut self, entity: &Entity) {
+        self.entries.insert(
+            entity.id,
+            LkgEntry {
+                fingerprint: entity.fingerprint.clone(),
+            },
+        );
     }
 
     /// Get the LKG state for an entity.
@@ -50,9 +68,9 @@ impl LkgStore {
     pub fn has_changed(&self, id: &EntityId, new_fingerprint: &SemanticFingerprint) -> bool {
         match self.entries.get(id) {
             Some(entry) => {
-                entry.entity.fingerprint.ast_hash != new_fingerprint.ast_hash
-                    || entry.entity.fingerprint.signature_hash != new_fingerprint.signature_hash
-                    || entry.entity.fingerprint.behavior_hash != new_fingerprint.behavior_hash
+                entry.fingerprint.ast_hash != new_fingerprint.ast_hash
+                    || entry.fingerprint.signature_hash != new_fingerprint.signature_hash
+                    || entry.fingerprint.behavior_hash != new_fingerprint.behavior_hash
             }
             None => true, // No LKG means it's new
         }
@@ -109,7 +127,7 @@ mod tests {
         let mut store = LkgStore::new();
         let entity = test_entity("foo");
         let id = entity.id;
-        store.record(entity, vec![]);
+        store.record(&entity);
 
         assert!(store.get(&id).is_some());
         assert_eq!(store.len(), 1);
@@ -120,7 +138,7 @@ mod tests {
         let mut store = LkgStore::new();
         let entity = test_entity("bar");
         let id = entity.id;
-        store.record(entity, vec![]);
+        store.record(&entity);
 
         // Same fingerprint
         let same = SemanticFingerprint {
@@ -164,9 +182,35 @@ mod tests {
         let mut store = LkgStore::new();
         let entity = test_entity("baz");
         let id = entity.id;
-        store.record(entity, vec![]);
+        store.record(&entity);
         store.remove(&id);
         assert!(store.get(&id).is_none());
         assert!(store.is_empty());
+    }
+
+    /// The entry is exactly the fingerprint it holds and nothing beside it,
+    /// which is the property the daemon's retained footprint rests on. An
+    /// `Entity`, a `String` or a `Vec` back on this struct moves the size and
+    /// fails here. The bytes the entry does not reach are proved separately, by
+    /// the allocator guard in `tests/lkg_retained_bytes.rs`.
+    #[test]
+    fn an_entry_is_exactly_a_fingerprint() {
+        assert_eq!(
+            std::mem::size_of::<LkgEntry>(),
+            std::mem::size_of::<SemanticFingerprint>(),
+            "an entry must be exactly the fingerprint it holds"
+        );
+    }
+
+    /// Recording an entity twice under the same id keeps one entry, so a
+    /// reconcile loop that re-records unchanged entities cannot grow the store.
+    #[test]
+    fn re_recording_an_entity_does_not_grow_the_store() {
+        let mut store = LkgStore::new();
+        let entity = test_entity("qux");
+        store.record(&entity);
+        store.record(&entity);
+        store.record(&entity);
+        assert_eq!(store.len(), 1);
     }
 }
