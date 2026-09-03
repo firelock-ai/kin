@@ -12573,11 +12573,15 @@ mod tests {
         // sees a kin image on a process that is about to become `sleep`. That
         // window reddened two shards on 2026-09-03. Wait for the exec to land
         // before asking the question the assertion is about.
-        assert!(
-            wait_until_image_is_not_ours(foreign_pid),
-            "the spawned sleep never left this test binary's image within {:?}",
-            EXEC_SETTLE_BOUND
-        );
+        if !wait_until_image_is_not_ours(foreign_pid) {
+            // Reap before failing, or the sleep outlives the test as a leak.
+            let _ = foreign.kill();
+            let _ = foreign.wait();
+            panic!(
+                "the spawned sleep never left this test binary's image within {:?}",
+                EXEC_SETTLE_BOUND
+            );
+        }
         std::fs::write(&lock, format!("pid={foreign_pid} acquired_at=now\n")).unwrap();
         assert!(
             startup_lock_holder_is_foreign(foreign_pid),
