@@ -62,7 +62,6 @@ for path in \
   /usr/share/swift \
   /usr/local/share/powershell \
   /usr/local/share/chromium \
-  /usr/local/lib/node_modules \
   /opt/az \
   /usr/local/share/boost; do
   [ -e "$path" ] || continue
