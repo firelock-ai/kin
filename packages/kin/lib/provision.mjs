@@ -412,9 +412,14 @@ function unixSystemToolPath(name) {
   );
 }
 
-function archiveExtraction(platform, env, file) {
+// The archive layout comes from the TARGET, the extractor from the HOST, and
+// conflating the two is what broke the native Windows leg once already: a
+// Windows host has no /usr/bin, and the cross-target tests unpack a darwin
+// archive on it. `host` is a parameter rather than a read of `process.platform`
+// so every combination is testable from one machine.
+export function archiveExtraction(platform, env, file, host = process.platform) {
   if (platform === 'win32') {
-    if (process.platform === 'win32') {
+    if (host === 'win32') {
       return {
         executable: windowsSystemTarPath(env),
         args: ['-xf', file, '-C', '.'],
@@ -428,8 +433,12 @@ function archiveExtraction(platform, env, file) {
       args: ['-q', file, '-d', '.'],
     };
   }
+  // A Unix archive. On a Unix host that is the absolute system tar; on a
+  // Windows host, which only ever happens under a cross-target test, it is the
+  // same System32 bsdtar the Windows arm above uses, and bsdtar reads .tar.gz.
+  // Either way the extractor is named absolutely rather than found on PATH.
   return {
-    executable: unixSystemToolPath('tar'),
+    executable: host === 'win32' ? windowsSystemTarPath(env) : unixSystemToolPath('tar'),
     args: ['-xf', file, '-C', '.'],
   };
 }

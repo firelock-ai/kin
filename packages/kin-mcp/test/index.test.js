@@ -10,6 +10,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  archiveExtraction,
   assertSecureReleaseBaseUrl,
   childEnv,
   DEFAULT_RELEASE_BASE_URL,
@@ -21,6 +22,46 @@ import {
   runKinMcp,
   isTruthyEnv
 } from '../src/index.js';
+
+// The archive layout is a property of the target; the extractor is a property
+// of the host. Reading `process.platform` inside the target branch conflated
+// them, and the native Windows leg went red on three tests that unpack a Unix
+// archive on a Windows runner, where /usr/bin/tar does not exist. All four
+// combinations are asserted here rather than only the two a single runner can
+// reach, so neither leg has to be the place this is discovered.
+test('the extractor is chosen by the host and the layout by the target', () => {
+  const winEnv = { SystemRoot: 'C:\\Windows' };
+  const sys32Tar = path.win32.join('C:\\Windows', 'System32', 'tar.exe');
+
+  // Windows target.
+  assert.deepEqual(archiveExtraction('win32', winEnv, 'a.zip', 'win32'), {
+    executable: sys32Tar,
+    args: ['-xf', 'a.zip', '-C', '.']
+  });
+  assert.deepEqual(archiveExtraction('win32', {}, 'a.zip', 'linux'), {
+    executable: '/usr/bin/unzip',
+    args: ['-q', 'a.zip', '-d', '.']
+  });
+
+  // Unix target. On a Windows host this is the cross-target case, and it must
+  // not reach for /usr/bin.
+  assert.deepEqual(archiveExtraction('linux', winEnv, 'a.tar.gz', 'win32'), {
+    executable: sys32Tar,
+    args: ['-xf', 'a.tar.gz', '-C', '.']
+  });
+
+  // On a Unix host it is an absolute system tar, never a bare name PATH would
+  // resolve. Asserted as a property so the test does not care which of the two
+  // trusted directories this machine keeps tar in.
+  if (process.platform !== 'win32') {
+    const unix = archiveExtraction('linux', {}, 'a.tar.gz', 'linux');
+    assert.ok(
+      unix.executable === '/usr/bin/tar' || unix.executable === '/bin/tar',
+      `expected an absolute system tar, got ${unix.executable}`
+    );
+    assert.deepEqual(unix.args, ['-xf', 'a.tar.gz', '-C', '.']);
+  }
+});
 
 test('MCP auto-init boolean accepts the generated env-contract vocabulary', () => {
   for (const token of ['1', 'true', 'TRUE', 'TrUe', 'yes', 'YES', 'on', 'ON', ' on ']) {

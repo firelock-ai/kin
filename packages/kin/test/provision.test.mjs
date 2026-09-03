@@ -10,6 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 
 import {
+  archiveExtraction,
   artifactName,
   releaseDownloadUrl,
   parseSha256File,
@@ -31,6 +32,42 @@ import { binaryName, readLauncherStamp, writeLauncherStamp } from '../lib/resolv
 // bundle-only assertions remain authoritative on macOS/Linux; Windows runs the
 // native ZIP path and all platform-neutral provisioning policy below.
 const macArchiveModeTest = process.platform === 'win32' ? test.skip : test;
+
+// The archive layout is a property of the target; the extractor is a property
+// of the host. Reading `process.platform` inside the target branch conflated
+// them, and the native Windows leg went red on three tests that unpack a darwin
+// archive on a Windows runner, where /usr/bin/tar does not exist. All four
+// combinations are asserted here rather than only the two a single runner can
+// reach, so neither leg has to be the place this is discovered.
+test('the extractor is chosen by the host and the layout by the target', () => {
+  const winEnv = { SystemRoot: 'C:\\Windows' };
+  const sys32Tar = path.win32.join('C:\\Windows', 'System32', 'tar.exe');
+
+  assert.deepEqual(archiveExtraction('win32', winEnv, 'a.zip', 'win32'), {
+    executable: sys32Tar,
+    args: ['-xf', 'a.zip', '-C', '.'],
+  });
+  assert.deepEqual(archiveExtraction('win32', {}, 'a.zip', 'darwin'), {
+    executable: '/usr/bin/unzip',
+    args: ['-q', 'a.zip', '-d', '.'],
+  });
+
+  // Unix target on a Windows host: the cross-target case, which must not reach
+  // for /usr/bin.
+  assert.deepEqual(archiveExtraction('darwin', winEnv, 'a.tar.gz', 'win32'), {
+    executable: sys32Tar,
+    args: ['-xf', 'a.tar.gz', '-C', '.'],
+  });
+
+  if (process.platform !== 'win32') {
+    const unix = archiveExtraction('darwin', {}, 'a.tar.gz', 'darwin');
+    assert.ok(
+      unix.executable === '/usr/bin/tar' || unix.executable === '/bin/tar',
+      `expected an absolute system tar, got ${unix.executable}`,
+    );
+    assert.deepEqual(unix.args, ['-xf', 'a.tar.gz', '-C', '.']);
+  }
+});
 
 test('artifactName maps every released host and matches release.yml naming', () => {
   assert.equal(artifactName('darwin', 'arm64'), 'kin-macos-aarch64.tar.gz');
