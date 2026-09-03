@@ -33,11 +33,12 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -270,6 +271,53 @@ struct StagedState<Id: DocId> {
     docs: HashMap<Id, IndexedDoc>,
     doc_count: usize,
     total_doc_length: usize,
+    /// Ids removed since the last commit.
+    ///
+    /// Only the mapped path reads it, and only the mapped path could: the heap
+    /// path snapshots the live corpus into `docs` and expresses a removal by
+    /// ABSENCE from that snapshot. On a mapped store the snapshot starts empty,
+    /// because the heap maps are empty, so absence says nothing and a removal
+    /// has to be recorded rather than implied.
+    #[serde(default)]
+    removed: HashSet<Id>,
+}
+
+/// Proof, checked by the compiler, that the caller already holds `staged`.
+///
+/// `staged` is the outermost lock, and a persist has to run under it: it is what
+/// makes the four live-state fields a consistent snapshot rather than four reads
+/// from four moments. The write path reaches that persist through three frames,
+/// and the frame that needs the guarantee is the innermost one, so the obvious
+/// shape is for the innermost frame to take the lock itself.
+///
+/// That shape deadlocks. `parking_lot`'s `RwLock` is not reentrant: a `read()`
+/// from a thread that already holds the write guard parks forever, against
+/// itself, with no second thread involved. `commit` holds `staged.write()`
+/// across its persist, so once the default commit wrote v5 every persisted
+/// commit in the crate parked on its own guard.
+///
+/// So the lock is taken once, at the top of each path, and the proof travels
+/// down as this token. It is zero-sized and cannot be forged: the only way to
+/// build one is to hand a constructor a live guard, and the borrow keeps that
+/// guard alive for as long as the token is. `commit` builds one from its write
+/// guard; `persist_mapped`, which is entered without one, takes a read guard of
+/// its own first.
+#[derive(Clone, Copy)]
+struct StagedHeld<'a> {
+    _held: PhantomData<&'a ()>,
+}
+
+impl<'a> StagedHeld<'a> {
+    /// From a write guard, the mode a committer holds.
+    fn writing<T>(_guard: &'a RwLockWriteGuard<'_, T>) -> Self {
+        Self { _held: PhantomData }
+    }
+
+    /// From a read guard, the mode an explicit persist takes for itself. Read is
+    /// enough: it excludes every writer, which is all the snapshot needs.
+    fn reading<T>(_guard: &'a RwLockReadGuard<'_, T>) -> Self {
+        Self { _held: PhantomData }
+    }
 }
 
 /// The monolithic on-disk layout, whose documents keep owned token strings.
@@ -724,6 +772,19 @@ fn manifest_path(storage_path: &Path) -> PathBuf {
     storage_path.with_file_name(name)
 }
 
+/// The version a manifest declares, read as raw little-endian bytes.
+///
+/// Read before any decode, because `bincode` allows trailing bytes: handing a
+/// manifest of one shape to the other's struct yields plausible nonsense rather
+/// than an error. `None` when there is no readable manifest there.
+fn version_of_manifest(storage_path: &Path) -> Option<u32> {
+    let bytes = std::fs::read(manifest_path(storage_path)).ok()?;
+    if bytes.len() < 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 /// Path of the file holding segment `k` at generation `gen`.
 fn segment_path(storage_path: &Path, segment: usize, gen: u64) -> PathBuf {
     let mut name = storage_path
@@ -1163,6 +1224,19 @@ pub struct TextIndex<Id: DocId = u64> {
     /// keep substring matching sublinear in vocabulary size. Rebuilt on demand
     /// whenever its stamped epoch falls behind `index_epoch`.
     trigram: RwLock<Option<TrigramIndex>>,
+    /// The committed index, served from a mapping, when the store on disk is v5.
+    ///
+    /// EXACTLY ONE backend holds the committed state. When this is `Some` the
+    /// heap maps above are empty and every read comes from the mapping; when it
+    /// is `None` the heap holds it, which is a store with no path at all and a
+    /// v3 or v4 store before its first commit converts it. Two live backends
+    /// would mean every query merging two answers, and the identity guard would
+    /// then be proving something about a merge rather than about the format.
+    ///
+    /// Staged writes are invisible to search until `commit` either way, so a
+    /// pending delta never has to participate in a query. That is what keeps the
+    /// dispatch a choice rather than a join.
+    mapped: RwLock<Option<MappedIndex<Id>>>,
 }
 
 impl<Id: DocId> Default for TextIndex<Id> {
@@ -1187,6 +1261,7 @@ impl<Id: DocId> TextIndex<Id> {
             seg: RwLock::new(SegmentPersistState::new(resolve_default_segment_count())),
             index_epoch: AtomicU64::new(0),
             trigram: RwLock::new(None),
+            mapped: RwLock::new(None),
         }
     }
 
@@ -1216,6 +1291,7 @@ impl<Id: DocId> TextIndex<Id> {
             docs: self.docs.read().clone(),
             doc_count: *self.doc_count.read(),
             total_doc_length: *self.total_doc_length.read(),
+            removed: HashSet::new(),
         })
     }
 
@@ -1229,12 +1305,10 @@ impl<Id: DocId> TextIndex<Id> {
 
     /// Return the number of committed documents currently visible to search.
     pub fn live_document_count(&self) -> usize {
+        if let Some(mapped) = self.mapped.read().as_ref() {
+            return mapped.live_document_count();
+        }
         *self.doc_count.read()
-    }
-
-    /// Whether a committed document with this ID is currently visible to search.
-    pub fn contains(&self, doc_id: &Id) -> bool {
-        self.docs.read().contains_key(doc_id)
     }
 
     /// Document frequency of a query `term`: the number of committed documents
@@ -1246,6 +1320,9 @@ impl<Id: DocId> TextIndex<Id> {
     /// the minimum across tokens. Returns 0 when no token of the term is indexed
     /// (the caller treats 0 as "unknown" and falls back to its default weight).
     pub fn doc_frequency(&self, term: &str) -> usize {
+        if let Some(mapped) = self.mapped.read().as_ref() {
+            return mapped.doc_frequency(term);
+        }
         let index = self.index.read();
         let mut min_df: Option<usize> = None;
         for tok in tokenize(term) {
@@ -1271,6 +1348,7 @@ impl<Id: DocId> TextIndex<Id> {
             seg: RwLock::new(SegmentPersistState::new(resolve_default_segment_count())),
             index_epoch: AtomicU64::new(0),
             trigram: RwLock::new(None),
+            mapped: RwLock::new(None),
         }
     }
 
@@ -1381,6 +1459,8 @@ impl<Id: DocId> TextIndex<Id> {
                 doc_length,
             },
         );
+        // An upsert supersedes a removal staged earlier in the same batch.
+        state.removed.remove(&id);
         self.mark_doc_upserted(&id);
         drop(staged_guard);
         Ok(())
@@ -1450,6 +1530,8 @@ impl<Id: DocId> TextIndex<Id> {
                     doc_length,
                 },
             );
+            // An upsert supersedes a removal staged earlier in the same batch.
+            state.removed.remove(&id);
             self.mark_doc_upserted(&id);
         }
 
@@ -1482,6 +1564,9 @@ impl<Id: DocId> TextIndex<Id> {
             state.doc_count = state.doc_count.saturating_sub(1);
             state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
         }
+        // Recorded as well as removed, because on a mapped store the snapshot
+        // above is empty and absence from it says nothing.
+        state.removed.insert(*id);
         self.mark_doc_removed(id);
         drop(staged_guard);
         Ok(())
@@ -1507,6 +1592,7 @@ impl<Id: DocId> TextIndex<Id> {
                 state.doc_count = state.doc_count.saturating_sub(1);
                 state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
             }
+            state.removed.insert(*id);
         }
         for id in ids {
             self.mark_doc_removed(id);
@@ -1555,10 +1641,36 @@ impl<Id: DocId> TextIndex<Id> {
             );
         }
 
-        // Replace live state directly, no staging needed. The epoch is bumped
-        // while the index write guard is held so a fuzzy reader observes a
-        // consistent (index, epoch) pair and rebuilds its trigram candidate
-        // index against this vocabulary.
+        // `staged` FIRST, then the live guards under it, and the order is the
+        // fix rather than a tidy-up.
+        //
+        // This used to publish the four live fields and take `staged` only
+        // afterwards, which is the canonical order backwards. It deadlocked
+        // nothing, because each of those four guards is dropped before the next
+        // is taken, so the rebuild never held two at once. What it broke is the
+        // mapped writer's snapshot.
+        //
+        // `write_mapped_image` holds `staged` and then reads `index`, `docs` and
+        // the two counters, and its comment says `staged` is what stops a
+        // rebuild landing in the middle of that. It did not, while the rebuild
+        // published before asking for `staged`: the writer could take the NEW
+        // `index` and then block on `docs` until the rebuild had moved on, and
+        // come away with a new inverted index against the old document set. It
+        // does not fail loudly either. `write_mapped` buckets by the document
+        // table it was given and drops every posting whose id that table does
+        // not hold, so `written_docs` matches the old `doc_count` it also read,
+        // the cross-check passes, and the image is quietly missing the new
+        // corpus.
+        //
+        // Publishing under ONE guard rather than five also keeps the vocabulary
+        // honest: `commit` holds this same lock across its whole persist, so a
+        // rebuild that published field by field could have its documents naming
+        // ids a freshly reset table no longer holds.
+        //
+        // The epoch is bumped while the index write guard is held so a fuzzy
+        // reader observes a consistent (index, epoch) pair and rebuilds its
+        // trigram candidate index against this vocabulary.
+        let mut staged_guard = self.staged.write();
         {
             let mut live = self.index.write();
             *live = index;
@@ -1567,9 +1679,16 @@ impl<Id: DocId> TextIndex<Id> {
         *self.docs.write() = docs;
         *self.doc_count.write() = doc_count;
         *self.total_doc_length.write() = total_doc_length;
-        // Clear any pending staged state.
-        *self.staged.write() = None;
+        *staged_guard = None;
+        // And the mapping this replaces. A rebuild puts the whole corpus in the
+        // heap maps, so leaving a mapped backend installed would leave BOTH
+        // holding committed state, reads still answering from the stale image,
+        // and the following commit taking the mapped path with an empty delta:
+        // the rebuild would be silently discarded. That is the path kin-db takes
+        // to rebuild the text index from the graph.
+        *self.mapped.write() = None;
         self.mark_all_segments_dirty();
+        drop(staged_guard);
 
         Ok(())
     }
@@ -1630,6 +1749,10 @@ impl<Id: DocId> TextIndex<Id> {
             );
         }
 
+        // `staged` first, then the live guards under it, for the reasons
+        // `rebuild_all` states above. The two paths publish identically and an
+        // inversion in either is an inversion in the type.
+        let mut staged_guard = self.staged.write();
         {
             let mut live = self.index.write();
             *live = index;
@@ -1638,8 +1761,16 @@ impl<Id: DocId> TextIndex<Id> {
         *self.docs.write() = docs;
         *self.doc_count.write() = doc_count;
         *self.total_doc_length.write() = total_doc_length;
-        *self.staged.write() = None;
+        *staged_guard = None;
+        // And the mapping this replaces. A rebuild puts the whole corpus in the
+        // heap maps, so leaving a mapped backend installed would leave BOTH
+        // holding committed state, reads still answering from the stale image,
+        // and the following commit taking the mapped path with an empty delta:
+        // the rebuild would be silently discarded. That is the path kin-db takes
+        // to rebuild the text index from the graph.
+        *self.mapped.write() = None;
         self.mark_all_segments_dirty();
+        drop(staged_guard);
 
         Ok(())
     }
@@ -1676,6 +1807,10 @@ impl<Id: DocId> TextIndex<Id> {
         let _span = tracing::info_span!("kin_search.commit", staged = self.staged.read().is_some())
             .entered();
         let mut staged_guard = self.staged.write();
+        if self.mapped.read().is_some() {
+            let state = staged_guard.take();
+            return self.commit_mapped(state);
+        }
         if let Some(state) = staged_guard.take() {
             {
                 let mut live = self.index.write();
@@ -1686,8 +1821,170 @@ impl<Id: DocId> TextIndex<Id> {
             *self.doc_count.write() = state.doc_count;
             *self.total_doc_length.write() = state.total_doc_length;
         }
-        self.persist_to_disk()?;
+        // The guard travels down as a token rather than being taken again below.
+        // See `StagedHeld`: taking it again is a self-deadlock, not a wait.
+        self.persist_to_disk(StagedHeld::writing(&staged_guard))?;
         Ok(())
+    }
+
+    /// Commit onto a mapped image: rewrite each segment from what survives in it
+    /// plus what the delta adds, then map the result.
+    ///
+    /// The staged state on a mapped store is a DELTA and not a snapshot, because
+    /// `ensure_staged` clones the heap maps and those are empty here. So
+    /// `state.docs` is exactly what was upserted, `state.removed` is exactly what
+    /// was removed, and everything else comes out of the mapping.
+    ///
+    /// Every segment is visited, but only one is resident at a time: the fold
+    /// reads a segment, the encoder consumes it, and both are dropped before the
+    /// next. A segment with no change is rewritten identically rather than
+    /// skipped, which costs write bandwidth and buys the guarantee that the new
+    /// manifest names only files this commit wrote. Skipping is the next change
+    /// and it needs the dirty set to be trustworthy first.
+    fn commit_mapped(&self, state: Option<StagedState<Id>>) -> Result<(), SearchError>
+    where
+        Id: Serialize + DeserializeOwned,
+    {
+        let Some(path) = self.path.as_ref() else {
+            // A read-only handle over a mapped store. It cannot write, and it
+            // cannot absorb the delta either, because the committed state IS the
+            // mapping and a delta only becomes visible by rewriting it. The heap
+            // path could publish into its live maps and so appeared to work
+            // in-process; here that would be a silent discard, so it refuses.
+            return Err(SearchError::IndexError(
+                "this index was opened read-only and serves from a mapping, so a commit has \
+                 nowhere to go; reopen for writing to commit"
+                    .to_string(),
+            ));
+        };
+        let (upserts, removed) = match state {
+            Some(state) => (state.docs, state.removed),
+            None => (HashMap::new(), HashSet::new()),
+        };
+
+        let mapped_guard = self.mapped.read();
+        let mapped = mapped_guard
+            .as_ref()
+            .expect("checked by the caller under the staged write guard");
+        let segment_count = mapped.segment_count().max(1);
+        let graph_root_hash = *self.graph_root_hash.read();
+
+        // A document's occurrences, resolved out of the vocabulary the staged
+        // ids name. The order is the order it produced them, which is the order
+        // its postings have to come back in.
+        let vocab = self.vocab.read();
+        let mut staged_tokens: HashMap<Id, Vec<(String, f32)>> =
+            HashMap::with_capacity(upserts.len());
+        for (id, doc) in &upserts {
+            let mut tokens = Vec::with_capacity(doc.tokens_by_field.len());
+            for (token_id, weight) in &doc.tokens_by_field {
+                let Some(token) = vocab.token(*token_id) else {
+                    return Err(SearchError::IndexError(format!(
+                        "a staged document names vocabulary id {token_id}, which this index never \
+                         interned"
+                    )));
+                };
+                tokens.push((token.as_ref().to_owned(), *weight));
+            }
+            staged_tokens.insert(*id, tokens);
+        }
+        drop(vocab);
+
+        // The segments this delta actually reaches. A function of the DELTA and
+        // never of what the image happens to contain, so a removal of an id the
+        // image does not hold still costs one rewrite. That keeps the rule one
+        // sentence long, which is worth more than the rewrite it saves.
+        let mut dirty: HashSet<usize> = HashSet::new();
+        for id in staged_tokens.keys().chain(removed.iter()) {
+            dirty.insert(segment_of(id, segment_count));
+        }
+
+        let (doc_count, total_doc_length) =
+            mapped::write_mapped_streaming(path, segment_count, graph_root_hash, |segment| {
+                // A segment nothing touched keeps its file and its generation.
+                //
+                // Without this a commit with one changed document re-encoded and
+                // fsynced all sixty-four, which took the suite's churn soak from
+                // three seconds to over twenty-eight minutes before it was
+                // killed. A reconcile loop would do the same to a daemon.
+                if !dirty.contains(&segment) {
+                    let (docs, length, tombstones) = mapped.carry(segment).unwrap_or_default();
+                    return Ok(mapped::SegmentPlan::Carry {
+                        gen: mapped.segment_gen(path, segment),
+                        tombstones,
+                        doc_count: docs,
+                        total_doc_length: length,
+                    });
+                }
+                let mut build = mapped::SegmentBuild::new();
+                // What survives in the mapping: not removed, and not superseded
+                // by an upsert of the same id.
+                mapped.fold_segment_into(
+                    segment,
+                    |id| !removed.contains(id) && !staged_tokens.contains_key(id),
+                    &mut build,
+                )?;
+                for (id, tokens) in &staged_tokens {
+                    if segment_of(id, segment_count) != segment {
+                        continue;
+                    }
+                    let doc_length = upserts
+                        .get(id)
+                        .map(|doc| doc.doc_length)
+                        .expect("a staged token list names a staged document");
+                    build.push_document(*id, tokens, doc_length)?;
+                }
+                Ok(mapped::SegmentPlan::Rewrite(build))
+            })?;
+
+        drop(mapped_guard);
+        // The disk is already the new image, so the mapping in hand is stale
+        // whatever happens next. Dropping it before the reopen means a failure
+        // cannot leave a handle that folds the OLD image into the next commit
+        // and silently reverts what this one just wrote.
+        *self.mapped.write() = None;
+        let reopened = MappedIndex::open_archiving(path, true)?;
+        if reopened.live_document_count() != doc_count
+            || reopened.total_doc_length() != total_doc_length
+        {
+            return Err(SearchError::IndexError(format!(
+                "the image just written holds {} documents of {} tokens and the write reported {} \
+                 of {}",
+                reopened.live_document_count(),
+                reopened.total_doc_length(),
+                doc_count,
+                total_doc_length
+            )));
+        }
+        *self.mapped.write() = Some(reopened);
+        *self.doc_count.write() = doc_count;
+        *self.total_doc_length.write() = total_doc_length;
+        self.index_epoch.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl<Id> TextIndex<Id>
+where
+    Id: DocId + Serialize + DeserializeOwned,
+{
+    // `contains` and `fuzzy_search` live here rather than in the unconstrained
+    // block, and that is a narrowing of their bounds worth stating.
+    //
+    // A mapped backend cannot encode a query id to binary-search the document
+    // table, nor decode a result id out of it, without `Serialize` and
+    // `DeserializeOwned`. Those are the bounds `open` has always required, and a
+    // mapped backend can only exist on an index that came through `open`, so no
+    // index that could reach these methods before is unable to now. A caller
+    // holding a non-serialisable id keeps every other method, including
+    // `live_document_count` and `doc_frequency`, which need neither.
+
+    /// Whether a committed document with this ID is currently visible to search.
+    pub fn contains(&self, doc_id: &Id) -> bool {
+        if let Some(mapped) = self.mapped.read().as_ref() {
+            return mapped.contains(doc_id);
+        }
+        self.docs.read().contains_key(doc_id)
     }
 
     /// Search across indexed documents.
@@ -1705,6 +2002,9 @@ impl<Id: DocId> TextIndex<Id> {
             limit = limit
         )
         .entered();
+        if let Some(mapped) = self.mapped.read().as_ref() {
+            return mapped.fuzzy_search(query_str, limit);
+        }
         let query_tokens = tokenize(query_str);
         if query_tokens.is_empty() {
             return Ok(Vec::new());
@@ -1887,12 +2187,7 @@ impl<Id: DocId> TextIndex<Id> {
 
         Ok(results)
     }
-}
 
-impl<Id> TextIndex<Id>
-where
-    Id: DocId + Serialize + DeserializeOwned,
-{
     /// Open or create a persisted text search index.
     pub fn open(path: Option<&PathBuf>) -> Result<Self, SearchError> {
         Self::open_with_persistence(path, true)
@@ -1924,11 +2219,49 @@ where
             None
         });
 
-        // Auto-detect the on-disk format independently of the write-side flag, so
-        // toggling `KIN_SEARCH_INCREMENTAL_PERSIST` is safe in both directions: a
-        // segmented index opened with the flag off still loads (and the next
-        // monolithic commit retires it), and vice-versa.
+        // Auto-detect the on-disk format independently of the write-side flag.
+        //
+        // The flag is no longer a two-way lever, and saying so is the honest
+        // form. A v5 image is MAPPED whatever the flag says, and a commit on a
+        // mapped store rewrites the mapping before `persist_to_disk` ever
+        // consults the flag, so a v5 store with the flag off keeps writing v5.
+        // The route back to monolithic is a `rebuild_all`, which releases the
+        // mapping, and then a commit. A v3 or v4 index still loads either way.
         if manifest_path(&storage_path).exists() {
+            // A mapped image is MAPPED, not decoded. This is the whole cutover
+            // in three lines: the segment files are opened, their headers and
+            // FST roots touched, and nothing else is read until a query asks
+            // for it. What the heap holds afterwards is the mapping handles,
+            // one bit per document and three counters.
+            //
+            // The segment count comes off the manifest so a later commit writes
+            // the same partition, and the bincode writer's delta baseline is
+            // left absent, because a v4 commit must never publish a manifest
+            // naming v5 files.
+            if version_of_manifest(&storage_path) == Some(MAPPED_SEGMENT_VERSION) {
+                // The write-mode flag straight through: a writing open
+                // archives a corrupt manifest so the store can recover, a
+                // read-only one must not rename files.
+                let mapped = MappedIndex::open_archiving(&storage_path, persist_changes)?;
+                let segment_count = mapped.segment_count().max(1);
+                *index.graph_root_hash.write() = mapped.graph_root_hash();
+                // The counters travel with it. They are a shadow of the
+                // mapping's on a mapped store, and leaving them at zero made a
+                // consistency check downstream compare zero against zero and
+                // pass, which is how an empty image could be written over a
+                // full one and report success.
+                *index.doc_count.write() = mapped.live_document_count();
+                *index.total_doc_length.write() = mapped.total_doc_length();
+                *index.mapped.write() = Some(mapped);
+                index.index_epoch.fetch_add(1, Ordering::Relaxed);
+                let mut seg = index.seg.write();
+                seg.segment_count = segment_count;
+                seg.baseline_gens = None;
+                seg.segment_docs = None;
+                seg.dirty = SegmentDirty::All;
+                drop(seg);
+                return Ok(index);
+            }
             let loaded = Self::load_segmented(&storage_path, persist_changes)?;
             *index.index.write() = loaded.index;
             index.index_epoch.fetch_add(1, Ordering::Relaxed);
@@ -2083,14 +2416,15 @@ where
     /// path rewrites only changed segments; when `KIN_SEARCH_INCREMENTAL_PERSIST`
     /// explicitly disables it, the legacy monolithic path rewrites the full
     /// bincode file.
-    fn persist_to_disk(&self) -> Result<(), SearchError> {
+    fn persist_to_disk(&self, staged: StagedHeld<'_>) -> Result<(), SearchError> {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
 
         if self.incremental_enabled {
-            self.persist_segmented(path)
-        } else {
+            return self.persist_mapped_and_install(path, staged);
+        }
+        {
             self.persist_monolithic(path)?;
             // Transition safety: if this index was previously segmented, the
             // monolithic file we just wrote is now the truth — retire the stale
@@ -2160,278 +2494,13 @@ where
         Ok(())
     }
 
-    /// Segmented/incremental persist: after the first segmented baseline is
-    /// established, visit only changed segments, re-serialize and durably write
-    /// them, and finally swap in a small manifest. The manifest is the single
-    /// atomic commit point: every referenced segment file is fsynced before it
-    /// is named, so a crash leaves either the old manifest (old segments) or the
-    /// new one (all new/kept segments present) — never a torn, half-applied set.
-    fn persist_segmented(&self, path: &Path) -> Result<(), SearchError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                SearchError::IndexError(format!(
-                    "failed to create text index directory {}: {err}",
-                    parent.display()
-                ))
-            })?;
-        }
-
-        let docs = self.docs.read();
-        // Held across the segment loop because every document's stored ids are
-        // resolved through it, and a write that interned a new token midway
-        // would leave one segment's ids resolving against a table another
-        // segment never saw.
-        let vocab = self.vocab.read();
-        let doc_count = *self.doc_count.read();
-        let total_doc_length = *self.total_doc_length.read();
-        let graph_root_hash = *self.graph_root_hash.read();
-
-        let mut seg = self.seg.write();
-        let segment_count = match &seg.baseline_gens {
-            Some(gens) => gens.len().max(1),
-            None => seg.segment_count.max(1),
-        };
-        // A full rewrite is required when there is no segmented baseline to delta
-        // from (fresh index, or one just loaded from the monolithic format) or
-        // after a `rebuild_all` marked every segment dirty.
-        let rewrite_all = seg.baseline_gens.is_none() || matches!(seg.dirty, SegmentDirty::All);
-        let dirty: Vec<usize> = if rewrite_all {
-            (0..segment_count).collect()
-        } else {
-            match &seg.dirty {
-                SegmentDirty::Tracked(set) => set.iter().copied().collect(),
-                SegmentDirty::All => (0..segment_count).collect(),
-            }
-        };
-
-        let rebuild_segment_docs = rewrite_all || seg.segment_docs.is_none();
-        let mut buckets: Vec<Vec<Id>> = vec![Vec::new(); segment_count];
-        if rebuild_segment_docs {
-            // First segmented establishment and full rebuilds intentionally walk
-            // the whole corpus because every segment is the changed set.
-            for id in docs.keys() {
-                buckets[segment_of(id, segment_count)].push(*id);
-            }
-        } else {
-            // Once a segmented baseline exists, segment membership lets small
-            // commits walk only the dirty segments instead of rebucketing every
-            // live doc id on each persist.
-            let segment_docs = seg
-                .segment_docs
-                .as_ref()
-                .expect("checked by rebuild_segment_docs");
-            for &s in &dirty {
-                for id in &segment_docs[s] {
-                    if docs.contains_key(id) {
-                        buckets[s].push(*id);
-                    }
-                }
-            }
-        }
-
-        // With no in-memory baseline, the generations come off DISK rather than
-        // from a vector of `None`.
-        //
-        // `None` here used to mean "start at 0", and 0 is exactly the generation
-        // the mapped writer picks on an empty directory. So a commit with no
-        // baseline renamed v4 bytes onto the very names a live v5 manifest held,
-        // before the v4 manifest replaced it. A crash or a concurrent reader in
-        // that window finds a manifest naming files of the other format, and
-        // since the index is derived the recovery is to archive it and rebuild:
-        // the corpus is gone. Two ways in, and both reach it through a baseline
-        // this build clears on purpose, one after a mapped image is loaded and
-        // one after a mapped image is written to a different path.
-        //
-        // Reading the live manifest is the general invariant: no writer renames
-        // onto a name the live manifest holds, whichever format wrote it.
-        let old_gens: Vec<Option<u64>> = match &seg.baseline_gens {
-            Some(gens) => gens.clone(),
-            None => {
-                let mut on_disk = mapped::read_manifest_gens(path);
-                on_disk.resize(segment_count, None);
-                on_disk
-            }
-        };
-        let mut new_gens = old_gens.clone();
-
-        // Re-serialize and durably write each dirty segment under a fresh
-        // generation (an immutable new file — never an in-place overwrite).
-        for &s in &dirty {
-            let ids = &buckets[s];
-            if ids.is_empty() {
-                // The segment is now empty: it gets no file and a `None` gen.
-                new_gens[s] = None;
-                continue;
-            }
-            let mut seg_index: HashMap<String, Postings<Id>> = HashMap::new();
-            let mut seg_docs: HashMap<Id, IndexedDoc> = HashMap::with_capacity(ids.len());
-            let mut seg_doc_count = 0usize;
-            let mut seg_total_len = 0usize;
-            for id in ids {
-                let doc = &docs[id];
-                // Reconstruct this doc's postings from its stored tokens in the
-                // exact same order `upsert`/`rebuild_all` built the global index,
-                // so the merged-on-load result is byte-for-byte the same index.
-                for (token_id, weight) in &doc.tokens_by_field {
-                    let Some(token) = vocab.token(*token_id) else {
-                        return Err(SearchError::IndexError(format!(
-                            "text index segment {s} holds a document naming vocabulary id \
-                             {token_id}, which this index never interned"
-                        )));
-                    };
-                    seg_index
-                        .entry(token.as_ref().to_owned())
-                        .or_default()
-                        .add(*id, *weight);
-                }
-                seg_doc_count += 1;
-                seg_total_len += doc.doc_length;
-                seg_docs.insert(*id, doc.clone());
-            }
-            // A segment's vocabulary is its own inverted index's keys, sorted.
-            // Derived rather than stored: the tokens are already in the file as
-            // those keys, and writing them twice would put back a share of what
-            // this change removes. Sorted so the derivation is the same on both
-            // sides and independent of hash order.
-            let seg_vocab = segment_vocabulary(&seg_index);
-            let seg_ids: HashMap<&str, u32> = seg_vocab
-                .iter()
-                .enumerate()
-                .map(|(position, token)| {
-                    (
-                        token.as_str(),
-                        u32::try_from(position).expect("a segment holds under 4 billion tokens"),
-                    )
-                })
-                .collect();
-            // Rewrite the global ids the live index uses into this segment's
-            // own, because a global id means nothing to a process that has not
-            // built this exact vocabulary.
-            for doc in seg_docs.values_mut() {
-                for (token_id, _) in doc.tokens_by_field.iter_mut() {
-                    let Some(token) = vocab.token(*token_id) else {
-                        return Err(SearchError::IndexError(format!(
-                            "text index segment {s} holds a document naming vocabulary id \
-                             {token_id}, which this index never interned"
-                        )));
-                    };
-                    let Some(local) = seg_ids.get(token.as_ref()) else {
-                        return Err(SearchError::IndexError(format!(
-                            "text index segment {s} holds token {token:?} in a document but not \
-                             in its own inverted index"
-                        )));
-                    };
-                    *token_id = *local;
-                }
-            }
-            let seg_data = SegmentData {
-                index: seg_index,
-                docs: seg_docs,
-                doc_count: seg_doc_count,
-                total_doc_length: seg_total_len,
-            };
-            let encoded = bincode::serialize(&seg_data).map_err(|err| {
-                SearchError::IndexError(format!("failed to encode text index segment {s}: {err}"))
-            })?;
-            let new_gen = old_gens[s].map(|g| g.wrapping_add(1)).unwrap_or(0);
-            let seg_file = segment_path(path, s, new_gen);
-            let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let tmp = unique_tmp_path(&seg_file, seq);
-            write_file_durably(&tmp, &encoded).map_err(|err| {
-                let _ = std::fs::remove_file(&tmp);
-                SearchError::IndexError(format!(
-                    "failed to write text index segment {}: {err}",
-                    tmp.display()
-                ))
-            })?;
-            std::fs::rename(&tmp, &seg_file).map_err(|err| {
-                let _ = std::fs::remove_file(&tmp);
-                SearchError::IndexError(format!(
-                    "failed to promote text index segment {} -> {}: {err}",
-                    tmp.display(),
-                    seg_file.display()
-                ))
-            })?;
-            sync_parent_dir(&seg_file);
-            new_gens[s] = Some(new_gen);
-        }
-
-        // Publish the manifest — the atomic commit point.
-        let manifest = SegmentManifest {
-            version: SEGMENTED_FORMAT_VERSION,
-            segment_count,
-            segment_gens: new_gens.clone(),
-            doc_count,
-            total_doc_length,
-            graph_root_hash,
-        };
-        let m_encoded = bincode::serialize(&manifest).map_err(|err| {
-            SearchError::IndexError(format!("failed to encode text index manifest: {err}"))
-        })?;
-        let m_path = manifest_path(path);
-        let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let m_tmp = unique_tmp_path(&m_path, seq);
-        write_file_durably(&m_tmp, &m_encoded).map_err(|err| {
-            let _ = std::fs::remove_file(&m_tmp);
-            SearchError::IndexError(format!(
-                "failed to write text index manifest {}: {err}",
-                m_tmp.display()
-            ))
-        })?;
-        std::fs::rename(&m_tmp, &m_path).map_err(|err| {
-            let _ = std::fs::remove_file(&m_tmp);
-            SearchError::IndexError(format!(
-                "failed to promote text index manifest {} -> {}: {err}",
-                m_tmp.display(),
-                m_path.display()
-            ))
-        })?;
-        sync_parent_dir(&m_path);
-
-        let mut new_segment_docs = if rebuild_segment_docs {
-            let mut rebuilt = vec![HashSet::new(); segment_count];
-            for (s, ids) in buckets.iter().enumerate() {
-                rebuilt[s].extend(ids.iter().copied());
-            }
-            rebuilt
-        } else {
-            let mut kept = seg
-                .segment_docs
-                .clone()
-                .unwrap_or_else(|| vec![HashSet::new(); segment_count]);
-            for &s in &dirty {
-                kept[s].clear();
-                kept[s].extend(buckets[s].iter().copied());
-            }
-            kept
-        };
-        new_segment_docs.truncate(segment_count);
-        while new_segment_docs.len() < segment_count {
-            new_segment_docs.push(HashSet::new());
-        }
-
-        // Committed. Adopt the new generations as the baseline and clear dirt.
-        seg.baseline_gens = Some(new_gens.clone());
-        seg.segment_count = segment_count;
-        seg.segment_docs = Some(new_segment_docs);
-        seg.dirty = SegmentDirty::Tracked(HashSet::new());
-        drop(seg);
-        drop(docs);
-
-        // Best-effort GC of files the new manifest no longer references: prior
-        // generations of rewritten segments, and any stale monolithic file this
-        // segmented index supersedes. Orphans are harmless (load only follows the
-        // manifest); this just reclaims space.
-        for s in 0..segment_count {
-            if let Some(old) = old_gens[s] {
-                if new_gens[s] != Some(old) {
-                    let _ = std::fs::remove_file(segment_path(path, s, old));
-                }
-            }
-        }
-        let _ = std::fs::remove_file(path);
-        Ok(())
-    }
+    // The bincode segmented WRITER is gone. It has no callers: a commit writes
+    // v5 and a store already on v5 rewrites itself through `commit_mapped`.
+    //
+    // Its READER stays, and stays load-bearing, because every store in the
+    // field is v3 or v4 and has to open. Reading is a range and writing is a
+    // point, and this is what that finally looks like: three formats read, one
+    // written.
 
     /// Load a segmented index: read the manifest (the version gate), then read
     /// and merge every referenced segment into a single in-memory index that is
@@ -2699,25 +2768,62 @@ where
     /// path with an extension is the storage file, one without is a directory
     /// holding `index.bin`.
     pub fn persist_mapped(&self, path: &Path) -> Result<(), SearchError> {
+        // This entry point is reached without a guard, so it takes one, and it
+        // takes it FIRST: `staged` is the outermost lock, and a check that read
+        // `mapped` before it would be the one path in the crate asking for the
+        // two in the opposite order to `commit`.
+        let staged = self.staged.read();
+        // It writes the HEAP index, and on a mapped store the heap is empty by
+        // design. Without this it would publish a manifest of zero documents,
+        // reclaim every segment file the old one named, and report success,
+        // because the counters it cross-checks against are the same zero.
+        //
+        // A commit is how a mapped store is written now, so this refuses rather
+        // than guessing which the caller meant.
+        if self.mapped.read().is_some() {
+            return Err(SearchError::IndexError(
+                "this index already serves from a mapping; commit writes it, and persisting the \
+                 heap side here would publish an empty image over it"
+                    .to_string(),
+            ));
+        }
         let storage_path = storage_file_path_for(path);
+        self.write_mapped_image(&storage_path, StagedHeld::reading(&staged))?;
+        // The image at this path is now somebody else's, so this handle's delta
+        // bookkeeping is stale and is cleared rather than carried: it describes
+        // segments of an index this handle no longer matches.
+        let mut seg = self.seg.write();
+        seg.baseline_gens = None;
+        seg.segment_docs = None;
+        seg.dirty = SegmentDirty::All;
+        Ok(())
+    }
+
+    /// Write the live heap index as a mapped image at `storage_path`, and report
+    /// what it wrote.
+    fn write_mapped_image(
+        &self,
+        storage_path: &Path,
+        _staged: StagedHeld<'_>,
+    ) -> Result<(usize, usize), SearchError> {
+        let storage_path = storage_file_path_for(storage_path);
         // All FOUR live guards are held at once, and that is the difference
         // between a consistent image and a rejected one.
         //
-        // `staged` is not enough on its own. `rebuild_all` and
-        // `rebuild_all_owned` publish `index`, then `docs`, then the two
-        // counters under four INDEPENDENT write guards and clear `staged` only
-        // afterwards, so a snapshot taken between the first two would bucket a
-        // new inverted index against the old document set. `bucket`'s
-        // membership filter then silently drops every posting for a new id, and
-        // the image is either refused by its own load-time cross-check or served
-        // with a wrong `avgdl`. Holding all four blocks that publication
-        // outright.
+        // `staged`, which the caller proves it holds, is not enough on its own.
+        // `rebuild_all` and `rebuild_all_owned` publish `index`, then `docs`,
+        // then the two counters, and they do it under `staged` for exactly this
+        // reason: a snapshot taken between the first two would bucket a new
+        // inverted index against the old document set. `bucket`'s membership
+        // filter then silently drops every posting for a new id, and the image
+        // is either refused by its own load-time cross-check or served with a
+        // wrong `avgdl`. Holding all four here, under `staged`, blocks that
+        // publication outright.
         //
-        // Order is `staged`, then the live guards in the order every other
-        // reader takes them (`index`, `docs`, `doc_count`, `total_doc_length`),
-        // then `seg`. That is the canonical order, so no writer or committer can
-        // invert it against this call.
-        let _staged = self.staged.read();
+        // Order is `staged` (the caller's), then the live guards in the order
+        // every other reader takes them (`index`, `docs`, `doc_count`,
+        // `total_doc_length`), then `seg`. That is the canonical order, so no
+        // writer or committer can invert it against this call.
         let index = self.index.read();
         let docs = self.docs.read();
         let doc_count = self.doc_count.read();
@@ -2725,28 +2831,69 @@ where
         let doc_lengths: HashMap<Id, usize> =
             docs.iter().map(|(id, doc)| (*id, doc.doc_length)).collect();
         let segment_count = self.seg.read().segment_count.max(1);
-        mapped::write_mapped(
+        // The writer counts what it wrote rather than being told, so a caller
+        // whose counters disagree with its own maps produces an image that
+        // agrees with itself. The disagreement is then caught here, against the
+        // live counters, instead of being written into a manifest that the
+        // reader would refuse on the next open.
+        let (written_docs, written_length) = mapped::write_mapped(
             &storage_path,
             &index,
             &doc_lengths,
             segment_count,
-            *doc_count,
-            *total_doc_length,
             *self.graph_root_hash.read(),
         )?;
+        if written_docs != *doc_count || written_length != *total_doc_length {
+            return Err(SearchError::IndexError(format!(
+                "wrote {written_docs} documents of {written_length} tokens while the live counters \
+                 say {} of {}",
+                *doc_count, *total_doc_length
+            )));
+        }
+        Ok((written_docs, written_length))
+    }
 
-        // The mapped image is now the canonical one at this path, so the
-        // bincode writer's delta baseline has to go.
-        //
-        // Without this the next ordinary `commit` is a DELTA: it rewrites only
-        // the segments whose documents changed, in v4, and publishes a v4
-        // manifest that still names the old generation for every other segment.
-        // Those segments now hold `KINSEG05` files, so the following `open`
-        // decodes the magic as a bincode map length, fails, archives the
-        // manifest as corrupt, and the whole persisted index is gone, with the
-        // monolithic fallback already unlinked. Clearing the baseline forces
-        // that commit to be a full establishing rewrite, whose manifest names
-        // only files it just wrote.
+    /// Write the live heap index as a mapped image and hand the committed state
+    /// over to it.
+    ///
+    /// This is the flip that makes a daemon get any of this. Before it a store
+    /// wrote the bincode segmented format and `open` had nothing to map, so the
+    /// format existed and nothing used it.
+    ///
+    /// It runs only from the heap side, because a commit on a store that is
+    /// already mapped goes through `commit_mapped` and never reaches here. So
+    /// this is the conversion: a fresh store's first commit, and the first
+    /// commit after a rebuild replaced the corpus.
+    fn persist_mapped_and_install(
+        &self,
+        path: &Path,
+        staged: StagedHeld<'_>,
+    ) -> Result<(), SearchError> {
+        let (doc_count, total_doc_length) = self.write_mapped_image(path, staged)?;
+        let mapped = MappedIndex::open_archiving(path, true)?;
+        if mapped.live_document_count() != doc_count
+            || mapped.total_doc_length() != total_doc_length
+        {
+            return Err(SearchError::IndexError(format!(
+                "the image just written holds {} documents of {} tokens and the write reported \
+                 {doc_count} of {total_doc_length}",
+                mapped.live_document_count(),
+                mapped.total_doc_length()
+            )));
+        }
+        *self.mapped.write() = Some(mapped);
+        // Exactly one backend holds the committed state, so the heap side is
+        // released rather than left as a second copy of what is now pages. The
+        // vocabulary goes too: it exists to name the tokens a forward map holds,
+        // and a mapped store has no forward map. The trigram goes because the
+        // mapped path answers substrings from the term dictionary.
+        self.index.write().clear();
+        self.docs.write().clear();
+        *self.vocab.write() = Vocabulary::default();
+        *self.trigram.write() = None;
+        *self.doc_count.write() = doc_count;
+        *self.total_doc_length.write() = total_doc_length;
+        self.index_epoch.fetch_add(1, Ordering::Relaxed);
         let mut seg = self.seg.write();
         seg.baseline_gens = None;
         seg.segment_docs = None;
@@ -3378,14 +3525,114 @@ mod tests {
 
     // ── FIR-3064: vocabulary ids in the forward index ───────────────────────
 
+    /// Hand-write a fresh v4 (bincode) segmented store at `storage` from an
+    /// already-committed in-memory index's real state.
+    ///
+    /// `persist_segmented` is gone: a commit writes v5, and a store already on
+    /// v5 rewrites itself through `commit_mapped`, so nothing in this build can
+    /// produce fresh v4 bytes any other way. What is kept is the shape that
+    /// writer produced -- one `SegmentData` per non-empty segment, ids and
+    /// postings rebucketed against a segment-local vocabulary, a
+    /// `SegmentManifest` naming generation 0 for every present segment -- so a
+    /// test can still exercise the untouched legacy reader against real v4
+    /// bytes instead of a format this build can no longer write for itself.
+    fn write_legacy_segmented_fixture(idx: &TextIndex<TestId>, storage: &Path) {
+        // Every real writer creates the store directory before it writes into
+        // it, and a fixture standing in for one has to as well. Without this the
+        // first segment write fails `NotFound` on a caller that passed a path
+        // under a directory nothing had made yet.
+        if let Some(parent) = storage.parent() {
+            std::fs::create_dir_all(parent).expect("create the store directory");
+        }
+        let docs = idx.docs.read();
+        let vocab = idx.vocab.read();
+        let doc_count = *idx.doc_count.read();
+        let total_doc_length = *idx.total_doc_length.read();
+        let graph_root_hash = *idx.graph_root_hash.read();
+        let segment_count = idx.seg.read().segment_count.max(1);
+
+        let mut buckets: Vec<Vec<TestId>> = vec![Vec::new(); segment_count];
+        for id in docs.keys() {
+            buckets[segment_of(id, segment_count)].push(*id);
+        }
+
+        let mut segment_gens: Vec<Option<u64>> = vec![None; segment_count];
+        for (s, ids) in buckets.iter().enumerate() {
+            if ids.is_empty() {
+                continue;
+            }
+            let mut seg_index: HashMap<String, Postings<TestId>> = HashMap::new();
+            let mut seg_docs: HashMap<TestId, IndexedDoc> = HashMap::with_capacity(ids.len());
+            for id in ids {
+                let doc = &docs[id];
+                for (token_id, weight) in &doc.tokens_by_field {
+                    let token = vocab
+                        .token(*token_id)
+                        .expect("every stored id was interned");
+                    seg_index
+                        .entry(token.as_ref().to_owned())
+                        .or_default()
+                        .add(*id, *weight);
+                }
+                seg_docs.insert(*id, doc.clone());
+            }
+            let seg_vocab = segment_vocabulary(&seg_index);
+            let seg_ids: HashMap<&str, u32> = seg_vocab
+                .iter()
+                .enumerate()
+                .map(|(position, token)| {
+                    (
+                        token.as_str(),
+                        u32::try_from(position).expect("a segment holds under 4 billion tokens"),
+                    )
+                })
+                .collect();
+            for doc in seg_docs.values_mut() {
+                for (token_id, _) in doc.tokens_by_field.iter_mut() {
+                    let token = vocab
+                        .token(*token_id)
+                        .expect("every stored id was interned");
+                    *token_id = seg_ids[token.as_ref()];
+                }
+            }
+            let seg_doc_count = seg_docs.len();
+            let seg_total_len: usize = seg_docs.values().map(|d| d.doc_length).sum();
+            let seg_data = SegmentData {
+                index: seg_index,
+                docs: seg_docs,
+                doc_count: seg_doc_count,
+                total_doc_length: seg_total_len,
+            };
+            let encoded = bincode::serialize(&seg_data).unwrap();
+            std::fs::write(segment_path(storage, s, 0), &encoded).unwrap();
+            segment_gens[s] = Some(0);
+        }
+
+        let manifest = SegmentManifest {
+            version: SEGMENTED_FORMAT_VERSION,
+            segment_count,
+            segment_gens,
+            doc_count,
+            total_doc_length,
+            graph_root_hash,
+        };
+        std::fs::write(
+            manifest_path(storage),
+            bincode::serialize(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
     /// An index written before the forward map held vocabulary ids still opens.
     ///
     /// This is the migration the change must not require, and the manifest's
     /// two version checks were equalities, so before this test the answer was
     /// that it did require one. The fixture is aged deliberately rather than
-    /// mocked: a real index is built and persisted by this build, then every
-    /// segment is rewritten in the v3 shape with its documents carrying owned
-    /// token strings, and the manifest is re-stamped v3. Nothing else changes.
+    /// mocked: a real index is built and committed by this build, hand-written
+    /// as v4 (`write_legacy_segmented_fixture`, since this build no longer has
+    /// a v4 writer of its own), then every segment is rewritten in the v3 shape
+    /// with its documents carrying owned token strings, and the manifest is
+    /// re-stamped v3. Nothing else changes.
     ///
     /// Then it is opened and SEARCHED, because a load that produced an index
     /// with the right document count and the wrong token ids would pass a
@@ -3395,17 +3642,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path().join("index.bin");
 
-        // Build and persist at the current version.
+        // Build and commit in memory: persisting through this build's own
+        // commit() writes v5 since the cutover, and there is no live writer
+        // left that would give "the current version" a v4 meaning.
         let (id_a, doc_a) = make_doc("parse_header", "src/parse.rs", "function");
         let (id_b, doc_b) = make_doc("render_header", "src/render.rs", "function");
-        let expected = {
-            let index: TextIndex<TestId> = TextIndex::open(Some(&storage)).unwrap();
-            index.upsert_searchable(id_a, &doc_a).unwrap();
-            index.upsert_searchable(id_b, &doc_b).unwrap();
-            index.commit().unwrap();
-            index.fuzzy_search("header", 10).unwrap()
-        };
+        let source: TextIndex<TestId> = TextIndex::new();
+        source.upsert_searchable(id_a, &doc_a).unwrap();
+        source.upsert_searchable(id_b, &doc_b).unwrap();
+        source.commit().unwrap();
+        let expected = source.fuzzy_search("header", 10).unwrap();
         assert_eq!(expected.len(), 2, "the fixture must match both documents");
+
+        write_legacy_segmented_fixture(&source, &storage);
         assert!(
             manifest_path(&storage).exists(),
             "the fixture must have persisted segmented, or this ages nothing"
@@ -3470,10 +3719,13 @@ mod tests {
         );
 
         // The negative controls, so the range is a range and not an acceptance
-        // of anything.
+        // of anything. The upper bogus value is one past the whole readable
+        // range (MAX_SEGMENTED_FORMAT_VERSION, now the mapped format) rather
+        // than one past SEGMENTED_FORMAT_VERSION, which the cutover made a
+        // valid version under a different manifest shape.
         for bogus in [
             MIN_SEGMENTED_FORMAT_VERSION - 1,
-            SEGMENTED_FORMAT_VERSION + 1,
+            MAX_SEGMENTED_FORMAT_VERSION + 1,
         ] {
             let mut refused = manifest.clone();
             refused.version = bogus;
@@ -3998,9 +4250,13 @@ mod tests {
     }
 
     fn read_manifest_gens(storage: &Path) -> Vec<Option<u64>> {
-        let bytes = std::fs::read(manifest_path(storage)).unwrap();
-        let manifest: SegmentManifest = bincode::deserialize(&bytes).unwrap();
-        manifest.segment_gens
+        // Delegates to the production reader rather than decoding bincode
+        // directly. A fixture built through `build_into` writes v5 since the
+        // cutover, so the manifest here is a `MappedManifest`, not the v3/v4
+        // `SegmentManifest` this helper used to assume; `mapped::
+        // read_manifest_gens` is the one place both shapes are already
+        // dispatched on the version prefix.
+        mapped::read_manifest_gens(storage)
     }
 
     fn first_present_segment(storage: &Path) -> usize {
@@ -4051,7 +4307,12 @@ mod tests {
 
     /// Incremental persist re-serializes ONLY the segments whose documents
     /// changed: adding one doc bumps exactly its segment's generation and leaves
-    /// every other segment file untouched. This is the scaling-cliff fix.
+    /// every other segment file untouched. This is the scaling-cliff fix, now
+    /// carried by `commit_mapped`'s `SegmentPlan::Carry` rather than by the
+    /// heap-side `seg.segment_docs` bookkeeping the deleted bincode writer used:
+    /// a mapped store clears that field on every conversion (it has nothing to
+    /// track once the mapping is the truth), so membership is asserted through
+    /// the public read path instead of by peeking at it.
     #[test]
     fn incremental_persist_rewrites_only_the_dirty_segment() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4061,8 +4322,6 @@ mod tests {
 
         let gens_before = read_manifest_gens(&storage);
         let segment_count = gens_before.len();
-        let members_before = idx.seg.read().segment_docs.as_ref().unwrap().clone();
-        assert_eq!(members_before.len(), segment_count);
 
         let new_id = TestId(99_999);
         let new_doc = TestDoc {
@@ -4086,18 +4345,20 @@ mod tests {
             vec![touched],
             "exactly the touched segment must be rewritten (the cliff fix)"
         );
-        let members_after = idx.seg.read().segment_docs.as_ref().unwrap().clone();
-        assert_eq!(members_after.len(), segment_count);
-        for s in 0..segment_count {
-            if s == touched {
-                assert!(members_after[s].contains(&new_id));
-                assert_eq!(members_after[s].len(), members_before[s].len() + 1);
-            } else {
-                assert_eq!(members_after[s], members_before[s]);
-            }
-        }
 
+        // Every carried segment's documents must have survived the touched
+        // segment's rewrite untouched, and the new document must answer. Asked
+        // through the public API rather than internal bookkeeping, so this
+        // proves what a caller can actually observe rather than what one field
+        // says it did.
         let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        for (id, _) in fixture_docs() {
+            assert!(
+                reopened.contains(&id),
+                "{id:?} went missing after a commit that should only have touched segment \
+                 {touched}"
+            );
+        }
         let hits = reopened.fuzzy_search("freshlyAddedSymbol", 10).unwrap();
         assert_eq!(hits[0].0, new_id);
         assert_eq!(reopened.live_document_count(), fixture_docs().len() + 1);
@@ -4360,11 +4621,27 @@ mod tests {
     /// single-core machine. What IS guaranteed is where the work runs: rayon
     /// executes `par_iter` closures on pool workers, so a sequential loader
     /// running inline on this test's thread fails both assertions below.
+    ///
+    /// This is a v4 property, not a v5 one: `open_segments` in `mapped.rs` maps
+    /// each segment in a plain sequential loop, because opening a mapped
+    /// segment is a header read rather than a full deserialize and there is no
+    /// longer enough per-segment work to be worth fanning out. `build_into`
+    /// would give this a v5 store since the cutover, so the fixture is
+    /// hand-written as v4 (`write_legacy_segmented_fixture`) to keep exercising
+    /// the legacy loader's own parallel decode, which is unchanged and still
+    /// load-bearing for every v3/v4 store in the field.
     #[test]
     fn segment_decode_runs_on_the_rayon_pool() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("seg");
-        let _idx = build_into(&dir, true);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        let source: TextIndex<TestId> = TextIndex::new();
+        source.seg.write().segment_count = 8;
+        for (id, doc) in fixture_docs() {
+            source.upsert_searchable(id, &doc).unwrap();
+        }
+        source.commit().unwrap();
+        write_legacy_segmented_fixture(&source, &storage);
 
         let _ = segment_decode_observer::take();
         let reloaded = TextIndex::<TestId>::open(Some(&dir)).unwrap();
@@ -4435,6 +4712,12 @@ mod tests {
     }
 
     /// A manifest referencing a segment file that no longer exists is corrupt.
+    ///
+    /// The mapped reader opens each segment in index order and refuses on the
+    /// first one it cannot open (`open_segments` in `mapped.rs`), which reports
+    /// the segment and generation rather than the legacy loader's
+    /// "missing/unreadable segment" phrase; that phrasing was specific to the
+    /// bincode reader's parallel decode and this only needs the same substance.
     #[test]
     fn missing_segment_is_corrupt() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4448,8 +4731,12 @@ mod tests {
 
         let err = TextIndex::<TestId>::open(Some(&dir)).err().unwrap();
         assert!(
-            matches!(err, SearchError::CorruptIndex { ref reason, .. } if reason.contains("missing/unreadable segment")),
-            "expected missing-segment CorruptIndex, got {err:?}"
+            matches!(
+                err,
+                SearchError::CorruptIndex { ref reason, .. }
+                    if reason.contains("unreadable") && reason.contains(&format!("segment {target} gen {gen}"))
+            ),
+            "expected an unreadable-segment CorruptIndex naming segment {target} gen {gen}, got {err:?}"
         );
     }
 
@@ -4475,10 +4762,15 @@ mod tests {
         assert!(!manifest.exists(), "corrupt manifest must be archived");
     }
 
-    /// Toggling the flag OFF on a segmented index: it still loads, and the next
-    /// (monolithic) commit retires the manifest. Results are stable throughout.
+    /// Toggling the flag OFF on a MAPPED index has no effect: `commit` checks
+    /// `self.mapped` before it ever looks at `incremental_enabled`, so once a
+    /// store is on the v5 path there is no toggle back to the monolithic
+    /// format. That used to be reachable, when the flag chose between two
+    /// bincode writers; the bincode segmented writer is gone and a mapped store
+    /// commits through `commit_mapped` unconditionally, so this now asserts the
+    /// toggle is inert rather than asserting the conversion it used to make.
     #[test]
-    fn segmented_to_monolithic_toggle_preserves_results() {
+    fn toggling_off_a_mapped_index_does_not_revert_it() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("idx");
         let seg = build_into(&dir, true);
@@ -4486,18 +4778,25 @@ mod tests {
         let storage = TextIndex::<TestId>::storage_file_path(&dir);
         assert!(manifest_path(&storage).exists());
 
-        // Reopen with the flag off (auto-detects + loads the segmented index).
+        // Reopen with the flag off. The reopen maps the v5 image regardless of
+        // the flag, so this is exercising "the flag off on an already-mapped
+        // index", the same starting condition the retired test used.
         let mut idx = TextIndex::<TestId>::open(Some(&dir)).unwrap();
         idx.incremental_enabled = false;
         assert_eq!(all_query_results(&idx), before);
 
-        // A commit now writes monolithic and retires the stale manifest.
+        // A commit still writes v5: commit_mapped runs because the store is
+        // mapped, never consulting the flag that would have chosen a writer on
+        // a heap-backed store.
         idx.commit().unwrap();
         assert!(
-            !manifest_path(&storage).exists(),
-            "manifest must be retired"
+            manifest_path(&storage).exists(),
+            "a mapped store stays mapped; commit_mapped does not retire its own manifest"
         );
-        assert!(storage.exists(), "monolithic index.bin must be written");
+        assert!(
+            !storage.exists(),
+            "a mapped store never falls back to writing a monolithic index.bin"
+        );
 
         let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
         assert_eq!(all_query_results(&reopened), before);
@@ -4610,9 +4909,16 @@ mod tests {
                     .join()
                     .expect("coordinator thread panicked (a worker assertion failed)");
             }
+            // Named as a deadlock rather than as an inversion. Both shapes end
+            // here and they are not the same defect: two threads can take two
+            // locks in opposite orders, and one thread can ask for a lock it is
+            // already holding, which `parking_lot` never grants. This helper
+            // now guards a single-threaded caller too, and calling that an
+            // inversion sent the last reader looking for a second thread.
             Err(_) => panic!(
-                "{label}: concurrent workload did not complete within {timeout:?} — \
-                 lock-order-inversion deadlock has regressed"
+                "{label}: workload did not complete within {timeout:?}, so a deadlock has \
+                 regressed: either an inversion between threads, or a lock re-acquired by the \
+                 thread that already holds it"
             ),
         }
     }
@@ -4765,6 +5071,146 @@ mod tests {
             expected,
             "every concurrently-inserted doc must survive persistence"
         );
+    }
+
+    /// A single-threaded persisted commit must return. One thread, one call, no
+    /// contention: just a stopwatch.
+    ///
+    /// The class is a persist frame re-acquiring a lock its own caller already
+    /// holds. `commit` holds `staged` across its whole persist, on purpose, so a
+    /// frame below it that asked for `staged` again parked against itself:
+    /// `parking_lot`'s `RwLock` is not reentrant, and a read from the thread
+    /// holding the write guard waits for a guard that will not be released until
+    /// the read returns. Once the default commit wrote v5, that reached every
+    /// persisted commit in the crate, on every platform, at zero CPU.
+    ///
+    /// It carries a timeout for the same reason it exists. A self-deadlock has
+    /// no assertion to fail: it hangs the binary, the harness never finishes, and
+    /// the only signal is a hosted job that never reports. On 2026-09-03 the
+    /// three checks that run this suite sat `in_progress` for 46 minutes on an
+    /// idle runner while all seven that do not run tests concluded green. The
+    /// budget is what turns that into a red line in seconds.
+    ///
+    /// All three ways into the writer are called, because they take `staged`
+    /// differently: a first commit converts the heap and is handed the
+    /// committer's write guard, a second commit deltas onto the mapping, and
+    /// `persist_mapped` is entered with no guard at all and takes its own.
+    #[test]
+    fn a_persisted_commit_returns_without_retaking_a_lock_it_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("selfdeadlock");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        run_with_deadlock_timeout(
+            "single_threaded_persisted_commit",
+            std::time::Duration::from_secs(30),
+            {
+                let dir = dir.clone();
+                move || {
+                    let idx = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+                    idx.upsert(TestId(1), &[("selfDeadlockGuard", 5.0)])
+                        .unwrap();
+                    // The conversion, under `commit`'s own `staged` write guard.
+                    idx.commit().unwrap();
+                    idx.upsert(TestId(2), &[("selfDeadlockGuard", 5.0)])
+                        .unwrap();
+                    // And the delta onto the mapping, which is the other commit path.
+                    idx.commit().unwrap();
+                    assert_eq!(idx.live_document_count(), 2);
+
+                    // The explicit persist, entered with no guard in hand.
+                    let heap = TextIndex::<TestId>::new();
+                    heap.upsert(TestId(3), &[("selfDeadlockGuard", 5.0)])
+                        .unwrap();
+                    heap.commit().unwrap();
+                    heap.persist_mapped(&elsewhere).unwrap();
+                }
+            },
+        );
+
+        let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        assert_eq!(reopened.live_document_count(), 2);
+    }
+
+    /// A rebuild publishes nothing until it holds `staged`.
+    ///
+    /// `rebuild_all` replaces the four live fields wholesale. It used to replace
+    /// them first and take `staged` afterwards, and each of the four guards is
+    /// dropped before the next is taken, so nothing deadlocked and nothing was
+    /// obviously wrong. What was wrong is what `write_mapped_image` believes:
+    /// it holds `staged` and then reads `index`, `docs` and the two counters,
+    /// and its comment says `staged` is what stops a rebuild landing in the
+    /// middle of that.
+    ///
+    /// It did not. The writer could read the NEW inverted index, block on
+    /// `docs` until the rebuild moved past it, and come away with the new index
+    /// against the old document set. That image is not refused, either:
+    /// `write_mapped` drops every posting whose id the document table it was
+    /// handed does not hold, so its own count matches the old `doc_count` it
+    /// read beside it, the cross-check passes, and the corpus is quietly
+    /// missing.
+    ///
+    /// So the property under test is the ORDER and not a race outcome: while a
+    /// `staged` guard is held, the live state must not move. The window is
+    /// polled rather than slept through, so the assertion fires the moment a
+    /// rebuild publishes early instead of depending on a sleep being long
+    /// enough.
+    #[test]
+    fn a_rebuild_publishes_nothing_until_it_holds_staged() {
+        use std::sync::Arc;
+
+        let idx = Arc::new(TextIndex::<TestId>::new());
+        idx.upsert(TestId(1), &[("beforeRebuild", 1.0)]).unwrap();
+        idx.commit().unwrap();
+        assert_eq!(idx.live_document_count(), 1);
+        assert!(idx.index.read().contains_key("beforerebuild"));
+
+        // Held the way `write_mapped_image`'s caller holds it. Read is the
+        // weaker of the two modes, so proving it excludes a rebuild proves the
+        // write mode does too.
+        let held = idx.staged.read();
+
+        let rebuilding = {
+            let idx = Arc::clone(&idx);
+            std::thread::spawn(move || {
+                let docs: Vec<(TestId, Vec<(&str, f32)>)> = (0..8u64)
+                    .map(|k| (TestId(100 + k), vec![("afterRebuild", 1.0)]))
+                    .collect();
+                idx.rebuild_all(&docs).unwrap();
+            })
+        };
+
+        // Three seconds of chances. A rebuild of eight one-token documents has
+        // nothing to wait for except this guard, so under the old order it has
+        // long since replaced `index`, `docs` and both counters by the first
+        // poll.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                !idx.index.read().contains_key("afterrebuild"),
+                "a rebuild published its inverted index while a `staged` guard was held, so a \
+                 persist running under that guard can read it against the old document table"
+            );
+            assert_eq!(
+                *idx.doc_count.read(),
+                1,
+                "a rebuild published its counters while a `staged` guard was held"
+            );
+            assert!(
+                idx.docs.read().contains_key(&TestId(1)),
+                "a rebuild published its document table while a `staged` guard was held"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // And it is a hold rather than a loss: released, the rebuild lands.
+        drop(held);
+        rebuilding.join().expect("the rebuilding thread panicked");
+        assert_eq!(idx.live_document_count(), 8);
+        assert!(idx.index.read().contains_key("afterrebuild"));
+        assert!(!idx.index.read().contains_key("beforerebuild"));
     }
 
     // postings: term -> (occurrences, sorted [(doc_id, weight vec)])
