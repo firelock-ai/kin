@@ -137,7 +137,17 @@ def initialize_repo(repo: Path) -> str:
     (repo / "Cargo.toml").write_text(manifest(), encoding="utf-8")
     (repo / "Cargo.lock").write_text("version = 4\nkin-db 0.7.67\n", encoding="utf-8")
     (repo / "README.md").write_text("base\n", encoding="utf-8")
-    run_git(repo, "add", "Cargo.toml", "Cargo.lock", "README.md")
+    # A baseline fuzz/Cargo.lock, mirroring the real repo shape: fuzz/Cargo.lock
+    # is always a tracked file there, so ALLOWED_PATHS admits it as a path that
+    # may be absent from a given wave's diff, never as a path absent from the
+    # tree. Seeding it here keeps every other fixture's diff exactly as before
+    # (an untouched tracked file produces no diff entry) and lets the two
+    # fixtures that do touch it below register as modifications, not adds.
+    (repo / "fuzz").mkdir(parents=True, exist_ok=True)
+    (repo / "fuzz" / "Cargo.lock").write_text(
+        "version = 4\nkin-model 0.7.23\n", encoding="utf-8"
+    )
+    run_git(repo, "add", "Cargo.toml", "Cargo.lock", "README.md", "fuzz/Cargo.lock")
     run_git(repo, "commit", "-q", "-m", "base")
     return run_git(repo, "rev-parse", "HEAD")
 
@@ -165,6 +175,7 @@ def commit_dependency_head(
     lock_version: str = "0.7.69",
     marker: bool = True,
     readme: str | None = None,
+    fuzz_lock_version: str | None = None,
 ) -> str:
     (repo / "Cargo.toml").write_text(
         manifest(dependency, workspace_version=workspace_version, extra=extra),
@@ -175,6 +186,13 @@ def commit_dependency_head(
     )
     if readme is not None:
         (repo / "README.md").write_text(readme, encoding="utf-8")
+    if fuzz_lock_version is not None:
+        # A modification, not an add: initialize_repo already committed a
+        # baseline fuzz/Cargo.lock, matching how the real wave only ever
+        # rewrites an already-tracked file.
+        (repo / "fuzz" / "Cargo.lock").write_text(
+            f"version = 4\nkin-model {fuzz_lock_version}\n", encoding="utf-8"
+        )
     run_git(repo, "add", "-A")
     message = "dependency wave"
     if marker:
@@ -696,7 +714,10 @@ class HeadAdmissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             base = initialize_repo(repo)
-            head = commit_dependency_head(repo)
+            # Touches all three admitted paths, so evidence.paths below covers
+            # the full ALLOWED_PATHS set, including the detached fuzz workspace
+            # lock the receiver now regenerates alongside the root pins.
+            head = commit_dependency_head(repo, fuzz_lock_version="0.7.24")
             reviews, comments = attestation_documents(repo, base, head)
             evidence = head_guard.validate_attestation(
                 repo,
@@ -2377,6 +2398,9 @@ class WorkflowContractTests(unittest.TestCase):
         admission = step_block(
             self.workflow, "Admit the generated dependency delta before compilation"
         )
+        fuzz_lock = step_block(
+            self.workflow, "Update the detached fuzz workspace lock to match"
+        )
         self.assertIn(
             "run: cargo check --locked -p kin-core -p kin-cli -p kin-daemon -p kin-mcp",
             smoke,
@@ -2386,7 +2410,16 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn("--bump-own-version false", block)
         self.assertIn("expected_tree=", snapshot)
         self.assertIn('--expected-tree "$EXPECTED_TREE"', admission)
+        # This has to run before the snapshot below, not after: every later
+        # re-check in this pipeline (apply_candidate's re-validation in
+        # mutate-wave, and the final verify-generated-head check against the
+        # pushed PR head) compares against the tree the snapshot step records,
+        # so fuzz/Cargo.lock has to already be in the working tree by then.
+        self.assertIn("if: steps.update.outputs.changed == 'true'", fuzz_lock)
+        self.assertIn("cargo update --manifest-path fuzz/Cargo.toml", fuzz_lock)
+        self.assertIn("git add fuzz/Cargo.lock", fuzz_lock)
         prepare_names = [
+            "Update the detached fuzz workspace lock to match",
             "Snapshot the exact generated dependency delta",
             "Admit the generated dependency delta before compilation",
             "Build the hash-bound data-only candidate handoff",
@@ -2446,6 +2479,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("add-paths: |", writer)
         self.assertIn("Cargo.lock", writer)
         self.assertIn("Cargo.toml", writer)
+        self.assertIn("fuzz/Cargo.lock", writer)
         self.assertIn("ADMITTED_BASE", verifier)
         self.assertIn(".base.sha", verifier)
         self.assertIn(".auto_merge == null", verifier)

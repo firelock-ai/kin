@@ -93,20 +93,46 @@ def initialize_repo(repo: Path) -> str:
     (repo / "Cargo.toml").write_text(manifest(), encoding="utf-8")
     (repo / "Cargo.lock").write_text("version = 4\nkin-db 0.7.67\n", encoding="utf-8")
     (repo / "README.md").write_text("base\n", encoding="utf-8")
+    # A baseline fuzz/Cargo.lock, mirroring the real repo: it is always a
+    # tracked file there, so ALLOWED_PATHS admits it as a path a given wave's
+    # diff may leave untouched, never as a path absent from the tree. Seeding
+    # it here leaves every fixture that never touches it unaffected (an
+    # untouched tracked file produces no diff entry) and lets commit_wave's
+    # optional fuzz_lock_version below register as a modification, not an add.
+    (repo / "fuzz").mkdir(parents=True, exist_ok=True)
+    (repo / "fuzz" / "Cargo.lock").write_text(
+        "version = 4\nkin-model 0.7.23\n", encoding="utf-8"
+    )
     run_git(repo, "add", "-A")
     run_git(repo, "commit", "-q", "-m", "base")
     return run_git(repo, "rev-parse", "HEAD")
 
 
-def write_pins(repo: Path, dependency: str, lock_version: str) -> None:
+def write_pins(
+    repo: Path,
+    dependency: str,
+    lock_version: str,
+    *,
+    fuzz_lock_version: str | None = None,
+) -> None:
     (repo / "Cargo.toml").write_text(manifest(dependency), encoding="utf-8")
     (repo / "Cargo.lock").write_text(
         f"version = 4\nkin-db {lock_version}\n", encoding="utf-8"
     )
+    if fuzz_lock_version is not None:
+        (repo / "fuzz" / "Cargo.lock").write_text(
+            f"version = 4\nkin-model {fuzz_lock_version}\n", encoding="utf-8"
+        )
 
 
-def commit_wave(repo: Path, dependency: str = "=0.7.69", lock_version: str = "0.7.69") -> str:
-    write_pins(repo, dependency, lock_version)
+def commit_wave(
+    repo: Path,
+    dependency: str = "=0.7.69",
+    lock_version: str = "0.7.69",
+    *,
+    fuzz_lock_version: str | None = None,
+) -> str:
+    write_pins(repo, dependency, lock_version, fuzz_lock_version=fuzz_lock_version)
     run_git(repo, "add", "-A")
     run_git(repo, "commit", "-q", "-m", f"dependency wave\n\n{head_guard.COMMIT_MARKER}")
     return run_git(repo, "rev-parse", "HEAD")
@@ -1149,7 +1175,11 @@ class AdmittedHeadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             base = initialize_repo(repo)
-            admitted_head = commit_wave(repo)
+            # fuzz_lock_version touches all three admitted paths, so
+            # evidence.paths below covers the full ALLOWED_PATHS set, including
+            # the detached fuzz workspace lock the receiver now regenerates
+            # alongside the root pins.
+            admitted_head = commit_wave(repo, fuzz_lock_version="0.7.24")
             admitted = head_guard.validate_delta(repo, base, admitted_head, require_marker=True)
             tip = advance_main(repo, base)
             run_git(repo, "cherry-pick", admitted_head)

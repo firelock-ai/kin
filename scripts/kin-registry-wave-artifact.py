@@ -18,7 +18,15 @@ from typing import Any, Sequence
 
 EXPECTED_REPOSITORY = "firelock-ai/kin"
 EXPECTED_WORKFLOW_PATH = ".github/workflows/kin-registry-release.yml"
-ALLOWED_PATHS = ("Cargo.lock", "Cargo.toml")
+# Kept as its own ordered tuple rather than importing verify-kin-registry-wave-
+# head.py's ALLOWED_PATHS frozenset: this constant is serialized as
+# `list(ALLOWED_PATHS)` into the candidate.json handoff and compared for exact
+# list equality across two separate CI processes (prepare-wave writes it,
+# mutate-wave reads it back). Python randomizes string-hash seeds per process,
+# so a frozenset's iteration order is not guaranteed stable across processes; a
+# literal tuple is. land-kin-registry-wave.py can safely import the frozenset
+# because it only ever uses it for membership and sorted() there.
+ALLOWED_PATHS = ("Cargo.lock", "Cargo.toml", "fuzz/Cargo.lock")
 LOWER_SHA = re.compile(r"^[0-9a-f]{40}$")
 HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 VERSION_EVIDENCE = re.compile(r"^(?:absent|[0-9A-Za-z.+-]+)$")
@@ -121,13 +129,37 @@ def _safe_regular(path: Path) -> bytes:
 
 
 def _exact_entries(directory: Path, expected: frozenset[str]) -> None:
+    """Require the directory tree to hold exactly the expected file paths.
+
+    Walks recursively rather than listing top-level names only, because
+    ALLOWED_PATHS now includes fuzz/Cargo.lock: a shallow `iterdir()` would see
+    a bare `fuzz` directory entry that can never equal the string
+    "fuzz/Cargo.lock", refusing every candidate. Every directory encountered is
+    rejected if it is a symlink before being walked into, so a symlinked
+    subdirectory can never smuggle a read from outside `directory`; the same
+    rejection applies to any non-regular leaf.
+    """
+
     if directory.is_symlink() or not directory.is_dir():
         raise ArtifactError("artifact path is not an exact directory")
-    entries = frozenset(item.name for item in directory.iterdir())
-    if entries != expected:
+    found: set[str] = set()
+    pending = [directory]
+    while pending:
+        current = pending.pop()
+        for item in current.iterdir():
+            relative = item.relative_to(directory).as_posix()
+            if item.is_symlink():
+                raise ArtifactError(f"artifact entry {relative} is a symlink")
+            if item.is_dir():
+                pending.append(item)
+            elif item.is_file():
+                found.add(relative)
+            else:
+                raise ArtifactError(f"artifact entry {relative} is not a regular file")
+    if found != expected:
         raise ArtifactError(
             "artifact entries differ from the allowlist: "
-            + ", ".join(sorted(entries ^ expected))
+            + ", ".join(sorted(found ^ expected))
         )
 
 
@@ -159,7 +191,21 @@ def _validate_candidate(
         item = value.get(field)
         if not isinstance(item, str) or VERSION_EVIDENCE.fullmatch(item) is None:
             raise ArtifactError(f"candidate {field} is invalid")
-    if value.get("paths") != list(ALLOWED_PATHS):
+    # "paths" is the subset of ALLOWED_PATHS this delta actually touched, in
+    # ALLOWED_PATHS's own canonical order, not the full allowlist: a wave that
+    # moves a pin fuzz/Cargo.lock does not depend on (kin-blobs, say) never
+    # touches it, and validate_index_delta/validate_delta already admit that
+    # subset. Every real wave happened to touch every one of the previous two
+    # paths together, which is what let this check hard-require the full list
+    # without it ever being exercised as a subset.
+    paths_value = value.get("paths")
+    if (
+        not isinstance(paths_value, list)
+        or not paths_value
+        or len(set(paths_value)) != len(paths_value)
+        or any(path not in ALLOWED_PATHS for path in paths_value)
+        or paths_value != [path for path in ALLOWED_PATHS if path in paths_value]
+    ):
         raise ArtifactError("candidate paths differ from the exact allowlist")
     files = value.get("files")
     if not isinstance(files, dict) or frozenset(files) != frozenset(ALLOWED_PATHS):
@@ -209,6 +255,10 @@ def prepare_candidate(
     files: dict[str, str] = {}
     for path in ALLOWED_PATHS:
         content = _git(workspace, "show", f":{path}")
+        # ALLOWED_PATHS now includes fuzz/Cargo.lock, the first admitted path
+        # with a directory component; output_dir itself is created above but
+        # not its subdirectories.
+        (output_dir / path).parent.mkdir(parents=True, exist_ok=True)
         (output_dir / path).write_bytes(content)
         files[path] = _sha256(content)
     manifest: dict[str, Any] = {
@@ -220,7 +270,12 @@ def prepare_candidate(
         "delta_sha256": evidence.delta_sha256,
         "package_version": evidence.package_version,
         "workspace_version": evidence.workspace_version,
-        "paths": list(ALLOWED_PATHS),
+        # The subset of ALLOWED_PATHS this delta actually touched (evidence.paths
+        # comes from validate_index_delta's real git diff), not the full
+        # allowlist: `files` below always carries all of ALLOWED_PATHS, because
+        # apply_candidate needs every admitted path's current bytes to
+        # reconstruct the tree, changed or not, but "paths" describes the delta.
+        "paths": [path for path in ALLOWED_PATHS if path in evidence.paths],
         "files": files,
     }
     _validate_candidate(
@@ -264,6 +319,7 @@ def apply_candidate(
         if _sha256(content) != value["files"][path]:
             raise ArtifactError(f"artifact bytes for {path} differ from their digest")
     for path in ALLOWED_PATHS:
+        (workspace / path).parent.mkdir(parents=True, exist_ok=True)
         (workspace / path).write_bytes((artifact_dir / path).read_bytes())
     _git(workspace, "add", "--", *ALLOWED_PATHS)
 
