@@ -387,22 +387,44 @@ mod tests {
         );
     }
 
-    /// Ranking reads the name before the prose. `references` is a segment of
-    /// `find_references`' name and appears in several other descriptions, so the
-    /// named tool has to come first or the ranking is reading prose.
+    /// Ranking reads the name before the prose. `references` is a segment of two
+    /// tool names and appears in the descriptions of ten more, so every tool
+    /// carrying it in its NAME has to rank above every tool that only mentions
+    /// it.
+    ///
+    /// Stated as that property rather than as one expected first row, which is
+    /// what the first version of this test asserted and what the ranking does
+    /// not promise: `bulk_check_references` and `find_references` both carry the
+    /// term as a name segment and score identically, so which of the two leads
+    /// is decided by the alphabetical tie-break that keeps the order stable
+    /// across builds.
     #[test]
     fn a_name_hit_outranks_a_description_hit() {
         let payload = call(serde_json::json!({ "need": "references", "limit": 25 }));
         let names: Vec<String> =
             serde_json::from_value(payload["matched_names"].clone()).expect("names");
-        assert_eq!(
-            names.first().map(String::as_str),
-            Some("find_references"),
-            "the name hit did not come first: {names:?}"
+        let in_name: Vec<bool> = names
+            .iter()
+            .map(|name| name.contains("references"))
+            .collect();
+
+        // Both controls. Without a name hit the assertion is vacuous, and
+        // without a prose hit there is nothing for a name hit to outrank.
+        assert!(
+            in_name.iter().any(|hit| *hit),
+            "no tool matched by name, so this proves nothing about ordering: {names:?}"
         );
         assert!(
-            names.len() > 1,
-            "the description hits vanished, so this proves nothing about ordering: {names:?}"
+            in_name.iter().any(|hit| !*hit),
+            "no tool matched by prose, so this proves nothing about ordering: {names:?}"
+        );
+
+        let last_name_hit = in_name.iter().rposition(|hit| *hit).expect("a name hit");
+        let first_prose_hit = in_name.iter().position(|hit| !*hit).expect("a prose hit");
+        assert!(
+            last_name_hit < first_prose_hit,
+            "a tool that only mentions the term outranks one that carries it in its name: \
+             {names:?}"
         );
     }
 
