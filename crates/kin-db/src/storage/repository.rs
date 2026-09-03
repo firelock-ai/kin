@@ -729,6 +729,42 @@ impl PersistedRepositoryAuthority {
         Ok(authority)
     }
 
+    /// Drop the operation record embedded in every receipt whose operation the
+    /// log beside it already holds.
+    ///
+    /// FIR-3064 stopped a receipt EMBEDDING its operation record, but
+    /// `PersistedCommitReceipt::trimmed` is only ever pushed, so a store
+    /// written before that change carried its fat receipts through every
+    /// rewrite. Measured by walking the persisted frame of a converted Linux
+    /// subtree: `receipts[0]` alone is 411,771,864 bytes of a 2,043,051,848
+    /// byte body, 20.15 percent of the store, and it is a verbatim second copy
+    /// of a record in the operation log a few elements away.
+    ///
+    /// Nothing reads the embedded copy. In kin-db the field's only reader is
+    /// `GraphSnapshot::persists_a_trimmed_receipt`, which asks whether ANY
+    /// receipt is trimmed and only becomes more true here;
+    /// [`PersistedCommitReceipt::validate_against`] compares against the log
+    /// entry and never touches it; and kin's `rejoined_receipt` takes the
+    /// record from the log. No root folds `receipts`, so this moves no
+    /// identity and needs no schema or wire version.
+    ///
+    /// A receipt whose operation the log does NOT hold keeps its copy. The
+    /// envelope requires every operation to have a receipt and not the reverse,
+    /// so that case is representable, and dropping a record nothing else holds
+    /// would be destroying the only copy rather than removing a duplicate.
+    pub(crate) fn trim_receipts_the_log_already_holds(&mut self) {
+        let logged: BTreeSet<_> = self
+            .operation_log
+            .iter()
+            .map(|operation| operation.operation_id)
+            .collect();
+        for receipt in &mut self.receipts {
+            if receipt.operation.is_some() && logged.contains(&receipt.operation_id) {
+                receipt.operation = None;
+            }
+        }
+    }
+
     /// Fail closed on malformed, non-canonical, or root-inconsistent metadata.
     pub fn validate_against_snapshot(&self, snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
         let admitted = AdmittedChangeMap::admit(&snapshot.changes, "snapshot")?;
@@ -3693,6 +3729,15 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     metadata
         .receipts
         .sort_by_key(|persisted| persisted.operation_id);
+    // And the ones this store inherited, for the reason on the method: a store
+    // written before the receipt trim carried its fat receipts through every
+    // rewrite, and on a converted Linux subtree that is 411,771,864 bytes of a
+    // 2,043,051,848 byte body. `AuthorityFrame::apply_to_envelope` calls the
+    // same function on the reader's side, and it has to: `first_difference`
+    // compares the reconstructed envelope with this one by `PartialEq`, so a
+    // trim on one side only would make the writer refuse its own frame and
+    // rewrite the whole base instead.
+    metadata.trim_receipts_the_log_already_holds();
     snapshot.repository_authority = Some(metadata);
     // A publish carries whatever section its base already had, or none, and
     // never writes one: see the note in `apply_workspace`. The version still
@@ -20515,6 +20560,118 @@ mod tests {
 
     fn decoded_on_this_thread() -> usize {
         crate::storage::change_map::change_maps_decoded_on_this_thread()
+    }
+
+    /// FIR-3064: a commit trims the receipts it INHERITED, not only the one it
+    /// writes.
+    ///
+    /// `PersistedCommitReceipt::trimmed` is only ever pushed, so a store
+    /// written before the receipt trim carried its fat receipts through every
+    /// rewrite. Measured by walking a converted Linux subtree's persisted
+    /// frame, `receipts[0]` alone is 411,771,864 bytes of a 2,043,051,848 byte
+    /// body, 20.15 percent, and it is a verbatim second copy of a record in the
+    /// operation log a few elements away.
+    ///
+    /// The store is AGED on purpose, the way PR 271's own compatibility test
+    /// ages one: the operation record is put back into the receipt, which is
+    /// exactly the shape every store written before that change has on disk.
+    /// Without that, this test would grade a receipt the binary under test just
+    /// wrote trimmed, and would pass with the trim removed.
+    #[test]
+    fn a_commit_trims_the_receipts_it_inherited_and_keeps_one_the_log_cannot_replace() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .expect("the fixture commits");
+
+        let committed = load_recovered_repository_authority(
+            &LocalFileBackend::new(directory.path()),
+            repository_id().as_str(),
+            HISTORY_VALIDATION_VERSION,
+        )
+        .unwrap()
+        .expect("the committed store recovers")
+        .recovered
+        .snapshot;
+        let envelope = committed
+            .repository_authority
+            .clone()
+            .expect("a committed store carries its envelope");
+
+        // The integration half: what this binary writes carries no embedded
+        // record at all.
+        assert!(
+            !envelope.receipts.is_empty(),
+            "the control: the fixture wrote a receipt"
+        );
+        assert!(
+            !envelope.operation_log.is_empty(),
+            "the control: and an operation log to name it from"
+        );
+        assert!(
+            envelope
+                .receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_none()),
+            "no receipt this binary writes embeds its operation record"
+        );
+
+        // Age it: put every record back, which is what every pre-trim store on
+        // disk looks like.
+        let mut aged = envelope.clone();
+        for receipt in &mut aged.receipts {
+            let record = aged_record(&envelope, receipt.operation_id);
+            receipt.operation = Some(record);
+        }
+        assert!(
+            aged.receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_some()),
+            "the control: the aged envelope really is fat before the trim runs"
+        );
+
+        aged.trim_receipts_the_log_already_holds();
+        assert!(
+            aged.receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_none()),
+            "an inherited receipt whose record the log holds must be trimmed"
+        );
+
+        // The control that stops this from being a blanket delete: a receipt
+        // whose record the log does NOT hold keeps its only copy. Same fat
+        // envelope with the log emptied, so nothing can replace what is dropped.
+        let mut orphaned = envelope.clone();
+        for receipt in &mut orphaned.receipts {
+            let record = aged_record(&envelope, receipt.operation_id);
+            receipt.operation = Some(record);
+        }
+        orphaned.operation_log.clear();
+        orphaned.trim_receipts_the_log_already_holds();
+        assert!(
+            orphaned
+                .receipts
+                .iter()
+                .all(|receipt| receipt.operation.is_some()),
+            "a receipt whose record the log cannot replace must keep it"
+        );
+    }
+
+    /// The operation record the log holds for `operation_id`, for aging a
+    /// receipt back into its pre-trim shape.
+    fn aged_record(
+        envelope: &PersistedRepositoryAuthority,
+        operation_id: OperationId,
+    ) -> RepositoryOperationRecord {
+        envelope
+            .operation_log
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("every receipt in the fixture names an operation the log holds")
+            .clone()
     }
 
     fn root_folds_on_this_thread() -> usize {

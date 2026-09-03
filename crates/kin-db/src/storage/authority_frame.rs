@@ -601,6 +601,14 @@ impl AuthorityFrame {
         envelope
             .receipts
             .sort_by_key(|receipt| receipt.operation_id);
+        // The writer trims every receipt whose operation the log already holds,
+        // so the reader does too. This is not an optimization on this side, it
+        // is what makes the two sides agree: `prove_reproduces` compares the
+        // reconstructed snapshot with the successor through `first_difference`,
+        // which compares `repository_authority` by `PartialEq`, so trimming on
+        // one side only would make the writer refuse its own frame and rewrite
+        // the whole base instead of appending to the journal.
+        envelope.trim_receipts_the_log_already_holds();
         Ok(envelope)
     }
 }
