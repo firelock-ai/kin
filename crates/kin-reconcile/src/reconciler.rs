@@ -346,22 +346,6 @@ impl Reconciler {
         &self.policy
     }
 
-    /// Seed the LKG store from an existing graph so incremental reconcile
-    /// correctly detects which entities actually changed vs. which are unchanged.
-    /// Without this, the first reconcile after daemon startup reports all entities
-    /// as modified (LKG empty → has_changed returns true for everything).
-    pub fn seed_lkg_from_graph<G: GraphStore>(&mut self, graph: &G) {
-        if let Ok(entities) = graph.list_all_entities() {
-            for entity in entities {
-                let relations = graph
-                    .get_all_relations_for_entity(&entity.id)
-                    .unwrap_or_default();
-                self.lkg.record(entity, relations);
-            }
-            tracing::info!(count = self.lkg.len(), "seeded LKG from graph snapshot");
-        }
-    }
-
     /// Seed only entity fingerprints from an existing graph.
     ///
     /// This is the daemon-startup fast path. The reconciler only consults LKG
@@ -369,8 +353,8 @@ impl Reconciler {
     /// on large persisted graphs adds minutes to daemon startup.
     pub fn seed_lkg_entities_from_graph<G: GraphStore>(&mut self, graph: &G) {
         if let Ok(entities) = graph.list_all_entities() {
-            for entity in entities {
-                self.lkg.record(entity, vec![]);
+            for entity in &entities {
+                self.lkg.record(entity);
             }
             tracing::info!(
                 count = self.lkg.len(),
@@ -920,11 +904,11 @@ impl Reconciler {
                     // fingerprint. Span and blob provenance must advance even for
                     // source edits that are semantically equivalent.
                     if updated != *old {
+                        self.lkg.record(&updated);
                         delta.entity_deltas.push(EntityDelta::Modified {
                             old: old.clone(),
-                            new: updated.clone(),
+                            new: updated,
                         });
-                        self.lkg.record(updated.clone(), vec![]);
                         modified.push(old.id);
 
                         debug!(
@@ -933,7 +917,7 @@ impl Reconciler {
                             "entity modified"
                         );
                     } else {
-                        self.lkg.record(old.clone(), vec![]);
+                        self.lkg.record(old);
                         debug!(
                             entity = %old.name,
                             "entity payload unchanged, skipping"
@@ -962,7 +946,7 @@ impl Reconciler {
                     delta.entity_deltas.push(EntityDelta::Added {
                         new: added_entity.clone(),
                     });
-                    self.lkg.record(added_entity.clone(), vec![]);
+                    self.lkg.record(&added_entity);
                     added.push(added_entity.id);
 
                     debug!(
@@ -2647,7 +2631,7 @@ mod tests {
         let entity = make_entity("bar", "src/main.rs");
         let id = entity.id;
 
-        reconciler.lkg.record(entity, vec![]);
+        reconciler.lkg.record(&entity);
         assert!(reconciler.lkg().get(&id).is_some());
     }
 
@@ -3888,8 +3872,8 @@ mod tests {
 
         // Seed the reconciler LKG with the file_a entities.
         let mut reconciler = Reconciler::new(dir.path().to_path_buf());
-        reconciler.lkg.record(entity_a.clone(), vec![]);
-        reconciler.lkg.record(stale_entity.clone(), vec![]);
+        reconciler.lkg.record(&entity_a);
+        reconciler.lkg.record(&stale_entity);
 
         // Construct an IndexedFile that represents a re-parse of file_a:
         //   - entity_a is present (same name/kind → matched, no fingerprint change)
