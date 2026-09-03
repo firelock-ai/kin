@@ -1664,24 +1664,29 @@ impl Reconciler {
             let body = if let Some(supplied) = entity_bodies.get(&id) {
                 supplied.clone()
             } else if let Some(ref span) = entity.span {
-                // Try cached content first (race-safe), fall back to disk.
-                let contents = if let Some(cached) = self.projection.get_content(&span.file) {
-                    cached.to_vec()
-                } else {
-                    let file_path = self.working_dir.join(span.file.0.as_str());
-                    if file_path.exists() {
-                        std::fs::read(&file_path).map_err(|e| {
-                            ReconcileError::BodyExtractionFailed {
-                                entity_id: id,
-                                reason: format!("failed to read {}: {}", file_path.display(), e),
-                            }
-                        })?
-                    } else {
-                        return Err(ReconcileError::BodyExtractionFailed {
-                            entity_id: id,
-                            reason: format!("file not found and no cached content: {}", span.file),
-                        });
-                    }
+                // Membership first. Reading a path this projection did not
+                // register would make the working copy an answer authority for
+                // graph misses, which is the one thing this boundary must never
+                // become. kin-vfs holds the identical line at its own staging
+                // boundary (`KinWriter::read_staged`) in the same words, and the
+                // two are one policy rather than two decisions that happen to
+                // agree.
+                //
+                // The registered bytes are also the only ones these spans are
+                // valid against: they were cached by the reconcile that produced
+                // the spans, so a working-copy read could return a newer file
+                // written by a concurrent editor and splice at misaligned
+                // offsets. Refusing therefore costs nothing that was correct.
+                let Some(contents) = self.projection.get_content(&span.file).map(<[u8]>::to_vec)
+                else {
+                    return Err(ReconcileError::BodyExtractionFailed {
+                        entity_id: id,
+                        reason: format!(
+                            "no registered projection content for {}; graph-derived state missed \
+                             and the working copy is not an answer authority",
+                            span.file
+                        ),
+                    });
                 };
                 let start = span.start_byte;
                 let end = span.end_byte;
@@ -2772,6 +2777,66 @@ mod tests {
                 assert!(reason.contains("no source span"));
             }
             other => panic!("expected BodyExtractionFailed, got: {:?}", other),
+        }
+    }
+
+    /// A projection miss refuses instead of reading the working copy.
+    ///
+    /// The file is written to the working directory holding exactly the bytes
+    /// the span is valid against, so a fallback that read it would succeed and
+    /// return a correct-looking body. That is the point: the refusal must not
+    /// depend on the file being absent, because absence is the easy case and
+    /// presence is the one that silently makes the working copy an answer
+    /// authority for a graph miss.
+    #[test]
+    fn project_transaction_refuses_a_projection_miss_rather_than_reading_the_working_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "pub fn cached() -> u32 { 7 }\n";
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), source).unwrap();
+
+        let mut reconciler = Reconciler::new(dir.path().to_path_buf());
+        let mut entity = make_entity("cached", "src/lib.rs");
+        entity.span = Some(kin_model::SourceSpan {
+            file: FilePathId::new("src/lib.rs"),
+            start_byte: 0,
+            end_byte: source.len(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            end_col: source.len() as u32,
+        });
+        let entity_id = entity.id;
+        let mut old = entity.clone();
+        old.fingerprint.ast_hash = Hash256::from_bytes([0; 32]);
+        let transaction = TransactionDelta {
+            entity_deltas: vec![EntityDelta::Modified { old, new: entity }],
+            ..TransactionDelta::default()
+        };
+
+        // Positive control. A refusal proves nothing unless the bytes a
+        // fallback would have reached are really on disk and really readable.
+        assert_eq!(
+            std::fs::read(dir.path().join("src/lib.rs")).unwrap(),
+            source.as_bytes(),
+            "the working copy must hold the readable bytes this test refuses to read"
+        );
+
+        match reconciler
+            .project_transaction_to_files(&transaction, &HashMap::new())
+            .unwrap_err()
+        {
+            ReconcileError::BodyExtractionFailed {
+                entity_id: failed_id,
+                reason,
+            } => {
+                assert_eq!(failed_id, entity_id);
+                assert!(
+                    reason.contains("not an answer authority"),
+                    "the refusal must say why it refused, got: {reason}"
+                );
+            }
+            other => panic!("expected BodyExtractionFailed, got: {other:?}"),
         }
     }
 
