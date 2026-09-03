@@ -20951,6 +20951,141 @@ mod tests {
         );
     }
 
+    /// The identity `local_state_root` folds must not move when the way it is
+    /// computed changes.
+    ///
+    /// [`local_state_root`] folds [`RepositoryOperationRecord::identity_hash`]
+    /// over the whole operation log, so that digest is a persisted authority
+    /// input rather than an internal detail. A byte that differs is not a
+    /// faster hash, it is every store in the field refusing its own bundle at
+    /// the next open that recomputes. kin-model 0.7.24 made `canonicalized`
+    /// borrow instead of cloning when `ref_mutations` and `tree_deltas` are
+    /// already in canonical order, which changes how that digest is reached,
+    /// and this is what refuses a later change that also moves what it reaches.
+    ///
+    /// **Why this lives here rather than in kin-model.** That crate grades its
+    /// borrowing path against a retained copying oracle, which is the right
+    /// check and is a different one. This asks what kin-model cannot: whether
+    /// the records THIS crate commits and persists hash the same either way.
+    /// Its only operation-record fixture is deliberately non-canonical, so it
+    /// has nothing that takes the borrowing path to compare.
+    ///
+    /// **No hand-rolled oracle, because canonicalization is order-normalizing.**
+    /// The two sides are the same record in two orders. The sorted one is
+    /// already canonical and takes the borrowing path; the reversed one is not
+    /// and takes the copying path. Canonicalizing the second produces the
+    /// first, so equal digests are exactly the statement that borrowing and
+    /// copying agree, with nothing reimplemented from kin-model to be wrong
+    /// about.
+    ///
+    /// The control that stops it passing vacuously is asserted in both
+    /// directions: one case must be canonical or the borrowing path never runs,
+    /// and one must not be or the copying path never runs.
+    #[test]
+    fn the_persisted_operation_identity_is_the_same_hash_either_way() {
+        let directory = TempDir::new().unwrap();
+        drop(committed_local_repository(&directory));
+        let committed = load_recovered_repository_authority(
+            &LocalFileBackend::new(directory.path()),
+            repository_id().as_str(),
+            HISTORY_VALIDATION_VERSION,
+        )
+        .unwrap()
+        .expect("the committed store recovers")
+        .recovered
+        .snapshot;
+        let envelope = committed
+            .repository_authority
+            .as_ref()
+            .expect("a committed store carries its envelope");
+        let persisted = envelope
+            .operation_log
+            .first()
+            .expect("a committed store carries an operation record");
+
+        let canonically_ordered = |record: &RepositoryOperationRecord| {
+            let refs_sorted = record
+                .ref_mutations
+                .windows(2)
+                .all(|pair| pair[0].name <= pair[1].name);
+            let tree_sorted = record.workspace_mutation.as_ref().is_none_or(|workspace| {
+                workspace
+                    .tree_deltas
+                    .windows(2)
+                    .all(|pair| pair[0].artifact_id() <= pair[1].artifact_id())
+            });
+            refs_sorted && tree_sorted
+        };
+
+        let mut sorted = persisted.clone();
+        sorted
+            .ref_mutations
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        if let Some(workspace) = &mut sorted.workspace_mutation {
+            workspace
+                .tree_deltas
+                .sort_by_key(|delta| delta.artifact_id());
+        }
+        let mut reversed = sorted.clone();
+        reversed.ref_mutations.reverse();
+        if let Some(workspace) = &mut reversed.workspace_mutation {
+            workspace.tree_deltas.reverse();
+        }
+
+        assert!(
+            canonically_ordered(&sorted),
+            "the control: the sorted case must be canonical, or the borrowing path never runs"
+        );
+        assert!(
+            !canonically_ordered(&reversed),
+            "the control: the reversed case must NOT be canonical, or the copying path never \
+             runs and this compares the borrowing path with itself"
+        );
+
+        let borrowing = sorted
+            .identity_hash()
+            .expect("the canonical record hashes on the borrowing path");
+        let copying = reversed
+            .identity_hash()
+            .expect("the reversed record hashes on the copying path");
+        assert_eq!(
+            borrowing, copying,
+            "the identity a persisted local_state_root folds differs between the borrowing and \
+             copying paths, which moves that root and invalidates every persisted bundle"
+        );
+
+        // And the digest is reading the record at all. Without this the
+        // equality above could hold because it reads nothing.
+        let mut moved = sorted.clone();
+        moved.transaction_hash = Hash256::from_bytes([0xCD; 32]);
+        assert_ne!(
+            moved.identity_hash().expect("the perturbed record hashes"),
+            borrowing,
+            "the control: transaction_hash is folded by the identity payload, so moving it must \
+             change the identity"
+        );
+
+        // And not reading the two root bundles, which it excludes by
+        // construction. `prepare_successor` states that exclusion as an
+        // obligation when it fills in `roots_after` after folding, so it is
+        // load-bearing rather than incidental.
+        let mut excluded = sorted.clone();
+        let wrong = AuthorityRoot::new(
+            REPOSITORY_ROOT_SCHEMA_VERSION,
+            Hash256::from_bytes([0xEF; 32]),
+        );
+        excluded.roots_before.local_state = wrong;
+        excluded.roots_after.local_state = wrong;
+        assert_eq!(
+            excluded
+                .identity_hash()
+                .expect("the record with moved bundles hashes"),
+            borrowing,
+            "the mirror control: identity_hash excludes roots_before and roots_after by \
+             construction, so moving them must not change the identity"
+        );
+    }
+
     #[test]
     fn an_open_with_a_verified_record_leaves_the_change_map_on_disk() {
         let directory = TempDir::new().unwrap();
