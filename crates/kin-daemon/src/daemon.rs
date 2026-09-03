@@ -429,10 +429,6 @@ pub fn lsp_adapter_for(
             &kin_lsp::adapters::typescript::TypeScriptAdapter,
             workspace_root,
         )),
-        kin_model::LanguageId::Go => Some(describe(
-            &kin_lsp::adapters::go::GoplsAdapter,
-            workspace_root,
-        )),
         _ => None,
     }
 }
