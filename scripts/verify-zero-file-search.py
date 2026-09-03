@@ -264,12 +264,25 @@ BOUNDARY_DIRS = [
     # is now scanned by default and its boundary IO is declared per file in
     # scripts/zero-file-search-allowlist.json, so a new daemon module, a new
     # query handler above all, is covered the moment it is added.
+    #
+    # kin-projection and kin-reconcile are absent for the same reason, and the
+    # argument is the daemon's applied a second time rather than a new one.
+    # Both were whole-directory entries, so neither gate could see either
+    # crate: this one skipped them here, and the shell guard beside it scans a
+    # fixed list of kin-cli command modules and reaches no other crate by
+    # construction. What the exemption was covering was a graph-miss path in
+    # the reconciler that read the working copy, latent only because its one
+    # caller was a test. Narrowing surfaced 58 sites across five files;
+    # 57 are materialization, write and ingest-boundary IO and are declared per
+    # file in the allowlist with an owner and an expiry, and the fifty-eighth,
+    # a working-copy probe deciding a placement answer, is recorded there as
+    # debt rather than as a boundary. A boundary directory carries neither an
+    # owner nor an expiry, which is why converting one is worth the entries it
+    # costs.
     "crates/kin-migrate/",
     "crates/kin-index/",
     "crates/kin-registry/",
     "crates/kin-buildinfo/",
-    "crates/kin-projection/",
-    "crates/kin-reconcile/",
     # kin-core is a mixed crate: it carries the semantic repo's config, layout,
     # init, projection, ingestion, and git-history boundary IO — all legitimate
     # input/output boundaries — but it must not be broadly exempted, or an

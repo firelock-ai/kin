@@ -749,6 +749,114 @@
         "read_window_record",
         "write_window_record"
       ]
+    },
+    {
+      "file": "crates/kin-projection/src/tree.rs",
+      "reason": "Exact graph-tree materialization, end to end. This module takes a ResolvedTree the graph has already resolved and publishes it as filesystem objects, then proves what it published still matches. Nothing here decides an answer: every path it touches comes from a RepoPath the graph named, every byte it writes comes from a BlobStore hash the graph named, and no locate, search, context, trace, review, xref or rename result derives from any of it. Four shapes, each pinned to its exact line. (1) Root and staging lifecycle: proving the projection root is a directory, emptying it, and minting uniquely named staging and backup siblings beside it. The `std::process::id()` there is this process's own pid, used to make that sibling name unique; it spawns nothing, and the guard reports it only because the subprocess pattern matches the `process::` path. (2) Materialization: creating parent directories and writing the planned entries. (3) Pre-mutation refusal: `validate_existing_entry` compares the working copy against the graph's blob and refuses with LocalModification when the bytes, the mode or the symlink target differ, and `validate_target_collision` and `validate_directory_is_fully_displaced` refuse an untracked collision before anything is mutated. Those reads decide only whether to refuse; the graph still says what the tree should be. (4) Rollback and durability: removing what the transaction created and fsyncing the staged directories before the swap, which is what the `std::fs::File::open` is. Pinned by exact expression rather than exempted whole-file, so a filesystem primitive added anywhere in this module, including inside one of these functions, fails the guard until it is re-justified.",
+      "owner": "kin-projection",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "match fs::symlink_metadata(root) {",
+        "Ok(metadata) if !metadata.file_type().is_dir() => {",
+        "fs::read_dir(root).map_err(|error| transaction.abort(io(root, error)))?;",
+        "fs::remove_dir(root).map_err(|error| transaction.abort(io(root, error)))?;",
+        "let root_recovery = fs::create_dir(root)",
+        "fs::create_dir(&backup_root).map_err(|error| transaction.abort(io(&backup_root, error)))?;",
+        "let metadata = fs::symlink_metadata(root).map_err(|error| io(root, error))?;",
+        "if !metadata.file_type().is_dir() {",
+        "name.push(format!(\".{role}.{}.{}\", std::process::id(), ordinal));",
+        "match fs::create_dir(&candidate) {",
+        "fs::create_dir_all(parent).map_err(|error| io(parent, error))?;",
+        "fs::symlink_metadata(&path).map_err(|error| ProjectionError::LocalModification {",
+        "if !metadata.file_type().is_file() {",
+        "let actual = fs::read(&path).map_err(|error| io(&path, error))?;",
+        "if !metadata.file_type().is_symlink() {",
+        "fs::read_link(path)",
+        "match fs::symlink_metadata(&path) {",
+        "Ok(metadata) if metadata.file_type().is_dir() => {}",
+        "match fs::symlink_metadata(&destination) {",
+        {
+          "expr": "Ok(metadata) if metadata.file_type().is_dir() => {",
+          "count": 4
+        },
+        "for child in fs::read_dir(&current).map_err(|error| io(&current, error))? {",
+        "fs::symlink_metadata(&child_path).map_err(|error| io(&child_path, error))?;",
+        {
+          "expr": "if metadata.file_type().is_dir() {",
+          "count": 2
+        },
+        "match fs::remove_dir(&directory) {",
+        {
+          "expr": "match fs::symlink_metadata(path) {",
+          "count": 3
+        },
+        {
+          "expr": "fs::remove_dir(path).map_err(|error| io(path, error))",
+          "count": 2
+        },
+        {
+          "expr": "Ok(_) => fs::remove_file(path).map_err(|error| io(path, error)),",
+          "count": 2
+        },
+        "for child in fs::read_dir(&directory).map_err(|error| io(&directory, error))? {",
+        "fs::symlink_metadata(child.path()).map_err(|error| io(child.path(), error))?;",
+        "std::fs::File::open(&directory)",
+        "fs::remove_dir_all(path).map_err(|error| io(path, error))"
+      ]
+    },
+    {
+      "file": "crates/kin-projection/src/engine.rs",
+      "reason": "Projection write boundary: the two-phase commit that materializes entity mutations. Every pinned expression sits in `project_entity_mutations_with_policy`, which splices graph-owned content, writes each result to a temp path, then renames the temps into place and cleans up every temp file on any failure. One read appears in it and it is a refusal rather than an answer: before renaming, the committer compares the file on disk against `state.file_contents`, the content the projection based its splices on, and skips that file when a concurrent editor has changed it rather than overwriting the editor's work. Nothing read there reaches a locate, search, context, trace, review or xref result, and the content being written comes from the graph, never from the tree. Pinned by exact expression rather than exempted whole-file, so a filesystem primitive added anywhere in this module fails the guard, which is what should happen if a projection path ever starts reading the working copy to decide what to project.",
+      "owner": "kin-projection",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "std::fs::create_dir_all(parent).map_err(|e| ProjectionError::io(parent, e))?;",
+        "std::fs::write(&tmp_path, &new_content).map_err(|e| {",
+        "let _ = std::fs::remove_file(prev_tmp);",
+        {
+          "expr": "let _ = std::fs::remove_file(&tmp_path);",
+          "count": 4
+        },
+        "if file_path.exists() {",
+        "match std::fs::read(&file_path) {",
+        "if let Err(e) = std::fs::rename(&tmp_path, &file_path) {"
+      ]
+    },
+    {
+      "file": "crates/kin-projection/src/living_docs.rs",
+      "reason": "Documentation write boundary, and it only writes. `generate_living_docs` lists entities from the graph, renders ARCHITECTURE.md, AGENTS.md and CONTEXT.md from what the graph returned, and writes them under the docs directory it was given. It reads nothing from the filesystem at all: the pinned expressions are one `create_dir_all` for the output directory and three identical `write` calls, one per rendered document. A generated document is an output of graph truth, never an input to it. Pinned rather than exempted whole-file so a read added to this module fails the guard.",
+      "owner": "kin-projection",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "std::fs::create_dir_all(docs_dir).map_err(|e| ProjectionError::io(docs_dir, e))?;",
+        {
+          "expr": "std::fs::write(&path, doc).map_err(|e| ProjectionError::io(&path, e))?;",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-projection/src/placement.rs",
+      "reason": "Known violation under repair, not a boundary claim. Unlike the other kin-projection entries here, this read decides the answer: step 1 of `decide_placement` probes the working copy with `path.exists()` to choose between PlacementDecision::ExistingFile and PlacementDecision::NewFile for an entity whose `file_origin` the graph already names. The graph owns that fact in its exact tree, so the filesystem is answering a question the graph can answer. That is the same shape this guard's own note beside `graph.rs` records for the orphan count that used to probe each entity's file_origin with `.exists()`, and the same shape as the reconciler's working-copy fallback that was refused instead. The entry exists so the violation is visible, owned and dated rather than invisible, which is what it was for as long as this crate was exempt as a directory; it must not be read as evidence the path is graph-backed. Two facts bound it. `decide_placement` has no production caller: it is `pub` here and re-exported from `lib.rs`, and a workspace sweep finds those two mentions and its own test and nothing else, so no product surface observes the answer today. And it cannot be fixed in place, because the graph's exact tree reaches callers through `resolved_tree()` on the concrete store while this function is generic over GraphStore, whose supertraits do not carry it, so the fix is a bound change on a public signature rather than a line edit. Tracked on the internal board; the pin and this entry come out when the decision reads graph truth. Dated sooner than the boundary entries beside it because it is debt rather than a boundary.",
+      "owner": "kin-projection",
+      "expiration": "2026-10-31",
+      "allow_match": [
+        "if path.exists() {"
+      ]
+    },
+    {
+      "file": "crates/kin-reconcile/src/reconciler.rs",
+      "reason": "Ingest boundary: the file-event edge where the working tree becomes graph truth, plus the freshness checks that keep that edge honest. Reconcile is the direction that reads files by definition, and none of the pinned expressions produces an answer. `reconcile_file_change` probes `path.exists()` on a Removed event because an editor's atomic save writes a temp, deletes the original and renames, so a surviving Removed in a dedup batch can name a file that is back on disk; the probe decides which reconcile path runs, not what anything means. `comparable_event_path` canonicalizes the closest existing ancestor of an event path so a macOS /var event and a /private/var repository root compare as the same repository, which is path identity rather than content. The two `std::fs::read` calls re-read a file after the indexing pipeline already indexed it and hash the bytes: when the hash differs from the indexed one the reconcile returns FileModifiedDuringReconcile and defers to the next tick, and the bytes are discarded either way, so the content the graph receives still comes from the pipeline. The graph-miss path that once read the working copy from this module now refuses instead. Pinned by exact expression rather than exempted whole-file, so a read added to this crate, above all one on a miss path, fails the guard the moment it appears.",
+      "owner": "kin-reconcile",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        "if path.exists() {",
+        "match ancestor.canonicalize() {",
+        {
+          "expr": "match std::fs::read(path) {",
+          "count": 2
+        }
+      ]
     }
   ]
 }
