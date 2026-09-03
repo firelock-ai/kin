@@ -529,6 +529,48 @@ test('ensureKinBinary installs the flat native Windows zip and .exe pair', async
   }
 });
 
+// The Unix arm of the same rule the Windows test above proves. `tar` was
+// resolved through PATH, so a planted `tar` unpacked the archive whose SHA-256
+// had just been verified: the integrity check protected bytes an attacker's
+// program then read. The hostile `tar` here exits 97, so this test is red
+// against a PATH lookup and green against an absolute one.
+test(
+  'ensureKinBinary unpacks the Unix archive with an absolute tar under a hostile PATH',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-hostile-tar-'));
+    const assetName = 'kin-linux-x86_64';
+    const version = '9.9.9-test';
+    const { archiveBytes, archiveName, checksum, kinBytes, daemonBytes } =
+      await buildReleaseArchive(tmpDir, assetName);
+    const server = startReleaseServer(version, archiveName, archiveBytes, checksum);
+
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const env = await environmentWithHostileTar(tmpDir, {
+      KIN_MCP_CACHE_DIR: tmpDir,
+      KIN_MCP_RELEASE_BASE_URL: baseUrl
+    });
+
+    try {
+      const binaryPath = await ensureKinBinary({
+        env,
+        platform: 'linux',
+        arch: 'x64',
+        version
+      });
+
+      assert.equal(await fs.readFile(binaryPath, 'utf8'), kinBytes.toString('utf8'));
+      const daemonPath = resolveDaemonBinaryPath(binaryPath);
+      assert.equal(await fs.readFile(daemonPath, 'utf8'), daemonBytes.toString('utf8'));
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  }
+);
+
 test('ensureKinBinary fails with a precise message when the archive omits kin-daemon', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-nodaemon-'));
   const assetName = 'kin-linux-x86_64';

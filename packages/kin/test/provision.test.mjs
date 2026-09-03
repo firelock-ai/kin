@@ -345,6 +345,34 @@ test('provision uses deterministic Windows ZIP extraction under a hostile PATH',
   }
 });
 
+// The Unix arm of the rule the Windows test above proves. `tar` was resolved
+// through PATH, so a planted `tar` unpacked the archive whose SHA-256 had just
+// been verified: the integrity check protected bytes an attacker's program
+// then read. The hostile `tar` here exits 97, so this test is red against a
+// PATH lookup and green against an absolute one.
+macArchiveModeTest(
+  'provision unpacks the Unix archive with an absolute tar under a hostile PATH',
+  async () => {
+    const { work, fetchImpl } = makeFixture();
+    const home = path.join(work, 'kin-home');
+    const env = environmentWithHostileTar(work, { KIN_HOME: home });
+    try {
+      const installed = await provision('9.9.9', {
+        env,
+        platform: 'darwin',
+        arch: 'arm64',
+        fetchImpl,
+        log: () => {},
+      });
+      assert.equal(installed, path.join(home, 'bin', 'kin'));
+      assert.ok(fs.existsSync(path.join(home, 'bin', 'kin-daemon')));
+      assert.equal(readLauncherStamp(env), '9.9.9');
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  },
+);
+
 test('provision streams live archive byte and percent progress without touching checksum semantics', async () => {
   const { work, bytes, fetchImpl, platform, arch } = makeHostProvisionFixture({
     streamArchive: true,

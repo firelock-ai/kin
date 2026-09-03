@@ -386,6 +386,32 @@ function windowsSystemTarPath(env) {
   return path.win32.join(systemRoot, 'System32', 'tar.exe');
 }
 
+// Where a Unix system tool is allowed to come from.
+//
+// `spawnSync('tar', ...)` resolves through PATH, and PATH belongs to whoever
+// started this process. A `tar` planted earlier in it unpacks the archive
+// whose SHA-256 was just verified, so the integrity check ends up protecting
+// bytes that somebody else's program reads. These directories are root-owned
+// on macOS and Linux and SIP-protected on macOS. The Windows arm has named its
+// extractor absolutely since it was written; this is the same rule on Unix.
+const UNIX_TOOL_DIRECTORIES = ['/usr/bin', '/bin'];
+
+// The absolute path of a Unix system tool, refused when it is in none of the
+// trusted directories.
+//
+// Refusing rather than falling back to PATH: a fallback makes the guard
+// advisory, and provision already reports an extractor that will not run.
+function unixSystemToolPath(name) {
+  for (const directory of UNIX_TOOL_DIRECTORIES) {
+    const candidate = path.posix.join(directory, name);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  throw new Error(
+    `${name} was not found in ${UNIX_TOOL_DIRECTORIES.join(' or ')}; refusing to resolve it ` +
+      'through PATH, where a planted binary would run in its place',
+  );
+}
+
 function archiveExtraction(platform, env, file) {
   if (platform === 'win32') {
     if (process.platform === 'win32') {
@@ -402,7 +428,10 @@ function archiveExtraction(platform, env, file) {
       args: ['-q', file, '-d', '.'],
     };
   }
-  return { executable: 'tar', args: ['-xf', file, '-C', '.'] };
+  return {
+    executable: unixSystemToolPath('tar'),
+    args: ['-xf', file, '-C', '.'],
+  };
 }
 
 /**
@@ -493,9 +522,10 @@ export async function provision(version, opts = {}) {
 
     const toolEnv = mergeEnvironment(process.env, env);
     const extraction = archiveExtraction(platform, toolEnv, file);
-    // Windows authority is the absolute System32 bsdtar, never a Git/MSYS or
-    // user-provided `tar` found through PATH. Relative operands also avoid the
-    // GNU remote-host interpretation of `C:\\...` paths.
+    // The extractor is named absolutely on both platforms: System32 bsdtar on
+    // Windows, never a Git/MSYS `tar` earlier in PATH, and /usr/bin/tar or
+    // /bin/tar on Unix. Relative operands also avoid the GNU remote-host
+    // interpretation of `C:\\...` paths.
     const extracted = spawnSync(extraction.executable, extraction.args, {
       cwd: tmp,
       encoding: 'utf8',
