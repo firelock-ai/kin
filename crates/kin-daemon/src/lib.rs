@@ -143,6 +143,7 @@ mod repository_rollback;
 mod repository_stash;
 mod repository_tag;
 pub mod session_registry;
+pub mod source_body_memo;
 mod source_cas;
 pub mod state;
 pub mod supervisor;

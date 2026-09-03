@@ -3358,6 +3358,32 @@ impl StorageBackend for PublicationGatedStorageBackend {
         self.inner.load_recovery_state(repo_id)
     }
 
+    /// Forward the publication probe to the backend's own metadata-only
+    /// implementation.
+    ///
+    /// This looks like boilerplate and is not. `StorageBackend` gives
+    /// `load_snapshot_cursor` a default that recovers the whole authority and
+    /// throws the reconstructed graph away, because that is the only thing a
+    /// backend with no metadata read can do. GCS has one: it lists the delta
+    /// prefix and HEADs `graph.kndb`, and reads no body at all. A decorator
+    /// that omits this method silently downgrades every caller beneath it to
+    /// the full-recovery default, and this decorator wraps the hosted backend
+    /// for the whole process.
+    ///
+    /// `DaemonState::probe_repo_publication` runs this on every hosted request
+    /// to decide whether its cached generation is still current, and describes
+    /// itself as one metadata-only backend read. Without this forward it was
+    /// downloading and decoding the entire snapshot instead, once per request.
+    ///
+    /// Measured on `kin-ecosystem-kin-graphs-dev` over the 24 hours ending
+    /// 2026-09-03T20:00Z: 15,520 `ListObjects`, and `ReadObject` running 14,184
+    /// ahead of `GetObjectMetadata`. One excess body read per list is the
+    /// signature of the default; the override would have produced one excess
+    /// HEAD per list instead.
+    fn load_snapshot_cursor(&self, repo_id: &str) -> Result<Option<SnapshotCursor>, KinDbError> {
+        self.inner.load_snapshot_cursor(repo_id)
+    }
+
     fn save_source_blob(
         &self,
         repo_id: &str,
@@ -6861,6 +6887,136 @@ mod tests {
         fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
             Ok(vec!["kin".to_string()])
         }
+    }
+
+    /// A backend whose publication probe is metadata-only, and which says
+    /// loudly when a caller took the recovering default instead.
+    #[derive(Default)]
+    struct CursorProbeBackend {
+        cursor_reads: Arc<AtomicU64>,
+        snapshot_reads: Arc<AtomicU64>,
+        recovery_reads: Arc<AtomicU64>,
+    }
+
+    impl StorageBackend for CursorProbeBackend {
+        fn load_snapshot_cursor(
+            &self,
+            _repo_id: &str,
+        ) -> Result<Option<SnapshotCursor>, KinDbError> {
+            self.cursor_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(SnapshotCursor::from_backend_generation(11)))
+        }
+
+        fn load_snapshot(
+            &self,
+            _repo_id: &str,
+        ) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
+            self.snapshot_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        fn load_recovery_state(&self, _repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
+            self.recovery_reads.fetch_add(1, Ordering::SeqCst);
+            Ok((None, Vec::new()))
+        }
+
+        fn save_snapshot(
+            &self,
+            _repo_id: &str,
+            _data: &[u8],
+            _expected_gen: Generation,
+        ) -> Result<Generation, KinDbError> {
+            Ok(1)
+        }
+
+        fn save_delta(
+            &self,
+            _repo_id: &str,
+            _delta_data: &[u8],
+            _base_gen: Generation,
+        ) -> Result<Generation, KinDbError> {
+            Ok(1)
+        }
+
+        fn load_deltas_since(
+            &self,
+            _repo_id: &str,
+            _since_gen: Generation,
+        ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
+            Ok(Vec::new())
+        }
+
+        fn clear_deltas(&self, _repo_id: &str) -> Result<(), KinDbError> {
+            Ok(())
+        }
+
+        fn save_overlay(
+            &self,
+            _repo_id: &str,
+            _session_id: &str,
+            _data: &[u8],
+        ) -> Result<(), KinDbError> {
+            Ok(())
+        }
+
+        fn load_overlay(
+            &self,
+            _repo_id: &str,
+            _session_id: &str,
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            Ok(None)
+        }
+
+        fn delete_overlay(&self, _repo_id: &str, _session_id: &str) -> Result<(), KinDbError> {
+            Ok(())
+        }
+
+        fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
+            Ok(vec!["kin".to_string()])
+        }
+    }
+
+    /// The publication probe must stay metadata-only through the gate.
+    ///
+    /// `DaemonState::probe_repo_publication` runs `load_snapshot_cursor` on
+    /// every hosted request to decide whether its cached generation is still
+    /// current, and the trait's default for that method recovers the whole
+    /// authority and throws the graph away. A gate that omits the method
+    /// inherits that default and turns a HEAD into a full snapshot download,
+    /// once per request, for the life of the deployment.
+    ///
+    /// Asserting the counters rather than the returned cursor is the point: a
+    /// gate on the default answers with the right cursor too, and only the
+    /// request it made tells the two apart.
+    #[test]
+    fn the_gate_keeps_the_publication_probe_metadata_only() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let control = control(store, clock, READER_A);
+        let backend = CursorProbeBackend::default();
+        let cursor_reads = Arc::clone(&backend.cursor_reads);
+        let snapshot_reads = Arc::clone(&backend.snapshot_reads);
+        let recovery_reads = Arc::clone(&backend.recovery_reads);
+        let writer = PublicationGatedStorageBackend::new(Box::new(backend), control);
+
+        for _ in 0..5 {
+            assert_eq!(
+                writer.load_snapshot_cursor("kin").unwrap(),
+                Some(SnapshotCursor::from_backend_generation(11))
+            );
+        }
+
+        assert_eq!(cursor_reads.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            snapshot_reads.load(Ordering::SeqCst),
+            0,
+            "the probe must not download a snapshot body"
+        );
+        assert_eq!(
+            recovery_reads.load(Ordering::SeqCst),
+            0,
+            "the probe must not run an authority recovery"
+        );
     }
 
     struct BlockingBackend {
