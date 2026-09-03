@@ -268,6 +268,14 @@ pub(crate) enum McpToolProfile {
     /// client that only queries, not a mode: `AgentDefault` is unchanged and
     /// still serves every write tool.
     AgentQuery,
+    /// The measured always-on set plus the tool search that reaches the rest.
+    ///
+    /// The smallest surface this binary serves and the first designed from
+    /// measurement rather than from what a code-graph agent ought to want. It
+    /// serves five tools; the other sixty-two are found through
+    /// `kin_tool_search`, which returns a tool's full registered schema, so this
+    /// is a smaller list rather than a smaller product.
+    AgentSearch,
     /// The retrieval belt the benchmark arm drives.
     Benchmark,
     /// Read-only graph-native ContextBench belt: no write-side session or
@@ -282,6 +290,7 @@ pub(crate) enum McpToolProfile {
 const TOOL_PROFILE_TOKENS: &[(&str, McpToolProfile)] = &[
     ("agent-default", McpToolProfile::AgentDefault),
     ("agent-query", McpToolProfile::AgentQuery),
+    ("agent-search", McpToolProfile::AgentSearch),
     ("full", McpToolProfile::Full),
     ("benchmark", McpToolProfile::Benchmark),
     ("context-bench", McpToolProfile::ContextBench),
@@ -293,6 +302,7 @@ impl McpToolProfile {
         match self {
             Self::AgentDefault => Some(kin_mcp::agent_default_tool_names()),
             Self::AgentQuery => Some(kin_mcp::agent_query_tool_names()),
+            Self::AgentSearch => Some(kin_mcp::agent_search_tool_names()),
             Self::Benchmark => Some(kin_mcp::benchmark_tool_names()),
             Self::ContextBench => Some(kin_mcp::context_bench_tool_names()),
             Self::Full => None,
@@ -302,14 +312,18 @@ impl McpToolProfile {
     /// Whether this profile IS the curated agent belt: short descriptions,
     /// trimmed input schemas, and the compact `semantic_locate` shape.
     ///
-    /// `agent-default` and `agent-query`, which is that belt with its write half
-    /// removed and therefore the same short forms. `full` is the whole
-    /// documented surface by definition. `benchmark` and `context-bench` keep
-    /// the long forms and the shared payload because their bytes are an input to
-    /// a citable result, and a benchmark number must not move because a
+    /// `agent-default`, `agent-query`, which is that belt with its write half
+    /// removed, and `agent-search`, which is the measured always-on slice of it:
+    /// all three serve the same short forms. `full` is the whole documented
+    /// surface by definition. `benchmark` and `context-bench` keep the long
+    /// forms and the shared payload because their bytes are an input to a
+    /// citable result, and a benchmark number must not move because a
     /// description was rewritten or a payload was narrowed.
     pub(crate) fn is_agent_belt(self) -> bool {
-        matches!(self, Self::AgentDefault | Self::AgentQuery)
+        matches!(
+            self,
+            Self::AgentDefault | Self::AgentQuery | Self::AgentSearch
+        )
     }
 
     pub(crate) fn token(self) -> &'static str {
@@ -374,10 +388,13 @@ impl ResolvedToolProfile {
                 "Kin MCP: serving the default '{token}' tool profile ({count} tools). Set \
                  KIN_MCP_TOOL_PROFILE=agent-query (or --tool-profile agent-query) for the same \
                  belt without the session and transaction tools ({} tools), which a \
-                 query-only client re-sends in every prompt and never calls, or \
+                 query-only client re-sends in every prompt and never calls, \
+                 KIN_MCP_TOOL_PROFILE=agent-search for the measured always-on set ({} tools) \
+                 with every other tool reached through kin_tool_search, or \
                  KIN_MCP_TOOL_PROFILE=full for the complete {} tool surface; accepted \
                  profiles: {}.",
                 McpToolProfile::AgentQuery.tool_count(),
+                McpToolProfile::AgentSearch.tool_count(),
                 McpToolProfile::Full.tool_count(),
                 accepted_tool_profiles()
             ),
@@ -1001,6 +1018,7 @@ mod tests {
         let rows = [
             ("agent-default", McpToolProfile::AgentDefault),
             ("agent-query", McpToolProfile::AgentQuery),
+            ("agent-search", McpToolProfile::AgentSearch),
             ("benchmark", McpToolProfile::Benchmark),
             ("context-bench", McpToolProfile::ContextBench),
             ("full", McpToolProfile::Full),
@@ -1084,6 +1102,19 @@ mod tests {
                 kin_mcp::agent_query_tool_names().len()
             )),
             "notice must state what the query surface costs: {notice}"
+        );
+        // And the smallest surface, for the same reason: a profile nobody is
+        // told about is the invisible default one profile along.
+        assert!(
+            notice.contains("KIN_MCP_TOOL_PROFILE=agent-search"),
+            "notice must name the always-on surface: {notice}"
+        );
+        assert!(
+            notice.contains(&format!(
+                "({} tools)",
+                kin_mcp::agent_search_tool_names().len()
+            )),
+            "notice must state what the search surface costs: {notice}"
         );
     }
 

@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Tool Surface Reference
 
-The Kin MCP server exposes 66 semantic tools to AI assistants (Claude, Cursor, Gemini,
+The Kin MCP server exposes 67 semantic tools to AI assistants (Claude, Cursor, Gemini,
 Codex, etc.). These tools bridge the gap between traditional file-first navigation and
 Kin's graph-first semantic substrate: instead of issuing raw shell commands or reading raw
 files, an assistant interacts with the codebase through entity-level primitives.
@@ -160,6 +160,7 @@ command line (the flag wins):
 | -- | -- |
 | `agent-default` | the curated agent belt, **the default** |
 | `agent-query` | the same belt with no session and no transaction tools, for a client that only queries |
+| `agent-search` | the measured always-on set, with every other tool reached through `kin_tool_search` |
 | `full` | every tool this reference documents |
 | `benchmark` | the retrieval belt the benchmark arm drives |
 | `context-bench` | read-only graph-native retrieval, no write-side session or transaction tools |
@@ -210,6 +211,41 @@ still served on it, and nothing here makes Kin read-only. What `agent-query` buy
 a client that never stages or commits stops paying for those contracts in every prompt. Like
 every profile it is a context budget rather than a permission boundary, so the paragraph above
 applies: a local process holding your daemon's credentials can still write.
+
+#### `agent-search` is the always-on set, and the rest is found on demand
+
+Every profile above trades bytes. This one changes where the tools live. `agent-search` serves
+five tools, and everything else is reached by asking `kin_tool_search` for it in plain language.
+A match comes back as the whole tool definition, exactly as `full` serves it, so a tool found on
+one turn is callable on the next with nothing withheld.
+
+```sh
+KIN_MCP_TOOL_PROFILE=agent-search kin mcp start --repo /path/to/repo
+```
+
+The always-on set is `semantic_locate`, `trace_data_flow`, `get_context_pack`,
+`kin_graph_status` and `kin_tool_search`. The first three are there because they were measured.
+Across 40 agentic runs on 2026-09-03, over four questions on three repositories with one local
+model, those three took 96 of the 103 tool calls made, `impact_analysis` was offered 24 times and
+called none, and nine of the fourteen tools `agent-query` serves were never called once. A
+four-tool arm answered every question the fourteen-tool control answered, in fewer calls, for 36
+percent fewer tokens, and cited fewer symbols that failed to resolve.
+
+Say the shape of that result precisely. It is a cost result. Answered rate, calls to answer and
+expected-entity slots did not separate the candidate sets at all, and nothing in it reproduces
+the published claims that a smaller tool surface raises accuracy. Whether tool search raises
+Kin's own accuracy is unmeasured.
+
+`kin_graph_status` is in the set on a different argument. It was offered 40 times and called
+zero, so the call log alone would move it behind search. It stays because it is the only tool
+that answers whether the graph can be trusted at all, and the response envelope does not carry
+that reading on a healthy answer: `_kin.verdict` is computed from seven inputs and the graph
+freshness one is silent by construction. Until a stale graph reaches an agent through the
+envelope, this is the tool that says so, and it costs about 610 bytes.
+
+An agent that never searches gets a narrower answer, never a wrong one. No served description
+points at a withheld tool in silence: on this profile the note names `kin_tool_search` as the way
+to reach it, rather than telling an agent mid-session to restart the server on `full`.
 
 `agent-default` serves the declaration filter under its registered name, `semantic_search`,
 like every other profile. It also accepts **`find_declarations`** on a `tools/call`, which is
@@ -334,11 +370,12 @@ reported rather than served as a confident answer.
 ---
 
 ## 10. Utility & Health
-*Tools:* `dead_code`, `find_dead_code_seeded`, `benchmark`, `kin_graph_status`
+*Tools:* `dead_code`, `find_dead_code_seeded`, `benchmark`, `kin_graph_status`, `kin_tool_search`
 
 - **`dead_code` / `find_dead_code_seeded`**: Identify unreachable or orphaned entities (whole-repo or seeded by a semantic query).
 - **`benchmark`**: Run Kin's retrieval/locate benchmarks.
 - **`kin_graph_status`**: Report one schema-bound, point-in-time status view of the exact daemon graph selected for the call, covering entity and relation counts, selected-graph embedding coverage (indexed / total / pending), temporal-session versus HEAD scope, a process-local authority epoch, and backing authority. The daemon holds its normal embedding-work fence while reading internally synchronized coverage counters, then revalidates graph/scope authority before publishing; observed counts still do not attest enrichment completeness.
+- **`kin_tool_search`**: Find the tools this server registers but the current profile does not serve, by describing the need in plain language. Each match comes back as the complete tool definition, exactly as the `full` profile serves it, so a tool found here is callable on the next turn with nothing withheld. `matched_names` lists every match and `matches` carries the full definitions for the first `limit` of them, so a bounded answer reports what it did not carry. Omit `need` to enumerate the whole registry. It answers from the registry compiled into the server rather than from the graph, so it needs no daemon.
 
 ---
 

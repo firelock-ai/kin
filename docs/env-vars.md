@@ -39,7 +39,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_MCP_KIN_BINARY` | path | *(unset)* | operational | explicit native Kin binary used by the @kinlab/kin-mcp wrapper |
 | `KIN_MCP_RELEASE_BASE_URL` | url | GitHub Releases | operational | release mirror base URL used by the @kinlab/kin-mcp wrapper |
 | `KIN_MCP_REPO` | path | *(unset)* | operational | bind `kin mcp start` to this repository instead of the launch directory |
-| `KIN_MCP_TOOL_PROFILE` | string | agent-default | operational | MCP tool surface: agent-default (curated, the default), agent-query (the same belt with no session or transaction tools), full (every tool), benchmark, context-bench |
+| `KIN_MCP_TOOL_PROFILE` | string | agent-default | operational | MCP tool surface: agent-default (curated, the default), agent-query (the same belt with no session or transaction tools), agent-search (the measured always-on set, the rest reached through kin_tool_search), full (every tool), benchmark, context-bench |
 | `KIN_NO_PROVISION` | bool | false | operational | forbid network provisioning by the @kinlab/kin launcher |
 | `KIN_NO_SETUP` | bool | false | operational | skip the installer's post-install setup wizard when set truthy |
 | `KIN_REGISTRY_REPAIR` | bool | false | operational | allow the POSIX installer to repair safe registry ownership modes |

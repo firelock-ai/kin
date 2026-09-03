@@ -2085,9 +2085,11 @@ enum McpAction {
         repo: Option<PathBuf>,
         /// Tool surface to serve: `agent-default` (the curated agent belt,
         /// and the default), `agent-query` (that belt without the session and
-        /// transaction tools, for a client that only queries), `full` (every
-        /// tool, roughly 12k extra tokens of schemas per session), `benchmark`,
-        /// or `context-bench`. Overrides KIN_MCP_TOOL_PROFILE.
+        /// transaction tools, for a client that only queries), `agent-search`
+        /// (the measured always-on set, with every other tool reached through
+        /// `kin_tool_search`), `full` (every tool, roughly 12k extra tokens of
+        /// schemas per session), `benchmark`, or `context-bench`. Overrides
+        /// KIN_MCP_TOOL_PROFILE.
         #[arg(long = "tool-profile", value_name = "PROFILE")]
         tool_profile: Option<String>,
         /// Never start or revive a daemon from this server: bind only a daemon
