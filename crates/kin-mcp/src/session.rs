@@ -2531,7 +2531,17 @@ mod tests {
             .expect_err("one transaction past the cap must be refused");
         assert!(
             error.contains("transaction_limit_exceeded"),
-            "a refusal must be findable by name: {error}"
+            "a refusal must be findable by name"
+        );
+        // The refusal names no session id, and this is the assertion that keeps
+        // it that way. `begin_transaction` has a second refusal path that DOES
+        // interpolate the caller's id ("Session not found"), so anything that
+        // renders this error into a panic message or a log carries a session
+        // identifier with it. That is why the assertion above no longer prints
+        // `{error}`: the diagnostic was worth less than the leak it created.
+        assert!(
+            !error.contains("sess-1"),
+            "the transaction-limit refusal must not name the caller's own session"
         );
 
         // A second session is unaffected: this is a per-session ceiling, and a
