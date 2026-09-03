@@ -10142,6 +10142,16 @@ fn extract_multihop_signals(
                 }
 
                 let mut rels = graph.get_all_relations_for_entity(&current)?;
+                // Keep only the kinds this walk can follow, BEFORE the frontier
+                // cut and before the source-degree count both read this list.
+                // `get_all_relations_for_entity` returns every kind, and the
+                // kinds outside `allowed_kinds` are not a rounding error: on a
+                // TypeScript repository `UsesType` and `Contains` alone are 46%
+                // of all relations. Counting them spent frontier budget on edges
+                // the loop below then skipped, and inflated the source-degree
+                // dampener that gates every neighbour, so raising the frontier
+                // limit made the walk reach FEWER files rather than more.
+                rels.retain(|rel| allowed_kinds.contains(&rel.kind));
                 // The frontier cut below keeps a PREFIX, so the order must be
                 // deterministic (adjacency iteration order is per-process):
                 // highest-priority relations first, id as the total tie-break —
@@ -10164,9 +10174,8 @@ fn extract_multihop_signals(
                     &rels
                 };
                 for rel in rels_to_process {
-                    if !allowed_kinds.contains(&rel.kind) {
-                        continue;
-                    }
+                    // `rels` was filtered to `allowed_kinds` above, so every
+                    // relation here is one the walk follows.
                     let neighbor_id = if rel.src == GraphNodeId::Entity(current) {
                         rel.dst
                     } else {
@@ -31681,6 +31690,109 @@ mod tests {
         )
         .unwrap();
         assert!(hits.contains_key("pkg/prompt/prompt.go"));
+    }
+
+    /// Relations the walk cannot follow must not decide whether it follows the
+    /// ones it can.
+    ///
+    /// `get_all_relations_for_entity` returns every kind. `allowed_kinds` names
+    /// a subset, and `UsesType` and `Contains` are outside it. Before the
+    /// `retain` in `extract_multihop_signals` those kinds still reached the
+    /// source-degree dampener, which gates every neighbour through the hard
+    /// cutoff, so an entity holding sixty type annotations and one call was
+    /// treated as a sixty-one-edge hub and its one call was dropped from the
+    /// walk entirely, not merely from the ranking.
+    ///
+    /// The arithmetic, on the shipped constants. The target file holds 20
+    /// entities, so `hub_dampen` is `1/log2(21)` = 0.2277. Counting all 61
+    /// relations puts `source_degree_dampen` at `1/log2(61)` = 0.1686 and their
+    /// product at 0.0384, under the 0.05 cutoff. Counting only the one
+    /// walkable relation leaves the dampener at 1.0 and the product at 0.2277,
+    /// over it.
+    ///
+    /// Measured on VS Code (FIR-3129): with the unwalkable kinds counted, the
+    /// walk reached 790 files and never `cursorTypeOperations.ts`; without
+    /// them, 882 files including it.
+    #[test]
+    fn extract_multihop_signals_degree_dampening_ignores_unwalkable_relation_kinds() {
+        fn build(noise_edges: usize) -> (kin_db::InMemoryGraph, HashMap<String, Vec<FileHit>>) {
+            let graph = kin_db::InMemoryGraph::new();
+            let seed = test_entity("Seed", "src/seed.ts", 1, 10);
+            graph.upsert_entity(&seed).unwrap();
+
+            // The target file needs real entities, because `hub_dampen` counts
+            // them off the graph rather than off the edge.
+            let mut target_first = None;
+            for i in 0..20 {
+                let entity = test_entity(&format!("Target{i}"), "src/target.ts", 1, 5);
+                graph.upsert_entity(&entity).unwrap();
+                if target_first.is_none() {
+                    target_first = Some(entity.id);
+                }
+            }
+            let target_first = target_first.expect("20 target entities were inserted");
+
+            let relate = |kind: RelationKind, dst| {
+                graph
+                    .upsert_relation(&Relation {
+                        id: RelationId::new(),
+                        kind,
+                        src: GraphNodeId::Entity(seed.id),
+                        dst: GraphNodeId::Entity(dst),
+                        confidence: 1.0,
+                        origin: RelationOrigin::Parsed,
+                        created_in: None,
+                        import_source: None,
+                        evidence: Vec::new(),
+                    })
+                    .unwrap();
+            };
+
+            // The one edge the walk is supposed to follow.
+            relate(RelationKind::Calls, target_first);
+            // Edges it never follows, which used to count anyway.
+            for i in 0..noise_edges {
+                let noise = test_entity(&format!("Noise{i}"), "src/noise.ts", 1, 5);
+                graph.upsert_entity(&noise).unwrap();
+                relate(RelationKind::UsesType, noise.id);
+            }
+
+            let seeds = HashMap::from([(
+                String::from("src/seed.ts"),
+                vec![FileHit {
+                    score: 100.0,
+                    spans: vec![],
+                }],
+            )]);
+            (graph, seeds)
+        }
+
+        // Baseline first, so a failure below cannot be the fixture. With no
+        // unwalkable edges at all the call must project the target file.
+        let (graph, seeds) = build(0);
+        let baseline =
+            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false, None)
+                .unwrap();
+        assert!(
+            baseline.contains_key("src/target.ts"),
+            "fixture is wrong: a lone Calls edge should already project the target file"
+        );
+
+        // Now the same graph plus sixty edges of a kind the walk never follows.
+        // Nothing about the Calls edge or the target file has changed.
+        let (graph, seeds) = build(60);
+        let hits =
+            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false, None)
+                .unwrap();
+        assert!(
+            hits.contains_key("src/target.ts"),
+            "sixty UsesType edges made the source look like a hub and cost the walk its \
+             only Calls edge; the degree count must read the relations the walk follows"
+        );
+        assert!(
+            !hits.contains_key("src/noise.ts"),
+            "UsesType is outside allowed_kinds, so the noise file must never be projected"
+        );
     }
 
     #[test]
