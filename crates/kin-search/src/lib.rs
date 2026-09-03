@@ -41,6 +41,10 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+mod mapped;
+
+pub use mapped::{MappedIndex, MAPPED_SEGMENT_VERSION};
+
 // ── Error type ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -353,6 +357,15 @@ pub const SEGMENTED_FORMAT_VERSION: u32 = 4;
 /// PR 271 (FIR-3064).
 pub const MIN_SEGMENTED_FORMAT_VERSION: u32 = 3;
 
+/// The newest segmented format this build READS.
+///
+/// Not the same number as [`SEGMENTED_FORMAT_VERSION`], which is what the
+/// default commit WRITES, and that gap is the point: reading is a range and
+/// writing is a point. v5 is the mapped layout, produced only by an explicit
+/// [`TextIndex::persist_mapped`], and a v5 image loaded through the ordinary
+/// path is materialized into the same in-memory shapes v4 produces.
+pub const MAX_SEGMENTED_FORMAT_VERSION: u32 = MAPPED_SEGMENT_VERSION;
+
 /// Default number of segments a doc set is partitioned into when the segmented
 /// persistence path is active. Each segment is an independent, immutable file;
 /// a commit re-serializes only the segments whose docs changed, so the cost of a
@@ -458,7 +471,15 @@ struct LoadedSegmented<Id: DocId> {
     total_doc_length: usize,
     graph_root_hash: Option<[u8; 32]>,
     segment_count: usize,
-    baseline_gens: Vec<Option<u64>>,
+    /// `Some` when the on-disk generations can be deltaed from on the next
+    /// commit, `None` when the next commit must rewrite every segment.
+    ///
+    /// `None` is not an absence of information, it is the information: a mapped
+    /// v5 image loaded onto the heap shapes cannot be deltaed by the bincode
+    /// writer, because rewriting one segment in v4 under a v4 manifest would
+    /// leave the untouched segments as v5 files that the v4 loader would then
+    /// read as corruption.
+    baseline_gens: Option<Vec<Option<u64>>>,
     segment_docs: Vec<HashSet<Id>>,
 }
 
@@ -557,6 +578,33 @@ fn write_file_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Publish `bytes` at `path` durably and atomically: encode to a uniquely
+/// named sibling temp file, fsync its contents, rename it into place, then fsync
+/// the directory so the rename itself survives a crash.
+///
+/// A fixed `.tmp` name plus a non-fsynced write is the torn-write class this
+/// guards against, and a shared `/tmp`-style name is the cross-process clobber
+/// beside it: the sequence number and the pid keep two concurrent publishers
+/// off each other's in-flight file.
+fn write_and_promote(path: &Path, bytes: &[u8]) -> Result<(), SearchError> {
+    let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = unique_tmp_path(path, seq);
+    write_file_durably(&tmp, bytes).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp);
+        SearchError::IndexError(format!("failed to write {}: {err}", tmp.display()))
+    })?;
+    std::fs::rename(&tmp, path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp);
+        SearchError::IndexError(format!(
+            "failed to promote {} -> {}: {err}",
+            tmp.display(),
+            path.display()
+        ))
+    })?;
+    sync_parent_dir(path);
+    Ok(())
+}
+
 /// Best-effort `fsync` of a path's parent directory so a `rename`/`create`
 /// within it is durable. Directory fsync is unsupported on some platforms;
 /// failures are non-fatal because the file itself was already fsynced.
@@ -651,6 +699,20 @@ fn corrupt_index_error(storage_path: &Path, reason: String, archive: bool) -> Se
 /// Suffix appended to the storage file name to derive segmented-format siblings,
 /// e.g. `index.bin` -> `index.bin.kinseg-manifest`, `index.bin.kinseg-3-7`.
 const KINSEG_PREFIX: &str = ".kinseg-";
+
+/// Resolve a caller-supplied path to the storage file the index writes.
+///
+/// A path with an extension is taken as the file itself; a path without one is
+/// taken as a directory holding `index.bin`. Free-standing rather than an
+/// associated function so the mapped reader resolves it the same way without
+/// naming a document id type.
+fn storage_file_path_for(path: &Path) -> PathBuf {
+    if path.extension().is_some() {
+        path.to_path_buf()
+    } else {
+        path.join("index.bin")
+    }
+}
 
 /// Path of the segmented manifest, a sibling of the monolithic storage file.
 fn manifest_path(storage_path: &Path) -> PathBuf {
@@ -1213,11 +1275,7 @@ impl<Id: DocId> TextIndex<Id> {
     }
 
     fn storage_file_path(path: &Path) -> PathBuf {
-        if path.extension().is_some() {
-            path.to_path_buf()
-        } else {
-            path.join("index.bin")
-        }
+        storage_file_path_for(path)
     }
 
     /// Record that the segment owning `id` changed, so the next segmented
@@ -1881,9 +1939,17 @@ where
             *index.graph_root_hash.write() = loaded.graph_root_hash;
             let mut seg = index.seg.write();
             seg.segment_count = loaded.segment_count;
-            seg.baseline_gens = Some(loaded.baseline_gens);
+            let deltaable = loaded.baseline_gens.is_some();
+            seg.baseline_gens = loaded.baseline_gens;
             seg.segment_docs = Some(loaded.segment_docs);
-            seg.dirty = SegmentDirty::Tracked(HashSet::new());
+            // A load with no reusable baseline must not be able to write a
+            // partial manifest: mark every segment dirty so the next commit is a
+            // full establishing rewrite.
+            seg.dirty = if deltaable {
+                SegmentDirty::Tracked(HashSet::new())
+            } else {
+                SegmentDirty::All
+            };
         } else if let Some(persisted) = Self::load_persisted(&storage_path, persist_changes)? {
             *index.index.write() = persisted.index;
             index.index_epoch.fetch_add(1, Ordering::Relaxed);
@@ -2163,9 +2229,28 @@ where
             }
         }
 
+        // With no in-memory baseline, the generations come off DISK rather than
+        // from a vector of `None`.
+        //
+        // `None` here used to mean "start at 0", and 0 is exactly the generation
+        // the mapped writer picks on an empty directory. So a commit with no
+        // baseline renamed v4 bytes onto the very names a live v5 manifest held,
+        // before the v4 manifest replaced it. A crash or a concurrent reader in
+        // that window finds a manifest naming files of the other format, and
+        // since the index is derived the recovery is to archive it and rebuild:
+        // the corpus is gone. Two ways in, and both reach it through a baseline
+        // this build clears on purpose, one after a mapped image is loaded and
+        // one after a mapped image is written to a different path.
+        //
+        // Reading the live manifest is the general invariant: no writer renames
+        // onto a name the live manifest holds, whichever format wrote it.
         let old_gens: Vec<Option<u64>> = match &seg.baseline_gens {
             Some(gens) => gens.clone(),
-            None => vec![None; segment_count],
+            None => {
+                let mut on_disk = mapped::read_manifest_gens(path);
+                on_disk.resize(segment_count, None);
+                on_disk
+            }
         };
         let mut new_gens = old_gens.clone();
 
@@ -2373,16 +2458,24 @@ where
             ));
         }
         let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if !(MIN_SEGMENTED_FORMAT_VERSION..=SEGMENTED_FORMAT_VERSION).contains(&version) {
+        if !(MIN_SEGMENTED_FORMAT_VERSION..=MAX_SEGMENTED_FORMAT_VERSION).contains(&version) {
             return Err(corrupt_index_error(
                 &m_path,
                 format!(
                     "unsupported segmented manifest version {version}; this build reads {} \
                      through {}",
-                    MIN_SEGMENTED_FORMAT_VERSION, SEGMENTED_FORMAT_VERSION
+                    MIN_SEGMENTED_FORMAT_VERSION, MAX_SEGMENTED_FORMAT_VERSION
                 ),
                 archive_corrupt,
             ));
+        }
+        // Dispatch BEFORE decoding, because `bincode::deserialize` allows
+        // trailing bytes: a v5 manifest fed to `SegmentManifest` would decode
+        // into plausible-looking nonsense rather than fail. The version was read
+        // as raw little-endian bytes above precisely so this branch can be taken
+        // without committing to a struct layout.
+        if version == MAPPED_SEGMENT_VERSION {
+            return mapped::rehydrate(storage_path, &bytes, archive_corrupt);
         }
         let manifest: SegmentManifest = bincode::deserialize(&bytes).map_err(|err| {
             corrupt_index_error(
@@ -2588,9 +2681,77 @@ where
             total_doc_length,
             graph_root_hash: manifest.graph_root_hash,
             segment_count: manifest.segment_count,
-            baseline_gens: manifest.segment_gens,
+            baseline_gens: Some(manifest.segment_gens),
             segment_docs,
         })
+    }
+
+    /// Write the live index as a mapped v5 image: an FST term dictionary, block
+    /// postings and a document table per segment, plus a manifest carrying the
+    /// tombstones.
+    ///
+    /// Explicit rather than the default commit path, on purpose. This build's
+    /// query path still reads the heap shapes, so flipping every store's format
+    /// would move the bytes without moving the memory. The reader accepts v5
+    /// either way, so an image written here opens on the ordinary load path too.
+    ///
+    /// `path` follows the same rule the other persistence entry points follow: a
+    /// path with an extension is the storage file, one without is a directory
+    /// holding `index.bin`.
+    pub fn persist_mapped(&self, path: &Path) -> Result<(), SearchError> {
+        let storage_path = storage_file_path_for(path);
+        // All FOUR live guards are held at once, and that is the difference
+        // between a consistent image and a rejected one.
+        //
+        // `staged` is not enough on its own. `rebuild_all` and
+        // `rebuild_all_owned` publish `index`, then `docs`, then the two
+        // counters under four INDEPENDENT write guards and clear `staged` only
+        // afterwards, so a snapshot taken between the first two would bucket a
+        // new inverted index against the old document set. `bucket`'s
+        // membership filter then silently drops every posting for a new id, and
+        // the image is either refused by its own load-time cross-check or served
+        // with a wrong `avgdl`. Holding all four blocks that publication
+        // outright.
+        //
+        // Order is `staged`, then the live guards in the order every other
+        // reader takes them (`index`, `docs`, `doc_count`, `total_doc_length`),
+        // then `seg`. That is the canonical order, so no writer or committer can
+        // invert it against this call.
+        let _staged = self.staged.read();
+        let index = self.index.read();
+        let docs = self.docs.read();
+        let doc_count = self.doc_count.read();
+        let total_doc_length = self.total_doc_length.read();
+        let doc_lengths: HashMap<Id, usize> =
+            docs.iter().map(|(id, doc)| (*id, doc.doc_length)).collect();
+        let segment_count = self.seg.read().segment_count.max(1);
+        mapped::write_mapped(
+            &storage_path,
+            &index,
+            &doc_lengths,
+            segment_count,
+            *doc_count,
+            *total_doc_length,
+            *self.graph_root_hash.read(),
+        )?;
+
+        // The mapped image is now the canonical one at this path, so the
+        // bincode writer's delta baseline has to go.
+        //
+        // Without this the next ordinary `commit` is a DELTA: it rewrites only
+        // the segments whose documents changed, in v4, and publishes a v4
+        // manifest that still names the old generation for every other segment.
+        // Those segments now hold `KINSEG05` files, so the following `open`
+        // decodes the magic as a bincode map length, fails, archives the
+        // manifest as corrupt, and the whole persisted index is gone, with the
+        // monolithic fallback already unlinked. Clearing the baseline forces
+        // that commit to be a full establishing rewrite, whose manifest names
+        // only files it just wrote.
+        let mut seg = self.seg.write();
+        seg.baseline_gens = None;
+        seg.segment_docs = None;
+        seg.dirty = SegmentDirty::All;
+        Ok(())
     }
 
     /// Remove a stale segmented manifest (and orphaned segment files) when the

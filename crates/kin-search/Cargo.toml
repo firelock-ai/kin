@@ -3,7 +3,7 @@
 
 [package]
 name = "kin-search"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
@@ -20,6 +20,13 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 tracing = "0.1"
 rayon = "1"
+# The mapped layout's two pieces. `fst` is the finite-state term dictionary,
+# Unlicense/MIT with no required dependencies of its own; `memmap2` is the
+# mapping, MIT OR Apache-2.0, already resolved in kin and kin-db. Both licenses
+# are on `deny.toml`'s allow list and both come from crates.io, which is the one
+# registry `[sources]` admits.
+fst = "0.4"
+memmap2 = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
