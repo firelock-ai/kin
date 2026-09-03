@@ -27,6 +27,14 @@ pub enum VfsError {
     #[error("invalid operation for path: {path}")]
     InvalidInput { path: String },
 
+    /// A write named a path that resolves outside the workspace root. The
+    /// lexical form was clean; a symlink already in the working copy redirected
+    /// it. Distinct from [`VfsError::PermissionDenied`] because the caller did
+    /// nothing wrong and the repository's own contents did, and an operator
+    /// reading a log needs to be able to tell those apart.
+    #[error("path resolves outside the workspace root: {path}")]
+    EscapesRoot { path: String },
+
     /// The path names a nested-repository boundary (a Git submodule pointer)
     /// with no child projection mounted. The entry is carried explicitly in
     /// tree listings, but its contents cannot be served as a blob, symlink, or

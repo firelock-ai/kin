@@ -11,6 +11,7 @@
 
 pub mod cache;
 pub mod canary;
+pub mod containment;
 pub mod error;
 pub mod path;
 pub mod pathmap;
@@ -21,6 +22,7 @@ pub mod tree;
 pub mod writer;
 
 pub use canary::{CanaryRegistry, InterposeStatus};
+pub use containment::{contained_entry, contained_target};
 pub use error::{VfsError, VfsResult};
 pub use path::{VfsName, VfsPath, VfsPathError};
 pub use provider::{AsyncContentProvider, ContentProvider};
