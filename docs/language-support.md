@@ -30,7 +30,7 @@ cannot drift apart.
 | TypeScript | ✓ | calls, contains, extends, implements, references | ✓ (jest) | ✓ | ✓ typescript-language-server |
 | JavaScript | ✓ | calls, contains, extends, references | ✓ | ✓ | ✓ typescript-language-server |
 | Python | ✓ | calls, contains, extends, references | ✓ (pytest) | ✓ | ✓ pyright / pylsp |
-| Go | ✓ | calls, contains, extends, implements, references, sends-message, spawns | ✓ | ✓ | not wired (gopls adapter exists) |
+| Go | ✓ | calls, contains, extends, implements, references, sends-message, spawns | ✓ | ✓ | ✓ gopls |
 | Java | ✓ | calls, contains, extends, implements, references | ✓ (junit) | ✓ | not wired (jdtls adapter exists) |
 | Rust | ✓ | calls, contains, implements, references | ✓ (cargo) | ✓ | ✓ rust-analyzer |
 | C++ | ✓ | calls, contains, extends, imports, references, uses-macro | ✓ | ✓ | not wired (clangd adapter exists) |
@@ -61,12 +61,14 @@ classifies it as `type_resolved` rather than as a name match.
 
 Two facts have to hold together before any of those edges can exist: the daemon
 has to wire an adapter for the language, and a server binary has to be installed
-on the host. The daemon wires **Rust, Python, TypeScript and JavaScript**, which
-is what `kin_core::reference_coverage::ENRICHABLE_LANGUAGES` names and what a
-test in `kin_daemon` holds it to. Every other language carries no reference,
+on the host. The daemon wires **Rust, Python, TypeScript, JavaScript and Go**,
+which is what `kin_core::reference_coverage::ENRICHABLE_LANGUAGES` names and what
+a test in `kin_daemon` holds it to. Every other language carries no reference,
 override or uses-type edge by construction, whatever is installed. kin-lsp does
-carry adapters for Go, Java, C and C++, and the table above says so, but those
-adapters are not reached from the runtime today.
+carry adapters for Java, C and C++, and the table above says so, but those
+adapters are not reached from the runtime today. That is a decision rather than
+an oversight: they are named on `NOT_YET_WIRED` in `kin_daemon`, and a test
+there fails if kin-lsp registers a provider that is neither wired nor listed.
 
 This matters because cross-file resolution without a language server falls back
 to matching bare names, which produces edges that name a plausible destination
@@ -75,10 +77,24 @@ rather than a proven one.
 Install the servers with:
 
 ```
-npm install -g pyright                                   # Python
-npm install -g typescript-language-server typescript     # TypeScript and JavaScript
-rustup component add rust-analyzer                       # Rust
+npm install -g pyright                                      # Python
+npm install -g typescript-language-server typescript@^5     # TypeScript and JavaScript
+rustup component add rust-analyzer                          # Rust
+go install golang.org/x/tools/gopls@v0.22.0                 # Go
 ```
+
+Both version pins are load-bearing. TypeScript 7 ships no `lib/tsserver.js`, so
+an unpinned `typescript` resolves to a version `typescript-language-server`
+cannot start. An unpinned `gopls@latest` gives two machines set up a week apart
+two different servers over one repository, with nothing recording which one
+produced an edge.
+
+`go install` writes into `$(go env GOPATH)/bin`, which is on nobody's PATH by
+default, and the daemon starts a server with a bare `gopls`. So run the command
+above only if that directory is already on your PATH. Otherwise let Kin install
+it: `kin doctor --fix --install-language-servers` sets `GOBIN` to a directory
+under `KIN_HOME` that both Kin binaries append to PATH at startup, which is the
+one destination the daemon is guaranteed to find.
 
 `kin setup` and `kin doctor --fix` will offer to run these for you. Neither
 installs without consent: interactively they ask once per command with the
