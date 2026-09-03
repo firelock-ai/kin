@@ -22,7 +22,6 @@ use kin_model::{
     RepositoryId, ResolvedTree, SemanticChange, SemanticChangeId, TransactionDelta, TreeEntry,
     WorkspaceId,
 };
-use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 #[cfg(feature = "firestore")]
 // Needed for method-call syntax in some feature shapes and not others: the
@@ -1622,40 +1621,6 @@ impl GraphOwnedSourceView {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct ProjectionChangedSet {
-    pub upserted: HashSet<FilePathId>,
-    pub removed: HashSet<FilePathId>,
-}
-
-impl ProjectionChangedSet {
-    pub fn is_empty(&self) -> bool {
-        self.upserted.is_empty() && self.removed.is_empty()
-    }
-
-    pub fn record_reconcile_outcome(&mut self, outcome: &kin_reconcile::ReconcileOutcome) {
-        match outcome {
-            kin_reconcile::ReconcileOutcome::Updated { file_id, .. } => {
-                self.upsert(file_id.clone());
-            }
-            kin_reconcile::ReconcileOutcome::FileRemoved { file_id, .. } => {
-                self.remove(file_id.clone());
-            }
-            _ => {}
-        }
-    }
-
-    pub fn upsert(&mut self, file_id: FilePathId) {
-        self.removed.remove(&file_id);
-        self.upserted.insert(file_id);
-    }
-
-    pub fn remove(&mut self, file_id: FilePathId) {
-        self.upserted.remove(&file_id);
-        self.removed.insert(file_id);
-    }
-}
-
 /// Messages sent to the LSP enrichment worker.
 #[derive(Debug)]
 pub enum LspEnrichmentMessage {
@@ -2766,12 +2731,6 @@ pub struct DaemonState {
     durable_entity_count: AtomicU64,
     pub blobs: Arc<BlobStore>,
     /// Why the derived ingestion CAS could not be hydrated from graph
-    /// authority when this state was opened, if it could not.
-    ///
-    /// Projection reads name this instead of surfacing a bare missing-blob
-    /// error, so an un-hydrated store is reported as the authority gap it is
-    /// rather than as a mysteriously absent object.
-    ingest_cas_hydration_gap: Option<String>,
     /// Why a persisted local or hosted vector artifact was not installed when
     /// this state was opened.
     ///
@@ -2786,9 +2745,6 @@ pub struct DaemonState {
     /// describe different stores and only one of them can be true at a time.
     vector_index_salvage: Option<crate::VectorSalvage>,
     pub reconciler: RwLock<Reconciler>,
-    /// Cached FileLayouts for all tracked files.
-    /// Populated on init, updated on commits.
-    pub projection: RwLock<ProjectionState>,
     /// Session and intent coordinator (Phase 7).
     pub coordinator: SessionCoordinator,
     /// Serializes daemon intent lifecycle mutations with MCP transaction
@@ -4686,10 +4642,10 @@ impl DaemonState {
     /// backend.
     ///
     /// The local path hydrates from repository authority so every blob the
-    /// projection later reads is present before the daemon serves anything.
-    /// The backend path reads the same store through `rebuild_projection` and
-    /// `refresh_projection` but used to open against whatever happened to be
-    /// on local disk, which on a fresh hosted instance is nothing.
+    /// layout backfill and the reconcile and commit paths later read is present
+    /// before the daemon serves anything. The backend path reads the same store
+    /// but used to open against whatever happened to be on local disk, which on
+    /// a fresh hosted instance is nothing.
     ///
     /// Returns the number of source bodies hydrated, or the reason the hosted
     /// backend could not supply them. A graph with no resolved artifacts needs
@@ -5138,11 +5094,9 @@ impl DaemonState {
             layout,
             graph,
             blobs: Arc::new(blobs),
-            ingest_cas_hydration_gap: None,
             vector_index_discarded: sidecar_open.discarded,
             vector_index_salvage: sidecar_open.salvage,
             reconciler: RwLock::new(reconciler),
-            projection: RwLock::new(ProjectionState::new()),
             coordinator,
             coordination_gate: tokio::sync::Mutex::new(()),
             graph_authority_clock: Arc::new(GraphAuthorityClock::default()),
@@ -5450,28 +5404,20 @@ impl DaemonState {
         // treat as a cache. That was true of the local path only; a hosted
         // instance opened against an empty local disk and every projection read
         // failed on a blob nothing had put there.
-        let ingest_cas_hydration_gap =
-            match Self::hydrate_backend_ingest_cas(repo_id, &backend, graph.as_ref(), &blobs) {
-                Ok(hydrated_source_bodies) => {
-                    info!(
-                        repo_id,
-                        hydrated_source_bodies,
-                        "hydrated derived ingestion CAS from hosted repository authority"
-                    );
-                    None
-                }
-                Err(reason) => {
-                    // Not fatal: a hosted graph whose backend carries no
-                    // repository authority still serves every query that does
-                    // not need source bodies. Recorded so the reads that DO
-                    // need them report this instead of a bare missing blob.
-                    warn!(
-                        repo_id,
-                        reason, "derived ingestion CAS was not hydrated on the backend open path"
-                    );
-                    Some(reason)
-                }
-            };
+        match Self::hydrate_backend_ingest_cas(repo_id, &backend, graph.as_ref(), &blobs) {
+            Ok(hydrated_source_bodies) => info!(
+                repo_id,
+                hydrated_source_bodies,
+                "hydrated derived ingestion CAS from hosted repository authority"
+            ),
+            // Not fatal: a hosted graph whose backend carries no repository
+            // authority still serves every query that does not need source
+            // bodies, so the gap is reported here and the open continues.
+            Err(reason) => warn!(
+                repo_id,
+                reason, "derived ingestion CAS was not hydrated on the backend open path"
+            ),
+        }
         // Hosted local disk is only a projection cache. Resolve the vector
         // artifact through the same backend authority as the graph, bind it to
         // the recovered generation and retrieval hash, then materialize it for
@@ -5506,11 +5452,9 @@ impl DaemonState {
             layout,
             graph: Arc::clone(&graph),
             blobs: Arc::new(blobs),
-            ingest_cas_hydration_gap,
             vector_index_discarded: sidecar_open.discarded,
             vector_index_salvage: sidecar_open.salvage,
             reconciler: RwLock::new(reconciler),
-            projection: RwLock::new(ProjectionState::new()),
             coordinator,
             coordination_gate: tokio::sync::Mutex::new(()),
             graph_authority_clock: Arc::new(GraphAuthorityClock::default()),
@@ -10694,22 +10638,6 @@ impl DaemonState {
                 .is_file()
     }
 
-    /// Name the open-path hydration gap on an error that a hydrated ingestion
-    /// CAS would not have produced.
-    ///
-    /// Without this a hosted daemon reports "cannot load graph-owned blob X",
-    /// which reads as graph corruption. The blob is fine; nothing ever put it
-    /// in this instance's derived store, and that is a different problem with a
-    /// different fix.
-    fn attribute_ingest_cas_gap(&self, error: DaemonError) -> DaemonError {
-        match &self.ingest_cas_hydration_gap {
-            Some(reason) => exact_source_storage_error(format!(
-                "{error}; the derived ingestion CAS was never hydrated on this open path: {reason}"
-            )),
-            None => error,
-        }
-    }
-
     /// Issue the derived ingestion CAS's deferred directory barriers.
     ///
     /// The store defers the barrier that makes a blob's *name* durable and
@@ -10721,99 +10649,6 @@ impl DaemonState {
     /// shutdown, including clean ones.
     pub fn sync_blob_store(&self) -> Result<()> {
         self.blobs.sync().map_err(DaemonError::from)
-    }
-
-    /// Rebuild projection state from the current graph.
-    ///
-    /// Loads every persisted [`FileLayout`] and its blob-backed base content
-    /// from the graph's exact resolved tree. Missing entries or blobs are
-    /// authority gaps and fail loudly; runtime projection never repairs graph
-    /// truth from raw filesystem contents.
-    ///
-    /// Called after graph init, snapshot load, or a write-notify reconcile.
-    pub async fn rebuild_projection(&self) -> Result<()> {
-        let mut projection = self.projection.write().await;
-
-        let tree = self.graph.resolved_tree();
-        let state =
-            ProjectionState::from_resolved_tree(self.graph.as_ref(), self.blobs.as_ref(), &tree)
-                .map_err(|error| self.attribute_ingest_cas_gap(DaemonError::from(error)))?;
-        let registered = state.file_ids().len();
-        *projection = state;
-        info!(
-            files = registered,
-            "rebuilt projection state from persisted graph truth"
-        );
-        Ok(())
-    }
-
-    /// Refresh projection state for a touched-file set.
-    ///
-    /// This is the warm path after reconcile/VFS writes: removed files are
-    /// evicted from the projection cache, and added/modified files are loaded
-    /// from graph-owned layout + blob content. Missing entries or blobs fail
-    /// loudly instead of being repaired from the filesystem.
-    pub async fn refresh_projection(&self, changed: &ProjectionChangedSet) -> Result<()> {
-        if changed.is_empty() {
-            return Ok(());
-        }
-
-        let mut projection = self.projection.write().await;
-        let mut loaded = 0usize;
-        let mut removed = 0usize;
-        let mut skipped = 0usize;
-
-        for file_id in &changed.removed {
-            projection.remove_file(file_id);
-            removed += 1;
-        }
-
-        for file_id in &changed.upserted {
-            let Some(layout) = self
-                .graph
-                .get_file_layout(file_id)
-                .map_err(DaemonError::from)?
-            else {
-                projection.remove_file(file_id);
-                skipped += 1;
-                continue;
-            };
-
-            let entry = self
-                .graph
-                .get_tree_entry(file_id)
-                .map_err(DaemonError::from)?
-                .ok_or_else(|| {
-                    exact_source_storage_error(format!(
-                        "projection refresh for {file_id} has no graph-owned tree entry"
-                    ))
-                })?;
-            let TreeEntry::Blob { hash, .. } = entry else {
-                return Err(exact_source_storage_error(format!(
-                    "projection refresh for {file_id} has a layout attached to a non-blob tree entry"
-                )));
-            };
-            let content = self
-                .blobs
-                .read(&kin_blobs::Hash256(*hash.as_bytes()))
-                .map_err(|error| {
-                    self.attribute_ingest_cas_gap(exact_source_storage_error(format!(
-                        "projection refresh for {file_id} cannot load graph-owned blob {}: {error}",
-                        hash
-                    )))
-                })?;
-            projection.register_file(layout, content);
-            loaded += 1;
-        }
-
-        info!(
-            upserted = loaded,
-            graph_backed = loaded,
-            removed,
-            skipped,
-            "refreshed projection state for changed files"
-        );
-        Ok(())
     }
 
     /// Mark the graph as dirty (mutated since last save).
@@ -17171,9 +17006,9 @@ mod tests {
     #[test]
     fn backend_hydration_installs_every_body_the_graph_names() {
         // "Rehydrated on every daemon open" used to be true of the local path
-        // only. The backend path reads the same derived store through
-        // `rebuild_projection`, keyed on exactly this resolved tree, and used to
-        // open against whatever happened to be on local disk.
+        // only. The backend path reads the same derived store, keyed on exactly
+        // this resolved tree, and used to open against whatever happened to be
+        // on local disk.
         let repo_dir = tempfile::tempdir().unwrap();
         let body = b"services:\n  api:\n    image: kin:dev\n";
         let init = kin_core::init(repo_dir.path()).unwrap();
@@ -17254,7 +17089,6 @@ mod tests {
         let state = DaemonState::open(init.layout).expect("local open");
 
         assert_eq!(state.blobs.read(&hash).unwrap(), body);
-        assert!(state.ingest_cas_hydration_gap.is_none());
     }
 
     #[test]
@@ -17267,40 +17101,17 @@ mod tests {
         let kindb_dir = init.layout.kindb_dir();
         let repo_id = kin_core::manifest::resolve_repo_id(&init.layout, None).unwrap();
 
-        let state = DaemonState::open_with_backend(
+        let opened = DaemonState::open_with_backend(
             init.layout,
             Box::new(LocalFileBackend::new(kindb_dir)),
             &repo_id,
             None,
-        )
-        .expect("backend open");
-
-        assert!(
-            state.ingest_cas_hydration_gap.is_none(),
-            "an empty tree is not an authority gap: {:?}",
-            state.ingest_cas_hydration_gap
         );
-    }
 
-    #[test]
-    fn a_recorded_hydration_gap_is_named_in_projection_errors() {
-        // A hosted graph whose backend carries no repository authority still
-        // serves every query that needs no source body, so an un-hydratable
-        // store is recorded rather than fatal. The reads that DO need one must
-        // then report the authority gap instead of a bare missing blob, which
-        // reads as graph corruption.
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let mut state = DaemonState::open(init.layout).expect("local open");
-        state.ingest_cas_hydration_gap = Some("hosted backend carries no authority".to_string());
-
-        let reported = state
-            .attribute_ingest_cas_gap(exact_source_storage_error("cannot load graph-owned blob"))
-            .to_string();
         assert!(
-            reported.contains("never hydrated on this open path")
-                && reported.contains("hosted backend carries no authority"),
-            "the error must name the hydration gap: {reported}"
+            opened.is_ok(),
+            "an empty tree is not an authority gap: {:?}",
+            opened.err()
         );
     }
 
@@ -17605,21 +17416,6 @@ mod tests {
         assert_eq!(
             opened.salvage, None,
             "and nothing was salvaged either, since there was nothing to salvage"
-        );
-    }
-
-    #[test]
-    fn a_hydrated_state_reports_blob_errors_unchanged() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let init = kin_core::init(repo_dir.path()).unwrap();
-        let state = DaemonState::open(init.layout).expect("local open");
-
-        let reported = state
-            .attribute_ingest_cas_gap(exact_source_storage_error("cannot load graph-owned blob"))
-            .to_string();
-        assert!(
-            !reported.contains("never hydrated"),
-            "a hydrated store must not blame a gap it does not have: {reported}"
         );
     }
 

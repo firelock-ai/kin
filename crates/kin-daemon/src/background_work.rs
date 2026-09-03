@@ -1326,9 +1326,16 @@ mod tests {
     /// Paired with the test above rather than written alone: the two run the
     /// identical wedged scenario and differ only in how the pass registered, so
     /// a sweep that stopped everything, or one that stopped nothing, fails one
-    /// of them. The projection rebuild is the real case — a single `await` with
-    /// no loop — and publishing `stopped` for work still running would make the
-    /// health surface lie about the one thing it exists to report.
+    /// of them. The projection rebuild was the real case — a single `await`
+    /// with no loop — and publishing `stopped` for work still running would
+    /// make the health surface lie about the one thing it exists to report.
+    ///
+    /// That pass was removed in 2026-09 along with the write-only projection
+    /// cache it rebuilt, so `PASS_PROJECTION` and `disclosed_pass` now have no
+    /// production caller and this pair is the only cover the disclose-only mode
+    /// has. The constant and the reasoning are kept rather than repointed at
+    /// another pass: a mode with no user is worth seeing, and the argument above
+    /// is the only written record of why the mode exists at all.
     #[test]
     fn a_disclose_only_pass_is_reported_but_never_claimed_stopped() {
         let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(60));
