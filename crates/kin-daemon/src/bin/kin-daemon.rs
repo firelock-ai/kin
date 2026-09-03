@@ -282,7 +282,7 @@ fn create_state(
                     // the primary graph until the GCS fence has completed.
                     let state = DaemonState::open_with_backend_and_publication_control(
                         layout,
-                        Box::new(backend),
+                        backend,
                         repo_id,
                         allowed_repo_ids,
                         Arc::clone(&publication_control),
@@ -296,7 +296,7 @@ fn create_state(
             };
             let state = DaemonState::open_with_backend_and_publication_control(
                 layout,
-                Box::new(backend),
+                backend,
                 repo_id,
                 allowed_repo_ids,
                 Arc::clone(&publication_control),
@@ -347,13 +347,23 @@ fn create_state(
 /// or serves nothing, on its first snapshot read. An operator who asked for an
 /// emulator and got the real service back would have no signal at all, so this
 /// path never falls back: it starts against the endpoint or it stops.
+///
+/// The backend comes back wrapped in
+/// [`kin_daemon::source_body_memo::SourceBodyMemoBackend`], so a repeated read
+/// of one immutable source body costs memory instead of two more billed
+/// object-store operations. Wrapped here rather than at the daemon state, so
+/// the memo is part of what "the hosted GCS backend" means and a caller cannot
+/// hold the raw one by accident. Measured on `kin-ecosystem-kin-graphs-dev`
+/// over the 24 hours ending 2026-09-03T20:00Z: 6.64M body reads and 6.62M
+/// metadata reads against a bucket holding 6,834 objects, which is each object
+/// fetched about 970 times a day.
 #[cfg(feature = "gcs")]
 fn open_gcs_backend(
     bucket: &str,
     prefix: String,
 ) -> std::result::Result<
     (
-        kin_db::GcsBackend,
+        Box<dyn kin_db::StorageBackend>,
         std::sync::Arc<dyn object_store::ObjectStore>,
     ),
     Box<dyn std::error::Error>,
@@ -378,7 +388,8 @@ fn open_gcs_backend(
     }
     let store = gcs_endpoint::object_store_for(endpoint.as_ref(), bucket)?;
     let backend = kin_db::GcsBackend::from_store(Box::new(Arc::clone(&store)), prefix);
-    Ok((backend, store))
+    let backend = kin_daemon::source_body_memo::SourceBodyMemoBackend::new(Box::new(backend));
+    Ok((Box::new(backend), store))
 }
 
 fn acquire_before_state<T>(
