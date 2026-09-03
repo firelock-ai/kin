@@ -55,6 +55,7 @@ pub const ENRICHABLE_LANGUAGES: &[LanguageId] = &[
     LanguageId::Python,
     LanguageId::TypeScript,
     LanguageId::JavaScript,
+    LanguageId::Go,
 ];
 
 /// What a host's language server can actually do for one language.
@@ -2028,14 +2029,20 @@ mod tests {
 
     /// The language-server state is filled from a probe the caller ran, not
     /// guessed here. A language this build wires no adapter for is Unsupported
-    /// whatever is installed, which is why gopls on PATH buys Go nothing.
+    /// whatever is installed, which is why jdtls on PATH buys Java nothing.
+    ///
+    /// The unwired example used to be Go, and Go was the right one until the
+    /// daemon gained its `gopls` arm. The property this test guards outlives
+    /// any one language, so it moved to Java rather than being deleted: kin-lsp
+    /// carries a complete `jdtls` provider that the daemon deliberately does not
+    /// construct, which is exactly the shape the assertion is about.
     #[test]
     fn language_server_state_is_attached_rather_than_assumed() {
         let unfilled = ReferenceEdgeCoverage {
             parse: None,
             languages: vec![
                 language_row("python", ReferenceEnrichment::Unknown),
-                language_row("go", ReferenceEnrichment::Unknown),
+                language_row("java", ReferenceEnrichment::Unknown),
             ],
             totals: None,
         };
@@ -2046,7 +2053,7 @@ mod tests {
 
         let filled = unfilled
             .clone()
-            .with_language_servers(&usable(&[LanguageId::Go]));
+            .with_language_servers(&usable(&[LanguageId::Java]));
         assert_eq!(
             filled.languages_missing_a_language_server(),
             vec!["python"],
@@ -2055,7 +2062,7 @@ mod tests {
         assert_eq!(
             filled.languages[1].reference_enrichment,
             ReferenceEnrichment::Unsupported,
-            "gopls on PATH gives Go nothing: no adapter consumes it"
+            "jdtls on PATH gives Java nothing: no adapter consumes it"
         );
 
         let complete =

@@ -140,7 +140,7 @@ fn outside_a_repository_the_fix_run_says_where_to_run_it_instead() {
         "both scopes have to be named or the reader guesses. stderr={stderr}"
     );
     assert!(
-        stderr.contains("rust, python, typescript, javascript"),
+        stderr.contains("rust, python, typescript, javascript, go"),
         "it has to name what it would have checked. stderr={stderr}"
     );
 }

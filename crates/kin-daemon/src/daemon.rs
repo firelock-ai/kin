@@ -315,7 +315,7 @@ pub(crate) fn reset_vector_index_and_requeue_after_contention_for_test(
 /// it for the query paths.
 ///
 /// Spawned rather than awaited. Probing means starting each server and running
-/// the initialize handshake, and four languages against the probe budget would
+/// the initialize handshake, and five languages against the probe budget would
 /// add seconds to daemon startup in the healthy case and far more when a server
 /// hangs. Nothing waits on the answer: until it publishes, every observation
 /// reads the readiness as unknown, which already keeps the absence-trust gate
@@ -429,6 +429,10 @@ pub fn lsp_adapter_for(
             &kin_lsp::adapters::typescript::TypeScriptAdapter,
             workspace_root,
         )),
+        kin_model::LanguageId::Go => Some(describe(
+            &kin_lsp::adapters::go::GoplsAdapter,
+            workspace_root,
+        )),
         _ => None,
     }
 }
@@ -463,6 +467,19 @@ mod adapter_wiring_tests {
     use kin_core::reference_coverage::ENRICHABLE_LANGUAGES;
     use kin_model::LanguageId;
     use std::path::Path;
+
+    /// Languages kin-lsp registers a complete provider for that this build
+    /// deliberately does not construct yet.
+    ///
+    /// A decision written down, not an oversight left implicit. Each of these
+    /// has a `ProviderSpec` in `ProviderRegistry::with_defaults` and an adapter
+    /// module in `kin_lsp::adapters`, so wiring one is the same shape the Go row
+    /// already is: an arm here, an entry in `ENRICHABLE_LANGUAGES`, and an
+    /// install recipe in kin-cli. None is wired today because none has an
+    /// install recipe and none is on the corpus the enrichment work is measured
+    /// against, and a language with an arm and no recipe fails
+    /// `every_enrichable_language_has_an_install_command`.
+    const NOT_YET_WIRED: &[LanguageId] = &[LanguageId::Java, LanguageId::C, LanguageId::Cpp];
 
     /// `ENRICHABLE_LANGUAGES` documents itself as the set the daemon wires an
     /// adapter for. This is that sentence as an assertion, in both directions.
@@ -513,6 +530,7 @@ mod adapter_wiring_tests {
             (LanguageId::Python, "pyright-langserver"),
             (LanguageId::TypeScript, "typescript-language-server"),
             (LanguageId::JavaScript, "typescript-language-server"),
+            (LanguageId::Go, "gopls"),
         ] {
             let (cmd, _, _) =
                 lsp_adapter_for(language, root).unwrap_or_else(|| panic!("{language} not wired"));
@@ -555,6 +573,58 @@ mod adapter_wiring_tests {
             assert!(
                 lsp_adapter_for(language, root).is_none(),
                 "{language} must not be wired without being declared enrichable"
+            );
+        }
+    }
+
+    /// Every language kin-lsp registers a provider for is either wired here or
+    /// named above as a decision somebody made.
+    ///
+    /// This is the class that shipped in v0.6.4 and it is invisible to the
+    /// set-equality test above. kin-lsp's adapter suite grew to six languages
+    /// while this map stayed at four, so a Go repository was told its reference
+    /// edges were `unsupported` while a complete `gopls` adapter sat inside the
+    /// same binary. `the_adapter_map_and_the_enrichable_set_name_the_same_languages`
+    /// cannot catch that: a language missing from BOTH constants agrees with
+    /// itself, and the two stayed in lockstep the whole time they were wrong.
+    ///
+    /// So this one reads the third constant, kin-lsp's own registry, which is
+    /// the thing that actually grew. A seventh provider arriving there now fails
+    /// here rather than going quiet for a release.
+    #[test]
+    fn every_registered_provider_is_wired_or_named_as_a_decision() {
+        let root = Path::new("/nonexistent-workspace");
+        let registered: Vec<LanguageId> = kin_lsp::registry::ProviderRegistry::with_defaults()
+            .known_binaries()
+            .into_iter()
+            .map(|(language, _)| language)
+            .collect();
+
+        // Positive controls, not decoration. A registry that answered with an
+        // empty list, or with only the languages this build already wires,
+        // would satisfy every assertion below while grading nothing, and it
+        // would read exactly like a pass. One language from each side of the
+        // decision has to be in the set before the loop means anything.
+        assert!(
+            registered.contains(&LanguageId::Go),
+            "kin-lsp registers no Go provider, so this guard is reading the wrong list: \
+             {registered:?}"
+        );
+        assert!(
+            registered.contains(&LanguageId::Java),
+            "kin-lsp registers no Java provider, so nothing here exercises the deferred \
+             side: {registered:?}"
+        );
+
+        for language in registered {
+            let wired = lsp_adapter_for(language, root).is_some();
+            let deferred = NOT_YET_WIRED.contains(&language);
+            assert!(
+                wired != deferred,
+                "{language}: kin-lsp registers a provider for it, so it must either have an \
+                 arm in lsp_adapter_for (wired = {wired}) or be named on NOT_YET_WIRED \
+                 (deferred = {deferred}). Both at once is a list that rotted; neither is the \
+                 gap that shipped."
             );
         }
     }
