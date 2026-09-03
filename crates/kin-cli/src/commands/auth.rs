@@ -1039,15 +1039,22 @@ mod tests {
         )
         .unwrap();
 
-        let plaintext = fallback_credential_probe_path(base_url)
+        // The credential path and the warning built from it are both derived
+        // from `account_key`, which CodeQL's `rust/cleartext-logging` treats as
+        // a sensitive value. Neither is a secret, it is a SHA-256 of the base
+        // URL, but a panic message that interpolates either one is a sink as far
+        // as that rule is concerned. So these assertions compare the value and
+        // report the property, never the value. The array of needles below is
+        // beside its assertion, so a failure still names what was missing.
+        let credential_file = fallback_credential_probe_path(base_url)
             .unwrap()
             .with_extension("json");
         assert!(
-            plaintext.exists(),
-            "the plaintext tier must write where the reader looks: {plaintext:?}"
+            credential_file.exists(),
+            "the plaintext tier must write where the reader looks"
         );
         assert_eq!(
-            fs::metadata(&plaintext).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&credential_file).unwrap().permissions().mode() & 0o777,
             0o600,
             "a plaintext credential file must be owner-only"
         );
@@ -1057,18 +1064,16 @@ mod tests {
             "the credential directory must be owner-only"
         );
 
-        let warning = plaintext_tier_warning(&plaintext);
+        let warning = plaintext_tier_warning(&credential_file);
+        for needle in ["PLAINTEXT", "0600", "0700", "KINLAB_AUTH_PASSPHRASE"] {
+            assert!(
+                warning.contains(needle),
+                "the plaintext-tier warning must name {needle}"
+            );
+        }
         assert!(
-            warning.contains("PLAINTEXT"),
-            "the warning must name the tier: {warning}"
-        );
-        assert!(
-            warning.contains(&plaintext.display().to_string()),
-            "the warning must name the file: {warning}"
-        );
-        assert!(
-            warning.contains("KINLAB_AUTH_PASSPHRASE"),
-            "the warning must name the way out: {warning}"
+            warning.contains(&credential_file.display().to_string()),
+            "the plaintext-tier warning must name the credential file it wrote"
         );
     }
 

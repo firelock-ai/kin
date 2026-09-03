@@ -13251,9 +13251,15 @@ mod tests {
     }
 
     /// What counts as this machine's own daemon, and what only looks like it.
+    ///
+    /// Reported by index rather than by value. Two of the refused entries carry
+    /// userinfo, which is the whole point of having them, and CodeQL's
+    /// `rust/cleartext-logging` reads a URL interpolated into a panic message as
+    /// a credential reaching a sink. The index maps to the line above it, so a
+    /// failure is still one line away from the input that caused it.
     #[test]
     fn only_a_real_loopback_endpoint_reads_as_loopback() {
-        for trusted in [
+        for (index, endpoint) in [
             "http://127.0.0.1:4219",
             "http://127.0.0.1",
             "http://127.7.7.7:4219",
@@ -13262,14 +13268,17 @@ mod tests {
             "http://[::1]:4219",
             "https://127.0.0.1:4219",
             "https://localhost",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert!(
-                endpoint_is_loopback(trusted),
-                "{trusted} names this machine and must be trusted"
+                endpoint_is_loopback(endpoint),
+                "loopback case {index} names this machine and must be trusted"
             );
         }
 
-        for hostile in [
+        for (index, endpoint) in [
             "http://attacker.example:4219",
             "http://10.0.0.5:4219",
             // Every one of these starts with a string a prefix test looks for.
@@ -13282,10 +13291,13 @@ mod tests {
             "ftp://127.0.0.1",
             "127.0.0.1:4219",
             "",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert!(
-                !endpoint_is_loopback(hostile),
-                "{hostile} is not this machine and must not be trusted"
+                !endpoint_is_loopback(endpoint),
+                "refused case {index} is not this machine and must not be trusted"
             );
         }
     }
@@ -13317,11 +13329,11 @@ mod tests {
         };
         assert!(
             refusal.contains("refusing to send the local daemon token"),
-            "the refusal must name what it refused: {refusal}"
+            "the refusal must name what it refused"
         );
         assert!(
             refusal.contains("attacker.example"),
-            "the refusal must name the endpoint: {refusal}"
+            "the refusal must name the endpoint it refused"
         );
 
         // A remote endpoint an operator paired with its own credential is the
