@@ -75,3 +75,11 @@ KIN_UPDATE_TEST_WORKER_STAGE
 # nothing an operator sets.
 KIN_RECEIVER_HOP_CORPUS
 KIN_RECEIVER_HOP_FOCAL
+
+# Read only by the ignored real-store heap measurement in
+# crates/kin-reconcile/tests/lkg_real_store_heap.rs, which names the store,
+# repository and workspace an operator points it at by hand. A fixture input
+# for one #[ignore] test, not an operator lever, and nothing at runtime reads it.
+KIN_LKG_STORE
+KIN_LKG_REPO
+KIN_LKG_WORKSPACE
