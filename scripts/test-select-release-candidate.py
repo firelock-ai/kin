@@ -1083,6 +1083,34 @@ class ContractTests(unittest.TestCase):
         self.assertIn("needs.preflight.result == 'success'", condition)
         self.assertIn("needs.select.outputs.decision == 'proof'", condition)
 
+    def test_the_publisher_records_the_token_scope_before_it_decides(self) -> None:
+        """A refusal has to name its own evidence, and cannot be caused by naming it.
+
+        The publisher proves its token against GET /repos before writing, and
+        the push half of that check reads a block reporting the authenticated
+        USER's permissions. What an App installation token gets there was
+        guessed wrong twice on 2026-09-03 while four cycles refused with a
+        message naming the verdict and never the evidence. So the scope is
+        recorded first, and the recording is barred from failing the job:
+        a diagnostic that can break the thing it explains is worse than none.
+        """
+
+        publish = job_block(CUT_WORKFLOW_PATH.read_text(encoding="utf-8"), "publish")
+        record = publish.find("- name: Record what the evidence token can do")
+        write = publish.find("- name: Publish preflight.json for the candidate")
+        self.assertNotEqual(record, -1, "the publish job no longer records the token scope")
+        self.assertNotEqual(write, -1, "the publish job no longer publishes")
+        self.assertLess(
+            record,
+            write,
+            "the token scope is recorded after the write it exists to explain, so a refusal "
+            "at the write leaves no record of what the token looked like",
+        )
+        diagnostic = publish[record:write]
+        self.assertIn("if: always()", diagnostic)
+        self.assertIn("exit 0", diagnostic)
+        self.assertNotIn("set -euo pipefail", diagnostic)
+
     def test_the_workflow_calls_the_selector_and_binds_its_trigger(self) -> None:
         workflow = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
         for needle in (
