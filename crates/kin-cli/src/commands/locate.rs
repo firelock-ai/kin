@@ -3505,7 +3505,7 @@ fn run_with_graph_capture_budgeted(
         }
         None => semantic_coverage,
     };
-    let priority_hits: HashMap<String, Vec<FileHit>> = priority_files
+    let mut priority_hits: HashMap<String, Vec<FileHit>> = priority_files
         .iter()
         .filter(|(path, _)| !is_vendored_path(path))
         .map(|(path, score)| {
@@ -3518,6 +3518,12 @@ fn run_with_graph_capture_budgeted(
             )
         })
         .collect();
+    // FIR-3129: fold the lexical name-match pass's own top entity in here,
+    // by its own score, so multihop and cochange below see it as a seed
+    // file even when nothing else already resolved it. See
+    // `top_lexical_tail_match` for why this needs its own pass rather than
+    // widening the exact-name tier `priority_files` already carries.
+    fold_lexical_tail_match_into_priority_hits(&mut priority_hits, text, graph);
 
     // Phase 2b: Multihop expansion from resolved files (graph follow-up)
     let multihop = if fast_entity_dominant || budget.phase_should_skip("multihop") {
@@ -6344,6 +6350,133 @@ pub fn discover_historical_test_artifact_priority_files(
 // ---------------------------------------------------------------------------
 // Priority file extraction
 // ---------------------------------------------------------------------------
+
+/// The single best entity a bare lexical tail match names on the query's
+/// title line, folded into `priority_hits` by its own score. `None` when no
+/// title-line term tail-matches anything the exact tier below did not
+/// already take.
+///
+/// FIR-3129. `extract_priority_file_traces`'s own name-match tier requires
+/// the WHOLE entity name to equal a leaf term (`unique_files.len() <= 3`
+/// below), so a qualified name like `Owner.member` never satisfies it for
+/// the leaf `member` -- every method and field in a typed codebase carries
+/// its owner, and it is the graph's own token index, not that exact check,
+/// which is what actually returns them for a bare-word query. The multihop
+/// walk seeds only from files a signal already resolved, never from the
+/// entity the retrieval would itself rank best by name, so a file one hop
+/// from an admitted seed can go unwalked even when its own top symbol is an
+/// exact tail match for the query.
+///
+/// Deliberately narrow, on purpose: a tail is shared by many owners
+/// (`*.get`, `*.type`), so admitting every tail match at a flat score would
+/// reproduce the exact tier's own failure mode of a flat, undiscriminating
+/// tier, one match kind over. This keeps only the single highest-scoring
+/// one, at half the exact tier's own base score, so it can never outrank a
+/// genuine full-name match and only ever contributes at most one file. It
+/// names no file: which one wins is decided entirely by the query and the
+/// graph it runs against.
+fn top_lexical_tail_match(text: &str, graph: &kin_db::InMemoryGraph) -> Option<(String, f32)> {
+    // Half the exact-name tier's own title-term base (`base = if is_title {
+    // 50.0 } else { 30.0 }` below). A tail match is weaker evidence than a
+    // full-name match, so at the same term-discrimination weight it can
+    // never outscore one.
+    const TAIL_MATCH_BASE: f32 = 25.0;
+
+    let title_line = text.lines().next().unwrap_or("");
+    let re_word = regex::Regex::new(r"\b([a-zA-Z_]\w+)\b").ok()?;
+
+    let mut best: Option<(f32, String)> = None;
+    let mut seen_leaves = HashSet::new();
+    for cap in re_word.captures_iter(title_line) {
+        let leaf_lower = cap[1].to_ascii_lowercase();
+        if leaf_lower.len() <= 2
+            || is_noise_term(&leaf_lower)
+            || !seen_leaves.insert(leaf_lower.clone())
+        {
+            continue;
+        }
+        let filter = EntityFilter {
+            name_pattern: Some(leaf_lower.clone()),
+            ..Default::default()
+        };
+        let Ok(matched) = graph.query_entities(&filter) else {
+            continue;
+        };
+        if matched.is_empty() {
+            continue;
+        }
+        let df = graph.text_doc_frequency(&leaf_lower);
+        let n = graph.text_document_count();
+        let weight = if df > 0 && n > 0 {
+            let common = (0.02 * n as f32).max(1.0);
+            (common / df as f32).min(1.0)
+        } else {
+            1.0
+        };
+        let score = TAIL_MATCH_BASE * weight;
+        for entity in &matched {
+            // A bare name equal to the leaf is the exact tier's own match,
+            // not this one's to take.
+            if entity.name.to_lowercase() == leaf_lower {
+                continue;
+            }
+            if !matches!(
+                entity.kind,
+                EntityKind::Function
+                    | EntityKind::Method
+                    | EntityKind::Class
+                    | EntityKind::TraitDef
+                    | EntityKind::Interface
+                    | EntityKind::EnumDef
+                    | EntityKind::Module
+            ) {
+                continue;
+            }
+            if qualified_name_tail(&entity.name.to_lowercase()) != leaf_lower {
+                continue;
+            }
+            let Some(ref fo) = entity.file_origin else {
+                continue;
+            };
+            if is_test_path(&fo.0) || is_vendored_path(&fo.0) {
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some((best_score, best_path)) => match score.partial_cmp(best_score) {
+                    Some(std::cmp::Ordering::Greater) => true,
+                    Some(std::cmp::Ordering::Equal) => fo.0 < *best_path,
+                    _ => false,
+                },
+            };
+            if better {
+                best = Some((score, fo.0.clone()));
+            }
+        }
+    }
+    best.map(|(score, path)| (path, score))
+}
+
+/// The whole of FIR-3129's seeding change: fold `top_lexical_tail_match`'s
+/// single answer into `priority_hits`, by its own score, WHEN there is one.
+///
+/// Named and tested on its own because the property that matters is the
+/// conditional itself, not just what a match looks like once found: nothing
+/// here may add a `priority_hits` entry when `top_lexical_tail_match`
+/// returns `None`. A query that names no file must seed no file -- the
+/// score is what earns a seed a place, never a name or a default.
+fn fold_lexical_tail_match_into_priority_hits(
+    priority_hits: &mut HashMap<String, Vec<FileHit>>,
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+) {
+    if let Some((path, score)) = top_lexical_tail_match(text, graph) {
+        priority_hits.entry(path).or_default().push(FileHit {
+            score,
+            spans: vec![],
+        });
+    }
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(String, f32)> {
@@ -31235,6 +31368,131 @@ mod tests {
 
         assert!(hits.contains_key("programs/fileio.h"));
         assert!(hits.contains_key("programs/fileio_types.h"));
+    }
+
+    #[test]
+    fn top_lexical_tail_match_picks_the_qualified_entity_the_exact_tier_cannot_reach() {
+        let graph = kin_db::InMemoryGraph::new();
+        let owner = test_entity("Owner.member", "src/owner.rs", 1, 10);
+        graph.upsert_entity(&owner).unwrap();
+
+        let hit = top_lexical_tail_match("What does member do here", &graph);
+
+        assert_eq!(
+            hit,
+            Some(("src/owner.rs".to_string(), 25.0)),
+            "the only entity in the graph is `Owner.member`, whose tail is the query's \
+             own word `member`; the exact tier can never take it (its full name is not \
+             bare `member`), so this pass must"
+        );
+    }
+
+    #[test]
+    fn top_lexical_tail_match_leaves_a_bare_exact_name_to_the_exact_tier() {
+        let graph = kin_db::InMemoryGraph::new();
+        let bare = test_entity("member", "src/bare.rs", 1, 10);
+        graph.upsert_entity(&bare).unwrap();
+
+        let hit = top_lexical_tail_match("What does member do here", &graph);
+
+        assert_eq!(
+            hit, None,
+            "the only entity is named exactly `member`; that is the exact tier's own \
+             match and this pass must leave it alone rather than double-counting it"
+        );
+    }
+
+    #[test]
+    fn top_lexical_tail_match_breaks_a_score_tie_on_the_lexicographically_smaller_path() {
+        let graph = kin_db::InMemoryGraph::new();
+        // Inserted out of path order, so a passing test cannot be an accident
+        // of graph or index iteration order.
+        let b = test_entity("OwnerB.member", "src/b.rs", 1, 10);
+        graph.upsert_entity(&b).unwrap();
+        let a = test_entity("OwnerA.member", "src/a.rs", 1, 10);
+        graph.upsert_entity(&a).unwrap();
+
+        let hit = top_lexical_tail_match("What does member do here", &graph);
+
+        assert_eq!(
+            hit,
+            Some(("src/a.rs".to_string(), 25.0)),
+            "OwnerA.member and OwnerB.member tie on score; the tie-break must be the \
+             path, deterministically, not graph or index iteration order"
+        );
+    }
+
+    #[test]
+    fn top_lexical_tail_match_returns_none_without_a_tail_match() {
+        let graph = kin_db::InMemoryGraph::new();
+        let unrelated = test_entity("Something.else", "src/other.rs", 1, 10);
+        graph.upsert_entity(&unrelated).unwrap();
+
+        assert_eq!(top_lexical_tail_match("hello world", &graph), None);
+    }
+
+    #[test]
+    fn fold_lexical_tail_match_into_priority_hits_adds_nothing_without_a_match() {
+        let graph = kin_db::InMemoryGraph::new();
+        let unrelated = test_entity("Something.else", "src/other.rs", 1, 10);
+        graph.upsert_entity(&unrelated).unwrap();
+
+        let mut priority_hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+        fold_lexical_tail_match_into_priority_hits(&mut priority_hits, "hello world", &graph);
+
+        assert!(
+            priority_hits.is_empty(),
+            "no query term tail-matches anything in this graph; a query that names no \
+             file must seed no file, not some unconditional default"
+        );
+    }
+
+    #[test]
+    fn fold_lexical_tail_match_into_priority_hits_adds_the_match_by_score() {
+        let graph = kin_db::InMemoryGraph::new();
+        let owner = test_entity("Owner.member", "src/owner.rs", 1, 10);
+        graph.upsert_entity(&owner).unwrap();
+
+        let mut priority_hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+        fold_lexical_tail_match_into_priority_hits(
+            &mut priority_hits,
+            "What does member do here",
+            &graph,
+        );
+
+        let hits = priority_hits
+            .get("src/owner.rs")
+            .expect("the only tail match in the graph must be folded in");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].score, 25.0);
+    }
+
+    #[test]
+    fn fold_lexical_tail_match_into_priority_hits_appends_rather_than_overwrites() {
+        let graph = kin_db::InMemoryGraph::new();
+        let owner = test_entity("Owner.member", "src/owner.rs", 1, 10);
+        graph.upsert_entity(&owner).unwrap();
+
+        let mut priority_hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+        priority_hits.insert(
+            "src/owner.rs".to_string(),
+            vec![FileHit {
+                score: 200.0,
+                spans: vec![],
+            }],
+        );
+        fold_lexical_tail_match_into_priority_hits(
+            &mut priority_hits,
+            "What does member do here",
+            &graph,
+        );
+
+        let hits = &priority_hits["src/owner.rs"];
+        assert_eq!(
+            hits.len(),
+            2,
+            "an existing signal for this file must survive, not be replaced"
+        );
     }
 
     #[test]
