@@ -13305,13 +13305,16 @@ mod tests {
         )
         .is_ok());
 
-        let refusal = DaemonClient::from_base_url_with_explicit_authority(
+        // Matched rather than unwrapped: `DaemonClient` is not `Debug`, so
+        // `unwrap_err` cannot render the Ok side.
+        let refusal = match DaemonClient::from_base_url_with_explicit_authority(
             "http://attacker.example:4219",
             Some("repo-local-token".to_string()),
             None,
-        )
-        .unwrap_err()
-        .to_string();
+        ) {
+            Ok(_) => panic!("a non-loopback endpoint must not receive the local daemon token"),
+            Err(error) => error.to_string(),
+        };
         assert!(
             refusal.contains("refusing to send the local daemon token"),
             "the refusal must name what it refused: {refusal}"
