@@ -97,9 +97,9 @@ need in plain language. Kin registers far more tools than any agent profile serv
 small always-on set, chosen so the list you carry on every turn stays cheap, and everything else is \
 reached through here. Give `need` a plain-language description of the job (\"what breaks if I \
 change this\", \"who calls this function\", \"read one file's exact bytes\") and each match comes \
-back as the complete tool definition -- name, description, annotations and input schema -- exactly \
-as the `full` profile serves it, so a tool you find is callable on your next turn with nothing \
-withheld. `matched_names` lists every match in rank order and `matches` carries the full \
+back as the complete tool definition, carrying its name, description, annotations and input schema \
+exactly as the `full` profile serves them, so a tool you find is callable on your next turn with \
+nothing withheld. `matched_names` lists every match in rank order and `matches` carries the full \
 definitions for the first `limit` of them, so a match this call had no room for is reported rather \
 than dropped. Omit `need` to enumerate the whole registry. Ranking reads tool names first, then \
 titles, then descriptions, and an exact tool name always comes back first. This answers from the \
