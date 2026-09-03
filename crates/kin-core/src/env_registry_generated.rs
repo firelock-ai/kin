@@ -128,6 +128,7 @@ pub const GENERATED_KNOBS: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_INFERRED_ORIGIN_WEIGHT", kind: Kind::NonNegF32, default: "0.7", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: inferred origin weight" },
     EnvVarSpec { name: "KIN_LOCATE_INNER_METHOD_TOPK", kind: Kind::Usize, default: "5", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: inner method topk" },
     EnvVarSpec { name: "KIN_LOCATE_LEXICAL_FLOOR_ADMIT_STRENGTH", kind: Kind::NonNegF32, default: "0.6", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: lexical floor admit strength" },
+    EnvVarSpec { name: "KIN_LOCATE_LEXICAL_FLOOR_BUDGET", kind: Kind::Usize, default: "12", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: lexical floor budget" },
     EnvVarSpec { name: "KIN_LOCATE_LEXICAL_FLOOR_COMMON_FRAC", kind: Kind::NonNegF32, default: "0.02", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: lexical floor common frac" },
     EnvVarSpec { name: "KIN_LOCATE_LEXICAL_FLOOR_LIFT", kind: Kind::NonNegF32, default: "1.05", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: lexical floor lift" },
     EnvVarSpec { name: "KIN_LOCATE_LEXICAL_FLOOR_LIFT_PRESENT", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: lexical floor lift present" },
