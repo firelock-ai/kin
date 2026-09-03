@@ -1036,6 +1036,26 @@ jobs:
       - name: Falsify Docker daemon production feature guard
         run: bash scripts/check-docker-daemon-features.test.sh
 
+      # ADDED here rather than moved out of `check`, for the reason the kin-vfs
+      # step below records. `check` carries `github.event_name != 'pull_request'`,
+      # so for as long as these two guards ran only there, a pull request could
+      # introduce a raw filesystem read on an answer path and no check on that
+      # pull request could report it; the guards graded the invariant only after
+      # the merge, on main's own push run. This job carries the required "Fast
+      # gate lint and policy" context, so the answer now arrives while a commit
+      # can still change it. Moving rather than adding was not an option:
+      # `bin/kin-precheck` in the umbrella enumerates the gate list out of the
+      # `check` job by name and refuses with no tally when a script it expects is
+      # missing there, so a move would drop both guards from every lane's local
+      # verdict at the same moment it added them to the pull request. Both are
+      # pure scanners over the tree with no toolchain and no network, so the cost
+      # of running them in both places is seconds.
+      - name: Check Zero File-Search Invariant
+        run: python3 scripts/verify-zero-file-search.py
+
+      - name: Check Zero File-Search Invariant (answer modules)
+        run: bash scripts/zero_file_search_guard.sh
+
       # ADDED here rather than moved out of `check`, deliberately, for two
       # reasons. `check` carries `github.event_name != 'pull_request'`, so the
       # thinned six-context pull-request gate never runs it and main failed its
