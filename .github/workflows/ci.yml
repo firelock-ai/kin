@@ -2611,16 +2611,27 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Measured across eleven consecutive main pushes on 2026-09-03: the
-      # disk, not the code, is what ends this job. A hosted ubuntu runner carries tens of gigabytes of Android, .NET,
-      # GHC and CodeQL toolchains that no kin build touches, and tarpaulin's
-      # instrumented debug build of the whole workspace does not fit in what is
-      # left. The two deaths are one cause. `rust-lld` mmaps its output, so a
-      # write with no blocks behind it arrives as `ld terminated with signal 7
-      # [Bus error]` and reads as a compiler crash; or the runner's worker hits
-      # `No space left on device` writing its own log and takes the job with
-      # it. The `df` on both sides is what lets the next reader see a near miss
-      # instead of inferring one from a linker signal.
+      # The runner is not small; the build is enormous, and the margin was
+      # under half a gigabyte. Measured on main's push run 33711619735, the
+      # first to carry this step: 145G of disk with 86.1 GiB free before the
+      # reclaim, 30.4 GiB free after tarpaulin finished, so the instrumented
+      # build of the whole workspace consumes about 85.7 GiB. Without the
+      # reclaim it was landing inside 0.4 GiB of the wall, which is why eleven
+      # consecutive main pushes on 2026-09-03 failed in two shapes rather than
+      # one, and why some of them squeaked through. Whether a run crossed the
+      # line came down to how much the image already held.
+      #
+      # Both shapes are that one cause. `rust-lld` mmaps its output, so a write
+      # with no blocks behind it arrives as `ld terminated with signal 7 [Bus
+      # error]` and reads as a compiler crash; or the runner's own worker hits
+      # `No space left on device` writing its diagnostic log and takes the job
+      # down with no failed step in it.
+      #
+      # Reclaiming the toolchains no kin build touches buys 30 GiB, which is
+      # about 35% headroom over the build. That is a margin, not a fix in
+      # perpetuity: it erodes as the workspace grows, and the `df` lines on both
+      # sides are what let the next reader see the next near miss coming instead
+      # of inferring it from a linker signal.
       #
       # `continue-on-error` because a reclaim that does not apply on some future
       # runner image is not a reason to stop a build. The script already exits 0
