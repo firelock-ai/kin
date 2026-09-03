@@ -6,6 +6,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
@@ -1009,9 +1010,80 @@ impl RepositoryOperationRecord {
         )
     }
 
-    /// A copy of this record with every collection this identity canonicalizes
-    /// put in its canonical order.
-    fn canonicalized(&self) -> Self {
+    /// This record with every collection this identity canonicalizes in its
+    /// canonical order, **borrowed when it is already in that order**.
+    ///
+    /// The digest is unchanged by construction: when the collections are
+    /// already sorted, sorting them would produce this exact value, so hashing
+    /// the record itself hashes the same bytes the copy would have produced.
+    /// The only thing that moves is whether a copy is made.
+    ///
+    /// It matters because the copy is not small. A `RepositoryOperationRecord`
+    /// carries its whole `workspace_mutation`, and on a converted Linux subtree
+    /// that record is 411,771,106 bytes on the wire, so every identity cloned
+    /// it and then serialized the clone.
+    ///
+    /// **And the largest collection it sorted was already sorted.**
+    /// [`Self::validate`] runs first, above, and reaches
+    /// `workspace_mutation.validate_shape()`, which calls
+    /// `semantic_delta.validate()`, which REFUSES any of the three delta
+    /// vectors whose adjacent pairs are not strictly increasing by
+    /// `target_id`. `WorkspaceSemanticDelta::sort_canonical` sorts by exactly
+    /// that key. So on a record that has passed validation, sorting the
+    /// semantic delta is provably a no-op, and the whole record was being
+    /// copied in order to perform it.
+    ///
+    /// `ref_mutations` and `tree_deltas` are different: validation checks them
+    /// for uniqueness, through a `BTreeSet` on name and on artifact id, and not
+    /// for order. So they may genuinely need sorting, and when either does this
+    /// still makes the copy it always made.
+    fn canonicalized(&self) -> Cow<'_, Self> {
+        if self.is_already_canonical() {
+            return Cow::Borrowed(self);
+        }
+        let mut canonical = self.clone();
+        canonical
+            .ref_mutations
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        if let Some(workspace) = &mut canonical.workspace_mutation {
+            workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+            workspace.semantic_delta.sort_canonical();
+        }
+        Cow::Owned(canonical)
+    }
+
+    /// Whether every collection [`Self::canonicalized`] sorts is already in
+    /// that order.
+    ///
+    /// Deliberately does NOT consult the semantic delta. Validation has already
+    /// refused any record whose delta vectors are out of order, so asking again
+    /// would walk the one collection that is large to re-establish something
+    /// the caller proved a few lines earlier. If that validation ever stops
+    /// enforcing the order, this comment is the thing that is wrong, and the
+    /// differential test against the retained sorting path is what will say so.
+    fn is_already_canonical(&self) -> bool {
+        let refs_sorted = self
+            .ref_mutations
+            .windows(2)
+            .all(|pair| pair[0].name <= pair[1].name);
+        let tree_sorted = self.workspace_mutation.as_ref().is_none_or(|workspace| {
+            workspace
+                .tree_deltas
+                .windows(2)
+                .all(|pair| pair[0].artifact_id() <= pair[1].artifact_id())
+        });
+        refs_sorted && tree_sorted
+    }
+
+    /// The pre-borrowing `canonicalized`: always a copy, always sorted.
+    ///
+    /// Retained as the ORACLE rather than deleted. A differential in which both
+    /// sides go through the same new code proves nothing, so this is kept as
+    /// the exact body that shipped, and the borrowing path is graded against
+    /// it. That is the same reason `canonical_json_bytes_via_tree` is kept
+    /// beside the streaming encoder in this crate.
+    #[cfg(test)]
+    fn canonicalized_by_copying(&self) -> Self {
         let mut canonical = self.clone();
         canonical
             .ref_mutations
@@ -1021,6 +1093,17 @@ impl RepositoryOperationRecord {
             workspace.semantic_delta.sort_canonical();
         }
         canonical
+    }
+
+    /// [`Self::identity_hash`] as it computed before the borrowing path, for
+    /// the differential.
+    #[cfg(test)]
+    pub(crate) fn identity_hash_by_copying(&self) -> Result<Hash256> {
+        self.validate()?;
+        hash_serialized(
+            b"kin-repository-operation-v4\0",
+            &self.canonicalized_by_copying().identity_payload(),
+        )
     }
 
     /// The exact payload [`Self::identity_hash`] hashes, over a canonicalized
@@ -2072,6 +2155,134 @@ mod tests {
         transaction.workspace_mutation = None;
         transaction.local_overlay_delta = None;
         transaction
+    }
+
+    /// The premise the borrowing path rests on, asserted rather than argued.
+    ///
+    /// `canonicalized` may borrow instead of copying only because a record that
+    /// has passed `validate` already has its semantic delta in the order
+    /// `sort_canonical` would impose. That holds only if the two use the SAME
+    /// key: `sort_canonical` sorts by `target_id`, and `validate` refuses
+    /// adjacent pairs that are not strictly increasing by `target_id`.
+    ///
+    /// If this ever fires, `canonicalized` must go back to copying, or become a
+    /// view type that sorts the delta itself. Everything else here assumes it.
+    #[test]
+    fn validate_enforces_the_order_sort_canonical_imposes() {
+        let first = EntityDelta::Added {
+            new: semantic_entity(1, "first"),
+        };
+        let second = EntityDelta::Added {
+            new: semantic_entity(2, "second"),
+        };
+        assert_ne!(
+            first.target_id(),
+            second.target_id(),
+            "the control: the two deltas must have distinct targets, or order is unobservable"
+        );
+        let (low, high) = if first.target_id() < second.target_id() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+
+        let descending = WorkspaceSemanticDelta {
+            version: WORKSPACE_SEMANTIC_DELTA_SCHEMA_VERSION,
+            entity_deltas: vec![high.clone(), low.clone()],
+            relation_deltas: Vec::new(),
+            external_reference_deltas: Vec::new(),
+        };
+        assert!(
+            descending.validate().is_err(),
+            "validate must refuse a descending delta, or it enforces no order at all"
+        );
+
+        let mut sorted = descending.clone();
+        sorted.sort_canonical();
+        assert_eq!(
+            sorted.entity_deltas,
+            vec![low, high],
+            "sort_canonical must order by the key validate enforces"
+        );
+        sorted.validate().expect(
+            "a sorted delta must satisfy validate; if it does not, sort_canonical and validate \
+             use different keys and canonicalized must not borrow",
+        );
+    }
+
+    /// The borrowing identity must be the copying identity, byte for byte.
+    ///
+    /// This is a PERSISTED authority digest. A byte that differs is not a
+    /// faster hash, it is every root bundle in every store being wrong, so the
+    /// borrowing path is graded against the exact body that shipped rather than
+    /// against a constant this binary produced.
+    #[test]
+    fn the_borrowed_identity_is_the_copying_identity_for_every_shape() {
+        let mut reversed_refs = sample_operation_record();
+        reversed_refs.ref_mutations.reverse();
+
+        let mut reversed_tree = sample_operation_record();
+        if let Some(workspace) = &mut reversed_tree.workspace_mutation {
+            workspace.tree_deltas.reverse();
+        }
+
+        let mut no_workspace = sample_operation_record();
+        no_workspace.workspace_mutation = None;
+
+        let mut no_refs = sample_operation_record();
+        no_refs.ref_mutations.clear();
+
+        // A case that IS canonical, so the borrow path is exercised. The
+        // fixture is deliberately non-canonical: `canonicalizable_transaction`
+        // says "every vector below is out of canonical order on purpose", so
+        // without this every case took the copy path, and the control below
+        // said so on the first CI run.
+        let mut already_canonical = sample_operation_record();
+        already_canonical
+            .ref_mutations
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        if let Some(workspace) = &mut already_canonical.workspace_mutation {
+            workspace.tree_deltas.sort_by_key(TreeDelta::artifact_id);
+        }
+
+        let cases: [(&str, RepositoryOperationRecord); 6] = [
+            ("already canonical", already_canonical),
+            ("as built", sample_operation_record()),
+            ("ref mutations reversed", reversed_refs),
+            ("tree deltas reversed", reversed_tree),
+            ("no workspace mutation", no_workspace),
+            ("no ref mutations", no_refs),
+        ];
+
+        for (name, record) in &cases {
+            let borrowed = record.identity_hash().expect("the borrowing path hashes");
+            let copying = record
+                .identity_hash_by_copying()
+                .expect("the copying oracle hashes");
+            assert_eq!(
+                borrowed, copying,
+                "the borrowed identity differs from the copying identity for the {name} case, \
+                 which would change a persisted authority digest"
+            );
+        }
+
+        // The control that stops this passing vacuously: at least one case must
+        // actually take the COPYING path, or the differential only ever
+        // compared the borrowing path with itself.
+        assert!(
+            cases
+                .iter()
+                .any(|(_, record)| !record.is_already_canonical()),
+            "the control: some case must be non-canonical, or the copy path is never exercised"
+        );
+        // And at least one must take the BORROWING path, for the same reason in
+        // the other direction.
+        assert!(
+            cases
+                .iter()
+                .any(|(_, record)| record.is_already_canonical()),
+            "the control: some case must be canonical, or the borrow path is never exercised"
+        );
     }
 
     /// One operation record carrying every optional field this crate can put in
