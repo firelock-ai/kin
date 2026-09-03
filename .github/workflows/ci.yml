@@ -1122,6 +1122,8 @@ jobs:
             scripts/check-kin-vfs-compat.test.mjs \
             scripts/check-rc-build-drift.test.mjs \
             scripts/check-release-proof-artifacts.test.mjs \
+            scripts/release-promotion-plan.test.mjs \
+            scripts/read-promotion-plan.test.mjs \
             scripts/release-train-body.test.mjs \
             scripts/check-release-version.test.mjs \
             scripts/release-intent.test.mjs \
@@ -1695,6 +1697,8 @@ jobs:
             scripts/check-kin-vfs-compat.test.mjs \
             scripts/check-rc-build-drift.test.mjs \
             scripts/check-release-proof-artifacts.test.mjs \
+            scripts/release-promotion-plan.test.mjs \
+            scripts/read-promotion-plan.test.mjs \
             scripts/release-train-body.test.mjs \
             scripts/check-release-version.test.mjs \
             scripts/release-intent.test.mjs \

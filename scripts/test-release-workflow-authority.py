@@ -872,6 +872,16 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
         "stranger-standby": "Report the stranger a runner cannot take",
         "report": "Report the cut's decision",
     },
+    # The second tier of the proof contract. A tag now mints on the machine
+    # preflight alone and the release is published as a prerelease; this sweep
+    # is what takes it to GitHub Latest once its stranger record lands, and what
+    # alarms while it has not. None of its jobs runs on a pull_request or
+    # merge_group event, so none can claim a required context; it is registered
+    # here because this census is what would otherwise let a new workflow's job
+    # NAME appear unreviewed.
+    ".github/workflows/release-promote.yml": {
+        "promote": "Promote proven releases to Latest",
+    },
     ".github/workflows/release-recovery.yml": {
         "reconcile": "Reconcile failed release",
     },
@@ -1121,6 +1131,119 @@ EXTERNAL_REQUIRED_CONTEXT_SPOOF = textwrap.dedent(
 def require(content: str, needle: str, context: str) -> None:
     if needle not in content:
         raise AssertionError(f"{context} is missing required policy: {needle}")
+
+
+# ── the two-tier proof contract ───────────────────────────────────────────
+#
+# Until 2026-09-02 both decision points required the same thing: a preflight
+# record AND a complete stranger record, or no release at all. That made every
+# release hostage to a driver, and on run rc0551 the account's weekly limit
+# turned a proven candidate into a tag that could not be cut, with a hold alarm
+# as the only signal.
+#
+# The contract now has two tiers, and these assertions are what stop the tiers
+# collapsing back into one in either direction. Collapsing UP puts the outage
+# back. Collapsing DOWN promotes a release to GitHub Latest with no first-contact
+# proof, which is the 2026-08-20 failure this whole gate exists for.
+#
+# Every assertion reads active lines, never raw text, because each of these
+# files carries prose ABOUT the thing being asserted and a check satisfied by
+# its own explanatory comment cannot fail.
+TAG_TIER_MODE = "KIN_RELEASE_REQUIRE=preflight"
+PROMOTION_STATE = "complete"
+
+
+def assert_tag_tier_requires_only_the_machine_proof(release_tag: str) -> None:
+    """The mint must ask for the preflight tier, so a missing stranger cannot hold a tag."""
+
+    lines = active_lines(release_tag)
+    if not any(TAG_TIER_MODE in line for line in lines):
+        raise AssertionError(
+            "release-tag.yml must run the proof gate with "
+            f"{TAG_TIER_MODE}; without it a candidate whose stranger has not "
+            "run yet cannot be tagged at all, which is the outage this tier "
+            "exists to end"
+        )
+    # Reading the state is not optional. A mint that relaxed the requirement and
+    # then said nothing would cut tags that silently claim nothing, and the
+    # release would carry no record of what it is missing.
+    if not any("stranger_state=" in line for line in lines):
+        raise AssertionError(
+            "release-tag.yml must record the stranger state it proceeded on"
+        )
+
+
+def assert_latest_requires_the_stranger(release: str) -> None:
+    """GitHub Latest is the claim of first-contact coverage, so it needs the record."""
+
+    lines = active_lines(release)
+    gate = f'"$STRANGER_STATE" != {PROMOTION_STATE}'
+    if not any(gate in line for line in lines):
+        raise AssertionError(
+            "release.yml must refuse to promote a release to GitHub Latest "
+            f"unless its stranger state is {PROMOTION_STATE}; Latest is what an "
+            "installer resolves, so it is the claim first-contact proof backs"
+        )
+    if not any("promoted=false" in line for line in lines):
+        raise AssertionError(
+            "release.yml must record promoted=false when it holds a release, so "
+            "a downstream job can tell 'held' from 'this step never ran'"
+        )
+
+
+def assert_latest_claims_gate_on_promotion(release: str) -> None:
+    """Every job whose meaning is "this IS Latest" must gate on the promotion, not the job."""
+
+    needed = "needs.finalize_release.outputs.promoted == 'true'"
+    for job in ("promote_ghcr_latest", "seal_release_completion"):
+        start = release.index(f"\n  {job}:")
+        end = release.index("\n    steps:", start)
+        if needed not in "\n".join(active_lines(release[start:end])):
+            raise AssertionError(
+                f"{job} must gate on {needed}; it claims that this release IS "
+                "Latest, and finalize_release now succeeds without promoting "
+                "when first-contact proof is pending"
+            )
+
+
+def assert_require_modes_match_the_gate(
+    release_tag: str, release: str, proof_gate: str
+) -> None:
+    """The mode both workflows ask for must be one the gate module actually knows.
+
+    This is the coupling that would otherwise fail on a release night. A mode
+    renamed in the module and not in the workflows refuses at run time with
+    "unknown require mode", which is correct behaviour and a stopped release.
+    """
+
+    declared = re.search(
+        r"export const REQUIRE_MODES = Object\.freeze\(\[([^\]]*)\]\)",
+        proof_gate,
+    )
+    if declared is None:
+        raise AssertionError(
+            "the proof gate must declare REQUIRE_MODES for the workflows to be "
+            "checked against"
+        )
+    modes = set(re.findall(r"'([^']+)'", declared.group(1)))
+    asked = set()
+    for source in (release_tag, release):
+        for line in active_lines(source):
+            found = re.search(r"KIN_RELEASE_REQUIRE=([A-Za-z-]+)", line)
+            if found:
+                asked.add(found.group(1))
+    if not asked:
+        raise AssertionError(
+            "no workflow asks the proof gate for a require mode, so this "
+            "coupling checks nothing"
+        )
+    unknown = sorted(asked - modes)
+    if unknown:
+        raise AssertionError(
+            f"the release workflows ask the proof gate for mode(s) {unknown} "
+            f"that it does not declare (it knows {sorted(modes)}); move both "
+            "sides together"
+        )
 
 
 def expect_assertion(
@@ -16411,6 +16534,69 @@ def main() -> None:
                 assert_ruleset_mirror_stays_a_superset(mutant)
             ),
         )
+    # The two-tier proof contract, and a falsification arm per direction it
+    # could collapse. Each mutant is the smallest edit that would actually be
+    # made by someone "tidying up", not a syntactic wreck.
+    assert_tag_tier_requires_only_the_machine_proof(release_tag)
+    assert_latest_requires_the_stranger(release)
+    assert_latest_claims_gate_on_promotion(release)
+    assert_require_modes_match_the_gate(release_tag, release, proof_gate)
+    expect_assertion(
+        "the mint goes back to requiring a stranger before a tag",
+        "must run the proof gate with",
+        lambda mutant=release_tag.replace(
+            "            KIN_RELEASE_REQUIRE=preflight \\\n", "", 1
+        ): assert_tag_tier_requires_only_the_machine_proof(mutant),
+    )
+    expect_assertion(
+        "promotion to Latest stops asking about the stranger",
+        "must refuse to promote a release to GitHub Latest",
+        lambda mutant=release.replace(
+            'if [ "$STRANGER_STATE" != complete ]; then',
+            'if [ "$STRANGER_STATE" = never ]; then',
+            1,
+        ): assert_latest_requires_the_stranger(mutant),
+    )
+    expect_assertion(
+        "GHCR latest moves on a release that was held as a prerelease",
+        "must gate on needs.finalize_release.outputs.promoted",
+        lambda mutant=release.replace(
+            "        needs.config.outputs.release_channel == 'latest' &&\n"
+            "        needs.finalize_release.outputs.promoted == 'true' &&\n"
+            "        startsWith(github.ref, 'refs/tags/v') &&\n"
+            "        !contains(github.ref_name, '-')\n"
+            "      }}\n"
+            "    runs-on: ubuntu-latest\n"
+            "    environment: release\n"
+            "    # Least privilege for one registry-side tag move",
+            "        needs.config.outputs.release_channel == 'latest' &&\n"
+            "        startsWith(github.ref, 'refs/tags/v') &&\n"
+            "        !contains(github.ref_name, '-')\n"
+            "      }}\n"
+            "    runs-on: ubuntu-latest\n"
+            "    environment: release\n"
+            "    # Least privilege for one registry-side tag move",
+            1,
+        ): assert_latest_claims_gate_on_promotion(mutant),
+    )
+    expect_assertion(
+        "a workflow asks for a mode the gate module does not know",
+        "that it does not declare",
+        lambda mutant=release_tag.replace(
+            "KIN_RELEASE_REQUIRE=preflight", "KIN_RELEASE_REQUIRE=machine", 1
+        ): assert_require_modes_match_the_gate(mutant, release, proof_gate),
+    )
+    # The coupling must also be able to notice that nothing asks at all, or it
+    # would pass forever on a tree where the mode was deleted from both sides.
+    expect_assertion(
+        "no workflow asks the gate for a mode at all",
+        "so this coupling checks nothing",
+        lambda: assert_require_modes_match_the_gate(
+            release_tag.replace("KIN_RELEASE_REQUIRE=preflight", "", 1),
+            release.replace("KIN_RELEASE_REQUIRE=preflight", "", 1),
+            proof_gate,
+        ),
+    )
     assert_soft_decline_is_legible(release_tag)
     assert_recovery_escalation_classifies(
         RELEASE_RECOVERY.read_text(encoding="utf-8")
