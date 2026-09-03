@@ -3236,7 +3236,9 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
 
         let search_set = name_set(agent_search_tool_names());
         let mut with_search = tool_definitions();
-        with_search.tools.retain(|tool| search_set.contains(&tool.name));
+        with_search
+            .tools
+            .retain(|tool| search_set.contains(&tool.name));
         annotate_unserved_cross_references(&mut with_search, &registered, &search_set);
         let annotated: Vec<&ToolDefinition> = with_search
             .tools

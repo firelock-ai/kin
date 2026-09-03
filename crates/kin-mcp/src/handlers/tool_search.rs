@@ -6,10 +6,11 @@
 //! Every tool a profile serves rides in the model's prompt on every turn,
 //! because native tool calling re-sends the whole `tools` array. So the served
 //! list is a per-turn tax and the registry is far larger than any agent needs at
-//! once: 66 tools and 142,850 bytes on `full`, 15,345 bytes over 14 tools on
-//! `agent-query`. Measured across 40 real agentic runs on 2026-09-03, three
-//! tools took 96 of the 103 calls made, and nine of `agent-query`'s fourteen
-//! were offered and never called once.
+//! once: 67 tools on `full`, the 66 that preceded this one measured at 142,850
+//! bytes, against 13,725 over 14 tools on `agent-query` and 5,976 over the five
+//! this tool's own profile serves. Measured across 40 real agentic runs on
+//! 2026-09-03, three tools took 96 of the 103 calls made, and nine of
+//! `agent-query`'s fourteen were offered and never called once.
 //!
 //! The answer is not to drop those tools. It is to stop carrying them and to
 //! make them findable, which is what this is. A profile serves a small always-on
@@ -197,10 +198,7 @@ fn rank<'a>(definitions: &'a [ToolDefinition], need: &str) -> Vec<Ranked<'a>> {
     let mut ranked: Vec<Ranked<'a>> = definitions
         .iter()
         .filter_map(|definition| {
-            let mut score: u64 = terms
-                .iter()
-                .map(|term| term_score(definition, term))
-                .sum();
+            let mut score: u64 = terms.iter().map(|term| term_score(definition, term)).sum();
             if definition.name.eq_ignore_ascii_case(&exact) {
                 score += 10_000;
             }
@@ -369,8 +367,11 @@ mod tests {
         let payload = call(serde_json::json!({}));
         let names: Vec<String> =
             serde_json::from_value(payload["matched_names"].clone()).expect("names");
-        let mut registered: Vec<String> =
-            registry.tools.iter().map(|tool| tool.name.clone()).collect();
+        let mut registered: Vec<String> = registry
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
         registered.sort();
         let mut found = names.clone();
         found.sort();
