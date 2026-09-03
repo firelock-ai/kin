@@ -76,6 +76,42 @@ def matrix_artifacts(block: str) -> list[str]:
     return re.findall(r"(?m)^ +artifact: ([A-Za-z0-9._-]+)$", block)
 
 
+def job_names(source: str) -> list[str]:
+    return re.findall(r"(?m)^  ([a-z][a-z0-9_-]*):\n", source)
+
+
+def job_needs(block: str) -> list[str]:
+    match = re.search(r"(?m)^    needs: (.+)$", block)
+    if match is None:
+        return []
+    value = match.group(1).strip()
+    if value.startswith("["):
+        return [name.strip() for name in value.strip("[]").split(",") if name.strip()]
+    return [value]
+
+
+def job_if(block: str) -> str:
+    """The job-level `if`, block scalar or inline, flattened to one line."""
+
+    match = re.search(r"(?m)^    if: (.*)$", block)
+    if match is None:
+        return ""
+    first = match.group(1).strip()
+    if not first.startswith(">-") and not first.startswith("|"):
+        return first
+    body = block.split(match.group(0), 1)[1].splitlines()
+    lines = []
+    for line in body:
+        if not line.strip():
+            continue
+        if not line.startswith("      "):
+            break
+        if line.strip().startswith("#"):
+            continue
+        lines.append(line.strip())
+    return " ".join(lines)
+
+
 def load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
@@ -989,6 +1025,63 @@ class ContractTests(unittest.TestCase):
         self.assertIn("          pattern: kin-release-preflight-*\n", cut)
         rc = RC_BUILD_PATH.read_text(encoding="utf-8")
         self.assertNotIn("name: kin-release-preflight-", rc)
+
+    def test_every_job_downstream_of_a_skipped_arm_survives_that_skip(self) -> None:
+        """The second deadlock, as an assertion.
+
+        `arm` runs only on the `arm` decision, so it is skipped on the proof
+        path, and a skip propagates along the dependency chain to every job
+        that does not override it. `preflight` overrides it with `always()`;
+        `publish`, one link further down, did not, so on 2026-09-03 run
+        33699387471 decided `proof`, all three preflight legs passed and filed
+        their leg records, and the publisher skipped at once with zero steps.
+        It had never been evaluated before, because no cycle had ever reached
+        `proof`.
+
+        The rule this pins: any job that can be reached from `arm` through
+        `needs` has to carry a status function, or an upstream skip decides it.
+        """
+
+        source = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
+        blocks = {name: job_block(source, name) for name in job_names(source)}
+        self.assertIn("arm", blocks, "release-cut.yml no longer has an arm job")
+        self.assertIn(
+            "needs.select.outputs.decision == 'arm'",
+            job_if(blocks["arm"]),
+            "arm is no longer the conditional job this rule is about",
+        )
+
+        downstream: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for name, block in blocks.items():
+                if name in downstream or name == "arm":
+                    continue
+                if any(need == "arm" or need in downstream for need in job_needs(block)):
+                    downstream.add(name)
+                    changed = True
+
+        self.assertTrue(downstream, "nothing needs arm, so this rule guards nothing")
+        for name in sorted(downstream):
+            self.assertIn(
+                "always()",
+                job_if(blocks[name]),
+                f"job {name!r} is downstream of the conditional arm job without always(), "
+                "so an arm skip skips it whatever its own condition says",
+            )
+
+    def test_the_publisher_still_refuses_a_preflight_that_did_not_pass(self) -> None:
+        """`always()` must not become a gate that publishes anything.
+
+        The publisher survives an unrelated upstream skip, and nothing more: it
+        still has to read the preflight matrix's own result as success, and it
+        still only runs on the proof decision.
+        """
+
+        condition = job_if(job_block(CUT_WORKFLOW_PATH.read_text(encoding="utf-8"), "publish"))
+        self.assertIn("needs.preflight.result == 'success'", condition)
+        self.assertIn("needs.select.outputs.decision == 'proof'", condition)
 
     def test_the_workflow_calls_the_selector_and_binds_its_trigger(self) -> None:
         workflow = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")

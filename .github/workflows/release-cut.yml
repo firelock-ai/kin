@@ -440,7 +440,22 @@ jobs:
   publish:
     name: Publish the candidate's preflight record
     needs: [select, preflight]
-    if: needs.select.outputs.decision == 'proof' && needs.preflight.result == 'success'
+    # `always()` for the same reason `preflight` carries it, one link further
+    # down. `arm` is skipped on the proof path, and a skip propagates along the
+    # dependency chain to every job that does not override it, so without this
+    # the publisher was skipped even with both of its own needs green. It had
+    # never been evaluated before 2026-09-03: no cycle had ever reached `proof`,
+    # because the selector asked rc-builds for artifacts they do not upload. On
+    # run 33699387471 all three preflight legs passed, filed their leg records,
+    # and this job skipped at once with zero steps.
+    #
+    # This does not weaken the gate. The condition still demands that the
+    # preflight matrix concluded success, so a failed or skipped leg publishes
+    # nothing; `always()` only stops an unrelated upstream skip from deciding it.
+    if: >-
+      always() &&
+      needs.select.outputs.decision == 'proof' &&
+      needs.preflight.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: release-tag
