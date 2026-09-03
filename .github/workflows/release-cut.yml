@@ -551,18 +551,34 @@ jobs:
           body="$(gh api "repos/${GITHUB_REPOSITORY}" 2>&1)" || body=''
           if [ -z "$body" ]; then
             perms='UNREADABLE (the repo read itself failed)'
+            shape='UNREADABLE'
           else
             perms="$(printf '%s' "$body" | jq -c 'if has("permissions") then .permissions else "ABSENT" end' 2>/dev/null)" || perms='UNPARSEABLE'
+            shape="$(printf '%s' "$body" | jq -r 'if has("permissions") then (.permissions | type) else "key absent" end' 2>/dev/null)" || shape='UNPARSEABLE'
           fi
+          # Whether this is an installation token at all, which decides whether
+          # the field above is even meant to carry an answer. /installation/repositories
+          # is the one endpoint that answers for an installation token and refuses
+          # every other kind, so its status is the discriminator rather than a guess
+          # from the shape of something else.
+          inst="$(gh api /installation/repositories --jq '.total_count' 2>/dev/null)" || inst=''
+          if [ -n "$inst" ]; then kind="installation token (sees ${inst} repo(s))"; else kind='not an installation token, or that endpoint refused it'; fi
+          # contents:write is what the App holds; permissions.push is a repo-collaborator
+          # concept and is not obliged to project into it. If these disagree, the door
+          # is consulting the wrong field rather than the right field wrongly.
           {
             echo '### Evidence token scope'
             echo ''
-            printf 'GET /repos/%s returned permissions: %s\n' "$GITHUB_REPOSITORY" "${perms:-EMPTY}"
-            echo ''
+            printf 'GET /repos/%s permissions: %s\n\n' "$GITHUB_REPOSITORY" "${perms:-EMPTY}"
+            printf 'permissions field type: %s\n\n' "${shape:-EMPTY}"
+            printf 'token kind: %s\n\n' "$kind"
             echo 'The publisher refuses on a block whose push is not true, and proceeds when'
-            echo 'the block is absent, so the line above says which branch it took.'
+            echo 'the block is absent, so the lines above say which branch it took and'
+            echo 'whether that field could have carried the answer in the first place.'
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "evidence token sees permissions: ${perms:-EMPTY}"
+          echo "evidence token permissions: ${perms:-EMPTY}"
+          echo "evidence token permissions type: ${shape:-EMPTY}"
+          echo "evidence token kind: $kind"
           exit 0
 
       - name: Publish preflight.json for the candidate
