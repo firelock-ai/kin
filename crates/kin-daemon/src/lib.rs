@@ -146,6 +146,7 @@ pub mod session_registry;
 pub mod source_body_memo;
 mod source_cas;
 pub mod state;
+pub mod storage_delegate;
 pub mod supervisor;
 pub mod traffic_adapter;
 pub mod write_veto;
