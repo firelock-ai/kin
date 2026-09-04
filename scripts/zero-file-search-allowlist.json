@@ -54,9 +54,9 @@
     },
     {
       "file": "crates/kin-cli/src/commands/spec.rs",
-      "reason": "Known violation under repair, not a boundary claim. Unlike every other entry here, these reads ARE the answer authority: `kin spec list` and `kin spec show` resolve their result by walking and parsing .kin/specs/*.json, which is exactly what the Zero File-Search Authority Rule forbids on a query path. The entry exists so the violation is visible, owned, and dated rather than invisible, which it was until this module entered the scanned query set: nothing had ever reported it. It is not evidence the path is graph-backed and must not be read as one. The reason it cannot simply be fixed is storage, not wiring: the pinned registry crates carry no home for a spec. kin_model::Spec is a bare data struct, GraphStore composes EntityStore, ChangeStore, WorkStore, ReviewStore, VerificationStore, ProvenanceStore and SessionStore and none of them has a spec method, and kin-db imports SpecId without using it. Mapping a spec onto a WorkItem would drop constraints, affected systems, validation requirements and the free-string scope, so the faithful fix is a SpecStore in kin-model and kin-db, which is a bottom-up registry publish. Tracked on the internal board for the command and for the store substrate; both pins and this entry come out when the query path reads graph truth. Pinned to the seven exact expressions rather than the whole file, so the debt cannot grow: any newly added filesystem primitive in this module fails the guard",
+      "reason": "Known violation under repair, not a boundary claim. Unlike every other entry here, these reads ARE the answer authority: `kin spec list` and `kin spec show` resolve their result by walking and parsing .kin/specs/*.json, which is exactly what the Zero File-Search Authority Rule forbids on a query path. The entry exists so the violation is visible, owned, and dated rather than invisible, which it was until this module entered the scanned query set: nothing had ever reported it. It is not evidence the path is graph-backed and must not be read as one. The reason it cannot simply be fixed is storage, not wiring: the pinned registry crates carry no home for a spec. kin_model::Spec is a bare data struct, GraphStore composes EntityStore, ChangeStore, WorkStore, ReviewStore, VerificationStore, ProvenanceStore and SessionStore and none of them has a spec method, and kin-db imports SpecId without using it. Mapping a spec onto a WorkItem would drop constraints, affected systems, validation requirements and the free-string scope, so the faithful fix is a SpecStore in kin-model and kin-db, which is a bottom-up registry publish. Tracked on the internal board for the command and for the store substrate; both pins and this entry come out when the query path reads graph truth. Pinned to the seven exact expressions rather than the whole file, so the debt cannot grow: any newly added filesystem primitive in this module fails the guard. Re-dated from 2026-10-31 to 2027-01-29 on 2026-09-03. The original date was set while neither zero-file-search guard graded a pull request, so it was a tracking date rather than a merge blocker. kin#1448 moved both guards into fast-gate-lint, which carries the required \"Fast gate lint and policy\" context and no job-level if, so from that landing the expiry blocks every kin pull request on the day it fires, whatever that pull request touches. The fix is the SpecStore train described above: kin-model, then kin-db, then a registry publish, carrying a GraphSnapshot format version, which is not schedulable against the old date. Measured on 2026-09-03 against the current pins: still no SpecStore in kin-model 0.7.23 or kin-db 0.7.96, and kin-db still imports SpecId at types.rs:15 without using it. The new date is kin-cli's own review day under the staggering this guard now recommends, so it is not a day any other owner's entries share.",
       "owner": "kin-cli",
-      "expiration": "2026-10-31",
+      "expiration": "2027-01-29",
       "allow_match": [
         "fs::create_dir_all(&specs_dir)?;",
         "fs::write(&spec_file, &json)?;",
@@ -64,7 +64,8 @@
         "let mut entries: Vec<_> = fs::read_dir(specs_dir)?",
         "let content = fs::read_to_string(entry.path())?;",
         "if !spec_file.exists() {",
-        "let content = fs::read_to_string(&spec_file)?;"
+        "let content = fs::read_to_string(&spec_file)?;",
+        "use std::fs;"
       ]
     },
     {
@@ -276,7 +277,34 @@
         "fs::read_to_string(path).ok()",
         "let _ = fs::write(serving_path(kin_root), body);",
         "let _ = fs::remove_file(serving_path(kin_root));",
-        "let raw = fs::read_to_string(serving_path(kin_root)).ok()?;"
+        "let raw = fs::read_to_string(serving_path(kin_root)).ok()?;",
+        "&& fs::rename(&announced, kin_root.join(APPROACHING_COMMIT_FILE_NAME)).is_err()",
+        "&& fs::rename(&tmp, kin_root.join(KILL_RECORD_FILE_NAME)).is_err()",
+        "&& fs::rename(&tmp, kin_root.join(TRANSACTION_FILE_NAME)).is_err()",
+        "FileExt::lock_shared(&file)?;",
+        "_file: File,",
+        "_root: File,",
+        "fn open_windows_regular_nofollow(path: &Path) -> std::io::Result<File> {",
+        "fn open_windows_root_guard(path: &Path) -> std::io::Result<File> {",
+        {
+          "expr": "fn same_file_object(left: &fs::Metadata, right: &fs::Metadata) -> bool {",
+          "count": 2
+        },
+        "fn windows_file_identity(file: &File) -> std::io::Result<((u32, u64), u32)> {",
+        "let Ok(mut log) = OpenOptions::new()",
+        {
+          "expr": "let file = OpenOptions::new()",
+          "count": 2
+        },
+        "let mut options = OpenOptions::new();",
+        "use fs2::FileExt;",
+        "use std::fs::{self, File, OpenOptions};",
+        "use std::os::unix::fs::MetadataExt as _;",
+        "use std::os::unix::fs::OpenOptionsExt as _;",
+        {
+          "expr": "use std::os::windows::fs::OpenOptionsExt as _;",
+          "count": 2
+        }
       ]
     },
     {
@@ -324,7 +352,8 @@
         "reexec_self"
       ],
       "allow_match": [
-        "file: std::fs::File,"
+        "file: std::fs::File,",
+        "use fs2::FileExt;"
       ]
     },
     {
@@ -334,6 +363,15 @@
       "expiration": "2026-12-31",
       "allow_fn": [
         "try_acquire_repository_runtime_authority"
+      ],
+      "allow_match": [
+        "Err(error) if error.kind() == fs2::lock_contended_error().kind() => {",
+        "file: File,",
+        "fn acquire_lifecycle_coordination(kin_root: &Path, deadline: Instant) -> std::io::Result<File> {",
+        "fn stamp_owner(file: &mut File, owner_stamp: &str) {",
+        "let file = OpenOptions::new()",
+        "use fs2::FileExt;",
+        "use std::fs::{File, OpenOptions};"
       ]
     },
     {
@@ -386,7 +424,11 @@
       ],
       "allow_match": [
         "use std::process::{Child, Command, ExitStatus, Output, Stdio};",
-        "let _ = std::fs::remove_file(&self.path);"
+        "let _ = std::fs::remove_file(&self.path);",
+        "file: File,",
+        "use fs2::FileExt;",
+        "use std::fs::{File, OpenOptions};",
+        "use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};"
       ]
     },
     {
@@ -748,7 +790,11 @@
       "expiration": "2026-12-31",
       "allow_match": [
         "std::fs::File",
-        "std::fs::create_dir_all(out_dir)"
+        "std::fs::create_dir_all(out_dir)",
+        "stream: BufWriter::new(File::create(out_dir.join(\"transcript.jsonl\"))?),",
+        "stream: BufWriter<File>,",
+        "trace: BufWriter::new(File::create(out_dir.join(\"kin-trace.jsonl\"))?),",
+        "trace: BufWriter<File>,"
       ]
     },
     {
@@ -813,7 +859,21 @@
         "for child in fs::read_dir(&directory).map_err(|error| io(&directory, error))? {",
         "fs::symlink_metadata(child.path()).map_err(|error| io(child.path(), error))?;",
         "std::fs::File::open(&directory)",
-        "fs::remove_dir_all(path).map_err(|error| io(path, error))"
+        "fs::remove_dir_all(path).map_err(|error| io(path, error))",
+        "fn executable_bit(_metadata: &fs::Metadata) -> bool {",
+        "fn executable_bit(metadata: &fs::Metadata) -> bool {",
+        "fs::rename(&source, &backup).map_err(|error| io(&source, error))?;",
+        "fs::rename(&source, &destination).map_err(|error| io(&destination, error))",
+        "fs::rename(&staged, &destination).map_err(|error| io(&destination, error))?;",
+        "fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| io(path, error))",
+        "if let Err(error) = fs::rename(&transaction.stage_root, root) {",
+        "let mut file = OpenOptions::new()",
+        "std::os::unix::fs::symlink(PathBuf::from(target), destination)",
+        "use std::fs::{self, OpenOptions};",
+        {
+          "expr": "use std::os::unix::fs::PermissionsExt as _;",
+          "count": 2
+        }
       ]
     },
     {
@@ -860,6 +920,240 @@
           "count": 2
         }
       ]
+    },
+    {
+      "file": "crates/kin-core/src/assistant.rs",
+      "reason": "Assistant integration boundary: discovers, reads and writes the assistant configuration files Kin manages on the operator's machine. The guard reports 42 sites here, dominated by existence probes and `std::fs` reads and writes against those config paths. It resolves no locate, search, context, trace, review or xref result. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/assistant_sync.rs",
+      "reason": "Managed assistant-doc sync for AGENTS.md, CLAUDE.md, CODEX.md, GEMINI.md and their siblings, per the module's own doc. It writes Kin-generated content inside managed blocks while preserving everything around them, which is a materialization boundary: the content comes from Kin, the file is the output. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/config.rs",
+      "reason": "The semantic repository's own config file, read and written at a path the caller already validated. It never resolves a path by searching and answers no query. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/config/windows.rs",
+      "reason": "The Windows half of the same config writer, and the identical boundary as config.rs beside it. Split out because publishing a file atomically shares no code between the two platforms: the Unix writer holds a directory descriptor and publishes with `renameat2`. Every call here writes or proves the repository's own config file at a path the caller already validated, never resolves one by searching. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/dependencies.rs",
+      "reason": "Cross-repo dependency detection from manifest files, per the module's own doc: it parses Cargo.toml, package.json and go.mod to discover external dependencies. That is a manifest ingestion boundary rather than a graph answer, and whether this should resolve from the spine instead is the open question `deps.rs` is scanned to keep visible. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/git_init.rs",
+      "reason": "Exact, fail-closed Git repository admission, per the module's own doc: Git is consulted only at this explicit ingestion boundary. Reading a Git repository from disk is the whole point of an import boundary, and it runs before graph truth for that repository exists. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/init.rs",
+      "reason": "Repository conversion, end to end, and the largest of these at 102 reported sites. It runs before any graph exists, on the source tree and on the staging directories it mints itself, and its output is the .kin repository rather than an answer to a query. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/init_attempt.rs",
+      "reason": "The post-mortem for an interrupted init, and the same boundary as init_staging.rs beside it. It reads only the staging directories init itself minted in the repository's parent, to report where a killed conversion stopped and how much disk it is holding. It answers no locate, search, context, trace, review or xref query, reads no repository content, and runs before any graph exists. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/init_staging.rs",
+      "reason": "Init's own staging directories, and nothing else. It runs before any graph exists, on paths init itself minted, and its whole output is whether a directory this process created still needs removing. It answers no query, and the directory it enumerates is the repository's parent, never repository content. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/layout.rs",
+      "reason": "The on-disk shape of a .kin repository: where its directories are and whether they are present. Eight sites, all existence probes and path resolution against the repository's own layout rather than against repository content. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/manifest.rs",
+      "reason": "The repository manifest file, read and written at the layout's own path. Four sites, all against that one file. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/registry.rs",
+      "reason": "The cross-repo Kin registry at `<managed Kin home>/registry.toml`, per the module's own doc, which lets MCP servers and cross-repo queries discover Kin repositories on disk. The registry file is the boundary; what it returns is a list of repository roots, not a semantic answer about any repository's contents. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/shims.rs",
+      "reason": "Graph-projection command shims: when Kin launches an assistant or shell against an exact workspace projection, this writes a directory of small wrapper executables for it to find. It only writes, and what it writes is generated by Kin. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/sync_state.rs",
+      "reason": "Persisted sync state per remote in `.kin/sync_state.json`, per the module's own doc. Two sites, both reading and writing that one Kin-owned file. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/tree.rs",
+      "reason": "Working-tree inspection for admission and reconcile, and the second largest at 144 sites, overwhelmingly metadata and file-type probes. It is the input boundary that tells Kin what the tree currently holds so the graph can be built from or compared against it. It is also the file in this set closest to an answer path, which is why the expiry matters: this is the one to narrow to pins first. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-git/src/lossless.rs",
+      "reason": "The lossless Git migration boundary, per the module's own doc: it preserves Git as an exact external format without making it an authority path inside Kin. Capturing a Git repository from disk is the entire point of an import boundary. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-git",
+      "expiration": "2027-03-31"
+    },
+    {
+      "file": "crates/kin-git/src/admission_blockers.rs",
+      "reason": "Runs before any graph exists, on the source Git repository, and produces only refusals. Nothing it reads reaches a query answer, and its whole output is a list of reasons admission cannot start. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-git",
+      "expiration": "2027-03-31"
+    },
+    {
+      "file": "crates/kin-git/src/preflight.rs",
+      "reason": "Read-only authority preflight for one exact Git workspace migration, per the module's own doc: it proves a checkout matches its committed seed before admission. It refuses or proceeds; it never produces a result a user queried for. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-git",
+      "expiration": "2027-03-31"
+    },
+    {
+      "file": "crates/kin-git/src/repository_export.rs",
+      "reason": "Exact Git projection for repository-v6 authority, per the module's own doc: imported Git objects are copied byte-for-byte from graph-owned source CAS. This materializes graph-owned history back out as Git, which is an output boundary. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-git",
+      "expiration": "2027-03-31"
+    },
+    {
+      "file": "crates/kin-ranking/src/ltr.rs",
+      "reason": "The gradient-boosted ranking model's own serialized weights, loaded from and saved to a model file. Two sites, both against that file. The ranking it then performs reads graph results, never the filesystem. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-ranking",
+      "expiration": "2027-04-30"
+    },
+    {
+      "file": "crates/kin-cli/src/daemon_client.rs",
+      "reason": "HTTP client and lifecycle helpers for the kin daemon, per the module's own doc: CLI commands use it to query the daemon's live graph instead of opening a snapshot directly. The 122 reported sites are daemon lifecycle rather than answers: the socket and port records, the binary it re-execs, and the subprocess that starts it. The answers themselves come back over HTTP from the graph. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-01-29"
+    },
+    {
+      "file": "crates/kin-cli/src/profile.rs",
+      "reason": "Local CLI profile and environment probing. Eight sites, five of them subprocess execution for environment discovery, none of them reading repository content. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-01-29"
+    },
+    {
+      "file": "crates/kin-cli/src/main.rs",
+      "reason": "The CLI entry point: argument dispatch, and the process launches that dispatch implies. Ten sites, eight of them subprocess execution. It routes to the command modules rather than resolving any answer itself, and the query commands it routes to are scanned. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-01-29"
+    },
+    {
+      "file": "crates/kin-migrate/src/bounded_process.rs",
+      "reason": "Bounded, tree-contained execution for migration metadata subprocesses, per the module's own doc. The subprocess IS the product here: it drains stdout and stderr into byte-bounded sinks and terminates descendants. It runs no search tool on Kin's behalf and answers no query. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-migrate/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 8 .rs files, 8 of them on the scanned runtime path, and only 4 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-migrate",
+      "expiration": "2027-05-28"
+    },
+    {
+      "file": "crates/kin-migrate/src/executor.rs",
+      "reason": "Exact in-place Git migration, per the module's own doc, delegating to the same atomic repository-v6 admission boundary as `kin init` so there is one Git-to-Kin authority path. Migration is explicitly allowed to read files as an ingestion boundary. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-migrate/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 8 .rs files, 8 of them on the scanned runtime path, and only 4 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-migrate",
+      "expiration": "2027-05-28"
+    },
+    {
+      "file": "crates/kin-migrate/src/scanner.rs",
+      "reason": "Pre-migration scanning of the source repository. It reads the tree being migrated, which is the input side of an ingestion boundary, and produces no query result. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-migrate/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 8 .rs files, 8 of them on the scanned runtime path, and only 4 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-migrate",
+      "expiration": "2027-05-28"
+    },
+    {
+      "file": "crates/kin-migrate/src/finalize.rs",
+      "reason": "Shared onboarding finalization for `kin init` and `kin migrate`, per the module's own doc: it persists the .kidx read index and the registry entry. One site, on that output path. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-migrate/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 8 .rs files, 8 of them on the scanned runtime path, and only 4 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-migrate",
+      "expiration": "2027-05-28"
+    },
+    {
+      "file": "crates/kin-index/src/repository.rs",
+      "reason": "Exact repository membership discovery, per the module's own doc: it admits every regular file and symbolic link, including configuration, vendored trees, binaries and unsupported languages. Walking the tree is how graph membership is built, which the rule allows explicitly as ingestion. It is also the largest unowned surface of the six directories, at 45 sites, and a defect here mislabels graph truth rather than answering from the tree. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-index/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 36 .rs files, 14 of them on the scanned runtime path, and only 4 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-index",
+      "expiration": "2027-06-25"
+    },
+    {
+      "file": "crates/kin-index/src/watcher.rs",
+      "reason": "The filesystem watcher that tells the index what changed. Watching paths is the trigger for re-ingestion, not an answer to a query. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-index/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 36 .rs files, 14 of them on the scanned runtime path, and only 4 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-index",
+      "expiration": "2027-06-25"
+    },
+    {
+      "file": "crates/kin-index/src/pipeline.rs",
+      "reason": "The graph build and update pipeline. Five sites, on the ingestion path that turns files into graph-owned entities. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-index/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 36 .rs files, 14 of them on the scanned runtime path, and only 4 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-index",
+      "expiration": "2027-06-25"
+    },
+    {
+      "file": "crates/kin-index/src/support.rs",
+      "reason": "Coverage and support reporting, per the module's own doc: it walks a directory tree, classifies every file and summarises how many fall into each bucket. It reports on ingestion coverage rather than answering a semantic query, and it returns counts rather than file contents. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-index/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 36 .rs files, 14 of them on the scanned runtime path, and only 4 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-index",
+      "expiration": "2027-06-25"
+    },
+    {
+      "file": "crates/kin-registry/src/atomic_file.rs",
+      "reason": "Crash-safe publication of registry artifacts, per the module's own doc: stage bytes in the destination directory, durably flush, then replace with one atomic rename. Publication is a write boundary, and all 46 sites here are that one pattern. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-registry/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 7 .rs files, 7 of them on the scanned runtime path, and only 4 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-registry",
+      "expiration": "2027-07-30"
+    },
+    {
+      "file": "crates/kin-registry/src/lib.rs",
+      "reason": "Package serving for the KinLab platform, per the module's own doc, layered as blob store, manifest store and per-ecosystem protocol adapter. It serves packages, not repository semantics, and answers no locate, search, context, trace, review or xref query. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-registry/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 7 .rs files, 7 of them on the scanned runtime path, and only 4 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-registry",
+      "expiration": "2027-07-30"
+    },
+    {
+      "file": "crates/kin-registry/src/oci.rs",
+      "reason": "The OCI Distribution Specification adapter, per the module's own doc. Same boundary as lib.rs above: an artifact protocol served over HTTP. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-registry/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 7 .rs files, 7 of them on the scanned runtime path, and only 4 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-registry",
+      "expiration": "2027-07-30"
+    },
+    {
+      "file": "crates/kin-registry/src/storage_lock.rs",
+      "reason": "Cross-process advisory locks for registry storage transactions, per the module's own doc, keyed on the shared storage path because a registry root can be mounted by several daemon processes. The lock file is the boundary and it holds no repository content. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-registry/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 7 .rs files, 7 of them on the scanned runtime path, and only 4 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-registry",
+      "expiration": "2027-07-30"
+    },
+    {
+      "file": "crates/kin-runtime/src/exec.rs",
+      "reason": "Running a command in a materialized workspace, which is this crate's product rather than a query path. All three sites are subprocess execution; the crate reads no repository file. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-runtime/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 7 .rs files, 7 of them on the scanned runtime path, and only 3 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-runtime",
+      "expiration": "2027-08-27"
+    },
+    {
+      "file": "crates/kin-runtime/src/run.rs",
+      "reason": "The run surface over the same execution boundary. Two sites, both subprocess execution. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-runtime/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 7 .rs files, 7 of them on the scanned runtime path, and only 3 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-runtime",
+      "expiration": "2027-08-27"
+    },
+    {
+      "file": "crates/kin-runtime/src/workspace.rs",
+      "reason": "The materialized workspace a command runs inside. One site, on preparing that workspace rather than reading it for an answer. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-runtime/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 7 .rs files, 7 of them on the scanned runtime path, and only 3 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-runtime",
+      "expiration": "2027-08-27"
+    },
+    {
+      "file": "crates/kin-parser/src/todos.rs",
+      "reason": "Inline TODO/FIXME/HACK extraction, per the module's own doc, and the one genuine recursive source-tree walk among the six directories: read_dir, recurse on is_dir, read_to_string every file with a matching extension, depth-bounded. It is legal today and that was checked rather than assumed: both live callers, `work.rs:895` for `kin work todo-import` and `handlers/work.rs:570` for the agent-facing `kin_todo_import` MCP tool, persist every extracted marker through `create_work_item` and return counts, so the walk builds graph-owned truth, which the rule permits. It is one caller away from illegal: the day something returns the extracted list instead of importing it, this walk becomes the answer. That is exactly why it needs an owner and a date rather than a crate-wide silence. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-parser/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 33 .rs files, 20 of them on the scanned runtime path, and only 1 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
+      "owner": "kin-parser",
+      "expiration": "2027-09-24"
     }
   ]
 }
