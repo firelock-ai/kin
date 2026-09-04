@@ -282,15 +282,16 @@ export async function buildPlan({
   if (!repository) {
     throw new Error('no repository given; set GITHUB_REPOSITORY');
   }
-  const releases = await api('/releases?per_page=100');
-  // A full page is a refusal, not an answer. A promoter that silently read
-  // only the newest hundred releases would go quiet exactly when the list
-  // grew past them, and it would look identical to a healthy rail.
-  if (Array.isArray(releases) && releases.length === 100) {
-    throw new Error(
-      'the release listing filled a whole page, so it may be truncated; page ' +
-      'it before trusting this sweep',
-    );
+  const releases = [];
+  // Read the complete listing before judging any release. A full final page
+  // needs one more request to distinguish it from a truncated listing.
+  for (let page = 1; ; page += 1) {
+    const entries = await api(`/releases?per_page=100&page=${page}`);
+    if (!Array.isArray(entries)) {
+      throw new Error(`release listing page ${page} did not come back as an array`);
+    }
+    releases.push(...entries);
+    if (entries.length < 100) break;
   }
   const candidates = selectCandidates(releases);
   log(`${candidates.length} published stable release(s) are not GitHub Latest`);
