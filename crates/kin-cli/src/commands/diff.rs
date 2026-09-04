@@ -80,6 +80,13 @@ pub struct DiffSummary {
     pub entities_added: usize,
     pub entities_modified: usize,
     pub entities_removed: usize,
+    /// Entities that appear in a changed artifact on both endpoints while their
+    /// own content is identical.
+    ///
+    /// Counted rather than silently dropped, and `#[serde(default)]` because
+    /// this crosses the daemon wire and an older peer sends none.
+    #[serde(default)]
+    pub entities_unchanged: usize,
     pub relations_added: usize,
     pub relations_modified: usize,
     pub relations_removed: usize,
@@ -311,9 +318,15 @@ pub fn inspect_with_endpoint_entities(
         &mut base_state,
         &mut head_state,
     );
-    let entity_deltas = diff_entities(&base_state.entities, &head_state.entities);
+    let (entity_deltas, entities_unchanged) =
+        diff_entities(&base_state.entities, &head_state.entities);
     let relation_deltas = diff_relations(&base_state.relations, &head_state.relations);
-    let summary = summarize(&artifact_deltas, &entity_deltas, &relation_deltas);
+    let summary = summarize(
+        &artifact_deltas,
+        &entity_deltas,
+        &relation_deltas,
+        entities_unchanged,
+    );
 
     let report = DiffReport {
         artifact_content: Vec::new(),
@@ -615,27 +628,52 @@ fn diff_trees(base: &ResolvedTree, head: &ResolvedTree) -> Vec<TreeDelta> {
         .collect()
 }
 
+/// The entity transitions between two graph states, and how many file-level
+/// ones were withheld.
+///
+/// A `Modified` delta is reported when the entity's own CONTENT moved, asked
+/// through [`kin_core::workspace_semantics::entity_content_agrees`], which is
+/// the same question `kin conflicts`, `kin log`, `kin blame` and `kin history`
+/// ask. Comparing the whole `Entity` here is what made `kin diff` answer a
+/// two-function commit with `Entities: +1 ~11 -0` and list nine functions the
+/// author never touched: `reconciler` stamps the whole FILE's blob hash into
+/// every entity's `metadata.extra`, and editing one function moves the byte
+/// span of every entity below it, so every entity in a changed file compares
+/// unequal.
+///
+/// The withheld count is returned rather than dropped. Those revisions are
+/// real, they are what the file did, and a reader who cannot see that they
+/// exist has lost information rather than been spared noise. That is the
+/// contract `kin blame` already holds its own listing to.
 fn diff_entities(
     base: &HashMap<EntityId, Entity>,
     head: &HashMap<EntityId, Entity>,
-) -> Vec<EntityDelta> {
-    base.keys()
+) -> (Vec<EntityDelta>, usize) {
+    let mut deltas = Vec::new();
+    let mut withheld = 0usize;
+    for entity_id in base
+        .keys()
         .copied()
         .chain(head.keys().copied())
         .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter_map(
-            |entity_id| match (base.get(&entity_id), head.get(&entity_id)) {
-                (None, Some(new)) => Some(EntityDelta::Added { new: new.clone() }),
-                (Some(old), Some(new)) if old != new => Some(EntityDelta::Modified {
-                    old: old.clone(),
-                    new: new.clone(),
-                }),
-                (Some(old), None) => Some(EntityDelta::Removed { old: old.clone() }),
-                (Some(_), Some(_)) | (None, None) => None,
-            },
-        )
-        .collect()
+    {
+        match (base.get(&entity_id), head.get(&entity_id)) {
+            (None, Some(new)) => deltas.push(EntityDelta::Added { new: new.clone() }),
+            (Some(old), Some(new)) if old != new => {
+                if kin_core::workspace_semantics::entity_content_agrees(old, new) {
+                    withheld += 1;
+                } else {
+                    deltas.push(EntityDelta::Modified {
+                        old: old.clone(),
+                        new: new.clone(),
+                    });
+                }
+            }
+            (Some(old), None) => deltas.push(EntityDelta::Removed { old: old.clone() }),
+            (Some(_), Some(_)) | (None, None) => {}
+        }
+    }
+    (deltas, withheld)
 }
 
 fn diff_relations(
@@ -665,8 +703,12 @@ fn summarize(
     artifacts: &[TreeDelta],
     entities: &[EntityDelta],
     relations: &[RelationDelta],
+    entities_unchanged: usize,
 ) -> DiffSummary {
-    let mut summary = DiffSummary::default();
+    let mut summary = DiffSummary {
+        entities_unchanged,
+        ..DiffSummary::default()
+    };
     for delta in artifacts {
         match delta {
             TreeDelta::Added { .. } => summary.artifacts_added += 1,
@@ -963,6 +1005,28 @@ pub fn build_diff_response(
     })
 }
 
+/// The line naming what the entity counts did not show.
+///
+/// Named rather than silent. The withheld revisions are real, they are what the
+/// file did, and a reader who cannot see that they exist has lost information
+/// rather than been spared noise.
+///
+/// Half of `kin blame`'s contract, not all of it. Blame names its withheld
+/// count AND takes `--all-revisions` to list them; `kin diff` names the count
+/// and has no flag that shows them yet. Saying so here rather than claiming the
+/// whole contract, because the flag is the follow-up and a comment that claims
+/// it is the reason nobody writes it.
+fn unchanged_entities_line(unchanged: usize) -> Option<String> {
+    if unchanged == 0 {
+        return None;
+    }
+    let plural = if unchanged == 1 { "y" } else { "ies" };
+    Some(format!(
+        "{unchanged} entit{plural} moved with a changed artifact without changing; \
+         they are not counted above"
+    ))
+}
+
 fn render_lines(report: &DiffReport) -> Vec<String> {
     let mut lines = vec![
         "Kin repository-v6 diff".to_string(),
@@ -988,6 +1052,9 @@ fn render_lines(report: &DiffReport) -> Vec<String> {
             report.summary.relations_removed
         ),
     ];
+    if let Some(line) = unchanged_entities_line(report.summary.entities_unchanged) {
+        lines.push(line);
+    }
     for delta in &report.artifact_deltas {
         lines.push(render_tree_delta(delta));
     }
@@ -1296,6 +1363,91 @@ mod tests {
         }
     }
 
+    /// `entity`, plus the file-level noise a real reconcile stamps on every
+    /// entity in a touched file whether or not that entity moved: the whole
+    /// FILE's blob hash in `metadata.extra`, and the byte span everything below
+    /// an edit shifts to.
+    fn entity_stamped(id: EntityId, name: &str, body: u8, stamp: u8) -> Entity {
+        let mut built = entity(id, name);
+        built.fingerprint.ast_hash = Hash256::from_bytes([body; 32]);
+        built.fingerprint.behavior_hash = Hash256::from_bytes([body; 32]);
+        built.fingerprint.equivalence_hash = Hash256::from_bytes([body; 32]);
+        built.metadata.extra.insert(
+            "artifact_blob".to_string(),
+            serde_json::Value::String(format!("{stamp:02x}")),
+        );
+        built.span = Some(kin_model::SourceSpan {
+            file: FilePathId::new("ledger/reporting.py"),
+            start_byte: usize::from(stamp) * 100,
+            end_byte: usize::from(stamp) * 100 + 40,
+            start_line: u32::from(stamp),
+            start_col: 0,
+            end_line: u32::from(stamp) + 3,
+            end_col: 0,
+        });
+        built
+    }
+
+    /// The vcs stranger run's `kin diff` finding, rebuilt.
+    ///
+    /// A commit that edited two function bodies reported
+    /// `Entities: +1 ~11 -0` and listed nine functions the author never
+    /// touched, because `diff_entities` compared the whole `Entity` and every
+    /// entity in a changed file carries that file's blob hash and a shifted
+    /// span. Twelve entities live in the two changed files, one is new, and
+    /// exactly one of the survivors was edited.
+    ///
+    /// Breaking it: put `old != new` back in place of the content comparison in
+    /// `diff_entities` and this reports eleven modified.
+    #[test]
+    fn a_two_function_commit_reports_the_functions_it_changed() {
+        let ids: Vec<EntityId> = (0..12).map(|_| EntityId::new()).collect();
+        let added = EntityId::new();
+        let mut base = HashMap::new();
+        let mut head = HashMap::new();
+        for (index, id) in ids.iter().enumerate() {
+            let name = format!("entity_{index}");
+            base.insert(*id, entity_stamped(*id, &name, 1, 0x10));
+            // Only the first survivor's own body moved. Every other entity
+            // moved only with its file.
+            let body = if index == 0 { 2 } else { 1 };
+            head.insert(*id, entity_stamped(*id, &name, body, 0x30));
+        }
+        head.insert(added, entity_stamped(added, "format_currency", 9, 0x30));
+
+        let (deltas, unchanged) = diff_entities(&base, &head);
+        let summary = summarize(&[], &deltas, &[], unchanged);
+        assert_eq!(summary.entities_added, 1, "{deltas:#?}");
+        assert_eq!(
+            summary.entities_modified, 1,
+            "one function body moved, not eleven: {deltas:#?}"
+        );
+        assert_eq!(summary.entities_removed, 0);
+        assert_eq!(
+            summary.entities_unchanged, 11,
+            "the eleven that moved with their file are counted, not dropped"
+        );
+
+        // Counted is not enough. A reader has to be able to SEE that they
+        // exist, which is the contract `kin blame` already holds itself to.
+        let line =
+            unchanged_entities_line(summary.entities_unchanged).expect("a withheld count says so");
+        assert!(line.contains("11"), "{line}");
+    }
+
+    /// The control for the test above. A diff that elides nothing must say
+    /// nothing about eliding, or every diff reads as trimmed.
+    #[test]
+    fn a_diff_that_withholds_nothing_says_nothing_about_withholding() {
+        let id = EntityId::new();
+        let base = HashMap::from([(id, entity_stamped(id, "format_totals", 1, 0x10))]);
+        let head = HashMap::from([(id, entity_stamped(id, "format_totals", 2, 0x30))]);
+        let (deltas, unchanged) = diff_entities(&base, &head);
+        assert_eq!(deltas.len(), 1, "a real body change is still reported");
+        assert_eq!(unchanged, 0);
+        assert!(unchanged_entities_line(unchanged).is_none());
+    }
+
     fn entity_in(id: EntityId, name: &str, file: &str) -> Entity {
         let mut built = entity(id, name);
         built.file_origin = Some(FilePathId::new(file));
@@ -1388,7 +1540,7 @@ mod tests {
         );
 
         // And the delta says what happened, which is the whole point.
-        let deltas = diff_entities(&base.entities, &head.entities);
+        let (deltas, _) = diff_entities(&base.entities, &head.entities);
         assert_eq!(deltas.len(), 2, "one added, one removed: {deltas:?}");
 
         match basis {
@@ -1530,7 +1682,7 @@ mod tests {
         let base_relations = HashMap::new();
         let head_relations = HashMap::from([(relation_id, relation.clone())]);
 
-        let entity_deltas = diff_entities(&base_entities, &head_entities);
+        let (entity_deltas, _) = diff_entities(&base_entities, &head_entities);
         let relation_deltas = diff_relations(&base_relations, &head_relations);
         assert_eq!(entity_deltas.len(), 3);
         assert!(entity_deltas.iter().any(|delta| {

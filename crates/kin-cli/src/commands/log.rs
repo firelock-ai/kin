@@ -43,7 +43,21 @@ pub struct LogEntry {
     pub timestamp: Timestamp,
     pub author: AuthorId,
     pub message: String,
+    /// Entity deltas whose entity's own content moved.
+    ///
+    /// Not `entity_deltas.len()`. A change that edits one function mints a
+    /// revision for every entity in that file, because `reconciler` stamps the
+    /// whole FILE's blob hash into every entity's `metadata.extra` and editing
+    /// one function moves the byte span of every entity below it. Those
+    /// revisions are real and are what the file did; counting them here
+    /// answered a two-function commit with `entities=12`.
     pub entity_delta_count: usize,
+    /// The entity deltas the count above leaves out, named rather than dropped.
+    ///
+    /// `#[serde(default)]` because this crosses the daemon wire and an older
+    /// peer sends none.
+    #[serde(default)]
+    pub entity_deltas_unchanged: usize,
     pub relation_delta_count: usize,
     pub tree_delta_count: usize,
     pub admission_policy_changed: bool,
@@ -135,6 +149,7 @@ pub fn inspect(
                 pending.push_back((*parent, depth + 1));
             }
         }
+        let entity_deltas_unchanged = unchanged_entity_deltas(change);
         entries.push(LogEntry {
             change_id,
             depth,
@@ -143,7 +158,8 @@ pub fn inspect(
             timestamp: change.timestamp.clone(),
             author: change.author.clone(),
             message: change.message.clone(),
-            entity_delta_count: change.entity_deltas.len(),
+            entity_delta_count: change.entity_deltas.len() - entity_deltas_unchanged,
+            entity_deltas_unchanged,
             relation_delta_count: change.relation_deltas.len(),
             tree_delta_count: change.tree_deltas.len(),
             admission_policy_changed: change.admission_policy_delta.is_some(),
@@ -193,6 +209,38 @@ pub fn build_log_response(
     })
 }
 
+/// How many of a change's entity deltas moved no entity's own content.
+///
+/// Asked through [`kin_core::workspace_semantics::entity_content_agrees`],
+/// which is the ONE answer `kin conflicts`, `kin diff`, `kin blame` and
+/// `kin history` ask too. Only a `Modified` delta can be one of these: an
+/// addition and a removal are content events by construction.
+fn unchanged_entity_deltas(change: &kin_model::SemanticChange) -> usize {
+    change
+        .entity_deltas
+        .iter()
+        .filter(|delta| match delta {
+            kin_model::EntityDelta::Modified { old, new } => {
+                kin_core::workspace_semantics::entity_content_agrees(old, new)
+            }
+            kin_model::EntityDelta::Added { .. } | kin_model::EntityDelta::Removed { .. } => false,
+        })
+        .count()
+}
+
+/// Name what the entity count leaves out, so a reader can see it exists.
+///
+/// Half of `kin blame`'s contract: blame names its withheld count AND takes
+/// `--all-revisions` to list them, while `kin log` names the count and has no
+/// flag that shows them yet. The flag is the follow-up.
+fn unchanged_suffix(unchanged: usize) -> String {
+    if unchanged == 0 {
+        return String::new();
+    }
+    let plural = if unchanged == 1 { "y" } else { "ies" };
+    format!(" ({unchanged} unchanged entit{plural} moved with their artifact)")
+}
+
 fn render_lines(report: &LogReport) -> Vec<String> {
     if report.entries.is_empty() {
         return vec!["(no changes)".to_string()];
@@ -218,11 +266,12 @@ fn render_lines(report: &LogReport) -> Vec<String> {
             ));
         }
         lines.push(format!(
-            "Deltas: entities={} relations={} tree={} policy={}",
+            "Deltas: entities={} relations={} tree={} policy={}{}",
             entry.entity_delta_count,
             entry.relation_delta_count,
             entry.tree_delta_count,
-            entry.admission_policy_changed
+            entry.admission_policy_changed,
+            unchanged_suffix(entry.entity_deltas_unchanged)
         ));
         lines.push(format!("    {}", entry.message.replace('\n', "\n    ")));
     }
@@ -233,5 +282,144 @@ fn render_origin(origin: ChangeOrigin) -> String {
     match origin {
         ChangeOrigin::Native => "native".to_string(),
         ChangeOrigin::GitCommit { oid } => format!("git commit {oid}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_model::{
+        Entity, EntityDelta, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId,
+        FingerprintAlgorithm, Hash256, LanguageId, SemanticChange, SemanticFingerprint, SourceSpan,
+        Visibility,
+    };
+
+    /// One version of one entity, plus the file-level noise a real reconcile
+    /// stamps on every entity in a touched file whether or not it moved: the
+    /// whole FILE's blob hash in `metadata.extra`, and the byte span everything
+    /// below an edit shifts to.
+    fn entity(id: EntityId, name: &str, body: u8, stamp: u8) -> Entity {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "artifact_blob".to_string(),
+            serde_json::Value::String(format!("{stamp:02x}")),
+        );
+        Entity {
+            id,
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Python,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([body; 32]),
+                signature_hash: Hash256::from_bytes([1; 32]),
+                behavior_hash: Hash256::from_bytes([body; 32]),
+                equivalence_hash: Hash256::from_bytes([body; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("ledger/reporting.py")),
+            span: Some(SourceSpan {
+                file: FilePathId::new("ledger/reporting.py"),
+                start_byte: usize::from(stamp) * 100,
+                end_byte: usize::from(stamp) * 100 + 40,
+                start_line: u32::from(stamp),
+                start_col: 0,
+                end_line: u32::from(stamp) + 3,
+                end_col: 0,
+            }),
+            signature: format!("def {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata { extra },
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn change_with(deltas: Vec<EntityDelta>) -> SemanticChange {
+        SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "Right-align report amounts".to_string(),
+            entity_deltas: deltas,
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            external_reference_deltas: Vec::new(),
+        }
+    }
+
+    /// The vcs stranger run's `kin log` finding, rebuilt.
+    ///
+    /// A commit that edited two function bodies read `Deltas: entities=12`,
+    /// because a file-level edit mints a revision for every entity in that
+    /// file. Twelve deltas, one addition, one real body change, ten that moved
+    /// only with their file.
+    ///
+    /// Breaking it: return 0 from `unchanged_entity_deltas` and this reports
+    /// twelve.
+    #[test]
+    fn a_two_function_commit_counts_the_functions_it_changed() {
+        let mut deltas = vec![EntityDelta::Added {
+            new: entity(EntityId::new(), "format_currency", 9, 0x30),
+        }];
+        let edited = EntityId::new();
+        deltas.push(EntityDelta::Modified {
+            old: entity(edited, "format_totals", 1, 0x10),
+            new: entity(edited, "format_totals", 2, 0x30),
+        });
+        for index in 0..10 {
+            let id = EntityId::new();
+            let name = format!("untouched_{index}");
+            deltas.push(EntityDelta::Modified {
+                old: entity(id, &name, 1, 0x10),
+                new: entity(id, &name, 1, 0x30),
+            });
+        }
+        let change = change_with(deltas);
+        assert_eq!(change.entity_deltas.len(), 12, "the fixture is the case");
+
+        let unchanged = unchanged_entity_deltas(&change);
+        assert_eq!(unchanged, 10);
+        assert_eq!(
+            change.entity_deltas.len() - unchanged,
+            2,
+            "one addition and one changed body"
+        );
+
+        // Counted is not enough. A reader has to be able to see they exist.
+        let suffix = unchanged_suffix(unchanged);
+        assert!(suffix.contains("10"), "{suffix}");
+    }
+
+    /// The control. A change that withholds nothing must say nothing about
+    /// withholding, or every line reads as trimmed. An addition and a removal
+    /// are content events and are never withheld.
+    #[test]
+    fn a_change_that_withholds_nothing_says_nothing_about_withholding() {
+        let id = EntityId::new();
+        let change = change_with(vec![
+            EntityDelta::Added {
+                new: entity(EntityId::new(), "format_currency", 9, 0x30),
+            },
+            EntityDelta::Removed {
+                old: entity(EntityId::new(), "legacy_totals", 5, 0x10),
+            },
+            EntityDelta::Modified {
+                old: entity(id, "format_totals", 1, 0x10),
+                new: entity(id, "format_totals", 2, 0x30),
+            },
+        ]);
+        assert_eq!(unchanged_entity_deltas(&change), 0);
+        assert!(unchanged_suffix(0).is_empty());
     }
 }
