@@ -476,14 +476,32 @@
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "resolve semantic and exact-tree conflicts against one durable merge transaction",
+        "settle complete regular-file bodies from explicit input, persist exact CAS bytes, and derive added and removed declarations and cross-file relations from those bodies",
+        "accept at most 8 MiB of aggregate authored input per request, with related files also supported across separate requests",
+        "continue saved authored decisions after daemon restart without rereading external input paths",
+        "accept authored paths already holding their chosen bytes under retained regular-file proofs, and refuse unrelated drift, different bodies or publication races",
+        "retain ambient file observations without moving an open merge restore generation",
         "publish the resolved workspace and target ref atomically with compare-and-swap",
-        "refuse a resolution authored against a merge record another session has advanced",
-        "abort by proving the workspace equals the recorded restore point and moving no ref"
+        "refuse stale record identities and contradictory whole-file and subject choices",
+        "abort by terminating the merge record without moving refs or restoring workspace state, including after the workspace has moved"
       ],
       "evidence_tests": [
-        "crates/kin-cli/tests/repository_merge_resolution.rs"
+        "crates/kin-cli/tests/repository_merge_resolution.rs::authored_merge_body_survives_restart_and_rebuilds_added_and_removed_declarations",
+        "crates/kin-cli/tests/repository_merge_resolution.rs::authored_merge_body_refuses_stale_and_competing_choices_without_partial_settlement",
+        "crates/kin-cli/tests/repository_merge_resolution.rs::authored_merge_accepts_exact_non_source_bytes_and_refuses_invalid_source_atomically",
+        "crates/kin-cli/tests/repository_merge_resolution.rs::authored_merge_rebuilds_cross_file_relations_to_a_new_declaration",
+        "crates/kin-cli/tests/repository_merge_resolution.rs::authored_merge_rebuilds_cross_file_relations_across_separate_requests",
+        "crates/kin-cli/tests/repository_merge_resolution.rs::authored_merge_backend_refuses_raw_input_over_the_limit_before_record_or_blob_changes",
+        "crates/kin-cli/tests/repository_merge_resolution.rs::authored_destination_file_preserves_an_incoming_relation_conflict",
+        "crates/kin-cli/tests/repository_merge_resolution.rs::authored_merge_accepts_in_place_input_and_preserves_unrelated_or_later_edits",
+        "crates/kin-cli/tests/repository_merge_resolution.rs::aborting_a_merge_from_a_moved_workspace_abandons_it_and_restores_nothing",
+        "crates/kin-cli/tests/repository_merge_resolution.rs::aborting_after_a_non_user_semantic_move_does_not_wedge",
+        "kin_daemon::api::tests::ambient_admission_preserves_open_merge_restore_generation_across_restart",
+        "kin_core::tree::tests::authored_projection_rollback_preserves_observed_input_bytes",
+        "kin_core::tree::tests::authored_projection_revalidates_same_byte_object_identity",
+        "kin_core::tree::tests::authored_projection_never_accepts_matching_bytes_through_a_symlink"
       ],
-      "note": "Resolution moves the durable merge-transaction record through the sealed repository transaction path. Settling entries and publishing the merge are separate transactions by construction: a record commits the resolutions it already carries, so the transaction that publishes never decides any part of the merge. Each settlement carries its actor, timestamp, and the operation that committed it, and the persistence layer proves that operation is the one committing it, so provenance cannot name a transaction that never happened. `--expect` binds a resolution to the record identity the caller read, so a session resolving against a view another session already advanced is refused rather than silently rebased. Completing recomposes from graph truth and holds the result to the record: same identities, same divergences, same side digests, or the merge fails loud rather than publishing a different merge than the one resolved. A resolution that claims a side is checked against history rather than trusted. The merge change, the target ref by compare-and-swap against the recorded first parent, the exact workspace, and the record's termination publish in one transaction. Aborting proves the workspace still equals the recorded restore point and terminates the record without moving any ref. Authoring a resolution value neither side holds is not a proven shape and is refused; every divergence the composer produces is settled by taking a side, removing the identity, or naming which claimant keeps a contested path."
+      "note": "Resolution persists decisions before publication. Taking a side is checked against recorded history. `--file PATH FILE` accepts a complete body for one recorded regular-file artifact conflict, retaining the target artifact's path and executable bit, using source then base when the target artifact is absent. It settles the file-owned conflicts, stores immutable CAS bytes, and reparses supported source to derive the complete entity and relation state, including new or removed declarations. Opaque files retain their exact bytes. Invalid source and conflicting explicit choices refuse without partially settling the record. A later side or removal choice cannot overwrite an authored body; another explicit file decision can replace it. A surviving destination does not settle another file's incoming relationship conflict. The limit is 8 MiB of aggregate custom input per request; files may be settled in separate requests. `--expect` refuses a record another session advanced. Continue loads saved bodies only from CAS and deterministically rebuilds their semantics, including cross-file links, after restart. An in-place input is accepted only when retained projection checks prove its exact desired regular-file bytes and identity. Unrelated edits, later different bytes, symlinks and replacement races refuse before publication; rollback preserves the observed authored input. Ambient admission retains pending events while a merge is open, so editing a conflict does not invalidate its restore generation. The merge change, target ref, exact workspace and record termination publish in one repository transaction. Abort terminates only the merge record. It neither moves refs nor restores files or graph state, and remains available when the workspace has moved."
     },
     {
       "command": "rename",

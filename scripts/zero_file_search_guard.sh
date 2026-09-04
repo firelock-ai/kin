@@ -181,6 +181,10 @@ allow_for() {
     locate_debug.rs)
       printf '%s\n' 'std::fs::read_to_string(path)'
       ;;
+    resolve.rs)
+      # Explicit bounded merge input, submitted once and persisted in CAS.
+      printf '%s\n' 'let input = std::fs::File::open(source)'
+      ;;
     contextbench_locate.rs)
       printf '%s\n' 'std::fs::read_to_string(&task_file)'
       ;;

@@ -170,15 +170,14 @@ struct ExactTreeAdmission {
     /// the caller can publish it standalone if its own transaction never
     /// reaches authority.
     deferred_tree: Option<crate::repository_commit::AdmittedWorkspaceTree>,
-    /// The pass derived a transition and then stood down for a commit that had
-    /// entered the daemon while it worked. Nothing was published and nothing was
-    /// applied to the derived graph, so the caller must treat this pass as not
-    /// having happened and let the commit admit the working copy itself.
-    yielded_to_pending_commit: bool,
+    /// The pass yielded to a pending commit or an open merge. Nothing was
+    /// published or applied to the derived graph. The caller retains its host
+    /// events until repository authority can admit them.
+    yielded_authority: bool,
 }
 
 impl ExactTreeAdmission {
-    /// A pass that stood down for a commit already inside the daemon.
+    /// A pass that stood down for a pending commit or an open merge.
     ///
     /// It carries no deltas because it admitted nothing: the transition it
     /// derived was dropped unpublished, so reporting it would name work that
@@ -190,7 +189,7 @@ impl ExactTreeAdmission {
             semantic_events: Vec::new(),
             policy,
             deferred_tree: None,
-            yielded_to_pending_commit: true,
+            yielded_authority: true,
         }
     }
 }
@@ -684,6 +683,15 @@ fn exact_tree_admission(
     // while the host walk is running fails the whole admission instead of
     // having its desired tree replanned onto the newer authority.
     let (expected_roots, policy) = current_authority_admission(state)?;
+    if publication == TreePublication::StandaloneUnlessACommitIsWaiting
+        && crate::api::cached_authority_has_open_merge(state)
+            .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?
+    {
+        // A conflict edit belongs to the open merge until resolution publishes
+        // it. Ambient admission would move its restore generation and make the
+        // saved resolution stale. The watcher retains this pass's events.
+        return Ok(ExactTreeAdmission::yielded(policy));
+    }
     let previous = state.graph.resolved_tree();
     let tracked_paths = previous
         .artifacts_by_path()
@@ -986,7 +994,7 @@ fn exact_tree_admission(
         semantic_events: dedup_file_events(semantic_events),
         policy,
         deferred_tree,
-        yielded_to_pending_commit: false,
+        yielded_authority: false,
     })
 }
 
@@ -1010,7 +1018,7 @@ pub(crate) fn ambient_admission_for_test(
         Some(observation),
         TreePublication::StandaloneUnlessACommitIsWaiting,
     )
-    .map(|admission| admission.yielded_to_pending_commit)
+    .map(|admission| admission.yielded_authority)
 }
 
 /// Report whether one planned exact-tree transition moves a repository member
@@ -2983,7 +2991,7 @@ pub async fn run_loop_armed(
             // nothing. Its events go back on the queue rather than into the
             // retry ladder: nothing failed, and the next round will find them
             // either already admitted by the commit or still owed.
-            Ok(admission) if admission.yielded_to_pending_commit => {
+            Ok(admission) if admission.yielded_authority => {
                 commit_yields += 1;
                 drop(graph_mutation);
                 drop(reconciler);
@@ -2991,8 +2999,7 @@ pub async fn run_loop_armed(
                 enqueue_file_events(&mut pending_events, watcher_batch);
                 debug!(
                     consecutive = commit_yields,
-                    "stood this reconcile round down at its publication for a commit inside \
-                     the daemon"
+                    "retained this reconcile round for a pending commit or an open merge"
                 );
                 state
                     .reconciliation_status
@@ -6930,7 +6937,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            !admission.yielded_to_pending_commit,
+            !admission.yielded_authority,
             "there is no commit to stand down for"
         );
         assert!(
@@ -6989,7 +6996,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            admission.yielded_to_pending_commit,
+            admission.yielded_authority,
             "a commit inside the daemon must take this tick's publication"
         );
         assert!(
@@ -7019,7 +7026,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !admission.yielded_to_pending_commit,
+            !admission.yielded_authority,
             "the daemon is quiet again, so the next round admits"
         );
         assert_eq!(

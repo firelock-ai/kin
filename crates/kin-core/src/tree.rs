@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashMap;
 #[cfg(any(unix, windows))]
 use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap};
 #[cfg(any(unix, windows))]
 use std::ffi::OsString;
 #[cfg(any(unix, windows))]
@@ -515,6 +515,39 @@ pub fn transition_repository_workspace_tree_and_commit_repository_transaction(
         || {},
         || {},
         None,
+        None,
+        commit_repository_transaction_exact_and_freeze,
+    )
+    .map(|(count, (receipt, freeze))| (count, receipt, freeze))
+}
+
+/// Publish an exact workspace transition while accepting explicitly authored
+/// paths that already hold their target bytes. Authority still compares the
+/// original previous tree; only the frozen filesystem baseline may use a
+/// target entry, and only after proving its exact bytes and materialization kind.
+pub fn transition_repository_workspace_tree_and_commit_authored_transaction(
+    root: &Path,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+    authored_paths: &BTreeSet<RepoPath>,
+) -> Result<(
+    usize,
+    RepositoryCommitReceipt,
+    LocalRepositoryAuthorityFreeze,
+)> {
+    transition_repository_workspace_tree_and_commit_with_hooks(
+        root,
+        previous_tree,
+        target_tree,
+        authority,
+        transaction,
+        || {},
+        || {},
+        || {},
+        None,
+        Some(authored_paths),
         commit_repository_transaction_exact_and_freeze,
     )
     .map(|(count, (receipt, freeze))| (count, receipt, freeze))
@@ -750,6 +783,7 @@ pub(crate) fn checkout_repository_workspace_subtree_and_commit_with_hooks(
         after_identity_revalidation,
         after_projection_mutation,
         Some(selected),
+        None,
         commit_repository_transaction_exact_and_freeze,
     )
     .map(|(count, (receipt, freeze))| (count, receipt, freeze))
@@ -834,6 +868,7 @@ pub(crate) fn repair_repository_workspace_subtree_projection_with_hooks(
                 authority,
                 receipt: &receipt,
             }),
+            accepted_target_paths: None,
             checkout_projection_freeze: Some(&mut authority_freeze),
         },
         after_read_only_preflight,
@@ -973,6 +1008,7 @@ fn transition_repository_workspace_tree_and_commit_with_hooks<T>(
     after_identity_revalidation: impl FnOnce(),
     after_projection_mutation: impl FnOnce(),
     checkout_scope: Option<&RepoPath>,
+    accepted_target_paths: Option<&BTreeSet<RepoPath>>,
     commit: impl FnOnce(
         &RepositoryAuthorityManager<LocalFileBackend>,
         RepositoryTransaction,
@@ -1027,6 +1063,7 @@ fn transition_repository_workspace_tree_and_commit_with_hooks<T>(
             }),
             checkout_scope,
             checkout_projection_authority: None,
+            accepted_target_paths,
             checkout_projection_freeze: None,
         },
         after_read_only_preflight,
@@ -4160,6 +4197,7 @@ struct ReconciledProjectionOptions<'a> {
     checkout_scope: Option<&'a RepoPath>,
     checkout_projection_authority: Option<CheckoutProjectionAuthority<'a>>,
     checkout_projection_freeze: Option<&'a mut Option<LocalRepositoryAuthorityFreeze>>,
+    accepted_target_paths: Option<&'a BTreeSet<RepoPath>>,
 }
 
 impl Default for ReconciledProjectionOptions<'_> {
@@ -4169,6 +4207,7 @@ impl Default for ReconciledProjectionOptions<'_> {
             graph_only_transition: None,
             checkout_scope: None,
             checkout_projection_authority: None,
+            accepted_target_paths: None,
             checkout_projection_freeze: None,
         }
     }
@@ -4524,11 +4563,47 @@ fn project_reconciled_source_tree_and_commit<T>(
                 )
             })
             .transpose()?;
-        let requires_target_revalidation =
-            authority_commit.is_some() || checkout_projection_commit.is_some();
+        let requires_target_revalidation = authority_commit.is_some()
+            || checkout_projection_commit.is_some()
+            || options.accepted_target_paths.is_some();
         let is_selected = |path: &RepoPath| {
             checkout_scope.is_some_and(|scope| repository_path_is_same_or_descendant(path, scope))
         };
+        let observed_previous = if let Some(paths) = options.accepted_target_paths {
+            let mut observed = previous_entries.to_vec();
+            for path in paths {
+                let target_entry = entries
+                    .iter()
+                    .find(|entry| entry.file_id == path)
+                    .ok_or_else(|| {
+                        KinError::Other(format!("authored path {path} has no target entry"))
+                    })?;
+                if !matches!(target_entry.kind, TreeEntry::Blob { .. }) {
+                    return Err(KinError::Other(format!(
+                        "authored path {path} must be a regular file"
+                    )));
+                }
+                match projection.validate_frozen_entry_unchanged(target_entry) {
+                    Ok(_) => {
+                        if let Some(previous) =
+                            observed.iter_mut().find(|entry| entry.file_id == path)
+                        {
+                            *previous = *target_entry;
+                        } else {
+                            observed.push(*target_entry);
+                        }
+                    }
+                    // A path that does not already equal its explicit target
+                    // must pass the ordinary prior-body or untracked-path guard.
+                    Err(KinError::ProjectionConflict(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Some(observed)
+        } else {
+            None
+        };
+        let previous_entries = observed_previous.as_deref().unwrap_or(previous_entries);
         let previous =
             TrackedPathClassifier::new(previous_entries.iter().map(|entry| entry.file_id))?;
         let target = TrackedPathClassifier::new(entries.iter().map(|entry| entry.file_id))?;
@@ -4580,7 +4655,10 @@ fn project_reconciled_source_tree_and_commit<T>(
         // path. Otherwise an unchanged-but-locally-edited file could survive
         // while the workspace transaction declares the exact target tree
         // clean, making the physical projection lie about graph authority.
-        let preflight_previous = if authority_commit.is_some() && checkout_scope.is_none() {
+        let preflight_previous = if (authority_commit.is_some()
+            || options.accepted_target_paths.is_some())
+            && checkout_scope.is_none()
+        {
             previous_entries.iter().collect::<Vec<_>>()
         } else {
             affected_previous
@@ -12697,6 +12775,7 @@ mod tests {
                     }),
                     checkout_scope: None,
                     checkout_projection_authority: None,
+                    accepted_target_paths: None,
                     checkout_projection_freeze: None,
                 },
                 || {},
@@ -12744,6 +12823,7 @@ mod tests {
                     }),
                     checkout_scope: None,
                     checkout_projection_authority: None,
+                    accepted_target_paths: None,
                     checkout_projection_freeze: None,
                 },
                 || {},
@@ -12788,6 +12868,7 @@ mod tests {
                 }),
                 checkout_scope: None,
                 checkout_projection_authority: None,
+                accepted_target_paths: None,
                 checkout_projection_freeze: None,
             },
             || {
@@ -13591,6 +13672,7 @@ mod tests {
                 }),
                 checkout_scope: None,
                 checkout_projection_authority: None,
+                accepted_target_paths: None,
                 checkout_projection_freeze: None,
             },
             || {},
@@ -13657,6 +13739,7 @@ mod tests {
                 }),
                 checkout_scope: None,
                 checkout_projection_authority: None,
+                accepted_target_paths: None,
                 checkout_projection_freeze: None,
             },
             || {},
@@ -14313,6 +14396,187 @@ mod tests {
         assert!(
             !root.path().join(".kin").exists(),
             "existing-only freeze created repository control state"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn authored_projection_rollback_preserves_observed_input_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let authored = repo_path("authored.rs");
+        let other = repo_path("other.txt");
+        let old = b"old\n";
+        let chosen = b"chosen\n";
+        let changed = b"changed\n";
+        materialize_source_tree(
+            root.path(),
+            [
+                (&authored, exact_blob(old, false), old.as_slice()),
+                (&other, exact_blob(old, false), old.as_slice()),
+            ],
+        )
+        .unwrap();
+        std::fs::write(root.path().join("authored.rs"), chosen).unwrap();
+        let previous = validated_source_entries([
+            (&authored, exact_blob(old, false), old.as_slice()),
+            (&other, exact_blob(old, false), old.as_slice()),
+        ])
+        .unwrap();
+        let target = validated_source_entries([
+            (&authored, exact_blob(chosen, false), chosen.as_slice()),
+            (&other, exact_blob(changed, false), changed.as_slice()),
+        ])
+        .unwrap();
+        let paths = BTreeSet::from([authored.clone()]);
+        let error = project_reconciled_source_tree_and_commit(
+            root.path(),
+            &previous,
+            &target,
+            &should_preserve_checkout_path,
+            ReconciledProjectionOptions {
+                open_mode: ProjectionOpenMode::ExistingFrozen,
+                accepted_target_paths: Some(&paths),
+                ..ReconciledProjectionOptions::default()
+            },
+            || {},
+            || {},
+            || {},
+            None,
+            None,
+            || {
+                ProjectionAuthorityCommit::<()>::DefinitelyNotCommitted(KinError::Other(
+                    "injected authority refusal".to_string(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("injected authority refusal"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("authored.rs")).unwrap(),
+            chosen
+        );
+        assert_eq!(std::fs::read(root.path().join("other.txt")).unwrap(), old);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn authored_projection_revalidates_same_byte_object_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = repo_path("authored.rs");
+        let old = b"old\n";
+        let chosen = b"chosen\n";
+        materialize_source_tree(
+            root.path(),
+            [(&path, exact_blob(old, false), old.as_slice())],
+        )
+        .unwrap();
+        std::fs::write(root.path().join("authored.rs"), chosen).unwrap();
+        let previous =
+            validated_source_entries([(&path, exact_blob(old, false), old.as_slice())]).unwrap();
+        let target =
+            validated_source_entries([(&path, exact_blob(chosen, false), chosen.as_slice())])
+                .unwrap();
+        let paths = BTreeSet::from([path.clone()]);
+        let committed = std::cell::Cell::new(false);
+        let error = project_reconciled_source_tree_and_commit(
+            root.path(),
+            &previous,
+            &target,
+            &should_preserve_checkout_path,
+            ReconciledProjectionOptions {
+                open_mode: ProjectionOpenMode::ExistingFrozen,
+                accepted_target_paths: Some(&paths),
+                ..ReconciledProjectionOptions::default()
+            },
+            || {
+                std::fs::rename(
+                    root.path().join("authored.rs"),
+                    root.path().join("displaced.rs"),
+                )
+                .unwrap();
+                std::fs::write(root.path().join("authored.rs"), chosen).unwrap();
+            },
+            || {},
+            || {},
+            None,
+            None,
+            || {
+                committed.set(true);
+                ProjectionAuthorityCommit::Committed(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("changed object identity"),
+            "{error}"
+        );
+        assert!(!committed.get());
+        assert_eq!(
+            std::fs::read(root.path().join("authored.rs")).unwrap(),
+            chosen
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authored_projection_never_accepts_matching_bytes_through_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = repo_path("authored.rs");
+        let old = b"old\n";
+        let chosen = b"chosen\n";
+        materialize_source_tree(
+            root.path(),
+            [(&path, exact_blob(old, false), old.as_slice())],
+        )
+        .unwrap();
+        std::fs::write(outside.path().join("target.rs"), chosen).unwrap();
+        std::fs::remove_file(root.path().join("authored.rs")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("target.rs"),
+            root.path().join("authored.rs"),
+        )
+        .unwrap();
+        let previous =
+            validated_source_entries([(&path, exact_blob(old, false), old.as_slice())]).unwrap();
+        let target =
+            validated_source_entries([(&path, exact_blob(chosen, false), chosen.as_slice())])
+                .unwrap();
+        let paths = BTreeSet::from([path.clone()]);
+        let committed = std::cell::Cell::new(false);
+        let error = project_reconciled_source_tree_and_commit(
+            root.path(),
+            &previous,
+            &target,
+            &should_preserve_checkout_path,
+            ReconciledProjectionOptions {
+                open_mode: ProjectionOpenMode::ExistingFrozen,
+                accepted_target_paths: Some(&paths),
+                ..ReconciledProjectionOptions::default()
+            },
+            || {},
+            || {},
+            || {},
+            None,
+            None,
+            || {
+                committed.set(true);
+                ProjectionAuthorityCommit::Committed(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, KinError::ProjectionConflict(_)), "{error}");
+        assert!(!committed.get());
+        assert!(std::fs::symlink_metadata(root.path().join("authored.rs"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read(outside.path().join("target.rs")).unwrap(),
+            chosen
         );
     }
 

@@ -674,6 +674,14 @@ pub(crate) fn cached_authority_admission(
     Ok((admission.roots, admission.policy))
 }
 
+pub(crate) fn cached_authority_has_open_merge(
+    state: &DaemonState,
+) -> Result<bool, (StatusCode, String)> {
+    Ok(cached_authority_admission_entry(state)?
+        .open_merge
+        .is_some())
+}
+
 fn refuse_commit_during_open_merge(state: &DaemonState) -> Result<(), (StatusCode, String)> {
     let admission = cached_authority_admission_entry(state)?;
     let Some(open_merge) = admission.open_merge else {
@@ -2009,7 +2017,12 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/branch", post(command_branch))
         .route("/commands/merge", post(command_merge))
         .route("/commands/conflicts", post(command_conflicts))
-        .route("/commands/resolve", post(command_resolve))
+        .route(
+            "/commands/resolve",
+            post(command_resolve).layer(DefaultBodyLimit::max(
+                kin_cli::commands::resolve::MAX_RESOLVE_REQUEST_BYTES,
+            )),
+        )
         .route("/commands/drift", post(command_drift))
         .route("/commands/tag", post(command_tag))
         .route("/commands/admit", post(command_admit))
@@ -36447,6 +36460,104 @@ mod tests {
              cannot be evidence about what a publication did to it"
         );
         (bare, roots)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn ambient_admission_preserves_open_merge_restore_generation_across_restart() {
+        let (state, layout, repository, _, _) = universal_branch_test_state("ambient-open-merge");
+        let path = repository.join("selected/compose.yaml");
+        let original = b"services:\n  api:\n    image: main-conflict\n";
+        std::fs::write(&path, original).unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "create a real conflict",
+        )
+        .await;
+        let response = crate::repository_merge::execute(
+            &state,
+            &kin_cli::commands::merge::MergeRequest {
+                source: kin_model::RefName::branch(b"feature").unwrap(),
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("ambient-merge-test"),
+            },
+        )
+        .unwrap_or_else(|refusal| {
+            panic!(
+                "fixture merge refused: {}",
+                axum::response::IntoResponse::into_response(refusal).status()
+            )
+        });
+        assert!(matches!(
+            response.report.unwrap().outcome,
+            kin_cli::commands::merge::MergeOutcome::Conflicted
+        ));
+        let before = cached_authority_admission_entry(&state).unwrap();
+        assert!(
+            before.open_merge.is_some(),
+            "the fixture must hold a durable open merge"
+        );
+        let expected_tree = state.graph.resolved_tree();
+        let authored = b"services:\n  api:\n    image: hand-authored-resolution\n";
+        std::fs::write(&path, authored).unwrap();
+        let observation =
+            std::iter::once(RepoPath::from_utf8("selected/compose.yaml").unwrap()).collect();
+        let yielded = crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap();
+        assert_eq!(
+            cached_authority_admission_entry(&state).unwrap().roots,
+            before.roots,
+            "an ambient conflict edit must not advance the merge restore generation"
+        );
+        assert!(yielded, "the watcher must retain the unadmitted event");
+        assert_eq!(state.graph.resolved_tree(), expected_tree);
+        assert_eq!(std::fs::read(&path).unwrap(), authored);
+        drop(app);
+        drop(state);
+
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        assert!(crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
+        assert_eq!(
+            cached_authority_admission_entry(&state).unwrap().roots,
+            before.roots
+        );
+        assert_eq!(state.graph.resolved_tree(), expected_tree);
+        // Restore the projection before aborting; this test exercises the
+        // ambient gate independently of custom-resolution projection policy.
+        std::fs::write(&path, original).unwrap();
+        crate::repository_merge_state::execute_resolve(
+            &state,
+            &kin_cli::commands::resolve::ResolveRequest {
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("ambient-merge-test"),
+                action: kin_cli::commands::resolve::ResolveAction::Abort,
+                expected_record: None,
+            },
+        )
+        .unwrap_or_else(|refusal| {
+            panic!(
+                "fixture abort refused: {}",
+                axum::response::IntoResponse::into_response(refusal).status()
+            )
+        });
+        assert!(!cached_authority_has_open_merge(&state).unwrap());
+        std::fs::write(&path, authored).unwrap();
+        let after_abort = cached_authority_admission_entry(&state)
+            .unwrap()
+            .roots
+            .generation;
+        assert!(!crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
+        assert_eq!(
+            cached_authority_admission_entry(&state)
+                .unwrap()
+                .roots
+                .generation,
+            after_abort + 1,
+            "the retained observation must admit normally after the merge closes"
+        );
+        assert_ne!(state.graph.resolved_tree(), expected_tree);
     }
 
     /// A merge published through `resolve --continue` must reach the live graph

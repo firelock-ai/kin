@@ -1682,3 +1682,688 @@ fn an_untouched_entity_differs_between_branches_only_in_its_span() {
         "the entity both sides edited must differ semantically; it differed on {edited:?}"
     );
 }
+
+#[test]
+fn authored_merge_body_survives_restart_and_rebuilds_added_and_removed_declarations() {
+    let root = tempdir().expect("temp root");
+    let repo = opposed_entities_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
+        "init",
+    );
+    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    let ours = branch_change(&layout, "main");
+    let theirs = branch_change(&layout, "feature");
+    let before = fs::read(repo.join("src/lib.rs")).unwrap();
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "park merge",
+    );
+    let report = conflicts_report(&runtime, &repo);
+    let expected = record_hash(&report);
+    let body = b"pub fn alpha(value: i32, count: u64) -> u64 { gamma(value) + count }\npub fn gamma(value: i32) -> u64 { value as u64 }\n";
+    let input = root.path().join("resolved=source.rs");
+    fs::write(&input, body).unwrap();
+    let settled = run_kin(
+        &runtime,
+        &repo,
+        &[
+            "resolve",
+            "--file",
+            "src/lib.rs",
+            input.to_str().unwrap(),
+            "--expect",
+            &expected,
+            "--json",
+        ],
+    );
+    let settled: Value = serde_json::from_str(&ok(&settled, "settle authored body")).unwrap();
+    assert_eq!(settled["unresolved_count"], 0);
+    assert_eq!(
+        branch_change(&layout, "main"),
+        ours,
+        "settlement must not create an intermediate merge"
+    );
+    assert_eq!(
+        fs::read(repo.join("src/lib.rs")).unwrap(),
+        before,
+        "settlement leaves the workspace untouched"
+    );
+    let saved = persisted_record(&layout).unwrap();
+    let authored: Vec<_> = saved
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.resolution {
+            kin_model::MergeEntryResolution::Payload {
+                payload: kin_model::MergeResolutionPayload::Artifact(located),
+                ..
+            } => located.entry.blob_identity(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(authored.len(), 1);
+    assert_eq!(
+        open_authority(&layout)
+            .load_source_blob(authored[0])
+            .unwrap()
+            .unwrap(),
+        body
+    );
+    fs::remove_file(&input).unwrap();
+    stop_daemon(&runtime, &repo);
+    assert_eq!(persisted_record(&layout).unwrap().hash, saved.hash);
+    let continued =
+        run_kin_without_enrichment(&runtime, &repo, &["resolve", "--continue", "--json"]);
+    let continued: Value =
+        serde_json::from_str(&ok(&continued, "publish after restart without input file")).unwrap();
+    let change: SemanticChangeId =
+        serde_json::from_value(continued["merge_change"].clone()).unwrap();
+    assert_eq!(change_parents(&layout, &change), vec![ours, theirs]);
+    assert_eq!(fs::read(repo.join("src/lib.rs")).unwrap(), body);
+    assert_eq!(branch_change(&layout, "feature"), theirs);
+    let merged = graph_at(&layout, &change);
+    let alpha = entity_named(&merged, "alpha");
+    let gamma = entity_named(&merged, "gamma");
+    assert!(
+        !merged.entities.values().any(|entity| entity.name == "beta"),
+        "removed declaration must not remain in graph truth"
+    );
+    for entity in [&alpha, &gamma] {
+        let span = entity.span.as_ref().unwrap();
+        let exact = &body[span.start_byte..span.end_byte];
+        assert!(std::str::from_utf8(exact)
+            .unwrap()
+            .starts_with(&format!("pub fn {}", entity.name)));
+        assert_eq!(
+            entity.metadata.extra.get("blob_hash"),
+            Some(&Value::String(authored[0].to_string()))
+        );
+    }
+    assert!(
+        merged.relations.values().any(|relation| {
+            relation.kind == kin_model::RelationKind::Calls
+                && relation.src == kin_model::GraphNodeId::Entity(alpha.id)
+                && relation.dst == kin_model::GraphNodeId::Entity(gamma.id)
+        }),
+        "the new declaration's call edge must be derived from the authored body"
+    );
+    stop_daemon(&runtime, &repo);
+    assert_eq!(graph_at(&layout, &change).entities, merged.entities);
+}
+
+#[test]
+fn authored_merge_body_refuses_stale_and_competing_choices_without_partial_settlement() {
+    let root = tempdir().expect("temp root");
+    let repo = opposed_entities_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
+        "init",
+    );
+    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "park merge",
+    );
+    let initial = persisted_record(&layout).unwrap();
+    let input = root.path().join("resolution.rs");
+    fs::write(&input, b"pub fn alpha() {}\npub fn gamma() {}\n").unwrap();
+    let competing = run_kin(
+        &runtime,
+        &repo,
+        &[
+            "resolve",
+            "--file",
+            "src/lib.rs",
+            input.to_str().unwrap(),
+            "--theirs",
+            "alpha",
+        ],
+    );
+    assert!(
+        !competing.status.success(),
+        "competing whole-file and entity decisions must refuse"
+    );
+    assert!(
+        String::from_utf8_lossy(&competing.stderr).contains("also covered"),
+        "{}",
+        String::from_utf8_lossy(&competing.stderr)
+    );
+    assert_eq!(persisted_record(&layout).unwrap().hash, initial.hash);
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &["resolve", "--file", "src/lib.rs", input.to_str().unwrap()],
+        ),
+        "settle file",
+    );
+    let settled = persisted_record(&layout).unwrap();
+    assert_ne!(settled.hash, initial.hash);
+    fs::write(&input, b"pub fn alpha(value: bool) {}\n").unwrap();
+    let stale = run_kin(
+        &runtime,
+        &repo,
+        &[
+            "resolve",
+            "--file",
+            "src/lib.rs",
+            input.to_str().unwrap(),
+            "--expect",
+            &initial.hash.to_string(),
+        ],
+    );
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("has advanced"));
+    assert_eq!(persisted_record(&layout).unwrap().hash, settled.hash);
+    let overlapping = run_kin(&runtime, &repo, &["resolve", "--theirs", "alpha"]);
+    assert!(!overlapping.status.success());
+    assert!(String::from_utf8_lossy(&overlapping.stderr).contains("authored body"));
+    assert_eq!(persisted_record(&layout).unwrap().hash, settled.hash);
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &[
+                "resolve",
+                "--file",
+                "src/lib.rs",
+                input.to_str().unwrap(),
+                "--expect",
+                &settled.hash.to_string(),
+            ],
+        ),
+        "intentionally replace whole-file decision",
+    );
+    assert_ne!(persisted_record(&layout).unwrap().hash, settled.hash);
+}
+
+#[test]
+fn authored_merge_accepts_exact_non_source_bytes_and_refuses_invalid_source_atomically() {
+    let root = tempdir().expect("temp root");
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
+        "init",
+    );
+    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "park merge",
+    );
+    let initial = persisted_record(&layout).unwrap();
+    let source = root.path().join("source.rs");
+    let opaque = root.path().join("opaque.dat");
+    let mut raw = vec![0xff; 700 * 1024];
+    raw[0] = 0;
+    fs::write(&opaque, &raw).unwrap();
+    fs::write(&source, b"pub fn base( {\n").unwrap();
+    let invalid = run_kin(
+        &runtime,
+        &repo,
+        &[
+            "resolve",
+            "--file",
+            "shared.txt",
+            opaque.to_str().unwrap(),
+            "--file",
+            "src/lib.rs",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !invalid.status.success(),
+        "invalid source must not publish partial graph meaning"
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr).contains("syntax errors"),
+        "{}",
+        String::from_utf8_lossy(&invalid.stderr)
+    );
+    assert_eq!(persisted_record(&layout).unwrap().hash, initial.hash);
+    fs::write(&source, b"pub fn base(value: i32, count: u64) {}\n").unwrap();
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &[
+                "resolve",
+                "--file",
+                "shared.txt",
+                opaque.to_str().unwrap(),
+                "--file",
+                "src/lib.rs",
+                source.to_str().unwrap(),
+            ],
+        ),
+        "settle both file bodies",
+    );
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--continue"]),
+        "publish both file bodies",
+    );
+    assert_eq!(fs::read(repo.join("shared.txt")).unwrap(), raw);
+    assert_eq!(
+        fs::read(repo.join("src/lib.rs")).unwrap(),
+        fs::read(source).unwrap()
+    );
+}
+
+#[test]
+fn authored_merge_rebuilds_cross_file_relations_to_a_new_declaration() {
+    exercise_authored_cross_file_resolution(false);
+}
+
+#[test]
+fn authored_merge_rebuilds_cross_file_relations_across_separate_requests() {
+    exercise_authored_cross_file_resolution(true);
+}
+
+fn exercise_authored_cross_file_resolution(separate_requests: bool) {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+    fs::write(
+        repo.join("a.py"),
+        b"from b import beta\n\ndef run(value):\n    return beta(value)\n",
+    )
+    .unwrap();
+    fs::write(repo.join("b.py"), b"def beta(value):\n    return value\n").unwrap();
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "linked Python source"]);
+    run_git(&repo, &["switch", "-c", "feature"]);
+    fs::write(
+        repo.join("a.py"),
+        b"from b import beta\n\ndef run(value):\n    return beta(value) + 1\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("b.py"),
+        b"def beta(value):\n    return value + 1\n",
+    )
+    .unwrap();
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "feature edits"]);
+    run_git(&repo, &["switch", "main"]);
+    fs::write(
+        repo.join("a.py"),
+        b"from b import beta\n\ndef run(value):\n    return beta(value) + 2\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("b.py"),
+        b"def beta(value):\n    return value + 2\n",
+    )
+    .unwrap();
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "main edits"]);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
+        "init",
+    );
+    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "park merge",
+    );
+    let a = root.path().join("a-resolution.py");
+    let b = root.path().join("b-resolution.py");
+    fs::write(
+        &a,
+        b"from b import gamma\n\ndef run(value):\n    return gamma(value) + 3\n",
+    )
+    .unwrap();
+    fs::write(&b, b"def gamma(value):\n    return value * 2\n").unwrap();
+    if separate_requests {
+        ok(
+            &run_kin(
+                &runtime,
+                &repo,
+                &["resolve", "--file", "a.py", a.to_str().unwrap()],
+            ),
+            "settle the calling file first",
+        );
+        let first = persisted_record(&layout).unwrap();
+        let retained = first
+            .entries
+            .iter()
+            .find(|entry| {
+                matches!(
+                    &entry.resolution,
+                    kin_model::MergeEntryResolution::Payload {
+                        payload: kin_model::MergeResolutionPayload::Artifact(located), ..
+                    } if located.path.to_string() == "a.py"
+                )
+            })
+            .expect("the first file must have a persisted authored body");
+        ok(
+            &run_kin(
+                &runtime,
+                &repo,
+                &[
+                    "resolve",
+                    "--file",
+                    "b.py",
+                    b.to_str().unwrap(),
+                    "--all-ours",
+                    "--expect",
+                    &first.hash.to_string(),
+                ],
+            ),
+            "settle the referenced file in another request",
+        );
+        let second = persisted_record(&layout).unwrap();
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .find(|entry| entry.subject == retained.subject),
+            Some(retained),
+            "a later file request must preserve the earlier authored body"
+        );
+    } else {
+        ok(
+            &run_kin(
+                &runtime,
+                &repo,
+                &[
+                    "resolve",
+                    "--file",
+                    "a.py",
+                    a.to_str().unwrap(),
+                    "--file",
+                    "b.py",
+                    b.to_str().unwrap(),
+                    "--all-ours",
+                ],
+            ),
+            "settle both linked files",
+        );
+    }
+    stop_daemon(&runtime, &repo);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["resolve", "--continue"]),
+        "publish linked files",
+    );
+    let merged = graph_at(&layout, &branch_change(&layout, "main"));
+    let caller = entity_named(&merged, "run");
+    let target = entity_named(&merged, "gamma");
+    assert!(!merged.entities.values().any(|entity| entity.name == "beta"));
+    assert!(
+        merged.relations.values().any(|relation| {
+            relation.kind == kin_model::RelationKind::Calls
+                && relation.src == kin_model::GraphNodeId::Entity(caller.id)
+                && relation.dst == kin_model::GraphNodeId::Entity(target.id)
+        }),
+        "an authored call must resolve to the new declaration in the other authored file"
+    );
+    assert_eq!(fs::read(repo.join("a.py")).unwrap(), fs::read(a).unwrap());
+    assert_eq!(fs::read(repo.join("b.py")).unwrap(), fs::read(b).unwrap());
+}
+
+#[test]
+fn authored_merge_backend_refuses_raw_input_over_the_limit_before_record_or_blob_changes() {
+    use kin_cli::commands::resolve::{
+        ResolveAction, ResolveChoice, ResolveDirective, ResolveRequest, MAX_RESOLVE_FILE_BYTES,
+    };
+    let root = tempdir().expect("temp root");
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
+        "init",
+    );
+    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "park merge",
+    );
+    let initial = persisted_record(&layout).unwrap();
+    let body = vec![0; MAX_RESOLVE_FILE_BYTES + 1];
+    let digest = kin_blobs::digest(&body);
+    assert!(open_authority(&layout)
+        .load_source_blob(digest)
+        .unwrap()
+        .is_none());
+    let common::RecordedDaemonEndpoint::Listening { port } =
+        common::probe_recorded_daemon_endpoint(layout.root())
+    else {
+        panic!("the fixture daemon must be listening before sending a bounded request");
+    };
+    let request = ResolveRequest {
+        operation_id: kin_model::OperationId::new(),
+        actor: kin_model::AuthorId::new("merge-resolution-test"),
+        expected_record: Some(initial.hash),
+        action: ResolveAction::Settle {
+            directives: vec![ResolveDirective {
+                selector: "shared.txt".to_string(),
+                choice: ResolveChoice::File { body },
+            }],
+            all: None,
+        },
+    };
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let token = fs::read_to_string(layout.root().join("daemon.token")).unwrap();
+    let response = executor
+        .block_on(
+            reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/commands/resolve"))
+                .bearer_auth(token.trim())
+                .json(&request)
+                .send(),
+        )
+        .expect("send directly to the fixture daemon");
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error = executor.block_on(response.text()).unwrap();
+    assert!(error.contains("custom resolution input exceeds"), "{error}");
+    assert_eq!(persisted_record(&layout).unwrap().hash, initial.hash);
+    assert!(open_authority(&layout)
+        .load_source_blob(digest)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn authored_destination_file_preserves_an_incoming_relation_conflict() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+    fs::write(
+        repo.join("a.py"),
+        b"from b import beta\n\ndef run(value):\n    return beta(value)\n",
+    )
+    .unwrap();
+    fs::write(repo.join("b.py"), b"def beta(value):\n    return value\n").unwrap();
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "linked Python source"]);
+    run_git(&repo, &["switch", "-c", "feature"]);
+    fs::write(
+        repo.join("a.py"),
+        b"from b import beta\n\ndef run(value):\n    return 1 + beta(value)\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("b.py"),
+        b"def beta(value):\n    return value + 1\n",
+    )
+    .unwrap();
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "feature edits"]);
+    run_git(&repo, &["switch", "main"]);
+    fs::write(
+        repo.join("a.py"),
+        b"from b import beta\n\ndef run(value):\n    return 20 + beta(value)\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("b.py"),
+        b"def beta(value):\n    return value + 2\n",
+    )
+    .unwrap();
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "main edits"]);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
+        "init",
+    );
+    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "park merge",
+    );
+    let initial = persisted_record(&layout).unwrap();
+    let ours = graph_at(&layout, &initial.binding.ours_change);
+    let caller = entity_named(&ours, "run");
+    let destination = entity_named(&ours, "beta");
+    let incoming: Vec<_> = initial
+        .entries
+        .iter()
+        .filter(|entry| {
+            let kin_model::MergeConflictSubject::Relation { relation } = entry.subject else {
+                return false;
+            };
+            ours.relations.get(&relation).is_some_and(|relation| {
+                relation.src == kin_model::GraphNodeId::Entity(caller.id)
+                    && relation.dst == kin_model::GraphNodeId::Entity(destination.id)
+            })
+        })
+        .cloned()
+        .collect();
+    assert!(
+        !incoming.is_empty(),
+        "the fixture must hold a real incoming relation conflict"
+    );
+    let input = root.path().join("b-resolution.py");
+    fs::write(&input, b"def beta(value):\n    return value * 3\n").unwrap();
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &["resolve", "--file", "b.py", input.to_str().unwrap()],
+        ),
+        "settle destination file",
+    );
+    let settled = persisted_record(&layout).unwrap();
+    for original in &incoming {
+        assert_eq!(
+            settled
+                .entries
+                .iter()
+                .find(|entry| entry.subject == original.subject),
+            Some(original),
+            "the destination file must not choose another file's incoming relationship"
+        );
+        let kin_model::MergeConflictSubject::Relation { relation } = original.subject else {
+            unreachable!()
+        };
+        ok(
+            &run_kin(
+                &runtime,
+                &repo,
+                &["resolve", "--theirs", &relation.to_string()],
+            ),
+            "settle incoming relation independently",
+        );
+    }
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--all-theirs"]),
+        "settle remaining source file choices",
+    );
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--continue"]),
+        "publish coherent source and destination decisions",
+    );
+    assert_eq!(
+        fs::read(repo.join("b.py")).unwrap(),
+        fs::read(input).unwrap()
+    );
+}
+
+#[test]
+fn authored_merge_accepts_in_place_input_and_preserves_unrelated_or_later_edits() {
+    let root = tempdir().expect("temp root");
+    let repo = conflicting_repository(root.path());
+    fs::write(repo.join("untouched.txt"), b"keep this\n").unwrap();
+    run_git(&repo, &["add", "untouched.txt"]);
+    run_git(&repo, &["commit", "-m", "independent tracked file"]);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
+        "init",
+    );
+    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    let head = branch_change(&layout, "main");
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "park merge",
+    );
+    let initial = persisted_record(&layout).unwrap();
+    let source = repo.join("src/lib.rs");
+    let body = b"pub fn base(value: i32, count: u64) -> u64 { value as u64 + count }\n";
+    fs::write(&source, body).unwrap();
+    let external = root.path().join("shared-resolution.txt");
+    fs::write(&external, b"combined shared bytes\n").unwrap();
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &[
+                "resolve",
+                "--file",
+                "src/lib.rs",
+                source.to_str().unwrap(),
+                "--file",
+                "shared.txt",
+                external.to_str().unwrap(),
+                "--expect",
+                &initial.hash.to_string(),
+            ],
+        ),
+        "settle mixed in-place and external input",
+    );
+    let settled = persisted_record(&layout).unwrap();
+    fs::write(repo.join("untouched.txt"), b"unrelated local edit\n").unwrap();
+    let unrelated = run_kin(&runtime, &repo, &["resolve", "--continue"]);
+    assert!(!unrelated.status.success());
+    assert!(
+        String::from_utf8_lossy(&unrelated.stderr).contains("untouched.txt"),
+        "{}",
+        String::from_utf8_lossy(&unrelated.stderr)
+    );
+    assert_eq!(branch_change(&layout, "main"), head);
+    assert_eq!(persisted_record(&layout).unwrap().hash, settled.hash);
+    assert_eq!(fs::read(&source).unwrap(), body);
+    fs::write(repo.join("untouched.txt"), b"keep this\n").unwrap();
+    fs::write(&source, b"pub fn later_edit() {}\n").unwrap();
+    let later = run_kin(&runtime, &repo, &["resolve", "--continue"]);
+    assert!(!later.status.success());
+    assert!(
+        String::from_utf8_lossy(&later.stderr).contains("src/lib.rs"),
+        "{}",
+        String::from_utf8_lossy(&later.stderr)
+    );
+    assert_eq!(fs::read(&source).unwrap(), b"pub fn later_edit() {}\n");
+    assert_eq!(persisted_record(&layout).unwrap().hash, settled.hash);
+    fs::write(&source, body).unwrap();
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--continue"]),
+        "publish the exact authored input already projected in place",
+    );
+    assert_ne!(branch_change(&layout, "main"), head);
+    assert_eq!(fs::read(source).unwrap(), body);
+    assert_eq!(
+        fs::read(repo.join("shared.txt")).unwrap(),
+        b"combined shared bytes\n"
+    );
+    assert_eq!(
+        fs::read(repo.join("untouched.txt")).unwrap(),
+        b"keep this\n"
+    );
+}

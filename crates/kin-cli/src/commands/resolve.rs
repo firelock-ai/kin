@@ -10,14 +10,19 @@
 //! requires to still be current, so a session resolving against a view another
 //! session has already advanced is refused rather than silently rebased.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use kin_model::{
     AuthorId, Hash256, MergeSide, MergeTransactionRecord, OperationId, RepositoryId, RootBundle,
     SemanticChangeId, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 pub const RESOLVE_REPORT_SCHEMA: &str = "kin.resolve.v1";
+/// Custom input is bounded before it is admitted to repository authority.
+pub const MAX_RESOLVE_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// JSON encodes each byte using at most four bytes, including its separator.
+pub const MAX_RESOLVE_REQUEST_BYTES: usize = 4 * MAX_RESOLVE_FILE_BYTES + 1024 * 1024;
 
 /// How one named conflict is settled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +36,9 @@ pub enum ResolveChoice {
     /// One claimant keeps a contested path. A path has no side to take, so it
     /// is settled by naming an owner among its claimants.
     PathOwner { artifact: String },
+    /// Replace a conflicting artifact with explicit input bytes and derive its
+    /// merged entities and relationships from that body.
+    File { body: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +119,7 @@ pub async fn run(
     base: Vec<String>,
     remove: Vec<String>,
     keep_path: Vec<String>,
+    file: Vec<String>,
     all_ours: bool,
     all_theirs: bool,
     do_continue: bool,
@@ -124,6 +133,7 @@ pub async fn run(
         base,
         remove,
         keep_path,
+        file,
         all_ours,
         all_theirs,
         do_continue,
@@ -162,6 +172,7 @@ fn plan_action(
     base: Vec<String>,
     remove: Vec<String>,
     keep_path: Vec<String>,
+    file: Vec<String>,
     all_ours: bool,
     all_theirs: bool,
     do_continue: bool,
@@ -169,6 +180,14 @@ fn plan_action(
 ) -> Result<ResolveAction> {
     if do_continue && abort {
         bail!("a merge either completes or is abandoned; --continue and --abort are exclusive");
+    }
+    if !file.is_empty() && (do_continue || abort) {
+        bail!(
+            "settle file conflicts first, then run `kin resolve --continue` or `kin resolve --abort`"
+        );
+    }
+    if file.len() % 2 != 0 {
+        bail!("--file expects two arguments: <PATH> <FILE>");
     }
     let mut directives = Vec::new();
     for selector in ours {
@@ -218,6 +237,23 @@ fn plan_action(
             },
         });
     }
+    let mut remaining_file_bytes = MAX_RESOLVE_FILE_BYTES;
+    for pair in file.chunks_exact(2) {
+        let selector = &pair[0];
+        let source = &pair[1];
+        if selector.trim().is_empty() {
+            bail!("--file requires the conflicted repository path or artifact identity");
+        }
+        if directives.iter().any(|entry| entry.selector == *selector) {
+            bail!("conflict {selector} has more than one resolution in this request");
+        }
+        let body = read_resolution_body(source, remaining_file_bytes)?;
+        remaining_file_bytes -= body.len();
+        directives.push(ResolveDirective {
+            selector: selector.clone(),
+            choice: ResolveChoice::File { body },
+        });
+    }
     let all = match (all_ours, all_theirs) {
         (true, true) => bail!("--all-ours and --all-theirs choose different sides for one merge"),
         (true, false) => Some(MergeSide::Ours),
@@ -242,11 +278,28 @@ fn plan_action(
     // of this function, and because it names the full remedy set inline.
     if !settling {
         bail!(
-            "nothing to resolve; name a conflict with --ours/--theirs/--base/--remove/--keep-path, \
+            "nothing to resolve; name a conflict with --ours/--theirs/--base/--remove/--keep-path/--file, \
              settle the rest with --all-ours or --all-theirs, or finish with --continue or --abort"
         );
     }
     Ok(ResolveAction::Settle { directives, all })
+}
+
+fn read_resolution_body(source: &str, remaining_bytes: usize) -> Result<Vec<u8>> {
+    let input = std::fs::File::open(source)
+        .with_context(|| format!("could not read resolution body from {source}"))?;
+    let mut body = Vec::new();
+    input
+        .take(remaining_bytes as u64 + 1)
+        .read_to_end(&mut body)
+        .with_context(|| format!("could not read resolution body from {source}"))?;
+    if body.len() > remaining_bytes {
+        bail!(
+            "custom resolution bodies exceed the {MAX_RESOLVE_FILE_BYTES}-byte input limit per \
+             request; resolve multiple files in separate requests"
+        );
+    }
+    Ok(body)
 }
 
 fn parse_record_hash(value: &str) -> Result<Hash256> {
@@ -266,6 +319,98 @@ fn parse_record_hash(value: &str) -> Result<Hash256> {
 mod tests {
     use super::*;
 
+    fn file_action(
+        file: Vec<String>,
+        ours: Vec<String>,
+        do_continue: bool,
+    ) -> Result<ResolveAction> {
+        plan_action(
+            ours,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            file,
+            false,
+            false,
+            do_continue,
+            false,
+        )
+    }
+
+    #[test]
+    fn file_resolution_captures_exact_input_bytes_independent_of_the_input_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("combined=body.bin");
+        let body = b"ours\r\ntheirs\0\xff";
+        std::fs::write(&source, body).unwrap();
+        let action = file_action(
+            vec!["src/a=b.bin".to_string(), source.display().to_string()],
+            Vec::new(),
+            false,
+        )
+        .unwrap();
+        std::fs::write(&source, b"changed after capture").unwrap();
+        assert_eq!(
+            action,
+            ResolveAction::Settle {
+                directives: vec![ResolveDirective {
+                    selector: "src/a=b.bin".to_string(),
+                    choice: ResolveChoice::File {
+                        body: body.to_vec(),
+                    },
+                }],
+                all: None,
+            }
+        );
+        let encoded = serde_json::to_vec(&action).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ResolveAction>(&encoded).unwrap(),
+            action
+        );
+        assert!(!String::from_utf8(encoded)
+            .unwrap()
+            .contains("combined=body.bin"));
+    }
+
+    #[test]
+    fn file_resolution_refuses_missing_input_and_contradictory_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing").display().to_string();
+        let binding = vec!["src/code.rs".to_string(), missing];
+        assert!(file_action(binding.clone(), Vec::new(), false)
+            .unwrap_err()
+            .to_string()
+            .contains("could not read resolution body"));
+        assert!(file_action(binding.clone(), Vec::new(), true)
+            .unwrap_err()
+            .to_string()
+            .contains("settle file conflicts first"));
+        assert!(file_action(binding, vec!["src/code.rs".to_string()], false)
+            .unwrap_err()
+            .to_string()
+            .contains("more than one resolution"));
+        assert!(
+            file_action(vec!["src/code.rs".to_string()], Vec::new(), false)
+                .unwrap_err()
+                .to_string()
+                .contains("two arguments")
+        );
+    }
+
+    #[test]
+    fn file_resolution_input_limit_refuses_truncation_and_accepts_exact_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("body.bin");
+        std::fs::write(&source, [0xff; 5]).unwrap();
+        let source = source.to_str().unwrap();
+        assert_eq!(read_resolution_body(source, 5).unwrap(), [0xff; 5]);
+        assert!(read_resolution_body(source, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("input limit"));
+    }
+
     fn keep_path_directives(binding: &str) -> Vec<ResolveDirective> {
         let action = plan_action(
             Vec::new(),
@@ -273,6 +418,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec![binding.to_string()],
+            Vec::new(),
             false,
             false,
             false,
@@ -320,6 +466,9 @@ mod tests {
 }
 
 async fn execute(request: ResolveRequest) -> Result<ResolveResponse> {
+    if serde_json::to_vec(&request)?.len() > MAX_RESOLVE_REQUEST_BYTES {
+        bail!("resolution request exceeds the {MAX_RESOLVE_REQUEST_BYTES}-byte transport limit");
+    }
     let layout = super::merge::require_repository_layout()?;
     let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?

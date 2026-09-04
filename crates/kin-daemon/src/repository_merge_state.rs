@@ -12,6 +12,8 @@
 //! commits the resolutions it already carries, so the transaction that publishes
 //! the merge is never the one that decided any part of it.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::{Context, Result};
 use axum::http::StatusCode;
 use kin_cli::commands::conflicts::{
@@ -25,10 +27,11 @@ use kin_db::{
     ChangeStore, LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager,
 };
 use kin_model::{
-    MergeConflictSubject, MergeEntryResolution, MergeResolutionPayload, MergeResolutionProvenance,
-    MergeSide, MergeTransactionDelta, MergeTransactionRecord, MergeTransactionState,
-    RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryTransaction, Timestamp,
-    TransactionDelta, WorkspaceId, WorkspaceState, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    EntityStore, MergeConflictSubject, MergeEntryResolution, MergeResolutionPayload,
+    MergeResolutionProvenance, MergeSide, MergeTransactionDelta, MergeTransactionRecord,
+    MergeTransactionState, RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryTransaction,
+    Timestamp, TransactionDelta, WorkspaceId, WorkspaceState,
+    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 
 use crate::local_repository_authority::ActiveLocalRepositoryAuthority;
@@ -505,7 +508,7 @@ fn plan_resolution(
 
     match &request.action {
         ResolveAction::Settle { directives, all } => settle(
-            authority, request, roots, workspace, record, directives, *all,
+            state, authority, request, roots, workspace, record, directives, *all,
         ),
         ResolveAction::Continue => {
             let execution =
@@ -533,6 +536,7 @@ fn into_resolve_execution(execution: MergeExecution) -> ResolveExecution {
 /// transaction.
 #[allow(clippy::too_many_arguments)]
 fn settle(
+    state: &DaemonState,
     authority: &ActiveLocalRepositoryAuthority,
     request: &ResolveRequest,
     roots: kin_model::RootBundle,
@@ -548,8 +552,24 @@ fn settle(
     };
     let mut next = record.clone();
     let mut settled = Vec::new();
+    let (authored, covered) =
+        settle_authored_files(state, authority, &record, directives, &provenance)?;
+    for (subject, resolution) in authored {
+        next = next.resolve_entry(&subject, resolution)?;
+        settled.push(subject);
+    }
     for directive in directives {
+        if matches!(directive.choice, ResolveChoice::File { .. }) {
+            continue;
+        }
         let subject = select_subject(&next, &directive.selector)?;
+        if covered.contains(&subject) {
+            return Err(merge_bad_request(format!(
+                "{} is also covered by --file in this request; choose one resolution for that file",
+                directive.selector
+            )));
+        }
+        refuse_authored_overlap(authority, &next, &subject)?;
         let resolution = resolution_for(&next, &subject, &directive.choice, &provenance)?;
         next = next
             .resolve_entry(&subject, resolution)
@@ -620,6 +640,520 @@ fn settle(
         next,
         None,
     ))
+}
+
+type MergeInputs = [kin_model::graph::ResolvedGraphState; 3];
+type SettledEntries = Vec<(MergeConflictSubject, MergeEntryResolution)>;
+
+fn merge_inputs(
+    authority: &ActiveLocalRepositoryAuthority,
+    record: &MergeTransactionRecord,
+) -> Result<(kin_db::GraphSnapshot, MergeInputs)> {
+    let lease = authority.manager.read_authority();
+    let mut snapshot = lease.snapshot().clone();
+    snapshot.repository_authority = None;
+    drop(lease);
+    let graph = kin_db::InMemoryGraph::from_snapshot(snapshot.clone())?;
+    let inputs = [
+        graph.resolve_graph_at(&record.binding.ours_change)?,
+        graph.resolve_graph_at(&record.binding.theirs_change)?,
+        graph.resolve_graph_at(&record.binding.base_change)?,
+    ];
+    snapshot.entities = inputs[0].entities.clone();
+    snapshot.relations = inputs[0].relations.clone();
+    snapshot.entity_revisions = inputs[0].entity_revisions.clone();
+    snapshot.resolved_tree = inputs[0].tree.clone();
+    snapshot.external_references = inputs[0].external_references.clone();
+    snapshot.outgoing.clear();
+    snapshot.incoming.clear();
+    Ok((snapshot, inputs))
+}
+
+fn file_coverage(
+    record: &MergeTransactionRecord,
+    inputs: &MergeInputs,
+    artifact: kin_model::ArtifactId,
+) -> BTreeSet<MergeConflictSubject> {
+    let paths: BTreeSet<String> = inputs
+        .iter()
+        .filter_map(|input| input.tree.get(&artifact))
+        .map(|entry| entry.path.to_string())
+        .collect();
+    let entities: BTreeSet<kin_model::EntityId> = inputs
+        .iter()
+        .flat_map(|input| input.entities.values())
+        .filter(|entity| entity_path(entity).is_some_and(|path| paths.contains(path)))
+        .map(|entity| entity.id)
+        .collect();
+    record
+        .entries
+        .iter()
+        .filter(|entry| match entry.subject {
+            MergeConflictSubject::Artifact { artifact: id } => id == artifact,
+            MergeConflictSubject::Entity { entity } => entities.contains(&entity),
+            MergeConflictSubject::Relation { relation } => inputs.iter().any(|input| {
+                input
+                    .relations
+                    .get(&relation)
+                    .is_some_and(|value| match value.src {
+                        kin_model::GraphNodeId::Entity(id) => entities.contains(&id),
+                        kin_model::GraphNodeId::Artifact(id) => id == artifact,
+                        _ => false,
+                    })
+            }),
+            MergeConflictSubject::Path { .. } => false,
+        })
+        .map(|entry| entry.subject.clone())
+        .collect()
+}
+
+fn entity_path(entity: &kin_model::Entity) -> Option<&str> {
+    entity
+        .span
+        .as_ref()
+        .map(|span| span.file.0.as_str())
+        .or_else(|| entity.file_origin.as_ref().map(|file| file.0.as_str()))
+}
+
+fn authored_artifacts(
+    record: &MergeTransactionRecord,
+) -> Vec<(kin_model::ArtifactId, kin_model::LocatedEntry)> {
+    record
+        .entries
+        .iter()
+        .filter_map(|entry| match (&entry.subject, &entry.resolution) {
+            (
+                MergeConflictSubject::Artifact { artifact },
+                MergeEntryResolution::Payload {
+                    payload: MergeResolutionPayload::Artifact(located),
+                    ..
+                },
+            ) => Some((*artifact, located.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn refuse_authored_overlap(
+    authority: &ActiveLocalRepositoryAuthority,
+    record: &MergeTransactionRecord,
+    subject: &MergeConflictSubject,
+) -> Result<()> {
+    let authored = authored_artifacts(record);
+    if authored.is_empty() {
+        return Ok(());
+    }
+    let (_, inputs) = merge_inputs(authority, record)?;
+    for (artifact, located) in authored {
+        let authored_operation =
+            record
+                .entries
+                .iter()
+                .find_map(|entry| match (&entry.subject, &entry.resolution) {
+                    (
+                        MergeConflictSubject::Artifact { artifact: id },
+                        MergeEntryResolution::Payload { provenance, .. },
+                    ) if *id == artifact => Some(provenance.operation_id),
+                    _ => None,
+                });
+        let removed_by_body = record.entries.iter().any(|entry| {
+            &entry.subject == subject && matches!(&entry.resolution,
+                MergeEntryResolution::Payload { payload: MergeResolutionPayload::Removed, provenance }
+                    if Some(provenance.operation_id) == authored_operation)
+        });
+        if file_coverage(record, &inputs, artifact).contains(subject) || removed_by_body {
+            return Err(merge_conflict(format!(
+                "{} is covered by the authored body for {}; use --file again to replace that whole-file decision",
+                render_subject_identity(subject), located.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn settle_authored_files(
+    state: &DaemonState,
+    authority: &ActiveLocalRepositoryAuthority,
+    record: &MergeTransactionRecord,
+    directives: &[ResolveDirective],
+    provenance: &MergeResolutionProvenance,
+) -> Result<(SettledEntries, BTreeSet<MergeConflictSubject>)> {
+    let total = directives
+        .iter()
+        .try_fold(0usize, |total, directive| match &directive.choice {
+            ResolveChoice::File { body } => total.checked_add(body.len()),
+            _ => Some(total),
+        })
+        .ok_or_else(|| merge_bad_request("custom resolution input size overflow"))?;
+    if total > kin_cli::commands::resolve::MAX_RESOLVE_FILE_BYTES {
+        return Err(merge_bad_request(format!(
+            "custom resolution input exceeds {} bytes; settle files in separate requests",
+            kin_cli::commands::resolve::MAX_RESOLVE_FILE_BYTES
+        )));
+    }
+    if !directives
+        .iter()
+        .any(|directive| matches!(directive.choice, ResolveChoice::File { .. }))
+    {
+        return Ok((Vec::new(), BTreeSet::new()));
+    }
+    let (mut snapshot, inputs) = merge_inputs(authority, record)?;
+    let mut files = BTreeMap::new();
+    let mut covered = BTreeSet::new();
+    for directive in directives {
+        let ResolveChoice::File { body } = &directive.choice else {
+            continue;
+        };
+        let matches: Vec<_> = record
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry.subject, MergeConflictSubject::Artifact { .. })
+                    && entry_matches(entry, &directive.selector)
+            })
+            .collect();
+        let [entry] = matches.as_slice() else {
+            return Err(merge_bad_request(format!(
+                "--file {} must name exactly one recorded artifact conflict",
+                directive.selector
+            )));
+        };
+        let MergeConflictSubject::Artifact { artifact } = entry.subject else {
+            unreachable!()
+        };
+        if files.contains_key(&artifact) {
+            return Err(merge_bad_request(format!(
+                "{} has more than one --file body",
+                directive.selector
+            )));
+        }
+        let original = inputs
+            .iter()
+            .find_map(|input| input.tree.get(&artifact))
+            .ok_or_else(|| {
+                merge_conflict("the conflicted artifact is absent from merge history")
+            })?;
+        let kin_model::TreeEntry::Blob { executable, .. } = original.entry else {
+            return Err(merge_bad_request(format!(
+                "--file {} requires a regular file artifact",
+                directive.selector
+            )));
+        };
+        let hash = kin_blobs::digest(body);
+        let located = kin_model::LocatedEntry::new(
+            original.path.clone(),
+            kin_model::TreeEntry::blob(hash, executable),
+        );
+        covered.extend(file_coverage(record, &inputs, artifact));
+        files.insert(artifact, (located, body.clone()));
+    }
+    for directive in directives {
+        if !matches!(directive.choice, ResolveChoice::File { .. }) {
+            let subject = select_subject(record, &directive.selector)?;
+            if covered.contains(&subject) {
+                return Err(merge_bad_request(format!(
+                    "{} is also covered by --file in this request; choose one resolution for that file",
+                    directive.selector
+                )));
+            }
+        }
+    }
+    // A file deleted on the target side still has historical identities to
+    // match. Bring those identities into the detached planning view only.
+    for artifact in files.keys() {
+        if snapshot.resolved_tree.get(artifact).is_none() {
+            let input = inputs
+                .iter()
+                .find(|input| input.tree.get(artifact).is_some())
+                .unwrap();
+            let original = input.tree.get(artifact).unwrap();
+            let mut artifacts: Vec<_> = snapshot.resolved_tree.artifacts().cloned().collect();
+            artifacts.push(original.clone());
+            snapshot.resolved_tree = kin_model::ResolvedTree::from_artifacts(artifacts)?;
+            for entity in input
+                .entities
+                .values()
+                .filter(|entity| entity_path(entity) == Some(original.path.to_string().as_str()))
+            {
+                snapshot.entities.insert(entity.id, entity.clone());
+            }
+        }
+    }
+    seed_authored_identities(&mut snapshot, &inputs, record, &files);
+    let parsed = reparse_authored_files(state, snapshot, &files)?;
+    let paths: BTreeSet<_> = files
+        .values()
+        .map(|(located, _)| located.path.to_string())
+        .collect();
+    let removed_entities: BTreeSet<_> = inputs
+        .iter()
+        .flat_map(|input| input.entities.values())
+        .filter(|entity| {
+            entity_path(entity).is_some_and(|path| paths.contains(path))
+                && !parsed.entities.contains_key(&entity.id)
+        })
+        .map(|entity| entity.id)
+        .collect();
+    for entry in &record.entries {
+        if let MergeConflictSubject::Relation { relation } = entry.subject {
+            if inputs.iter().any(|input| {
+                input.relations.get(&relation).is_some_and(|value| {
+                    [value.src, value.dst].iter().any(|node| {
+                        node.as_entity()
+                            .is_some_and(|id| removed_entities.contains(&id))
+                    })
+                })
+            }) {
+                covered.insert(entry.subject.clone());
+            }
+        }
+    }
+    for directive in directives {
+        if !matches!(directive.choice, ResolveChoice::File { .. }) {
+            let subject = select_subject(record, &directive.selector)?;
+            if covered.contains(&subject) {
+                return Err(merge_bad_request(format!(
+                    "{} is also covered by --file in this request; its endpoint is removed by that body",
+                    directive.selector
+                )));
+            }
+        }
+    }
+    let mut resolutions = Vec::new();
+    for subject in &covered {
+        let payload = match subject {
+            MergeConflictSubject::Artifact { artifact } => {
+                MergeResolutionPayload::Artifact(files[artifact].0.clone())
+            }
+            MergeConflictSubject::Entity { entity } => parsed
+                .entities
+                .get(entity)
+                .map(|entity| MergeResolutionPayload::Entity(Box::new(entity.clone())))
+                .unwrap_or(MergeResolutionPayload::Removed),
+            MergeConflictSubject::Relation { relation } => parsed
+                .relations
+                .get(relation)
+                .map(|relation| MergeResolutionPayload::Relation(Box::new(relation.clone())))
+                .unwrap_or(MergeResolutionPayload::Removed),
+            MergeConflictSubject::Path { .. } => unreachable!(),
+        };
+        resolutions.push((
+            subject.clone(),
+            MergeEntryResolution::Payload {
+                payload,
+                provenance: provenance.clone(),
+            },
+        ));
+    }
+    // Blobs become immutable input before the single merge-record CAS can
+    // reference them. A rejected record update can leave only unreferenced CAS.
+    for (located, body) in files.values() {
+        let kin_model::TreeEntry::Blob { hash: content, .. } = located.entry else {
+            unreachable!()
+        };
+        authority.manager.save_source_blob(content, body)?;
+    }
+    Ok((resolutions, covered))
+}
+
+/// Reconstruct the complete graph-derived meaning of explicit file input.
+/// This is an ingestion boundary over immutable bytes, with no workspace read.
+fn reparse_authored_files(
+    state: &DaemonState,
+    mut snapshot: kin_db::GraphSnapshot,
+    files: &BTreeMap<kin_model::ArtifactId, (kin_model::LocatedEntry, Vec<u8>)>,
+) -> Result<kin_db::GraphSnapshot> {
+    snapshot.repository_authority = None;
+    snapshot.outgoing.clear();
+    snapshot.incoming.clear();
+    let external_references = snapshot.external_references.clone();
+    let prospective = kin_db::InMemoryGraph::from_snapshot(snapshot)?;
+    let pipeline = kin_index::IndexPipeline::new();
+    let mut reconciler = kin_reconcile::Reconciler::new(std::path::PathBuf::new());
+    reconciler.seed_cross_file_linker_from_graph(&prospective);
+    let mut ordered: Vec<_> = files.iter().collect();
+    ordered.sort_by(|left, right| left.1 .0.path.cmp(&right.1 .0.path));
+    for (artifact, (located, body)) in ordered {
+        let file = kin_model::FilePathId::new(located.path.to_string());
+        let digest = state.blobs.write(body)?;
+        let kin_model::TreeEntry::Blob { hash: content, .. } = located.entry else {
+            return Err(merge_bad_request(
+                "an authored merge body must be a regular file",
+            ));
+        };
+        if digest.0 != *content.as_bytes() {
+            return Err(merge_conflict(format!(
+                "authored body digest differs for {}",
+                located.path
+            )));
+        }
+        let old = prospective.resolved_tree().get(artifact).cloned();
+        let delta = match old {
+            Some(old) if old.located_entry() == *located => None,
+            Some(old) => Some(kin_model::TreeDelta::Updated {
+                artifact_id: *artifact,
+                old: old.located_entry(),
+                new: located.clone(),
+            }),
+            None => Some(kin_model::TreeDelta::Added {
+                artifact_id: *artifact,
+                new: located.clone(),
+            }),
+        };
+        if let Some(delta) = delta {
+            prospective.apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![delta],
+                ..TransactionDelta::default()
+            })?;
+        }
+        match pipeline
+            .index_any_content(&file, body, digest)
+            .with_context(|| format!("parse authored merge body for {file}"))?
+        {
+            kin_index::IndexedAny::EntitySource(indexed) => {
+                if !matches!(indexed.parse_state, kin_model::ParseState::Valid) {
+                    return Err(merge_bad_request(format!("the authored body for {file} has syntax errors; correct it before settling")));
+                }
+                let result = reconciler
+                    .reconcile_indexed_content(&indexed, state.blobs.as_ref(), &prospective)
+                    .with_context(|| format!("derive complete merge semantics for {file}"))?;
+                prospective.apply_transaction_delta(&result.delta)?;
+            }
+            _ => {
+                let before = prospective.to_snapshot();
+                let retired: BTreeSet<_> = before
+                    .entities
+                    .values()
+                    .filter(|entity| entity_path(entity) == Some(file.0.as_str()))
+                    .map(|entity| entity.id)
+                    .collect();
+                let delta = TransactionDelta {
+                    entity_deltas: retired
+                        .iter()
+                        .map(|id| kin_model::EntityDelta::Removed {
+                            old: before.entities[id].clone(),
+                        })
+                        .collect(),
+                    relation_deltas: before
+                        .relations
+                        .values()
+                        .filter(|relation| {
+                            [relation.src, relation.dst].iter().any(|node| {
+                                node.as_entity().is_some_and(|id| retired.contains(&id))
+                            }) || (relation.src == kin_model::GraphNodeId::Artifact(*artifact)
+                                && matches!(
+                                    relation.origin,
+                                    kin_model::RelationOrigin::Parsed
+                                        | kin_model::RelationOrigin::Inferred
+                                ))
+                        })
+                        .map(|relation| kin_model::RelationDelta::Removed {
+                            old: relation.clone(),
+                        })
+                        .collect(),
+                    ..TransactionDelta::default()
+                };
+                prospective.apply_transaction_delta(&delta)?;
+            }
+        }
+    }
+    let parsed = prospective.to_snapshot();
+    if parsed.external_references != external_references {
+        return Err(merge_conflict(
+            "authored merge input changes external-reference records; this merge cannot publish those records safely",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn seed_authored_identities(
+    snapshot: &mut kin_db::GraphSnapshot,
+    inputs: &MergeInputs,
+    record: &MergeTransactionRecord,
+    files: &BTreeMap<kin_model::ArtifactId, (kin_model::LocatedEntry, Vec<u8>)>,
+) {
+    // Original first-parent identities are stable anchors even when a
+    // conflict payload removes an old declaration before this full reparse.
+    let paths: BTreeSet<_> = files
+        .values()
+        .map(|(located, _)| located.path.to_string())
+        .collect();
+    snapshot
+        .entities
+        .retain(|_, entity| !entity_path(entity).is_some_and(|path| paths.contains(path)));
+    for input in inputs {
+        for entity in input
+            .entities
+            .values()
+            .filter(|entity| entity_path(entity).is_some_and(|path| paths.contains(path)))
+        {
+            snapshot
+                .entities
+                .entry(entity.id)
+                .or_insert_with(|| entity.clone());
+        }
+    }
+    // Derived relation payloads can name declarations absent from the original
+    // conflict set. Recreate those relations only after their declarations have
+    // been parsed, using recorded input identities as matching anchors.
+    let covered: BTreeSet<_> = files
+        .keys()
+        .flat_map(|artifact| file_coverage(record, inputs, *artifact))
+        .collect();
+    for subject in &covered {
+        let MergeConflictSubject::Relation { relation } = subject else {
+            continue;
+        };
+        snapshot.relations.remove(relation);
+        if let Some(original) = inputs
+            .iter()
+            .find_map(|input| input.relations.get(relation))
+        {
+            let valid = [original.src, original.dst].iter().all(|node| match node {
+                kin_model::GraphNodeId::Entity(entity) => snapshot.entities.contains_key(entity),
+                kin_model::GraphNodeId::Artifact(artifact) => {
+                    snapshot.resolved_tree.get(artifact).is_some()
+                }
+                _ => true,
+            });
+            if valid {
+                snapshot.relations.insert(*relation, original.clone());
+            }
+        }
+    }
+}
+
+/// Load only durable authored bodies, then rederive their complete semantics
+/// over the composed graph. The external input pathname is never consulted.
+pub(crate) fn replay_authored_files(
+    state: &DaemonState,
+    authority: &ActiveLocalRepositoryAuthority,
+    record: &MergeTransactionRecord,
+    mut snapshot: kin_db::GraphSnapshot,
+) -> Result<kin_db::GraphSnapshot> {
+    let mut files = BTreeMap::new();
+    for (artifact, located) in authored_artifacts(record) {
+        let kin_model::TreeEntry::Blob { hash: content, .. } = located.entry else {
+            return Err(merge_conflict(
+                "an authored file record names a non-file artifact",
+            ));
+        };
+        let body = authority
+            .manager
+            .load_source_blob(content)?
+            .ok_or_else(|| {
+                merge_conflict(format!(
+                    "authored body {content} is missing from repository CAS"
+                ))
+            })?;
+        files.insert(artifact, (located, body));
+    }
+    if files.is_empty() {
+        return Ok(snapshot);
+    }
+    let (_, inputs) = merge_inputs(authority, record)?;
+    seed_authored_identities(&mut snapshot, &inputs, record, &files);
+    reparse_authored_files(state, snapshot, &files)
 }
 
 /// Abandon the merge, whatever the workspace has done since it opened.
@@ -852,6 +1386,11 @@ fn resolution_for(
                 side: *side,
                 provenance: provenance.clone(),
             }
+        }
+        ResolveChoice::File { .. } => {
+            return Err(merge_bad_request(
+                "a file body must settle its artifact and derived conflicts together",
+            ));
         }
         ResolveChoice::Remove => MergeEntryResolution::Payload {
             payload: MergeResolutionPayload::Removed,
