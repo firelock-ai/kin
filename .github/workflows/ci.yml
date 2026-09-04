@@ -1123,6 +1123,31 @@ jobs:
           # shellcheck disable=SC2086
           cargo clippy --all-targets --all-features -- $allows
 
+      # The deployed Firestore client needs a body to retry a query, but a
+      # successful Commit has already acknowledged its atomic write and must
+      # not replay just because its informational body truncates. The default
+      # workspace profile leaves this feature off. Keep the three real socket
+      # contracts in this required context, after its all-features build, with
+      # an exact listing assertion so a stale filter cannot grade nothing.
+      - name: Test Firestore post-status response semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          listing="$(cargo test -p kin-spine --features firestore --locked -- --list | tr -d '\r')"
+          for test_name in \
+            firestore::transient_retry_tests::query_documents_retries_a_body_that_fails_to_arrive_over_the_wire \
+            firestore::transient_retry_tests::commit_write_batch_does_not_replay_after_a_truncated_success_body \
+            firestore::transient_retry_tests::get_document_does_not_retry_a_permission_denied_with_a_truncated_body
+          do
+            matches="$(printf '%s\n' "$listing" | awk -v expected="$test_name: test" '$0 == expected { count += 1 } END { print count + 0 }')"
+            if [ "$matches" -ne 1 ]; then
+              echo "::error title=Missing Firestore response-body test::$test_name listed $matches time(s)"
+              exit 1
+            fi
+            cargo test -p kin-spine --features firestore --locked "$test_name" \
+              -- --exact --nocapture --test-threads=1
+          done
+
       # Nine of the window's 64 failures were release ordering and npm
       # provenance policy and eight more were this gate, so a fifth of what a
       # pull request used to learn in thirty minutes is learned here in under
