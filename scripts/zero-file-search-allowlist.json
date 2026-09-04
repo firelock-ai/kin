@@ -1373,21 +1373,32 @@
     },
     {
       "file": "crates/kin-cli/src/commands/locate_cursor.rs",
-      "reason": "The per-repo paging cursor for `kin locate --next`, per its own doc. It holds a continuation token, never repository content, and a miss restarts paging rather than answering. Already declared in the shell guard's own pins; this entry is what makes both guards agree it is a boundary. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "reason": "The per-repo paging cursor for `kin locate --next`, per its own doc. It holds a continuation token, never repository content, and a miss restarts paging rather than answering. Read, written and cleared here, and those three expressions are the whole of its filesystem surface. PINNED rather than whole-file, and that distinction is the correction this entry exists to record. `scripts/zero_file_search_guard.sh` enforced this module before FIR-2282, with these exact expressions declared in its own `allow_for`. A whole-file entry drops the path during that guard's enumeration, one step before the deferral logic, so the first cut of FIR-2282 left neither guard scanning it: a coverage REGRESSION inside the change that widens coverage, found by review. Pinning keeps both guards on every other line of the file, which is what the shell guard already had.",
       "owner": "kin-cli",
-      "expiration": "2027-06-18"
+      "expiration": "2027-06-18",
+      "allow_match": [
+        "std::fs::read_to_string(&path)",
+        "let _ = std::fs::write(&path, cursor);",
+        "let _ = std::fs::remove_file(&path);"
+      ]
     },
     {
       "file": "crates/kin-cli/src/commands/locate_debug.rs",
-      "reason": "`kin locate-debug`: the offline signal breakdown reader, per its own doc. Already declared in the shell guard's pins; this entry is the other half of that declaration. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "reason": "`kin locate-debug`: the offline signal-breakdown reader, per its own doc. The single read is the dump file an operator names on the command line, never repository content. PINNED rather than whole-file, and that distinction is the correction this entry exists to record. `scripts/zero_file_search_guard.sh` enforced this module before FIR-2282, with these exact expressions declared in its own `allow_for`. A whole-file entry drops the path during that guard's enumeration, one step before the deferral logic, so the first cut of FIR-2282 left neither guard scanning it: a coverage REGRESSION inside the change that widens coverage, found by review. Pinning keeps both guards on every other line of the file, which is what the shell guard already had.",
       "owner": "kin-cli",
-      "expiration": "2027-06-18"
+      "expiration": "2027-06-18",
+      "allow_match": [
+        "std::fs::read_to_string(path)"
+      ]
     },
     {
       "file": "crates/kin-cli/src/commands/contextbench_locate.rs",
-      "reason": "The benchmark task-input boundary: it reads the task file a benchmark run names. Already declared in the shell guard's pins; this entry is the other half. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "reason": "The benchmark task-input boundary: it reads the task file a benchmark run names. That file is the harness's input, not repository content, and no locate result derives from it. PINNED rather than whole-file, and that distinction is the correction this entry exists to record. `scripts/zero_file_search_guard.sh` enforced this module before FIR-2282, with these exact expressions declared in its own `allow_for`. A whole-file entry drops the path during that guard's enumeration, one step before the deferral logic, so the first cut of FIR-2282 left neither guard scanning it: a coverage REGRESSION inside the change that widens coverage, found by review. Pinning keeps both guards on every other line of the file, which is what the shell guard already had.",
       "owner": "kin-cli",
-      "expiration": "2027-06-18"
+      "expiration": "2027-06-18",
+      "allow_match": [
+        "std::fs::read_to_string(&task_file)"
+      ]
     },
     {
       "file": "crates/kin-cli/src/commands/status.rs",

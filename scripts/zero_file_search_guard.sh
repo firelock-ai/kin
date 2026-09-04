@@ -276,7 +276,40 @@ for rel in "${authority_files[@]}"; do
   # Only a one-line statement is dropped, never an item with a body. A gated
   # `fn` or `mod` keeps being scanned, which over-reports rather than
   # under-reports, and over-reporting is the direction a reviewer can see.
+  # Comments are stripped, because this guard had no lexer and the deny set is
+  # full of ordinary words. Measured: `// we deliberately avoid OpenOptions
+  # here`, `// the process as a whole is graph-owned` and a trailing
+  # `// OpenOptions is not used` each redden a REQUIRED context, in any of the
+  # 57 modules FIR-2282 newly covers, while the Python checker correctly ignores
+  # all three. A guard that fails on prose trains people to write around it.
+  #
+  # The stripper tracks double-quoted strings so a `//` inside a literal cannot
+  # truncate the code after it, and it carries block-comment state across lines.
+  # Every way it can be wrong is a FALSE POSITIVE: a char literal holding a quote
+  # leaves it believing it is inside a string, so it stops stripping and reports
+  # more, and a string spanning lines resets at the newline, where the only thing
+  # it could then hide is text inside a literal, which is not code. It never
+  # strips something it should have scanned.
   region="$(awk -v s="$test_start" -v e="$test_end" '
+    function strip(line,   i, n, ch, nx, out, in_str, esc) {
+      n = length(line); out = ""
+      for (i = 1; i <= n; i++) {
+        ch = substr(line, i, 1); nx = substr(line, i + 1, 1)
+        if (in_block) { if (ch == "*" && nx == "/") { in_block = 0; i++ } ; continue }
+        if (in_str) {
+          out = out ch
+          if (esc) esc = 0
+          else if (ch == "\\") esc = 1
+          else if (ch == "\"") in_str = 0
+          continue
+        }
+        if (ch == "\"") { in_str = 1; out = out ch; continue }
+        if (ch == "/" && nx == "/") break
+        if (ch == "/" && nx == "*") { in_block = 1; i++; continue }
+        out = out ch
+      }
+      return out
+    }
     NR >= s && NR <= e                              { next }
     /^[[:space:]]*#\[cfg\(test\)\][[:space:]]*$/ { gate = 1; next }
     gate && /^[[:space:]]*(\/\/|$)/                 { next }
@@ -284,7 +317,7 @@ for rel in "${authority_files[@]}"; do
       gate = 0
       if ($0 !~ /^[[:space:]]*mod / && $0 ~ /;[[:space:]]*$/) next
     }
-                                                    { print NR ":" $0 }
+                                                    { print NR ":" strip($0) }
   ' "$file")"
   scan_region="$region"
 

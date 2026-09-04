@@ -1529,7 +1529,17 @@ BINDING_LEARNER_CASES = [
     ("third-party fs crate", "use fs2::FileExt;\n", {"FileExt"}),
     # A glob binds no name the declaration names, so the vocabulary is the
     # fallback for that one shape.
-    ("glob", "use std::fs::*;\n", set(FS_GLOB_VOCABULARY)),
+    #
+    # The expectation is a LITERAL set, not `set(FS_GLOB_VOCABULARY)`. Written
+    # against the constant it was testing, both sides of the comparison moved
+    # together: dropping the glob branch was caught, and SHRINKING the
+    # vocabulary was not, because the case would have shrunk with it. That is
+    # the same self-referential shape as the defect this whole table exists to
+    # stop, one level down, and it was found by review rather than by the table.
+    # Naming the items here means removing one fails.
+    ("glob", "use std::fs::*;\n",
+     {"File", "OpenOptions", "DirBuilder", "DirEntry", "ReadDir", "Metadata",
+      "Permissions", "FileType", "FileTimes"}),
     # `as _` imports a trait for its methods and binds nothing a later line can
     # spell. The learner must return nothing here and leave the import to
     # NAMESPACE_REACH, which is the honest limit recorded on the function.
