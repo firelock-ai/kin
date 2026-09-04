@@ -23,25 +23,115 @@
 # Python checker rather than being duplicated here.
 #
 # Usage: zero_file_search_guard.sh [repo_root]
+#        zero_file_search_guard.sh --list-scanned [repo_root]
 # Exit: 0 when the answer paths are graph-clean, 1 on the first violation.
 set -euo pipefail
 
+# Two lists, two meanings, and the difference matters.
+#
+#   --list-scanned   every answer module, deferred ones included. This is the
+#                    notion of an answer module the Python checker's
+#                    `check_guard_seam` compares against, because a deferred
+#                    file is still an answer module; it is simply graded by the
+#                    other guard.
+#   --list-enforced  the modules THIS guard actually runs its deny set over.
+#                    scripts/falsify-zero-file-search.py poisons these, and
+#                    poisoning a deferred one would fail for the wrong reason.
+list_only=0
+if [[ "${1:-}" == "--list-scanned" ]]; then
+  list_only=1
+  shift
+elif [[ "${1:-}" == "--list-enforced" ]]; then
+  list_only=2
+  shift
+fi
+
 repo_root="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cmd_dir="crates/kin-cli/src/commands"
+allowlist="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/zero-file-search-allowlist.json"
 
-# Answer-authority modules that must resolve results from graph truth alone.
-authority_files=(
-  "$cmd_dir/locate.rs"
-  "$cmd_dir/locate_cursor.rs"
-  "$cmd_dir/locate_debug.rs"
-  "$cmd_dir/contextbench_locate.rs"
-  "$cmd_dir/search.rs"
-  "$cmd_dir/context.rs"
-  "$cmd_dir/trace.rs"
-  "$cmd_dir/trace_data_flow.rs"
-  "$cmd_dir/review.rs"
-  "$cmd_dir/xref.rs"
-)
+# Answer-authority modules, DERIVED rather than listed.
+#
+# This was a hardcoded array of ten module names, and that was the FIR-2282
+# defect: an opt-in list on a surface of 107 modules, so a new command with a
+# raw filesystem fallback was outside the guard on the day it was written. It
+# was also the second such list. The Python checker kept its own, they covered
+# different sets, and nothing compared them, so `contextbench_locate.rs`,
+# `locate_cursor.rs` and `locate_debug.rs` were answer modules here and did not
+# exist over there.
+#
+# So: every module in the directory is an answer module, minus the ones the
+# shared allowlist exempts whole-file. That is the same list
+# `command_modules_scanned` builds in the Python checker, and its
+# `check_guard_seam` runs `--list-scanned` and fails when the two differ, so the
+# drift that produced this ticket cannot recur silently.
+#
+# A whole-file exemption is an entry with no `allow_match` and no `allow_fn`.
+# Read with awk rather than a JSON parser because this guard stays dependency
+# free, and the allowlist is machine-written with one key per line. The parse
+# carries its own control below: a run that resolves zero modules refuses
+# instead of reporting a clean sheet over nothing.
+allowlist_files() {
+  # $2 selects which kind: "whole" for entries with no pins, "pinned" for the
+  # rest. Both are read from the same entries in one pass so they cannot
+  # disagree about which bucket a file is in.
+  awk -v want="$2" '
+    /^    \{/                    { file=""; pinned=0; next }
+    /"file":/                    { if (match($0, /crates\/[^"]*/)) file=substr($0, RSTART, RLENGTH) }
+    /"allow_match"|"allow_fn"/   { pinned=1 }
+    /^    \}/                    {
+      if (file != "" && ((want == "whole" && pinned == 0) || (want == "pinned" && pinned == 1)))
+        print file
+      file=""; pinned=0
+    }
+  ' "$1"
+}
+
+exempt=" $(allowlist_files "$allowlist" whole | tr '\n' ' ') "
+
+# Files whose exemptions are expression pins or function bodies. This guard
+# cannot express those without a JSON parser it deliberately does not have, so
+# it DEFERS them to the Python checker, which grades them in full.
+#
+# Deferring rather than exempting, and counted out loud below, because a silent
+# skip is the defect this ticket exists to remove. A deferred file is still an
+# answer module: it appears in `--list-scanned`, the seam check compares it, and
+# the Python checker reports every line of it. What this guard gives up is only
+# its second opinion, and only where a boundary has already been declared and
+# reviewed.
+pinned=" $(allowlist_files "$allowlist" pinned | tr '\n' ' ') "
+
+# The test-file rule, stated to match `is_test_file` in the Python checker
+# exactly: a `test_` prefix or a `_test.rs` suffix. Both spellings, because the
+# checker skips both and the seam check compares the resulting sets.
+#
+# `test_subprocess.rs` is why the prefix half is here and it was found by that
+# seam check on its first run, not by reading. It is `#[cfg(test)] pub(crate)
+# mod test_subprocess;` in commands/mod.rs, so it does not exist in a production
+# build, and this guard would have scanned it while the checker skipped it.
+authority_files=()
+while IFS= read -r path; do
+  rel="${path#"$repo_root"/}"
+  base="${rel##*/}"
+  case "$base" in test_*) continue ;; *_test.rs) continue ;; esac
+  [[ "$exempt" == *" $rel "* ]] && continue
+  authority_files+=("$rel")
+done < <(find "$repo_root/$cmd_dir" -maxdepth 1 -name '*.rs' -type f | sort)
+
+# The control. A glob that matched nothing, or an allowlist parse that swallowed
+# every module, would otherwise print "answer paths are graph-clean" over an
+# empty set, which is the exact failure mode this ticket is about.
+if ((${#authority_files[@]} < 10)); then
+  echo "Zero File-Search guard REFUSES: resolved only ${#authority_files[@]} answer" >&2
+  echo "module(s) under $cmd_dir. That is fewer than this repository has ever had," >&2
+  echo "so the enumeration is broken rather than the tree being clean." >&2
+  exit 1
+fi
+
+if ((list_only == 1)); then
+  printf '%s\n' "${authority_files[@]##*/}"
+  exit 0
+fi
 
 # Raw filesystem read / existence / traversal primitives. Subprocess creation
 # is denied wholesale in answer modules so dynamic or multiline rg/grep/find/
@@ -133,11 +223,33 @@ test_module_span() {
   ' "$1"
 }
 
+enforced_files=()
+for rel in "${authority_files[@]}"; do
+  if [[ "$pinned" == *" $rel "* ]] && [[ -z "$(allow_for "${rel##*/}")" ]]; then
+    continue
+  fi
+  enforced_files+=("$rel")
+done
+
+if ((list_only == 2)); then
+  printf '%s\n' "${enforced_files[@]##*/}"
+  exit 0
+fi
+
 violations=()
+deferred=$(( ${#authority_files[@]} - ${#enforced_files[@]} ))
 for rel in "${authority_files[@]}"; do
   file="$repo_root/$rel"
   [[ -f "$file" ]] || continue
   base="$(basename "$rel")"
+  # Declared boundaries this guard cannot express, deferred to the Python
+  # checker. A file `allow_for` covers is NOT deferred: those pins are this
+  # guard's own and predate the shared list, and dropping them would quietly
+  # narrow coverage of the four core answer modules while this change claims to
+  # widen it.
+  if [[ "$pinned" == *" $rel "* ]] && [[ -z "$(allow_for "$base")" ]]; then
+    continue
+  fi
   read -r test_start test_end <<<"$(test_module_span "$file")"
 
   # Read into an array rather than a single string. `while read` rather than
@@ -150,8 +262,30 @@ for rel in "${authority_files[@]}"; do
 
   # Everything outside the test module, before it and after it alike, with the
   # original line numbers preserved.
-  region="$(awk -v s="$test_start" -v e="$test_end" \
-    'NR < s || NR > e { print NR ":" $0 }' "$file")"
+  # Everything outside the test module, plus the single-statement items a
+  # `#[cfg(test)]` gates on its own.
+  #
+  # The second half was found by widening this guard's coverage, not by reading:
+  # `setup_ledger.rs` carries `#[cfg(test)]` on line 25 and `use std::fs;` on 26,
+  # a test-only import of a production-looking module. `test_module_span` only
+  # recognises a `#[cfg(test)]` whose next item is a `mod`, so it walked past
+  # this one to the real test module at 768 and reported line 26 as a production
+  # filesystem import. The Python checker's cfg tracker already excluded it, so
+  # the two guards disagreed about one line of one file.
+  #
+  # Only a one-line statement is dropped, never an item with a body. A gated
+  # `fn` or `mod` keeps being scanned, which over-reports rather than
+  # under-reports, and over-reporting is the direction a reviewer can see.
+  region="$(awk -v s="$test_start" -v e="$test_end" '
+    NR >= s && NR <= e                              { next }
+    /^[[:space:]]*#\[cfg\(test\)\][[:space:]]*$/ { gate = 1; next }
+    gate && /^[[:space:]]*(\/\/|$)/                 { next }
+    gate {
+      gate = 0
+      if ($0 !~ /^[[:space:]]*mod / && $0 ~ /;[[:space:]]*$/) next
+    }
+                                                    { print NR ":" $0 }
+  ' "$file")"
   scan_region="$region"
 
   # An empty array is unbound under `set -u` on bash 3.2, so expand it guarded.
@@ -197,4 +331,5 @@ if ((${#violations[@]} > 0)); then
   exit 1
 fi
 
-echo "Zero File-Search guard passed: answer paths are graph-clean."
+echo "Zero File-Search guard passed: ${#authority_files[@]} answer modules are graph-clean" \
+     "($deferred with declared boundary pins deferred to verify-zero-file-search.py)."

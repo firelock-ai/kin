@@ -423,26 +423,36 @@ def probe_sites(lines):
     return sites
 
 
-def shell_guard_modules(root):
-    """The answer modules the shell guard lists, read from the script itself.
+def shell_guard_modules(root, flag="--list-enforced"):
+    """The answer modules the shell guard names, asked OF the shell guard.
 
-    Read rather than restated for the same reason as the Python list: a
-    harness that keeps its own copy of what it is supposed to cover will
-    eventually cover something else.
+    This used to parse an `authority_files=(...)` array out of the script. That
+    array is gone: FIR-2282 made the command surface opt-out, so the guard
+    derives its modules from the shared allowlist and there is no literal list
+    left to read. Asking it directly is better anyway, for the reason the array
+    was read rather than restated in the first place. A harness that keeps its
+    own copy of what it is supposed to cover will eventually cover something
+    else.
+
+    `--list-enforced` rather than `--list-scanned` on purpose: the enforced list
+    excludes modules whose declared boundary pins the shell guard defers to the
+    Python checker. Poisoning one of those would fail for the wrong reason.
     """
-    path = os.path.join(root, "scripts", "zero_file_search_guard.sh")
-    modules, collecting = set(), False
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("authority_files=("):
-                collecting = True
-                continue
-            if collecting:
-                if line.strip() == ")":
-                    break
-                entry = line.strip().strip('"')
-                if entry.startswith("$cmd_dir/"):
-                    modules.add(entry.split("/")[-1])
+    guard = os.path.join(root, "scripts", "zero_file_search_guard.sh")
+    result = subprocess.run(
+        ["bash", guard, flag, root], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"::error::the shell guard refused to enumerate its modules "
+            f"({flag}, rc={result.returncode}): {result.stderr.strip()[:300]}"
+        )
+    modules = {line.strip() for line in result.stdout.split("\n") if line.strip()}
+    if not modules:
+        # The control. An empty set would silently make every module below
+        # "not in the shell guard's scope" and the harness would report a clean
+        # sheet over nothing, which is the failure mode it exists to catch.
+        raise SystemExit("::error::the shell guard enumerated zero answer modules")
     return modules
 
 
@@ -545,13 +555,19 @@ def main():
     exempt = whole_file_exempt(root)
     shell_modules = shell_guard_modules(root)
 
+    # Which modules each guard grades, asked of each guard rather than assumed.
+    # The command surface is opt-out since FIR-2282, so "scanned" is now the
+    # default and the interesting set is what remains after the allowlist.
+    policies = guard.load_allowlist()[0]
+    python_modules = guard.command_modules_scanned(policies)
+
     enforced, skipped = [], []
     cmd_dir = os.path.join(root, CMD_DIR)
     for name in sorted(os.listdir(cmd_dir)):
-        if name not in guard.QUERY_COMMANDS and name not in shell_modules:
+        if name not in python_modules and name not in shell_modules:
             continue
         rel = f"{CMD_DIR}/{name}"
-        python_scans = name in guard.QUERY_COMMANDS and rel not in exempt
+        python_scans = name in python_modules and rel not in exempt
         shell_scans = name in shell_modules
         if python_scans or shell_scans:
             enforced.append((rel, python_scans, shell_scans))
@@ -560,7 +576,7 @@ def main():
 
     if skipped:
         print("Not falsifiable — the allowlist exempts these answer modules entirely,")
-        print("so the guard never scans them despite their being listed as query commands:")
+        print("so neither guard scans them despite their being command modules:")
         for rel in skipped:
             print(f"  - {rel}")
         print()

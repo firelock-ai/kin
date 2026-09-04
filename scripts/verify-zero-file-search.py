@@ -25,12 +25,14 @@ import os
 import sys
 import json
 import re
+import subprocess
 from datetime import date
 
 # Resolve paths relative to kin repo root
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 KIN_ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.dirname(SCRIPT_DIR)
 ALLOWLIST_PATH = os.path.join(SCRIPT_DIR, "zero-file-search-allowlist.json")
+CMD_DIR = "crates/kin-cli/src/commands"
 
 # Every allowlist entry must carry these so each exemption has an accountable
 # owner and a date by which it is re-justified or removed.
@@ -393,63 +395,52 @@ def expiry_report(today=None):
 # Everything else is a whole-file entry in the allowlist with an owner and a
 # staggered review date.
 
-QUERY_COMMANDS = {
-    "locate.rs",
-    "search.rs",
-    "trace.rs",
-    "trace_data_flow.rs",
-    "xref.rs",
-    "review.rs",
-    "ref_lookup.rs",
-    # refs answers incoming-reference queries purely from graph relation edges;
-    # scanning it keeps that authority path free of any raw source-tree walk.
-    "refs.rs",
-    # Context-pack assembly is an answer authority, not an IO boundary.
-    "context.rs",
-    # rename derives its edit plan — the answer — from the graph's entity and
-    # reference relations, so it is an authority path even though applying the
-    # plan later writes files.
-    "rename.rs",
-    # deps answers a cross-repo dependency query. Whether it may answer it from
-    # manifests instead of the spine is an open decision; scanning it keeps the
-    # question visible instead of silent.
-    "deps.rs",
-    # Read-only analyses that answer from graph relations, history, and health
-    # records. None of them should need the working tree to produce an answer.
-    "blame.rs",
-    "impact.rs",
-    "dead_code.rs",
-    "overview.rs",
-    # health reports on the local install and graph state. Environment probes
-    # here are a diagnostic boundary, but repo-content reads would not be.
-    "health.rs",
-    # `kin graph validate`/`inspect`/`stats` report on graph integrity itself.
-    # A validation surface that decides its answer from the working tree states
-    # the filesystem's opinion of the graph rather than the graph's own, which
-    # is how the orphan count came to be computed by probing each entity's
-    # file_origin with `.exists()`. Orphan status now resolves against the
-    # graph-owned exact tree, and scanning this module is what keeps it there.
-    "graph.rs",
-    # The same graph data, rendered. A visualization that reads the tree would
-    # draw a picture of the projection while claiming to draw the graph.
-    "graph_viz.rs",
-    # Co-change answers from graph-owned CoChanges relations; the Git-format
-    # boundary that captures them lives in kin-git, not here.
-    "cochange.rs",
-    # History answers from recorded commits, not from re-reading the tree.
-    "history.rs",
-    # `kin mcp` is how agents reach Kin. It is a launcher today and carries no
-    # filesystem primitive at all, which is exactly why it belongs here: the
-    # agent-facing entry point should never become the one answer surface that
-    # nothing was watching.
-    "mcp.rs",
-    # `kin spec list`/`show` answer from graph-owned specs. The module was
-    # outside this set for as long as it answered by reading .kin/specs/*.json,
-    # so the guard reported the invariant holding over a surface that was
-    # breaking it. Coverage is half the fix: without the module scanned, a
-    # later reader could reintroduce the sidecar read and CI would stay green.
-    "spec.rs"
-}
+# QUERY_COMMANDS is gone, and its deletion is FIR-2282.
+#
+# It was an opt-in list of answer modules, so the command surface was exempt by
+# default: a module was scanned only if somebody remembered to name it. That is
+# the same polarity error BOUNDARY_DIRS was, pointing the other way. One
+# exempted by default, this one covered only by opt-in, and both report PASSED
+# when they under-cover.
+#
+# Measured on main at 8f1283293 before the change: 107 command modules, 22 named
+# here, 10 named in the shell guard's own list, and 82 covered by NEITHER. The
+# guard read 78k lines of the command surface and skipped 108k, so most of the
+# CLI was outside the gate that exists to hold the thesis on it.
+#
+# Two hand-maintained lists over one surface also drift, and these had.
+# `contextbench_locate.rs`, `locate_cursor.rs` and `locate_debug.rs` were
+# answer modules to the shell guard, with declared boundary pins, and did not
+# exist to this one. Nothing could report that, because nothing compared them.
+#
+# The commands directory is now scanned by default like every other crate, the
+# exemptions live in the allowlist with an owner and a date, and
+# `command_modules_scanned` below is the single notion of an answer module that
+# both guards read. `check_guard_seam` fails if the two ever disagree again.
+
+
+def command_modules_scanned(policies):
+    """Command modules the guards scan: everything not exempt whole-file.
+
+    THE shared definition. The shell guard derives its own list from the same
+    allowlist through `--list-scanned`, and `check_guard_seam` requires the two
+    to be identical, so this function is the only place the notion lives.
+    """
+    directory = os.path.join(KIN_ROOT, CMD_DIR)
+    if not os.path.isdir(directory):
+        return set()
+    scanned = set()
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".rs"):
+            continue
+        rel = f"{CMD_DIR}/{name}"
+        if is_test_file(rel):
+            continue
+        policy = policies.get(rel)
+        if policy is not None and policy.whole_file:
+            continue
+        scanned.add(name)
+    return scanned
 
 # Matches a free or method function declaration, including the visibility,
 # constness, asyncness, unsafety and ABI a declaration may carry. `pub(crate)`
@@ -512,12 +503,6 @@ def is_test_file(rel_path):
     if is_build_or_example(rel_path):
         return True
 
-    # For CLI commands, only scan query commands
-    if "crates/kin-cli/src/commands/" in rel_path:
-        filename = os.path.basename(rel_path)
-        if filename not in QUERY_COMMANDS:
-            return True
-
     return False
 
 
@@ -525,14 +510,17 @@ def scan_reaches(rel_path):
     """Whether the walk would scan this path absent any allowlist policy.
 
     A pinned entry answers yes by construction: naming spans in a file forces it
-    to be scanned even inside a boundary directory. A whole-file entry for a path
-    the walk skips anyway answers no, and such an entry is inert. Eight of them
-    had accumulated on command modules outside the query set and on a file
-    already enumerated as a boundary, each reading like an enforced boundary
-    declaration while granting exactly nothing. Deciding this from the same walk
-    predicate the scan uses is what keeps the two from drifting: add a module to
-    QUERY_COMMANDS and its dormant whole-file exemption would begin to matter,
-    which is when it has to be re-justified rather than silently inherited.
+    to be scanned. A whole-file entry for a path the walk skips anyway answers
+    no, and such an entry is inert. Eight of them had accumulated on command
+    modules outside the old opt-in query set and on a file already enumerated as
+    a boundary, each reading like an enforced boundary declaration while granting
+    exactly nothing. Deciding this from the same walk predicate the scan uses is
+    what keeps the two from drifting.
+
+    Since the command surface became opt-out, this predicate is what makes a
+    dormant exemption impossible there rather than merely unlikely: every module
+    is reached, so an entry either excuses something real or is reported as inert
+    on the run that adds it.
     """
     return rel_path.startswith("crates/") and not is_test_file(rel_path)
 
@@ -1566,6 +1554,68 @@ def line_is_reported(line, bindings=()):
     return bound is not None and bound.search(structure) is not None
 
 
+def check_guard_seam(policies):
+    """Require both guards to agree on what an answer module is.
+
+    This is the check whose absence produced FIR-2282's quieter half. Two
+    hand-maintained opt-in lists covered the same directory, they had drifted to
+    different sets, and nothing anywhere compared them, so
+    `contextbench_locate.rs`, `locate_cursor.rs` and `locate_debug.rs` were
+    answer modules to one guard and did not exist to the other. Both lists are
+    now derived from this allowlist, which makes them agree today; this makes
+    them stay agreeing.
+
+    It runs the shell guard's OWN enumeration rather than reimplementing it.
+    A Python copy of that logic would be a third list to drift, and it would
+    pass while the shell guard did something else entirely, which is the shape
+    of every defect this file has been fixed for.
+    """
+    errors = []
+    guard = os.path.join(SCRIPT_DIR, "zero_file_search_guard.sh")
+    if not os.path.exists(guard):
+        return [f"  the shell guard is missing at {guard}, so the two guards' notion "
+                "of an answer module cannot be compared"]
+    try:
+        result = subprocess.run(
+            ["bash", guard, "--list-scanned", KIN_ROOT],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as error:  # noqa: BLE001 - reported, never swallowed
+        return [f"  could not run the shell guard's --list-scanned: {error}"]
+    if result.returncode != 0:
+        return [
+            "  the shell guard refused to enumerate its answer modules "
+            f"(rc={result.returncode}): {result.stderr.strip()[:200]}"
+        ]
+
+    theirs = {line.strip() for line in result.stdout.split("\n") if line.strip()}
+    ours = command_modules_scanned(policies)
+
+    # The control. Both sides empty would compare equal and prove nothing, which
+    # is exactly how an opt-in list reports PASSED over a surface it never read.
+    if not ours or not theirs:
+        return [
+            f"  the answer-module set is empty (python {len(ours)}, shell "
+            f"{len(theirs)}); an empty set compares equal to an empty set, so "
+            "this comparison would pass while neither guard read anything"
+        ]
+
+    for name in sorted(theirs - ours):
+        errors.append(
+            f"  {name} is an answer module to the shell guard and not to this "
+            "one. One list, two answers: give it an allowlist entry or remove "
+            "the shell guard's reason for scanning it"
+        )
+    for name in sorted(ours - theirs):
+        errors.append(
+            f"  {name} is an answer module to this guard and not to the shell "
+            "guard, so a raw read there is graded by only one of the two"
+        )
+    return errors
+
+
 def self_test():
     """Check the deny set and the binding learner, returning a list of errors.
 
@@ -1668,6 +1718,7 @@ def audit_std():
 def main():
     policies, allowlist_errors = load_allowlist()
     deny_set_errors = self_test()
+    seam_errors = check_guard_seam(policies)
     expiry_warnings, expiry_summary = expiry_report()
     total_violations = 0
     scanned = 0
@@ -1736,6 +1787,12 @@ def main():
         print(f"Verification FAILED: Found {total_violations} zero-file-search violations.")
     if allowlist_errors:
         report_allowlist_errors(allowlist_errors)
+    if seam_errors:
+        # Its own section. A seam failure is not a dirty tree and not a broken
+        # deny set: it says the two guards disagree about what they are guarding,
+        # which makes both their verdicts partial.
+        print("\nGuard seam FAILED (the two guards disagree on the answer-module set):")
+        print("\n".join(seam_errors))
     if deny_set_errors:
         # Last, and separate from the scan's own verdict. A scan is only worth
         # its deny set, so a broken deny set has to be reported as its own
@@ -1743,7 +1800,7 @@ def main():
         # a clean tree.
         print("\nDeny-set self-test FAILED:")
         print("\n".join(deny_set_errors))
-    if total_violations or allowlist_errors or deny_set_errors:
+    if total_violations or allowlist_errors or deny_set_errors or seam_errors:
         sys.exit(1)
 
     print(
