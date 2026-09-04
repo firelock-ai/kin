@@ -31,7 +31,6 @@ use crate::error::{KinError, Result};
 use crate::layout::{KinLayout, KIN_LAYOUT_VERSION};
 use crate::manifest::KinManifest;
 
-#[path = "replica_init.rs"]
 pub mod replica;
 
 const INIT_STAGE_PREFIX: &str = ".kin.init-";
