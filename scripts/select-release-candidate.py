@@ -24,7 +24,7 @@ the decision rests on and answers one of four things:
               the candidate archives; preflight them and publish the record
   stranger    preflight.json is filed for the candidate, so the mint can tag it
               already, and stranger.env is what would let the release claim
-              GitHub Latest; run the three-arm stranger on the same archive
+              first-contact coverage; run the three-arm stranger on that archive
   refuse      no reviewed main commit carrying the version qualifies, named sha
               by sha with the context that disqualified it
 
@@ -46,11 +46,12 @@ The rule, in the order it is applied:
    conclude success, or exhausted rc-build attempts.
 4. A sha in the range carries preflight.json alone: the mint owns it too. Since
    2026-09-04 the mint tags on the machine preflight alone, matching the
-   KIN_RELEASE_REQUIRE=preflight tier its gate runs, so a stranger that cannot
-   run does not hold a release. The cut stands down rather than arming a newer
-   sha it would only race. `stranger_state` on the decision says which of the
-   two records backed it, and release.yml keeps a pending release a prerelease
-   and off GitHub Latest.
+   preflight-only tier its gate runs, so a stranger that cannot run does not
+   hold a release. The cut stands down rather than arming a newer sha it would
+   only race. `stranger_state` on the decision says which of the two records
+   backed it, and a release missing stranger.env is published and promoted like
+   any other, carrying a pending notice that says nobody has measured what a
+   first-time user meets.
 5. Otherwise the newest main commit in the range whose CI and Acceptance push
    runs concluded success, and whose required contexts each appear exactly once
    under push provenance and concluded green, becomes the candidate. A sha still
@@ -791,9 +792,10 @@ def judge(snapshot: dict[str, Any], grade: Grader) -> Decision:
     # sha carrying preflight.json and runs its proof gate with
     # KIN_RELEASE_REQUIRE=preflight, so a filed preflight is already a tag
     # whether or not a stranger ever runs. The cut still files the stranger
-    # when it can, because that record is what promotes a release to GitHub
-    # Latest; what it no longer does is treat a missing one as a reason to hold
-    # the version. Computed here and consumed after the candidate block, so the
+    # when it can, because that record is the only thing that tells a measured
+    # release from an unmeasured one; what it no longer does is treat a missing
+    # one as a reason to hold the version, or the release. Computed here and
+    # consumed after the candidate block, so the
     # STRANGER decision below stays reachable and release-cut.yml's stranger
     # job keeps running.
     mintable = [sha for sha in shas if PREFLIGHT_RECORD in records(sha)]
@@ -834,9 +836,9 @@ def judge(snapshot: dict[str, Any], grade: Grader) -> Decision:
                 )
             return Decision(
                 STRANGER,
-                f"preflight is recorded for {candidate}, which the mint can already tag; the "
-                "stranger record is what promotes the release to GitHub Latest, so run it "
-                "while the archives it must judge still exist",
+                f"preflight is recorded for {candidate}, which the mint can already tag and "
+                "promote; the stranger record is the only thing that will tell that release "
+                "from a measured one, so run it while the archives it must judge still exist",
                 version,
                 branch,
                 candidate=candidate,
@@ -907,7 +909,7 @@ def judge(snapshot: dict[str, Any], grade: Grader) -> Decision:
             STAND_DOWN,
             f"{mintable[0]} carries {PREFLIGHT_RECORD} and awaits the mint, which tags on the "
             "machine preflight alone; first contact is still unrecorded, so the release will "
-            "ship as a prerelease naming that gap",
+            "ship and be promoted carrying a notice that names that gap",
             version,
             branch,
             candidate=mintable[0],

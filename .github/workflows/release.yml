@@ -2514,7 +2514,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "release proof records verified for $CANDIDATE_SHA, the commit this job promotes"
           if [ "$stranger_state" = pending ]; then
-            echo "::warning::first-contact proof is PENDING for ${GITHUB_REF_NAME}; this release stays a prerelease and will not become GitHub Latest until its stranger.env lands"
+            echo "::warning::first-contact proof is PENDING for ${GITHUB_REF_NAME}; it is published and promoted anyway and carries a pending notice until its stranger.env lands"
           else
             echo "::notice::first-contact proof complete on arms ${stranger_arms}, driven on the ${stranger_driver} endpoint"
           fi

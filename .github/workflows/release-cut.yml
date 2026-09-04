@@ -873,9 +873,10 @@ jobs:
           {
             echo "## Both proof records are filed for \`${CANDIDATE}\`"
             echo ""
-            echo "The mint already selects any sha in the range carrying \`preflight.json\`. With"
-            echo "\`stranger.env\` filed too, the release it cuts also claims first-contact coverage"
-            echo "and is eligible for GitHub Latest instead of shipping as a prerelease."
+            echo "The mint already selects any sha in the range carrying \`preflight.json\`, and the"
+            echo "release it cuts becomes GitHub Latest either way. With \`stranger.env\` filed too,"
+            echo "that release also gets to claim first-contact coverage instead of carrying a"
+            echo "pending notice saying nobody measured what a first-time user meets."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # No runner, so say so loudly and hand over the exact command. This is the

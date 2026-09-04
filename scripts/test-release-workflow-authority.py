@@ -7765,25 +7765,42 @@ def assert_the_mint_records_the_state_it_tagged_on(release_tag: str) -> None:
             f"the mint failed on a fully proven tag: {proven_run.stdout}{proven_run.stderr}"
         )
 
-    if MINT_FIRST_CONTACT_ROW not in held[0]:
-        raise AssertionError(
-            "the minted-tag summary must carry a first-contact row "
-            f"({MINT_FIRST_CONTACT_ROW}); the step summary is the mint's own "
-            f"record of what the tag it just created may claim: {held[0]}"
-        )
-    if held[0] == proven[0]:
+    # Read the ROW, not the whole summary. Asserting on the summary text lets a
+    # prose sentence elsewhere in it satisfy the check: the complete branch's
+    # own claim sentence contains the word "pending" (it says the release does
+    # NOT carry a pending notice), which silently defeated a whole-summary
+    # search for that word and was caught only by this function's own
+    # falsification arm.
+    def row(summary: str) -> str:
+        rows = [
+            line for line in summary.splitlines() if MINT_FIRST_CONTACT_ROW in line
+        ]
+        if len(rows) != 1:
+            raise AssertionError(
+                "the minted-tag summary must carry exactly one first-contact row "
+                f"({MINT_FIRST_CONTACT_ROW}); the step summary is the mint's own "
+                f"record of what the tag it just created may claim: {summary}"
+            )
+        return rows[0]
+
+    held_row, proven_row = row(held[0]), row(proven[0])
+    if held_row == proven_row:
         raise AssertionError(
             "the mint writes the same record whether or not the tag carries "
             "first-contact proof, so a release minted on the machine preflight "
             "alone is indistinguishable from a proven one"
         )
-    if "pending" not in held[0]:
+    if "pending" not in held_row:
         raise AssertionError(
-            f"the minted-tag summary must name a pending first contact: {held[0]}"
+            f"the minted-tag summary must name a pending first contact: {held_row}"
         )
-    if "green+brown+vcs" not in proven[0]:
+    if "pending" in proven_row:
         raise AssertionError(
-            f"the minted-tag summary must name the arms that proved it: {proven[0]}"
+            f"the minted-tag summary calls a proven tag pending: {proven_row}"
+        )
+    if "green+brown+vcs" not in proven_row:
+        raise AssertionError(
+            f"the minted-tag summary must name the arms that proved it: {proven_row}"
         )
 
 
@@ -16870,7 +16887,7 @@ def main() -> None:
     assert_the_mint_records_the_state_it_tagged_on(release_tag)
     expect_assertion(
         "the minted-tag summary drops its first-contact row",
-        "must carry a first-contact row",
+        "must carry exactly one first-contact row",
         lambda mutant=release_tag.replace(
             '            echo "| first contact | ${first_contact} |"\n', "", 1
         ): assert_the_mint_records_the_state_it_tagged_on(mutant),
@@ -16891,8 +16908,6 @@ def main() -> None:
             '            echo "| first contact | ${first_contact} |"\n',
             '            echo "| first contact | recorded |"\n',
             1,
-        ).replace(
-            '            echo "$claim"\n', '            echo "recorded"\n', 1
         ): assert_the_mint_records_the_state_it_tagged_on(mutant),
     )
     assert_the_stranger_labels_a_release_and_never_holds_it(release)

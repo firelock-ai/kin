@@ -268,10 +268,11 @@ jobs:
             # take both records, and that made the listing stricter than the
             # gate it feeds, so a preflight-only sha was never proposed and the
             # mint no-opped in silence while the gate that would have admitted
-            # it never saw a candidate. `stranger.env` still decides what the
-            # release may CLAIM: release.yml keeps a stranger-pending release a
-            # prerelease and off GitHub Latest, and the summary below records
-            # which of the two this mint tagged. This is what lets
+            # it never saw a candidate. `stranger.env` no longer holds anything
+            # either: it decides only what the release may CLAIM. A release
+            # missing it is tagged, published and promoted like any other and
+            # carries a pending notice, and the summary below records which of
+            # the two this mint tagged. This is what lets
             # main keep moving through a proof window. The candidate used to be
             # the head of the version bump branch, and the train rewrites that
             # head every cycle it finds drift, so evidence published for it went
@@ -1871,7 +1872,7 @@ jobs:
           if [ "$stranger_state" = pending ]; then
             # A warning, not an error. The release proceeds and says what it is
             # missing; a red run here would put the rail back where it was.
-            echo "::warning::first-contact proof is PENDING for $SHA: no stranger.env exists, so $TAG will be published as a prerelease and will not become GitHub Latest until the stranger record lands"
+            echo "::warning::first-contact proof is PENDING for $SHA: no stranger.env exists, so nothing has measured what a first-time user meets. $TAG is tagged and promoted anyway and carries a pending notice until the stranger record lands"
           else
             echo "::notice::first-contact proof complete for $SHA on arms ${stranger_arms}, driven on the ${stranger_driver} endpoint"
           fi
@@ -1985,10 +1986,10 @@ jobs:
           fi
           if [ "$STRANGER_STATE" = complete ]; then
             first_contact="complete on arms \`${STRANGER_ARMS}\`, driven on the \`${STRANGER_DRIVER}\` endpoint"
-            claim="This tag carries first-contact proof and its release is eligible for GitHub Latest."
+            claim="This tag carries first-contact proof, so its release claims first-contact coverage rather than carrying a pending notice."
           else
             first_contact="**pending** (no \`stranger.env\`)"
-            claim="This tag was minted on the machine preflight alone. Nothing has measured what a first-time user meets, so \`release.yml\` publishes it as a prerelease and holds GitHub Latest until the stranger record lands."
+            claim="This tag was minted on the machine preflight alone. Nothing has measured what a first-time user meets. It is published and promoted anyway, and \`release.yml\` stamps that gap onto the release body until the stranger record lands."
           fi
           {
             echo "## Release tag minted"

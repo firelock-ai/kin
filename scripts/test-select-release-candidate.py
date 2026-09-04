@@ -567,7 +567,7 @@ class JudgeTests(unittest.TestCase):
             ),
             grader,
         )
-        self.assertDecision(decision, selector.STRANGER, "promotes the release to GitHub Latest")
+        self.assertDecision(decision, selector.STRANGER, "will tell that release from a measured one")
         # The rc-build run travels with the decision, because the stranger has
         # to run on the very bytes the published preflight judged.
         self.assertEqual(decision.rc_run, 34_000_000_001)
@@ -641,7 +641,7 @@ class JudgeTests(unittest.TestCase):
         self.assertDecision(decision, selector.STAND_DOWN, "awaits the mint")
         self.assertEqual(decision.candidate, MIDDLE)
         self.assertEqual(decision.stranger_state, selector.STRANGER_PENDING)
-        self.assertIn("prerelease naming that gap", decision.reason)
+        self.assertIn("promoted carrying a notice that names that gap", decision.reason)
         self.assertEqual(decision.details["mintable"], [MIDDLE])
         self.assertEqual(grader.calls, [], "a filed preflight must cost no grading")
 
