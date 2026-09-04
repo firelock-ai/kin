@@ -16949,7 +16949,7 @@ def main() -> None:
         ): assert_the_stranger_labels_a_release_and_never_holds_it(mutant),
     )
     expect_assertion(
-        "GHCR latest moves on a release that was held as a prerelease",
+        "GHCR latest moves on a release that was never promoted",
         "must gate on needs.finalize_release.outputs.promoted",
         lambda mutant=release.replace(
             "        needs.config.outputs.release_channel == 'latest' &&\n"

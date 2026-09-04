@@ -1738,14 +1738,21 @@ jobs:
       # whose failure mode is "no tag, forever, quietly" is not protecting the
       # release, it is preventing it.
       #
-      # What replaces it is not less proof, it is proof at the point the claim is
-      # made. A tag is not a claim of first-contact coverage; GitHub Latest is,
-      # because that is the version an installer resolves. release.yml's
-      # finalize_release still requires the complete stranger record before it
-      # flips a release out of prerelease, so a release with no first-contact
-      # proof exists, is installable by anyone who names it, and never becomes
-      # the one a stranger gets by default. The record cannot claim coverage it
-      # does not have, and the release stops being hostage to a driver.
+      # What replaced it, from 2026-09-02, was proof at the point the claim is
+      # made: the tag moved on the preflight and GitHub Latest still required
+      # the stranger record. That held the line in the wrong place. Latest is
+      # what an installer resolves, so holding it kept a finished, installable
+      # release out of every default install path while every machine signal
+      # was green, for want of a driver nobody could summon. Founder decision,
+      # 2026-09-03: "I dont even want that to block. If I run out of limit.
+      # Ship anyways. Stranger is nice to have."
+      #
+      # So since 2026-09-04 nothing waits, and what replaces the hold is a
+      # LABEL. The tag, the release and Latest all move on the preflight, and a
+      # release with no first-contact proof says so on its own body, in this
+      # mint's step summary, and in release.yml's promote summary. The record
+      # still cannot claim coverage it does not have. What it no longer does is
+      # withhold the release while it lacks it.
       #
       # `require: preflight` narrows exactly one condition: an ABSENT
       # stranger.env becomes a reported pending state. A stranger record that

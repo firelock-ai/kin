@@ -2391,8 +2391,8 @@ jobs:
     environment: release
     # Whether this release actually became GitHub Latest, for the jobs whose
     # whole meaning is "this IS Latest". They gate on it rather than on this
-    # job's conclusion, because a release held as a prerelease for want of
-    # first-contact proof is a SUCCESSFUL run of this job and a release that
+    # job's conclusion, because this job succeeds on paths that promote nothing:
+    # a prerelease tag never runs the promote step at all, and such a release
     # must not move GHCR's `latest` or be sealed as a completed stable release.
     outputs:
       promoted: ${{ steps.promote.outputs.promoted }}
