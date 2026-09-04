@@ -8268,7 +8268,25 @@ pub(crate) async fn readmit_semantics_for_paths(
                     &reconciled,
                     ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. }
                 );
-                if should_apply {
+                // `BrokenAst` and `Conflict` retain last-known-good state and
+                // derive nothing, so the file keeps the spans its previous parse
+                // recorded. Counting either as enrichment would be this whole
+                // change's own defect one level down: a clean summary over a
+                // file that still answers at its old positions. The daemon
+                // reconciles under `ReconcilePolicy::FallbackToLkg`, so a
+                // syntactically broken file is the ordinary case rather than an
+                // edge, and it is exactly the case an agent produces mid-edit.
+                if !should_apply {
+                    warn!(
+                        file = %file_id,
+                        outcome = ?reconciled,
+                        "published bytes were read but no semantic transaction came back, so \
+                         this path still answers at the positions its previous parse recorded"
+                    );
+                    outcome.failed.push(file_id.0.clone());
+                    continue;
+                }
+                {
                     let derived_entities = !delta.entity_deltas.is_empty();
                     if let Err(error) = state.graph.apply_transaction_delta(&delta) {
                         warn!(
@@ -8314,8 +8332,8 @@ pub(crate) async fn readmit_semantics_for_paths(
                         }
                     }
                     graph_changed = true;
+                    outcome.enriched += 1;
                 }
-                outcome.enriched += 1;
             }
             Err(error) => {
                 warn!(

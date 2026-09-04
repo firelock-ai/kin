@@ -35031,6 +35031,113 @@ mod tests {
         );
     }
 
+    /// FIR-3200. A session that publishes a file the parser cannot parse is
+    /// refused in words, and the bytes stay published.
+    ///
+    /// This is the arm I could not build a deterministic trigger for until
+    /// review found the defect underneath it. The daemon reconciles under
+    /// `ReconcilePolicy::FallbackToLkg`, so unparseable source comes back as
+    /// `ReconcileOutcome::BrokenAst`: last-known-good state retained, no
+    /// transaction derived, the file still answering at the positions its
+    /// previous parse recorded. Counting that as enrichment reproduced this
+    /// change's own defect one level down, on the most ordinary agent case there
+    /// is, a file caught mid-edit.
+    ///
+    /// So the trigger is the ordinary case: prepend the seventeen lines and
+    /// leave the file syntactically broken. The reconcile must name the file
+    /// rather than report a clean summary, and the tree must still carry the
+    /// bytes, because a parser never retracts membership.
+    ///
+    /// Falsify by restoring the unconditional `outcome.enriched += 1` outside
+    /// the applied-delta arm: this returns 200 with enriched 1 and failures 0
+    /// over a file whose span never moved.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_session_publishing_unparseable_source_is_refused_and_keeps_its_bytes() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = state.layout.root().join("runs/session-fir3200-broken");
+        materialize_session_through_api(&app, &session_dir).await;
+        let session_file = session_dir.join("shifted.rs");
+        prepend_session_lines(&session_file, 17);
+        let mut broken = std::fs::read(&session_file).unwrap();
+        broken.extend_from_slice(b"pub fn half_written(\n");
+        std::fs::write(&session_file, &broken).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_dir": session_dir,
+                            "confirm_mass_deletion": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a reconcile that could not re-parse what it published must not read as a clean \
+             success: {body}"
+        );
+        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(refusal["error"], "semantic_readmission_failed");
+        assert_eq!(refusal["files"], json!(["shifted.rs"]));
+        assert_eq!(refusal["summary"]["semantic_files_enriched"], json!(0));
+        assert_eq!(refusal["summary"]["semantic_enrichment_failures"], json!(1));
+
+        // Membership is not in doubt, and a parser may not retract it. The
+        // refusal is a report of a graph gap, never a rollback.
+        let tree = state.graph.resolved_tree();
+        let published = tree
+            .artifact_at_path(&RepoPath::from_utf8("shifted.rs".to_string()).unwrap())
+            .expect("the path stays in the exact tree");
+        let kin_model::TreeEntry::Blob { hash, .. } = published.entry else {
+            panic!("the fixture is a regular file");
+        };
+        assert_eq!(
+            state
+                .blobs
+                .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
+                .expect("the published body is readable"),
+            broken,
+            "the refusal reports a gap in the graph and never retracts the bytes"
+        );
+        assert_eq!(
+            published_start_line(&state, "shifted.rs"),
+            before,
+            "an unparseable file keeps its last-known-good spans, which is what the refusal is \
+             telling the caller about"
+        );
+    }
+
     /// FIR-3200. The refusal a reconcile returns when its bytes published and
     /// their semantics did not.
     ///
