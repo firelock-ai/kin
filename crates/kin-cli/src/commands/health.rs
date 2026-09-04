@@ -11925,7 +11925,7 @@ mod tests {
 
         // The state under test: absent when the command opened and absent when
         // it closed, which is what a cold container with no egress budget gets.
-        let init_line = crate::commands::init::embedding_model_notice(&absent, false, None);
+        let init_line = crate::commands::init::embedding_model_notice(&absent, &absent, None);
         let doctor = embedding_model_check_from(&absent, Some(true));
 
         assert!(
