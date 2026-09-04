@@ -306,6 +306,168 @@ pub struct RepositoryTransferExpectation {
     pub limits: RepositoryTransferLimits,
 }
 
+/// Bind an initial transfer to actual, unpublished generation-zero roots.
+pub fn replica_bootstrap_expectation(
+    repository_id: RepositoryId,
+    default_ref: RefName,
+    roots: RootBundle,
+) -> Result<RepositoryTransferExpectation> {
+    let expectation = RepositoryTransferExpectation {
+        repository_id,
+        destination_ref: default_ref,
+        destination_target: None,
+        destination_head: None,
+        roots,
+        default_ref: None,
+        git_authority_hash: None,
+        supported_features: required_features(),
+        limits: RepositoryTransferLimits::default(),
+    };
+    validate_expectation(&expectation)?;
+    if !destination_is_unborn(&expectation) {
+        return Err(invalid(
+            "replica bootstrap requires generation-zero authority",
+        ));
+    }
+    Ok(expectation)
+}
+
+/// A validated first transfer and the complete source bodies it references.
+pub struct ReplicaBootstrap {
+    pub transaction: RepositoryTransaction,
+    pub bodies: Vec<(Hash256, Vec<u8>)>,
+}
+
+/// Compose a validated transfer and its first workspace as one transaction.
+///
+/// No source path is read here. Every projected byte and semantic entity comes
+/// from the exact history and bodies the pack carries.
+pub fn prepare_replica_bootstrap(
+    pack: &RepositoryTransferPack,
+    expectation: &RepositoryTransferExpectation,
+    workspace_id: WorkspaceId,
+    case: AdmissionCase,
+) -> Result<ReplicaBootstrap> {
+    use kin_model::{
+        EffectiveAdmissionPolicyStamp, EntityDelta, FrozenLocalOverlay, FrozenLocalOverlayDelta,
+        LocatedEntry, RelationDelta, TreeDelta, WorkspaceExpectation, WorkspaceHead,
+        WorkspaceMutation, WorkspaceSemanticDelta,
+    };
+    validate_expectation(expectation)?;
+    if !destination_is_unborn(expectation)
+        || pack.repository_id != expectation.repository_id
+        || pack.source_ref != expectation.destination_ref
+        || pack.destination_ref != expectation.destination_ref
+        || pack.expected_destination_roots != expectation.roots
+        || pack.expected_destination_head != expectation.destination_head
+        || pack.expected_destination_target != expectation.destination_target
+        || pack.expected_destination_default_ref != expectation.default_ref
+        || pack.expected_destination_git_authority_hash != expectation.git_authority_hash
+    {
+        return Err(invalid(
+            "replica pack does not bind the unborn destination identity and roots",
+        ));
+    }
+    validate_pack(pack, &expectation.limits)?;
+    validate_change_and_tree_closure(std::iter::empty(), pack)?;
+    let decoded = pack
+        .bodies
+        .iter()
+        .map(|body| Ok((body.hash, body.decode()?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    for record in &pack.external_objects {
+        let bytes = decoded
+            .get(&record.body_hash)
+            .ok_or_else(|| invalid("replica pack omits an external object body"))?;
+        record.validate_raw(bytes).map_err(model)?;
+    }
+    let store = TransferChangeStore {
+        changes: pack
+            .changes
+            .iter()
+            .cloned()
+            .map(|change| (change.id, change))
+            .collect(),
+    };
+    for identity in &pack.trees {
+        let tree = store.resolve_tree_at(&identity.change_id).map_err(model)?;
+        for artifact in tree.artifacts() {
+            if artifact
+                .entry
+                .blob_identity()
+                .is_some_and(|hash| !decoded.contains_key(&hash))
+            {
+                return Err(invalid(format!(
+                    "replica pack omits a historical body at {}",
+                    artifact.path
+                )));
+            }
+        }
+    }
+    let target = store.resolve_graph_at(&pack.source_head).map_err(model)?;
+    let mut cursor = Some(pack.source_head);
+    let shared = loop {
+        let id = cursor.ok_or_else(|| invalid("replica head has no shared admission policy"))?;
+        let change = store
+            .changes
+            .get(&id)
+            .ok_or_else(|| invalid("replica policy history is incomplete"))?;
+        if let Some(delta) = &change.admission_policy_delta {
+            break delta
+                .new
+                .clone()
+                .ok_or_else(|| invalid("replica head removes its admission policy"))?;
+        }
+        cursor = change.parents.first().copied();
+    };
+    let overlay = FrozenLocalOverlay::new(workspace_id, 0, case, Vec::new()).map_err(model)?;
+    let policy = EffectiveAdmissionPolicyStamp {
+        shared: shared.stamp(),
+        local: overlay.stamp(),
+    };
+    let mut transaction = transfer_transaction(pack, AuthorId::new("kin"))?;
+    transaction.workspace_mutation = Some(WorkspaceMutation {
+        workspace_id,
+        expected: WorkspaceExpectation::MustNotExist,
+        new_generation: 0,
+        new_head: WorkspaceHead::Symbolic {
+            target: expectation.destination_ref.clone(),
+        },
+        new_base_target: Some(published_ref_target(pack)),
+        new_base_tree_hash: Some(pack.source_tree_hash),
+        tree_deltas: target
+            .tree
+            .artifacts()
+            .map(|artifact| TreeDelta::Added {
+                artifact_id: artifact.artifact_id,
+                new: LocatedEntry::new(artifact.path.clone(), artifact.entry),
+            })
+            .collect(),
+        new_tree_hash: pack.source_tree_hash,
+        semantic_delta: WorkspaceSemanticDelta::new(
+            target
+                .entities
+                .into_values()
+                .map(|new| EntityDelta::Added { new })
+                .collect(),
+            target
+                .relations
+                .into_values()
+                .map(|new| RelationDelta::Added { new })
+                .collect(),
+        )
+        .map_err(model)?,
+        new_shared_admission_policy: shared,
+        new_admission_policy: policy,
+    });
+    transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
+    transaction.validate().map_err(model)?;
+    Ok(ReplicaBootstrap {
+        transaction,
+        bodies: decoded.into_iter().collect(),
+    })
+}
+
 impl TryFrom<RepositoryTransferStatus> for RepositoryTransferExpectation {
     type Error = RepositoryTransferError;
 

@@ -832,10 +832,13 @@ enum Command {
     },
     /// Clone a repository
     Clone {
-        /// Git repository URL (native Kin transport is an explicit open gate)
+        /// Native Kin locator or Git repository URL
         url: String,
         /// Target directory (defaults to repo name)
         path: Option<String>,
+        /// Native repository identity when URL is a peer daemon HTTP endpoint
+        #[arg(long)]
+        repository: Option<String>,
     },
     /// Restore an exact path or subtree from immutable repository-v6 history
     Checkout {
@@ -3632,7 +3635,11 @@ fn run() -> Result<()> {
                     commands::capabilities::require_ready("pull")?;
                     commands::transfer::pull(remote, url, reference, json).await
                 }
-                Command::Clone { url, path } => commands::clone::run(url, path).await,
+                Command::Clone {
+                    url,
+                    path,
+                    repository,
+                } => commands::clone::run(url, path, repository).await,
                 Command::Checkout {
                     path,
                     path_hex,

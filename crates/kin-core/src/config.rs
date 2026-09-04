@@ -144,6 +144,8 @@ pub enum RemoteHostKind {
     Bitbucket,
     #[serde(rename = "kinlab", alias = "kin-lab", alias = "kin-hub")]
     KinLab,
+    #[serde(rename = "peer")]
+    Peer,
 }
 
 impl RemoteHostKind {
@@ -153,6 +155,7 @@ impl RemoteHostKind {
             Self::GitLab => "gitlab",
             Self::Bitbucket => "bitbucket",
             Self::KinLab => "kinlab",
+            Self::Peer => "peer",
         }
     }
 
@@ -163,6 +166,7 @@ impl RemoteHostKind {
             "gitlab" => Some(Self::GitLab),
             "bitbucket" => Some(Self::Bitbucket),
             "kinlab" => Some(Self::KinLab),
+            "peer" => Some(Self::Peer),
             _ => None,
         }
     }
@@ -2132,6 +2136,26 @@ transport = "native-kin"
         let parsed: KinConfig = toml::from_str(legacy).unwrap();
         assert_eq!(parsed.remote.refs.len(), 1);
         assert_eq!(parsed.remote.refs[0].host, RemoteHostKind::KinLab);
+    }
+
+    #[test]
+    fn native_peer_origin_config_round_trips() {
+        let config = r#"
+[remote]
+default = "origin"
+[[remote.refs]]
+name = "origin"
+host = "peer"
+transport = "native-kin"
+url = "http://127.0.0.1:9876"
+"#;
+        let parsed: KinConfig = toml::from_str(config).unwrap();
+        assert_eq!(parsed.remote.refs[0].host, RemoteHostKind::Peer);
+        assert_eq!(RemoteHostKind::from_str("peer"), Some(RemoteHostKind::Peer));
+        assert_eq!(RemoteHostKind::Peer.as_str(), "peer");
+        let roundtrip: KinConfig = toml::from_str(&toml::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(roundtrip.remote.default.as_deref(), Some("origin"));
+        assert_eq!(roundtrip.remote.refs[0], parsed.remote.refs[0]);
     }
 
     #[test]
