@@ -3880,11 +3880,13 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let initialized = state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed);
+    let authority_started = Instant::now();
     let hosted_spine_ready = if initialized && state.hosted_spine_readiness_required() {
         state.acquire_spine_read_authority().await.is_some()
     } else {
         true
     };
+    let authority_wait = authority_started.elapsed();
     let warming = state.spine_warming() || (initialized && !hosted_spine_ready);
 
     if initialized && hosted_spine_ready {
@@ -3896,6 +3898,34 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
             }),
         )
     } else {
+        // Say which half refused, and how long the authority check spent
+        // waiting, because a refusal that says nothing is how a rollout gets
+        // read as a broken daemon.
+        //
+        // On 2026-09-04 a hosted daemon bound port 4219 at 464 s into its
+        // start, then failed its rollout 134 s later having never reported
+        // ready. Nothing in that pod's log said whether it was still
+        // uninitialized or whether the spine authority was refusing, and
+        // Kubernetes records only the status code, so the post-mortem could
+        // name a mechanism and not confirm it. This is the line that would
+        // have answered it.
+        //
+        // WARN rather than DEBUG on purpose: a hosted daemon that cannot
+        // serve is the operator's problem whether or not anyone raised the
+        // log level first, and this stops as soon as the daemon is ready.
+        tracing::warn!(
+            initialized,
+            hosted_spine_ready,
+            warming,
+            refused_on = if !initialized {
+                "initialization"
+            } else {
+                "hosted spine authority"
+            },
+            authority_wait_ms = authority_wait.as_millis() as u64,
+            spine_gate_wait_ms = state.last_spine_gate_read_wait().as_millis() as u64,
+            "readiness refused"
+        );
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ReadinessResponse {
@@ -42766,6 +42796,138 @@ mod tests {
         assert!(
             !readiness.warming,
             "an idle daemon must not claim to be warming"
+        );
+    }
+
+    // ── A refusal has to say what refused ────────────────────────────────
+    //
+    // Kubernetes records the status code and nothing else. On 2026-09-04 a
+    // hosted daemon bound its port at 464 s, failed its rollout 134 s later
+    // without ever reporting ready, and the pod log carried no line saying
+    // whether it was still uninitialized or whether the spine authority was
+    // refusing. The post-mortem could name a mechanism and not confirm it.
+    //
+    // These two tests are a pair on purpose. The first fails if the line is
+    // removed or stops naming which half refused. The second fails if the
+    // line is emitted unconditionally, which would satisfy the first while
+    // making the log useless and noisy on every healthy probe.
+
+    /// Collects formatted tracing output so a test can assert on it.
+    #[derive(Clone)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(
+                &self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_readiness_says_which_half_refused() {
+        let captured = CapturedLog::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        // `set_default` is thread-local and `#[tokio::test]` runs the future on
+        // this thread, so the handler below writes into `captured`.
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        // `test_state()` opens a real repo, and `DaemonState::open` sets
+        // `is_initialized` from whether a snapshot loaded, so the fixture
+        // arrives ready. Put it back to the state a starting daemon is in, so
+        // the first half is what refuses.
+        let state = test_state();
+        state
+            .is_initialized
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let response = router(state)
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let logged = captured.text();
+        assert!(
+            logged.contains("readiness refused"),
+            "a 503 from /readiness must say so in the log; Kubernetes keeps only \
+             the status code, so an unlogged refusal is an unanswerable rollout \
+             failure. Captured output was: {logged:?}"
+        );
+        assert!(
+            logged.contains("refused_on=\"initialization\""),
+            "the refusal must name which half refused, so a reader does not have \
+             to guess between initialization and the spine authority. Captured \
+             output was: {logged:?}"
+        );
+        assert!(
+            logged.contains("spine_gate_wait_ms="),
+            "the refusal must report how long the authority check waited for the \
+             publication gate, which is the measurement that separates a slow \
+             open from starvation behind the refresh passes. Captured output \
+             was: {logged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ready_daemon_logs_no_readiness_refusal() {
+        let captured = CapturedLog::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let response = router(state)
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let logged = captured.text();
+        assert!(
+            !logged.contains("readiness refused"),
+            "a ready daemon must not log a refusal. The probe runs every few \
+             seconds for the life of the pod, so an unconditional line would \
+             bury the one case that matters. Captured output was: {logged:?}"
         );
     }
 
