@@ -164,9 +164,10 @@ longer.
 One thing to expect on a small repository: `kin init` starts a background
 download of the roughly 523 MB embedding model, and a conversion that finishes
 in seconds can beat it. When that happens the first `kin locate` ranks on
-lexical and graph signals alone, and it names the download as what its rows are
-waiting on rather than leaving you to guess. Run the query again once the model
-lands.
+lexical and graph signals alone and says why on the line beneath its rows. If
+that line reports the model still downloading, run the query again once it
+lands. If it reports that none of it arrived, do not wait on it: `kin embed`
+fetches the rest.
 
 Wire your agent after `kin init`, not before. The rest of this section is the
 same path with the detail behind each step.
