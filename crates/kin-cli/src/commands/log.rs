@@ -229,6 +229,10 @@ fn unchanged_entity_deltas(change: &kin_model::SemanticChange) -> usize {
 }
 
 /// Name what the entity count leaves out, so a reader can see it exists.
+///
+/// Half of `kin blame`'s contract: blame names its withheld count AND takes
+/// `--all-revisions` to list them, while `kin log` names the count and has no
+/// flag that shows them yet. The flag is the follow-up.
 fn unchanged_suffix(unchanged: usize) -> String {
     if unchanged == 0 {
         return String::new();

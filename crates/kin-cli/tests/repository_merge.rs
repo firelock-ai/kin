@@ -332,6 +332,136 @@ fn merge_composes_disjoint_semantic_and_tree_work_into_one_merge_change() {
     );
 }
 
+/// An ordinary one-sided merge publishes the SIBLING entities of an edited
+/// function at the offsets the merged file actually holds them at.
+///
+/// This is the clean-merge call site of the alignment step, end to end through
+/// a real daemon, and it is the most ordinary merge there is: one branch edits
+/// one function, the other branch never touches that file.
+///
+/// The entity composer and the artifact composer decide separately. Enlarging
+/// one function moves the byte span of every entity below it, so on the source
+/// branch each sibling carries a new span and a new file blob stamp while its
+/// own source is untouched. Content agrees, so the sibling never conflicts and
+/// never gets a settlement, and composition takes ours, which is base. The
+/// artifact composer takes theirs, because ours left the file alone. Without
+/// the alignment the merge publishes the PRE-EDIT offsets for every sibling
+/// while the tree holds the post-edit bytes, and nothing downstream catches it:
+/// the entity delta is empty because content did not move, replay checks only
+/// tree equality, and publish installs the stored delta without re-deriving
+/// anything.
+///
+/// Breaking it: drop the `align_unchanged_entities_with_their_artifacts` call
+/// in `three_way`, and the published spans are base's.
+#[test]
+fn merge_of_a_one_sided_edit_publishes_its_siblings_at_the_merged_offsets() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+
+    // A file with a function above the ones this test watches, so enlarging the
+    // first moves the rest.
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn alpha() {}\n\npub fn beta() {}\n\npub fn gamma() {}\n",
+    )
+    .expect("write the shared library");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "add the library"]);
+
+    // The source branch edits ONLY alpha's body.
+    run_git(&repo, &["switch", "-c", "feature"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn alpha() {\n    let a = 1;\n    let b = 2;\n    let _ = a + b;\n}\n\npub fn beta() {}\n\npub fn gamma() {}\n",
+    )
+    .expect("enlarge alpha on the source branch");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "give alpha a body"]);
+
+    // The active branch never touches that file.
+    run_git(&repo, &["switch", "main"]);
+    fs::write(repo.join("ours.txt"), b"main ours\n").expect("edit an unrelated file on main");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "main work"]);
+
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+    let ours_before = branch_change(&layout, "main");
+    let theirs = branch_change(&layout, "feature");
+
+    let merged = run_kin(&runtime, &repo, &["merge", "feature", "--json"]);
+    assert!(
+        merged.status.success(),
+        "a one-sided edit composes: stdout={} stderr={}",
+        String::from_utf8_lossy(&merged.stdout),
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    assert_eq!(merge_report(&merged)["outcome"], "merged");
+
+    let merge_change = branch_change(&layout, "main");
+    let reopened = open_authority(&layout);
+    let lease = reopened.read_authority();
+    let snapshot = lease.snapshot().clone();
+    drop(lease);
+    let graph = kin_db::InMemoryGraph::from_snapshot(snapshot).expect("replay merged history");
+    let (resolved, ours_state, theirs_state) = {
+        use kin_model::ChangeStore;
+        (
+            graph
+                .resolve_graph_at(&merge_change)
+                .expect("resolve the merged graph state"),
+            graph
+                .resolve_graph_at(&ours_before)
+                .expect("resolve the active branch parent"),
+            graph
+                .resolve_graph_at(&theirs)
+                .expect("resolve the source branch parent"),
+        )
+    };
+
+    let span_of = |state: &kin_model::graph::ResolvedGraphState, name: &str| {
+        state
+            .entities
+            .values()
+            .find(|entity| entity.name == name)
+            .and_then(|entity| entity.span.clone())
+    };
+
+    // The fixture is the case it claims to be: the edit moved the siblings on
+    // the source branch and left them where they were on ours. Without this the
+    // assertions below would hold on a merge that published nothing at all.
+    let ours_beta = span_of(&ours_state, "beta").expect("ours holds beta");
+    let theirs_beta = span_of(&theirs_state, "beta").expect("theirs holds beta");
+    assert_ne!(
+        ours_beta.start_byte, theirs_beta.start_byte,
+        "the edit has to have moved beta, or there is nothing to get wrong"
+    );
+
+    for name in ["beta", "gamma"] {
+        let published = span_of(&resolved, name).unwrap_or_else(|| panic!("{name} survives"));
+        let theirs_span =
+            span_of(&theirs_state, name).unwrap_or_else(|| panic!("{name} on theirs"));
+        let ours_span = span_of(&ours_state, name).unwrap_or_else(|| panic!("{name} on ours"));
+        assert_eq!(
+            published.start_byte, theirs_span.start_byte,
+            "{name} publishes the offsets of the bytes the merge published, not ours' \
+             {} against theirs' {}",
+            ours_span.start_byte, theirs_span.start_byte
+        );
+        assert_eq!(
+            published.end_byte, theirs_span.end_byte,
+            "{name} end offset"
+        );
+    }
+
+    // And the bytes really are theirs, so the spans above are describing them.
+    assert_eq!(
+        fs::read(repo.join("src/lib.rs")).unwrap(),
+        b"pub fn alpha() {\n    let a = 1;\n    let b = 2;\n    let _ = a + b;\n}\n\npub fn beta() {}\n\npub fn gamma() {}\n",
+    );
+}
+
 /// The source branch is already an ancestor: nothing to publish.
 #[test]
 fn merge_of_an_ancestor_branch_is_already_up_to_date_and_publishes_nothing() {

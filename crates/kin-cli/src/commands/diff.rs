@@ -1007,10 +1007,15 @@ pub fn build_diff_response(
 
 /// The line naming what the entity counts did not show.
 ///
-/// Named rather than silent, the same contract `kin blame` holds its own
-/// listing to. The withheld revisions are real, they are what the file did, and
-/// a reader who cannot see that they exist has lost information rather than
-/// been spared noise.
+/// Named rather than silent. The withheld revisions are real, they are what the
+/// file did, and a reader who cannot see that they exist has lost information
+/// rather than been spared noise.
+///
+/// Half of `kin blame`'s contract, not all of it. Blame names its withheld
+/// count AND takes `--all-revisions` to list them; `kin diff` names the count
+/// and has no flag that shows them yet. Saying so here rather than claiming the
+/// whole contract, because the flag is the follow-up and a comment that claims
+/// it is the reason nobody writes it.
 fn unchanged_entities_line(unchanged: usize) -> Option<String> {
     if unchanged == 0 {
         return None;

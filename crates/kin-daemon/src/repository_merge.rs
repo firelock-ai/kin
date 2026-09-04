@@ -688,6 +688,7 @@ fn three_way(
         &base_state,
         &ours_state,
         &theirs_state,
+        &artifacts_by_id(&base_state.tree),
         &artifacts_by_id(&ours_state.tree),
         &artifacts_by_id(&theirs_state.tree),
         &merged_artifacts,
@@ -1074,6 +1075,7 @@ pub(crate) fn publish_resolved_merge(
         &base_state,
         &ours_state,
         &theirs_state,
+        &base_artifacts,
         &ours_artifacts,
         &theirs_artifacts,
         &merged_artifacts,
@@ -2050,17 +2052,30 @@ where
 /// [`project_artifacts_from_settled_entities`] makes the file follow the
 /// settlement. For an entity NEITHER branch edited it is not. Its content is
 /// identical on every side, so it never conflicts and never gets a settlement,
-/// and the composer above takes `ours` for it. If that file publishes from
-/// `theirs`, the graph then serves ours' byte span and ours' file blob stamp
-/// for theirs' bytes, under an envelope that looks clean: the entity delta is
-/// empty because content did not move, replay checks only tree equality, and
-/// publish installs the stored delta without re-deriving anything. That is the
-/// stale-span class, arriving through the merge.
+/// and the composer above takes `ours` for it. If that file publishes from any
+/// other side, the graph then serves ours' byte span and ours' file blob stamp
+/// for another side's bytes, under an envelope that looks clean: the entity
+/// delta is empty because content did not move, replay checks only tree
+/// equality, and publish installs the stored delta without re-deriving
+/// anything. That is the stale-span class, arriving through the merge.
 ///
-/// So the side is taken from the file rather than from a default. Run this
-/// after the artifacts are FINAL: after composition on a clean merge, and after
-/// both `apply_resolution` and `project_artifacts_from_settled_entities` on a
-/// settled one, because that projection can still flip a file.
+/// So the side is taken from the file rather than from a default, and it is
+/// ANY of the three. A reader who settles a file `--base` publishes base's
+/// bytes, and an entity left on ours over them is the same defect wearing a
+/// different side.
+///
+/// The join is by the file's IDENTITY as the merged tree carries it, never by
+/// the path the entity had before the merge. A file that moved on one side
+/// keeps its identity and changes its path, so a path join finds nothing there
+/// and the entity silently keeps the other side's span over the moved file's
+/// bytes. Every side's own span is read for exactly that reason, base included
+/// and on the same footing rather than as a fallback: the entity names a
+/// different path on whichever side moved it.
+///
+/// Run this after the artifacts are FINAL: after composition on a clean merge,
+/// and after both `apply_resolution` and
+/// `project_artifacts_from_settled_entities` on a settled one, because that
+/// projection can still flip a file.
 ///
 /// It touches only entities whose content agrees across the sides, which is
 /// exactly the set that carries no semantic decision. An entity that conflicted
@@ -2069,15 +2084,15 @@ fn align_unchanged_entities_with_their_artifacts(
     base_state: &kin_model::graph::ResolvedGraphState,
     ours_state: &kin_model::graph::ResolvedGraphState,
     theirs_state: &kin_model::graph::ResolvedGraphState,
+    base_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
     ours_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
     theirs_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
     merged_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
     merged_entities: &mut std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
 ) {
-    let mut by_path: BTreeMap<&kin_model::RepoPath, &ResolvedArtifact> = BTreeMap::new();
-    for artifact in merged_artifacts.values() {
-        by_path.insert(&artifact.path, artifact);
-    }
+    let base_by_path = artifact_identities_by_path(base_artifacts);
+    let ours_by_path = artifact_identities_by_path(ours_artifacts);
+    let theirs_by_path = artifact_identities_by_path(theirs_artifacts);
 
     let mut aligned = Vec::new();
     for entity in merged_entities.keys().copied() {
@@ -2091,34 +2106,110 @@ fn align_unchanged_entities_with_their_artifacts(
         if ours == theirs || !entities_agree(Some(ours), Some(theirs)) {
             continue;
         }
-        // An entity names its file in its span, which is also how the conflict
-        // listing labels it. Base is read too, for an entity whose file moved.
-        let Some(path) = [ours, theirs]
-            .into_iter()
-            .chain(base_state.entities.get(&entity))
-            .find_map(|found| found.span.as_ref())
-            .map(|span| span.file.to_string())
-        else {
+        let Some(published) = published_artifact_for(
+            entity,
+            [
+                (ours_state, &ours_by_path),
+                (theirs_state, &theirs_by_path),
+                (base_state, &base_by_path),
+            ],
+            merged_artifacts,
+        ) else {
             continue;
         };
-        let Some(published) = by_path
-            .iter()
-            .find(|(candidate, _)| candidate.to_string() == path)
-            .map(|(_, artifact)| *artifact)
-        else {
+        // Which side's file this is. Ours first, so a file that publishes from
+        // ours, or from a value ours and another side agree on, moves nothing.
+        let side = if ours_artifacts.get(&published.artifact_id) == Some(published) {
+            continue;
+        } else if theirs_artifacts.get(&published.artifact_id) == Some(published) {
+            MergeSide::Theirs
+        } else if base_artifacts.get(&published.artifact_id) == Some(published) {
+            MergeSide::Base
+        } else {
+            // A published value no side holds is not attributable, so the
+            // entity stays where composition put it rather than being moved on
+            // a guess.
             continue;
         };
-        let from_ours = ours_artifacts.get(&published.artifact_id) == Some(published);
-        let from_theirs = theirs_artifacts.get(&published.artifact_id) == Some(published);
-        // `ours` is already installed, so only a file that publishes from
-        // theirs alone moves anything. A file that matches both sides, or
-        // neither, leaves the entity where composition put it.
-        if from_theirs && !from_ours {
-            aligned.push((entity, theirs.clone()));
+        // A side that does not hold the entity says nothing about it. Removing
+        // it here would drop work no branch removed.
+        if let Some(value) = graph_side(&side, base_state, ours_state, theirs_state)
+            .entities
+            .get(&entity)
+        {
+            aligned.push((entity, value.clone()));
         }
     }
     for (entity, value) in aligned {
         merged_entities.insert(entity, value);
+    }
+}
+
+/// One side's paths, keyed by their bytes, so an entity's file resolves to the
+/// identity that side gave it in one lookup.
+///
+/// A `RepoPath` is bytes and a span's `FilePathId` wraps a `String`, so the
+/// join needs no allocation on either side. Rendering both sides of every
+/// comparison allocated twice per artifact per entity, which on a real
+/// repository is the whole tree walked once per entity in it.
+///
+/// A path claimed by more than one artifact on a side maps to every claimant,
+/// so a contested path stays visible as one rather than collapsing to whichever
+/// artifact was seen last.
+fn artifact_identities_by_path(
+    artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+) -> std::collections::HashMap<&[u8], Vec<kin_model::ArtifactId>> {
+    let mut by_path: std::collections::HashMap<&[u8], Vec<kin_model::ArtifactId>> =
+        std::collections::HashMap::with_capacity(artifacts.len());
+    for artifact in artifacts.values() {
+        by_path
+            .entry(artifact.path.as_bytes())
+            .or_default()
+            .push(artifact.artifact_id);
+    }
+    by_path
+}
+
+/// The merged tree's entry for the file one entity lives in.
+///
+/// Resolved by IDENTITY rather than by path. Every side's own span is consulted
+/// and every one of them contributes, because a side that moved the file names
+/// the new path there while the others still name the old one, and each side's
+/// own tree is what maps its path back to an identity. Base is read on the same
+/// footing as the other two rather than as a fallback: an entity can name a
+/// third path there.
+///
+/// `None` when nothing resolves, and `None` when more than one published
+/// artifact does. A contested path is a conflict of its own with its own
+/// settlement, and picking one claimant here would answer it silently.
+fn published_artifact_for<'a>(
+    entity: kin_model::EntityId,
+    sides: [(
+        &kin_model::graph::ResolvedGraphState,
+        &std::collections::HashMap<&[u8], Vec<kin_model::ArtifactId>>,
+    ); 3],
+    merged_artifacts: &'a std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+) -> Option<&'a ResolvedArtifact> {
+    let mut identities = BTreeSet::new();
+    for (state, by_path) in sides {
+        let Some(span) = state
+            .entities
+            .get(&entity)
+            .and_then(|found| found.span.as_ref())
+        else {
+            continue;
+        };
+        if let Some(claimants) = by_path.get(span.file.0.as_bytes()) {
+            identities.extend(claimants.iter().copied());
+        }
+    }
+    let mut published = identities
+        .into_iter()
+        .filter_map(|identity| merged_artifacts.get(&identity));
+    let first = published.next()?;
+    match published.next() {
+        None => Some(first),
+        Some(_) => None,
     }
 }
 
@@ -3596,6 +3687,7 @@ mod tests {
             &base_state,
             &ours_state,
             &theirs_state,
+            &artifacts_by_id(&base_state.tree),
             &ours_artifacts,
             &theirs_artifacts,
             &merged_artifacts,
@@ -3634,6 +3726,7 @@ mod tests {
             &base_state,
             &ours_state,
             &theirs_state,
+            &artifacts_by_id(&base_state.tree),
             &ours_artifacts,
             &theirs_artifacts,
             &merged_artifacts,
@@ -3646,6 +3739,148 @@ mod tests {
             "an entity nobody edited follows the flip its file took"
         );
         assert!(merged_artifacts.contains_key(&file));
+    }
+
+    /// A file settled `--base` carries base's spans, not ours'.
+    ///
+    /// The alignment used to move an entity only to `theirs`, so a reader who
+    /// settled a contested file to the common ancestor published base's bytes
+    /// with ours' byte span and ours' blob stamp over them. Same defect,
+    /// different side. Both branches have to have changed the file for `--base`
+    /// to be a settlement the reader can make and for base's value to differ
+    /// from both sides; a fixture where base and ours hold the same bytes
+    /// cannot tell the two apart and would pass on the broken rule.
+    ///
+    /// Breaking it: take theirs only, and this reports ours' span.
+    #[test]
+    fn a_file_settled_to_base_carries_the_base_spans_of_what_nobody_edited() {
+        let entity = kin_model::EntityId::new();
+        let file = ArtifactId::new();
+        let path = "ledger/reporting.py";
+        let state = |stamp: u8, blob: u8| ResolvedGraphState {
+            entities: [(
+                entity,
+                python_entity(entity, "totals_by_month", path, 1, stamp),
+            )]
+            .into(),
+            tree: ResolvedTree::from_artifacts([artifact(file, path, blob)]).unwrap(),
+            ..ResolvedGraphState::default()
+        };
+        // Both branches changed the file, so it conflicted and the reader
+        // settled it `--base`. This entity is not what either of them edited.
+        let base_state = state(0x10, 0xa0);
+        let ours_state = state(0x20, 0xa1);
+        let theirs_state = state(0x30, 0xb0);
+        let base_artifacts = artifacts_by_id(&base_state.tree);
+        let merged_artifacts = base_artifacts.clone();
+        let mut merged_entities = ours_state.entities.clone();
+
+        align_unchanged_entities_with_their_artifacts(
+            &base_state,
+            &ours_state,
+            &theirs_state,
+            &base_artifacts,
+            &artifacts_by_id(&ours_state.tree),
+            &artifacts_by_id(&theirs_state.tree),
+            &merged_artifacts,
+            &mut merged_entities,
+        );
+
+        assert_eq!(
+            merged_entities.get(&entity).unwrap(),
+            base_state.entities.get(&entity).unwrap(),
+            "an entity nobody edited follows its file to base"
+        );
+        assert!(merged_artifacts.contains_key(&file));
+    }
+
+    /// A file one side MOVED carries that side's spans for what nobody edited.
+    ///
+    /// The entity's file has to be found by the identity the merged tree
+    /// carries, never by a path. A move keeps the identity and changes the
+    /// path, so a path join looks for the pre-merge path, finds nothing in the
+    /// merged tree, and silently leaves the entity on ours with ours' offsets
+    /// into a file that now lives somewhere else.
+    ///
+    /// Breaking it: join by the merged entity's own span path, and this finds
+    /// no artifact and reports ours' span.
+    #[test]
+    fn a_file_moved_on_one_side_carries_its_moved_spans() {
+        let entity = kin_model::EntityId::new();
+        let file = ArtifactId::new();
+        let old_path = "ledger/reporting.py";
+        let new_path = "ledger/reports/reporting.py";
+        let state = |path: &str, stamp: u8, blob: u8| ResolvedGraphState {
+            entities: [(
+                entity,
+                python_entity(entity, "totals_by_month", path, 1, stamp),
+            )]
+            .into(),
+            tree: ResolvedTree::from_artifacts([artifact(file, path, blob)]).unwrap(),
+            ..ResolvedGraphState::default()
+        };
+        // Ours left the file where it was; theirs moved it, keeping identity.
+        let base_state = state(old_path, 0x10, 0xa0);
+        let ours_state = state(old_path, 0x20, 0xa0);
+        let theirs_state = state(new_path, 0x30, 0xa0);
+        let base_artifacts = artifacts_by_id(&base_state.tree);
+        let ours_artifacts = artifacts_by_id(&ours_state.tree);
+        let theirs_artifacts = artifacts_by_id(&theirs_state.tree);
+
+        let mut conflicts = Vec::new();
+        let mut merged_entities = compose(
+            &base_state.entities,
+            &ours_state.entities,
+            &theirs_state.entities,
+            |entity| MergeConflictSubject::Entity { entity: *entity },
+            MergeSideValue::entity,
+            |_| None,
+            entities_agree,
+            &mut conflicts,
+        )
+        .unwrap();
+        let merged_artifacts = compose(
+            &base_artifacts,
+            &ours_artifacts,
+            &theirs_artifacts,
+            |artifact| MergeConflictSubject::Artifact {
+                artifact: *artifact,
+            },
+            MergeSideValue::artifact,
+            |_| None,
+            |left, right| left == right,
+            &mut conflicts,
+        )
+        .unwrap();
+        assert!(conflicts.is_empty(), "a one-sided move is a clean merge");
+        assert_eq!(
+            merged_artifacts.get(&file).unwrap().path.to_string(),
+            new_path,
+            "the merged tree carries the move"
+        );
+
+        align_unchanged_entities_with_their_artifacts(
+            &base_state,
+            &ours_state,
+            &theirs_state,
+            &base_artifacts,
+            &ours_artifacts,
+            &theirs_artifacts,
+            &merged_artifacts,
+            &mut merged_entities,
+        );
+
+        let published = merged_entities.get(&entity).unwrap();
+        assert_eq!(
+            published,
+            theirs_state.entities.get(&entity).unwrap(),
+            "an entity nobody edited follows the file that moved"
+        );
+        assert_eq!(
+            published.span.as_ref().unwrap().file.to_string(),
+            new_path,
+            "and names the path the merged tree publishes it at"
+        );
     }
 
     /// The control. Alignment must not touch an entity a settlement decided.
@@ -3682,6 +3917,7 @@ mod tests {
             &base_state,
             &ours_state,
             &theirs_state,
+            &artifacts_by_id(&base_state.tree),
             &ours_artifacts,
             &theirs_artifacts,
             &theirs_artifacts.clone(),
