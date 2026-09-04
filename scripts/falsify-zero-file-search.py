@@ -588,49 +588,110 @@ def main():
     py_guard = os.path.join(root, "scripts", "verify-zero-file-search.py")
     sh_guard = os.path.join(root, "scripts", "zero_file_search_guard.sh")
 
-    print(f"Falsifying {len(enforced)} answer modules at up to 4 sites each")
-    print("  py = Python checker, sh = shell guard, - = module not in that guard's scope\n")
+    # Batched by site, one guard run per site instead of one per module.
+    #
+    # FIR-2282 made the command surface opt-out, which took the enforced set from
+    # 25 modules to 59, and this loop used to run both guards once per module per
+    # site: 472 runs where it had been 200, at roughly 4.5s each. Measured, that
+    # is about 20 minutes for this section alone against a 30-minute job timeout,
+    # so widening coverage would have broken `Falsify guards` on main by clock
+    # rather than by verdict.
+    #
+    # Batching is the same trade the cfg-tracker probes below already make, and
+    # it costs the same thing: attribution. A guard that goes red names some
+    # files, and a module missing from that list could mean the probe was missed
+    # OR that an earlier probe's exclusion swallowed it. So a batch that is not
+    # unanimous is replayed one module at a time, which localises it exactly, and
+    # only a failing run pays for that.
+    #
+    # Each module keeps its own probe, its own site, and its own required
+    # report, so the per-module guarantee is unchanged. What changes is how many
+    # times the tree is walked to check them.
+    print(f"Falsifying {len(enforced)} answer modules at up to 4 sites each, batched by site")
+    print("  py = Python checker, sh = shell guard\n")
     failures = []
-    for rel, python_scans, shell_scans in enforced:
-        path = os.path.join(root, rel)
-        with open(path, "r", encoding="utf-8") as f:
-            original = f.read()
-        lines = original.split("\n")
-        marks = []
+
+    def poison_at(entries, label_wanted):
+        """Poison every entry at `label_wanted`; return {rel: original}."""
+        saved = {}
+        for rel, _, _ in entries:
+            path = os.path.join(root, rel)
+            with open(path, "r", encoding="utf-8") as handle:
+                original = handle.read()
+            saved[rel] = original
+            lines = original.split("\n")
+            sites = dict(probe_sites(lines))
+            idx = sites.get(label_wanted)
+            if idx is None:
+                continue
+            poisoned = lines[:idx] + [POISON] + lines[idx:]
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(poisoned))
+        return saved
+
+    def restore(saved):
+        for rel, original in saved.items():
+            with open(os.path.join(root, rel), "w", encoding="utf-8") as handle:
+                handle.write(original)
+
+    def verdicts_for(entries, label_wanted):
+        """{rel: (py, sh)} for one batched run at one site."""
+        saved = poison_at(entries, label_wanted)
         try:
-            for label, idx in probe_sites(lines):
-                poisoned = lines[:idx] + [POISON] + lines[idx:]
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(poisoned))
-                cell = []
-                for tag, scans, cmd in (
-                    ("py", python_scans, [sys.executable, py_guard, root]),
-                    ("sh", shell_scans, ["bash", sh_guard, root]),
-                ):
-                    if not scans:
-                        cell.append("-")
-                        continue
-                    code, out = run(cmd)
-                    named = (
-                        scan_reported(out, rel)
-                        if tag == "py"
-                        else os.path.basename(rel) in out
-                    )
-                    if code == 0:
-                        failures.append(f"{rel} @ {label}: {tag} guard PASSED on a poisoned tree")
-                        cell.append("BLIND")
-                    elif not named:
-                        failures.append(
-                            f"{rel} @ {label}: {tag} guard failed but its scan never "
-                            "reported the file"
-                        )
-                        cell.append("UNNAMED")
-                    else:
-                        cell.append("ok")
-                marks.append(f"{label}=py:{cell[0]}/sh:{cell[1]}")
+            py_code, py_out = run([sys.executable, py_guard, root])
+            sh_code, sh_out = run(["bash", sh_guard, root])
         finally:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(original)
+            restore(saved)
+        out = {}
+        for rel, python_scans, shell_scans in entries:
+            lines = saved[rel].split("\n")
+            if label_wanted not in dict(probe_sites(lines)):
+                out[rel] = ("-", "-")
+                continue
+            py = "-"
+            if python_scans:
+                py = "ok" if (py_code != 0 and scan_reported(py_out, rel)) else (
+                    "BLIND" if py_code == 0 else "UNNAMED")
+            sh = "-"
+            if shell_scans:
+                sh = "ok" if (sh_code != 0 and os.path.basename(rel) in sh_out) else (
+                    "BLIND" if sh_code == 0 else "UNNAMED")
+            out[rel] = (py, sh)
+        return out
+
+    labels = ["eof", "quarter", "half", "last-prod"]
+    table = {rel: {} for rel, _, _ in enforced}
+    for label in labels:
+        batch = verdicts_for(enforced, label)
+        # Only the modules that did NOT come back ok are replayed, and only
+        # those are ambiguous. A module the guard NAMED was genuinely reported,
+        # whoever else was poisoned in the same run. A module it did not name is
+        # the open question: its own probe may have been missed, or an earlier
+        # snippet's over-wide exclusion may have swallowed it. Replaying exactly
+        # those answers it, and it keeps a failing run cheap: replaying all 67
+        # at every site took over ten minutes and is what a red build would have
+        # paid on every push.
+        unclear = [e for e in enforced if any(v not in ("ok", "-") for v in batch[e[0]])]
+        for entry in unclear:
+            batch.update(verdicts_for([entry], label))
+        for rel, pair in batch.items():
+            table[rel][label] = pair
+
+    for rel, python_scans, shell_scans in enforced:
+        marks = []
+        for label in labels:
+            py, sh = table[rel].get(label, ("-", "-"))
+            if py == "-" and sh == "-":
+                continue
+            marks.append(f"{label}=py:{py}/sh:{sh}")
+            for tag, verdict in (("py", py), ("sh", sh)):
+                if verdict == "BLIND":
+                    failures.append(f"{rel} @ {label}: {tag} guard PASSED on a poisoned tree")
+                elif verdict == "UNNAMED":
+                    failures.append(
+                        f"{rel} @ {label}: {tag} guard failed but its scan never "
+                        "reported the file"
+                    )
         print(f"  {os.path.basename(rel):24} {'  '.join(marks)}")
 
     # A module that was whole-file exempt has no falsification history at all:
