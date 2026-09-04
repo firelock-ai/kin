@@ -2028,15 +2028,27 @@ fn stranded_init_stage_check_for(roots: &[PathBuf]) -> HealthCheck {
 
 /// Survey every scan root once, keeping each stage the first time it is seen.
 ///
-/// The roots overlap by construction: a working directory and its parent both
-/// name the parent's staging when the run happens one level down. Deduplicated
-/// on the owner record's path, which is unique per stage.
+/// Deduplicated on the owner record's path, which is unique per stage. The
+/// roots are a directory and its parent, so they hold disjoint entries today
+/// and the dedupe is insurance against a caller that passes overlapping roots
+/// rather than against the pair `staging_scan_roots` returns.
+///
+/// A root that could not be read is recorded, not dropped. Reporting a parent
+/// as clean because `read_dir` refused it would be the false negative this row
+/// exists to end, and it is the parent, one level up from where an operator
+/// stands, that these stages strand in.
 pub(crate) fn survey_stranded_stages(roots: &[PathBuf]) -> kin_core::StrandedStageSurvey {
     let mut survey = kin_core::StrandedStageSurvey::default();
     let mut seen = std::collections::BTreeSet::new();
     for root in roots {
-        let Ok(found) = kin_core::survey_orphaned_repository_stages(root) else {
-            continue;
+        let found = match kin_core::survey_orphaned_repository_stages(root) {
+            Ok(found) => found,
+            Err(error) => {
+                survey
+                    .unreadable
+                    .push(format!("{}: {error}", root.display()));
+                continue;
+            }
         };
         survey.live += found.live;
         for stage in found.stages {
@@ -2072,14 +2084,32 @@ pub fn stranded_stage_scan_roots() -> Vec<PathBuf> {
 /// owner lock, a private owner record and stage directory owned by this user,
 /// the exact recorded stage path, and a matching device and inode. A stage a
 /// live `kin init` holds is never touched.
+///
+/// That owner lock is host-local, so the proof holds on local storage and not
+/// on a shared mount, where a stage another machine is still writing can read
+/// as abandoned. FIR-3155 carries the fix, a host identifier on the owner
+/// record.
+///
+/// Refuses rather than returning zero when no root could be examined at all. A
+/// caller reading only the exit status would otherwise take "I could not look"
+/// for "there was nothing there".
 pub fn reclaim_stranded_stages(json: bool) -> anyhow::Result<()> {
-    let roots = stranded_stage_scan_roots();
+    reclaim_stranded_stages_in(&stranded_stage_scan_roots(), json)
+}
+
+/// [`reclaim_stranded_stages`] against explicit roots.
+///
+/// Split out so the refusal below is reachable from a test. Resolving the roots
+/// from `env::current_dir` is process-global state, and a test that changed the
+/// working directory to drive this would reach every other test running beside
+/// it in the same binary.
+pub(crate) fn reclaim_stranded_stages_in(roots: &[PathBuf], json: bool) -> anyhow::Result<()> {
     let mut recovered = 0usize;
     let mut bytes = 0u64;
     let mut retained = 0usize;
     let mut live = 0usize;
     let mut failures: Vec<String> = Vec::new();
-    for root in &roots {
+    for root in roots {
         match kin_core::reclaim_orphaned_repository_stages(root) {
             Ok(outcome) => {
                 recovered += outcome.recovered;
@@ -2091,6 +2121,17 @@ pub fn reclaim_stranded_stages(json: bool) -> anyhow::Result<()> {
             // thing an operator must not read as "nothing was stranded there".
             Err(error) => failures.push(format!("{}: {error}", root.display())),
         }
+    }
+    // Fail loud. `recovered == 0` beside a failure for every root is not a clean
+    // parent, and the summary sentence below says "nothing to reclaim here",
+    // which is the one thing this must not tell a script that reads only the
+    // exit status.
+    if failures.len() == roots.len() && !roots.is_empty() {
+        anyhow::bail!(
+            "kin doctor --reclaim-staging: no directory could be examined, so this run says \
+             nothing about what is stranded here: {}",
+            failures.join("; ")
+        );
     }
     if json {
         println!(
@@ -2117,18 +2158,22 @@ pub fn reclaim_stranded_stages(json: bool) -> anyhow::Result<()> {
     if !json {
         if retained > 0 {
             let (noun, pronoun) = if retained == 1 {
-                ("stage", "it")
+                ("store", "it")
             } else {
-                ("stages", "them")
+                ("stores", "them")
             };
             println!(
-                "  {retained} further staging {noun} left alone, because this run could not prove \
+                "  {retained} further staged {noun} left alone, because this run could not prove \
                  {pronoun} unused."
             );
         }
         if live > 0 {
-            let verb = if live == 1 { "is" } else { "are" };
-            println!("  {live} staging {verb} owned by a `kin init` running right now.");
+            let (noun, verb) = if live == 1 {
+                ("store", "is")
+            } else {
+                ("stores", "are")
+            };
+            println!("  {live} staged {noun} {verb} owned by a `kin init` running right now.");
         }
         for failure in &failures {
             println!("  could not be examined, {failure}");
@@ -5964,6 +6009,83 @@ mod tests {
         let quiet = stranded_init_stage_check_for(&[clean.path().to_path_buf()]);
         assert!(matches!(quiet.status, HealthStatus::Healthy), "{quiet:?}");
         assert!(quiet.manual_fix.is_none(), "{quiet:?}");
+    }
+
+    /// A scan root the process cannot read is reported, not reported as clean.
+    ///
+    /// The row used to drop the error and fall through to Healthy, printing
+    /// "no crashed `kin init` left a staged store beside this directory" about
+    /// a directory it had never managed to open. The reclaim beside it already
+    /// refused to do that, so the two surfaces disagreed on the same machine.
+    ///
+    /// The clean tempdir above is the control for the Healthy arm; this one is
+    /// the control for the other direction, so neither reading is an accident.
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_root_that_cannot_be_read_is_reported_rather_than_read_as_clean() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = directory.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let check = stranded_init_stage_check_for(std::slice::from_ref(&sealed));
+        // Restored before any assertion, so a failing assertion still leaves a
+        // directory the tempdir can remove.
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(check.status, HealthStatus::Degraded), "{check:?}");
+        assert!(
+            check.detail.contains(&sealed.display().to_string()),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("does not say whether anything is stranded"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// A reclaim that could examine nothing refuses, rather than exiting clean.
+    ///
+    /// `main` exits non-zero only on `Err`, so returning `Ok(())` after every
+    /// root failed would tell a script that reads the exit status that the disk
+    /// was examined and found clean. The human summary in that case even prints
+    /// "nothing to reclaim here", which is the one sentence this must never say
+    /// about a directory it could not open.
+    ///
+    /// The readable tempdir is the control: a genuinely clean parent still
+    /// succeeds, so this is not a refusal that fires on everything.
+    #[cfg(unix)]
+    #[test]
+    fn a_reclaim_that_could_examine_nothing_refuses_rather_than_reporting_clean() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = directory.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let refused = reclaim_stranded_stages_in(std::slice::from_ref(&sealed), false);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = refused.expect_err("a root that could not be examined is not a clean parent");
+        let message = error.to_string();
+        assert!(message.contains(&sealed.display().to_string()), "{message}");
+        assert!(
+            message.contains("no directory could be examined"),
+            "{message}"
+        );
+
+        let clean = tempfile::tempdir().unwrap();
+        assert!(
+            reclaim_stranded_stages_in(&[clean.path().to_path_buf()], false).is_ok(),
+            "a readable empty parent still succeeds"
+        );
     }
 
     /// The reading a user needed BEFORE the commit that killed their daemon.

@@ -1299,10 +1299,12 @@ enum Command {
         /// Delete the staged stores a crashed `kin init` left beside this
         /// directory and its parent
         ///
-        /// Removes only a stage whose owner is provably gone and whose
-        /// destination repository was never created. Bare `kin doctor` is the
-        /// dry run: it names every stage this would take, with its size, and
-        /// deletes nothing.
+        /// Removes only a stage no live `kin init` on this machine owns and
+        /// whose destination repository was never created. The lock that proves
+        /// that is host-local, so run this on local storage: on a shared mount a
+        /// stage another machine is still writing can read as abandoned. Bare
+        /// `kin doctor` is the dry run: it names every stage this would take,
+        /// with its size, and deletes nothing.
         #[arg(long = "reclaim-staging", default_value_t = false)]
         reclaim_staging: bool,
     },

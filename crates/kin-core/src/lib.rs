@@ -88,9 +88,10 @@ pub use init::{
     init, init_adopting, init_replica, init_replica_adopting, initialize_repository_authority,
     prepare_repository_layout_at, prepare_repository_layout_with_origin, publish_repository_layout,
     publish_repository_layout_linearized, reclaim_orphaned_repository_stages,
-    survey_orphaned_repository_stages, InitResult, PreparedRepositoryInit, PublishedRepository,
-    ReclaimedStrandedStages, RepositoryBootstrap, RepositoryIdentityOrigin, RepositoryPublication,
-    StrandedRepositoryStage, StrandedStageSurvey, StrandedStageVerdict,
+    stranded_stage_doctor_row, survey_orphaned_repository_stages, InitResult,
+    PreparedRepositoryInit, PublishedRepository, ReclaimedStrandedStages, RepositoryBootstrap,
+    RepositoryIdentityOrigin, RepositoryPublication, StrandedRepositoryStage, StrandedStageSurvey,
+    StrandedStageVerdict,
 };
 pub use layout::KinLayout;
 pub use manifest::KinManifest;

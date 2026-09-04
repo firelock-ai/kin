@@ -2523,6 +2523,14 @@ pub struct StrandedStageSurvey {
     /// Candidates a live initializer holds right now. Counted, not listed: an
     /// init running beside you is the healthy case and is not a finding.
     pub live: usize,
+    /// Directories this pass could not read at all, each with its reason.
+    ///
+    /// Carried rather than dropped, and reported by
+    /// [`stranded_stage_doctor_row`] as a finding of its own. A root that could
+    /// not be scanned is the one thing an operator must not read as "nothing
+    /// was stranded there", and the unreadable root is most plausibly the
+    /// parent directory, which is exactly where these stages strand.
+    pub unreadable: Vec<String>,
 }
 
 impl StrandedStageSurvey {
@@ -2539,8 +2547,10 @@ impl StrandedStageSurvey {
     }
 
     /// Whether anything here is worth an operator's attention.
+    ///
+    /// A root this pass could not read counts, because not knowing is a finding.
     pub fn is_empty(&self) -> bool {
-        self.stages.is_empty()
+        self.stages.is_empty() && self.unreadable.is_empty()
     }
 }
 
@@ -2593,7 +2603,7 @@ enum StageScanAction {
 
 /// What one pass of [`scan_repository_init_stages`] did.
 #[cfg(unix)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct StageScanOutcome {
     recovered: usize,
     retained: usize,
@@ -2731,11 +2741,14 @@ fn measure_stage_tree(root: &Path) -> (u64, bool, Option<std::time::SystemTime>)
                 complete = false;
                 continue;
             };
-            record_time(&metadata, &mut newest);
             let file_type = metadata.file_type();
+            // After the symlink skip, not before. A symlink contributes no
+            // bytes, so letting its mtime set the newest time would date the
+            // measurement by an entry the measurement does not count.
             if file_type.is_symlink() {
                 continue;
             }
+            record_time(&metadata, &mut newest);
             if file_type.is_dir() {
                 pending.push(path);
             } else if file_type.is_file() {
@@ -3118,8 +3131,15 @@ fn scan_repository_init_stages(
         }
         // Measured under the lock that proved the stage abandoned, and before
         // the claim that destroys it, so the number an operator is told came
-        // back is the number that was there.
-        let (bytes, _, _) = measure_stage_tree(&owned_root);
+        // back is the number that was there. Only where a caller reads it:
+        // `ReclaimedStages` has no bytes field and the destination-bound reaper
+        // discards the outcome's, so measuring there would put a second full
+        // walk of a staged store on `kin init`'s own path, beside the one
+        // `remove_dir_all` is about to do anyway.
+        let bytes = match scope {
+            StageScanScope::Unbound => measure_stage_tree(&owned_root).0,
+            StageScanScope::Destination(_) => 0,
+        };
         if owned_root == stage_root {
             if let Err(error) = rename_directory_noreplace(&stage_root, &reap_root) {
                 debug!(
@@ -3262,6 +3282,10 @@ pub fn survey_orphaned_repository_stages(staging_parent: &Path) -> Result<Strand
         Ok(StrandedStageSurvey {
             stages: outcome.stages,
             live: outcome.skipped,
+            // A single-root survey answers an unreadable root with `Err`. The
+            // list is for a caller aggregating several roots, which is where
+            // one failing must not silence the others.
+            unreadable: Vec::new(),
         })
     }
 }
@@ -3272,6 +3296,11 @@ pub fn survey_orphaned_repository_stages(staging_parent: &Path) -> Result<Strand
 /// Each stage is measured and removed under the same owner lock that proved it
 /// abandoned, so a live initializer arriving mid-pass is never raced and the
 /// bytes reported back are the bytes that were there.
+///
+/// That lock is host-local, so this proves the owner gone on local storage and
+/// not on a shared mount, where a stage another machine is still writing can
+/// read as abandoned. FIR-3155 carries the fix, a host identifier on the owner
+/// record; until it lands, every surface that offers this says so.
 pub fn reclaim_orphaned_repository_stages(
     staging_parent: &Path,
 ) -> Result<ReclaimedStrandedStages> {
@@ -3370,28 +3399,93 @@ fn describe_stranded_stage(stage: &StrandedRepositoryStage) -> String {
 /// init` reclaims a stage only at that stage's own recorded destination, and the
 /// stages that strand are the ones nobody ever initializes again.
 pub fn stranded_stage_doctor_row(survey: &StrandedStageSurvey) -> Option<(String, String)> {
-    if survey.stages.is_empty() {
+    if survey.is_empty() {
         return None;
     }
+    // A root this pass could not read is a finding on its own, not a silence.
+    // It is most plausibly the parent directory, which is exactly where these
+    // stages strand, so reporting the parent as clean because it could not be
+    // opened would be the false negative this row exists to end.
+    let unreadable = match survey.unreadable.len() {
+        0 => String::new(),
+        1 => format!(
+            "one directory beside this one could not be read, so this run does not say whether \
+             anything is stranded there: {}",
+            survey.unreadable[0]
+        ),
+        count => format!(
+            "{count} directories beside this one could not be read, so this run does not say \
+             whether anything is stranded there: {}",
+            survey.unreadable.join(", ")
+        ),
+    };
+    if survey.stages.is_empty() {
+        return Some((
+            unreadable,
+            "make those directories readable and run `kin doctor` again".to_string(),
+        ));
+    }
+
     let reclaimable = survey.reclaimable().collect::<Vec<_>>();
-    let held_back = survey.stages.len() - reclaimable.len();
-    if reclaimable.is_empty() {
-        let (noun, verb, pronoun) = if held_back == 1 {
-            ("stage", "was", "it")
+    let held_back = survey
+        .stages
+        .iter()
+        .filter(|stage| stage.verdict != StrandedStageVerdict::Reclaimable)
+        .collect::<Vec<_>>();
+    let describe = |stages: &[&StrandedRepositoryStage]| {
+        stages
+            .iter()
+            .map(|stage| describe_stranded_stage(stage))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let mut detail = if reclaimable.is_empty() {
+        let (noun, verb, pronoun) = if held_back.len() == 1 {
+            ("store", "was", "it")
         } else {
-            ("stages", "were", "them")
+            ("stores", "were", "them")
         };
-        let detail = format!(
-            "{held_back} repository staging {noun} beside this directory {verb} left by an \
-             interrupted `kin init`, and this run could not prove {pronoun} unused: {}",
-            survey
-                .stages
-                .iter()
-                .map(describe_stranded_stage)
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
-        let fix = format!(
+        format!(
+            "{} staged {noun} beside this directory {verb} left by an interrupted `kin init`, and \
+             this run could not prove {pronoun} unused: {}",
+            held_back.len(),
+            describe(&held_back)
+        )
+    } else {
+        let (run, verb) = if reclaimable.len() == 1 {
+            ("run", "is")
+        } else {
+            ("runs", "are")
+        };
+        format!(
+            "{} of staging from {} crashed `kin init` {run} {verb} reclaimable: {}",
+            crate::init_attempt::human_bytes(survey.reclaimable_bytes()),
+            reclaimable.len(),
+            describe(&reclaimable)
+        )
+    };
+    // Described rather than counted. A bare "1 more was left alone" tells an
+    // operator a directory exists and nothing about which one, how much disk it
+    // holds, or why this run declined it, which is the whole of what they came
+    // to the row for.
+    if !reclaimable.is_empty() && !held_back.is_empty() {
+        let (noun, pronoun) = if held_back.len() == 1 {
+            ("store", "it")
+        } else {
+            ("stores", "them")
+        };
+        detail.push_str(&format!(
+            ". This run also left {} further staged {noun} alone, because it could not prove \
+             {pronoun} unused: {}",
+            held_back.len(),
+            describe(&held_back)
+        ));
+    }
+    if !unreadable.is_empty() {
+        detail.push_str(&format!(". Separately, {unreadable}"));
+    }
+    let fix = if reclaimable.is_empty() {
+        format!(
             "delete {} by hand once no `kin init` is running here",
             survey
                 .stages
@@ -3399,40 +3493,15 @@ pub fn stranded_stage_doctor_row(survey: &StrandedStageSurvey) -> Option<(String
                 .map(|stage| stage.stage_path.display().to_string())
                 .collect::<Vec<_>>()
                 .join(" ")
-        );
-        return Some((detail, fix));
-    }
-    let total = survey.reclaimable_bytes();
-    let (run_noun, run_verb) = if reclaimable.len() == 1 {
-        ("run", "is")
+        )
     } else {
-        ("runs", "are")
+        // Names the machine, because the owner lock this proof rests on is
+        // host-local and the sentence used to promise more than that. FIR-3155.
+        "run `kin doctor --reclaim-staging` here, which removes only a stage no live `kin init` on \
+         this machine owns; a later `kin init` will not, because orphan recovery runs only at a \
+         stage's own recorded destination"
+            .to_string()
     };
-    let mut detail = format!(
-        "{} of staging from {} crashed `kin init` {run_noun} {run_verb} reclaimable: {}",
-        crate::init_attempt::human_bytes(total),
-        reclaimable.len(),
-        reclaimable
-            .iter()
-            .map(|stage| describe_stranded_stage(stage))
-            .collect::<Vec<_>>()
-            .join("; ")
-    );
-    if held_back > 0 {
-        let (noun, pronoun) = if held_back == 1 {
-            ("stage", "it")
-        } else {
-            ("stages", "them")
-        };
-        detail.push_str(&format!(
-            "; {held_back} further staging {noun} sat beside {pronoun} that this run could not \
-             prove unused"
-        ));
-    }
-    let fix = "run `kin doctor --reclaim-staging` here, which removes only a stage whose owner is \
-               provably gone; a later `kin init` will not, because orphan recovery runs only at a \
-               stage's own recorded destination"
-        .to_string();
     Some((detail, fix))
 }
 
@@ -4850,6 +4919,67 @@ mod tests {
         assert!(!stage_root.exists());
     }
 
+    /// The destination-bound reaper inside `kin init` measures nothing.
+    ///
+    /// `ReclaimedStages` has no bytes field and
+    /// `recover_orphaned_repository_stages` discards the outcome's, so
+    /// measuring on that path would put a second full walk of a staged store on
+    /// `kin init`'s own path, beside the one `remove_dir_all` is about to do
+    /// anyway. Asserted on the scan's own outcome, because the wrapper's return
+    /// type cannot show it.
+    ///
+    /// The unbound arm is the control: same stage, same bytes on disk, and a
+    /// caller that does read the number. Without it a scan that had stopped
+    /// measuring altogether would pass.
+    #[cfg(unix)]
+    #[test]
+    fn the_destination_bound_reaper_measures_nothing_the_caller_reads() {
+        fn strand_with_a_body(parent: &Path) -> PathBuf {
+            let repository = parent.join("repository");
+            std::fs::create_dir(&repository).unwrap();
+            let (stage_root, _) =
+                strand_repository_stage(parent, &repository.join(".kin")).unwrap();
+            std::fs::write(stage_root.join("body"), vec![0_u8; 65536]).unwrap();
+            repository.join(".kin")
+        }
+        fn scan_until_no_skip(parent: &Path, scope: StageScanScope<'_>) -> StageScanOutcome {
+            let mut outcome =
+                scan_repository_init_stages(parent, scope, StageScanAction::Reclaim).unwrap();
+            for _ in 0..40 {
+                if outcome.skipped == 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                outcome =
+                    scan_repository_init_stages(parent, scope, StageScanAction::Reclaim).unwrap();
+            }
+            outcome
+        }
+
+        let bound_dir = tempfile::tempdir().unwrap();
+        let bound_parent = bound_dir.path().canonicalize().unwrap();
+        let destination = strand_with_a_body(&bound_parent);
+        let bound = scan_until_no_skip(&bound_parent, StageScanScope::Destination(&destination));
+        assert_eq!(bound.recovered, 1, "the bound arm still reclaims");
+        assert_eq!(
+            bound.bytes_recovered, 0,
+            "and walks nothing for a number its caller drops"
+        );
+
+        let unbound_dir = tempfile::tempdir().unwrap();
+        let unbound_parent = unbound_dir.path().canonicalize().unwrap();
+        strand_with_a_body(&unbound_parent);
+        let unbound = scan_until_no_skip(&unbound_parent, StageScanScope::Unbound);
+        assert_eq!(
+            unbound.recovered, 1,
+            "the unbound arm reclaims the same way"
+        );
+        assert!(
+            unbound.bytes_recovered >= 65536,
+            "and does measure, because an operator reads the number: {unbound:?}"
+        );
+    }
+
     /// A stage whose destination exists now is named and left alone.
     ///
     /// The other half of the destination proof. Something else owns that
@@ -4908,6 +5038,7 @@ mod tests {
                 verdict: StrandedStageVerdict::Reclaimable,
             }],
             live: 0,
+            unreadable: Vec::new(),
         };
 
         let (detail, fix) =
@@ -4929,6 +5060,108 @@ mod tests {
             stranded_stage_doctor_row(&StrandedStageSurvey::default()).is_none(),
             "a clean parent is not a finding"
         );
+    }
+
+    /// A stage this pass declined is described, not just counted.
+    ///
+    /// The mixed case used to end in a bare "1 further staging stage sat beside
+    /// it", which tells an operator a directory exists and nothing about which
+    /// one, how much disk it holds, or why this run left it. That is the half
+    /// of the row they came for, and the pronoun pointed at the reclaimable
+    /// stage the same sentence had just said was provably unused.
+    #[test]
+    fn a_stage_the_row_declines_is_described_rather_than_counted() {
+        let survey = StrandedStageSurvey {
+            stages: vec![
+                stub_stage(
+                    "/scratchpad/.kin.init-11111111-1111-4111-8111-111111111111",
+                    1_610_612_736,
+                    StrandedStageVerdict::Reclaimable,
+                ),
+                stub_stage(
+                    "/scratchpad/.kin.init-22222222-2222-4222-8222-222222222222",
+                    4096,
+                    StrandedStageVerdict::Unprovable(
+                        "its filesystem identity is not provable".to_string(),
+                    ),
+                ),
+            ],
+            live: 0,
+            unreadable: Vec::new(),
+        };
+
+        let (detail, _) = stranded_stage_doctor_row(&survey).expect("a finding");
+        assert!(detail.contains(".kin.init-22222222"), "{detail}");
+        assert!(
+            detail.contains("its filesystem identity is not provable"),
+            "{detail}"
+        );
+        assert!(detail.contains("4.0 KB"), "{detail}");
+        // The reclaimable one is still the headline, and the declined one is
+        // not counted into the number that comes back.
+        assert!(detail.contains("1.5 GB of staging"), "{detail}");
+        assert_eq!(survey.reclaimable_bytes(), 1_610_612_736);
+    }
+
+    /// A directory this pass could not read is a finding, not a clean bill.
+    ///
+    /// The unreadable root is most plausibly the parent, which is exactly where
+    /// these stages strand, so answering "nothing is stranded here" because
+    /// `read_dir` refused is the false negative this row exists to end.
+    #[test]
+    fn a_root_that_could_not_be_read_is_a_finding_rather_than_silence() {
+        let survey = StrandedStageSurvey {
+            stages: Vec::new(),
+            live: 0,
+            unreadable: vec!["/scratchpad: permission denied".to_string()],
+        };
+        assert!(!survey.is_empty(), "not knowing is not the same as clean");
+
+        let (detail, fix) =
+            stranded_stage_doctor_row(&survey).expect("an unreadable root is a finding on its own");
+        assert!(
+            detail.contains("/scratchpad: permission denied"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("does not say whether anything is stranded"),
+            "{detail}"
+        );
+        assert!(fix.contains("readable"), "{fix}");
+
+        // And it rides along with a real stage rather than replacing it.
+        let both = StrandedStageSurvey {
+            stages: vec![stub_stage(
+                "/scratchpad/.kin.init-11111111-1111-4111-8111-111111111111",
+                4096,
+                StrandedStageVerdict::Reclaimable,
+            )],
+            live: 0,
+            unreadable: vec!["/elsewhere: permission denied".to_string()],
+        };
+        let (detail, fix) = stranded_stage_doctor_row(&both).expect("a finding");
+        assert!(detail.contains(".kin.init-11111111"), "{detail}");
+        assert!(detail.contains("/elsewhere: permission denied"), "{detail}");
+        assert!(fix.contains("kin doctor --reclaim-staging"), "{fix}");
+    }
+
+    /// One stranded stage, built for the row's wording rather than from disk.
+    fn stub_stage(
+        path: &str,
+        bytes: u64,
+        verdict: StrandedStageVerdict,
+    ) -> StrandedRepositoryStage {
+        StrandedRepositoryStage {
+            stage_path: PathBuf::from(path),
+            owner_path: PathBuf::from(format!("{path}.owner")),
+            destination_path: Some(PathBuf::from("/scratchpad/redis-full/.kin")),
+            bytes,
+            bytes_complete: true,
+            last_written: Some(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60),
+            ),
+            verdict,
+        }
     }
 
     /// Also asserts a reap, so it is bound to the platform that reaps.
