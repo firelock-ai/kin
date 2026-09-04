@@ -18938,8 +18938,19 @@ fn output_text(result: &LocateResult, explain: bool, query: &str) {
     for line in coverage_note_lines(result, explain) {
         eprintln!("⚠ {line}");
     }
+    // Computed before the empty-result return so both shapes of answer carry
+    // it. A query that returned nothing at all is the reading a store with no
+    // vectors produces most often, and it is the one where a reader is likeliest
+    // to conclude the store does not hold what they asked for.
+    let model_fetch = embedding_model_fetch_note(
+        result.semantic_coverage.as_ref(),
+        crate::embed_model::EmbedModelFetch::probe,
+    );
     if result.files.is_empty() {
         println!("No relevant files found.");
+        for line in locate_trailing_notes(result, query, model_fetch) {
+            eprintln!("⚠ {line}");
+        }
         return;
     }
 
@@ -18954,9 +18965,31 @@ and are not comparable between rows"
         println!("{}", line);
     }
 
-    if let Some(floor) = answer_floor_note(result, query) {
-        eprintln!("⚠ {floor}");
+    for line in locate_trailing_notes(result, query, model_fetch) {
+        eprintln!("⚠ {line}");
     }
+}
+
+/// The stderr notes that follow the ranked rows, in order.
+///
+/// Split from the writing for the reason [`coverage_note_lines`] is: asserting
+/// on the two notes apart grades neither the decision to emit both nor the
+/// order they arrive in, and a mutation that dropped one from the printing
+/// would leave both of their own tests green.
+///
+/// The floor sentence leads because it is about the rows a reader is looking
+/// at. The fetch line follows because it is the cause, and a reader given only
+/// the floor is told to name a symbol when the answer is to run the query again
+/// once the weights land.
+fn locate_trailing_notes(
+    result: &LocateResult,
+    query: &str,
+    model_fetch: Option<String>,
+) -> Vec<String> {
+    answer_floor_note(result, query)
+        .into_iter()
+        .chain(model_fetch)
+        .collect()
 }
 
 /// The note lines this surface writes to stderr, in order.
@@ -19121,6 +19154,54 @@ fn answer_floor_note(result: &LocateResult, query: &str) -> Option<String> {
          signals alone, so they are this store's nearest neighbours for your words rather \
          than a match. Name a symbol, file or identifier for a stronger answer."
     ))
+}
+
+/// Whether this store still owes embeddings, read off the daemon's own
+/// observation of its embedding substrate.
+///
+/// Read from [`SemanticCoverage::embedding_state`] rather than from `complete`,
+/// for the reason that field's own documentation gives: `complete` is a
+/// conjunction over several substrates and a role filter alone can clear it, so
+/// an embedding verdict derived from it reports a whole index as short.
+///
+/// `Unknown` is excluded deliberately. A build with no vector backend, or a
+/// reading taken with no index attached, has observed nothing about embeddings,
+/// and a model still in flight is not what such an answer is short of. Treating
+/// it as owed would put the download line in front of readers whose answer it
+/// does not explain.
+fn embedding_work_is_owed(coverage: &SemanticCoverage) -> bool {
+    matches!(
+        coverage.embedding_state,
+        EmbeddingState::Absent | EmbeddingState::Partial
+    )
+}
+
+/// What this answer owes a reader when its rows are lexical because the
+/// embedding weights have not landed, or `None` when the model is not the
+/// reason.
+///
+/// Two independent facts have to agree before the line is printed, and neither
+/// is sufficient alone. The daemon says embeddings are owed on this store; the
+/// local hub cache says the weights are not here. A store that owes embeddings
+/// with the model already cached is behind on work rather than on bytes, and a
+/// host with no model but nothing owed is a build or a scope that was never
+/// going to rank on vectors.
+///
+/// It exists because a fast `kin init` on a small repository returns before the
+/// fetch does, and the first `kin locate` then said only that no row cleared
+/// the answer floor. That sentence sends a reader to name a symbol, which does
+/// not help, when the fix is to run the query again once the download lands.
+///
+/// `probe` is taken as an argument so the decision is gradable without a hub
+/// cache on the host running the test.
+fn embedding_model_fetch_note(
+    coverage: Option<&SemanticCoverage>,
+    probe: impl FnOnce(bool) -> crate::embed_model::EmbedModelFetch,
+) -> Option<String> {
+    if !coverage.is_some_and(embedding_work_is_owed) {
+        return None;
+    }
+    probe(true).retrieval_clause()
 }
 
 /// The stdout lines `output_text` prints for the ranked file list, in order.
@@ -32681,6 +32762,149 @@ mod tests {
         assert!(
             synth.contains("6 pending"),
             "synthesized banner cites pending"
+        );
+    }
+
+    fn owed_embedding_coverage(state: EmbeddingState) -> SemanticCoverage {
+        SemanticCoverage {
+            supported: true,
+            indexed: 0,
+            total: 134,
+            pending: 0,
+            complete: false,
+            embedding_state: state,
+            limited_by: vec![COVERAGE_LIMIT_EMBEDDINGS_INCOMPLETE.to_string()],
+            read_at: None,
+            note: None,
+            graph_bodies: None,
+        }
+    }
+
+    fn weights_arriving(embed_pass_working: bool) -> crate::embed_model::EmbedModelFetch {
+        crate::embed_model::EmbedModelFetch {
+            model_id: crate::embed_model::DEFAULT_EMBED_MODEL_ID.to_string(),
+            cache_dir: Some("/home/dev/.cache/huggingface/hub/models--x".to_string()),
+            present: false,
+            fetched_bytes: 137 * 1024 * 1024,
+            expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
+            fetching: embed_pass_working,
+            no_fetch_reason: None,
+            relocated_hf_home: None,
+        }
+    }
+
+    fn weights_cached(_embed_pass_working: bool) -> crate::embed_model::EmbedModelFetch {
+        crate::embed_model::EmbedModelFetch {
+            present: true,
+            fetching: false,
+            fetched_bytes: 0,
+            ..weights_arriving(false)
+        }
+    }
+
+    /// The download line needs both facts and neither is sufficient alone: the
+    /// daemon says embeddings are owed here, and the local cache says the
+    /// weights have not landed. Either one on its own describes a different
+    /// problem with a different fix.
+    #[test]
+    fn the_model_fetch_note_needs_both_the_owed_work_and_the_missing_weights() {
+        // The stranger's reading on `expressjs/body-parser`: nothing indexed
+        // over 134 eligible entities, with the weights partway down.
+        let nothing_indexed = owed_embedding_coverage(EmbeddingState::Absent);
+        let note = embedding_model_fetch_note(Some(&nothing_indexed), weights_arriving)
+            .expect("owed work with the weights still arriving names the fetch");
+        assert!(
+            note.contains("137 of 523 MB") && note.contains("lexical until it lands"),
+            "the note carries the progress and what it costs this answer: {note}"
+        );
+        assert!(
+            embedding_model_fetch_note(
+                Some(&owed_embedding_coverage(EmbeddingState::Partial)),
+                weights_arriving
+            )
+            .is_some(),
+            "a half-embedded store waiting on the weights is the same situation"
+        );
+
+        // Weights here, work owed: the store is behind on embedding rather than
+        // on bytes, so the fetch line would name a cause that is not the one.
+        assert_eq!(
+            embedding_model_fetch_note(Some(&nothing_indexed), weights_cached),
+            None,
+            "a cached model is never reported as still arriving"
+        );
+
+        // Work not owed: nothing about this answer waits on a download,
+        // whatever the cache holds.
+        assert_eq!(
+            embedding_model_fetch_note(
+                Some(&owed_embedding_coverage(EmbeddingState::Present)),
+                weights_arriving
+            ),
+            None,
+            "a whole index owes no fetch"
+        );
+        assert_eq!(
+            embedding_model_fetch_note(
+                Some(&owed_embedding_coverage(EmbeddingState::Unknown)),
+                weights_arriving
+            ),
+            None,
+            "an unobserved substrate has not seen that embeddings are owed"
+        );
+        assert_eq!(
+            embedding_model_fetch_note(None, weights_arriving),
+            None,
+            "a payload carrying no coverage asserts nothing about embeddings"
+        );
+    }
+
+    /// Both trailing notes reach the surface, in the order a reader needs them:
+    /// what the rows are, then why.
+    #[test]
+    fn the_fetch_line_is_printed_beside_the_floor_sentence_and_not_instead_of_it() {
+        let fallback = row_with_symbols("lib/read.js", &[("readStream", "")]);
+        let mut weak = LocateResult::default();
+        weak.files = vec![fallback];
+        weak.semantic_coverage = Some(owed_embedding_coverage(EmbeddingState::Absent));
+
+        let fetch = embedding_model_fetch_note(weak.semantic_coverage.as_ref(), weights_arriving);
+        let lines = locate_trailing_notes(&weak, "where is the request body size limit", fetch);
+        assert_eq!(lines.len(), 2, "both notes are emitted: {lines:?}");
+        assert!(
+            lines[0].contains("no row cleared the answer floor"),
+            "the floor sentence still leads: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("embedding model still downloading"),
+            "and the cause follows it: {:?}",
+            lines[1]
+        );
+
+        // An answer that returned nothing at all still carries the cause, which
+        // is the shape a store with no vectors produces most often.
+        let mut empty = LocateResult::default();
+        empty.semantic_coverage = Some(owed_embedding_coverage(EmbeddingState::Absent));
+        let fetch = embedding_model_fetch_note(empty.semantic_coverage.as_ref(), weights_arriving);
+        let lines = locate_trailing_notes(&empty, "anything", fetch);
+        assert_eq!(lines.len(), 1, "no rows means no floor sentence: {lines:?}");
+        assert!(
+            lines[0].contains("embedding model still downloading"),
+            "the cause survives an empty answer: {:?}",
+            lines[0]
+        );
+
+        // The control: a store whose weights are here emits the floor sentence
+        // alone, so the second line is selected by the fetch rather than by
+        // being appended to every degraded answer.
+        let fetch = embedding_model_fetch_note(weak.semantic_coverage.as_ref(), weights_cached);
+        let lines = locate_trailing_notes(&weak, "where is the request body size limit", fetch);
+        assert_eq!(lines.len(), 1, "a cached model adds no line: {lines:?}");
+        assert!(
+            lines[0].contains("no row cleared the answer floor"),
+            "and the floor sentence is the one that survives: {:?}",
+            lines[0]
         );
     }
 

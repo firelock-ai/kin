@@ -161,6 +161,13 @@ cold-started, then in 71 milliseconds warm. Those are separately measured legs
 of one sitting, not one timed run, and a repository with deeper history takes
 longer.
 
+One thing to expect on a small repository: `kin init` starts a background
+download of the roughly 523 MB embedding model, and a conversion that finishes
+in seconds can beat it. When that happens the first `kin locate` ranks on
+lexical and graph signals alone, and it names the download as what its rows are
+waiting on rather than leaving you to guess. Run the query again once the model
+lands.
+
 Wire your agent after `kin init`, not before. The rest of this section is the
 same path with the detail behind each step.
 

@@ -1467,6 +1467,33 @@ pub(crate) fn embedding_model_notice(
             "Embedding model: {} was not on this machine, and this command fetched it{location}",
             fetch.model_id
         ),
+        // Bytes in the cache and no resolved snapshot is a fetch that started
+        // and has not finished. It is the state the five-command walk lands in
+        // on a small repository: `kin init` on `expressjs/body-parser` took ten
+        // seconds end to end against a fixed 523 MB download, and the summary
+        // then said the command "did not fetch it" over a download that was
+        // partway through. That sentence is true and it reads as nothing having
+        // happened, so it sent the reader to start a fetch already in progress
+        // and told them nothing about why their first `kin locate` would rank on
+        // lexical signals alone.
+        (false, false) if fetch.fetched_bytes > 0 => {
+            let because = match refusal {
+                Some(refusal) => format!(", because {}", refusal.cause_sentence()),
+                None => String::new(),
+            };
+            format!(
+                "Embedding model: {} is not on this machine yet and this command did not finish \
+                 fetching it{because}. {} is in the cache{}; `kin locate` ranks on lexical and \
+                 graph signals until the rest lands, and semantic ranking arrives when it does; \
+                 run `kin embed` to finish it now",
+                fetch.model_id,
+                fetch.render_progress(),
+                match fetch.cache_dir.as_deref() {
+                    Some(dir) => format!(" at {dir}"),
+                    None => String::new(),
+                }
+            )
+        }
         (false, false) => {
             let because = match refusal {
                 Some(refusal) => format!(", because {}", refusal.cause_sentence()),
@@ -2974,6 +3001,61 @@ mod tests {
         assert!(
             overridden_notice.contains("fetches the model from huggingface.co"),
             "the fetch is still named without a size: {overridden_notice}"
+        );
+    }
+
+    /// A fetch that started and did not finish is its own state, and it reads
+    /// differently from a run that fetched nothing.
+    ///
+    /// This is the state a fast `kin init` on a small repository lands in.
+    /// `expressjs/body-parser` converted in ten seconds against a fixed 523 MB
+    /// download, and the summary reported "did not fetch it" over a download
+    /// that was partway through, which reads as nothing having happened.
+    #[test]
+    #[serial_test::serial]
+    fn a_download_that_started_and_did_not_finish_reports_how_far_it_got() {
+        let _endpoint = kin_core::test_env::EnvVarGuard::unset("HF_ENDPOINT");
+        let partial = crate::embed_model::EmbedModelFetch {
+            model_id: crate::embed_model::DEFAULT_EMBED_MODEL_ID.to_string(),
+            cache_dir: Some("/home/dev/.cache/huggingface/hub/models--x".to_string()),
+            present: false,
+            fetched_bytes: 137 * 1024 * 1024,
+            expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
+            fetching: false,
+            no_fetch_reason: None,
+            relocated_hf_home: None,
+        };
+
+        let notice = embedding_model_notice(&partial, false, None);
+        assert!(
+            notice.contains("137 of 523 MB"),
+            "the bytes that landed are named against the size they are landing \
+             toward: {notice}"
+        );
+        assert!(
+            notice.contains("did not finish fetching it"),
+            "a fetch that started and stopped short says so: {notice}"
+        );
+        assert!(
+            notice.contains("lexical and graph signals until the rest lands"),
+            "and says what that costs the next query: {notice}"
+        );
+        assert!(
+            !notice.contains("did not fetch it"),
+            "a partial fetch must not read as a run that fetched nothing: {notice}"
+        );
+
+        // The control: the same model with nothing in the cache keeps the
+        // sentence it always had, so this arm is selected by the bytes rather
+        // than by being reachable from every absent state.
+        let nothing = crate::embed_model::EmbedModelFetch {
+            fetched_bytes: 0,
+            ..partial
+        };
+        let untouched = embedding_model_notice(&nothing, false, None);
+        assert!(
+            untouched.contains("did not fetch it") && !untouched.contains("of 523 MB"),
+            "an untouched cache reports no numerator: {untouched}"
         );
     }
 

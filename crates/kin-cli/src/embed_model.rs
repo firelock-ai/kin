@@ -215,8 +215,52 @@ impl EmbedModelFetch {
         ))
     }
 
+    /// The line a ranked answer owes a reader when the weights it would have
+    /// ranked with are not on this machine yet, or `None` when the model is not
+    /// what stands in the way.
+    ///
+    /// Separate from [`Self::status_clause`], which is appended to counters a
+    /// reader asked a coverage question about. This one is printed beside a
+    /// ranked answer nobody asked such a question about, so it names the
+    /// consequence for that answer rather than for the counters: the rows are
+    /// lexical until the fetch lands.
+    ///
+    /// It exists because a fast `kin init` on a small repository returns before
+    /// the fetch does. On `expressjs/body-parser` the whole command took ten
+    /// seconds against a fixed 523 MB download, so the first `kin locate` ran
+    /// with no embeddings at all and said only that no row had cleared the
+    /// answer floor. That sentence is true and it names the wrong cause:
+    /// nothing about the query or the store was short, the weights had simply
+    /// not arrived.
+    ///
+    /// The zero-byte wording is different for the reason
+    /// [`Self::download_phase`] gives. A fetch that has moved nothing is the
+    /// shape an unreachable host produces, and telling that reader to wait is
+    /// telling them to wait forever.
+    pub fn retrieval_clause(&self) -> Option<String> {
+        if !self.fetching {
+            return None;
+        }
+        if self.fetched_bytes == 0 {
+            return Some(format!(
+                "the {} embedding model is not on this machine and no bytes of it have arrived \
+                 yet (the fetch needs egress to {}); results are lexical until it lands",
+                self.model_id,
+                endpoint_host()
+            ));
+        }
+        Some(format!(
+            "embedding model still downloading ({}); results are lexical until it lands",
+            self.render_progress()
+        ))
+    }
+
     /// `N of 523 MB` where the total is known, `N MB fetched` where it is not.
-    fn render_progress(&self) -> String {
+    ///
+    /// Visible to the crate because `kin init`'s closing summary renders the
+    /// same numerator, and a second copy of this formatting would let the two
+    /// surfaces disagree about the same bytes.
+    pub(crate) fn render_progress(&self) -> String {
         match self.expected_bytes {
             Some(expected) => format!(
                 "{} of {}",
@@ -514,6 +558,69 @@ mod tests {
             stalled.contains("no bytes of it have arrived yet"),
             "a fetch that moved nothing says so: {stalled}"
         );
+    }
+
+    /// The clause a ranked answer carries while the weights are arriving. It
+    /// names the progress and the consequence, because a reader looking at
+    /// lexical rows needs to know both that the rows are provisional and that
+    /// waiting will change them.
+    #[test]
+    #[serial_test::serial]
+    fn a_ranked_answer_names_the_fetch_that_is_holding_its_vectors() {
+        let _endpoint = kin_core::test_env::EnvVarGuard::unset("HF_ENDPOINT");
+        let clause = fetching(137 * 1024 * 1024)
+            .retrieval_clause()
+            .expect("a fetch in flight has a clause");
+        assert_eq!(
+            clause,
+            "embedding model still downloading (137 of 523 MB); results are lexical until it lands"
+        );
+    }
+
+    /// Zero bytes names the egress instead of promising an arrival, for the
+    /// reason `download_phase` does: an air-gapped host told to wait waits
+    /// forever.
+    #[test]
+    #[serial_test::serial]
+    fn a_ranked_answer_with_no_bytes_names_the_egress_rather_than_an_arrival() {
+        let _endpoint = kin_core::test_env::EnvVarGuard::unset("HF_ENDPOINT");
+        let clause = fetching(0)
+            .retrieval_clause()
+            .expect("a fetch in flight has a clause");
+        assert!(
+            clause.contains("no bytes of it have arrived yet")
+                && clause.contains("needs egress to huggingface.co"),
+            "a fetch that moved nothing says so: {clause}"
+        );
+        assert!(
+            !clause.contains("still downloading"),
+            "a fetch that has moved nothing must not read as one that has: {clause}"
+        );
+    }
+
+    /// Every state in which the model is not the blocker renders nothing, so
+    /// the line can never appear beside an answer it does not explain.
+    #[test]
+    fn a_ranked_answer_says_nothing_when_the_model_is_not_the_blocker() {
+        let cached = EmbedModelFetch {
+            present: true,
+            fetching: false,
+            ..fetching(DEFAULT_EMBED_MODEL_BYTES)
+        };
+        assert_eq!(cached.retrieval_clause(), None);
+
+        let no_pass = EmbedModelFetch {
+            fetching: false,
+            ..fetching(137 * 1024 * 1024)
+        };
+        assert_eq!(no_pass.retrieval_clause(), None);
+
+        let remote = EmbedModelFetch {
+            model_id: "text-embedding-3-small".to_string(),
+            no_fetch_reason: Some("the openai provider embeds over HTTP".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(remote.retrieval_clause(), None);
     }
 
     /// An absent model with no pass running still reports what the first pass
