@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::path::Path;
-
-use kin_model::{Entity, EntityFilter, EntityKind, FilePathId, GraphStore, LanguageId};
+use kin_model::{
+    Entity, EntityFilter, EntityKind, FilePathId, GraphStore, LanguageId, RepoPath, ResolvedTree,
+};
 use tracing::debug;
 
 use crate::error::{ProjectionError, Result};
@@ -19,26 +19,50 @@ pub enum PlacementDecision {
     Ambiguous(Vec<FilePathId>),
 }
 
-/// Determine where a new entity should be placed in the working directory.
+/// Determine where a new entity should be placed in the repository.
 ///
 /// Policy (in priority order):
-/// 1. If `file_origin` is set, use that file.
+/// 1. If `file_origin` is set, use that file, creating it when the graph's
+///    exact tree does not already carry that path.
 /// 2. If a containing module/class entity exists in the graph, use that module's file.
 /// 3. If multiple candidate files exist, return `Ambiguous`.
 /// 4. If no match, generate a new file path from the entity's name and language.
+///
+/// `tree` is the graph's exact repository tree and is the authority on which
+/// paths the repository holds. A caller passes `graph.resolved_tree()`, or the
+/// tree resolved at whichever ref it is deciding against. The working copy is
+/// never consulted, and this function takes no filesystem path so that it
+/// cannot be.
 pub fn decide_placement<G: GraphStore>(
     entity: &Entity,
     graph: &G,
-    working_dir: &Path,
+    tree: &ResolvedTree,
 ) -> Result<PlacementDecision> {
-    // 1. Explicit file_origin
+    // 1. Explicit file_origin. Whether the repository already holds that path
+    //    is graph-owned truth, so the exact tree answers it. Until FIR-3148
+    //    this probed the working copy with `path.exists()`, which is the
+    //    Zero File-Search Authority violation the rule exists to stop: the
+    //    filesystem's opinion stood in for the graph's answer, and because
+    //    `Path::join` discards its base for an absolute argument and resolves
+    //    `..` through the OS, an origin pointing outside the repository was
+    //    answered from a file the repository does not contain.
     if let Some(ref file_id) = entity.file_origin {
-        let path = working_dir.join(&file_id.0);
-        if path.exists() {
+        // An origin the graph cannot address as a repository path is refused
+        // rather than repaired. There is no working copy left to fall back to,
+        // and inventing one would be this same violation under another name.
+        let path = RepoPath::from_utf8(file_id.0.clone()).map_err(|error| {
+            ProjectionError::PlacementOriginUnaddressable {
+                entity: entity.name.clone(),
+                file_id: file_id.to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        if tree.artifact_id_at_path(&path).is_some() {
             debug!(entity = %entity.name, file = %file_id, "placement: explicit file_origin");
             return Ok(PlacementDecision::ExistingFile(file_id.clone()));
         }
-        // File doesn't exist yet but was explicitly set — create it
+        // The exact tree does not carry that path, so the file has to be
+        // created. That is the graph's answer, not a fallback.
         debug!(entity = %entity.name, file = %file_id, "placement: new file from file_origin");
         return Ok(PlacementDecision::NewFile(file_id.clone()));
     }
@@ -298,6 +322,8 @@ pub fn generate_file_template(language: LanguageId, entity: &Entity) -> Vec<u8> 
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use kin_model::*;
 
@@ -384,8 +410,7 @@ mod tests {
         // No file_origin and no lineage_parent, so steps 1 and 2 cannot answer
         // and step 3 is the one under test.
         let orphan = make_entity("handle", EntityKind::Function, LanguageId::JavaScript);
-        let working_dir = tempfile::tempdir().unwrap();
-        match decide_placement(&orphan, &graph, working_dir.path()).unwrap() {
+        match decide_placement(&orphan, &graph, &graph.resolved_tree()).unwrap() {
             PlacementDecision::Ambiguous(candidates) => {
                 let mut names: Vec<String> = candidates.iter().map(|f| f.0.clone()).collect();
                 names.sort();
@@ -394,6 +419,134 @@ mod tests {
             other => panic!(
                 "a per-file-module language must report ambiguity and name its \
                  candidates, got {other:?}"
+            ),
+        }
+    }
+
+    /// Presence follows the graph's exact tree even when the working copy
+    /// says the opposite, in both directions.
+    ///
+    /// FIR-3148: step 1 used to answer this with
+    /// `working_dir.join(&file_id.0).exists()`. A case where the graph and the
+    /// working copy agree cannot tell a graph-backed answer from a filesystem
+    /// one, so each arm below is built so a filesystem probe would return the
+    /// other answer, and each asserts the disk state it depends on rather than
+    /// assuming it.
+    #[test]
+    fn a_path_absent_from_the_graph_is_a_new_file_though_the_working_copy_holds_it() {
+        // cargo and nextest both run a test with the package root as its
+        // working directory, so this very source file sits on disk at a
+        // relative path a probe would resolve. Assert that rather than assume
+        // it: if it stopped holding, this arm would pass without the graph and
+        // the working copy ever disagreeing, which proves nothing.
+        let on_disk = FilePathId::new("src/placement.rs");
+        assert!(
+            Path::new(&on_disk.0).exists(),
+            "the working copy must really hold {on_disk} for this arm to mean \
+             anything; without it the graph and the filesystem agree"
+        );
+
+        let graph = kin_db::InMemoryGraph::new();
+        let tree = graph.resolved_tree();
+        assert!(
+            tree.artifact_id_at_path(&RepoPath::from_utf8(on_disk.0.clone()).unwrap())
+                .is_none(),
+            "the graph must not carry {on_disk}, or the two do not disagree"
+        );
+
+        let mut entity = make_entity("handle", EntityKind::Function, LanguageId::Rust);
+        entity.file_origin = Some(on_disk.clone());
+
+        match decide_placement(&entity, &graph, &tree).unwrap() {
+            PlacementDecision::NewFile(file) => assert_eq!(file, on_disk),
+            other => panic!(
+                "presence must come from the exact tree, which does not carry \
+                 {on_disk}, rather than from the working copy that does; got \
+                 {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_path_the_graph_carries_is_an_existing_file_though_no_file_holds_it() {
+        let admitted = FilePathId::new("src/no-file-on-disk-holds-this.rs");
+        assert!(
+            !Path::new(&admitted.0).exists(),
+            "nothing may hold {admitted} on disk, or the graph and the working \
+             copy agree and this arm proves nothing"
+        );
+
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8(admitted.0.clone()).unwrap(),
+                        TreeEntry::blob(Hash256::from_bytes([0; 32]), false),
+                    ),
+                }],
+                admission_policy_delta: None,
+                external_reference_deltas: vec![],
+            })
+            .unwrap();
+        let tree = graph.resolved_tree();
+
+        let mut entity = make_entity("handle", EntityKind::Function, LanguageId::Rust);
+        entity.file_origin = Some(admitted.clone());
+
+        match decide_placement(&entity, &graph, &tree).unwrap() {
+            PlacementDecision::ExistingFile(file) => assert_eq!(file, admitted),
+            other => panic!(
+                "the exact tree carries {admitted}, so placement is into that \
+                 file even though nothing on disk holds it; got {other:?}"
+            ),
+        }
+    }
+
+    /// An origin the graph cannot address as a repository path fails loud.
+    ///
+    /// The hazard is demonstrated rather than asserted. `Path::join` resolves
+    /// `..` through the OS, so the probe this replaced answered `ExistingFile`
+    /// from a file outside the working directory entirely, for an entity whose
+    /// origin the repository does not and cannot contain.
+    #[test]
+    fn an_origin_the_graph_cannot_address_is_refused_rather_than_probed() {
+        let root = tempfile::tempdir().unwrap();
+        let working_dir = root.path().join("repo");
+        std::fs::create_dir(&working_dir).unwrap();
+        std::fs::write(
+            root.path().join("outside.rs"),
+            b"// not in the repository\n",
+        )
+        .unwrap();
+        let escaping = "../outside.rs";
+        assert!(
+            working_dir.join(escaping).exists(),
+            "the escape is what makes the refusal worth having; without it \
+             there is no hazard here to refuse"
+        );
+
+        let mut entity = make_entity("handle", EntityKind::Function, LanguageId::Rust);
+        entity.file_origin = Some(FilePathId::new(escaping));
+        let graph = kin_db::InMemoryGraph::new();
+        let tree = graph.resolved_tree();
+
+        match decide_placement(&entity, &graph, &tree) {
+            Err(ProjectionError::PlacementOriginUnaddressable {
+                entity: name,
+                file_id,
+                ..
+            }) => {
+                assert_eq!(name, "handle");
+                assert_eq!(file_id, escaping);
+            }
+            other => panic!(
+                "an origin that is not a repository path must fail loud rather \
+                 than be answered from whatever the working copy holds there; \
+                 got {other:?}"
             ),
         }
     }
