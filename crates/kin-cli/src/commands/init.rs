@@ -3045,9 +3045,9 @@ mod tests {
     /// `expressjs/body-parser` converted in ten seconds against a fixed 523 MB
     /// download and the summary reported "did not fetch it" over a download
     /// that was partway through, which reads as nothing having happened. The
-    /// second is the kin#1491 review's finding: a machine carrying an
-    /// interrupted cache from an earlier attempt has bytes throughout, and
-    /// crediting them to this command claims a download it never made.
+    /// second is what a machine carrying an interrupted cache from an earlier
+    /// attempt produces: bytes are there throughout, and crediting them to this
+    /// command claims a download it never made.
     #[test]
     #[serial_test::serial]
     fn the_absent_model_states_are_told_apart_by_the_bytes_this_run_added() {

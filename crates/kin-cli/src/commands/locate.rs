@@ -32865,9 +32865,9 @@ mod tests {
             "a cached model is never reported as still arriving"
         );
 
-        // kin#1491 review: the same owed work over a cache that did not move.
-        // The rows are still lexical and the model is still why, so the note
-        // stays, but nothing in it may promise an arrival.
+        // The same owed work over a cache that did not move. The rows are
+        // still lexical and the model is still why, so the note stays, but
+        // nothing in it may promise an arrival.
         let stalled = embedding_model_fetch_note(Some(&nothing_indexed), weights_stalled)
             .expect("an absent model still explains the rows");
         assert!(

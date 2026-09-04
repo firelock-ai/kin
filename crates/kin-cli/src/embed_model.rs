@@ -618,9 +618,9 @@ mod tests {
         );
     }
 
-    /// The reviewer's case on kin#1491: an `.incomplete` blob from a download
-    /// that already died reads exactly like one being written to right now, so
-    /// a window that saw no growth must not promise an arrival.
+    /// An `.incomplete` blob from a download that already died reads exactly
+    /// like one being written to right now, so a window that saw no growth must
+    /// not promise an arrival.
     #[test]
     #[serial_test::serial]
     fn a_stalled_cache_is_never_reported_as_a_download_in_flight() {

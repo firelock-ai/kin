@@ -1114,9 +1114,9 @@ mod tests {
 
     /// The freshness field carries two readings and they are graded apart.
     ///
-    /// The ADMISSION CLOCK weighs nothing, which is what FIR-2226 step 1
-    /// delivered. An earlier version of that change refused when no admission
-    /// was recorded, and the acceptance suite's anti-vacuity control caught it
+    /// The ADMISSION CLOCK weighs nothing. An earlier version of the change
+    /// that wired it refused when no admission was recorded, and the
+    /// acceptance suite's anti-vacuity control caught it
     /// certifying nothing: absence of the in-memory clock is the ordinary state
     /// of a healthy fresh store, so refusing on it floors every answer on every
     /// such store. Those arms are written against what the clock can honestly
@@ -1284,8 +1284,8 @@ mod tests {
             );
         }
 
-        /// The case FIR-3184 names: complete coverage over counters that replay
-        /// an earlier observation. `completeness` is a reading of the SUBSTRATE
+        /// Complete coverage over counters that replay an earlier
+        /// observation. `completeness` is a reading of the SUBSTRATE
         /// and cannot see that the sample was not live, so before this arm
         /// existed `_kin.verdict` read certified here.
         #[test]
