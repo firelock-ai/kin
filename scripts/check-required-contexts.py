@@ -40,30 +40,37 @@ limit, but it runs with neither set, which is the shape `bin/kin-precheck kin` r
 
   MATCH (exit 0)       the doc's count word, the doc's own list length, and GitHub's live list
                         all agree. Printed with the full list so a diff is easy to eyeball.
-  DRIFT (exit 1)       any of: the sentence could not be found or parsed in `AGENTS.md`; GitHub
-                        answered a status this check does not treat as transient (a 404 on the
-                        named path, a non-JSON body, a body with no `required_status_checks`
-                        rule); or GitHub answered fine and the two lists disagree. None of these
-                        is "could not check"; all of them are "checked, and it is wrong."
-  SKIP (exit 0, loud)  GitHub could not be reached at all (DNS, timeout, connection refused) or
-                        refused the read in a way indistinguishable from rate-limiting, a bad
-                        token, or GitHub's own server having an issue (401, 403, 429, or any
-                        5xx). This is the one outcome that does not fail the pull request, and it
-                        prints `::warning::` plus a `SKIP:` line so it is never mistaken for a
-                        pass in the log. A check that exits 0 having read nothing is worse than no
-                        check, so this path is narrow on purpose: a 404 is DRIFT, not SKIP,
-                        because a 404 means the path the doc names is itself wrong, which is
-                        squarely this check's job to catch.
+  DRIFT (exit 1)       any of: the sentence could not be found or parsed in `AGENTS.md`; a 404 on
+                        the named path (the doc's own claim about the path is wrong); a
+                        well-formed, fully-read JSON response that carries no
+                        `required_status_checks` rule; or GitHub answered fine and the two lists
+                        disagree. Every one of these is a complete, readable answer that is
+                        itself wrong, not a failure to get an answer.
+  SKIP (exit 0, loud)  GitHub could not be reached, or the read that came back cannot be trusted
+                        as a real answer: a connection failure, a timeout, an HTTP status that
+                        reads as rate-limiting or a GitHub-side error (401, 403, 429, any 5xx), a
+                        connection that reset or truncated mid-read, or a body that did not parse
+                        as JSON at all (an HTML error page from a proxy, an empty response, a cut-
+                        off stream). None of these says anything about whether the doc is right.
+                        This is the one outcome that does not fail the pull request, and it prints
+                        `::warning::` plus a `SKIP:` line so it is never mistaken for a pass in
+                        the log. A check that exits 0 having read nothing is worse than no check,
+                        so this path is narrow on purpose: a 404 is DRIFT, not SKIP, because that
+                        specific failure is a complete answer about the doc's own claim.
 
 This gates `Fast gate lint and policy`, a required context every pull request lands through, so a
-transient GitHub-side blip must never read as DRIFT. Before treating the read as unreachable, it
-retries up to three times, two seconds apart, but only on the shapes that are plausibly transient
-(429, 403, any 5xx, or the connection failing outright): 401 and 404 are never retried, because a
-bad token or a wrong path will not fix itself between one request and the next, and retrying them
-would spend the budget for no chance of a different answer. A 500 measured as DRIFT before this
-paragraph was added: kin#1456 was paused for review over the exact risk of a network-dependent
-required context, and raising one through the classifier (not reading the code and assuming)
-confirmed the gap before any review reported back.
+transient GitHub-side blip must never read as DRIFT, and must never escape as an uncaught
+traceback either, which reads exactly like a crash rather than a verdict. Before treating a read
+as unreachable, it retries up to three times, two seconds apart, on every shape above that is
+plausibly transient; 401 and 404 are never retried, because neither a bad token nor a wrong path
+fixes itself between one request and the next. Two defects were found this way, not assumed: a
+500 read as DRIFT until kin#1456 was paused for review over exactly that risk, and a follow-up
+read confirmed that `urlopen`'s own `HTTPError`/`URLError` wrapping covers only the connect phase,
+so a reset connection or a truncated read during `response.read()` (after headers already
+arrived, so neither exception type applies) escaped as an uncaught crash, and a body that failed
+to parse as JSON (an HTML error page, an empty response) raised DRIFT the same way the 500 did.
+Both were confirmed by actually triggering them through `fetch_required_contexts`, not by reading
+the code and assuming, before either was fixed.
 
 Falsified with `--self-test`, offline and hermetic: every control below injects a fake network
 call and a no-op sleep rather than reaching GitHub or waiting in real time, including the exact
@@ -71,6 +78,7 @@ six-doc/seven-live shape of the regression this check exists for.
 """
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -149,11 +157,16 @@ def fetch_required_contexts(api_path, token=None, timeout=10, opener=None,
     likewise injectable (a no-op in --self-test, so retries never make the offline suite slow);
     the default is the real `time.sleep`.
 
-    Retries up to `max_attempts` times, two seconds apart, but only on the codes in
-    RETRYABLE_HTTP_CODES or the connection failing outright (urlopen wraps a socket timeout in
-    URLError, not a bare TimeoutError, confirmed by actually raising one rather than assuming the
-    Python docs' shape holds; there is no separate TimeoutError handler here for that reason). A
-    404 or a 401 is raised on the first attempt with no retry, because neither is transient.
+    Retries up to `max_attempts` times, two seconds apart, on anything plausibly transient: the
+    codes in RETRYABLE_HTTP_CODES, the connection failing outright (urlopen wraps a socket
+    timeout in URLError, not a bare TimeoutError, confirmed by actually raising one rather than
+    assuming the Python docs' shape holds; there is no separate TimeoutError handler here for
+    that reason), a failure during response.read() that urlopen's own HTTPError/URLError
+    wrapping does not cover (a reset connection, a truncated read, a TLS failure -- confirmed by
+    actually raising one, since these happen after the response headers already arrived and
+    neither wrapped exception type applies), and a body that fails to parse as JSON (an HTML
+    error page from a proxy, an empty response, a cut-off stream). A 404 or a 401 is raised on
+    the first attempt with no retry, because neither is transient.
     """
     if opener is None:
         opener = lambda req: urllib.request.urlopen(req, timeout=timeout)  # noqa: E731
@@ -172,11 +185,12 @@ def fetch_required_contexts(api_path, token=None, timeout=10, opener=None,
     if token:
         request.add_header("Authorization", "Bearer %s" % token)
 
-    body = None
+    rules = None
     for attempt in range(1, max_attempts + 1):
         try:
             with opener(request) as response:
                 body = response.read()
+            rules = json.loads(body)
             break
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
@@ -207,11 +221,34 @@ def fetch_required_contexts(api_path, token=None, timeout=10, opener=None,
                 sleep(RETRY_DELAY_SECONDS)
                 continue
             raise unreachable from exc
+        except (OSError, http.client.HTTPException) as exc:
+            # Everything urlopen's own HTTPError/URLError wrapping does not cover, because it
+            # happens during response.read() rather than at connect: a reset connection, a
+            # truncated read (http.client.IncompleteRead), a TLS failure, a timeout landing
+            # mid-body. Placed after URLError deliberately: URLError (and HTTPError) are already
+            # OSError subclasses, confirmed by inspecting the MRO rather than assumed, so an
+            # OSError arm placed earlier would catch them first and lose their specific handling.
+            # None of these says anything about whether the doc is right.
+            unreachable = Unreachable(
+                "reading %s failed after %d attempt(s): %s: %s"
+                % (url, attempt, type(exc).__name__, exc)
+            )
+            if attempt < max_attempts:
+                sleep(RETRY_DELAY_SECONDS)
+                continue
+            raise unreachable from exc
+        except json.JSONDecodeError as exc:
+            # A truncated body, an HTML error page from a proxy in front of GitHub, or an empty
+            # response: GitHub did not hand back a complete answer, which is a transport failure
+            # this check could not read past, not evidence the doc's claim is wrong.
+            unreachable = Unreachable(
+                "%s did not return parseable JSON after %d attempt(s): %s" % (url, attempt, exc)
+            )
+            if attempt < max_attempts:
+                sleep(RETRY_DELAY_SECONDS)
+                continue
+            raise unreachable from exc
 
-    try:
-        rules = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise Drift("%s did not return JSON: %s" % (url, exc)) from exc
     if not isinstance(rules, list):
         raise Drift("%s answered with a %s, not a list of rules" % (url, type(rules).__name__))
 
@@ -401,6 +438,61 @@ def _counting_opener(fail_times, exc_factory, payload=None):
     return opener, calls
 
 
+class _FlakyReadResponse:
+    """A context-manager response that connects cleanly (so HTTPError/URLError never enter it)
+    but whose read() raises for the first `fail_times` calls, sharing one counter with the
+    opener that returns it, then returns `payload_bytes`. Models the class of failure
+    urlopen's own HTTPError/URLError wrapping does not cover, because it happens after the
+    response headers already arrived: a reset connection, a truncated read, a TLS failure."""
+
+    def __init__(self, calls, fail_times, exc_factory, payload_bytes):
+        self._calls = calls
+        self._fail_times = fail_times
+        self._exc_factory = exc_factory
+        self._payload_bytes = payload_bytes
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        self._calls["count"] += 1
+        if self._calls["count"] <= self._fail_times:
+            raise self._exc_factory()
+        return self._payload_bytes
+
+
+def _counting_read_opener(fail_times, exc_factory, payload=None):
+    """An opener whose response fails `fail_times` times at read() (not at connect), then
+    succeeds with `payload` (REAL_RULES_PAYLOAD if omitted). Returns (opener, calls)."""
+    calls = {"count": 0}
+    payload_bytes = json.dumps(REAL_RULES_PAYLOAD if payload is None else payload).encode("utf-8")
+
+    def opener(req):
+        return _FlakyReadResponse(calls, fail_times, exc_factory, payload_bytes)
+
+    return opener, calls
+
+
+def _returns_raw(raw_bytes):
+    """An opener that connects cleanly and returns `raw_bytes` verbatim, not JSON-encoded, for
+    testing a body that is not JSON at all (an HTML error page, a truncated response)."""
+
+    class _RawResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return raw_bytes
+
+    return lambda req: _RawResponse()
+
+
 def self_test():
     """Grade every outcome by name. A grader that cannot fail is not evidence: the controls
     below include both directions of disagreement, the count-word-vs-list-length check
@@ -502,6 +594,56 @@ def self_test():
         check("a response with no required_status_checks rule raises Drift, not empty agreement", False)
     except Drift:
         check("a response with no required_status_checks rule raises Drift, not empty agreement", True)
+
+    # Read-phase failures: urlopen's own HTTPError/URLError wrapping covers only the connect
+    # phase. A reset connection or a truncated read during response.read() escaped as an
+    # uncaught traceback before this fix, confirmed by actually raising one through
+    # fetch_required_contexts, not by reading the code and assuming; kin#1456's review named
+    # exactly this class after 589727bb8 closed the 5xx hole.
+    for name, exc_factory in (
+        ("ConnectionResetError", lambda: ConnectionResetError("Connection reset by peer")),
+        ("IncompleteRead", lambda: http.client.IncompleteRead(b"partial")),
+    ):
+        opener_read, calls_read = _counting_read_opener(99, exc_factory)
+        label = "a read-phase %s raises Unreachable after retrying, not an uncaught crash" % name
+        try:
+            fetch_required_contexts("/x", opener=opener_read, sleep=_no_sleep)
+            check(label, False)
+        except Unreachable:
+            check(label, calls_read["count"] == MAX_ATTEMPTS)
+        except Drift:
+            check(label, False)
+        # No bare `except Exception` guard here, deliberately: if this regresses, the escape
+        # itself is the failure signal, an uncaught traceback, the same shape a real crash is.
+
+    # A read-phase failure that clears within the retry budget returns the real answer, not just
+    # "did not raise" -- retry exists to recover a genuine transient blip.
+    opener_read_recovers, calls_read_recovers = _counting_read_opener(
+        2, lambda: ConnectionResetError("Connection reset by peer")
+    )
+    fetched_after_read_retry = fetch_required_contexts("/x", opener=opener_read_recovers, sleep=_no_sleep)
+    check("a read-phase failure that clears within the retry budget still returns the real answer",
+          fetched_after_read_retry == REAL_LIVE_SEVEN and calls_read_recovers["count"] == 3)
+
+    # A truncated body, an HTML error page from a proxy, or any non-JSON response is a transport
+    # failure this check could not read past, not evidence the doc's claim is wrong.
+    try:
+        fetch_required_contexts(
+            "/x", opener=_returns_raw(b"<html><body>502 Bad Gateway</body></html>"), sleep=_no_sleep
+        )
+        check("an HTML (non-JSON) body raises Unreachable, not Drift", False)
+    except Unreachable:
+        check("an HTML (non-JSON) body raises Unreachable, not Drift", True)
+    except Drift:
+        check("an HTML (non-JSON) body raises Unreachable, not Drift", False)
+
+    try:
+        fetch_required_contexts("/x", opener=_returns_raw(b""), sleep=_no_sleep)
+        check("an empty body raises Unreachable, not Drift", False)
+    except Unreachable:
+        check("an empty body raises Unreachable, not Drift", True)
+    except Drift:
+        check("an empty body raises Unreachable, not Drift", False)
 
     # compare()
     check("matching lists and count word: no problems",
