@@ -355,32 +355,61 @@ test('buildPlan turns an unresolvable tag into a wait, not a failure', async () 
   assert.match(plan.waiting[0].reason, /HTTP 404 Not Found/);
 });
 
-// The one read that must NOT fail soft. A truncated listing looks exactly like
-// a short one, and a promoter that silently read only the newest hundred
-// releases would go quiet at the moment the list outgrew them.
-test('buildPlan refuses a release listing that filled a whole page', async () => {
-  await assert.rejects(
-    buildPlan({
+for (const count of [99, 100, 101, 200, 201]) {
+  test(`buildPlan reads all ${count} releases before planning promotions`, async () => {
+    const releases = Array.from({ length: count }, (_, index) =>
+      release({ tag_name: `v1.0.${index}` }),
+    );
+    const pages = [];
+    const plan = await buildPlan({
       repository: 'firelock-ai/kin',
-      api: stubApi({ '/releases?': Array.from({ length: 100 }, () => release()) }),
-      judge: async () => ({}),
+      api: async (path) => {
+        if (path.startsWith('/releases?')) {
+          const page = Number(new URL(path, 'https://api.github.com').searchParams.get('page') ?? 1);
+          pages.push(page);
+          assert.ok(page <= Math.floor(count / 100) + 1, 'listing must stop at its terminal page');
+          return releases.slice((page - 1) * 100, page * 100);
+        }
+        return stubApi(listing())(path);
+      },
+      judge: async () => ({ stranger: { driver: { endpoint: 'account' } } }),
       now: NOW,
-    }),
-    /filled a whole page/,
-  );
-  // The control: ninety-nine is an answer, and it must be read as one.
-  const short = await buildPlan({
-    repository: 'firelock-ai/kin',
-    api: stubApi({
-      '/releases?': Array.from({ length: 99 }, () => release()),
-      '/git/ref/tags/': { object: { type: 'commit', sha: 'a'.repeat(40) } },
-      '/issues?': [],
-    }),
-    judge: async () => ({ stranger: { driver: { endpoint: 'account' } } }),
-    now: NOW,
+    });
+    assert.deepEqual(plan.promote.map((entry) => entry.tag), releases.map((entry) => entry.tag_name));
+    assert.deepEqual(pages, Array.from({ length: Math.floor(count / 100) + 1 }, (_, index) => index + 1));
   });
-  assert.equal(short.promote.length, 99);
-});
+}
+
+for (const [name, secondPage, reason] of [
+  ['unreadable', new Error('GET release page 2 failed: HTTP 503'), /GET release page 2 failed: HTTP 503/],
+  ['malformed', { message: 'not a listing' }, /release listing page 2 did not come back as an array/],
+]) {
+  test(`buildPlan refuses a later page that is ${name} before judging a partial listing`, async () => {
+    let judgements = 0;
+    await assert.rejects(
+      buildPlan({
+        repository: 'firelock-ai/kin',
+        api: async (path) => {
+          if (path.startsWith('/releases?')) {
+            const page = Number(new URL(path, 'https://api.github.com').searchParams.get('page') ?? 1);
+            if (page === 1) return Array.from({ length: 100 }, () => release());
+            assert.equal(page, 2);
+            if (secondPage instanceof Error) throw secondPage;
+            return secondPage;
+          }
+          return stubApi(listing())(path);
+        },
+        judge: async () => {
+          judgements += 1;
+          return {};
+        },
+        now: NOW,
+      }),
+      reason,
+    );
+    assert.equal(judgements, 0, 'an incomplete listing must not reach the proof gate');
+  });
+}
 
 test('buildPlan finds the open alarm by its exact title and nothing else', async () => {
   const withIssue = await buildPlan({
