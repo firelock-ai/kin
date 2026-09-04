@@ -93,8 +93,12 @@ changelog against newer code.
 ## Automatic release cut
 
 The mint tags the newest reviewed `main` commit in the staged version's range
-that carries both proof records under `evidence/<sha>/` on the `release-evidence`
-branch. `release-cut.yml` is what puts a record there without a captain.
+that carries `preflight.json` under `evidence/<sha>/` on the `release-evidence`
+branch. The machine preflight alone is what makes a candidate mint-eligible, and
+`stranger.env` beside it is a label on the release rather than a gate in front of
+it: a stranger that cannot run, because a runner is offline or a weekly limit is
+spent, must not hold a finished release. `release-cut.yml` is what puts a record
+there without a captain.
 
 It runs on a completed CI run for a `main` push, on a completed RC Build for a
 `release/v*-candidate` branch, on the typed `release_cut` repository dispatch
@@ -108,9 +112,12 @@ judgments are pure functions over one snapshot:
 1. `vX.Y.Z` already exists, so the cut is done.
 2. A sha in the range carries both records, so the mint owns it.
 3. The current candidate is kept until it is proven or dead. With `preflight.json`
-   recorded it waits for the stranger; alive with a usable RC Build it is proven;
-   alive with none it is armed again, twice at most.
-4. Otherwise the newest `main` commit in the range whose CI **and** Acceptance
+   recorded the mint can already tag it and the cut still runs the stranger,
+   because that record is what the release gets to claim; alive with a usable RC
+   Build it is proven; alive with none it is armed again, twice at most.
+4. A sha carries `preflight.json` alone, so the mint owns it and the cut stands
+   down rather than arming a newer sha it would only race.
+5. Otherwise the newest `main` commit in the range whose CI **and** Acceptance
    push runs concluded success, and whose required contexts each appear exactly
    once under push provenance, becomes the candidate.
 
@@ -160,8 +167,13 @@ gh secret set KIN_STRANGER_ANTHROPIC_API_KEY --repo firelock-ai/kin
 
 With the variable unset the cut still selects, arms and preflights, and the
 `stranger-standby` job prints the exact local command with all three arms named
-and raises a warning. Either way the mint stays refused for the missing
-`stranger.env` rather than being fed a partial one.
+and raises a warning. The mint tags either way. What a missing `stranger.env`
+costs is the claim, not the release: the mint's step summary carries a first
+contact row reading `pending`, `release.yml` stamps the same statement onto the
+release body behind the `<!-- kin-first-contact-proof -->` marker, and the
+release still becomes GitHub Latest. A partial record is still refused rather
+than accepted, because a record that overstates its own coverage is worse than
+no record.
 
 The driver takes its credential from `KIN_STRANGER_ANTHROPIC_API_KEY`, exported
 as `ANTHROPIC_API_KEY`. No harness change was needed: `driver_env_argv` unsets

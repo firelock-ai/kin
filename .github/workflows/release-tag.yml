@@ -260,7 +260,19 @@ jobs:
             done < <(git log --first-parent --format=%H "$sha" -- Cargo.toml)
 
             # The release is the NEWEST reviewed main commit in that range for
-            # which the proof loop published both records. This is what lets
+            # which the proof loop published `preflight.json`. The machine
+            # preflight alone is what makes a candidate mint-eligible, matching
+            # the preflight-only require tier the gate below runs: a
+            # stranger that has not run, because a runner is offline or a
+            # weekly limit was reached, must not hold a release. It used to
+            # take both records, and that made the listing stricter than the
+            # gate it feeds, so a preflight-only sha was never proposed and the
+            # mint no-opped in silence while the gate that would have admitted
+            # it never saw a candidate. `stranger.env` no longer holds anything
+            # either: it decides only what the release may CLAIM. A release
+            # missing it is tagged, published and promoted like any other and
+            # carries a pending notice, and the summary below records which of
+            # the two this mint tagged. This is what lets
             # main keep moving through a proof window. The candidate used to be
             # the head of the version bump branch, and the train rewrites that
             # head every cycle it finds drift, so evidence published for it went
@@ -313,13 +325,12 @@ jobs:
             fi
             jq -r '
               [.tree[] | select(.type == "blob") | .path]
-              | map(capture("^evidence/(?<sha>[0-9a-f]{40})/(?<name>preflight\\.json|stranger\\.env)$"))
-              | group_by(.sha)
-              | map(select((map(.name) | unique | length) == 2) | .[0].sha)
+              | map(capture("^evidence/(?<sha>[0-9a-f]{40})/preflight\\.json$") | .sha)
+              | unique
               | .[]
             ' <<< "$listing" > "$proven"
             recorded="$(command grep -c '' "$proven" || true)"
-            echo "proof loop has recorded ${recorded} fully-evidenced candidate(s)"
+            echo "proof loop has recorded ${recorded} mint-eligible candidate(s) carrying preflight.json"
 
             candidate=""
             if [ -s "$proven" ]; then
@@ -1727,14 +1738,21 @@ jobs:
       # whose failure mode is "no tag, forever, quietly" is not protecting the
       # release, it is preventing it.
       #
-      # What replaces it is not less proof, it is proof at the point the claim is
-      # made. A tag is not a claim of first-contact coverage; GitHub Latest is,
-      # because that is the version an installer resolves. release.yml's
-      # finalize_release still requires the complete stranger record before it
-      # flips a release out of prerelease, so a release with no first-contact
-      # proof exists, is installable by anyone who names it, and never becomes
-      # the one a stranger gets by default. The record cannot claim coverage it
-      # does not have, and the release stops being hostage to a driver.
+      # What replaced it, from 2026-09-02, was proof at the point the claim is
+      # made: the tag moved on the preflight and GitHub Latest still required
+      # the stranger record. That held the line in the wrong place. Latest is
+      # what an installer resolves, so holding it kept a finished, installable
+      # release out of every default install path while every machine signal
+      # was green, for want of a driver nobody could summon. Founder decision,
+      # 2026-09-03: "I dont even want that to block. If I run out of limit.
+      # Ship anyways. Stranger is nice to have."
+      #
+      # So since 2026-09-04 nothing waits, and what replaces the hold is a
+      # LABEL. The tag, the release and Latest all move on the preflight, and a
+      # release with no first-contact proof says so on its own body, in this
+      # mint's step summary, and in release.yml's promote summary. The record
+      # still cannot claim coverage it does not have. What it no longer does is
+      # withhold the release while it lacks it.
       #
       # `require: preflight` narrows exactly one condition: an ABSENT
       # stranger.env becomes a reported pending state. A stranger record that
@@ -1861,7 +1879,7 @@ jobs:
           if [ "$stranger_state" = pending ]; then
             # A warning, not an error. The release proceeds and says what it is
             # missing; a red run here would put the rail back where it was.
-            echo "::warning::first-contact proof is PENDING for $SHA: no stranger.env exists, so $TAG will be published as a prerelease and will not become GitHub Latest until the stranger record lands"
+            echo "::warning::first-contact proof is PENDING for $SHA: no stranger.env exists, so nothing has measured what a first-time user meets. $TAG is tagged and promoted anyway and carries a pending notice until the stranger record lands"
           else
             echo "::notice::first-contact proof complete for $SHA on arms ${stranger_arms}, driven on the ${stranger_driver} endpoint"
           fi
@@ -1925,6 +1943,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ACTOR: ${{ github.actor }}
+          # What the proof gate decided this tag is allowed to claim. The mint
+          # computed it three steps ago and, until 2026-09-04, wrote it only to
+          # GITHUB_OUTPUT, which nothing in this workflow read back. A mint that
+          # now tags on the machine preflight alone has to say so in its own
+          # record, or a release minted without first-contact proof is
+          # indistinguishable from one that has it.
+          STRANGER_STATE: ${{ steps.proof.outputs.stranger_state }}
+          STRANGER_ARMS: ${{ steps.proof.outputs.stranger_arms }}
+          STRANGER_DRIVER: ${{ steps.proof.outputs.stranger_driver }}
         run: |
           set -euo pipefail
           # The ref was just created, and the API is read-after-write eventually
@@ -1964,6 +1991,13 @@ jobs:
             echo "::error::post-verify failed: tag $TAG points at $got, not $SHA"
             exit 1
           fi
+          if [ "$STRANGER_STATE" = complete ]; then
+            first_contact="complete on arms \`${STRANGER_ARMS}\`, driven on the \`${STRANGER_DRIVER}\` endpoint"
+            claim="This tag carries first-contact proof, so its release claims first-contact coverage rather than carrying a pending notice."
+          else
+            first_contact="**pending** (no \`stranger.env\`)"
+            claim="This tag was minted on the machine preflight alone. Nothing has measured what a first-time user meets. It is published and promoted anyway, and \`release.yml\` stamps that gap onto the release body until the stranger record lands."
+          fi
           {
             echo "## Release tag minted"
             echo ""
@@ -1973,7 +2007,11 @@ jobs:
             echo "| sha | \`$SHA\` |"
             echo "| actor | \`$ACTOR\` |"
             echo "| repo | \`$REPO\` |"
+            echo "| first contact | ${first_contact} |"
+            echo ""
+            echo "$claim"
             echo ""
             echo "Tag ref created with the kin-release-bot installation token, which triggers the fail-closed \`release.yml\` DAG."
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::minted $TAG at $SHA with first-contact proof ${STRANGER_STATE}"
           echo "release tag $TAG minted and verified at $SHA"

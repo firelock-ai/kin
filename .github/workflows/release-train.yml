@@ -732,13 +732,18 @@ jobs:
       #
       # The refusal did not go away, it moved to the artifact that actually
       # ships. release-tag.yml now selects the newest main commit carrying the
-      # staged version for which the proof loop published records, and refuses
-      # to create the tag ref without them. That is the stronger placement: a
-      # tag run resolves its workflows from the tag and can never be repaired,
-      # so refusing before the ref exists beats refusing after. release.yml's
-      # finalize_release still refuses to promote a tag with no records, so both
-      # decision points keep importing one judge. What this branch's head is at
-      # any moment no longer decides anything, which is what lets main move.
+      # staged version for which the proof loop published `preflight.json`, and
+      # refuses to create the tag ref without it. That is the stronger
+      # placement: a tag run resolves its workflows from the tag and can never
+      # be repaired, so refusing before the ref exists beats refusing after.
+      # release.yml's finalize_release imports the same judge before it
+      # publishes, so both decision points keep one judge rather than two.
+      #
+      # `stranger.env` is not part of either refusal. Since 2026-09-04 a missing
+      # first-contact record labels the release rather than holding it, because
+      # a driver nobody can summon must not be able to stop a finished release.
+      # What this branch's head is at any moment no longer decides anything,
+      # which is what lets main move.
       - name: Arm protected auto-merge
         if: steps.plan.outputs.needed == 'true'
         env:

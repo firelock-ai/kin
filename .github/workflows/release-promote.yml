@@ -5,17 +5,25 @@ name: Release Promotion
 
 # Finishes a release whose first-contact proof arrived after its tag.
 #
-# The release chain has two tiers. release-tag.yml mints a tag on the machine
-# preflight alone, so a candidate is never held hostage to a driver; release.yml
-# publishes it as a prerelease and writes into its body that first-contact proof
-# is pending. GitHub Latest, which is what an installer resolves when a stranger
-# types the install line, still requires the complete stranger record.
+# release-tag.yml mints a tag on the machine preflight alone and release.yml
+# publishes and promotes it, writing into its body that first-contact proof is
+# pending. Nothing waits for the stranger any more, so what this workflow
+# finishes is the RECORD rather than the release: the pending notice has to come
+# back out once the record lands, or a measured release goes on claiming it was
+# never measured.
 #
-# Without this workflow that second tier would be a dead end: the record lands
-# on the evidence branch hours later and nothing would notice. A push to the
+# Without this workflow that would be a dead end: the record lands on the
+# evidence branch hours later and nothing would notice. A push to the
 # release-evidence branch cannot trigger anything either, because that branch is
 # an orphan carrying no workflow files, so GitHub resolves no workflow from the
 # pushed ref. Hence a sweep.
+#
+# KNOWN GAP, tracked as FIR-3152. selectCandidates in
+# scripts/release-promotion-plan.mjs still filters on `prerelease === true`,
+# which was how a held release was recognised. Nothing is held now, so this
+# sweep finds nothing, the notice is never stripped, and the
+# "Release published without first-contact proof" alarm never fires. Fixing it
+# means selecting on the pending marker instead of on the prerelease flag.
 on:
   # Offset from the train (7,22,37,52), recovery and the cut (3,18,33,48) and
   # the sentinel (11,41), so this reads a settled rail rather than one
@@ -112,7 +120,7 @@ jobs:
             for package in @kinlab/kin @kinlab/kin-mcp; do
               npm_version="$(node scripts/release-order.mjs npm-channel "$package" "$channel")"
               if [ "$npm_version" != "$version" ]; then
-                echo "::error::npm ${package}@${channel} serves ${npm_version}; ${tag} stays a prerelease"
+                echo "::error::npm ${package}@${channel} serves ${npm_version}; refusing to move GitHub Latest to ${tag}"
                 exit 1
               fi
             done

@@ -2391,8 +2391,8 @@ jobs:
     environment: release
     # Whether this release actually became GitHub Latest, for the jobs whose
     # whole meaning is "this IS Latest". They gate on it rather than on this
-    # job's conclusion, because a release held as a prerelease for want of
-    # first-contact proof is a SUCCESSFUL run of this job and a release that
+    # job's conclusion, because this job succeeds on paths that promote nothing:
+    # a prerelease tag never runs the promote step at all, and such a release
     # must not move GHCR's `latest` or be sealed as a completed stable release.
     outputs:
       promoted: ${{ steps.promote.outputs.promoted }}
@@ -2514,7 +2514,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "release proof records verified for $CANDIDATE_SHA, the commit this job promotes"
           if [ "$stranger_state" = pending ]; then
-            echo "::warning::first-contact proof is PENDING for ${GITHUB_REF_NAME}; this release stays a prerelease and will not become GitHub Latest until its stranger.env lands"
+            echo "::warning::first-contact proof is PENDING for ${GITHUB_REF_NAME}; it is published and promoted anyway and carries a pending notice until its stranger.env lands"
           else
             echo "::notice::first-contact proof complete on arms ${stranger_arms}, driven on the ${stranger_driver} endpoint"
           fi
@@ -2526,9 +2526,8 @@ jobs:
       - name: Record the missing first-contact proof on the release itself
         # Stable tags only. A prerelease TAG is a prerelease because that is
         # what it is, not because proof is missing, and it never becomes Latest
-        # whatever its record says. Telling a reader that an rc "stays a
-        # prerelease until its record lands" would promise something no path in
-        # this chain delivers.
+        # whatever its record says, so the notice would be answering a question
+        # nobody installing an rc is asking.
         if: >-
           ${{
             steps.proof.outputs.stranger_state == 'pending' &&
@@ -2553,19 +2552,23 @@ jobs:
           ${marker}
           > **First-contact proof pending.** This release cleared the machine preflight on its
           > own bytes. It has NOT been through the stranger arms (green, brown, vcs) that
-          > measure what a first-time user actually meets. It stays a prerelease and is not
-          > GitHub Latest until that record lands. Install it only if you meant this exact
-          > version.
+          > measure what a first-time user actually meets. It ships and is promoted anyway,
+          > so this notice is how you tell it apart from a release that was measured.
 
           NOTE
           printf '%s\n' "$body" >> "$RUNNER_TEMP/release-body.md"
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --notes-file "$RUNNER_TEMP/release-body.md"
 
-      # Latest is the claim of first-contact coverage, so this is where the
-      # stranger record is required. `promoted` is written on BOTH paths,
-      # because a downstream job reading an unset output cannot tell "held" from
-      # "this step never ran".
+      # First contact is a LABEL, not a gate (founder decision 2026-09-03:
+      # "I dont even want that to block. If I run out of limit. Ship anyways.
+      # Stranger is nice to have."). Latest used to require the stranger record
+      # here, which meant an offline runner or a spent weekly limit could keep a
+      # finished, installable release off /releases/latest indefinitely while
+      # every machine signal was green. It now says what it is missing, on the
+      # release body and in this summary, and promotes. `promoted` is still
+      # written explicitly, because a downstream job reading an unset output
+      # cannot tell a decision from a step that never ran.
       - name: Promote stable tag after public and npm proof
         id: promote
         if: ${{ !contains(github.ref_name, '-') }}
@@ -2575,17 +2578,17 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$STRANGER_STATE" != complete ]; then
-            echo "promoted=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::holding ${GITHUB_REF_NAME} as a prerelease: first-contact proof is ${STRANGER_STATE}"
+            echo "::warning::promoting ${GITHUB_REF_NAME} with first-contact proof ${STRANGER_STATE}: nothing has measured what a first-time user meets"
             {
-              echo "### GitHub Latest held"
+              echo "### Promoted with first contact ${STRANGER_STATE}"
               echo
-              echo "\`${GITHUB_REF_NAME}\` is published and installable, and is NOT GitHub Latest."
+              echo "\`${GITHUB_REF_NAME}\` becomes GitHub Latest on its machine preflight alone."
               echo "Its stranger record is \`${STRANGER_STATE}\`, so nothing here has been through the"
-              echo "green, brown and vcs first-contact arms. Latest moves on its own once that record"
-              echo "lands under this commit on the release-evidence branch."
+              echo "green, brown and vcs first-contact arms. The release body carries that notice, and"
+              echo "this is the label rather than a hold."
             } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          else
+            echo "::notice::promoting ${GITHUB_REF_NAME} with first-contact proof complete"
           fi
           echo "promoted=true" >> "$GITHUB_OUTPUT"
           version="${GITHUB_REF_NAME#v}"
@@ -2617,11 +2620,11 @@ jobs:
           expected=true
           case "$GITHUB_REF_NAME" in
             *-*) ;;
-            # A stable tag whose first-contact proof is still pending stays a
-            # prerelease ON PURPOSE, so this verification expects what the
-            # promote step above actually decided rather than what the tag's
-            # shape alone would imply. Read off that step's own output, so a
-            # promotion that silently failed to happen still fails here.
+            # Read the promote step's own output rather than the tag shape.
+            # Every stable tag is promoted now, whatever its first-contact
+            # record says, so this reads true on that path; keeping the output
+            # as the source means a promotion that silently failed to happen
+            # still fails here rather than being assumed from the tag name.
             *) [ "${PROMOTED:-}" = true ] && expected=false ;;
           esac
           if [ "$actual" != "$expected" ]; then
