@@ -306,6 +306,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_relation_census(&graph_status).await);
     checks.push(check_hydration_semantics());
     checks.push(check_parse_coverage(&graph_status).await);
+    checks.push(check_graph_section(&graph_status).await);
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
     checks.push(check_memory_floor());
@@ -4935,6 +4936,115 @@ pub(crate) fn parse_coverage_health(
     )
 }
 
+/// Whether this store serves its graph from the persisted section or folds its
+/// history at every open.
+async fn check_graph_section(graph_status: &RunGraphStatus) -> HealthCheck {
+    const ID: &str = "graph_section";
+    const LABEL: &str = "Graph section";
+
+    let response = match graph_section_row_for_unread_graph(graph_status.get().await) {
+        Ok(response) => response,
+        Err(row) => return row,
+    };
+    let Some(state) = response.graph_section.as_ref() else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            "the daemon serving this repository does not report whether it folds this store's \
+             history at every open; it predates the measurement",
+        )
+        .with_manual_fix(
+            "stop the daemon (`kin daemon stop`) so the next kin command starts one on this build",
+        );
+    };
+    graph_section_health(state)
+}
+
+/// This row's words for a graph status the run could not read.
+///
+/// Phrased here rather than shared with the other graph-truth rows because a
+/// row that reads graph truth must never render the same whether the graph was
+/// healthy or unreadable.
+fn graph_section_row_for_unread_graph(
+    status: &GraphStatusForRun,
+) -> Result<&crate::commands::graph::GraphCommandResponse, HealthCheck> {
+    const ID: &str = "graph_section";
+    const LABEL: &str = "Graph section";
+
+    match status {
+        GraphStatusForRun::Answered(response) => Ok(response),
+        GraphStatusForRun::NotInRepository => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "not in a Kin repository, so there is no store whose open cost could be read",
+        )),
+        GraphStatusForRun::NoDaemon => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "no daemon is serving this repository, so whether its opens fold history was not read",
+        )
+        .with_manual_fix("run any `kin` command in the repo to auto-start the daemon")),
+        GraphStatusForRun::DaemonUrlInvalid { daemon_url, error } => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
+        )
+        .with_manual_fix("check the daemon URL recorded for this repository")),
+        GraphStatusForRun::Unavailable { daemon_url, error } => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            format!(
+                "daemon reachable ({daemon_url}), but the graph section state is unavailable: \
+                 {error}"
+            ),
+        )
+        .with_manual_fix("run `kin graph status` and resolve the reported daemon error")),
+    }
+}
+
+/// Turn the section state into a row, split from its fetch so every branch is
+/// testable without a daemon.
+///
+/// `Degraded` for a folding store, and the severity is chosen rather than
+/// inherited. A store that folds is completely correct; it is only paying a full
+/// history replay at every open, which on the kin store was 47 seconds of a 95
+/// second one. `Missing` and `Misconfigured` fail the whole report, and a store
+/// that answers every question correctly must not do that. `Degraded` costs it
+/// the all-clear and nothing else, which is exactly the claim the evidence
+/// supports, and it names the one command that changes it.
+///
+/// A refused section is reported with kin-db's own refusal word because that is
+/// the word its own log carries, so an operator comparing this row against
+/// `.kin/daemon.log` is matching a term rather than guessing at a paraphrase.
+pub(crate) fn graph_section_health(
+    state: &kin_core::graph_section::GraphSectionState,
+) -> HealthCheck {
+    const ID: &str = "graph_section";
+    const LABEL: &str = "Graph section";
+
+    let status = match state.standing {
+        kin_core::graph_section::GraphSectionStanding::Serving
+        | kin_core::graph_section::GraphSectionStanding::Unborn => HealthStatus::Healthy,
+        kin_core::graph_section::GraphSectionStanding::Folding => HealthStatus::Degraded,
+        // Never healthy. A state that could not be read is not a state that is
+        // fine, and rendering it as one is the invisibility this row replaces.
+        kin_core::graph_section::GraphSectionStanding::Unknown => HealthStatus::Stale,
+    };
+    let check = HealthCheck::new(ID, LABEL, status, state.doctor_detail());
+    if state.folds() {
+        return check.with_manual_fix(
+            "run `kin graph materialize` to persist this workspace's base graph, so later opens \
+             read it instead of folding the history again",
+        );
+    }
+    check
+}
+
 /// Core of [`check_commit_memory_headroom`] with both readings as inputs, so
 /// every branch is testable on any host.
 fn commit_memory_headroom_check_for(
@@ -6568,7 +6678,40 @@ mod tests {
                 kin_core::reference_coverage::ReferenceEdgeCoverage::default(),
             ),
             relation_census: Some(census_pair(&[], &[], Vec::new())),
+            graph_section: Some(serving_section_state()),
         }))
+    }
+
+    /// A store whose persisted section answers for its base.
+    fn serving_section_state() -> kin_core::graph_section::GraphSectionState {
+        kin_core::graph_section::GraphSectionState {
+            schema: kin_core::graph_section::GRAPH_SECTION_STATE_SCHEMA.to_string(),
+            standing: kin_core::graph_section::GraphSectionStanding::Serving,
+            section_present: true,
+            refusal: None,
+            unreadable: None,
+            base_target: Some("2b".repeat(32)),
+            section_resolved_at: Some("2b".repeat(32)),
+            changes_in_store: 3005,
+            fold: kin_core::graph_section::FoldSize::Nothing,
+            prepared_may_preempt: false,
+        }
+    }
+
+    /// The same store with no section, which is every store written before v14.
+    fn folding_section_state() -> kin_core::graph_section::GraphSectionState {
+        kin_core::graph_section::GraphSectionState {
+            schema: kin_core::graph_section::GRAPH_SECTION_STATE_SCHEMA.to_string(),
+            standing: kin_core::graph_section::GraphSectionStanding::Folding,
+            section_present: false,
+            refusal: Some("absent".to_string()),
+            unreadable: None,
+            base_target: Some("2b".repeat(32)),
+            section_resolved_at: None,
+            changes_in_store: 3005,
+            fold: kin_core::graph_section::FoldSize::Exact(3005),
+            prepared_may_preempt: false,
+        }
     }
 
     /// FIR-2560. One `graph status` per doctor run, however many rows read it.
@@ -6683,6 +6826,173 @@ mod tests {
         assert!(
             relation_census_row_for_unread_graph(&answered_graph_status()).is_ok(),
             "a graph the run did read must hand its response to the census row"
+        );
+    }
+
+    /// A store that folds its whole history at every open is completely correct
+    /// and materially slower than it needs to be, and doctor has to say the
+    /// second without claiming the first. `Degraded` costs the report its
+    /// all-clear and nothing else; `Missing` or `Misconfigured` would fail a
+    /// report about a store answering every question correctly.
+    #[test]
+    fn a_folding_store_loses_the_all_clear_without_failing_the_report() {
+        let row = graph_section_health(&folding_section_state());
+        assert!(
+            matches!(row.status, HealthStatus::Degraded),
+            "a folding store is degraded, not broken: {:?}",
+            row.status
+        );
+        assert!(
+            !blocks_readiness(&row),
+            "a correct store must never fail the readiness verdict: {:?}",
+            row.status
+        );
+        assert!(
+            needs_attention(&row),
+            "a 47 second fold at every open must withhold the all-clear"
+        );
+        assert!(
+            row.detail.contains("folds"),
+            "the row must say what the store does: {}",
+            row.detail
+        );
+        assert!(
+            row.detail.contains("3005"),
+            "the row must name the size of the fold: {}",
+            row.detail
+        );
+        assert!(
+            row.manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("kin graph materialize")),
+            "a reported cost with no named fix is a nag: {:?}",
+            row.manual_fix
+        );
+    }
+
+    /// The control for the row above. A store whose section answers is healthy
+    /// and offers no repair, or the row would report every store as needing one
+    /// and could never distinguish the two.
+    #[test]
+    fn a_store_whose_section_answers_reads_healthy_with_nothing_to_fix() {
+        let row = graph_section_health(&serving_section_state());
+        assert!(
+            matches!(row.status, HealthStatus::Healthy),
+            "a served base is healthy: {:?}",
+            row.status
+        );
+        assert!(!needs_attention(&row));
+        assert_eq!(row.manual_fix, None, "there is nothing to repair");
+        assert!(
+            row.detail.contains("folds nothing"),
+            "the row must say the fold did not run: {}",
+            row.detail
+        );
+    }
+
+    /// A state doctor could not read is not a state that is fine. Rendering it
+    /// as healthy is the invisibility this row replaces, restated one layer up.
+    #[test]
+    fn a_section_state_that_could_not_be_read_is_never_healthy() {
+        let mut state = folding_section_state();
+        state.standing = kin_core::graph_section::GraphSectionStanding::Unknown;
+        state.unreadable = Some("this authority holds no workspace 0".to_string());
+        let row = graph_section_health(&state);
+        assert!(
+            !matches!(row.status, HealthStatus::Healthy),
+            "an unread state must never render as healthy: {:?}",
+            row.status
+        );
+        assert!(row.detail.contains("could not be read"), "{}", row.detail);
+    }
+
+    /// This row's own four unreadable arms. Shared wording would let one row go
+    /// quiet about a graph another row could not read, and a row that goes quiet
+    /// is indistinguishable from one reporting a healthy store.
+    #[test]
+    fn an_unread_graph_reaches_the_graph_section_row_in_its_own_words() {
+        let unreadable = [
+            (
+                GraphStatusForRun::NotInRepository,
+                "not in a Kin repository",
+            ),
+            (GraphStatusForRun::NoDaemon, "no daemon is serving"),
+            (
+                GraphStatusForRun::DaemonUrlInvalid {
+                    daemon_url: "http://127.0.0.1:0".to_string(),
+                    error: "invalid port".to_string(),
+                },
+                "its URL is invalid",
+            ),
+            (
+                GraphStatusForRun::Unavailable {
+                    daemon_url: "http://127.0.0.1:4242".to_string(),
+                    error: "connection refused".to_string(),
+                },
+                "unavailable",
+            ),
+        ];
+        for (status, expected) in unreadable {
+            let row = graph_section_row_for_unread_graph(&status)
+                .expect_err("an unread graph must produce a row rather than a response");
+            assert!(
+                !matches!(row.status, HealthStatus::Healthy),
+                "an unread graph must never render as healthy: {status:?} gave {:?}",
+                row.status
+            );
+            assert!(
+                row.detail.contains(expected),
+                "the row must name what happened: {status:?} gave {}",
+                row.detail
+            );
+        }
+        assert!(
+            graph_section_row_for_unread_graph(&answered_graph_status()).is_ok(),
+            "a graph the run did read must hand its response to this row"
+        );
+    }
+
+    /// A daemon built before this measurement existed sends no section state,
+    /// and the absence must read as a stale daemon rather than as a store with
+    /// nothing to report.
+    #[tokio::test]
+    async fn a_daemon_that_reports_no_section_state_reads_stale_rather_than_healthy() {
+        let older = RunGraphStatus::with_fetch(|| {
+            Box::pin(async {
+                GraphStatusForRun::Answered(Box::new(
+                    crate::commands::graph::GraphCommandResponse {
+                        lines: vec!["graph status".to_string()],
+                        error: None,
+                        source: None,
+                        reference_edge_coverage: None,
+                        relation_census: None,
+                        graph_section: None,
+                    },
+                ))
+            })
+        });
+        let row = check_graph_section(&older).await;
+        assert!(
+            matches!(row.status, HealthStatus::Stale),
+            "an older daemon is stale, not healthy: {:?}",
+            row.status
+        );
+        assert!(
+            row.manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("kin daemon stop")),
+            "the row must name how to get a daemon that reports it: {:?}",
+            row.manual_fix
+        );
+
+        // The control: a daemon that DOES report it reaches the measurement,
+        // or the arm above would be the only outcome this row can produce.
+        let current = RunGraphStatus::with_fetch(|| Box::pin(async { answered_graph_status() }));
+        let row = check_graph_section(&current).await;
+        assert!(
+            matches!(row.status, HealthStatus::Healthy),
+            "a reported serving section reads healthy: {:?}",
+            row.status
         );
     }
 

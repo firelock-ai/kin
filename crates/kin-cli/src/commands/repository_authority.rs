@@ -350,6 +350,18 @@ impl ActiveRepositoryAuthority {
         ))
     }
 
+    /// Whether an open of this store serves its workspace base from the
+    /// persisted graph section or folds it out of history, and how big that
+    /// fold is.
+    ///
+    /// Reads the envelope this open already holds and decodes nothing; see
+    /// [`kin_core::graph_section`] for why the exact fold count is taken only
+    /// where it is free.
+    pub(crate) fn graph_section_state(&self) -> kin_core::graph_section::GraphSectionState {
+        let lease = self.manager.read_authority();
+        kin_core::graph_section::read(&lease, &self.workspace_id)
+    }
+
     /// Payload receipt produced by the same recovery that built this manager.
     ///
     /// `None` only where no persisted authority existed and generation zero was

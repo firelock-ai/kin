@@ -1147,3 +1147,65 @@ fn admit_seeded(repo: &Path) -> AdmittedRepository {
         binding,
     }
 }
+
+/// The line that tells an operator what every counter above it cost to produce.
+///
+/// An admitted store carries no materialized graph section, so its daemon folds
+/// this workspace's base out of history at every open. On the kin store that
+/// fold was 47 seconds of a 95 second open, and until this line existed no kin
+/// surface said so: kin-db logs an absent section at `trace!` and the daemon
+/// runs at `info`, so a store on the slow path rendered exactly like one that
+/// was not.
+///
+/// The structural field and the printed line are asserted together on purpose.
+/// `kin doctor` reads the field and a person reads the line, and a change that
+/// moved one without the other would leave the two surfaces disagreeing about
+/// the same store with both of them green.
+#[test]
+fn graph_status_says_this_store_folds_its_history_at_every_open() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    let admitted = admit(&repo);
+    let graph = workspace_query_graph(&admitted.binding);
+
+    let response = graph_status(&admitted.binding, &graph);
+    let state = response
+        .graph_section
+        .as_ref()
+        .expect("graph status reports the section state structurally");
+
+    assert_eq!(
+        state.standing,
+        kin_core::graph_section::GraphSectionStanding::Folding,
+        "admission writes no section, so this store folds: {state:?}"
+    );
+    assert!(
+        state.base_target.is_some(),
+        "the fixture commits, so this is the folding case rather than the unborn one: {state:?}"
+    );
+    assert!(
+        state.fold.changes() > 0,
+        "a fold over a committed history walks at least one change: {state:?}"
+    );
+
+    let line = response
+        .lines
+        .iter()
+        .find(|line| line.starts_with("Graph section:"))
+        .unwrap_or_else(|| panic!("no section line in:\n{}", response.lines.join("\n")));
+    assert!(
+        line.contains("folds"),
+        "the printed line must say the store folds: {line}"
+    );
+    assert!(
+        line.contains(&state.fold.changes().to_string()),
+        "the printed line must carry the same count the field does: {line} against {state:?}"
+    );
+    // The control: the words a served base would print are absent here, or the
+    // assertion above would hold on every store and prove nothing.
+    assert!(
+        !line.contains("folds nothing"),
+        "a folding store must not print the served wording: {line}"
+    );
+}
