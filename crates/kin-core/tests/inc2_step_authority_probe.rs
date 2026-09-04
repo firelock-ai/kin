@@ -546,6 +546,7 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
                 local_overlay_delta: None,
                 merge_transaction_delta: None,
                 sealed_observation: None,
+                collaboration_delta: None,
             };
             drop(lease);
             transaction
@@ -937,6 +938,7 @@ fn a_step_whose_head_is_a_merge_commits_over_a_step_that_never_saw_the_side_line
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         drop(lease);
         transaction

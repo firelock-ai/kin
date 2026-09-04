@@ -330,6 +330,7 @@ fn add_exact_refs(layout: &kin_core::KinLayout) {
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     let receipt = manager
         .commit_repository_transaction(transaction)
@@ -367,6 +368,7 @@ fn exact_ref_create_transaction(
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     }
 }
 
@@ -1414,6 +1416,7 @@ fn publish_uncommitted_workspace_deltas(
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         })
         .expect("commit admitted workspace change");
 

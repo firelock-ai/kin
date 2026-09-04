@@ -462,6 +462,7 @@ fn push(
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     seal.validate()
         .context("validate the exact stash seal transaction")?;
@@ -628,6 +629,7 @@ fn return_to_base(
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
     transaction
         .validate()
@@ -842,6 +844,7 @@ fn pop(
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     transaction
         .validate()

@@ -268,6 +268,7 @@ fn publish_non_user_semantic_move(
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     drop(lease);
     manager

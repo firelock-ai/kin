@@ -19663,6 +19663,7 @@ mod tests {
                     .then(|| FrozenLocalOverlayDelta::initialize(overlay.clone())),
                 merge_transaction_delta: None,
                 sealed_observation: None,
+                collaboration_delta: None,
             };
             drop(lease);
             manager.commit_repository_transaction(transaction).unwrap();

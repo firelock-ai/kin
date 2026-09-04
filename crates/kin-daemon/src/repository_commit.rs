@@ -364,6 +364,7 @@ pub(crate) fn plan_session_workspace_admission(
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     transaction.validate()?;
     let transaction_hash = transaction.transaction_hash()?;
@@ -637,6 +638,7 @@ pub(crate) fn publish_workspace_tree(
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     transaction.validate()?;
 
@@ -1028,6 +1030,7 @@ fn plan_native_commit_inner(
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     transaction.validate()?;
 
@@ -2561,6 +2564,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         authority
             .commit_repository_transaction(transaction)
