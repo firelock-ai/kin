@@ -53,12 +53,15 @@ by the early ones.
                grammar that refused with a generic sentence would leave an
                operator no way to tell which of two endpoints was the bad one
   short_prefix a four-character prefix off a real change id resolves when it is
-               unique and is refused, naming itself, when it is not. Both arms
-               are graded every run, because which one applies is a property of
-               the fixture's own ids. An ambiguity-only check would have read
-               UNREADABLE four runs in five, and gate.py fails an unallowed
-               UNREADABLE, so it would have been red for a reason that has
-               nothing to do with the product
+               unique and is refused, naming itself and the count, when it is
+               not. Which arm the fixture reaches is a property of its own ids
+               and not something this suite gets to choose, and in practice that
+               is the unique arm: change ids are hashes, so a small repository's
+               own ids colliding on four hexadecimal characters is a
+               one-in-tens-of-thousands accident. The ambiguity refusal is
+               graded where a collision can be CONSTRUCTED rather than waited
+               for, in `crates/kin-cli/src/commands/ref_grammar.rs`, over the
+               same resolver `kin diff` calls
 
 Exit status is 0 when every check passed, 1 when one failed, 2 when none failed
 but one could not be read, and 3 when the run could not be set up. `--self-test`
@@ -309,13 +312,21 @@ def grade_refusal_names_the_selector(selector, text):
 def grade_short_prefix(prefix, text, matches):
     """A short prefix resolves when it is unique and is refused when it is not.
 
-    Both arms are graded in every run, because which one applies is a property
-    of the fixture's own change ids and not something the suite gets to choose.
-    Written as one grader rather than as an ambiguity check with an UNREADABLE
-    escape: three changes collide on four hex characters about one run in five,
-    so an ambiguity-only check would have spent four runs in five reporting that
-    it could not be read, and `gate.py` fails an UNREADABLE that carries no
-    allowance. A check that usually cannot answer is a check nobody trusts.
+    Both arms stay graded, and which one applies is a property of the fixture's
+    own change ids rather than something the suite gets to choose. In practice
+    the unique arm is the one that runs. Change ids are hashes, so this
+    fixture's own ids colliding on four hexadecimal characters is a
+    one-in-tens-of-thousands accident, not the one run in five this docstring
+    used to claim, and that wrong estimate is what licensed counting every
+    64-character hash the read surfaces printed as a change. `kin blame` prints
+    an entity revision id beside every change id and both render as 64 lowercase
+    hexadecimal characters, so a prefix matching one change and one revision was
+    reported here as two changes, and `kin diff` resolving the one change it
+    actually matched was graded as picking one silently. That is the FAIL run
+    33912645879 carried on prefix 'adfc'. The count now comes from
+    `semantic_change_ids`, which reads the column rather than the shape, and the
+    ambiguity refusal itself is graded deterministically in `ref_grammar.rs`
+    over a collision that is constructed.
     """
     if matches < 1:
         return UNREADABLE, (
@@ -351,6 +362,141 @@ HEX64 = re.compile(r"\b[0-9a-f]{64}\b")
 # self-test so the two cannot drift apart.
 FABRICATED_12 = "deadbeefcafe"
 FABRICATED_64 = "de" * 32
+
+
+# One real `kin blame biggest` stdout, from the same three-commit fixture this
+# suite seeds. Every line is byte-identical to what the binary printed except the
+# dashed rule under the header, shortened from 140 dashes to 78 to fit the line
+# budget; it carries no hash and the parse never reads it. The rest is verbatim
+# because the whole point of the parse below is what this text looks like: two
+# 64-character lowercase hashes side by side on every row, of which only the
+# second names a point in history.
+SELFTEST_BLAME = """\
+Blame for 'biggest' (Function, python) at \
+8ebcb1c67bf9594c608b24f8afec74d044e70ed2e1017fd50f8fc082d31e6c80:
+
+REVISION                              CHANGE                                \
+TIMESTAMP             AUTHOR           MESSAGE
+------------------------------------------------------------------------------
+57b4b3287a9093c8512b6e5abe0725527937e2eae25e10145698819635bb2d1a  \
+c4e634b2c431293236ab9106fbcd73d7090492bff1fb3127e186287cc0f22fa8  \
+2026-09-04T20:46:47.514820+00:00  ref-grammar-repro <repro@example.invalid>  \
+Add ledger line parsing
+7f051ba60cb46b2c0c8a6ff2516400f5022705a1f83f6e60eb602fdaed8763e1  \
+29872726c5c10df27ba4d239f560c8dce2910a587db5f95eadddd616fbebdad2  \
+2026-09-04T20:46:47.757698+00:00  ref-grammar-repro <repro@example.invalid>  \
+Add a biggest() helper
+1a9b0a6264099818e713a3030f052b801afd7ac6a9542398c5026bf54798c027  \
+8ebcb1c67bf9594c608b24f8afec74d044e70ed2e1017fd50f8fc082d31e6c80  \
+2026-09-04T20:46:47.991667+00:00  ref-grammar-repro <repro@example.invalid>  \
+Key biggest() on the amount column
+
+3 version(s) found.
+
+State at 8ebcb1c67bf9594c608b24f8afec74d044e70ed2e1017fd50f8fc082d31e6c80:
+  Signature: def biggest(rows)
+  Visibility: Public
+  File: ledger.py
+"""
+
+# The three semantic changes that blame text names, newest first, and the three
+# entity revision ids printed beside them. Both lists are read off the text
+# above by eye; the self-test proves the parse agrees and that the revision ids
+# really are in there, so neither list can quietly go stale.
+SELFTEST_CHANGE_IDS = [
+    "8ebcb1c67bf9594c608b24f8afec74d044e70ed2e1017fd50f8fc082d31e6c80",
+    "29872726c5c10df27ba4d239f560c8dce2910a587db5f95eadddd616fbebdad2",
+    "c4e634b2c431293236ab9106fbcd73d7090492bff1fb3127e186287cc0f22fa8",
+]
+SELFTEST_REVISION_IDS = [
+    "1a9b0a6264099818e713a3030f052b801afd7ac6a9542398c5026bf54798c027",
+    "7f051ba60cb46b2c0c8a6ff2516400f5022705a1f83f6e60eb602fdaed8763e1",
+    "57b4b3287a9093c8512b6e5abe0725527937e2eae25e10145698819635bb2d1a",
+]
+
+
+def selftest_log_json(change_ids):
+    """A `kin log --json` payload carrying `change_ids`, newest first.
+
+    Built rather than pasted because the real report is a few hundred lines of
+    root hashes and workspace state this parse never reads, and a literal that
+    large hides the four bytes that matter. The byte-array shape IS the product's
+    shape: `change_id` serializes as the bytes behind its `Hash256`, which is why
+    the parse cannot simply read a hex string. The live half is exercised for
+    real on every run of this suite, against whatever the binary actually emits.
+    """
+    return json.dumps({
+        "schema": "kin.log.v1",
+        "entries": [
+            {"change_id": [int(value[index:index + 2], 16)
+                           for index in range(0, len(value), 2)]}
+            for value in change_ids
+        ],
+    })
+
+
+def hex_change_id(value):
+    """One change id as lowercase hexadecimal, whatever `kin log --json` sent.
+
+    `change_id` serializes as the byte array behind its `Hash256`. A hex string
+    is accepted too, so a later change to that serialization is read rather than
+    silently dropped.
+    """
+    if isinstance(value, str):
+        return value.lower()
+    return "".join("%02x" % byte for byte in value)
+
+
+def change_ids_from_log_json(text):
+    """The change ids `kin log --json` names, newest first.
+
+    Read from the JSON report rather than from the human rendering. The
+    rendering is prose, and a regular expression over prose cannot tell a change
+    id from any other 64-character hash printed beside it. That is not a
+    hypothetical: it is the defect these two functions exist to end.
+    """
+    report = json.loads(text)
+    return [hex_change_id(entry["change_id"]) for entry in report.get("entries", [])]
+
+
+def change_ids_from_blame(text):
+    """The change ids `kin blame` names, in the order it prints them.
+
+    Blame prints a REVISION id and a CHANGE id side by side and both render as
+    64 lowercase hexadecimal characters, because `EntityRevisionId` and
+    `SemanticChangeId` are each a `Hash256`. A `findall` over the row takes both
+    and calls both changes. That is how this suite came to report `kin diff`
+    resolving an ambiguous prefix on run 33912645879: the second "change" was an
+    entity revision id, which names no point in history, and the one change the
+    prefix really matched was resolved correctly.
+
+    So the column decides rather than the shape. A row carrying two ids is
+    `revision  change`; a header line carrying one carries the change it is
+    reporting at.
+    """
+    ids = []
+    for line in (text or "").splitlines():
+        found = HEX64.findall(line)
+        if len(found) >= 2:
+            ids.append(found[1])
+        elif len(found) == 1:
+            ids.append(found[0])
+    return ids
+
+
+def semantic_change_ids(log_json_text, blame_text):
+    """Every semantic change id these two surfaces name, newest first, deduped.
+
+    Two surfaces on purpose, which is unchanged: a parse that keys on one
+    surface is a check that cannot fail the day that surface changes how it
+    prints. What changed is that each surface is now read where it says what a
+    value IS, rather than scanned for values that look alike.
+    """
+    ids = []
+    for value in change_ids_from_log_json(log_json_text) + change_ids_from_blame(blame_text):
+        if value not in ids:
+            ids.append(value)
+    return ids
 
 
 class Suite(object):
@@ -426,23 +572,22 @@ class Suite(object):
         return self._printed_id
 
     def changes(self):
-        """Every full change id this fixture holds, newest first.
+        """Every semantic change id this fixture's read surfaces name, newest first.
 
         Read from `kin log` AND `kin blame`, because a parse that keys on one
         surface printing full ids is a check that cannot fail the day that
         surface starts abbreviating the way `kin history` already does. blame.rs
-        prints `change.id` unabbreviated, so it is the backstop; the union is
-        deduplicated and an empty one is reported rather than proceeded on.
+        prints `change.id` unabbreviated, so it is the backstop.
+
+        stdout only, and `--json` for the log half. `answer()` folds stderr in so
+        a refusal can be graded, and stderr here carries tracing warnings that
+        are not the product's answer to anything.
         """
         if self._changes is not None:
             return self._changes
-        seen = []
-        for args in (["log", "-n", "20"], ["blame", "biggest"]):
-            _, text = self.answer(args)
-            for value in HEX64.findall(text):
-                if value not in seen:
-                    seen.append(value)
-        self._changes = seen
+        _, log_out, _ = self.kin_run(["log", "-n", "20", "--json"])
+        _, blame_out, _ = self.kin_run(["blame", "biggest"])
+        self._changes = semantic_change_ids(log_out, blame_out)
         return self._changes
 
     def measured(self):
@@ -645,6 +790,21 @@ def self_test():
               % (name, "ok" if ok else "BROKEN", want, status,
                  "" if ok else (" detail=%s" % (got[1] if isinstance(got, tuple) else ""))))
 
+    def expect_value(name, got, want):
+        """Like expect(), for a parse that returns a value rather than a verdict.
+
+        Prints both values on a break, because "expected=True got=False" over a
+        list of change ids tells a reader nothing about which id moved.
+        """
+        nonlocal ran, broken
+        ran += 1
+        ok = got == want
+        if not ok:
+            broken += 1
+        print("SELFTEST %s %s%s"
+              % (name, "ok" if ok else "BROKEN",
+                 "" if ok else (" expected=%r got=%r" % (want, got))))
+
     printed = "1971f659d7aa"
 
     # printed_id: the literal refusal must FAIL, the fixed answer must PASS.
@@ -721,6 +881,34 @@ def self_test():
            FAIL)
     expect("short_prefix/no-match-is-unreadable", grade_short_prefix("abcd", "", 0), UNREADABLE)
 
+    # The change set the short_prefix count is taken from. `matches` is the only
+    # input to that grader the product does not hand it directly, and reading it
+    # wrong is what made run 33912645879 red over correct behaviour, so the parse
+    # is graded here against real product text rather than trusted.
+    log_json = selftest_log_json(SELFTEST_CHANGE_IDS)
+    expect_value("change_set/names-changes-not-revisions",
+                 semantic_change_ids(log_json, SELFTEST_BLAME), SELFTEST_CHANGE_IDS)
+    # CONTROL: the revision ids ARE in that text. Without this, the case above is
+    # satisfied by a parse searching for something that is not there at all,
+    # which is the shape of every check that cannot fail.
+    expect_value("change_set/CONTROL-the-revision-ids-are-in-the-text",
+                 [value in SELFTEST_BLAME for value in SELFTEST_REVISION_IDS],
+                 [True, True, True])
+    # CONTROL: the parse this replaced. Six values where three are changes is the
+    # defect itself, written down, so a revert to `HEX64.findall` over the whole
+    # line goes red here rather than one acceptance run in thirteen thousand.
+    expect_value("change_set/CONTROL-a-findall-over-the-row-counts-six",
+                 len(set(HEX64.findall(SELFTEST_BLAME))), 6)
+    # `check_short_prefix` takes its prefix off index 0 and `measured()` takes
+    # its full-id forms off the same, so newest-first is load-bearing.
+    expect_value("change_set/log-json-leads-with-the-newest-change",
+                 semantic_change_ids(log_json, SELFTEST_BLAME)[0], SELFTEST_CHANGE_IDS[0])
+    # Blame is the backstop: with the log half empty it still names every change
+    # and still names no revision.
+    expect_value("change_set/blame-alone-is-a-backstop",
+                 sorted(semantic_change_ids(selftest_log_json([]), SELFTEST_BLAME)),
+                 sorted(SELFTEST_CHANGE_IDS))
+
     gate_ran, gate_broken = check_the_gate_reads_this_suites_report()
     ran += gate_ran
     broken += gate_broken
@@ -730,7 +918,7 @@ def self_test():
         return 1
     # A self-test that graded nothing is a failure, not a pass. The floor is the
     # count of expect() calls above, so deleting one has to be deliberate.
-    if ran < 24:
+    if ran < 29:
         print("SELFTEST %s BROKEN only %d case(s) ran; the self-test lost coverage"
               % (TICKET, ran))
         return 1
