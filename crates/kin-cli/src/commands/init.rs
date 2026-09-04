@@ -220,7 +220,13 @@ pub async fn run(
     // say the 523 MB download "happens during this command" unconditionally,
     // and on a container under memory pressure the background embed pass never
     // started, so nothing was fetched and the sentence was still printed.
-    let model_present_before = crate::embed_model::EmbedModelFetch::probe(false).present;
+    //
+    // The whole reading is kept rather than its presence bit alone, because the
+    // bytes are what decide attribution. A machine carrying an interrupted
+    // cache from some earlier attempt is absent before and absent after with a
+    // non-zero numerator throughout, and reading only `present` cannot tell
+    // that apart from a fetch this command actually moved.
+    let model_before = crate::embed_model::EmbedModelFetch::probe(false);
     let dir = path
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
@@ -350,7 +356,7 @@ pub async fn run(
             &enrichment,
             &cross_file,
             &graph_section_materialization,
-            model_present_before,
+            &model_before,
             daemon_death.as_ref(),
         )?;
     }
@@ -1262,7 +1268,7 @@ fn print_human_result(
     semantic_enrichment: &SemanticEnrichmentStatus,
     cross_file: &CrossFileEnrichment,
     graph_section_materialization: &InitGraphSectionMaterialization,
-    model_present_before: bool,
+    model_before: &crate::embed_model::EmbedModelFetch,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<()> {
     emit(&render_human_result(
@@ -1271,7 +1277,7 @@ fn print_human_result(
         semantic_enrichment,
         cross_file,
         graph_section_materialization,
-        model_present_before,
+        model_before,
         daemon_death,
     )?)
 }
@@ -1301,7 +1307,7 @@ fn render_human_result(
     semantic_enrichment: &SemanticEnrichmentStatus,
     cross_file: &CrossFileEnrichment,
     graph_section_materialization: &InitGraphSectionMaterialization,
-    model_present_before: bool,
+    model_before: &crate::embed_model::EmbedModelFetch,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<String> {
     let default_ref = initialized_default_ref(result);
@@ -1370,7 +1376,7 @@ fn render_human_result(
             "  {}",
             embedding_model_notice(
                 &crate::embed_model::EmbedModelFetch::probe(false),
-                model_present_before,
+                model_before,
                 embed_refusal.as_ref(),
             )
         ),
@@ -1448,7 +1454,7 @@ fn embed_refusal_for(root: &std::path::Path) -> Option<kin_core::memory_pressure
 /// sentence. See `doctor_and_init_agree_about_the_model_fetch`.
 pub(crate) fn embedding_model_notice(
     fetch: &crate::embed_model::EmbedModelFetch,
-    present_before: bool,
+    before: &crate::embed_model::EmbedModelFetch,
     refusal: Option<&kin_core::memory_pressure::PressureRefusal>,
 ) -> String {
     if let Some(reason) = fetch.no_fetch_reason.as_deref() {
@@ -1458,7 +1464,7 @@ pub(crate) fn embedding_model_notice(
         Some(dir) => format!(" at {dir}"),
         None => String::new(),
     };
-    match (present_before, fetch.present) {
+    match (before.present, fetch.present) {
         (true, _) => format!(
             "Embedding model: {} was already cached{location}, so this command downloaded nothing",
             fetch.model_id
@@ -1467,6 +1473,61 @@ pub(crate) fn embedding_model_notice(
             "Embedding model: {} was not on this machine, and this command fetched it{location}",
             fetch.model_id
         ),
+        // Bytes this command actually added, with no resolved snapshot at the
+        // end: a fetch it started or continued and did not finish. This is the
+        // state the five-command walk lands in on a small repository. `kin init`
+        // on `expressjs/body-parser` took ten seconds end to end against a fixed
+        // 523 MB download, and the summary then said the command "did not fetch
+        // it" over a download that was partway through, which reads as nothing
+        // having happened.
+        //
+        // Gated on GROWTH rather than on a non-zero numerator, because those are
+        // different facts and only one of them belongs to this run. A machine
+        // carrying an interrupted cache from an earlier attempt has bytes in it
+        // before this command starts, and attributing them here would credit
+        // this run with a download it never made.
+        (false, false) if fetch.fetched_bytes > before.fetched_bytes => {
+            let because = match refusal {
+                Some(refusal) => format!(", because {}", refusal.cause_sentence()),
+                None => String::new(),
+            };
+            format!(
+                "Embedding model: {} is not on this machine yet and this command did not finish \
+                 fetching it{because}. It fetched {} of {}, so {} is in the cache{}; `kin locate` \
+                 ranks on lexical and graph signals until the rest arrives; run `kin embed` to \
+                 finish it now",
+                fetch.model_id,
+                crate::embed_model::render_megabytes(
+                    fetch.fetched_bytes.saturating_sub(before.fetched_bytes)
+                ),
+                fetch.expected_download(),
+                fetch.render_progress(),
+                match fetch.cache_dir.as_deref() {
+                    Some(dir) => format!(" at {dir}"),
+                    None => String::new(),
+                }
+            )
+        }
+        // Bytes were already here and none were added. The reader still needs to
+        // know why their first query ranks on lexical signals, and this run
+        // still has to not claim a download it did not make.
+        (false, false) if fetch.fetched_bytes > 0 => {
+            let because = match refusal {
+                Some(refusal) => format!(", because {}", refusal.cause_sentence()),
+                None => String::new(),
+            };
+            format!(
+                "Embedding model: {} is not on this machine{because}. {} of an earlier fetch is \
+                 in the cache{} and this command added none of it, so `kin locate` ranks on \
+                 lexical and graph signals; run `kin embed` to fetch the rest now",
+                fetch.model_id,
+                fetch.render_progress(),
+                match fetch.cache_dir.as_deref() {
+                    Some(dir) => format!(" at {dir}"),
+                    None => String::new(),
+                }
+            )
+        }
         (false, false) => {
             let because = match refusal {
                 Some(refusal) => format!(", because {}", refusal.cause_sentence()),
@@ -2887,7 +2948,7 @@ mod tests {
         // during this command" whatever the run had done, and a cold-user walk
         // on 0.6.0 read that sentence off a run whose background embed pass had
         // never started, with no `~/.cache/huggingface` on the machine at all.
-        let did_not_fetch = embedding_model_notice(&absent, false, None);
+        let did_not_fetch = embedding_model_notice(&absent, &absent, None);
         assert!(
             did_not_fetch.contains("nomic-ai/nomic-embed-text-v1.5")
                 && did_not_fetch.contains("about 523 MB")
@@ -2919,7 +2980,7 @@ mod tests {
             reason: "the host had no room for the embed pass".to_string(),
             at_unix: 4_800,
         };
-        let refused = embedding_model_notice(&absent, false, Some(&refusal));
+        let refused = embedding_model_notice(&absent, &absent, Some(&refusal));
         assert!(
             refused.contains("the host had no room for the embed pass"),
             "a refusal on record is named as the cause: {refused}"
@@ -2933,7 +2994,7 @@ mod tests {
                 present: true,
                 ..absent.clone()
             },
-            false,
+            &absent,
             None,
         );
         assert!(
@@ -2950,7 +3011,7 @@ mod tests {
             present: true,
             ..absent.clone()
         };
-        let cached_notice = embedding_model_notice(&cached, true, None);
+        let cached_notice = embedding_model_notice(&cached, &cached, None);
         assert!(
             cached_notice.contains("was already cached") && !cached_notice.contains("523"),
             "a machine that had the model is not warned about a download: {cached_notice}"
@@ -2966,7 +3027,7 @@ mod tests {
             present: false,
             ..cached
         };
-        let overridden_notice = embedding_model_notice(&overridden, false, None);
+        let overridden_notice = embedding_model_notice(&overridden, &absent, None);
         assert!(
             !overridden_notice.contains("523"),
             "a model this build never measured is given no size: {overridden_notice}"
@@ -2974,6 +3035,85 @@ mod tests {
         assert!(
             overridden_notice.contains("fetches the model from huggingface.co"),
             "the fetch is still named without a size: {overridden_notice}"
+        );
+    }
+
+    /// Three absent-model states, told apart by bytes rather than by a
+    /// non-zero numerator, because only one of them belongs to this run.
+    ///
+    /// A fast `kin init` on a small repository lands in the first.
+    /// `expressjs/body-parser` converted in ten seconds against a fixed 523 MB
+    /// download and the summary reported "did not fetch it" over a download
+    /// that was partway through, which reads as nothing having happened. The
+    /// second is what a machine carrying an interrupted cache from an earlier
+    /// attempt produces: bytes are there throughout, and crediting them to this
+    /// command claims a download it never made.
+    #[test]
+    #[serial_test::serial]
+    fn the_absent_model_states_are_told_apart_by_the_bytes_this_run_added() {
+        let _endpoint = kin_core::test_env::EnvVarGuard::unset("HF_ENDPOINT");
+        let empty = crate::embed_model::EmbedModelFetch {
+            model_id: crate::embed_model::DEFAULT_EMBED_MODEL_ID.to_string(),
+            cache_dir: Some("/home/dev/.cache/huggingface/hub/models--x".to_string()),
+            present: false,
+            fetched_bytes: 0,
+            expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
+            fetching: false,
+            no_fetch_reason: None,
+            relocated_hf_home: None,
+        };
+        let partial = |bytes: u64| crate::embed_model::EmbedModelFetch {
+            fetched_bytes: bytes,
+            ..empty.clone()
+        };
+
+        // One: this command moved the download from nothing to 137 MB.
+        let moved = embedding_model_notice(&partial(137 * 1024 * 1024), &empty, None);
+        assert!(
+            moved.contains("It fetched 137 MB of about 523 MB")
+                && moved.contains("137 of 523 MB is in the cache"),
+            "what this run added and where the whole fetch stands are both \
+             named: {moved}"
+        );
+        assert!(
+            moved.contains("did not finish fetching it"),
+            "a fetch that started and stopped short says so: {moved}"
+        );
+        assert!(
+            !moved.contains("did not fetch it"),
+            "a partial fetch must not read as a run that fetched nothing: {moved}"
+        );
+
+        // Two, the review's case: the same 137 MB was already there and this
+        // command added none of it. Same numerator, different run, and the
+        // sentence may not credit this one.
+        let earlier = partial(137 * 1024 * 1024);
+        let untouched = embedding_model_notice(&earlier, &earlier, None);
+        assert!(
+            untouched.contains("137 of 523 MB of an earlier fetch is in the cache")
+                && untouched.contains("this command added none of it"),
+            "a pre-existing cache is attributed to the run that made it: {untouched}"
+        );
+        assert!(
+            !untouched.contains("It fetched") && !untouched.contains("did not finish fetching it"),
+            "and this run claims no download it did not make: {untouched}"
+        );
+
+        // Three: nothing in the cache before or after keeps the sentence it
+        // always had, so the arms above are selected by bytes rather than by
+        // being reachable from every absent state.
+        let nothing = embedding_model_notice(&empty, &empty, None);
+        assert!(
+            nothing.contains("did not fetch it") && !nothing.contains("of 523 MB is in the cache"),
+            "an untouched cache reports no numerator: {nothing}"
+        );
+
+        // And the reader is told what it costs the next query in both states
+        // where something is owed.
+        assert!(
+            moved.contains("ranks on lexical and graph signals")
+                && untouched.contains("ranks on lexical and graph signals"),
+            "both partial states say what the next query gets: {moved} / {untouched}"
         );
     }
 
