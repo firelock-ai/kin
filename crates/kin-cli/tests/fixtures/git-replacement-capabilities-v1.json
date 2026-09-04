@@ -218,6 +218,7 @@
         "kin_core::init::replica::tests::replica_publication_rejects_wrong_identity_before_target_exists",
         "kin_core::init::replica::tests::replica_publication_rejects_corrupt_body_before_target_exists",
         "kin_core::init::replica::tests::replica_publication_refuses_a_target_populated_during_preparation",
+        "kin_core::init::replica::tests::replica_publication_refuses_an_unmaterializable_entry_before_target_exists",
         "crates/kin-cli/tests/init_json.rs",
         "kin_daemon::api::tests::a_native_clone_adopts_the_remote_identity_and_admits_its_history",
         "kin_daemon::api::tests::a_natively_cloned_replica_can_pull_again_from_the_remote_it_adopted",

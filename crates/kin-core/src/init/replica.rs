@@ -244,6 +244,54 @@ mod tests {
         assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
     }
 
+    /// A gitlink is the only tree entry `blob_identity` cannot answer for, so it
+    /// is what puts a real non-materializable source entry into a bootstrap.
+    ///
+    /// The bootstrap transaction is edited rather than transferred from a peer
+    /// on purpose: `prepare_replica_bootstrap` refuses a gitlink pack at the
+    /// transport boundary, so the only way to hand `initialize` one is to build
+    /// it. What refuses it here is the graph's own admission rule inside
+    /// `commit_bootstrap`, which admits a gitlink only when it arrives on a
+    /// Git-origin change whose commit projection the same transaction verifies.
+    /// The `None` arm in the projection loop below is the second defence behind
+    /// that rule, and reaching it needs verified Git external authority this
+    /// unit test cannot mint. Both refusals sit above publication, which is what
+    /// this asserts.
+    #[test]
+    fn replica_publication_refuses_an_unmaterializable_entry_before_target_exists() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("replica");
+        let identity = RepositoryId::new("hosted-repository".to_string()).unwrap();
+        let error = initialize(&target, "trunk", &identity, |prepared, case| {
+            let mut transaction = transaction(prepared, case);
+            let workspace = transaction
+                .workspace_mutation
+                .as_mut()
+                .expect("a bootstrap transaction carries its workspace mutation");
+            workspace.tree_deltas.push(kin_model::TreeDelta::Added {
+                artifact_id: kin_model::ArtifactId::new(),
+                new: kin_model::LocatedEntry::new(
+                    kin_model::RepoPath::from_utf8("vendor/dependency").unwrap(),
+                    kin_model::TreeEntry::gitlink(kin_model::GitObjectId::sha1([0x5a; 20])),
+                ),
+            });
+            let tree = kin_model::ResolvedTree::default()
+                .apply(&workspace.tree_deltas)
+                .unwrap();
+            workspace.new_tree_hash = compute_resolved_tree_hash(&tree).unwrap();
+            Ok(Some(ReplicaBootstrapInput {
+                transaction,
+                bodies: vec![],
+            }))
+        })
+        .unwrap_err();
+        let reported = error.to_string();
+        assert!(reported.contains("gitlink"), "{reported}");
+        assert!(reported.contains("vendor/dependency"), "{reported}");
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn replica_publication_refuses_a_target_populated_during_preparation() {
         let parent = tempfile::tempdir().unwrap();
