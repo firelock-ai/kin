@@ -665,7 +665,7 @@
       "allow_match": [
         {
           "expr": ".metadata()",
-          "count": 7
+          "count": 9
         }
       ]
     },

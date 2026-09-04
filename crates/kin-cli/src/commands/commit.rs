@@ -7,7 +7,7 @@ use super::commit_progress::{
     daemon_death_explanation, PhaseTail, AUTHORITY_NOT_GIT_NOTE, DETACHED_HEAD_NOTE,
 };
 
-pub async fn run(message: String, quiet: bool) -> Result<()> {
+pub async fn run(message: Option<String>, quiet: bool, amend: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     // Before attribution, before the daemon is resolved, before anything this
     // command does for itself. The ambient reconcile tick and this commit both
@@ -21,7 +21,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     // exists.
     let _announced = CommitAnnouncement::announce(layout.root());
 
-    let result = run_daemon_commit(&layout, &message, quiet).await?;
+    let result = run_daemon_commit(&layout, message.as_deref(), quiet, amend).await?;
     if !quiet {
         println!(
             "{}",
@@ -205,8 +205,9 @@ const PHASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 
 async fn run_daemon_commit(
     layout: &kin_core::KinLayout,
-    message: &str,
+    message: Option<&str>,
     quiet: bool,
+    amend: bool,
 ) -> Result<DaemonCommitResult> {
     // Resolved here, in the caller's own environment and working directory,
     // rather than inside the daemon. The daemon is spawned with every `GIT_*`
@@ -215,6 +216,15 @@ async fn run_daemon_commit(
     // this command". Resolution also comes before the daemon is contacted: a
     // commit that cannot be attributed must not reach the authority path at all.
     let author = crate::commands::require_commit_author_for(layout)?;
+    let expected_head = if amend {
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
+        let authority = super::repository_authority::ActiveRepositoryAuthority::open(&binding)?;
+        Some(authority.current_change_id()?.ok_or_else(|| {
+            anyhow::anyhow!("cannot amend an unborn workspace; create a commit first")
+        })?)
+    } else {
+        None
+    };
     let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
         .await?
         .ok_or_else(|| crate::daemon_client::daemon_required_error("commit", layout))?;
@@ -224,17 +234,22 @@ async fn run_daemon_commit(
     // the byte-identical repository transaction.
     let operation_id = kin_model::OperationId::new();
     let timestamp = kin_model::Timestamp::now();
+    let mut payload = serde_json::json!({
+        "operation_id": operation_id,
+        "timestamp": timestamp,
+        "message": message,
+        "author": author,
+    });
+    if let Some(expected_head) = expected_head {
+        payload["amend"] = serde_json::json!(true);
+        payload["expected_head"] = serde_json::json!(expected_head);
+    }
     let mut request = client
         .post(format!(
             "{}/commands/commit",
             daemon_url.trim_end_matches('/')
         ))
-        .json(&serde_json::json!({
-            "operation_id": operation_id,
-            "timestamp": timestamp,
-            "message": message,
-            "author": author,
-        }));
+        .json(&payload);
     if let Some(token) = crate::daemon_client::resolve_daemon_auth_token() {
         request = request.bearer_auth(token);
     }

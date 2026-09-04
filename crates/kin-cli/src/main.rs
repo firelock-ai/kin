@@ -149,9 +149,12 @@ enum Command {
     /// commit prints, so this surface and that one cannot drift (FIR-2627).
     #[command(long_about = commands::commit_progress::COMMIT_LONG_ABOUT)]
     Commit {
-        /// Commit message
-        #[arg(short, long)]
-        message: String,
+        /// Commit message; amend preserves the existing message when omitted
+        #[arg(short, long, required_unless_present = "amend")]
+        message: Option<String>,
+        /// Replace the current change with the full working state, preserving its parents
+        #[arg(long)]
+        amend: bool,
         /// Suppress progress output (only print final summary)
         #[arg(short, long)]
         quiet: bool,
@@ -2848,9 +2851,13 @@ fn run() -> Result<()> {
                         commands::resources::run(json, profile).await
                     }
                 },
-                Command::Commit { message, quiet } => {
+                Command::Commit {
+                    message,
+                    quiet,
+                    amend,
+                } => {
                     commands::capabilities::require_ready("commit")?;
-                    commands::commit::run(message, quiet).await
+                    commands::commit::run(message, quiet, amend).await
                 }
                 Command::Log { count, json } => commands::log::run(count, json),
                 Command::Branch { action } => match action {
@@ -5609,6 +5616,36 @@ mod tests {
                      an open gate"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn commit_amend_preserves_message_unless_overridden() {
+        on_cli_test_stack(|| {
+            assert!(Cli::try_parse_from(["kin", "commit"]).is_err());
+            let cli = Cli::try_parse_from(["kin", "commit", "--amend"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Commit {
+                    amend: true,
+                    message: None,
+                    ..
+                }
+            ));
+            let cli =
+                Cli::try_parse_from(["kin", "commit", "--amend", "-m", "correction"]).unwrap();
+            assert!(
+                matches!(cli.command, Command::Commit { amend: true, message: Some(message), .. } if message == "correction")
+            );
+            let cli = Cli::try_parse_from(["kin", "commit", "-m", "new change"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Commit {
+                    amend: false,
+                    message: Some(_),
+                    ..
+                }
+            ));
         });
     }
 
