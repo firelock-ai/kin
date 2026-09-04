@@ -1552,7 +1552,19 @@ impl FirestoreStore {
                         Err(error) => return Ok(Attempt::Transport(error.to_string())),
                     };
                     let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
+                    // A body that fails to arrive after the status did is a
+                    // transport failure, never a success with an empty body:
+                    // an empty body would be parsed as the answer, and a
+                    // `:runQuery` answer of "" is a fatal serialization error
+                    // that the transient policy would otherwise never see.
+                    let body = match response.text().await {
+                        Ok(body) => body,
+                        Err(error) => {
+                            return Ok(Attempt::Transport(format!(
+                                "response body read failed after status {status}: {error}"
+                            )))
+                        }
+                    };
                     Ok(Attempt::Response(status, body))
                 });
                 match attempt {
@@ -7189,6 +7201,14 @@ mod transient_retry_tests {
         },
         /// Close without answering: the transport error the rehearsal saw.
         Drop,
+        /// Answer the status and headers, promise `claimed_len` body bytes,
+        /// write fewer, then close: the body read fails after the status
+        /// arrived, which is what a reset mid-stream looks like to the client.
+        Truncated {
+            status: u16,
+            body: String,
+            claimed_len: usize,
+        },
     }
 
     #[derive(Clone, Debug)]
@@ -7280,6 +7300,22 @@ mod transient_retry_tests {
                             let _ = stream.flush();
                         }
                         Scripted::Drop => drop(stream),
+                        Scripted::Truncated {
+                            status,
+                            body,
+                            claimed_len,
+                        } => {
+                            let reason = reqwest::StatusCode::from_u16(status)
+                                .ok()
+                                .and_then(|status| status.canonical_reason())
+                                .unwrap_or("Scripted");
+                            let response = format!(
+                                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {claimed_len}\r\nConnection: close\r\n\r\n{body}"
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                            drop(stream);
+                        }
                     }
                 }
             });
@@ -7351,6 +7387,39 @@ mod transient_retry_tests {
             .iter()
             .all(|request| request.method == "GET"
                 && request.path.ends_with("/spine_repo_heads_v2/abc")));
+    }
+
+    #[test]
+    fn query_documents_retries_a_body_that_fails_to_arrive_over_the_wire() {
+        let document = serde_json::json!({
+            "name": "projects/fixture-project/databases/(default)/documents/spine_entities_v2/pub_ent",
+            "fields": { "payload": { "stringValue": "{}" } },
+            "updateTime": "2026-09-04T13:39:12.000000Z"
+        });
+        let answer = serde_json::json!([
+            { "document": document, "readTime": "2026-09-04T13:39:12.000000Z" }
+        ])
+        .to_string();
+        // The first connection promises the whole answer and delivers half of
+        // it before closing, so the status is 200 and the body read fails.
+        let server = ScriptedServer::serve(vec![
+            Scripted::Truncated {
+                status: 200,
+                body: answer[..answer.len() / 2].to_string(),
+                claimed_len: answer.len(),
+            },
+            respond(200, &answer),
+        ]);
+        let store = store_against(&server);
+        let documents = store
+            .query_documents("spine_entities_v2", "publication_id", "pub", Some(1))
+            .expect("the second attempt carries the whole body");
+        assert_eq!(documents, vec![document]);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests
+            .iter()
+            .all(|request| request.method == "POST" && request.path.ends_with(":runQuery")));
     }
 
     #[test]
