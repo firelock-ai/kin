@@ -46,17 +46,54 @@ authority_files=(
 # Raw filesystem read / existence / traversal primitives. Subprocess creation
 # is denied wholesale in answer modules so dynamic or multiline rg/grep/find/
 # git-grep builders cannot bypass a line-local executable-name pattern.
-deny_re='\.is_file\(\)|\.is_dir\(\)|\.exists\(\)|\.try_exists\(\)|\.is_symlink\(\)|\.canonicalize\(\)|\.metadata\(\)|symlink_metadata|read_link|Command::new[[:space:]]*\(|process[[:space:]]*(::|as([[:space:]]|$))|std::fs::(read|read_to_string|read_dir|metadata|File)|[^_a-z]fs::(read|read_to_string|read_dir|metadata)|File::open|read_dir\(|WalkDir|walkdir::|glob::glob'
+#
+# The filesystem half matches the MODULE, not the item name. It used to read
+# `std::fs::(read|read_to_string|read_dir|metadata|File)`, an enumeration of
+# five functions, and `OpenOptions` was in neither that alternation nor the
+# Python checker's: a read written with the builder shape passed both guards
+# green in `locate.rs`, the flagship answer module. Naming five items out of a
+# module is always one item behind, and `std::fs::exists` stabilising in 1.81
+# would have been the next miss. `std::fs` on its own is complete over that
+# module forever, and it costs nothing here because none of the ten answer
+# modules imports it.
+#
+# This guard has no parser, so it cannot do what the Python checker does and
+# learn a file's bindings from its own `use` trees. It does not have to: you
+# cannot bind an fs name without a `use` line, and a `use` line always names
+# the module. So the type names below are belt to the namespace reach's braces,
+# and the two together close the same class the checker closes with a parser.
+deny_re='\.is_file\(\)|\.is_dir\(\)|\.exists\(\)|\.try_exists\(\)|\.is_symlink\(\)|\.canonicalize\(\)|\.metadata\(\)|symlink_metadata|read_link|Command::new[[:space:]]*\(|process[[:space:]]*(::|as([[:space:]]|$))|(std|core)::fs|std::os::(unix|windows|wasi)::fs|(tokio|async_std|smol)::fs|(fs_err|fs2|fs_extra|filetime|walkdir)::|[^_a-z]fs::[a-zA-Z_]|File::(open|create|create_new|options)|OpenOptions|DirBuilder|DirEntry|ReadDir|read_dir\(|WalkDir|glob::glob'
 
 # Per-file justified allowlist (input/output boundaries, not the answer). A new
 # or different primitive in the same file still trips the guard.
+#
+# One expression PER LINE, and more than one per file is allowed. It used to be
+# a single string, which was not a policy decision, it was the shape the deny
+# set happened to need: nothing else was reported, so nothing else had to be
+# declared. Widening the deny set from five enumerated `std::fs` functions to
+# the module surfaced the cursor cache's own write and delete in
+# `locate_cursor.rs`, two boundary calls sitting one line apart from a read that
+# was declared, invisible for as long as the guard only watched five names.
+# Each expression is still counted and must occur exactly once.
 allow_for() {
   case "$1" in
-    locate.rs)             printf '%s' 'let marker_present = tel::consent_marker_path(layout.root()).exists();' ;;
-    locate_cursor.rs)      printf '%s' 'std::fs::read_to_string(&path)' ;;
-    locate_debug.rs)       printf '%s' 'std::fs::read_to_string(path)' ;;
-    contextbench_locate.rs) printf '%s' 'std::fs::read_to_string(&task_file)' ;;
-    *)                     printf '%s' '' ;;
+    locate.rs)
+      printf '%s\n' 'let marker_present = tel::consent_marker_path(layout.root()).exists();'
+      ;;
+    locate_cursor.rs)
+      # The paging-cursor cache, read, written and cleared. It holds a locate
+      # continuation token, never repository content, and no locate result is
+      # derived from it: a miss restarts paging rather than answering.
+      printf '%s\n' 'std::fs::read_to_string(&path)' \
+                    'let _ = std::fs::write(&path, cursor);' \
+                    'let _ = std::fs::remove_file(&path);'
+      ;;
+    locate_debug.rs)
+      printf '%s\n' 'std::fs::read_to_string(path)'
+      ;;
+    contextbench_locate.rs)
+      printf '%s\n' 'std::fs::read_to_string(&task_file)'
+      ;;
   esac
 }
 
@@ -101,10 +138,25 @@ for rel in "${authority_files[@]}"; do
   file="$repo_root/$rel"
   [[ -f "$file" ]] || continue
   base="$(basename "$rel")"
-  allow="$(allow_for "$base")"
   read -r test_start test_end <<<"$(test_module_span "$file")"
 
-  if [[ -n "$allow" ]]; then
+  # Read into an array rather than a single string. `while read` rather than
+  # `mapfile`, because the CI image and this fleet's macOS boxes do not agree on
+  # bash 4.
+  allow_list=()
+  while IFS= read -r allow_expr; do
+    [[ -n "$allow_expr" ]] && allow_list+=("$allow_expr")
+  done < <(allow_for "$base")
+
+  # Everything outside the test module, before it and after it alike, with the
+  # original line numbers preserved.
+  region="$(awk -v s="$test_start" -v e="$test_end" \
+    'NR < s || NR > e { print NR ":" $0 }' "$file")"
+  scan_region="$region"
+
+  # An empty array is unbound under `set -u` on bash 3.2, so expand it guarded.
+  pin_failed=0
+  for allow in ${allow_list[@]+"${allow_list[@]}"}; do
     allow_hits="$(grep -F -o -- "$allow" "$file" || true)"
     allow_count=0
     if [[ -n "$allow_hits" ]]; then
@@ -114,17 +166,10 @@ for rel in "${authority_files[@]}"; do
       violations+=(
         "$rel: allowlist expression occurs $allow_count times (want exactly 1): $allow"
       )
+      pin_failed=1
       continue
     fi
-  fi
-
-  # Everything outside the test module, before it and after it alike, with the
-  # original line numbers preserved.
-  region="$(awk -v s="$test_start" -v e="$test_end" \
-    'NR < s || NR > e { print NR ":" $0 }' "$file")"
-  scan_region="$region"
-  if [[ -n "$allow" ]]; then
-    scan_region="$(printf '%s\n' "$region" | awk -v needle="$allow" '
+    scan_region="$(printf '%s\n' "$scan_region" | awk -v needle="$allow" '
       {
         pos = index($0, needle)
         if (pos > 0) {
@@ -133,7 +178,9 @@ for rel in "${authority_files[@]}"; do
         print
       }
     ')"
-  fi
+  done
+  [[ "$pin_failed" -eq 0 ]] || continue
+
   hits="$(printf '%s\n' "$scan_region" | grep -E "$deny_re" || true)"
   [[ -n "$hits" ]] || continue
   while IFS= read -r hit; do
