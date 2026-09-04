@@ -615,6 +615,7 @@ fn three_way(
         |entity| MergeConflictSubject::Entity { entity: *entity },
         MergeSideValue::entity,
         |entity| describe_entity(&ours_state.entities, &theirs_state.entities, entity),
+        entities_agree,
         &mut conflicts,
     )?;
     let merged_relations = compose(
@@ -626,6 +627,7 @@ fn three_way(
         },
         MergeSideValue::relation,
         |_| None,
+        |left, right| left == right,
         &mut conflicts,
     )?;
     let merged_artifacts = compose(
@@ -643,6 +645,7 @@ fn three_way(
                 .or_else(|| theirs_state.tree.get(artifact))
                 .map(|resolved| resolved.path.to_string())
         },
+        |left, right| left == right,
         &mut conflicts,
     )?;
     let mut claimed: BTreeMap<&kin_model::RepoPath, Vec<kin_model::ArtifactId>> = BTreeMap::new();
@@ -927,6 +930,7 @@ pub(crate) fn publish_resolved_merge(
         |entity| MergeConflictSubject::Entity { entity: *entity },
         MergeSideValue::entity,
         |entity| describe_entity(&ours_state.entities, &theirs_state.entities, entity),
+        entities_agree,
         &mut recomposed,
     )?;
     let mut merged_relations = compose(
@@ -938,6 +942,7 @@ pub(crate) fn publish_resolved_merge(
         },
         MergeSideValue::relation,
         |_| None,
+        |left, right| left == right,
         &mut recomposed,
     )?;
     let ours_artifacts = artifacts_by_id(&ours_state.tree);
@@ -958,6 +963,7 @@ pub(crate) fn publish_resolved_merge(
                 .or_else(|| theirs_state.tree.get(artifact))
                 .map(|resolved| resolved.path.to_string())
         },
+        |left, right| left == right,
         &mut recomposed,
     )?;
     let mut claimed: BTreeMap<&kin_model::RepoPath, Vec<kin_model::ArtifactId>> = BTreeMap::new();
@@ -1799,25 +1805,18 @@ fn decisions_a_side_drops<'a>(
 /// not semantic ones. Editing one function moves the span of every entity below
 /// it, so a whole-value comparison would report every entity in that file as
 /// disagreeing when only one of them moved. That is the same fan-out the
-/// conflict listing already shows, twenty-two entity conflicts for one edited
-/// function, and judging agreement on it would refuse every mixed settle kin
-/// can honestly project. Agreement is judged on what the graph calls content:
-/// the fingerprint over normalized structure, signature, exact source text and
-/// behaviour class, beside the declaration facts around it.
+/// conflict listing showed, fourteen entity and artifact conflicts for a
+/// two-function change, and judging agreement on it would refuse every mixed
+/// settle kin can honestly project.
+///
+/// This used to carry its own field list. It now defers to
+/// [`kin_core::workspace_semantics::entity_sides_agree`], which is the same
+/// list and is the ONE answer `compose` above, `kin conflicts`, `kin diff`,
+/// `kin log`, `kin blame` and `kin history` all ask. Two field lists were two
+/// answers to one question, and the surfaces that reported changes were reading
+/// neither.
 fn entities_agree(left: Option<&kin_model::Entity>, right: Option<&kin_model::Entity>) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => {
-            left.kind == right.kind
-                && left.name == right.name
-                && left.language == right.language
-                && left.fingerprint == right.fingerprint
-                && left.signature == right.signature
-                && left.visibility == right.visibility
-                && left.role == right.role
-        }
-        _ => false,
-    }
+    kin_core::workspace_semantics::entity_sides_agree(left, right)
 }
 
 /// Split settlements at one path into the SPECIFIC ones, which constrain what
@@ -1937,16 +1936,38 @@ fn side_flag(side: MergeSide) -> &'static str {
 
 /// Compose one identity-keyed dimension of the three-way merge.
 ///
-/// Every decision is by exact value equality against the merge base, so a side
-/// that did not move never overrides a side that did, and both sides moving to
-/// the same value is agreement rather than conflict.
-fn compose<K, V, S, D, L>(
+/// Every decision is by value equality against the merge base, so a side that
+/// did not move never overrides a side that did, and both sides moving to the
+/// same value is agreement rather than conflict.
+///
+/// `agrees` is how this dimension measures "did not move", and it is a
+/// parameter because the answer differs by dimension. Relations and artifacts
+/// use exact equality: their whole value IS their content. An `Entity` is not,
+/// and comparing one exactly is what inflated the conflict set. `reconciler`
+/// stamps the whole FILE's blob hash into every entity's `metadata.extra`, and
+/// editing one function moves the byte span of every entity below it, so on a
+/// file both branches touched every entity in it compares unequal on both
+/// sides and every one of them was minted as a conflict. A two-function change
+/// across two files reported fourteen conflicts where four exist, and
+/// `kin conflicts --show` printed empty `base -> ours` and `base -> theirs`
+/// diffs for the ten spurious ones, contradicting the same command's own list.
+///
+/// The decision table below is unchanged. Only the question it asks is: for
+/// entities it is now [`entities_agree`], the same content comparison the
+/// projection path already used to decide whether a settlement is dropped, and
+/// the same one `kin diff`, `kin log`, `kin blame` and `kin history` report on.
+/// An entity neither branch edited therefore composes instead of conflicting,
+/// and carries this branch's value, exactly as settling it `--ours` did before.
+/// The file's own bytes are still a decision the reader makes, because the
+/// artifact conflict for a file both branches changed is untouched by this.
+fn compose<K, V, S, D, L, A>(
     base: &std::collections::HashMap<K, V>,
     ours: &std::collections::HashMap<K, V>,
     theirs: &std::collections::HashMap<K, V>,
     subject: S,
     side_value: D,
     label: L,
+    agrees: A,
     conflicts: &mut Vec<MergeConflictEntry>,
 ) -> Result<std::collections::HashMap<K, V>>
 where
@@ -1955,6 +1976,7 @@ where
     S: Fn(&K) -> MergeConflictSubject,
     D: Fn(Option<&V>) -> std::result::Result<MergeSideValue, ModelError>,
     L: Fn(&K) -> Option<String>,
+    A: Fn(Option<&V>, Option<&V>) -> bool,
 {
     // Identity iteration is ordered so the reported conflict set is stable
     // across runs; the composed maps themselves are order-independent.
@@ -1967,11 +1989,11 @@ where
         let base_side = base.get(&id);
         let our_side = ours.get(&id);
         let their_side = theirs.get(&id);
-        let resolved = if our_side == their_side {
+        let resolved = if agrees(our_side, their_side) {
             our_side
-        } else if our_side == base_side {
+        } else if agrees(our_side, base_side) {
             their_side
-        } else if their_side == base_side {
+        } else if agrees(their_side, base_side) {
             our_side
         } else {
             conflicts.push(MergeConflictEntry {
@@ -3145,6 +3167,291 @@ mod tests {
         );
     }
 
+    /// One version of one entity, with the file-level noise a real reconcile
+    /// stamps on it.
+    ///
+    /// `body` is the entity's own source. `stamp` is the containing FILE's blob
+    /// hash and the byte offset every entity below an edit shifts to, which is
+    /// what `reconciler` writes into `metadata.extra` and `span` for every
+    /// entity in a touched file whether or not that entity moved.
+    fn python_entity(
+        id: kin_model::EntityId,
+        name: &str,
+        file: &str,
+        body: u8,
+        stamp: u8,
+    ) -> kin_model::Entity {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "artifact_blob".to_string(),
+            serde_json::Value::String(format!("{stamp:02x}")),
+        );
+        kin_model::Entity {
+            id,
+            kind: kin_model::EntityKind::Function,
+            name: name.to_string(),
+            language: kin_model::LanguageId::Python,
+            fingerprint: kin_model::SemanticFingerprint {
+                algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([body; 32]),
+                signature_hash: Hash256::from_bytes([1; 32]),
+                behavior_hash: Hash256::from_bytes([body; 32]),
+                equivalence_hash: Hash256::from_bytes([body; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(kin_model::FilePathId::new(file)),
+            span: Some(kin_model::SourceSpan {
+                file: kin_model::FilePathId::new(file),
+                start_byte: usize::from(stamp) * 100,
+                end_byte: usize::from(stamp) * 100 + 40,
+                start_line: u32::from(stamp),
+                start_col: 0,
+                end_line: u32::from(stamp) + 3,
+                end_col: 0,
+            }),
+            signature: format!("def {name}()"),
+            visibility: kin_model::Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::EntityMetadata { extra },
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    /// The stranger's merge, rebuilt: two files both branches changed, one
+    /// function inside each edited differently on the two sides.
+    ///
+    /// `ledger/reporting.py` holds five entities and `tests/test_reporting.py`
+    /// holds seven, which is where fourteen came from: 5 + 7 entities + 2
+    /// artifacts. Only `format_totals` and `test_search_requires_every_term`
+    /// carry a different body on the two sides. Every other entity holds the
+    /// same source on all three sides and differs only in the file blob stamp
+    /// and the byte span, which is exactly what a reconcile writes for every
+    /// entity in a file somebody else edited.
+    fn stranger_merge_states() -> (
+        ResolvedGraphState,
+        ResolvedGraphState,
+        ResolvedGraphState,
+        Vec<kin_model::EntityId>,
+    ) {
+        let reporting = ArtifactId::new();
+        let test_reporting = ArtifactId::new();
+        let reporting_path = "ledger/reporting.py";
+        let test_path = "tests/test_reporting.py";
+        let names: Vec<(&str, &str)> = vec![
+            ("reporting", reporting_path),
+            ("totals_by_category", reporting_path),
+            ("totals_by_month", reporting_path),
+            ("search_entries", reporting_path),
+            ("format_totals", reporting_path),
+            ("test_reporting", test_path),
+            ("ENTRIES", test_path),
+            ("test_totals_by_category", test_path),
+            ("test_totals_by_month", test_path),
+            ("test_format_totals", test_path),
+            ("test_search_matches_description", test_path),
+            ("test_search_requires_every_term", test_path),
+        ];
+        let ids: Vec<kin_model::EntityId> =
+            names.iter().map(|_| kin_model::EntityId::new()).collect();
+        // The two entities the two branches actually edited, differently.
+        let edited = ["format_totals", "test_search_requires_every_term"];
+
+        let build = |stamp: u8, body_of: &dyn Fn(&str) -> u8| {
+            let entities: std::collections::HashMap<kin_model::EntityId, kin_model::Entity> = names
+                .iter()
+                .zip(ids.iter())
+                .map(|((name, file), id)| {
+                    (*id, python_entity(*id, name, file, body_of(name), stamp))
+                })
+                .collect();
+            ResolvedGraphState {
+                entities,
+                tree: ResolvedTree::from_artifacts([
+                    artifact(reporting, reporting_path, stamp),
+                    artifact(test_reporting, test_path, stamp.wrapping_add(0x40)),
+                ])
+                .unwrap(),
+                ..ResolvedGraphState::default()
+            }
+        };
+
+        let base = build(0x10, &|_| 1);
+        let ours = build(0x20, &|name| if edited.contains(&name) { 2 } else { 1 });
+        let theirs = build(0x30, &|name| if edited.contains(&name) { 3 } else { 1 });
+        (base, ours, theirs, ids)
+    }
+
+    /// A two-function merge reports the two functions and the two files, not
+    /// every entity that lives in them.
+    ///
+    /// This is the vcs stranger run's top finding on the public v0.6.7 bytes:
+    /// `kin merge` answered a two-function change with fourteen conflicts, and
+    /// `kin conflicts --show` printed empty `base -> ours` and `base -> theirs`
+    /// diffs for ten of them, contradicting the same command's own list. The
+    /// cause is `compose` asking exact `Entity` equality on a value that
+    /// carries the whole FILE's blob hash and a byte span, so every entity in a
+    /// file both branches touched compares unequal on both sides.
+    ///
+    /// Breaking it: put `our_side == their_side`, `our_side == base_side` and
+    /// `their_side == base_side` back into `compose`'s decision table and this
+    /// reports fourteen.
+    #[test]
+    fn a_two_function_merge_conflicts_two_entities_and_two_artifacts() {
+        let (base_state, ours_state, theirs_state, _) = stranger_merge_states();
+        let mut conflicts = Vec::new();
+        let merged_entities = compose(
+            &base_state.entities,
+            &ours_state.entities,
+            &theirs_state.entities,
+            |entity| MergeConflictSubject::Entity { entity: *entity },
+            MergeSideValue::entity,
+            |entity| describe_entity(&ours_state.entities, &theirs_state.entities, entity),
+            entities_agree,
+            &mut conflicts,
+        )
+        .unwrap();
+        let _merged_artifacts = compose(
+            &artifacts_by_id(&base_state.tree),
+            &artifacts_by_id(&ours_state.tree),
+            &artifacts_by_id(&theirs_state.tree),
+            |artifact| MergeConflictSubject::Artifact {
+                artifact: *artifact,
+            },
+            MergeSideValue::artifact,
+            |_| None,
+            |left, right| left == right,
+            &mut conflicts,
+        )
+        .unwrap();
+
+        let entity_conflicts: Vec<&MergeConflictEntry> = conflicts
+            .iter()
+            .filter(|entry| matches!(entry.subject, MergeConflictSubject::Entity { .. }))
+            .collect();
+        let artifact_conflicts = conflicts
+            .iter()
+            .filter(|entry| matches!(entry.subject, MergeConflictSubject::Artifact { .. }))
+            .count();
+
+        let conflicted_names: Vec<&str> = entity_conflicts
+            .iter()
+            .filter_map(|entry| match &entry.subject {
+                MergeConflictSubject::Entity { entity } => ours_state
+                    .entities
+                    .get(entity)
+                    .map(|found| found.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            entity_conflicts.len(),
+            2,
+            "only the two edited functions conflict, got {conflicted_names:?}"
+        );
+        assert!(
+            conflicted_names.contains(&"format_totals")
+                && conflicted_names.contains(&"test_search_requires_every_term"),
+            "the two conflicts are the two edited functions, got {conflicted_names:?}"
+        );
+        assert_eq!(
+            artifact_conflicts, 2,
+            "both files still conflict, because their bytes are still a decision"
+        );
+        assert_eq!(
+            conflicts.len(),
+            4,
+            "four conflicts where the artifact-based composer minted fourteen"
+        );
+
+        // The ten that no longer conflict still have to COMPOSE, or the merge
+        // has silently dropped ten entities rather than stopped over-reporting
+        // them. Ten of the twelve, because a conflicted identity is composed by
+        // its settlement rather than here, which is unchanged.
+        assert_eq!(merged_entities.len(), 10);
+        for (name, file) in [
+            ("totals_by_category", "ledger/reporting.py"),
+            ("ENTRIES", "tests/test_reporting.py"),
+        ] {
+            let found = merged_entities
+                .values()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("{name} survives composition"));
+            assert_eq!(
+                found.span.as_ref().unwrap().file.to_string(),
+                file,
+                "{name} composes to a real value, not an empty one"
+            );
+        }
+    }
+
+    /// The positive control for the test above.
+    ///
+    /// An entity BOTH branches edited differently is a real conflict and must
+    /// stay one. Without this, a `compose` that never conflicted an entity at
+    /// all would satisfy the collapse assertion, and the fix would read as
+    /// working while it had removed conflict detection.
+    #[test]
+    fn an_entity_edited_differently_on_both_sides_still_conflicts() {
+        let id = kin_model::EntityId::new();
+        let state = |body: u8, stamp: u8| ResolvedGraphState {
+            entities: [(id, python_entity(id, "format_totals", "a.py", body, stamp))].into(),
+            ..ResolvedGraphState::default()
+        };
+        let mut conflicts = Vec::new();
+        compose(
+            &state(1, 0x10).entities,
+            &state(2, 0x20).entities,
+            &state(3, 0x30).entities,
+            |entity| MergeConflictSubject::Entity { entity: *entity },
+            MergeSideValue::entity,
+            |_| None,
+            entities_agree,
+            &mut conflicts,
+        )
+        .unwrap();
+        assert_eq!(conflicts.len(), 1, "a real content conflict is still one");
+    }
+
+    /// One side edited and the other did not, so the edit wins with no
+    /// conflict, and the edit is what the merge carries.
+    ///
+    /// The pair matters: asserting only that nothing conflicted would pass on a
+    /// composer that silently took `ours` and threw the other branch's work
+    /// away.
+    #[test]
+    fn a_one_sided_edit_composes_to_the_side_that_edited_it() {
+        let id = kin_model::EntityId::new();
+        let entities =
+            |body: u8,
+             stamp: u8|
+             -> std::collections::HashMap<kin_model::EntityId, kin_model::Entity> {
+                [(id, python_entity(id, "format_totals", "a.py", body, stamp))].into()
+            };
+        let mut conflicts = Vec::new();
+        let merged = compose(
+            &entities(1, 0x10),
+            // Ours holds the same source under a different file stamp, which is
+            // what a reconcile writes when somebody edits a neighbour.
+            &entities(1, 0x20),
+            &entities(7, 0x30),
+            |entity| MergeConflictSubject::Entity { entity: *entity },
+            MergeSideValue::entity,
+            |_| None,
+            entities_agree,
+            &mut conflicts,
+        )
+        .unwrap();
+        assert!(conflicts.is_empty(), "one-sided edits do not conflict");
+        assert_eq!(
+            merged.get(&id).unwrap().fingerprint.behavior_hash,
+            Hash256::from_bytes([7; 32]),
+            "the branch that edited the function is the branch whose body publishes"
+        );
+    }
+
     #[test]
     fn dangling_relation_records_and_accepts_its_present_base_side() {
         let target_id = ArtifactId::new();
@@ -3196,6 +3503,7 @@ mod tests {
             },
             MergeSideValue::artifact,
             |_| None,
+            |left, right| left == right,
             &mut conflicts,
         )
         .unwrap();
@@ -3208,6 +3516,7 @@ mod tests {
             },
             MergeSideValue::relation,
             |_| None,
+            |left, right| left == right,
             &mut conflicts,
         )
         .unwrap();
@@ -3315,6 +3624,7 @@ mod tests {
             },
             MergeSideValue::artifact,
             |_| None,
+            |left, right| left == right,
             &mut conflicts,
         )
         .unwrap();
@@ -3327,6 +3637,7 @@ mod tests {
             },
             MergeSideValue::relation,
             |_| None,
+            |left, right| left == right,
             &mut conflicts,
         )
         .unwrap();
