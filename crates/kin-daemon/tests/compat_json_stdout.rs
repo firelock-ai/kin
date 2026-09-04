@@ -81,4 +81,58 @@ async fn compat_json_stdout_is_pure_json_under_env_overrides() {
     assert!(parsed["build"]["dependency_provenance"].is_string());
     assert!(parsed["build"]["branch"].is_string());
     assert!(parsed["build"]["built_at"].is_string());
+
+    // The exact top-level key set. kin-infra reads this payload by name and
+    // records it verbatim as the evidence a hosted pin is graded against, so a
+    // key that quietly appears or disappears changes what that evidence means.
+    // Adding one is fine and this is where it is acknowledged.
+    let mut keys: Vec<&str> = parsed
+        .as_object()
+        .expect("the compat payload must be an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "build",
+            "graph_snapshot_max_supported_version",
+            "graph_snapshot_min_supported_version",
+            "graph_snapshot_version",
+            "hosted_start_requirements",
+            "schema",
+            "supervisor_startup_capabilities",
+            "supervisor_startup_protocol",
+            "version",
+        ],
+        "the compat payload's top-level shape changed"
+    );
+
+    // The hosted declaration itself, from the real binary rather than from the
+    // in-process renderer, so the block a deployment reads off an image is the
+    // one under test.
+    let hosted = &parsed["hosted_start_requirements"];
+    assert_eq!(hosted["schema"], "kin.daemon.hosted-start.v1");
+    assert!(
+        hosted["features"]["gcs"].is_boolean() && hosted["features"]["firestore"].is_boolean(),
+        "the declaration must report the build features hosted service needs: {hosted}"
+    );
+    let requirements = hosted["requirements"]
+        .as_array()
+        .expect("the declaration must carry a requirements array");
+    let project = requirements
+        .iter()
+        .find(|entry| entry["name"] == "GOOGLE_CLOUD_PROJECT")
+        .unwrap_or_else(|| panic!("the declaration must name GOOGLE_CLOUD_PROJECT: {hosted}"));
+    assert_eq!(project["required"], true);
+    assert_eq!(
+        project["absence"], "readiness-closed",
+        "a missing project does not stop the process, it holds readiness shut, and a deployment \
+         reading this block has to be told which"
+    );
+    assert_eq!(
+        project["refusals"][0]["message"],
+        "GOOGLE_CLOUD_PROJECT is required for hosted durable spine"
+    );
 }
