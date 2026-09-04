@@ -1874,6 +1874,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/check-kin-vfs-compat.mjs
 
+      # ADDED here as well as in `fast-gate-lint`, for the reason the step above
+      # is duplicated too: `bin/kin-precheck` enumerates guard scripts out of
+      # THIS job by name (`JOB="check"`), so a guard that exists only in
+      # `fast-gate-lint` is invisible to it, not UNCLASSIFIED, just never
+      # enumerated at all, which was verified empirically before adding this
+      # copy. `check` carries `github.event_name != 'pull_request'`, so this
+      # instance buys no pull-request coverage on its own; `fast-gate-lint`'s
+      # copy already does that. This one buys every lane's local
+      # `bin/kin-precheck kin` and a second look on every push to main. The
+      # cost of running it in both places is one API read on a push.
+      - name: Falsify required-contexts doc check
+        if: runner.os == 'Linux' && matrix.shard == 1
+        run: python3 scripts/check-required-contexts.py --self-test
+
+      - name: Check required-contexts doc matches branch protection
+        if: runner.os == 'Linux' && matrix.shard == 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check-required-contexts.py
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
         with:
