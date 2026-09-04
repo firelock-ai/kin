@@ -56,7 +56,9 @@
         "reject an unconfirmed mass deletion as a whole observation without publishing simultaneous additions, modifications, policy changes, or graph state",
         "commit exact workspace tree deltas and semantic deltas in one repository transaction",
         "preserve all unsupported-language and non-code artifacts, modes, symlinks, gitlinks, and byte-exact paths",
-        "publish the target ref with generation and root-bundle compare-and-swap and no raw-filesystem rebuild"
+        "publish the target ref with generation and root-bundle compare-and-swap and no raw-filesystem rebuild",
+        "explicit --amend replaces the exact selected head with full working state, retaining the original immutable change, author, message unless overridden, and every ordered parent",
+        "refuse stale amend selection before admission, unborn workspaces, open merges, and conflicting entity leases; detached amend advances only its workspace"
       ],
       "evidence_tests": [
         "kin_daemon::repository_commit::tests::native_commit_atomically_projects_exact_non_code_tree_and_ref",
@@ -67,9 +69,17 @@
         "kin_daemon::loop_runner::tests::incomplete_host_walk_publishes_no_workspace_authority",
         "kin_daemon::loop_runner::tests::unconfirmed_mass_deletion_publishes_no_part_of_the_observation",
         "kin_daemon::repository_commit::tests::stale_desired_tree_is_refused_against_newer_authority",
-        "kin_daemon::repository_commit::tests::desired_tree_planned_against_a_foreign_prior_tree_is_refused"
+        "kin_daemon::repository_commit::tests::desired_tree_planned_against_a_foreign_prior_tree_is_refused",
+        "crates/kin-cli/tests/commit_amend.rs::native_amend_replaces_imported_and_native_heads_through_matching_binaries",
+        "kin_daemon::repository_commit::tests::amend_root_preserves_authorship_and_pending_tree_after_reopen",
+        "kin_daemon::repository_commit::tests::amend_preserves_every_merge_parent_and_can_replace_message",
+        "kin_daemon::repository_commit::tests::amend_detached_head_moves_only_its_workspace",
+        "kin_daemon::repository_commit::tests::amend_refuses_unborn_stale_selection_and_stale_publication",
+        "kin_daemon::api::tests::commit_amend_rejects_stale_head_before_admitting_pending_files",
+        "kin_daemon::api::tests::commit_amend_cannot_drop_a_leased_entity_by_reverting_its_old_change",
+        "kin_daemon::api::tests::commit_amend_during_open_merge_refuses_before_admission"
       ],
-      "note": "Commit consumes one complete host observation that carries the scanner's completion proof into publication, binds the observed manifest to the authority roots and prior workspace tree it was planned against, and refuses rather than replans when authority moved. An unconfirmed mass deletion refuses the whole observation, so no addition, modification, or derived admission-policy state published beside it."
+      "note": "Commit consumes one complete host observation that carries the scanner's completion proof into publication, binds the observed manifest to the authority roots and prior workspace tree it was planned against, and refuses rather than replans when authority moved. An unconfirmed mass deletion refuses the whole observation, so no addition, modification, or derived admission-policy state published beside it. Explicit amend includes the full working state; path and hunk selection remain unavailable."
     },
     {
       "command": "log",

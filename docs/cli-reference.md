@@ -113,13 +113,16 @@ The commit lands in Kin's own authority, not in Git. Nothing is written to `.git
 
 > Recorded in Kin authority, not in git. `git status` stays dirty until you run `kin eject` or push this branch to a Kin remote.
 
+`kin commit --amend` replaces the current change with the full working state and keeps that change's parents. The message is kept unless `-m` supplies a new one. The replaced change stays immutable in history with its author, and the amend is recorded as the caller's operation. An amend is refused while a merge is open and when the selected head moved since it was read. A detached workspace amends only its own workspace and moves no ref. A plain `kin commit` with nothing to record still refuses as before.
+
 ```
 kin commit [options]
 ```
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-m, --message <message>` |  | Commit message |
+| `-m, --message <message>` |  | Commit message; amend preserves the existing message when omitted |
+| `--amend` |  | Replace the current change with the full working state, preserving its parents |
 | `-q, --quiet` |  | Suppress progress output (only print final summary) |
 
 ### `kin log`

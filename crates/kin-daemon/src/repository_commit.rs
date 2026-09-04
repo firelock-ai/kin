@@ -89,6 +89,8 @@ pub struct NativeCommitPlan {
     /// because a planner cannot tell an unclaimed file from an authored one,
     /// and an unclaimed file must never be reported as carried on a guess.
     pub carried_pending_files: Vec<RepoPath>,
+    /// Entity scopes whose published history this transaction changes.
+    pub entity_scope_ids: Vec<kin_model::EntityId>,
     previous_tree: kin_model::ResolvedTree,
     target_tree: kin_model::ResolvedTree,
     source_hashes: Vec<Hash256>,
@@ -672,6 +674,68 @@ pub(crate) fn publish_workspace_tree(
     }))
 }
 
+/// An explicit replacement of the exact change the caller selected.
+#[derive(Debug, Clone)]
+pub(crate) struct NativeAmend {
+    pub expected_head: SemanticChangeId,
+    pub message: Option<String>,
+}
+
+/// Check the selected head before filesystem admission can mutate the workspace.
+pub(crate) fn validate_native_amend_head(
+    authority_context: &LocalRepositoryAuthorityContext,
+    expected_head: SemanticChangeId,
+) -> Result<()> {
+    let authority = authority_context.open()?;
+    let lease = authority.read_authority();
+    let workspace = lease
+        .metadata()
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == authority_context.workspace_id())
+        .ok_or_else(|| invalid("repository authority has no local workspace"))?;
+    let (_, _, head) = resolve_commit_base(
+        lease.metadata(),
+        &workspace.head,
+        workspace.base_target.as_ref(),
+    )?;
+    require_amend_head(head, expected_head)
+}
+
+fn require_amend_head(head: Option<SemanticChangeId>, expected: SemanticChangeId) -> Result<()> {
+    match head {
+        None => Err(invalid("cannot amend an unborn workspace; create a commit first")),
+        Some(actual) if actual != expected => Err(invalid(format!(
+            "cannot amend {expected}: workspace HEAD is now {actual}; inspect the current change and retry"
+        ))),
+        Some(_) => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_native_amend(
+    graph: &kin_db::InMemoryGraph,
+    blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
+    operation_id: OperationId,
+    timestamp: Timestamp,
+    actor: AuthorId,
+    amend: &NativeAmend,
+) -> Result<NativeCommitPlan> {
+    plan_native_commit_inner(
+        graph,
+        blobs,
+        authority_context,
+        operation_id,
+        timestamp,
+        actor,
+        None,
+        &|_| String::new(),
+        None,
+        Some(amend),
+    )
+}
+
 /// Construct one exact native transaction without mutating repository
 /// authority.
 #[allow(clippy::too_many_arguments)]
@@ -693,6 +757,7 @@ pub(crate) fn plan_native_commit(
         author,
         None,
         &|_| message.clone(),
+        None,
         None,
     )
 }
@@ -725,6 +790,7 @@ pub(crate) fn plan_native_commit_from_base(
         None,
         &|_| message.clone(),
         Some(&base.roots),
+        None,
     )
 }
 
@@ -767,6 +833,7 @@ pub(crate) fn plan_native_commit_from_base_declaring_carry(
         Some(authored_files),
         message,
         Some(&base.roots),
+        None,
     )
 }
 
@@ -807,6 +874,7 @@ fn plan_native_commit_inner(
     authored_files: Option<&BTreeSet<RepoPath>>,
     message: &dyn Fn(&[RepoPath]) -> String,
     expected_roots: Option<&RootBundle>,
+    amend: Option<&NativeAmend>,
 ) -> Result<NativeCommitPlan> {
     let repository_id = authority_context.repository_id().clone();
     let workspace_id = authority_context.workspace_id();
@@ -835,8 +903,24 @@ fn plan_native_commit_inner(
         )));
     }
 
-    let (commit_target, current_ref_target, parent) =
+    let (commit_target, current_ref_target, head) =
         resolve_commit_base(metadata, &workspace.head, workspace.base_target.as_ref())?;
+    let previous_change = if let Some(amend) = amend {
+        require_amend_head(head, amend.expected_head)?;
+        Some(
+            lease
+                .snapshot()
+                .changes
+                .get(&amend.expected_head)
+                .ok_or_else(|| invalid("amend target is missing from repository history"))?,
+        )
+    } else {
+        None
+    };
+    let parents = previous_change
+        .map(|change| change.parents.clone())
+        .unwrap_or_else(|| head.into_iter().collect());
+    let parent = parents.first().copied();
     let parent_policy = match parent {
         Some(parent) => Some(
             metadata
@@ -929,7 +1013,13 @@ fn plan_native_commit_inner(
     let carried_pending_files = authored_files
         .map(|authored| carried_pending_paths(&deltas.tree_deltas, authored))
         .unwrap_or_default();
-    let message = message(&carried_pending_files);
+    let message = match (amend, previous_change) {
+        (Some(amend), Some(previous)) => amend
+            .message
+            .clone()
+            .unwrap_or_else(|| previous.message.clone()),
+        _ => message(&carried_pending_files),
+    };
     if message.trim().is_empty() {
         return Err(invalid("native commit message must not be empty"));
     }
@@ -940,9 +1030,11 @@ fn plan_native_commit_inner(
     let mut change = SemanticChange {
         id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
         origin: ChangeOrigin::Native,
-        parents: parent.into_iter().collect(),
+        parents,
         timestamp,
-        author: author.clone(),
+        author: previous_change
+            .map(|change| change.author.clone())
+            .unwrap_or_else(|| author.clone()),
         message,
         entity_deltas: deltas.entity_deltas,
         relation_deltas: deltas.relation_deltas,
@@ -955,6 +1047,18 @@ fn plan_native_commit_inner(
         external_reference_deltas: Vec::new(),
     };
     change.id = compute_semantic_change_id(&change)?;
+    let entity_scope_ids = change
+        .entity_deltas
+        .iter()
+        .chain(
+            previous_change
+                .into_iter()
+                .flat_map(|previous| previous.entity_deltas.iter()),
+        )
+        .map(kin_model::EntityDelta::target_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     let tree_hash = compute_resolved_tree_hash(&deltas.expected_tree)?;
     let workspace_tree_deltas =
@@ -978,7 +1082,11 @@ fn plan_native_commit_inner(
                     .map(|target| RefExpectation::MustEqual { target })
                     .unwrap_or(RefExpectation::MustNotExist),
                 new_target: Some(new_target.clone()),
-                policy: RefUpdatePolicy::FastForwardOnly,
+                policy: if amend.is_some() {
+                    RefUpdatePolicy::ForceWithLease
+                } else {
+                    RefUpdatePolicy::FastForwardOnly
+                },
             }],
         ),
         NativeCommitTarget::DetachedHead => (
@@ -1019,7 +1127,10 @@ fn plan_native_commit_inner(
         expected_generation: lease.roots().generation,
         expected_roots: lease.roots().clone(),
         actor: author,
-        reason: "publish admitted native semantic change".to_string(),
+        reason: match amend {
+            Some(amend) => format!("amend native semantic change {}", amend.expected_head),
+            None => "publish admitted native semantic change".to_string(),
+        },
         external_objects: Vec::new(),
         git_authority_delta: None,
         changes: vec![change.clone()],
@@ -1056,6 +1167,7 @@ fn plan_native_commit_inner(
         relation_count,
         file_count,
         carried_pending_files,
+        entity_scope_ids,
         previous_tree: workspace.tree,
         target_tree: deltas.expected_tree,
         source_hashes: source_hashes.into_iter().collect(),
@@ -2603,6 +2715,196 @@ mod tests {
             .change
             .id;
         (root, init, blobs, graph, first_change)
+    }
+
+    fn plan_amend_for_test(
+        init: &kin_core::InitResult,
+        blobs: &kin_blobs::BlobStore,
+        graph: &kin_db::InMemoryGraph,
+        expected_head: SemanticChangeId,
+        message: Option<&str>,
+    ) -> Result<NativeCommitPlan> {
+        super::plan_native_amend(
+            graph,
+            blobs,
+            &test_authority_context(&init.layout),
+            OperationId::new(),
+            Timestamp::now(),
+            AuthorId::new("amending actor"),
+            &NativeAmend {
+                expected_head,
+                message: message.map(str::to_owned),
+            },
+        )
+    }
+
+    #[test]
+    fn amend_root_preserves_authorship_and_pending_tree_after_reopen() {
+        let (_root, init, blobs, graph, first) = repository_with_one_change();
+        let original = reopen(&init).read_authority().snapshot().changes[&first].clone();
+        add_artifact(&graph, &blobs, b"pending.bin", &[0, 255, 4], |hash| {
+            TreeEntry::blob(hash, true)
+        });
+        let plan = plan_amend_for_test(&init, &blobs, &graph, first, None).unwrap();
+        assert!(
+            plan.change.parents.is_empty(),
+            "amending a root must not make its old head a parent"
+        );
+        assert_eq!(plan.change.author, original.author);
+        assert_eq!(plan.change.message, original.message);
+        assert_eq!(plan.transaction.actor, AuthorId::new("amending actor"));
+        assert_eq!(
+            plan.transaction.ref_mutations[0].policy,
+            RefUpdatePolicy::ForceWithLease
+        );
+        assert_eq!(
+            plan.transaction.ref_mutations[0].expected,
+            RefExpectation::MustEqual {
+                target: RefTarget::change(first)
+            }
+        );
+        let result = commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+        assert_ne!(result.change.id, first);
+        let recovered = super::recover_native_commit(
+            &test_authority_context(&init.layout),
+            result.receipt.operation_id,
+        )
+        .unwrap()
+        .expect("amend receipt must be recoverable");
+        assert_eq!(recovered.change.id, result.change.id);
+        assert_eq!(recovered.target, result.target);
+        assert_eq!(
+            std::fs::read(init.layout.working_dir().join("pending.bin")).unwrap(),
+            [0, 255, 4]
+        );
+        let authority = reopen(&init);
+        let lease = authority.read_authority();
+        assert_eq!(
+            lease.snapshot().changes[&first],
+            original,
+            "amend must retain the old immutable change"
+        );
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == init.workspace_id)
+            .unwrap();
+        assert_eq!(
+            workspace.base_target,
+            Some(RefTarget::change(result.change.id))
+        );
+        assert!(!workspace.is_dirty(), "the full working state was included");
+        let materialized = lease
+            .workspace_graph_snapshot(&init.workspace_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(materialized.resolved_tree, graph.resolved_tree());
+    }
+
+    #[test]
+    fn amend_preserves_every_merge_parent_and_can_replace_message() {
+        let (_root, init, blobs, graph, first) = repository_with_one_change();
+        let second_plan = plan_next_commit(&init, &blobs, &graph, b"second.txt").unwrap();
+        let second = commit_native_plan_with_projection(&init.layout, &blobs, second_plan)
+            .unwrap()
+            .change
+            .id;
+        let mut merge = plan_next_commit(&init, &blobs, &graph, b"third.txt").unwrap();
+        merge.change.parents = vec![second, first];
+        merge.change.id = compute_semantic_change_id(&merge.change).unwrap();
+        merge.transaction.changes = vec![merge.change.clone()];
+        merge.transaction.ref_mutations[0].new_target = Some(RefTarget::change(merge.change.id));
+        merge
+            .transaction
+            .workspace_mutation
+            .as_mut()
+            .unwrap()
+            .new_base_target = Some(RefTarget::change(merge.change.id));
+        let merged = commit_native_plan_with_projection(&init.layout, &blobs, merge)
+            .unwrap()
+            .change;
+        let plan = plan_amend_for_test(&init, &blobs, &graph, merged.id, Some("corrected message"))
+            .unwrap();
+        assert_eq!(plan.change.parents, vec![second, first]);
+        assert_eq!(plan.change.message, "corrected message");
+        let amended = commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+        let authority = reopen(&init);
+        let lease = authority.read_authority();
+        assert_eq!(lease.snapshot().changes[&merged.id], merged);
+        let mut snapshot = lease.snapshot().clone();
+        snapshot.repository_authority = None;
+        let history = kin_db::InMemoryGraph::from_snapshot(snapshot).unwrap();
+        use kin_model::ChangeStore as _;
+        assert_eq!(
+            history.resolve_graph_at(&amended.change.id).unwrap().tree,
+            graph.resolved_tree()
+        );
+    }
+
+    #[test]
+    fn amend_detached_head_moves_only_its_workspace() {
+        let (_root, init, blobs, graph, first) = repository_with_one_change();
+        detach_workspace_head(&init.layout);
+        let plan =
+            plan_amend_for_test(&init, &blobs, &graph, first, Some("detached correction")).unwrap();
+        assert!(plan.transaction.ref_mutations.is_empty());
+        assert!(plan.change.parents.is_empty());
+        let amended = commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+        let workspace = workspace_state(&init);
+        assert_eq!(
+            workspace.head,
+            WorkspaceHead::Detached {
+                target: RefTarget::change(amended.change.id)
+            }
+        );
+        assert_eq!(
+            reopen(&init)
+                .get_repository_ref(&init.repository_id, &RefName::branch(b"main").unwrap())
+                .unwrap()
+                .unwrap()
+                .target,
+            RefTarget::change(first)
+        );
+    }
+
+    #[test]
+    fn amend_refuses_unborn_stale_selection_and_stale_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let unknown = SemanticChangeId::from_hash(Hash256::from_bytes([42; 32]));
+        let error = plan_amend_for_test(&init, &blobs, &graph, unknown, None)
+            .err()
+            .expect("unborn amend must fail");
+        assert!(error.to_string().contains("unborn"), "{error}");
+        let (_root, init, blobs, graph, first) = repository_with_one_change();
+        let stale =
+            plan_amend_for_test(&init, &blobs, &graph, first, Some("stale correction")).unwrap();
+        let winner = plan_next_commit(&init, &blobs, &graph, b"winner.txt").unwrap();
+        let winner = commit_native_plan_with_projection(&init.layout, &blobs, winner)
+            .unwrap()
+            .change
+            .id;
+        let error = plan_amend_for_test(&init, &blobs, &graph, first, None)
+            .err()
+            .expect("stale amend must fail");
+        assert!(error.to_string().contains("HEAD is now"), "{error}");
+        let error = super::validate_native_amend_head(&test_authority_context(&init.layout), first)
+            .unwrap_err();
+        assert!(error.to_string().contains("HEAD is now"), "{error}");
+        let before = reopen(&init).read_authority().roots().clone();
+        let error = commit_native_plan(&init.layout, &blobs, stale).unwrap_err();
+        assert!(error.to_string().contains("generation mismatch"), "{error}");
+        let authority = reopen(&init);
+        let lease = authority.read_authority();
+        assert_eq!(*lease.roots(), before);
+        assert_eq!(lease.snapshot().changes.len(), 2);
+        assert_eq!(
+            workspace_state(&init).base_target,
+            Some(RefTarget::change(winner))
+        );
     }
 
     /// Stage a second artifact and plan the commit under test.

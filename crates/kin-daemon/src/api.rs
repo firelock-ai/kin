@@ -6170,7 +6170,12 @@ fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String
 struct CommandCommitRequest {
     operation_id: kin_model::OperationId,
     timestamp: kin_model::Timestamp,
-    message: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    amend: bool,
+    #[serde(default)]
+    expected_head: Option<kin_model::SemanticChangeId>,
     author: kin_model::AuthorId,
     #[serde(default)]
     session_id: Option<String>,
@@ -6195,6 +6200,25 @@ async fn command_commit(
         return Err(filesystem_ingest_disabled_response(
             "/commands/commit",
             &state.layout.working_dir().display().to_string(),
+        ));
+    }
+
+    if request.amend != request.expected_head.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "amend requires the exact expected_head; ordinary commit must not supply one"
+                .to_string(),
+        ));
+    }
+    if request
+        .message
+        .as_ref()
+        .is_some_and(|message| message.trim().is_empty())
+        || (!request.amend && request.message.is_none())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "native commit message must not be empty".to_string(),
         ));
     }
 
@@ -6231,6 +6255,13 @@ async fn command_commit(
     // Refuse before forced admission can advance that generation and strand
     // resolutions already persisted on the transaction.
     refuse_commit_during_open_merge(&state)?;
+    if let Some(expected_head) = request.expected_head {
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .map_err(repository_commit_error)?;
+        crate::repository_commit::validate_native_amend_head(&context, expected_head)
+            .map_err(repository_commit_error)?;
+    }
     // The admission derives the exact tree from the working copy but does not
     // publish it. This commit's own transaction carries that tree transition
     // beside the semantic change, so one repository-authority successor is
@@ -6316,19 +6347,40 @@ fn command_commit_after_admission(
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
             .map_err(repository_commit_error)?;
     let plan = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
-        crate::repository_commit::plan_native_commit(
-            graph,
-            state.blobs.as_ref(),
-            &authority_context,
-            request.operation_id,
-            request.timestamp,
-            request.author,
-            request.message,
-        )
+        if let Some(expected_head) = request.expected_head {
+            crate::repository_commit::plan_native_amend(
+                graph,
+                state.blobs.as_ref(),
+                &authority_context,
+                request.operation_id,
+                request.timestamp,
+                request.author,
+                &crate::repository_commit::NativeAmend {
+                    expected_head,
+                    message: request.message,
+                },
+            )
+        } else {
+            crate::repository_commit::plan_native_commit(
+                graph,
+                state.blobs.as_ref(),
+                &authority_context,
+                request.operation_id,
+                request.timestamp,
+                request.author,
+                request.message.ok_or_else(|| {
+                    crate::error::DaemonError::IncompatibleRepo(
+                        "native commit message must not be empty".to_string(),
+                    )
+                })?,
+            )
+        }
     })
     .map_err(repository_commit_error)?;
-    if let Some(refusal) = refuse_a_successor_that_records_nothing(&plan) {
-        return Err(refusal);
+    if !request.amend {
+        if let Some(refusal) = refuse_a_successor_that_records_nothing(&plan) {
+            return Err(refusal);
+        }
     }
     let change_id = plan.change.id;
     let branch_name = plan.target.branch().map(|name| name.to_string());
@@ -6341,14 +6393,10 @@ fn command_commit_after_admission(
         use kin_model::session::IntentScope;
 
         let scopes: Vec<IntentScope> = plan
-            .change
-            .entity_deltas
+            .entity_scope_ids
             .iter()
-            .map(|delta| match delta {
-                kin_model::EntityDelta::Added { new } => IntentScope::Entity(new.id),
-                kin_model::EntityDelta::Modified { new, .. } => IntentScope::Entity(new.id),
-                kin_model::EntityDelta::Removed { old } => IntentScope::Entity(old.id),
-            })
+            .copied()
+            .map(IntentScope::Entity)
             .collect();
 
         if !scopes.is_empty() {
@@ -34853,6 +34901,296 @@ mod tests {
             changes_after_first,
             "a refused commit must record no change at all"
         );
+    }
+
+    async fn amend_request_through_api(
+        app: &axum::Router,
+        expected_head: SemanticChangeId,
+        message: Option<&str>,
+    ) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": Timestamp::now(),
+                            "author": "Amending Actor <actor@example.invalid>",
+                            "message": message,
+                            "amend": true,
+                            "expected_head": expected_head,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn commit_amend_keeps_pending_sources_and_semantics_after_restart() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout;
+        let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        let app = router(Arc::clone(&state));
+        std::fs::write(
+            repo.path().join("main.rs"),
+            b"pub fn answer() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let first =
+            commit_through_api(&app, kin_model::OperationId::new(), "original message").await;
+        let original = state.graph.get_change(&first).unwrap().unwrap();
+        std::fs::write(
+            repo.path().join("main.rs"),
+            b"pub fn answer() -> u32 { 2 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("extra.rs"),
+            b"pub fn extra() -> bool { true }\n",
+        )
+        .unwrap();
+        let (status, body) = amend_request_through_api(&app, first, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let amended = branch_change(&state);
+        assert_ne!(amended, first);
+        let change = state.graph.get_change(&amended).unwrap().unwrap();
+        assert_eq!(change.parents, original.parents);
+        assert_eq!(change.message, original.message);
+        assert_eq!(change.author, original.author);
+        assert_eq!(state.graph.get_change(&first).unwrap().unwrap(), original);
+        let desired = state.graph.to_snapshot();
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let operation = lease.metadata().operation_log.last().unwrap();
+        assert_eq!(
+            operation.actor,
+            AuthorId::new("Amending Actor <actor@example.invalid>")
+        );
+        assert_eq!(
+            operation.ref_mutations[0].expected,
+            kin_model::RefExpectation::MustEqual {
+                target: kin_model::RefTarget::change(first)
+            }
+        );
+        assert!(!lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .is_dirty());
+        drop(lease);
+        drop(authority);
+        drop(app);
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        assert_eq!(branch_change(&reopened), amended);
+        let restored = reopened.graph.to_snapshot();
+        assert_eq!(restored.resolved_tree, desired.resolved_tree);
+        assert_eq!(restored.entities, desired.entities);
+        assert_eq!(
+            std::fs::read(repo.path().join("extra.rs")).unwrap(),
+            b"pub fn extra() -> bool { true }\n"
+        );
+        let app = router(Arc::clone(&reopened));
+        let (status, body) =
+            amend_request_through_api(&app, amended, Some("revised message")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            reopened
+                .graph
+                .get_change(&branch_change(&reopened))
+                .unwrap()
+                .unwrap()
+                .message,
+            "revised message"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn commit_amend_allows_an_explicit_replacement_with_no_content_delta() {
+        let repo = tempfile::tempdir().unwrap();
+        let state =
+            Arc::new(DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap());
+        let app = router(Arc::clone(&state));
+        std::fs::write(repo.path().join("value.txt"), b"one\n").unwrap();
+        let first = commit_through_api(&app, kin_model::OperationId::new(), "first").await;
+        std::fs::write(repo.path().join("value.txt"), b"two\n").unwrap();
+        let second = commit_through_api(&app, kin_model::OperationId::new(), "second").await;
+        std::fs::write(repo.path().join("value.txt"), b"one\n").unwrap();
+        let (status, body) =
+            amend_request_through_api(&app, second, Some("intentional empty replacement")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let change = state
+            .graph
+            .get_change(&branch_change(&state))
+            .unwrap()
+            .unwrap();
+        assert_eq!(change.parents, vec![first]);
+        assert!(change.entity_deltas.is_empty());
+        assert!(change.relation_deltas.is_empty());
+        assert!(change.tree_deltas.is_empty());
+        assert!(change.admission_policy_delta.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn commit_amend_rejects_stale_head_before_admitting_pending_files() {
+        let repo = tempfile::tempdir().unwrap();
+        let state =
+            Arc::new(DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap());
+        let app = router(Arc::clone(&state));
+        std::fs::write(repo.path().join("value.txt"), b"one\n").unwrap();
+        let first = commit_through_api(&app, kin_model::OperationId::new(), "first").await;
+        std::fs::write(repo.path().join("value.txt"), b"two\n").unwrap();
+        let second = commit_through_api(&app, kin_model::OperationId::new(), "second").await;
+        std::fs::write(
+            repo.path().join("not_admitted.rs"),
+            b"pub fn pending() {}\n",
+        )
+        .unwrap();
+        let before = generation_pair(&state);
+        let (status, body) = amend_request_through_api(&app, first, None).await;
+        assert!(status.is_client_error(), "{status}: {body}");
+        assert!(body.contains("HEAD is now"), "{body}");
+        assert_eq!(generation_pair(&state), before);
+        assert_eq!(branch_change(&state), second);
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&kin_model::RepoPath::from_utf8("not_admitted.rs").unwrap())
+            .is_none());
+        assert_eq!(
+            std::fs::read(repo.path().join("not_admitted.rs")).unwrap(),
+            b"pub fn pending() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn commit_amend_cannot_drop_a_leased_entity_by_reverting_its_old_change() {
+        let repo = tempfile::tempdir().unwrap();
+        let state =
+            Arc::new(DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap());
+        let app = router(Arc::clone(&state));
+        std::fs::write(repo.path().join("value.txt"), b"base\n").unwrap();
+        commit_through_api(&app, kin_model::OperationId::new(), "base").await;
+        std::fs::write(repo.path().join("main.rs"), b"pub fn value() -> u8 { 1 }\n").unwrap();
+        let second = commit_through_api(&app, kin_model::OperationId::new(), "add source").await;
+        let change = state.graph.get_change(&second).unwrap().unwrap();
+        assert!(change
+            .entity_deltas
+            .iter()
+            .all(|delta| matches!(delta, EntityDelta::Added { .. })));
+        let entity = change
+            .entity_deltas
+            .first()
+            .expect("the added source must have a semantic delta")
+            .target_id();
+        let owner = state
+            .coordinator
+            .register_session(
+                "codex",
+                "lease owner",
+                SessionTransport::Mcp,
+                None,
+                repo.path().to_path_buf(),
+                SessionCapabilities {
+                    can_write: true,
+                    can_commit: true,
+                    ..SessionCapabilities::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            state
+                .coordinator
+                .register_intent(
+                    &owner,
+                    vec![IntentScope::Entity(entity)],
+                    LockType::Hard,
+                    "protected entity",
+                    None,
+                )
+                .unwrap(),
+            crate::session_registry::IntentRegistrationResult::Registered { .. }
+        ));
+        std::fs::remove_file(repo.path().join("main.rs")).unwrap();
+        let count = state.graph.to_snapshot().changes.len();
+        let (status, body) = amend_request_through_api(&app, second, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("lease_conflict"), "{body}");
+        assert_eq!(branch_change(&state), second);
+        assert_eq!(state.graph.to_snapshot().changes.len(), count);
+        assert!(!repo.path().join("main.rs").exists());
+        assert!(state.graph.get_entity(&entity).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn commit_amend_during_open_merge_refuses_before_admission() {
+        let (state, _layout, repository, _, _) = universal_branch_test_state("amend-open-merge");
+        let app = router(Arc::clone(&state));
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: main-conflict\n",
+        )
+        .unwrap();
+        let head =
+            commit_through_api(&app, kin_model::OperationId::new(), "conflicting main").await;
+        let merge = kin_cli::commands::merge::MergeRequest {
+            source: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("merge test"),
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/merge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&merge).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .unwrap();
+        let merged: kin_cli::commands::merge::MergeResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(matches!(
+            merged.report.unwrap().outcome,
+            kin_cli::commands::merge::MergeOutcome::Conflicted
+        ));
+        let before = generation_pair(&state);
+        std::fs::write(repository.join("pending.txt"), b"pending outside merge\n").unwrap();
+        let (status, body) = amend_request_through_api(&app, head, Some("must refuse")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body.contains("merge transaction") && body.contains("still open"),
+            "{body}"
+        );
+        assert_eq!(generation_pair(&state), before);
+        assert_eq!(branch_change(&state), head);
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&kin_model::RepoPath::from_utf8("pending.txt").unwrap())
+            .is_none());
     }
 
     /// Changes in repository authority, read the way `kin log` reads them.
