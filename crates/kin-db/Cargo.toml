@@ -34,9 +34,9 @@ gcs = ["object_store/gcp", "tokio", "bytes"]
 sql = ["rusqlite"]
 
 [dependencies]
-kin-model = { version = "=0.7.24", registry = "kin" }
+kin-model = { version = "=0.7.25", registry = "kin" }
 kin-infer = { version = "0.2.44", registry = "kin", optional = true }
-kin-vector = { version = "=0.1.12", registry = "kin", optional = true }
+kin-vector = { version = "=0.2.0", registry = "kin", optional = true }
 kin-search = { version = "0.1.7", registry = "kin" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -87,7 +87,7 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 async-trait = "0.1"
 futures-util = "0.3"
-kin-vector = { version = "=0.1.12", registry = "kin" }
+kin-vector = { version = "=0.2.0", registry = "kin" }
 rand = "0.10"
 # Real Git object ids for the synthetic conversion the root-hash memory guard
 # commits; `ExternalObjectRecord` recomputes an oid and refuses a made-up one.
