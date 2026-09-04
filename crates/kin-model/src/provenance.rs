@@ -10,6 +10,7 @@
 use crate::ids::{Hash256, SemanticChangeId};
 use crate::timestamp::Timestamp;
 use crate::work::WorkScope;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Unique identifier for an actor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ActorId(pub Hash256);
 
 impl ActorId {
@@ -46,7 +47,7 @@ impl std::fmt::Display for ActorId {
 }
 
 /// Unique identifier for a delegation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct DelegationId(pub Hash256);
 
 impl DelegationId {
@@ -75,7 +76,7 @@ impl std::fmt::Display for DelegationId {
 }
 
 /// Unique identifier for an approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ApprovalId(pub Hash256);
 
 impl ApprovalId {
@@ -104,7 +105,7 @@ impl std::fmt::Display for ApprovalId {
 }
 
 /// Unique identifier for an audit event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct AuditEventId(pub Hash256);
 
 impl AuditEventId {
@@ -136,7 +137,7 @@ impl std::fmt::Display for AuditEventId {
 // Enums
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum ActorKind {
     Human,
     Assistant,
@@ -153,7 +154,7 @@ impl std::fmt::Display for ActorKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum ApprovalDecision {
     Approved,
     Rejected,
@@ -174,7 +175,7 @@ impl std::fmt::Display for ApprovalDecision {
 // Core types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Actor {
     pub actor_id: ActorId,
     pub kind: ActorKind,
@@ -182,7 +183,7 @@ pub struct Actor {
     pub external_refs: Vec<crate::work::ExternalRef>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Delegation {
     pub delegation_id: DelegationId,
     pub principal: ActorId,
@@ -192,7 +193,7 @@ pub struct Delegation {
     pub ended_at: Option<Timestamp>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Approval {
     pub approval_id: ApprovalId,
     pub change_id: SemanticChangeId,
@@ -202,7 +203,7 @@ pub struct Approval {
     pub timestamp: Timestamp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AuditEvent {
     pub event_id: AuditEventId,
     pub actor_id: ActorId,

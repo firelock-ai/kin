@@ -263,7 +263,7 @@ pub struct SemanticAnchor {
 
 /// The canonical work item: a feature, task, issue, debt item, or TODO
 /// anchored to semantic scopes in the code graph.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkItem {
     pub work_id: WorkId,
     pub kind: WorkKind,
@@ -354,7 +354,7 @@ impl std::fmt::Display for StalenessState {
 /// line numbers, so they are designed to stay attached across renames and
 /// moves. When the anchored entity's fingerprint drifts, staleness is
 /// detected.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Annotation {
     pub annotation_id: AnnotationId,
     pub kind: AnnotationKind,

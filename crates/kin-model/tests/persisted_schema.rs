@@ -65,6 +65,8 @@ const HUMAN_READABLE_ONLY: &[(&str, &str)] = &[
 /// green over an unchecked surface. Naming the types that must be found turns
 /// that silence into a failure.
 const MUST_BE_SCANNED: &[&str] = &[
+    "CollaborationDelta",
+    "Keyed",
     "MergeConflictEntry",
     "MergeTransactionRecord",
     "RepositoryOperationRecord",
@@ -112,6 +114,18 @@ const HAND_WRITTEN_SERIALIZATIONS: &[(&str, &str, &str)] = &[
     (
         "CanonicalWorkspaceSemanticDelta",
         "the_canonical_view_serializes_positionally_identical_bytes",
+        "",
+    ),
+    (
+        // A test-only replica of the positional encoding as kin-model 0.7.24
+        // wrote it, kept so the release before `collaboration_delta` has a
+        // wire this crate can still produce and diff against. It is registered
+        // like any other hand-written encoder because this scan reads source
+        // and cannot see `cfg(test)`, and registering it is the honest
+        // outcome: its whole purpose is to be diffed positionally, and the
+        // test named here is the diff.
+        "V0724Positional",
+        "a_transaction_without_collaboration_keeps_its_pre_collaboration_identity",
         "",
     ),
     (

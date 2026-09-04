@@ -40,6 +40,7 @@ pub(crate) mod alloc_probe;
 pub mod branch;
 pub(crate) mod canonical_ser;
 pub mod change;
+pub mod collaboration;
 pub mod conflict;
 pub mod context;
 pub mod contract;
@@ -86,6 +87,7 @@ pub use change::{
     ChangeOrigin, EntityDelta, LocatedEntry, RelationDelta, ResolvedArtifact, ResolvedTree,
     SemanticChange, TransactionDelta, TreeDelta, TreeEntry, TreeStateError,
 };
+pub use collaboration::{CollaborationDelta, Keyed, COLLABORATION_COLLECTIONS};
 pub use conflict::{ConflictKind, ConflictObject};
 pub use context::{
     AnnotationEntry, ArtifactContextEntry, ArtifactContextKind, ContextEntry, ContextPack,

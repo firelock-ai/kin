@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    collaboration::CollaborationDelta,
     identity::{
         append_canonical_key, append_canonical_object_header, append_canonical_seq,
         append_canonical_value, canonical_json_bytes, CanonicalSink, CountingSink, HashingSink,
@@ -1178,10 +1179,32 @@ pub struct RepositoryTransaction {
     /// admission remains responsible for verifying it against graph-owned
     /// content before committing this transaction.
     ///
-    /// Deliberately last. Positional serialization emits an explicit absent
-    /// merge slot when this field is present without a merge delta.
+    /// Positional serialization emits an explicit absent merge slot when this
+    /// field is present without a merge delta.
     #[serde(default)]
     pub sealed_observation: Option<SealedObservationBinding>,
+    /// The collaboration records this transaction admits.
+    ///
+    /// `RootBundle::collaboration` is replicated truth and
+    /// `has_same_replicated_truth` compares it, so two replicas that complete a
+    /// transfer must agree on it. Before this field existed nothing could move
+    /// it: no field here named a collaboration record, and `prepare_successor`
+    /// on the kin-db side had no collaboration domain to admit one into. Two
+    /// replicas could finish a successful transfer holding different
+    /// collaboration roots, with nothing erroring and no test failing.
+    ///
+    /// Optional and omitted when absent, so a transaction that touches no
+    /// collaboration serializes to the bytes it always did and keeps its
+    /// identity under the existing hash domain. That is what lets
+    /// `REPOSITORY_TRANSACTION_SCHEMA_VERSION` stay at 4: the version is gated
+    /// by exact equality, so moving it would refuse every transaction every
+    /// shipped binary builds, in both directions, to buy a compatibility this
+    /// field does not need.
+    ///
+    /// Deliberately last. Positional serialization emits explicit absent merge
+    /// and sealed slots when this field is present without them.
+    #[serde(default)]
+    pub collaboration_delta: Option<CollaborationDelta>,
 }
 
 #[derive(Serialize)]
@@ -1205,6 +1228,8 @@ struct RepositoryTransactionHumanReadable<'a> {
     merge_transaction_delta: &'a Option<MergeTransactionDelta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sealed_observation: &'a Option<SealedObservationBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collaboration_delta: &'a Option<CollaborationDelta>,
 }
 
 impl Serialize for RepositoryTransaction {
@@ -1231,6 +1256,7 @@ impl Serialize for RepositoryTransaction {
                 local_overlay_delta: &self.local_overlay_delta,
                 merge_transaction_delta: &self.merge_transaction_delta,
                 sealed_observation: &self.sealed_observation,
+                collaboration_delta: &self.collaboration_delta,
             }
             .serialize(serializer);
         }
@@ -1238,11 +1264,17 @@ impl Serialize for RepositoryTransaction {
         use serde::ser::SerializeSeq;
 
         const LEGACY_FIELD_COUNT: usize = 15;
-        let has_merge_slot =
-            self.merge_transaction_delta.is_some() || self.sealed_observation.is_some();
+        // Each tail slot is written when it is occupied OR when a later one is,
+        // so a present later value never slides into an absent earlier one's
+        // position. The chain is what keeps the rule stated once as the tail
+        // grows: read it upward from the last field.
+        let has_collaboration_slot = self.collaboration_delta.is_some();
+        let has_sealed_slot = self.sealed_observation.is_some() || has_collaboration_slot;
+        let has_merge_slot = self.merge_transaction_delta.is_some() || has_sealed_slot;
         let field_count = LEGACY_FIELD_COUNT
             + usize::from(has_merge_slot)
-            + usize::from(self.sealed_observation.is_some());
+            + usize::from(has_sealed_slot)
+            + usize::from(has_collaboration_slot);
         let mut sequence = serializer.serialize_seq(Some(field_count))?;
         sequence.serialize_element(&self.schema_version)?;
         sequence.serialize_element(&self.operation_id)?;
@@ -1262,8 +1294,11 @@ impl Serialize for RepositoryTransaction {
         if has_merge_slot {
             sequence.serialize_element(&self.merge_transaction_delta)?;
         }
-        if self.sealed_observation.is_some() {
+        if has_sealed_slot {
             sequence.serialize_element(&self.sealed_observation)?;
+        }
+        if has_collaboration_slot {
+            sequence.serialize_element(&self.collaboration_delta)?;
         }
         sequence.end()
     }
@@ -1397,7 +1432,8 @@ impl CanonicalTransaction<'_> {
         let source = self.source;
         let field_count = HUMAN_READABLE_FIELD_COUNT
             + usize::from(source.merge_transaction_delta.is_some())
-            + usize::from(source.sealed_observation.is_some());
+            + usize::from(source.sealed_observation.is_some())
+            + usize::from(source.collaboration_delta.is_some());
 
         append_canonical_object_header(out, field_count)?;
 
@@ -1407,6 +1443,13 @@ impl CanonicalTransaction<'_> {
         append_canonical_seq(out, &self.aliases)?;
         append_canonical_key(out, "changes")?;
         append_canonical_seq(out, &self.changes)?;
+        // "changes" then "collaboration_delta" then "default_ref_mutation":
+        // they share nothing past the first byte, and 'h' < 'o' < 'e' is not the
+        // comparison, 'c' == 'c' then 'h' < 'o' is, and then 'c' < 'd'.
+        if source.collaboration_delta.is_some() {
+            append_canonical_key(out, "collaboration_delta")?;
+            append_canonical_value(out, &source.collaboration_delta)?;
+        }
         append_canonical_key(out, "default_ref_mutation")?;
         append_canonical_value(out, &source.default_ref_mutation)?;
         append_canonical_key(out, "expected_generation")?;
@@ -1464,7 +1507,8 @@ impl Serialize for CanonicalTransaction<'_> {
             // own `Option::is_none`, which is NOT the positional branch's rule.
             let field_count = HUMAN_READABLE_FIELD_COUNT
                 + usize::from(source.merge_transaction_delta.is_some())
-                + usize::from(source.sealed_observation.is_some());
+                + usize::from(source.sealed_observation.is_some())
+                + usize::from(source.collaboration_delta.is_some());
             let mut state =
                 serializer.serialize_struct("RepositoryTransactionHumanReadable", field_count)?;
             state.serialize_field("schema_version", &source.schema_version)?;
@@ -1489,6 +1533,9 @@ impl Serialize for CanonicalTransaction<'_> {
             if source.sealed_observation.is_some() {
                 state.serialize_field("sealed_observation", &source.sealed_observation)?;
             }
+            if source.collaboration_delta.is_some() {
+                state.serialize_field("collaboration_delta", &source.collaboration_delta)?;
+            }
             return state.end();
         }
 
@@ -1498,11 +1545,13 @@ impl Serialize for CanonicalTransaction<'_> {
         // RepositoryTransaction`, whose element count varies with which
         // optional tail fields are present.
         const LEGACY_FIELD_COUNT: usize = 15;
-        let has_merge_slot =
-            source.merge_transaction_delta.is_some() || source.sealed_observation.is_some();
+        let has_collaboration_slot = source.collaboration_delta.is_some();
+        let has_sealed_slot = source.sealed_observation.is_some() || has_collaboration_slot;
+        let has_merge_slot = source.merge_transaction_delta.is_some() || has_sealed_slot;
         let field_count = LEGACY_FIELD_COUNT
             + usize::from(has_merge_slot)
-            + usize::from(source.sealed_observation.is_some());
+            + usize::from(has_sealed_slot)
+            + usize::from(has_collaboration_slot);
         let mut sequence = serializer.serialize_seq(Some(field_count))?;
         sequence.serialize_element(&source.schema_version)?;
         sequence.serialize_element(&source.operation_id)?;
@@ -1522,8 +1571,11 @@ impl Serialize for CanonicalTransaction<'_> {
         if has_merge_slot {
             sequence.serialize_element(&source.merge_transaction_delta)?;
         }
-        if source.sealed_observation.is_some() {
+        if has_sealed_slot {
             sequence.serialize_element(&source.sealed_observation)?;
+        }
+        if has_collaboration_slot {
+            sequence.serialize_element(&source.collaboration_delta)?;
         }
         sequence.end()
     }
@@ -1732,10 +1784,16 @@ impl RepositoryTransaction {
             && self.workspace_mutation.is_none()
             && self.local_overlay_delta.is_none()
             && self.merge_transaction_delta.is_none()
+            && self.collaboration_delta.is_none()
         {
             return Err(ModelError::InvalidOperation(
                 "repository transaction must contain at least one mutation".to_string(),
             ));
+        }
+        if let Some(delta) = &self.collaboration_delta {
+            delta.validate().map_err(|error| {
+                ModelError::InvalidOperation(format!("invalid collaboration delta: {error}"))
+            })?;
         }
         self.expected_roots.validate()?;
         if self.expected_generation != self.expected_roots.generation {
@@ -2531,6 +2589,7 @@ mod tests {
             local_overlay_delta: Some(local_overlay_delta),
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         }
     }
 
@@ -2714,17 +2773,29 @@ mod tests {
                 .workspace_id,
         ));
         let seal = sealed_observation();
+        let collaboration = crate::collaboration::tests::sample_delta();
+        // A present tail slot forces every earlier one to be written as an
+        // explicit nil, so arity is decided by the LAST occupied slot, not by
+        // how many are occupied. That is why the three seventeens and the four
+        // eighteens below are not a typo.
         let combinations = [
-            (None, None, 15),
-            (Some(merge.clone()), None, 16),
-            (None, Some(seal), 17),
-            (Some(merge), Some(seal), 17),
+            (None, None, None, 15),
+            (Some(merge.clone()), None, None, 16),
+            (None, Some(seal), None, 17),
+            (Some(merge.clone()), Some(seal), None, 17),
+            (None, None, Some(collaboration.clone()), 18),
+            (Some(merge.clone()), None, Some(collaboration.clone()), 18),
+            (None, Some(seal), Some(collaboration.clone()), 18),
+            (Some(merge), Some(seal), Some(collaboration), 18),
         ];
 
-        for (merge_transaction_delta, sealed_observation, expected_arity) in combinations {
+        for (merge_transaction_delta, sealed_observation, collaboration_delta, expected_arity) in
+            combinations
+        {
             let mut candidate = transaction.clone();
             candidate.merge_transaction_delta = merge_transaction_delta;
             candidate.sealed_observation = sealed_observation;
+            candidate.collaboration_delta = collaboration_delta;
             let encoded = rmp_serde::to_vec(&candidate).unwrap();
             assert_eq!(messagepack_array_len(&encoded), expected_arity);
             let decoded: RepositoryTransaction = rmp_serde::from_slice(&encoded).unwrap();
@@ -2754,21 +2825,256 @@ mod tests {
                 .workspace_id,
         ));
         let seal = sealed_observation();
+        let collaboration = crate::collaboration::tests::sample_delta();
         let combinations = [
-            (None, None),
-            (Some(merge.clone()), None),
-            (None, Some(seal)),
-            (Some(merge), Some(seal)),
+            (None, None, None),
+            (Some(merge.clone()), None, None),
+            (None, Some(seal), None),
+            (Some(merge.clone()), Some(seal), None),
+            (None, None, Some(collaboration.clone())),
+            (Some(merge.clone()), None, Some(collaboration.clone())),
+            (None, Some(seal), Some(collaboration.clone())),
+            (Some(merge), Some(seal), Some(collaboration)),
         ];
 
-        for (merge_transaction_delta, sealed_observation) in combinations {
+        for (merge_transaction_delta, sealed_observation, collaboration_delta) in combinations {
             let mut candidate = transaction.clone();
             candidate.merge_transaction_delta = merge_transaction_delta;
             candidate.sealed_observation = sealed_observation;
+            candidate.collaboration_delta = collaboration_delta;
             let encoded = serde_json::to_vec(&candidate).unwrap();
             let decoded: RepositoryTransaction = serde_json::from_slice(&encoded).unwrap();
             assert_eq!(decoded, candidate);
         }
+    }
+
+    /// A transaction that carries no collaboration is byte-identical to what
+    /// the release before this field wrote, at both encodings, for every tail
+    /// it could already have.
+    ///
+    /// This is the reader-version RANGE gate, stated on bytes rather than in
+    /// prose. `V0724RepositoryTransaction` is the wire as kin-model 0.7.24
+    /// wrote and read it, which is also the wire as of 0.7.25: #94 moved only
+    /// the kin-vector requirement in `Cargo.toml`, so `src/repository.rs` is
+    /// byte-identical at both tags and the encoder below is the immediate
+    /// predecessor's as well as 0.7.24's. Three things are asserted against it: the new writer
+    /// produces exactly those bytes when the field is absent, the new reader
+    /// decodes them back, and the pinned digest below does not move.
+    ///
+    /// The digest is what makes the field additive in fact rather than in
+    /// intent. It was measured before this field existed, and every repository
+    /// already on disk keeps its transaction identities and its authority roots
+    /// only while it holds. A change that moves it has broken that promise and
+    /// owes a schema version and a re-import, which is exactly the cost this
+    /// field was shaped to avoid: `REPOSITORY_TRANSACTION_SCHEMA_VERSION` is
+    /// compared by exact equality at `validate`, so a bump refuses every
+    /// transaction every shipped binary builds, in both directions.
+    #[test]
+    fn a_transaction_without_collaboration_keeps_its_pre_collaboration_identity() {
+        #[derive(Serialize)]
+        struct V0724RepositoryTransaction<'a> {
+            schema_version: u32,
+            operation_id: OperationId,
+            repository_id: &'a RepositoryId,
+            expected_generation: u64,
+            expected_roots: &'a RootBundle,
+            actor: &'a AuthorId,
+            reason: &'a str,
+            external_objects: &'a [ExternalObjectRecord],
+            git_authority_delta: &'a Option<GitExternalAuthorityDelta>,
+            changes: &'a [SemanticChange],
+            aliases: &'a [ExternalChangeAlias],
+            ref_mutations: &'a [RefMutation],
+            default_ref_mutation: &'a Option<DefaultRefMutation>,
+            workspace_mutation: &'a Option<WorkspaceMutation>,
+            local_overlay_delta: &'a Option<FrozenLocalOverlayDelta>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            merge_transaction_delta: &'a Option<MergeTransactionDelta>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sealed_observation: &'a Option<SealedObservationBinding>,
+        }
+
+        // Mirrors the positional branch as 0.7.24 wrote it: the merge slot is
+        // written when either tail field is present, the sealed slot only when
+        // it is itself present. Written as a type with its own `Serialize`
+        // rather than by driving a serializer, so it goes through the same
+        // `rmp_serde::to_vec` the production path does and no framing
+        // difference can come from the harness.
+        struct V0724Positional<'a>(&'a RepositoryTransaction);
+
+        impl Serialize for V0724Positional<'_> {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeSeq;
+                let transaction = self.0;
+                let has_merge_slot = transaction.merge_transaction_delta.is_some()
+                    || transaction.sealed_observation.is_some();
+                let count = 15
+                    + usize::from(has_merge_slot)
+                    + usize::from(transaction.sealed_observation.is_some());
+                let mut sequence = serializer.serialize_seq(Some(count))?;
+                sequence.serialize_element(&transaction.schema_version)?;
+                sequence.serialize_element(&transaction.operation_id)?;
+                sequence.serialize_element(&transaction.repository_id)?;
+                sequence.serialize_element(&transaction.expected_generation)?;
+                sequence.serialize_element(&transaction.expected_roots)?;
+                sequence.serialize_element(&transaction.actor)?;
+                sequence.serialize_element(&transaction.reason)?;
+                sequence.serialize_element(&transaction.external_objects)?;
+                sequence.serialize_element(&transaction.git_authority_delta)?;
+                sequence.serialize_element(&transaction.changes)?;
+                sequence.serialize_element(&transaction.aliases)?;
+                sequence.serialize_element(&transaction.ref_mutations)?;
+                sequence.serialize_element(&transaction.default_ref_mutation)?;
+                sequence.serialize_element(&transaction.workspace_mutation)?;
+                sequence.serialize_element(&transaction.local_overlay_delta)?;
+                if has_merge_slot {
+                    sequence.serialize_element(&transaction.merge_transaction_delta)?;
+                }
+                if transaction.sealed_observation.is_some() {
+                    sequence.serialize_element(&transaction.sealed_observation)?;
+                }
+                sequence.end()
+            }
+        }
+
+        fn legacy_bytes(transaction: &RepositoryTransaction) -> Vec<u8> {
+            rmp_serde::to_vec(&V0724Positional(transaction)).unwrap()
+        }
+
+        fn legacy_wire(transaction: &RepositoryTransaction) -> V0724RepositoryTransaction<'_> {
+            V0724RepositoryTransaction {
+                schema_version: transaction.schema_version,
+                operation_id: transaction.operation_id,
+                repository_id: &transaction.repository_id,
+                expected_generation: transaction.expected_generation,
+                expected_roots: &transaction.expected_roots,
+                actor: &transaction.actor,
+                reason: &transaction.reason,
+                external_objects: &transaction.external_objects,
+                git_authority_delta: &transaction.git_authority_delta,
+                changes: &transaction.changes,
+                aliases: &transaction.aliases,
+                ref_mutations: &transaction.ref_mutations,
+                default_ref_mutation: &transaction.default_ref_mutation,
+                workspace_mutation: &transaction.workspace_mutation,
+                local_overlay_delta: &transaction.local_overlay_delta,
+                merge_transaction_delta: &transaction.merge_transaction_delta,
+                sealed_observation: &transaction.sealed_observation,
+            }
+        }
+
+        let base = workspace_transaction();
+        assert!(base.collaboration_delta.is_none());
+        assert_eq!(
+            base.transaction_hash().unwrap().to_string(),
+            "3d1a5564f1284d98aeacb1b2c6166bc2ae49586661897933dc0cb45bb7f583df",
+            "adding an absent collaboration delta must not move transaction identity"
+        );
+        assert!(
+            !serde_json::to_string(&base)
+                .unwrap()
+                .contains("collaboration_delta"),
+            "an absent collaboration delta must not appear on the wire"
+        );
+
+        let merge = MergeTransactionDelta::open(crate::merge::tests::sample_record(
+            base.repository_id.clone(),
+            base.workspace_mutation.as_ref().unwrap().workspace_id,
+        ));
+        let seal = sealed_observation();
+        for (merge_transaction_delta, sealed_observation) in [
+            (None, None),
+            (Some(merge.clone()), None),
+            (None, Some(seal)),
+            (Some(merge), Some(seal)),
+        ] {
+            let mut candidate = base.clone();
+            candidate.merge_transaction_delta = merge_transaction_delta;
+            candidate.sealed_observation = sealed_observation;
+
+            let legacy = legacy_bytes(&candidate);
+            assert_eq!(
+                rmp_serde::to_vec(&candidate).unwrap(),
+                legacy,
+                "a collaboration-free transaction must write the exact bytes 0.7.24 wrote"
+            );
+            assert_eq!(
+                rmp_serde::from_slice::<RepositoryTransaction>(&legacy).unwrap(),
+                candidate,
+                "this reader must decode bytes a 0.7.24 writer produced"
+            );
+            assert_eq!(
+                serde_json::to_value(&candidate).unwrap(),
+                serde_json::to_value(legacy_wire(&candidate)).unwrap(),
+                "the named encoding must not gain a key either"
+            );
+        }
+    }
+
+    /// A transaction carrying collaboration records must not be mistakable for
+    /// one that does not, and the operation record inherits that through the
+    /// transaction hash rather than through a field of its own.
+    ///
+    /// The second half is the design being asserted, not an aside.
+    /// `merge_transaction_delta` sits on BOTH the transaction and the operation
+    /// record because it is a small authority transition the append-only audit
+    /// retains. Collaboration records are bulk graph content, like `changes`,
+    /// which is also absent from the record. Putting them in the operation log
+    /// would store every review note twice forever, once in the snapshot and
+    /// once in every record, which is the fat-receipt defect FIR-3064 measured
+    /// at 411,771,864 bytes of a 2,043,051,848 byte store and removed. So the
+    /// record binds WHAT the collaboration root became, through `roots_after`
+    /// and `transaction_hash`, and not WHICH records moved it.
+    #[test]
+    fn a_collaboration_delta_participates_in_transaction_and_operation_identity() {
+        let mut transaction = workspace_transaction();
+        let baseline = transaction.transaction_hash().unwrap();
+        transaction.collaboration_delta = Some(crate::collaboration::tests::sample_delta());
+        transaction.validate().unwrap();
+        let moved = transaction.transaction_hash().unwrap();
+        assert_ne!(
+            baseline, moved,
+            "two transactions differing only in the collaboration they admit share one identity"
+        );
+
+        let mut other = workspace_transaction();
+        let mut second = crate::collaboration::tests::sample_delta();
+        second.review_notes = vec![crate::collaboration::tests::review_note(0x6f)];
+        other.collaboration_delta = Some(second);
+        assert_ne!(
+            moved,
+            other.transaction_hash().unwrap(),
+            "two different collaboration deltas share one transaction identity"
+        );
+
+        let mut roots_after = roots();
+        roots_after.generation = roots().generation + 1;
+        let record = |transaction: &RepositoryTransaction| RepositoryOperationRecord {
+            operation_id: transaction.operation_id,
+            repository_id: transaction.repository_id.clone(),
+            transaction_hash: transaction.transaction_hash().unwrap(),
+            actor: transaction.actor.clone(),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ),
+            git_authority_delta: None,
+            ref_mutations: transaction.ref_mutations.clone(),
+            default_ref_mutation: transaction.default_ref_mutation.clone(),
+            workspace_mutation: transaction.workspace_mutation.clone(),
+            local_overlay_delta: transaction.local_overlay_delta.clone(),
+            roots_before: roots(),
+            roots_after: roots_after.clone(),
+            merge_transaction_delta: None,
+        };
+        assert_ne!(
+            record(&workspace_transaction()).identity_hash().unwrap(),
+            record(&transaction).identity_hash().unwrap(),
+            "the operation record must inherit the collaboration difference through its \
+             transaction hash; if it does not, the record needs a field of its own after all"
+        );
     }
 
     #[test]
@@ -3726,6 +4032,7 @@ mod tests {
             local_overlay_delta: Some(local_overlay_delta),
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         }
     }
 
@@ -4014,11 +4321,22 @@ mod tests {
     #[test]
     fn the_canonical_view_matches_across_every_optional_tail_combination() {
         let base = canonicalizable_transaction();
-        for (label, merge, sealed) in [
-            ("neither", false, false),
-            ("merge only", true, false),
-            ("sealed only", false, true),
-            ("both", true, true),
+        // Eight, not four. `HAND_KEPT_MIRRORS` registers this test as
+        // `RepositoryTransactionHumanReadable`'s entire disposition, on the
+        // grounds that it diffs that mirror's field SET, so a tail axis missing
+        // here is coverage the registration claims and does not have. A review
+        // found exactly that: deleting `collaboration_delta` from the
+        // human-readable branch of `Serialize for CanonicalTransaction` left
+        // the suite green.
+        for (label, merge, sealed, collaboration) in [
+            ("neither", false, false, false),
+            ("merge only", true, false, false),
+            ("sealed only", false, true, false),
+            ("merge and sealed", true, true, false),
+            ("collaboration only", false, false, true),
+            ("merge and collaboration", true, false, true),
+            ("sealed and collaboration", false, true, true),
+            ("all three", true, true, true),
         ] {
             let mut transaction = base.clone();
             if merge {
@@ -4036,6 +4354,9 @@ mod tests {
             }
             if sealed {
                 transaction.sealed_observation = Some(sealed_observation());
+            }
+            if collaboration {
+                transaction.collaboration_delta = Some(crate::collaboration::tests::sample_delta());
             }
             assert_eq!(
                 rmp_serde::to_vec(&CanonicalTransaction::new(&transaction)).unwrap(),
@@ -4280,14 +4601,18 @@ mod tests {
         empty_collections.external_objects = Vec::new();
         empty_collections.ref_mutations = Vec::new();
 
-        // `canonical_preimage` has two conditional branches, for the tail
-        // fields that skip independently, and no shape above reaches either.
-        // Hash-level coverage exists in
+        // `canonical_preimage` has three conditional branches, for the tail
+        // fields that skip independently, and no shape above reaches any of
+        // them. Hash-level coverage exists in
         // `the_canonical_view_matches_across_every_optional_tail_combination`,
         // but the offset reporter is the instrument that caught the
         // reason/ref_mutations ordering bug, and it can only report on shapes
-        // it is given. An independent review pointed this out.
-        let with_tails = |merge: bool, sealed: bool| {
+        // it is given. An independent review pointed this out for the merge and
+        // sealed branches, and a second one pointed it out again when
+        // `collaboration_delta` added a third: without a shape that populates
+        // it, moving its key out of byte-sorted order left the whole suite
+        // green.
+        let with_tails = |merge: bool, sealed: bool, collaboration: bool| {
             let mut transaction = canonicalizable_transaction();
             if merge {
                 let workspace_id = transaction
@@ -4304,6 +4629,9 @@ mod tests {
             }
             if sealed {
                 transaction.sealed_observation = Some(sealed_observation());
+            }
+            if collaboration {
+                transaction.collaboration_delta = Some(crate::collaboration::tests::sample_delta());
             }
             transaction
         };
@@ -4330,9 +4658,14 @@ mod tests {
             ("one_change", wide),
             ("unicode_message", unicode),
             ("sixteen_changes", large_transaction(16)),
-            ("merge_only", with_tails(true, false)),
-            ("sealed_only", with_tails(false, true)),
-            ("merge_and_sealed", with_tails(true, true)),
+            ("merge_only", with_tails(true, false, false)),
+            ("sealed_only", with_tails(false, true, false)),
+            ("merge_and_sealed", with_tails(true, true, false)),
+            ("collaboration_only", with_tails(false, false, true)),
+            (
+                "merge_sealed_and_collaboration",
+                with_tails(true, true, true),
+            ),
             ("git_authority", git_authority),
         ]
     }
@@ -4343,7 +4676,7 @@ mod tests {
     /// here is a change to what a transaction identity commits to, which every
     /// store already on disk depends on. It is a decision to make and version,
     /// never a value to regenerate.
-    const PINNED_PREIMAGE_DIGESTS: [(&str, &str); 10] = [
+    const PINNED_PREIMAGE_DIGESTS: [(&str, &str); 12] = [
         (
             "workspace_only",
             "87c06b3a2f89a7f7ca9cf1e45207a9b425b1e40c07d6d78ab43ea8625acb69a8",
@@ -4379,6 +4712,14 @@ mod tests {
         (
             "merge_and_sealed",
             "ba3d8e459829fcdf514938d327a5540677544d0ae6ba4fbfdae99730f3a65d3c",
+        ),
+        (
+            "collaboration_only",
+            "d45db4e09df71643754cb3c44a4b846b4871ee6eae19e6dc11fc626c6c68ff33",
+        ),
+        (
+            "merge_sealed_and_collaboration",
+            "282d173076ffcefb9d6d304d67044985ad2eaa7c4fb9ae9bddc02c7b2aea59f0",
         ),
         (
             "git_authority",
@@ -5861,6 +6202,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         assert!(transaction.validate().is_err());
     }

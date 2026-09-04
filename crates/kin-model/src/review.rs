@@ -199,7 +199,7 @@ impl std::str::FromStr for ReviewDiscussionState {
 // ---------------------------------------------------------------------------
 
 /// A review scoped to semantic changes between two points.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Review {
     pub review_id: ReviewId,
     pub title: String,
@@ -217,7 +217,7 @@ pub struct Review {
 }
 
 /// A record of a review decision (part of decision history).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewDecision {
     pub reviewer: IdentityRef,
     pub state: ReviewDecisionState,
@@ -226,7 +226,7 @@ pub struct ReviewDecision {
 }
 
 /// A note attached to a review.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewNote {
     pub note_id: ReviewNoteId,
     pub review_id: ReviewId,
@@ -238,7 +238,7 @@ pub struct ReviewNote {
 }
 
 /// A discussion thread on a review.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewDiscussion {
     pub discussion_id: ReviewDiscussionId,
     pub review_id: ReviewId,
@@ -249,7 +249,7 @@ pub struct ReviewDiscussion {
 }
 
 /// A single comment within a review discussion.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewComment {
     pub authored_by: IdentityRef,
     pub body: String,
@@ -257,7 +257,7 @@ pub struct ReviewComment {
 }
 
 /// A reviewer assignment on a review.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewAssignment {
     pub review_id: ReviewId,
     pub reviewer: IdentityRef,

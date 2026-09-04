@@ -47,7 +47,7 @@ impl std::fmt::Display for TestId {
 }
 
 /// Unique identifier for an assertion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct AssertionId(pub Hash256);
 
 impl AssertionId {
@@ -101,7 +101,7 @@ impl std::fmt::Display for VerificationRunId {
 }
 
 /// Unique identifier for a mock hint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct MockHintId(pub Hash256);
 
 impl MockHintId {
@@ -133,7 +133,7 @@ impl std::fmt::Display for MockHintId {
 // Enums
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum TestKind {
     Unit,
     Integration,
@@ -152,7 +152,7 @@ impl std::fmt::Display for TestKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum TestRunner {
     Cargo,
     Jest,
@@ -179,7 +179,7 @@ impl std::fmt::Display for TestRunner {
 // Core types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TestCase {
     pub test_id: TestId,
     pub name: String,
@@ -190,7 +190,7 @@ pub struct TestCase {
     pub file_origin: Option<FilePathId>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Assertion {
     pub assertion_id: AssertionId,
     pub summary: String,
@@ -198,7 +198,7 @@ pub struct Assertion {
     pub target_scope: WorkScope,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum VerificationStatus {
     Missing,
     Pending,
@@ -243,7 +243,7 @@ impl std::fmt::Display for CompletionState {
 }
 
 /// Strategy used to mock a dependency during a test run.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum MockStrategy {
     InMemory,
     Stub,
@@ -269,7 +269,7 @@ impl std::fmt::Display for MockStrategy {
 // ---------------------------------------------------------------------------
 
 /// A single execution of one or more tests with captured evidence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct VerificationRun {
     pub run_id: VerificationRunId,
     pub test_ids: Vec<TestId>,
@@ -283,7 +283,7 @@ pub struct VerificationRun {
 }
 
 /// Advisory hint that a dependency was mocked during a test run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct MockHint {
     pub hint_id: MockHintId,
     pub test_id: TestId,
