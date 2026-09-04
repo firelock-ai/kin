@@ -31,10 +31,8 @@
 // release's own release-provenance.json names the archives release.yml built
 // and published AT THE TAG, which are different bytes by construction: the tag
 // build is a fresh one, so the archive a developer downloads is never a
-// preflight leg. Requiring the preflight link alone therefore made the
-// released-byte proof of any release unable to lift that release's own pending
-// notice, which is what v0.6.7 measured on 2026-09-04: three complete arms on
-// the public Linux aarch64 archive, refused as "not on these bytes".
+// preflight leg. With the preflight link alone, a stranger run on released
+// bytes can never lift that release's own pending notice.
 
 import process from 'node:process';
 import { realpathSync } from 'node:fs';
@@ -83,9 +81,11 @@ export const REFERENCE_DRIVER_ENDPOINT = 'account';
 // the same literal, and the authority suite pins the two together so they
 // cannot drift into a bridge that resolves somewhere nothing was ever proven.
 export const BUMP_BRANCH = 'automation/release-next';
-// The release's own signed receipt. release.yml writes and attests it onto
-// every release beside a sha256 sidecar, and it is the second record that can
-// link a stranger run to this candidate's bytes.
+// The release's own receipt, and the second record that can link a stranger
+// run to this candidate's bytes. release.yml publishes it onto every release
+// beside a sha256 sidecar and other jobs verify its attestation; nothing in
+// this gate does, so it counts here as a trusted release receipt, a record the
+// release chain wrote, and never as signature-verified proof.
 export const PROVENANCE_ASSET = 'release-provenance.json';
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/;

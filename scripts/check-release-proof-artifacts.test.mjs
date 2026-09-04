@@ -1274,6 +1274,129 @@ test('findReleaseProvenance skips a draft and a release with no receipt', async 
   assert.equal(result.stranger.link, 'release-provenance');
 });
 
+// A release whose tag resolves to some other commit is not this candidate's,
+// whatever its receipt says. The foreign receipt here claims the candidate at
+// kin.commit and lists the very archive the stranger ran, so a gate that
+// stopped comparing the tag's commit would read it and ACCEPT. The candidate's
+// own release is absent, so the right answer is a refusal, and the foreign
+// asset must never be fetched at all; the tag ref must, or the skip was never
+// exercised.
+test('findReleaseProvenance skips a release whose tag resolves to another commit', async () => {
+  const seen = [];
+  const foreignAsset = `${ASSET_URL}-foreign`;
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: async (url) => {
+        seen.push(url);
+        return stubFetch({
+          [foreignAsset]: ok(JSON.stringify(provenanceRecord())),
+          '/git/ref/tags/v9.9.10': jsonOk({ object: { type: 'commit', sha: OTHER_SHA } }),
+          ...releaseRoutes({
+            listing: [
+              {
+                tag_name: 'v9.9.10',
+                draft: false,
+                assets: [{ name: PROVENANCE_ASSET, url: foreignAsset }],
+              },
+            ],
+          }),
+        })(url);
+      },
+    }),
+    new RegExp(`no published release of ${SHA} carries a ${PROVENANCE_ASSET}`),
+  );
+  assert.equal(
+    seen.some((url) => url.includes('/git/ref/tags/v9.9.10')),
+    true,
+    'the foreign tag was never resolved, so the skip was not exercised',
+  );
+  assert.equal(seen.includes(foreignAsset), false, "the foreign release's receipt was read");
+});
+
+// A receipt the release surface says exists and then does not serve. Fails
+// closed in BOTH require modes, with the transport answer in the message and
+// without the absence flag: the flag is what lets a caller widen on a missing
+// stranger record, and a missing release receipt must never be read that way,
+// or "we could not tell" becomes "no receipt, so judge on the preflight alone".
+test('main fails closed when the release provenance asset is missing', async () => {
+  for (const requireMode of REQUIRE_MODES) {
+    await assert.rejects(
+      main({
+        sha: SHA,
+        repository: REPO,
+        require: requireMode,
+        env: {},
+        log: () => {},
+        fetchImpl: stubFetch(
+          releaseRoutes({ asset: { ok: false, status: 404, statusText: 'Not Found' } }),
+        ),
+      }),
+      (error) => {
+        assert.match(
+          error.message,
+          new RegExp(`could not read ${PROVENANCE_ASSET} from release ${RELEASE_TAG}: HTTP 404 Not Found`),
+        );
+        assert.doesNotMatch(
+          error.message,
+          /has not recorded this candidate|does not exist on the release-evidence branch/,
+        );
+        assert.equal(
+          error.evidenceAbsent,
+          undefined,
+          `under require ${requireMode} a missing receipt wore the absence flag a caller may act on`,
+        );
+        return true;
+      },
+    );
+  }
+});
+
+// A rejected request, as distinct from an HTTP failure above: the listing
+// never answered at all. It refuses with the release-surface context in the
+// message, so an operator reading a blocked promotion sees which read died
+// rather than a bare socket error.
+test('main fails closed when the release listing cannot be reached', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: async (url) => {
+        if (url.includes('/releases?')) {
+          throw new Error('socket hang up');
+        }
+        return stubFetch(releaseRoutes())(url);
+      },
+    }),
+    /could not reach GitHub to list the releases of firelock-ai\/kin: socket hang up/,
+  );
+});
+
+// The same door for a transport failure on the asset alone: the listing and
+// the tag answered, the bytes did not arrive. Not agreement, not absence.
+test('main fails closed when the release provenance asset cannot be reached', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: async (url) => {
+        if (url.includes('/releases/assets/')) {
+          throw new Error('socket hang up');
+        }
+        return stubFetch(releaseRoutes())(url);
+      },
+    }),
+    new RegExp(`could not reach GitHub to read ${PROVENANCE_ASSET} from release ${RELEASE_TAG}: socket hang up`),
+  );
+});
+
 test('judgeReleaseProvenance refuses a record that is not one', () => {
   throwsWith(
     () => judgeReleaseProvenance(null, SHA, RELEASE_TAG),

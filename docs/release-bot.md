@@ -213,10 +213,14 @@ there are two honest sets of bytes: the preflight judges the rc-build archives,
 and `release.yml` rebuilds at the tag, so the archive a developer downloads is
 never a preflight leg. With only the first link, the released-byte proof of any
 release could never lift that release's own pending notice. The release receipt
-is held to the same standard: its `kin.commit`, and every artifact's, must be
-the candidate, so a release whose provenance describes another build refuses
-rather than being passed over. An archive in neither receipt is still a stranger
-that ran on some other build, and it is still refused.
+is a trusted release receipt, not signature-verified proof: other jobs verify
+the asset's attestation and the gate does not, so it trusts the record as one
+the release chain wrote and holds it to the same standard as the preflight. Its
+`kin.commit`, and every artifact's, must be the candidate, so a release whose
+provenance describes another build refuses rather than being passed over, and
+a receipt that cannot be read refuses rather than reading as absent. An archive
+in neither receipt is still a stranger that ran on some other build, and it is
+still refused.
 
 The driver takes its credential from `KIN_STRANGER_ANTHROPIC_API_KEY`, exported
 as `ANTHROPIC_API_KEY`. No harness change was needed: `driver_env_argv` unsets
