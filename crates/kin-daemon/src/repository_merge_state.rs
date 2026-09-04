@@ -54,6 +54,41 @@ pub(crate) fn workspace_merge_record(
         .find(|record| record.workspace_id == workspace_id)
 }
 
+/// What a caller needs to refuse around an open merge without carrying the
+/// record: the transaction to name, the two refs it binds, and how much of it
+/// is already settled.
+#[derive(Clone)]
+pub(crate) struct OpenMergeSummary {
+    pub(crate) transaction: String,
+    pub(crate) source_ref: String,
+    pub(crate) target_ref: String,
+    pub(crate) unresolved_count: usize,
+    pub(crate) conflict_count: usize,
+}
+
+/// The merge a workspace still holds open, summarized from an authority lease.
+///
+/// Takes the lease rather than the metadata a caller has already read, so the
+/// accessor stays in this module. Every `.metadata()` here reads a repository-v6
+/// authority lease and returns graph-owned truth, which is the justification
+/// this module carries; the daemon RPC surface is scanned in full because it is
+/// the answer authority, and moving one accessor into the module that owns
+/// merge state is the cheaper of the two ways to keep both statements true.
+pub(crate) fn open_merge_summary(
+    lease: &kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
+    workspace_id: WorkspaceId,
+) -> Option<OpenMergeSummary> {
+    workspace_merge_record(lease.metadata(), workspace_id)
+        .filter(|record| record.state.is_in_progress())
+        .map(|record| OpenMergeSummary {
+            transaction: record.hash.to_string(),
+            source_ref: record.binding.source_ref.to_string(),
+            target_ref: record.binding.target_ref.to_string(),
+            unresolved_count: record.unresolved().count(),
+            conflict_count: record.entries.len(),
+        })
+}
+
 pub(crate) fn commit_and_freeze_exact(
     manager: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,

@@ -223,8 +223,9 @@ pub(crate) struct ProjectionAuthorityCache {
     held: std::sync::Mutex<Option<HeldProjectionAuthority>>,
     query: std::sync::Mutex<Option<HeldQueryAuthority>>,
     command: std::sync::Mutex<Option<HeldCommandAuthority>>,
-    /// The admission pair every reconcile task needs, which is not a fourth
-    /// wrapper over the authority but two small values read out of one.
+    /// The admission values every reconcile task needs, plus the small
+    /// open-merge summary a commit gate needs. This is not a fourth wrapper
+    /// over the authority, only values read out of one.
     ///
     /// `current_authority_admission` wants a root bundle and a compiled
     /// admission matcher, and neither can differ between tasks inside one
@@ -277,6 +278,7 @@ struct HeldAdmission {
     published: LocalPublicationIdentity,
     roots: kin_model::RootBundle,
     policy: Option<kin_index::ResolvedAdmissionMatcher>,
+    open_merge: Option<crate::repository_merge_state::OpenMergeSummary>,
 }
 
 impl ProjectionAuthorityCache {
@@ -336,30 +338,15 @@ impl ProjectionAuthorityCache {
         });
     }
 
-    fn reuse_admission(
-        &self,
-        published: &LocalPublicationIdentity,
-    ) -> Option<(
-        kin_model::RootBundle,
-        Option<kin_index::ResolvedAdmissionMatcher>,
-    )> {
+    fn reuse_admission(&self, published: &LocalPublicationIdentity) -> Option<HeldAdmission> {
         lock_recover(&self.admission)
             .as_ref()
             .filter(|held| &held.published == published)
-            .map(|held| (held.roots.clone(), held.policy.clone()))
+            .cloned()
     }
 
-    fn install_admission(
-        &self,
-        published: LocalPublicationIdentity,
-        roots: kin_model::RootBundle,
-        policy: Option<kin_index::ResolvedAdmissionMatcher>,
-    ) {
-        *lock_recover(&self.admission) = Some(HeldAdmission {
-            published,
-            roots,
-            policy,
-        });
+    fn install_admission(&self, admission: HeldAdmission) {
+        *lock_recover(&self.admission) = Some(admission);
     }
 
     fn reuse_command(
@@ -616,15 +603,9 @@ fn command_repository_authority(
 /// at 2.205 seconds, which is what one open costs warm there. Neither value it
 /// reads can differ between tasks inside one publication, so the cost was paid
 /// per arrival for an answer that could not vary.
-pub(crate) fn cached_authority_admission(
+fn cached_authority_admission_entry(
     state: &DaemonState,
-) -> Result<
-    (
-        kin_model::RootBundle,
-        Option<kin_index::ResolvedAdmissionMatcher>,
-    ),
-    (StatusCode, String),
-> {
+) -> Result<HeldAdmission, (StatusCode, String)> {
     let backend = state.local_repository_backend().ok_or_else(|| {
         repository_authority_error("local daemon is missing its startup storage capability")
     })?;
@@ -634,8 +615,8 @@ pub(crate) fn cached_authority_admission(
     let repository_id = binding.repository_id().clone();
 
     let published = read_local_publication_identity(&backend, &repository_id)?;
-    if let Some(pair) = state.projection_authority.reuse_admission(&published) {
-        return Ok(pair);
+    if let Some(admission) = state.projection_authority.reuse_admission(&published) {
+        return Ok(admission);
     }
 
     let _load = lock_recover(&state.projection_authority.load_gate);
@@ -643,8 +624,8 @@ pub(crate) fn cached_authority_admission(
     // waited, and the label installed below must be the one taken before the
     // open it describes.
     let published = read_local_publication_identity(&backend, &repository_id)?;
-    if let Some(pair) = state.projection_authority.reuse_admission(&published) {
-        return Ok(pair);
+    if let Some(admission) = state.projection_authority.reuse_admission(&published) {
+        return Ok(admission);
     }
 
     let context =
@@ -654,20 +635,73 @@ pub(crate) fn cached_authority_admission(
         .open()
         .map_err(|error| repository_authority_error(error.to_string()))?;
     state.projection_authority.record_load();
-    let roots = authority.read_authority().roots().clone();
+    let lease = authority.read_authority();
+    let roots = lease.roots().clone();
+    let open_merge =
+        crate::repository_merge_state::open_merge_summary(&lease, context.workspace_id());
+    drop(lease);
     let policy = authority
         .workspace_admission_snapshot(context.repository_id(), &context.workspace_id())
         .map_err(|error| repository_authority_error(error.to_string()))?
         .map(|snapshot| snapshot.matcher);
+    let admission = HeldAdmission {
+        published,
+        roots,
+        policy,
+        open_merge,
+    };
     state
         .projection_authority
-        .install_admission(published, roots.clone(), policy.clone());
+        .install_admission(admission.clone());
     tracing::debug!(
         repository = %repository_id,
         loads = state.projection_authority.loads(),
         "admission pair loaded"
     );
-    Ok((roots, policy))
+    Ok(admission)
+}
+
+pub(crate) fn cached_authority_admission(
+    state: &DaemonState,
+) -> Result<
+    (
+        kin_model::RootBundle,
+        Option<kin_index::ResolvedAdmissionMatcher>,
+    ),
+    (StatusCode, String),
+> {
+    let admission = cached_authority_admission_entry(state)?;
+    Ok((admission.roots, admission.policy))
+}
+
+fn refuse_commit_during_open_merge(state: &DaemonState) -> Result<(), (StatusCode, String)> {
+    let admission = cached_authority_admission_entry(state)?;
+    let Some(open_merge) = admission.open_merge else {
+        return Ok(());
+    };
+    let resolved_count = open_merge.conflict_count - open_merge.unresolved_count;
+    let completion = if open_merge.unresolved_count == 0 {
+        "publish it with `kin resolve --do-continue`".to_string()
+    } else {
+        format!(
+            "settle its remaining {} conflict(s) with `kin resolve`, then publish it with `kin \
+             resolve --do-continue`",
+            open_merge.unresolved_count
+        )
+    };
+    Err((
+        StatusCode::CONFLICT,
+        format!(
+            "commit refused: merge transaction {} for {} into {} is still open ({} of {} \
+             conflict(s) settled); {completion}, or abandon it with `kin resolve --abort` before \
+             committing",
+            open_merge.transaction,
+            open_merge.source_ref,
+            open_merge.target_ref,
+            resolved_count,
+            open_merge.conflict_count,
+        ),
+    ))
 }
 
 /// Hand a command helper an authority this daemon already resolved.
@@ -6163,6 +6197,10 @@ async fn command_commit(
         state.coordination_gate.lock(),
     )
     .await;
+    // A merge record is bound to the workspace generation that opened it.
+    // Refuse before forced admission can advance that generation and strand
+    // resolutions already persisted on the transaction.
+    refuse_commit_during_open_merge(&state)?;
     // The admission derives the exact tree from the working copy but does not
     // publish it. This commit's own transaction carries that tree transition
     // beside the semantic change, so one repository-authority successor is

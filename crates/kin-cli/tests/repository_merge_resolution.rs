@@ -901,6 +901,68 @@ fn a_second_merge_while_one_is_in_progress_is_refused() {
     assert!(record.state.is_in_progress());
 }
 
+/// A commit cannot publish around a parked merge. Forced admission advances
+/// the workspace generation, so allowing the commit would make the recorded
+/// restore point stale and strand every resolution already carried by it.
+#[test]
+fn a_commit_while_a_merge_is_in_progress_is_refused_before_admission() {
+    let root = tempdir().expect("temp root");
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+    let main_before = branch_change(&layout, "main");
+    let parked = persisted_record(&layout).expect("the merge is parked");
+    let parked_hash = hex::encode(parked.hash.as_bytes());
+    let hand_authored = b"pub fn hand_authored_resolution(value: u64) {}\n";
+    fs::write(repo.join("src/lib.rs"), hand_authored).expect("write a hand-authored resolution");
+
+    let refused = run_kin(
+        &runtime,
+        &repo,
+        &["commit", "-m", "hand-authored merge resolution"],
+    );
+    assert!(
+        !refused.status.success(),
+        "commit must not publish around an open merge: stdout={} stderr={}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("HTTP 409 Conflict"),
+        "the open transaction is a conflict rather than a daemon fault: {stderr}"
+    );
+    assert!(
+        stderr.contains(&parked_hash),
+        "the refusal names the exact merge transaction: {stderr}"
+    );
+    assert!(
+        stderr.contains("kin resolve --do-continue") && stderr.contains("kin resolve --abort"),
+        "the refusal names both ways out of the open transaction: {stderr}"
+    );
+
+    assert_eq!(
+        branch_change(&layout, "main"),
+        main_before,
+        "the refused commit does not move the target branch"
+    );
+    assert_eq!(
+        persisted_record(&layout),
+        Some(parked),
+        "the refusal happens before admission and leaves the exact merge record intact"
+    );
+    assert_eq!(
+        fs::read(repo.join("src/lib.rs")).expect("read the authored resolution"),
+        hand_authored,
+        "the refusal preserves the operator's working-copy resolution"
+    );
+}
+
 /// Settling names one identity at a time, and a name that matches nothing is
 /// refused rather than quietly settling the wrong conflict.
 #[test]
