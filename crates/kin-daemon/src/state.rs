@@ -35,6 +35,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
+use crate::hosted_start;
 use crate::session_registry::SessionCoordinator;
 
 /// Borrowed immutable history used to materialize a hosted repository ref.
@@ -5684,20 +5685,20 @@ impl DaemonState {
         if self.storage_backend.is_none() {
             return Err("hosted spine contract requested for a local daemon".to_string());
         }
-        let project_id = std::env::var("GOOGLE_CLOUD_PROJECT")
-            .map_err(|_| "GOOGLE_CLOUD_PROJECT is required for hosted durable spine".to_string())?;
-        if project_id.is_empty() || project_id.trim() != project_id {
+        // Each name and refusal comes from the hosted start registry, which is
+        // what `kin-daemon --compat-json` declares. A requirement enforced here
+        // and undeclared there is a deployment nobody can grade, so the two are
+        // one table; `hosted_start` holds the test that keeps them one.
+        let project_id = hosted_start::GOOGLE_CLOUD_PROJECT.require(hosted_start::Stage::Spine)?;
+        if project_id.trim() != project_id {
             return Err("GOOGLE_CLOUD_PROJECT must be non-empty and canonical".to_string());
         }
-        let bucket = std::env::var("KIN_GCS_BUCKET")
-            .map_err(|_| "KIN_GCS_BUCKET is required for hosted durable spine".to_string())?;
-        if bucket.is_empty() || bucket.trim() != bucket || bucket.contains('/') {
+        let bucket = hosted_start::GCS_BUCKET.require(hosted_start::Stage::Spine)?;
+        if bucket.trim() != bucket || bucket.contains('/') {
             return Err("KIN_GCS_BUCKET must be a canonical bucket name".to_string());
         }
-        let prefix = std::env::var("KIN_GCS_PREFIX")
-            .map_err(|_| "KIN_GCS_PREFIX is required for hosted durable spine".to_string())?;
-        if prefix.is_empty()
-            || prefix.trim() != prefix
+        let prefix = hosted_start::GCS_PREFIX.require(hosted_start::Stage::Spine)?;
+        if prefix.trim() != prefix
             || prefix.starts_with('/')
             || prefix.ends_with('/')
             || prefix.contains("//")
@@ -5707,7 +5708,11 @@ impl DaemonState {
         let mut fleet = self
             .allowed_repo_ids
             .as_ref()
-            .ok_or_else(|| "KIN_REPO_IDS must name the exact hosted spine fleet".to_string())?
+            .ok_or_else(|| {
+                hosted_start::REPO_IDS
+                    .refusal(hosted_start::Stage::Spine)
+                    .to_string()
+            })?
             .iter()
             .cloned()
             .collect::<Vec<_>>();
@@ -7504,10 +7509,9 @@ impl DaemonState {
             #[cfg(feature = "firestore")]
             {
                 let (scope, fleet) = self.hosted_spine_contract()?;
-                let project_id = std::env::var("GOOGLE_CLOUD_PROJECT").map_err(|_| {
-                    "GOOGLE_CLOUD_PROJECT is required for hosted durable spine".to_string()
-                })?;
-                let database_id = std::env::var("FIRESTORE_DATABASE_ID").ok();
+                let project_id =
+                    hosted_start::GOOGLE_CLOUD_PROJECT.require(hosted_start::Stage::Spine)?;
+                let database_id = hosted_start::FIRESTORE_DATABASE_ID.read();
                 info!(
                     project = %project_id,
                     database = database_id.as_deref().unwrap_or("(default)"),
@@ -18225,5 +18229,106 @@ mod tests {
         assert!(refused.contains("expired"), "{refused}");
         drop(bound);
         gate().expect("an unbound lease defends nothing");
+    }
+    /// The complete hosted spine contract, from which one requirement at a
+    /// time is removed below.
+    fn hosted_spine_fleet() -> [&'static str; HOSTED_SPINE_FLEET_SIZE] {
+        ["kin", "kin-db", "kin-lsp", "kin-model", "kin-search"]
+    }
+
+    fn hosted_state_for_contract(with_fleet: bool) -> (DaemonState, tempfile::TempDir) {
+        use kin_db::LocalFileBackend;
+
+        let storage = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo_dir.path()).unwrap().layout;
+        let allowed = with_fleet.then(|| {
+            hosted_spine_fleet()
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        });
+        let state = DaemonState::open_with_backend(
+            layout,
+            Box::new(LocalFileBackend::new(storage.path())),
+            "kin",
+            allowed,
+        )
+        .unwrap();
+        (state, repo_dir)
+    }
+
+    /// Every requirement `--compat-json` declares as refused at the spine stage
+    /// actually closes the hosted spine contract, with the declared message.
+    ///
+    /// These are the ones that do not stop the process. The daemon binds, loads
+    /// the graph, keeps liveness green and holds `/readiness` at 503 for as long
+    /// as it runs, which is the shape the 2026-09-02 rollout hit. Declaring them
+    /// as merely "required" would have hidden that, so the stage is declared and
+    /// this is what proves the stage is real.
+    ///
+    /// Falsified in the other direction by
+    /// `hosted_start::tests::the_hosted_start_path_reads_no_environment_of_its_own`,
+    /// which refuses a refusal added here without a declaration.
+    #[test]
+    #[serial_test::serial]
+    fn every_declared_spine_requirement_closes_the_hosted_contract() {
+        let spine_requirements: Vec<_> = hosted_start::HOSTED_START_REQUIREMENTS
+            .iter()
+            .filter(|requirement| requirement.enforced_at(hosted_start::Stage::Spine))
+            .collect();
+
+        // Positive control: an empty list would make the loop below vacuous.
+        assert!(
+            spine_requirements.len() >= 3,
+            "the declaration lists {} spine requirements, which is too few to be the real set",
+            spine_requirements.len()
+        );
+
+        let complete: Vec<(&str, String)> = vec![
+            ("GOOGLE_CLOUD_PROJECT", "fixture-project".to_string()),
+            ("KIN_GCS_BUCKET", "fixture-bucket".to_string()),
+            ("KIN_GCS_PREFIX", "fixture-prefix".to_string()),
+            ("KIN_REPO_IDS", hosted_spine_fleet().join(",")),
+        ];
+
+        // With nothing missing the contract must hold, or every arm below would
+        // pass because the fixture was incomplete rather than because the
+        // requirement is enforced.
+        {
+            let mut environment = kin_core::test_env::EnvVarGuard::new();
+            for (name, value) in &complete {
+                environment.apply(name, Some(value.as_str()));
+            }
+            let (state, _repo) = hosted_state_for_contract(true);
+            state
+                .hosted_spine_contract()
+                .expect("the fixture must provision a complete hosted contract");
+        }
+
+        for requirement in &spine_requirements {
+            let mut environment = kin_core::test_env::EnvVarGuard::new();
+            for (name, value) in &complete {
+                if *name == requirement.name {
+                    environment.apply::<_, &str>(name, None);
+                } else {
+                    environment.apply(name, Some(value.as_str()));
+                }
+            }
+            // KIN_REPO_IDS reaches the contract through the allowlist the
+            // process was constructed with, not through a second read, so its
+            // absence is expressed the way startup expresses it.
+            let with_fleet = requirement.name != "KIN_REPO_IDS";
+            let (state, _repo) = hosted_state_for_contract(with_fleet);
+            let refusal = state
+                .hosted_spine_contract()
+                .expect_err("a missing hosted requirement must close the contract");
+            assert_eq!(
+                refusal,
+                requirement.refusal(hosted_start::Stage::Spine),
+                "removing {} produced a refusal --compat-json does not declare",
+                requirement.name
+            );
+        }
     }
 }
