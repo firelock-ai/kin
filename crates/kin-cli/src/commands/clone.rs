@@ -38,6 +38,17 @@ struct NativeCloneSource {
     locator: Option<String>,
 }
 
+/// Whether this URL is a Git clone URL rather than a native Kin endpoint.
+///
+/// A trailing `.git` is the Git clone convention, and it is never part of a
+/// native identity: every locator form `native_remote_locator` recognizes
+/// strips it before returning a repository id, so a URL still carrying one when
+/// the locator declined it was typed as a Git URL. Kin peers are otherwise
+/// ordinary HTTP endpoints, so nothing else in a bare URL separates the two.
+fn is_git_clone_url(url: &str) -> bool {
+    url.trim().trim_end_matches('/').ends_with(".git")
+}
+
 fn native_source(url: &str, repository: Option<&str>) -> Result<Option<NativeCloneSource>> {
     let locator = crate::commands::remote::native_remote_locator(url);
     let (base_url, organization_id, located_repository) = match locator {
@@ -56,6 +67,15 @@ fn native_source(url: &str, repository: Option<&str>) -> Result<Option<NativeClo
         );
         return Ok(None);
     };
+    // Reaching negotiation with a Git URL only produced "native remote did not
+    // publish an identity this replica can adopt", which blames the remote for
+    // the flag that rerouted the clone. The URL is never echoed, because this
+    // runs before the credential check below.
+    if located_repository.is_none() && is_git_clone_url(url) {
+        bail!(
+            "a Git clone URL does not take --repository; Git transport carries its own repository path. Drop --repository to clone through Git transport, or pass a native Kin locator such as kinlab://<org>/<repository-id>"
+        );
+    }
     if let Some(located) = &located_repository {
         ensure!(
             repository == located,
@@ -348,6 +368,44 @@ mod tests {
         assert_eq!(source.repository_id.as_str(), "repo");
         assert_eq!(source.endpoint.organization_id.as_deref(), Some("acme"));
         assert!(native_source("kinlab://acme/repo", Some("other")).is_err());
+    }
+
+    #[test]
+    fn a_git_clone_url_is_refused_rather_than_rerouted_onto_the_native_path() {
+        for url in [
+            "https://github.com/org/repo.git",
+            "https://github.com/org/repo.git/",
+            "git@github.com:org/repo.git",
+            "ssh://git@github.com/org/repo.git",
+        ] {
+            let error = native_source(url, Some("repo"))
+                .err()
+                .expect("a Git clone URL does not resolve as a native source");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Git clone URL does not take --repository"),
+                "{url}: {error}"
+            );
+        }
+        // Without the flag the same URL still falls through to Git transport,
+        // which is the path that clones it.
+        assert!(native_source("https://github.com/org/repo.git", None)
+            .unwrap()
+            .is_none());
+        // A peer that is not a Git clone URL still takes --repository, and a
+        // hosted locator spelled with .git is a native locator, not a Git URL.
+        assert!(native_source("http://127.0.0.1:4219", Some("repo"))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            native_source("kinlab://acme/repo.git", None)
+                .unwrap()
+                .unwrap()
+                .repository_id
+                .as_str(),
+            "repo"
+        );
     }
 
     #[test]
