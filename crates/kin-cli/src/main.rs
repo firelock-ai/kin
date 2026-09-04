@@ -1296,6 +1296,15 @@ enum Command {
         /// uncommitted changes to tracked files that diverge from it
         #[arg(long, default_value_t = false)]
         heal: bool,
+        /// Delete the staged stores a crashed `kin init` left beside this
+        /// directory and its parent
+        ///
+        /// Removes only a stage whose owner is provably gone and whose
+        /// destination repository was never created. Bare `kin doctor` is the
+        /// dry run: it names every stage this would take, with its size, and
+        /// deletes nothing.
+        #[arg(long = "reclaim-staging", default_value_t = false)]
+        reclaim_staging: bool,
     },
     /// First-time setup and health checks for the Kin system
     Setup {
@@ -4012,6 +4021,7 @@ fn run() -> Result<()> {
                     json,
                     drift,
                     heal,
+                    reclaim_staging,
                 } => {
                     // `--drift` reports the derived projection against graph
                     // truth; `--heal` rematerializes it. Bare `kin doctor`
@@ -4022,6 +4032,14 @@ fn run() -> Result<()> {
                     } else if drift {
                         commands::capabilities::require_ready("doctor --drift")?;
                         commands::drift::run(json).await
+                    } else if reclaim_staging {
+                        // Deliberately no `require_ready`. This deletes a
+                        // directory a crashed `kin init` left behind, on a path
+                        // where the repository was never created, which is
+                        // precisely a machine with nothing ready on it. Gating
+                        // it on readiness would refuse the only case it exists
+                        // for.
+                        commands::health::reclaim_stranded_stages(json)
                     } else {
                         commands::setup::doctor(fix, install_language_servers, json).await
                     }
