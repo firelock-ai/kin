@@ -2359,6 +2359,7 @@ mod tests {
         assert_eq!(transaction.aliases, admitted.aliases);
         assert!(transaction.git_authority_delta.is_none());
         assert!(transaction.workspace_mutation.is_none());
+        assert!(transaction.collaboration_delta.is_none());
         transaction.validate().unwrap();
     }
 

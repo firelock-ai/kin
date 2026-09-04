@@ -329,6 +329,26 @@ pub(crate) fn materialized_edges(
         }
     }
 
+    // One durable edge per (src_repo, src_entity, dst_repo, dst_entity). A source entity
+    // that imports the same symbol twice, or reaches one target through both an exact and
+    // an ambiguous resolution, yields identical identities, and the publication validator
+    // refuses a duplicate. Keep one edge per identity, the highest confidence seen, in a
+    // deterministic order.
+    edges.sort_by(|left, right| {
+        left.src_repo
+            .cmp(&right.src_repo)
+            .then_with(|| left.src_entity.cmp(&right.src_entity))
+            .then_with(|| left.dst_repo.cmp(&right.dst_repo))
+            .then_with(|| left.dst_entity.cmp(&right.dst_entity))
+            .then_with(|| right.confidence.total_cmp(&left.confidence))
+    });
+    edges.dedup_by(|later, kept| {
+        later.src_repo == kept.src_repo
+            && later.src_entity == kept.src_entity
+            && later.dst_repo == kept.dst_repo
+            && later.dst_entity == kept.dst_entity
+    });
+
     edges
 }
 
@@ -1251,6 +1271,62 @@ mod tests {
             matches!(results[0].1, ResolveResult::NotFound),
             "import naming kin_db must not bind a kin-vfs name collision, got {:?}",
             results[0].1
+        );
+    }
+
+    #[test]
+    fn materialized_edges_keep_one_edge_per_identity_with_the_highest_confidence() {
+        let source_entity = EntityId::new();
+        let target_entity = EntityId::new();
+        let import = |name: &str| UnresolvedImport {
+            source_repo: "kin".to_string(),
+            source_entity,
+            imported_name: name.to_string(),
+            imported_kind: Some(EntityKind::Class),
+            candidate_repos: vec!["kin-db".to_string()],
+            language: Some("rust".to_string()),
+            reference_fingerprint: None,
+            import_source: None,
+        };
+        let imports = vec![import("Graph"), import("Graph"), import("Graph")];
+        let resolutions = vec![
+            (
+                0usize,
+                ResolveResult::Resolved {
+                    target_repo: "kin-db".to_string(),
+                    target_entity,
+                    confidence: 0.6,
+                },
+            ),
+            (
+                1usize,
+                ResolveResult::Ambiguous {
+                    candidates: vec![("kin-db".to_string(), target_entity, 0.9)],
+                },
+            ),
+            (
+                2usize,
+                ResolveResult::Resolved {
+                    target_repo: "kin-db".to_string(),
+                    target_entity,
+                    confidence: 0.7,
+                },
+            ),
+        ];
+
+        let edges = materialized_edges(&imports, &resolutions);
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "one identity must publish as one edge: {edges:?}"
+        );
+        assert_eq!(edges[0].src_entity, source_entity);
+        assert_eq!(edges[0].dst_entity, target_entity);
+        assert!(
+            (edges[0].confidence - 0.9).abs() < f32::EPSILON,
+            "the kept edge carries the highest confidence: {}",
+            edges[0].confidence
         );
     }
 }

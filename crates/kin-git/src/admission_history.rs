@@ -187,10 +187,12 @@ impl AdmittedSemanticGitImportPlan {
 
     /// Bind this fully admitted history to an empty repository authority.
     ///
-    /// This method deliberately leaves workspace mutation and Git external
-    /// authority unset. The generation-zero integration layer binds the
-    /// separately validated workspace preflight and exact Git-authority delta
-    /// into the same transaction.
+    /// This method deliberately leaves workspace mutation, Git external
+    /// authority, and collaboration authority unset. The generation-zero
+    /// integration layer binds the separately validated workspace preflight
+    /// and exact Git-authority delta into the same transaction. Git admission
+    /// does not carry collaboration records, so it must not claim a
+    /// collaboration-root transition.
     pub fn into_generation_zero_repository_transaction(
         self,
         blob_store: &BlobStore,
@@ -224,6 +226,7 @@ impl AdmittedSemanticGitImportPlan {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         transaction.validate()?;
         Ok(transaction)

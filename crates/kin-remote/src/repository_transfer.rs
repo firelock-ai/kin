@@ -2104,6 +2104,7 @@ fn transfer_transaction(
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     transaction.validate().map_err(model)?;
     Ok(transaction)
@@ -2486,6 +2487,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -2628,6 +2630,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -2894,6 +2897,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         drop(source_lease);
         source
@@ -4039,6 +4043,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         drop(lease);
         fixture
@@ -4100,6 +4105,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         drop(lease);
         authority
@@ -4380,6 +4386,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         drop(lease);
         fixture

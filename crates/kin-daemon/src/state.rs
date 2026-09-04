@@ -10448,6 +10448,7 @@ impl DaemonState {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         let receipt = authority
             .commit_repository_transaction(transaction)
@@ -17703,6 +17704,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         let receipt = authority
             .commit_repository_transaction(transaction)

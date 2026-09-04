@@ -690,6 +690,7 @@ fn record_transaction(
         local_overlay_delta: None,
         merge_transaction_delta: Some(delta),
         sealed_observation: None,
+        collaboration_delta: None,
     }
 }
 
