@@ -1330,7 +1330,11 @@ mod tests {
             // the freshness reading rather than anything else in this fixture.
             let mut live = with_clock();
             live.completeness = Some(complete_coverage());
-            let certified = Verdict::compute(
+            // Named for the sample rather than for the outcome. A local called
+            // `certified` matches CodeQL's certificate-name heuristic for
+            // `rust/cleartext-logging`, and `assert!` counts as a log sink, so
+            // the earlier spelling raised a high-severity alert on this test.
+            let live_sample = Verdict::compute(
                 "find_references",
                 &populated_reference_payload("present"),
                 &live,
@@ -1338,9 +1342,9 @@ mod tests {
             )
             .expect("the readings are not all silent");
             assert!(
-                certified.certified,
+                live_sample.certified,
                 "the fixture certifies without the stale sample: {:?}",
-                certified.limiting_factor
+                live_sample.limiting_factor
             );
         }
 
