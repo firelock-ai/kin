@@ -312,6 +312,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_commit_memory_headroom());
     checks.push(check_daemon_kill_record());
     checks.push(check_interrupted_init());
+    checks.push(check_stranded_init_stage());
     checks.push(check_suspended_sweep());
     checks.extend(check_memory_pressure_rows(embedding_coverage));
     checks.push(check_retrieval_profile());
@@ -1990,6 +1991,153 @@ fn interrupted_init_check_for(roots: &[PathBuf]) -> HealthCheck {
         ),
     }
 }
+
+/// Reports, never reaps, exactly like the interrupted-conversion row above it.
+///
+/// Separate from that row rather than folded into it, because the two find
+/// different things. `abandoned_init_attempts` scans `.kin-git-capture-*`
+/// directories and learns about a repository stage only by reading a surviving
+/// capture record, which the native `kin init` path never writes at all. This
+/// row scans the `.kin.init-<uuid>.owner` records themselves, which is the same
+/// evidence `recover_orphaned_repository_stages` reaps by, so a stage whose
+/// capture directory is already gone is still named here. FIR-3146.
+fn check_stranded_init_stage() -> HealthCheck {
+    let cwd = env::current_dir().unwrap_or_default();
+    stranded_init_stage_check_for(&interrupted_init_scan_roots(&cwd))
+}
+
+fn stranded_init_stage_check_for(roots: &[PathBuf]) -> HealthCheck {
+    let survey = survey_stranded_stages(roots);
+    match kin_core::init::stranded_stage_doctor_row(&survey) {
+        Some((detail, fix)) => HealthCheck::new(
+            "stranded_init_stage",
+            "Stranded init staging",
+            HealthStatus::Degraded,
+            detail,
+        )
+        .with_manual_fix(fix),
+        None => HealthCheck::new(
+            "stranded_init_stage",
+            "Stranded init staging",
+            HealthStatus::Healthy,
+            "no crashed `kin init` left a staged store beside this directory",
+        ),
+    }
+}
+
+/// Survey every scan root once, keeping each stage the first time it is seen.
+///
+/// The roots overlap by construction: a working directory and its parent both
+/// name the parent's staging when the run happens one level down. Deduplicated
+/// on the owner record's path, which is unique per stage.
+pub(crate) fn survey_stranded_stages(roots: &[PathBuf]) -> kin_core::StrandedStageSurvey {
+    let mut survey = kin_core::StrandedStageSurvey::default();
+    let mut seen = std::collections::BTreeSet::new();
+    for root in roots {
+        let Ok(found) = kin_core::survey_orphaned_repository_stages(root) else {
+            continue;
+        };
+        survey.live += found.live;
+        for stage in found.stages {
+            if seen.insert(stage.owner_path.clone()) {
+                survey.stages.push(stage);
+            }
+        }
+    }
+    survey
+}
+
+/// Where a reclaim looks, which is exactly where the row that reported it
+/// looked.
+///
+/// Shared rather than re-derived: a reclaim that scanned a different set of
+/// directories than the row an operator just read would take back something
+/// they were never shown, or nothing at all.
+pub fn stranded_stage_scan_roots() -> Vec<PathBuf> {
+    let cwd = env::current_dir().unwrap_or_default();
+    interrupted_init_scan_roots(&cwd)
+}
+
+/// Take back every stranded stage the `stranded_init_stage` row just named.
+///
+/// The row is the dry run. `kin doctor` names every stage this would remove
+/// with its size and leaves the disk untouched, so an operator sees the list
+/// before anything is deleted and there is no second `--dry-run` flag to teach
+/// them. `kin cache gc` needs one because its default is destructive; this
+/// command's default surface is a diagnostic.
+///
+/// Removes only what `kin_core::reclaim_orphaned_repository_stages` proves
+/// abandoned, which is the same proof the reaper inside `kin init` uses: a free
+/// owner lock, a private owner record and stage directory owned by this user,
+/// the exact recorded stage path, and a matching device and inode. A stage a
+/// live `kin init` holds is never touched.
+pub fn reclaim_stranded_stages(json: bool) -> anyhow::Result<()> {
+    let roots = stranded_stage_scan_roots();
+    let mut recovered = 0usize;
+    let mut bytes = 0u64;
+    let mut retained = 0usize;
+    let mut live = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for root in &roots {
+        match kin_core::reclaim_orphaned_repository_stages(root) {
+            Ok(outcome) => {
+                recovered += outcome.recovered;
+                bytes = bytes.saturating_add(outcome.bytes_recovered);
+                retained += outcome.retained;
+                live += outcome.live;
+            }
+            // Named, not swallowed. A root that could not be scanned is the one
+            // thing an operator must not read as "nothing was stranded there".
+            Err(error) => failures.push(format!("{}: {error}", root.display())),
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": STRANDED_STAGE_RECLAIM_SCHEMA,
+                "roots": roots.iter().map(|root| root.display().to_string()).collect::<Vec<_>>(),
+                "recovered": recovered,
+                "bytes_recovered": bytes,
+                "retained": retained,
+                "live": live,
+                "unreadable_roots": failures,
+            }))?
+        );
+    } else if recovered == 0 {
+        println!("kin doctor --reclaim-staging: nothing to reclaim here.");
+    } else {
+        let noun = if recovered == 1 { "stage" } else { "stages" };
+        println!(
+            "kin doctor --reclaim-staging: reclaimed {} from {recovered} stranded init {noun}.",
+            kin_core::init_attempt::human_bytes(bytes)
+        );
+    }
+    if !json {
+        if retained > 0 {
+            let (noun, pronoun) = if retained == 1 {
+                ("stage", "it")
+            } else {
+                ("stages", "them")
+            };
+            println!(
+                "  {retained} further staging {noun} left alone, because this run could not prove \
+                 {pronoun} unused."
+            );
+        }
+        if live > 0 {
+            let verb = if live == 1 { "is" } else { "are" };
+            println!("  {live} staging {verb} owned by a `kin init` running right now.");
+        }
+        for failure in &failures {
+            println!("  could not be examined, {failure}");
+        }
+    }
+    Ok(())
+}
+
+/// Schema of the `--reclaim-staging --json` payload.
+pub const STRANDED_STAGE_RECLAIM_SCHEMA: &str = "kin.stranded-stage-reclaim.v1";
 
 fn check_repo_init() -> HealthCheck {
     let cwd = env::current_dir().unwrap_or_default();
@@ -5657,6 +5805,55 @@ mod tests {
             "a forced performance tier runs the full budget, whoever chose it: {}",
             forced.detail
         );
+    }
+
+    /// The stranded-stage row scans where an operator stands, and reaps
+    /// nothing.
+    ///
+    /// A repository stage sits beside the repository that was never created,
+    /// not inside it, so the row that finds it has to look at the parent as
+    /// well as the working directory. Scanned here from one level down, which
+    /// is the standpoint the reported case had: a real `redis-full` clone with
+    /// the crashed init's 1.5 GB stage sitting next to it.
+    ///
+    /// The clean parent beside it is the control. Without it a row that
+    /// reported every directory as degraded would pass this test.
+    #[cfg(unix)]
+    #[test]
+    fn the_stranded_stage_row_scans_the_working_directory_and_its_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let corpus = parent.join("redis-full");
+        std::fs::create_dir(&corpus).unwrap();
+        let (stage, owner) =
+            kin_core::init::strand_repository_stage(&parent, &corpus.join(".kin")).unwrap();
+
+        let check =
+            stranded_init_stage_check_for(&kin_core::init_attempt::staging_scan_roots(&corpus));
+        assert!(matches!(check.status, HealthStatus::Degraded), "{check:?}");
+        assert!(
+            check.detail.contains(&stage.display().to_string()),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .manual_fix
+                .as_deref()
+                .unwrap_or_default()
+                .contains("kin doctor --reclaim-staging"),
+            "{check:?}"
+        );
+        assert!(
+            stage.is_dir(),
+            "doctor reports and must never reap what it reports"
+        );
+        assert!(owner.is_file());
+
+        let clean = tempfile::tempdir().unwrap();
+        let quiet = stranded_init_stage_check_for(&[clean.path().to_path_buf()]);
+        assert!(matches!(quiet.status, HealthStatus::Healthy), "{quiet:?}");
+        assert!(quiet.manual_fix.is_none(), "{quiet:?}");
     }
 
     /// The reading a user needed BEFORE the commit that killed their daemon.

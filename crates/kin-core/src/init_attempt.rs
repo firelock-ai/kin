@@ -468,8 +468,13 @@ fn directory_bytes(root: &Path) -> u64 {
 }
 
 /// Disk one file occupies.
+///
+/// Shared with `init::measure_stage_tree`, which sizes a stranded repository
+/// stage for the same operator asking the same question one row further down
+/// the same `kin doctor` output. Two definitions of "how much disk" would print
+/// two answers for one machine.
 #[cfg(unix)]
-fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
+pub(crate) fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt as _;
 
     // `blocks()` is in 512-byte units by POSIX definition, whatever the
@@ -486,7 +491,7 @@ fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
 
 /// Disk one file occupies, where the platform publishes no allocation.
 #[cfg(not(unix))]
-fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
+pub(crate) fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
     metadata.len()
 }
 
