@@ -1481,6 +1481,16 @@ pub struct FirestoreStore {
     transient_retry_gate: Option<TransientRetryGate>,
 }
 
+/// Whether a successful Firestore response needs its body before the caller
+/// can decide its outcome. Reads need their JSON payload; Commit has already
+/// made its durable, atomic decision once its successful status arrived.
+#[cfg(feature = "firestore")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SuccessfulResponseBody {
+    Required,
+    Informational,
+}
+
 #[cfg(feature = "firestore")]
 impl FirestoreStore {
     /// Create a new Firestore store against Google APIs.
@@ -1535,6 +1545,7 @@ impl FirestoreStore {
     fn send_with_transient_retry(
         &self,
         describe: &str,
+        successful_response_body: SuccessfulResponseBody,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<(reqwest::StatusCode, String), SpineError> {
         enum Attempt {
@@ -1552,17 +1563,31 @@ impl FirestoreStore {
                         Err(error) => return Ok(Attempt::Transport(error.to_string())),
                     };
                     let status = response.status();
-                    // A body that fails to arrive after the status did is a
-                    // transport failure, never a success with an empty body:
-                    // an empty body would be parsed as the answer, and a
-                    // `:runQuery` answer of "" is a fatal serialization error
-                    // that the transient policy would otherwise never see.
+                    // A Firestore Commit's successful status already
+                    // acknowledges its atomic write, so its body is never
+                    // needed. Retrying after its informational body truncates
+                    // can turn an applied cleanup into a permanent
+                    // precondition error on the second attempt.
+                    if status.is_success()
+                        && successful_response_body == SuccessfulResponseBody::Informational
+                    {
+                        return Ok(Attempt::Response(status, String::new()));
+                    }
+                    // Reads need their successful JSON payload. A successful
+                    // read whose body fails to arrive is a transport failure
+                    // and gets the bounded retry policy. A failed status is
+                    // still an authoritative Firestore answer even if its
+                    // detail body truncates, so preserve its status for the
+                    // HTTP fallback classifier below.
                     let body = match response.text().await {
                         Ok(body) => body,
-                        Err(error) => {
+                        Err(error) if status.is_success() => {
                             return Ok(Attempt::Transport(format!(
                                 "response body read failed after status {status}: {error}"
                             )))
+                        }
+                        Err(error) => {
+                            format!("response body read failed after status {status}: {error}")
                         }
                     };
                     Ok(Attempt::Response(status, body))
@@ -1711,10 +1736,11 @@ impl FirestoreStore {
                 url.push_str(pt);
             }
 
-            let (status, body) = self
-                .send_with_transient_retry(&format!("list {collection}"), || {
-                    self.client.get(&url).bearer_auth(&token)
-                })?;
+            let (status, body) = self.send_with_transient_retry(
+                &format!("list {collection}"),
+                SuccessfulResponseBody::Required,
+                || self.client.get(&url).bearer_auth(&token),
+            )?;
             if !status.is_success() {
                 return Err(SpineError::Http(format!(
                     "list {collection} failed ({status}): {body}"
@@ -1747,10 +1773,11 @@ impl FirestoreStore {
     ) -> Result<Option<serde_json::Value>, SpineError> {
         let token = self.get_access_token()?;
         let url = self.document_url(collection, document_id);
-        let (status, body) = self
-            .send_with_transient_retry(&format!("read {collection}/{document_id}"), || {
-                self.client.get(&url).bearer_auth(&token)
-            })?;
+        let (status, body) = self.send_with_transient_retry(
+            &format!("read {collection}/{document_id}"),
+            SuccessfulResponseBody::Required,
+            || self.client.get(&url).bearer_auth(&token),
+        )?;
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -1791,10 +1818,11 @@ impl FirestoreStore {
             structured_query["limit"] = serde_json::json!(limit);
         }
         let query = serde_json::json!({ "structuredQuery": structured_query });
-        let (status, body) = self
-            .send_with_transient_retry(&format!("query {collection}"), || {
-                self.client.post(&url).bearer_auth(&token).json(&query)
-            })?;
+        let (status, body) = self.send_with_transient_retry(
+            &format!("query {collection}"),
+            SuccessfulResponseBody::Required,
+            || self.client.post(&url).bearer_auth(&token).json(&query),
+        )?;
         if !status.is_success() {
             return Err(SpineError::Http(format!(
                 "query {collection} failed ({status}): {body}"
@@ -1871,10 +1899,11 @@ impl FirestoreStore {
         operation: &str,
     ) -> Result<(), SpineError> {
         let body = serde_json::json!({ "writes": writes });
-        let (status, response_body) = self
-            .send_with_transient_retry(&format!("{operation} commit"), || {
-                self.client.post(url).bearer_auth(token).json(&body)
-            })?;
+        let (status, response_body) = self.send_with_transient_retry(
+            &format!("{operation} commit"),
+            SuccessfulResponseBody::Informational,
+            || self.client.post(url).bearer_auth(token).json(&body),
+        )?;
         if !status.is_success() {
             return Err(SpineError::Http(format!(
                 "{operation} commit failed ({status}): {response_body}"
@@ -2827,9 +2856,11 @@ impl FirestoreStore {
         // a permanent status; reconciliation below reads the durable head
         // either way, so a retry can only turn an indeterminate outcome into
         // a decided one.
-        let response = self.send_with_transient_retry("head CAS", || {
-            self.client.post(&url).bearer_auth(&token).json(&body)
-        });
+        let response = self.send_with_transient_retry(
+            "head CAS",
+            SuccessfulResponseBody::Informational,
+            || self.client.post(&url).bearer_auth(&token).json(&body),
+        );
         let (status, response_body) = match response {
             Ok((status, body)) => (status, (!status.is_success()).then_some(body)),
             Err(error) => {
@@ -7420,6 +7451,49 @@ mod transient_retry_tests {
         assert!(requests
             .iter()
             .all(|request| request.method == "POST" && request.path.ends_with(":runQuery")));
+    }
+
+    #[test]
+    fn commit_write_batch_does_not_replay_after_a_truncated_success_body() {
+        // A Commit's response body has no result the caller needs. Once its
+        // 200 status arrives, its atomic writes are acknowledged. A body
+        // truncation must therefore not issue the same cleanup commit again.
+        let commit_server = ScriptedServer::serve(vec![Scripted::Truncated {
+            status: 200,
+            body: "{".to_string(),
+            claimed_len: 2,
+        }]);
+        let commit_store = store_against(&commit_server);
+        commit_store
+            .commit_write_batch(
+                "owner",
+                &format!("{}:commit", commit_store.base_url()),
+                &[serde_json::json!({ "delete": "x" })],
+                "cleanup",
+            )
+            .expect("a successful Commit does not need its informational body");
+        let commit_requests = commit_server.requests();
+        assert_eq!(commit_requests.len(), 1, "{commit_requests:?}");
+        assert!(commit_requests[0].path.ends_with("/documents:commit"));
+    }
+
+    #[test]
+    fn get_document_does_not_retry_a_permission_denied_with_a_truncated_body() {
+        let denial = status_body("PERMISSION_DENIED");
+        let server = ScriptedServer::serve(vec![
+            Scripted::Truncated {
+                status: 403,
+                body: denial[..denial.len() / 2].to_string(),
+                claimed_len: denial.len(),
+            },
+            respond(200, "{}"),
+        ]);
+        let store = store_against(&server);
+        let error = store
+            .get_document("spine_repo_heads_v2", "abc")
+            .expect_err("a received permission status is final even without its body");
+        assert!(error.to_string().contains("403"), "{error}");
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]

@@ -4943,6 +4943,17 @@ FAST_GATE_SHARD_STEPS = (
 )
 FAST_GATE_SHARD_MATRIX = "shard: [1, 2, 3]"
 FAST_GATE_SHARD_INDEPENDENT_LEGS = "fail-fast: false"
+FIRESTORE_RESPONSE_BODY_CONTRACT_COMMAND = (
+    "cargo test -p kin-spine --features firestore --locked"
+)
+FIRESTORE_RESPONSE_BODY_CONTRACT_LISTING = (
+    "cargo test -p kin-spine --features firestore --locked -- --list"
+)
+FIRESTORE_RESPONSE_BODY_CONTRACT_TESTS = (
+    "firestore::transient_retry_tests::query_documents_retries_a_body_that_fails_to_arrive_over_the_wire",
+    "firestore::transient_retry_tests::commit_write_batch_does_not_replay_after_a_truncated_success_body",
+    "firestore::transient_retry_tests::get_document_does_not_retry_a_permission_denied_with_a_truncated_body",
+)
 FAST_GATE_AGGREGATE_ALWAYS_RUNS = "if: ${{ !cancelled() }}"
 # The Windows cross-check is in here rather than left advisory because the job
 # publishes no required context of its own. Without this line a red Windows leg
@@ -4990,6 +5001,17 @@ def assert_fast_gate_authority(workflow: str) -> None:
                 f"`{policy}`: 31 of 64 measured pull-request failures were "
                 "formatting, clippy or a policy script"
             )
+    lint_text = "\n".join(lint)
+    if (
+        FIRESTORE_RESPONSE_BODY_CONTRACT_COMMAND not in lint_text
+        or FIRESTORE_RESPONSE_BODY_CONTRACT_LISTING not in lint_text
+        or any(test_name not in lint_text for test_name in FIRESTORE_RESPONSE_BODY_CONTRACT_TESTS)
+    ):
+        raise AssertionError(
+            "the admission core must run the Firestore post-status response "
+            "contract with the firestore feature enabled and an exact listing; "
+            "default tests compile neither the retry nor Commit body behavior"
+        )
 
     shard = jobs["fast-gate-tests"]
     shard_lines = active_lines(shard)
@@ -15085,6 +15107,13 @@ def main() -> None:
             "--partition count:${{ matrix.shard }}/3",
             "--partition count:${{ matrix.shard }}/7",
             "one fact in two places and they disagree",
+        ),
+        (
+            "the Firestore post-status response contract is no longer selected by the admission core",
+            "fast-gate-lint",
+            FIRESTORE_RESPONSE_BODY_CONTRACT_TESTS[0],
+            "removed_firestore_response_body_contract",
+            "Firestore post-status response contract",
         ),
     ):
         # Scoped to the owning job block rather than the whole file: two jobs
