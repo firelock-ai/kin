@@ -695,13 +695,13 @@
     },
     {
       "file": "crates/kin-daemon/src/repository_merge_state.rs",
-      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified.",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. The third is `open_merge_summary`, which reads the merge-transaction set so the daemon's commit gate can refuse around an open merge; it lives here rather than on the RPC surface because that surface is scanned in full as the answer authority, and moving one lease accessor is cheaper than widening its exemption. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_match": [
         {
           "expr": ".metadata()",
-          "count": 2
+          "count": 3
         }
       ]
     },
