@@ -1071,6 +1071,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/check-kin-vfs-compat.mjs
 
+      # AGENTS.md's Landing section enumerates the required contexts on `main` as prose, read
+      # from `GET /repos/firelock-ai/kin/rules/branches/main`. On 2026-09-03 that prose had
+      # drifted: it said six and was missing `MCP surface contract`, and nothing had compared the
+      # two since whoever added that context did. This job carries the required "Fast gate lint
+      # and policy" context and runs on every pull request, so the pull request that next edits
+      # this sentence, or the release that next adds a context, is the one graded. The read needs
+      # no token against a public repository; `GH_TOKEN` is passed anyway for the 5000/hour limit
+      # rather than the anonymous 60/hour one.
+      - name: Falsify required-contexts doc check
+        run: python3 scripts/check-required-contexts.py --self-test
+
+      - name: Check required-contexts doc matches branch protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check-required-contexts.py
+
       # Byte-identical to the `check` job's clippy step, deliberately. The two
       # run on different events now and there is no event on which neither runs,
       # so the workspace is linted exactly once per event rather than twice.
