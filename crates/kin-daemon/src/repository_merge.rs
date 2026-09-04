@@ -608,7 +608,7 @@ fn three_way(
         .with_context(|| format!("resolve exact graph for branch {}", request.source))?;
 
     let mut conflicts = Vec::new();
-    let merged_entities = compose(
+    let mut merged_entities = compose(
         &base_state.entities,
         &ours_state.entities,
         &theirs_state.entities,
@@ -684,6 +684,15 @@ fn three_way(
     if !conflicts.is_empty() {
         return open_conflicted_merge(state, authority, request, plan, base, conflicts);
     }
+    align_unchanged_entities_with_their_artifacts(
+        &base_state,
+        &ours_state,
+        &theirs_state,
+        &artifacts_by_id(&ours_state.tree),
+        &artifacts_by_id(&theirs_state.tree),
+        &merged_artifacts,
+        &mut merged_entities,
+    );
 
     let desired_tree = ResolvedTree::from_artifacts(merged_artifacts.into_values())
         .context("compose exact merged repository tree")?;
@@ -1056,6 +1065,20 @@ pub(crate) fn publish_resolved_merge(
         merged_relations = authored.relations;
         merged_artifacts = artifacts_by_id(&authored.resolved_tree);
     }
+
+    // AFTER the authored-file replay above, never before it. That replay can
+    // rewrite the merged entities and the merged tree, and this reads the tree
+    // to decide which side each untouched entity follows, so running it first
+    // would decide against a tree that is about to move.
+    align_unchanged_entities_with_their_artifacts(
+        &base_state,
+        &ours_state,
+        &theirs_state,
+        &ours_artifacts,
+        &theirs_artifacts,
+        &merged_artifacts,
+        &mut merged_entities,
+    );
 
     // The resolutions are the caller's, so a composition they leave broken is
     // named rather than parked again: the record already holds one settlement
@@ -2016,6 +2039,87 @@ where
         }
     }
     Ok(merged)
+}
+
+/// Point every entity both branches left alone at the side its own file
+/// publishes from.
+///
+/// The composer decides entities and artifacts on separate passes, so the two
+/// can pick different sides for the same file. For an entity BOTH branches
+/// edited that is fine and deliberate:
+/// [`project_artifacts_from_settled_entities`] makes the file follow the
+/// settlement. For an entity NEITHER branch edited it is not. Its content is
+/// identical on every side, so it never conflicts and never gets a settlement,
+/// and the composer above takes `ours` for it. If that file publishes from
+/// `theirs`, the graph then serves ours' byte span and ours' file blob stamp
+/// for theirs' bytes, under an envelope that looks clean: the entity delta is
+/// empty because content did not move, replay checks only tree equality, and
+/// publish installs the stored delta without re-deriving anything. That is the
+/// stale-span class, arriving through the merge.
+///
+/// So the side is taken from the file rather than from a default. Run this
+/// after the artifacts are FINAL: after composition on a clean merge, and after
+/// both `apply_resolution` and `project_artifacts_from_settled_entities` on a
+/// settled one, because that projection can still flip a file.
+///
+/// It touches only entities whose content agrees across the sides, which is
+/// exactly the set that carries no semantic decision. An entity that conflicted
+/// holds the value its settlement chose and is left alone.
+fn align_unchanged_entities_with_their_artifacts(
+    base_state: &kin_model::graph::ResolvedGraphState,
+    ours_state: &kin_model::graph::ResolvedGraphState,
+    theirs_state: &kin_model::graph::ResolvedGraphState,
+    ours_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    theirs_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    merged_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    merged_entities: &mut std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+) {
+    let mut by_path: BTreeMap<&kin_model::RepoPath, &ResolvedArtifact> = BTreeMap::new();
+    for artifact in merged_artifacts.values() {
+        by_path.insert(&artifact.path, artifact);
+    }
+
+    let mut aligned = Vec::new();
+    for entity in merged_entities.keys().copied() {
+        let ours = ours_state.entities.get(&entity);
+        let theirs = theirs_state.entities.get(&entity);
+        // Identical values need no alignment, and a value the two sides
+        // disagree about is a settlement's, not this pass's.
+        let (Some(ours), Some(theirs)) = (ours, theirs) else {
+            continue;
+        };
+        if ours == theirs || !entities_agree(Some(ours), Some(theirs)) {
+            continue;
+        }
+        // An entity names its file in its span, which is also how the conflict
+        // listing labels it. Base is read too, for an entity whose file moved.
+        let Some(path) = [ours, theirs]
+            .into_iter()
+            .chain(base_state.entities.get(&entity))
+            .find_map(|found| found.span.as_ref())
+            .map(|span| span.file.to_string())
+        else {
+            continue;
+        };
+        let Some(published) = by_path
+            .iter()
+            .find(|(candidate, _)| candidate.to_string() == path)
+            .map(|(_, artifact)| *artifact)
+        else {
+            continue;
+        };
+        let from_ours = ours_artifacts.get(&published.artifact_id) == Some(published);
+        let from_theirs = theirs_artifacts.get(&published.artifact_id) == Some(published);
+        // `ours` is already installed, so only a file that publishes from
+        // theirs alone moves anything. A file that matches both sides, or
+        // neither, leaves the entity where composition put it.
+        if from_theirs && !from_ours {
+            aligned.push((entity, theirs.clone()));
+        }
+    }
+    for (entity, value) in aligned {
+        merged_entities.insert(entity, value);
+    }
 }
 
 /// Classify a value divergence from which of the three inputs held the identity.
@@ -3385,6 +3489,210 @@ mod tests {
                 "{name} composes to a real value, not an empty one"
             );
         }
+    }
+
+    /// Three states for one file and one entity in it, where the entity's own
+    /// source never moves.
+    ///
+    /// `ours` leaves the FILE exactly as base left it, so the artifact composer
+    /// takes theirs. The entity still differs between the two sides, because a
+    /// branch tip carries its own file blob stamp and byte span for every
+    /// entity it holds.
+    fn one_sided_file_edit() -> (
+        kin_model::EntityId,
+        ArtifactId,
+        ResolvedGraphState,
+        ResolvedGraphState,
+        ResolvedGraphState,
+    ) {
+        let entity = kin_model::EntityId::new();
+        let file = ArtifactId::new();
+        let path = "ledger/reporting.py";
+        let state = |entity_stamp: u8, blob: u8| ResolvedGraphState {
+            entities: [(
+                entity,
+                python_entity(entity, "totals_by_month", path, 1, entity_stamp),
+            )]
+            .into(),
+            tree: ResolvedTree::from_artifacts([artifact(file, path, blob)]).unwrap(),
+            ..ResolvedGraphState::default()
+        };
+        // Base and ours hold the same bytes; theirs edited the file.
+        (
+            entity,
+            file,
+            state(0x10, 0xa0),
+            state(0x20, 0xa0),
+            state(0x30, 0xb0),
+        )
+    }
+
+    /// An entity neither branch edited publishes from the side its own file
+    /// publishes from.
+    ///
+    /// The composer decides entities and artifacts on separate passes, so
+    /// without this they can pick different sides for the same file. An entity
+    /// whose content agrees everywhere never conflicts and never gets a
+    /// settlement, so it took `ours` while its file published from `theirs`,
+    /// and the graph then served ours' byte span and ours' blob stamp for
+    /// theirs' bytes. Nothing downstream catches it: the entity delta is empty
+    /// because content did not move, replay checks only tree equality, and
+    /// publish installs the stored delta without re-deriving anything. That is
+    /// the stale-span class, reintroduced through the merge.
+    ///
+    /// Breaking it: drop the
+    /// `align_unchanged_entities_with_their_artifacts` call and the composed
+    /// entity carries ours' span over theirs' bytes.
+    #[test]
+    fn an_entity_neither_branch_edited_follows_the_side_its_file_publishes() {
+        let (entity, file, base_state, ours_state, theirs_state) = one_sided_file_edit();
+        let ours_artifacts = artifacts_by_id(&ours_state.tree);
+        let theirs_artifacts = artifacts_by_id(&theirs_state.tree);
+
+        let mut conflicts = Vec::new();
+        let mut merged_entities = compose(
+            &base_state.entities,
+            &ours_state.entities,
+            &theirs_state.entities,
+            |entity| MergeConflictSubject::Entity { entity: *entity },
+            MergeSideValue::entity,
+            |_| None,
+            entities_agree,
+            &mut conflicts,
+        )
+        .unwrap();
+        let merged_artifacts = compose(
+            &artifacts_by_id(&base_state.tree),
+            &ours_artifacts,
+            &theirs_artifacts,
+            |artifact| MergeConflictSubject::Artifact {
+                artifact: *artifact,
+            },
+            MergeSideValue::artifact,
+            |_| None,
+            |left, right| left == right,
+            &mut conflicts,
+        )
+        .unwrap();
+        assert!(
+            conflicts.is_empty(),
+            "a one-sided file edit is a clean merge"
+        );
+
+        // The fixture is the case it claims to be: the file publishes from
+        // theirs, and before alignment the entity does not.
+        assert_eq!(
+            merged_artifacts.get(&file),
+            theirs_artifacts.get(&file),
+            "the artifact composer takes theirs, because ours left the file alone"
+        );
+        assert_eq!(
+            merged_entities.get(&entity).unwrap().span,
+            ours_state.entities.get(&entity).unwrap().span,
+            "composition alone leaves the entity on ours"
+        );
+
+        align_unchanged_entities_with_their_artifacts(
+            &base_state,
+            &ours_state,
+            &theirs_state,
+            &ours_artifacts,
+            &theirs_artifacts,
+            &merged_artifacts,
+            &mut merged_entities,
+        );
+
+        assert_eq!(
+            merged_entities.get(&entity).unwrap().span,
+            theirs_state.entities.get(&entity).unwrap().span,
+            "the entity publishes the span of the file that publishes"
+        );
+        assert_eq!(
+            merged_entities.get(&entity).unwrap(),
+            theirs_state.entities.get(&entity).unwrap(),
+            "and the blob stamp with it, so the graph and the bytes agree"
+        );
+    }
+
+    /// The same rule after a settlement flipped a file.
+    ///
+    /// `project_artifacts_from_settled_entities` can move a file to the side
+    /// its settled entities chose, AFTER `apply_resolution` has run, so the
+    /// alignment has to read the artifacts as they finally stand rather than as
+    /// composition left them. This drives that shape directly: the merged
+    /// artifact map holds theirs for the file, whatever put it there.
+    #[test]
+    fn an_artifact_flipped_by_a_settlement_carries_its_unchanged_entities() {
+        let (entity, file, base_state, ours_state, theirs_state) = one_sided_file_edit();
+        let ours_artifacts = artifacts_by_id(&ours_state.tree);
+        let theirs_artifacts = artifacts_by_id(&theirs_state.tree);
+        // Composition left the file on ours; the projection then flipped it.
+        let mut merged_entities = ours_state.entities.clone();
+        let merged_artifacts = theirs_artifacts.clone();
+
+        align_unchanged_entities_with_their_artifacts(
+            &base_state,
+            &ours_state,
+            &theirs_state,
+            &ours_artifacts,
+            &theirs_artifacts,
+            &merged_artifacts,
+            &mut merged_entities,
+        );
+
+        assert_eq!(
+            merged_entities.get(&entity).unwrap(),
+            theirs_state.entities.get(&entity).unwrap(),
+            "an entity nobody edited follows the flip its file took"
+        );
+        assert!(merged_artifacts.contains_key(&file));
+    }
+
+    /// The control. Alignment must not touch an entity a settlement decided.
+    ///
+    /// Without it, a pass that rewrote every entity from the published side
+    /// would satisfy both tests above while silently discarding the reader's
+    /// own `--ours` decision, which is the case
+    /// `project_artifacts_from_settled_entities` exists to protect.
+    #[test]
+    fn alignment_leaves_a_settled_entity_on_the_side_it_was_settled_to() {
+        let entity = kin_model::EntityId::new();
+        let file = ArtifactId::new();
+        let path = "ledger/reporting.py";
+        let state = |body: u8, stamp: u8, blob: u8| ResolvedGraphState {
+            entities: [(
+                entity,
+                python_entity(entity, "format_totals", path, body, stamp),
+            )]
+            .into(),
+            tree: ResolvedTree::from_artifacts([artifact(file, path, blob)]).unwrap(),
+            ..ResolvedGraphState::default()
+        };
+        // Both branches edited the function, differently, so it conflicted.
+        let base_state = state(1, 0x10, 0xa0);
+        let ours_state = state(2, 0x20, 0xa1);
+        let theirs_state = state(3, 0x30, 0xb0);
+        let ours_artifacts = artifacts_by_id(&ours_state.tree);
+        let theirs_artifacts = artifacts_by_id(&theirs_state.tree);
+
+        // The reader settled the entity `--ours` while the file publishes from
+        // theirs, which kin accepts and explains at publish time.
+        let mut merged_entities = ours_state.entities.clone();
+        align_unchanged_entities_with_their_artifacts(
+            &base_state,
+            &ours_state,
+            &theirs_state,
+            &ours_artifacts,
+            &theirs_artifacts,
+            &theirs_artifacts.clone(),
+            &mut merged_entities,
+        );
+
+        assert_eq!(
+            merged_entities.get(&entity).unwrap(),
+            ours_state.entities.get(&entity).unwrap(),
+            "a settled entity keeps the side the reader chose"
+        );
     }
 
     /// The positive control for the test above.
