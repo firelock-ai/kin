@@ -697,7 +697,7 @@ enum Command {
     },
     /// Resolve repository-v6 merge conflicts
     ///
-    /// Nine flags name a resolution and at least one is required, which is a
+    /// At least one resolution flag is required, which is a
     /// group rather than a per-argument condition. `kin conflicts` is the
     /// read-only view of the same transaction, so nothing here has to accept
     /// an empty invocation in order to be inspectable.
@@ -705,7 +705,7 @@ enum Command {
         .required(true)
         .multiple(true)
         .args([
-            "ours", "theirs", "base", "remove", "keep_path",
+            "ours", "theirs", "base", "remove", "keep_path", "file",
             "all_ours", "all_theirs", "do_continue", "abort",
         ]))]
     Resolve {
@@ -724,6 +724,9 @@ enum Command {
         /// Settle a contested path by naming the artifact that keeps it
         #[arg(long, value_name = "PATH=ARTIFACT")]
         keep_path: Vec<String>,
+        /// Resolve a conflicted repository path using the exact bytes in FILE
+        #[arg(long, num_args = 2, value_names = ["PATH", "FILE"], action = clap::ArgAction::Append)]
+        file: Vec<String>,
         /// Resolve all remaining conflicts keeping your version
         #[arg(long)]
         all_ours: bool,
@@ -3463,6 +3466,7 @@ fn run() -> Result<()> {
                     base,
                     remove,
                     keep_path,
+                    file,
                     all_ours,
                     all_theirs,
                     do_continue,
@@ -3477,6 +3481,7 @@ fn run() -> Result<()> {
                         base,
                         remove,
                         keep_path,
+                        file,
                         all_ours,
                         all_theirs,
                         do_continue,
@@ -5319,6 +5324,42 @@ mod tests {
                     .err()
                     .unwrap_or_else(|| panic!("{argv:?} must not parse"));
                 assert_eq!(error.exit_code(), 2, "{argv:?} must be a usage error");
+            }
+        });
+    }
+
+    #[test]
+    fn file_resolution_accepts_repeated_pairs_and_rejects_missing_bodies() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "kin",
+                "resolve",
+                "--file",
+                "src/a=b.rs",
+                "/tmp/a=b.rs",
+                "--file",
+                "notes.txt",
+                "/tmp/notes.txt",
+                "--json",
+            ])
+            .expect("explicit file resolutions are a complete invocation");
+            match cli.command {
+                Command::Resolve { file, json, .. } => {
+                    assert_eq!(
+                        file,
+                        ["src/a=b.rs", "/tmp/a=b.rs", "notes.txt", "/tmp/notes.txt"]
+                    );
+                    assert!(json);
+                }
+                _ => panic!("expected resolve"),
+            }
+            for argv in [
+                &["kin", "resolve", "--file"][..],
+                &["kin", "resolve", "--file", "src/code.rs"][..],
+                &["kin", "resolve", "--file", "src/code.rs", "--json"][..],
+            ] {
+                let error = Cli::try_parse_from(argv).err().expect("a body is required");
+                assert_eq!(error.exit_code(), 2);
             }
         });
     }

@@ -1021,6 +1021,36 @@ pub(crate) fn publish_resolved_merge(
         &mut merged_artifacts,
     )?;
 
+    if record.entries.iter().any(|entry| {
+        matches!(
+            &entry.resolution,
+            MergeEntryResolution::Payload {
+                payload: MergeResolutionPayload::Artifact(_),
+                ..
+            }
+        )
+    }) {
+        let mut authored = graph.to_snapshot();
+        authored.entities = merged_entities;
+        authored.relations = merged_relations;
+        authored.external_references = ours_state.external_references.clone();
+        authored
+            .external_references
+            .extend(theirs_state.external_references.clone());
+        authored.resolved_tree = ResolvedTree::from_artifacts(merged_artifacts.into_values())
+            .map_err(|error| {
+                merge_conflict(format!(
+                    "authored file resolutions leave an invalid tree: {error}"
+                ))
+            })?;
+        let authored = crate::repository_merge_state::replay_authored_files(
+            state, authority, &record, authored,
+        )?;
+        merged_entities = authored.entities;
+        merged_relations = authored.relations;
+        merged_artifacts = artifacts_by_id(&authored.resolved_tree);
+    }
+
     // The resolutions are the caller's, so a composition they leave broken is
     // named rather than parked again: the record already holds one settlement
     // per conflict, and re-opening would discard it.
@@ -1108,10 +1138,13 @@ pub(crate) fn publish_resolved_merge(
     let authoritative = replay
         .resolve_graph_at(&change.id)
         .context("replay the exact merge change")?;
-    if authoritative.tree != desired_tree {
+    if authoritative.tree != desired_tree
+        || authoritative.entities != merged_entities
+        || authoritative.relations != merged_relations
+    {
         bail!(
             "the resolution of {} into {} produced a change that does not replay to the same \
-             tree, so kin refused to publish it; nothing was written, and your recorded conflict \
+             tree and graph semantics, so kin refused to publish it; nothing was written, and your recorded conflict \
              resolutions are still there for another `kin resolve`",
             record.binding.source_ref,
             record.binding.target_ref
@@ -1203,11 +1236,28 @@ pub(crate) fn publish_resolved_merge(
         &authority.manager,
     )
     .context("validate exact workspace projection before publishing the merge")?;
-    if let Some(first) = drift.first() {
+    let authored_paths: BTreeSet<_> = record
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.resolution {
+            MergeEntryResolution::Payload {
+                payload: MergeResolutionPayload::Artifact(located),
+                ..
+            } => Some(located.path.clone()),
+            _ => None,
+        })
+        .collect();
+    let unrelated_drift: Vec<_> = drift
+        .drift
+        .iter()
+        .zip(&drift.drifted_paths)
+        .filter(|(_, path)| !authored_paths.contains(*path))
+        .collect();
+    if let Some((first, _)) = unrelated_drift.first() {
         return Err(kin_core::KinError::projection_conflict(format!(
             "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
              reconcile them into graph authority or discard them before publishing this merge",
-            drift.len()
+            unrelated_drift.len()
         ))
         .into());
     }
@@ -1233,12 +1283,13 @@ pub(crate) fn publish_resolved_merge(
     // installs nothing.
     let published_changes = transaction.changes.clone();
     let (materialized, receipt, authority_freeze) =
-        kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
+        kin_core::tree::transition_repository_workspace_tree_and_commit_authored_transaction(
             state.layout.working_dir(),
             &workspace.tree,
             &desired_tree,
             &authority.manager,
             transaction,
+            &authored_paths,
         )
         .with_context(|| {
             format!(
@@ -1387,6 +1438,38 @@ fn apply_resolution(
             bail!("a contested path has no side to take")
         }
         (subject, MergeEntryResolution::Payload { payload, .. }) => match (subject, payload) {
+            (MergeConflictSubject::Entity { entity }, MergeResolutionPayload::Entity(value)) => {
+                if value.id != *entity {
+                    return Err(merge_conflict(
+                        "an authored entity resolution names another identity",
+                    ));
+                }
+                entities.insert(*entity, value.as_ref().clone());
+            }
+            (
+                MergeConflictSubject::Relation { relation },
+                MergeResolutionPayload::Relation(value),
+            ) => {
+                if value.id != *relation {
+                    return Err(merge_conflict(
+                        "an authored relation resolution names another identity",
+                    ));
+                }
+                relations.insert(*relation, value.as_ref().clone());
+            }
+            (
+                MergeConflictSubject::Artifact { artifact },
+                MergeResolutionPayload::Artifact(value),
+            ) => {
+                artifacts.insert(
+                    *artifact,
+                    ResolvedArtifact {
+                        artifact_id: *artifact,
+                        path: value.path.clone(),
+                        entry: value.entry,
+                    },
+                );
+            }
             (MergeConflictSubject::Entity { entity }, MergeResolutionPayload::Removed) => {
                 entities.remove(entity);
             }

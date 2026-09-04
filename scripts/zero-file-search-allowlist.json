@@ -53,6 +53,15 @@
       ]
     },
     {
+      "file": "crates/kin-cli/src/commands/resolve.rs",
+      "reason": "Explicit merge input boundary: --file reads the caller-selected input once with a bounded reader, then submits those bytes as a merge decision. The daemon persists them in repository CAS and derives semantic state from that immutable input. Only this open expression is exempt; conflict inspection and every other primitive in the module remain guarded.",
+      "owner": "kin-cli",
+      "expiration": "2027-01-29",
+      "allow_match": [
+        "let input = std::fs::File::open(source)"
+      ]
+    },
+    {
       "file": "crates/kin-cli/src/commands/spec.rs",
       "reason": "Known violation under repair, not a boundary claim. Unlike every other entry here, these reads ARE the answer authority: `kin spec list` and `kin spec show` resolve their result by walking and parsing .kin/specs/*.json, which is exactly what the Zero File-Search Authority Rule forbids on a query path. The entry exists so the violation is visible, owned, and dated rather than invisible, which it was until this module entered the scanned query set: nothing had ever reported it. It is not evidence the path is graph-backed and must not be read as one. The reason it cannot simply be fixed is storage, not wiring: the pinned registry crates carry no home for a spec. kin_model::Spec is a bare data struct, GraphStore composes EntityStore, ChangeStore, WorkStore, ReviewStore, VerificationStore, ProvenanceStore and SessionStore and none of them has a spec method, and kin-db imports SpecId without using it. Mapping a spec onto a WorkItem would drop constraints, affected systems, validation requirements and the free-string scope, so the faithful fix is a SpecStore in kin-model and kin-db, which is a bottom-up registry publish. Tracked on the internal board for the command and for the store substrate; both pins and this entry come out when the query path reads graph truth. Pinned to the seven exact expressions rather than the whole file, so the debt cannot grow: any newly added filesystem primitive in this module fails the guard. Re-dated from 2026-10-31 to 2027-01-29 on 2026-09-03. The original date was set while neither zero-file-search guard graded a pull request, so it was a tracking date rather than a merge blocker. kin#1448 moved both guards into fast-gate-lint, which carries the required \"Fast gate lint and policy\" context and no job-level if, so from that landing the expiry blocks every kin pull request on the day it fires, whatever that pull request touches. The fix is the SpecStore train described above: kin-model, then kin-db, then a registry publish, carrying a GraphSnapshot format version, which is not schedulable against the old date. Measured on 2026-09-03 against the current pins: still no SpecStore in kin-model 0.7.23 or kin-db 0.7.96, and kin-db still imports SpecId at types.rs:15 without using it. The new date is kin-cli's own review day under the staggering this guard now recommends, so it is not a day any other owner's entries share.",
       "owner": "kin-cli",
