@@ -25,16 +25,43 @@ import os
 import sys
 import json
 import re
+import subprocess
 from datetime import date
 
 # Resolve paths relative to kin repo root
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 KIN_ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.dirname(SCRIPT_DIR)
 ALLOWLIST_PATH = os.path.join(SCRIPT_DIR, "zero-file-search-allowlist.json")
+CMD_DIR = "crates/kin-cli/src/commands"
 
 # Every allowlist entry must carry these so each exemption has an accountable
 # owner and a date by which it is re-justified or removed.
 REQUIRED_FIELDS = ("file", "reason", "owner", "expiration")
+
+# How much runway an expiring exemption gets before the guard starts saying so.
+#
+# An expiry used to be a cliff. The check at the bottom of `load_allowlist` is
+# `exp_date < today`, so an entry is fine on the last day and fails the build on
+# the next one, with no signal in between. That was survivable while both guards
+# ran only on push to main. kin#1448 moved them into `fast-gate-lint`, which
+# carries the required "Fast gate lint and policy" context and no job-level `if`,
+# so from that landing an expiry blocks EVERY kin pull request on the day it
+# fires, whatever the pull request touches. Nobody re-read the dates when that
+# landed, because nothing asked them to.
+#
+# 45 days is a runway a re-justification actually fits inside. The spec.rs entry
+# is the worked example: its fix is a kin-model then kin-db then registry
+# publish train carrying a GraphSnapshot format version, which is not schedulable
+# inside a week of notice.
+EXPIRY_WARNING_DAYS = 45
+
+# A shared expiry date is worth naming even when it is far away, because the
+# risk it carries is not the individual entry, it is the cluster. Entries that
+# all say "end of the quarter" carry no information about any one exemption and
+# guarantee that whichever day they share takes the whole repository down at
+# once. This is the threshold above which a shared date is reported in the
+# summary rather than left to be discovered on the day.
+EXPIRY_CLUSTER_SIZE = 3
 
 
 class Policy:
@@ -257,158 +284,163 @@ def load_allowlist():
     return policies, errors
 
 
-BOUNDARY_DIRS = [
-    # kin-daemon is deliberately absent. It used to be exempt as a directory,
-    # which exempted the RPC surface every agent and CLI reaches Kin through,
-    # and a six-handler opt-in rescued roughly a sixtieth of api.rs. The crate
-    # is now scanned by default and its boundary IO is declared per file in
-    # scripts/zero-file-search-allowlist.json, so a new daemon module, a new
-    # query handler above all, is covered the moment it is added.
-    #
-    # kin-projection and kin-reconcile are absent for the same reason, and the
-    # argument is the daemon's applied a second time rather than a new one.
-    # Both were whole-directory entries, so neither gate could see either
-    # crate: this one skipped them here, and the shell guard beside it scans a
-    # fixed list of kin-cli command modules and reaches no other crate by
-    # construction. What the exemption was covering was a graph-miss path in
-    # the reconciler that read the working copy, latent only because its one
-    # caller was a test. Narrowing surfaced 58 sites across five files;
-    # 57 are materialization, write and ingest-boundary IO and are declared per
-    # file in the allowlist with an owner and an expiry, and the fifty-eighth,
-    # a working-copy probe deciding a placement answer, is recorded there as
-    # debt rather than as a boundary. A boundary directory carries neither an
-    # owner nor an expiry, which is why converting one is worth the entries it
-    # costs.
-    "crates/kin-migrate/",
-    "crates/kin-index/",
-    "crates/kin-registry/",
-    "crates/kin-buildinfo/",
-    # kin-core is a mixed crate: it carries the semantic repo's config, layout,
-    # init, projection, ingestion, and git-history boundary IO — all legitimate
-    # input/output boundaries — but it must not be broadly exempted, or an
-    # answer-authority raw-filesystem path (like the retired text_refs source
-    # scan that backed `kin refs`/`kin rename`) could hide there again.
-    # Enumerate the boundary files explicitly so every other kin-core file,
-    # including any newly added one, is scanned by default.
-    "crates/kin-core/src/assistant.rs",
-    "crates/kin-core/src/assistant_sync.rs",
-    "crates/kin-core/src/config.rs",
-    # The Windows half of the same config writer. It is the identical boundary
-    # as config.rs, split out because publishing a file atomically shares no
-    # code between the two platforms, and it answers no query: every call here
-    # writes or proves the repository's own config file at a path the caller
-    # already validated, never resolves one by searching.
-    "crates/kin-core/src/config/windows.rs",
-    "crates/kin-core/src/dependencies.rs",
-    "crates/kin-core/src/env_registry.rs",
-    "crates/kin-core/src/federation.rs",
-    "crates/kin-core/src/git_init.rs",
-    "crates/kin-core/src/init.rs",
-    # The post-mortem for an interrupted init, and the same boundary as
-    # init_staging.rs beside it. It reads only the staging directories init
-    # itself minted in the repository's parent, to report where a killed
-    # conversion stopped and how much disk it is holding. It answers no
-    # locate/search/context/trace/review/xref query, reads no repository
-    # content, and runs before any graph exists.
-    "crates/kin-core/src/init_attempt.rs",
-    # Init's own staging directories, and nothing else. It runs before any
-    # graph exists, on paths init itself minted, and its whole output is
-    # whether a directory this process created still needs removing. It
-    # answers no locate/search/context/trace/review/xref query, and the
-    # directory it enumerates is the repository's parent, never repository
-    # content.
-    "crates/kin-core/src/init_staging.rs",
-    "crates/kin-core/src/layout.rs",
-    "crates/kin-core/src/lib.rs",
-    "crates/kin-core/src/manifest.rs",
-    "crates/kin-core/src/ref_view.rs",
-    "crates/kin-core/src/registry.rs",
-    "crates/kin-core/src/shims.rs",
-    "crates/kin-core/src/sync_state.rs",
-    "crates/kin-core/src/tree.rs",
-    # kin-git is scanned by default because it also carries answer-adjacent
-    # logic (co-change, blame-style history) that must come from graph truth.
-    # These four modules are the Git format boundary itself: capturing a Git
-    # repository, reporting what would stop one being admitted, proving a
-    # checkout matches its committed seed before admission, and materializing
-    # graph-owned history back out as Git. Reading a Git repository from disk is
-    # the entire point of an import boundary, and none of these modules answers
-    # a locate/search/context/trace/review/xref query. Enumerated file by file
-    # so every other kin-git module, including any newly added one, keeps being
-    # scanned.
-    "crates/kin-git/src/lossless.rs",
-    # Runs before any graph exists, on the source Git repository, and produces
-    # only refusals. Nothing it reads reaches a query answer, and its whole
-    # output is a list of reasons admission cannot start.
-    "crates/kin-git/src/admission_blockers.rs",
-    "crates/kin-git/src/preflight.rs",
-    "crates/kin-git/src/repository_export.rs",
-    "crates/kin-runtime/",
-    "crates/kin-parser/",
-    "crates/kin-ranking/src/ltr.rs",
-    "crates/kin-cli/src/daemon_client.rs",
-    "crates/kin-cli/src/profile.rs",
-    "crates/kin-cli/src/main.rs",
-    "crates/kin-cli/src/backend.rs"
-]
+def expiry_report(today=None):
+    """(warnings, summary) about allowlist expiries that have not fired yet.
 
-QUERY_COMMANDS = {
-    "locate.rs",
-    "search.rs",
-    "trace.rs",
-    "trace_data_flow.rs",
-    "xref.rs",
-    "review.rs",
-    "ref_lookup.rs",
-    # refs answers incoming-reference queries purely from graph relation edges;
-    # scanning it keeps that authority path free of any raw source-tree walk.
-    "refs.rs",
-    # Context-pack assembly is an answer authority, not an IO boundary.
-    "context.rs",
-    # rename derives its edit plan — the answer — from the graph's entity and
-    # reference relations, so it is an authority path even though applying the
-    # plan later writes files.
-    "rename.rs",
-    # deps answers a cross-repo dependency query. Whether it may answer it from
-    # manifests instead of the spine is an open decision; scanning it keeps the
-    # question visible instead of silent.
-    "deps.rs",
-    # Read-only analyses that answer from graph relations, history, and health
-    # records. None of them should need the working tree to produce an answer.
-    "blame.rs",
-    "impact.rs",
-    "dead_code.rs",
-    "overview.rs",
-    # health reports on the local install and graph state. Environment probes
-    # here are a diagnostic boundary, but repo-content reads would not be.
-    "health.rs",
-    # `kin graph validate`/`inspect`/`stats` report on graph integrity itself.
-    # A validation surface that decides its answer from the working tree states
-    # the filesystem's opinion of the graph rather than the graph's own, which
-    # is how the orphan count came to be computed by probing each entity's
-    # file_origin with `.exists()`. Orphan status now resolves against the
-    # graph-owned exact tree, and scanning this module is what keeps it there.
-    "graph.rs",
-    # The same graph data, rendered. A visualization that reads the tree would
-    # draw a picture of the projection while claiming to draw the graph.
-    "graph_viz.rs",
-    # Co-change answers from graph-owned CoChanges relations; the Git-format
-    # boundary that captures them lives in kin-git, not here.
-    "cochange.rs",
-    # History answers from recorded commits, not from re-reading the tree.
-    "history.rs",
-    # `kin mcp` is how agents reach Kin. It is a launcher today and carries no
-    # filesystem primitive at all, which is exactly why it belongs here: the
-    # agent-facing entry point should never become the one answer surface that
-    # nothing was watching.
-    "mcp.rs",
-    # `kin spec list`/`show` answer from graph-owned specs. The module was
-    # outside this set for as long as it answered by reading .kin/specs/*.json,
-    # so the guard reported the invariant holding over a surface that was
-    # breaking it. Coverage is half the fix: without the module scanned, a
-    # later reader could reintroduce the sidecar read and CI would stay green.
-    "spec.rs"
-}
+    Deliberately advisory. An expiry that has passed is an accountability
+    failure and fails the guard; an expiry that is approaching is information,
+    and turning it into a failure would just move the cliff earlier. So none of
+    this touches the exit status.
+
+    Reads the allowlist itself rather than taking `load_allowlist`'s parsed
+    output, which keeps that function's signature and its callers alone. The
+    file is small and the parse is not worth a coupling.
+
+    The summary line is unconditional, and that is the point of it. The failure
+    this exists to prevent was not that someone ignored a warning, it was that
+    47 entries quietly shared two dates and no run ever said so. One line naming
+    the next date and how many entries sit on it makes a cluster visible months
+    before it can hurt, with no threshold to tune and no noise on a clean run.
+    """
+    today = today or date.today()
+    try:
+        with open(ALLOWLIST_PATH, "r", encoding="utf-8") as handle:
+            entries = json.load(handle).get("allowlist", [])
+    except Exception:
+        # Loading already failed loudly in load_allowlist; do not report twice.
+        return [], None
+
+    upcoming = {}
+    for item in entries:
+        raw = item.get("expiration")
+        owner = item.get("owner", "?")
+        if not raw or not item.get("file"):
+            continue
+        try:
+            when = date.fromisoformat(raw)
+        except ValueError:
+            continue
+        if when < today:
+            continue  # already fired; load_allowlist reports it as an error
+        upcoming.setdefault(when, []).append((item["file"], owner))
+
+    if not upcoming:
+        return [], None
+
+    warnings = []
+    for when in sorted(upcoming):
+        days = (when - today).days
+        if days > EXPIRY_WARNING_DAYS:
+            continue
+        owners = sorted({owner for _, owner in upcoming[when]})
+        warnings.append(
+            f"  {len(upcoming[when])} exemption(s) expire {when.isoformat()}, "
+            f"in {days} day(s), owned by {', '.join(owners)}:"
+        )
+        for path, owner in sorted(upcoming[when]):
+            warnings.append(f"      {path} ({owner})")
+        warnings.append(
+            "    Re-justify with a later date and a stated reason, or remove the "
+            "exemption. After that date every kin pull request fails this gate."
+        )
+
+    soonest = min(upcoming)
+    count = len(upcoming[soonest])
+    summary = (
+        f"Next allowlist expiry: {soonest.isoformat()} "
+        f"({count} entr{'y' if count == 1 else 'ies'}, "
+        f"{(soonest - today).days} days)."
+    )
+    clusters = [
+        (when, len(rows))
+        for when, rows in sorted(upcoming.items())
+        if len(rows) >= EXPIRY_CLUSTER_SIZE
+    ]
+    if clusters:
+        shape = ", ".join(f"{n} on {when.isoformat()}" for when, n in clusters)
+        summary += (
+            f" Shared dates: {shape}. A date many entries share fails them all at"
+            " once; stagger by owner so each date means one owner's review."
+        )
+    return warnings, summary
+
+
+# BOUNDARY_DIRS is gone, and the deletion is the point of FIR-3149.
+#
+# It held 34 exemptions: six whole directories and 28 individual file paths.
+# None of the 34 carried an owner, an expiry or a reason, against 47 entries in
+# scripts/zero-file-search-allowlist.json that carry all three and are refused
+# by the loader when one is missing or past due. So the split was never
+# "directories are loose, files are owned"; it was one accountable list and one
+# unaccountable one, with a third of all exemptions living in the unaccountable
+# one. An uncounted exemption was its characteristic failure: kin-runtime and
+# kin-parser were whole-directory entries that no ticket in the class had ever
+# counted, because a directory line has no owner to notice it and no date to
+# surface it.
+#
+# It was also the only mechanism here that exempted code that did not exist yet.
+# An unlisted file inherited its directory's silence, so a new module in an
+# exempt crate was exempt on the day it was written, by nobody's decision. That
+# is how kin-daemon, kin-core, kin-projection and kin-reconcile each came to
+# hide a surface someone later had to find.
+#
+# What the conversion actually cost, measured rather than estimated: the six
+# directories covered 93 .rs files, 56 of them on the scanned runtime path, and
+# only 16 contain any filesystem primitive at all, so the exemption was roughly
+# three and a half times wider than anything it protected. Five of the 28
+# per-file paths reported zero sites and needed no entry at all; migrating them
+# would have manufactured an owner for something nobody has to own.
+# crates/kin-buildinfo/ needed none either, because all five of its sites were
+# in build.rs and `is_build_or_example` now excludes that by construction.
+# Everything else is a whole-file entry in the allowlist with an owner and a
+# staggered review date.
+
+# QUERY_COMMANDS is gone, and its deletion is FIR-2282.
+#
+# It was an opt-in list of answer modules, so the command surface was exempt by
+# default: a module was scanned only if somebody remembered to name it. That is
+# the same polarity error BOUNDARY_DIRS was, pointing the other way. One
+# exempted by default, this one covered only by opt-in, and both report PASSED
+# when they under-cover.
+#
+# Measured on main at 8f1283293 before the change: 107 command modules, 22 named
+# here, 10 named in the shell guard's own list, and 82 covered by NEITHER. The
+# guard read 78k lines of the command surface and skipped 108k, so most of the
+# CLI was outside the gate that exists to hold the thesis on it.
+#
+# Two hand-maintained lists over one surface also drift, and these had.
+# `contextbench_locate.rs`, `locate_cursor.rs` and `locate_debug.rs` were
+# answer modules to the shell guard, with declared boundary pins, and did not
+# exist to this one. Nothing could report that, because nothing compared them.
+#
+# The commands directory is now scanned by default like every other crate, the
+# exemptions live in the allowlist with an owner and a date, and
+# `command_modules_scanned` below is the single notion of an answer module that
+# both guards read. `check_guard_seam` fails if the two ever disagree again.
+
+
+def command_modules_scanned(policies):
+    """Command modules the guards scan: everything not exempt whole-file.
+
+    THE shared definition. The shell guard derives its own list from the same
+    allowlist through `--list-scanned`, and `check_guard_seam` requires the two
+    to be identical, so this function is the only place the notion lives.
+    """
+    directory = os.path.join(KIN_ROOT, CMD_DIR)
+    if not os.path.isdir(directory):
+        return set()
+    scanned = set()
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".rs"):
+            continue
+        rel = f"{CMD_DIR}/{name}"
+        if is_test_file(rel):
+            continue
+        policy = policies.get(rel)
+        if policy is not None and policy.whole_file:
+            continue
+        scanned.add(name)
+    return scanned
 
 # Matches a free or method function declaration, including the visibility,
 # constness, asyncness, unsafety and ABI a declaration may carry. `pub(crate)`
@@ -421,6 +453,35 @@ FN_DECL = re.compile(
     r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?(?:async\s+)?"
     r"(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]*\"\s+)?)?fn\s+([A-Za-z0-9_]+)\s*[(<]"
 )
+
+
+def is_build_or_example(rel_path):
+    """Whether cargo compiles this path into something other than the product.
+
+    A build script runs on the developer's machine before the crate exists, and
+    an example is not linked into the library at all. Neither can be a query
+    answer BY CONSTRUCTION, which is a different kind of reason from every
+    other exclusion here: the rest are judgements about what a module does, and
+    this one is a fact about what cargo builds.
+
+    It matters because it decides which exemptions are real. Five of
+    kin-buildinfo's five reported sites are in `build.rs`, and two of
+    kin-parser's eight are in `examples/dump_parsed.rs`, so without this the
+    only way to quiet them is a crate-wide exemption that also covers the
+    crate's runtime code. That is a whole-directory exemption bought to silence
+    a build script, and it is how a directory entry earns a reason nobody can
+    argue with while hiding things nobody looked at.
+
+    Anchored to cargo's own layout rather than matched as a substring.
+    `crates/<crate>/build.rs` is a build script; `crates/<crate>/src/build.rs`
+    is an ordinary module and stays scanned. Likewise `crates/<crate>/examples/`
+    is cargo's directory, while a hypothetical `crates/<crate>/src/examples/` is
+    runtime code.
+    """
+    segments = rel_path.split("/")
+    if len(segments) < 3 or segments[0] != "crates":
+        return False
+    return segments[2] == "build.rs" or (len(segments) > 3 and segments[2] == "examples")
 
 
 def is_test_file(rel_path):
@@ -436,16 +497,11 @@ def is_test_file(rel_path):
         or rel_path.endswith("_test.rs")
     ):
         return True
-    # Skip ingestion/migration/projection boundary directories/files
-    for bdir in BOUNDARY_DIRS:
-        if rel_path.startswith(bdir) or rel_path == bdir:
-            return True
 
-    # For CLI commands, only scan query commands
-    if "crates/kin-cli/src/commands/" in rel_path:
-        filename = os.path.basename(rel_path)
-        if filename not in QUERY_COMMANDS:
-            return True
+    # Not a runtime path at all, so no exemption should ever have to cover it.
+    # A crate exemption was the only way to silence a build script before this.
+    if is_build_or_example(rel_path):
+        return True
 
     return False
 
@@ -454,37 +510,148 @@ def scan_reaches(rel_path):
     """Whether the walk would scan this path absent any allowlist policy.
 
     A pinned entry answers yes by construction: naming spans in a file forces it
-    to be scanned even inside a boundary directory. A whole-file entry for a path
-    the walk skips anyway answers no, and such an entry is inert. Eight of them
-    had accumulated on command modules outside the query set and on a file
-    already enumerated as a boundary, each reading like an enforced boundary
-    declaration while granting exactly nothing. Deciding this from the same walk
-    predicate the scan uses is what keeps the two from drifting: add a module to
-    QUERY_COMMANDS and its dormant whole-file exemption would begin to matter,
-    which is when it has to be re-justified rather than silently inherited.
+    to be scanned. A whole-file entry for a path the walk skips anyway answers
+    no, and such an entry is inert. Eight of them had accumulated on command
+    modules outside the old opt-in query set and on a file already enumerated as
+    a boundary, each reading like an enforced boundary declaration while granting
+    exactly nothing. Deciding this from the same walk predicate the scan uses is
+    what keeps the two from drifting.
+
+    Since the command surface became opt-out, this predicate is what makes a
+    dormant exemption impossible there rather than merely unlikely: every module
+    is reached, so an entry either excuses something real or is reported as inert
+    on the run that adds it.
     """
     return rel_path.startswith("crates/") and not is_test_file(rel_path)
 
 
-# Patterns to scan.
+# What the guard detects, and why it is not a list of spellings.
 #
-# The first group is the raw filesystem read / existence / traversal primitive
-# set shared with scripts/zero_file_search_guard.sh. Answering a semantic query
-# by probing the working tree is the violation the rule exists to stop, and it
-# does not require the `std::fs::` prefix to happen: `path.exists()`,
-# `path.try_exists()`, `File::open`, a bare `read_dir(`, or a `WalkDir`
-# traversal all read the tree just as directly. Spawning a subprocess is also
-# denied in answer modules: otherwise `rg`, `grep`, `find`, or a multiline
-# `git grep` builder can replace the semantic authority behind the guard's
-# back.
+# A deny-list of call spellings is always one spelling behind, and this guard
+# was. `PATTERNS` carried `\bstd::fs::[a-zA-Z0-9_]+`, which catches the
+# fully-qualified form by accident, through the module path rather than through
+# the primitive. `{` is not in that character class, so
+# `use std::fs::{self, OpenOptions};` matched nothing, and neither did the
+# `OpenOptions::new()...open(path)` it enables. That import is
+# crates/kin-projection/src/tree.rs line 13 verbatim, so the shape that evaded
+# the guard was the shape the codebase already writes.
+#
+# The fix is not a longer list. It is to detect the OPERATION, which in Rust
+# has exactly three syntactic forms, and to enumerate only where the language
+# leaves no choice:
+#
+#   1. A filesystem module named in the path. `std::fs::anything` is a
+#      filesystem operation whatever `anything` is, so NAMESPACE_REACH matches
+#      the MODULE and lets the item name be anything at all. That is complete
+#      over `std::fs` present and future: `std::fs::exists` (stabilised in
+#      1.81) needed no edit here, and neither will the next one.
+#
+#   2. A name the file imported out of such a module. `OpenOptions::new()`
+#      carries no filesystem marker, but the `use` that bound it does, so the
+#      guard READS each file's own use trees and denies what they bind. That is
+#      complete over types std has not shipped yet, and it is the only
+#      mechanism that survives an alias: `use std::fs::OpenOptions as Opener;`
+#      defeats every global spelling list and does not defeat this.
+#
+#   3. An inherent method on `Path`/`PathBuf`, which needs no import and so has
+#      neither a module path nor a binding to learn from. This is the one place
+#      enumeration is forced, and the set is closed by std rather than by our
+#      imagination: ten methods, verified against
+#      library/std/src/path.rs on rustc 1.96.0 (2026-09-03) with
+#      `verify-zero-file-search.py --audit-std`. SELF_TEST_CASES holds every
+#      one of them with a positive and a negative control and runs on every
+#      invocation, so the enumeration cannot silently shrink.
+#
+# Spawning a subprocess is denied in answer modules for the same reason:
+# otherwise `rg`, `grep`, `find`, or a multiline `git grep` builder replaces the
+# semantic authority behind the guard's back.
 #
 # Writes and directory creation ARE denied here, unlike in the shell guard,
-# because the module-qualified patterns below match all of `std::fs::` and the
-# named `fs::` calls include the mutating ones. Materialization is a projection
-# boundary rather than answer-by-search, so a write in an answer module is not
-# the violation this rule exists to stop. It is still a claim worth stating out
+# because matching the module rather than the item name catches all of
+# `std::fs`, mutating calls included. Materialization is a projection boundary
+# rather than answer-by-search, so a write in an answer module is not the
+# violation this rule exists to stop. It is still a claim worth stating out
 # loud, and stating it means an explicit allowlist pin naming the boundary
 # rather than a pattern that never looked.
+
+# Module paths whose contents reach the filesystem. The two lists below differ
+# on purpose, because they are consumed by two different mechanisms.
+#
+# NAMESPACE_REACH is matched textually against every scanned line, so it carries
+# only spellings that cannot be anything else. `ignore` and `tempfile` are
+# absent from it precisely because they are ordinary English words that appear
+# in identifiers and prose.
+#
+# FS_USE_ROOTS is matched against a PARSED `use` path, where a root segment is
+# unambiguous by construction, so it can afford single-word crate names.
+NAMESPACE_REACH = re.compile(
+    r"\b(?:std|core)::fs\b"
+    r"|\bstd::os::(?:unix|windows|wasi)::fs\b"
+    r"|\b(?:tokio|async_std|smol)::fs\b"
+    r"|\b(?:fs_err|fs2|fs_extra|filetime|walkdir)::"
+    r"|\bWalkDir\b"
+    r"|\bglob::glob\b"
+)
+
+FS_USE_ROOTS = (
+    "std::fs",
+    "std::os::unix::fs",
+    "std::os::windows::fs",
+    "std::os::wasi::fs",
+    "tokio::fs",
+    "async_std::fs",
+    "smol::fs",
+    "fs_err",
+    "fs2",
+    "fs_extra",
+    "filetime",
+    "walkdir",
+    "glob",
+    "ignore",
+    "notify",
+    "tempfile",
+)
+# `std::process` is deliberately NOT here, and the reason is measured rather
+# than assumed. Subprocess execution is already detected twice, at the import
+# by `process\s*(?:::|as)` and at the call by `Command::new(`, so learning its
+# bindings adds no coverage. It does add reports: in kin-daemon-spawn alone it
+# named 21 more lines, every one of them a `Command` or `Stdio` mentioned in a
+# type position rather than an execution. Pins for those would be ceremony, and
+# an allowlist full of ceremony trains readers to skim the entry that matters.
+
+# The public item names `use std::fs::*;` brings into scope. A glob binds no
+# name the parser can read off the declaration, so this is the fallback for
+# that one shape. Everything else resolves from the use tree itself and needs
+# no vocabulary, which is the whole point.
+FS_GLOB_VOCABULARY = (
+    "File",
+    "OpenOptions",
+    "DirBuilder",
+    "DirEntry",
+    "ReadDir",
+    "Metadata",
+    "Permissions",
+    "FileType",
+    "FileTimes",
+)
+
+# The closed set from form 3 above: `Path`/`PathBuf` inherent methods that
+# reach the filesystem. Extracted from the toolchain's own std source by
+# `--audit-std`, which is how the claim "this set is closed" stays checkable
+# rather than remembered.
+PATH_FS_METHODS = (
+    "canonicalize",
+    "exists",
+    "is_dir",
+    "is_file",
+    "is_symlink",
+    "metadata",
+    "read_dir",
+    "read_link",
+    "symlink_metadata",
+    "try_exists",
+)
+
 PATTERNS = [
     (re.compile(r'\.is_file\(\)'), "filesystem existence probe (is_file)"),
     (re.compile(r'\.is_dir\(\)'), "filesystem existence probe (is_dir)"),
@@ -495,7 +662,7 @@ PATTERNS = [
     (re.compile(r'\.metadata\(\)'), "filesystem metadata probe"),
     (re.compile(r'\bsymlink_metadata\b'), "filesystem metadata probe"),
     (re.compile(r'\bread_link\b'), "filesystem symlink read"),
-    (re.compile(r'\bFile::open\b'), "raw file handle open"),
+    (re.compile(r'\bFile::(?:open|create|create_new|options)\b'), "raw file handle open"),
     (re.compile(r'\bread_dir\('), "directory traversal (read_dir)"),
     (re.compile(r'\bWalkDir\b|\bwalkdir::'), "directory traversal (walkdir)"),
     (re.compile(r'\bglob::glob\b'), "filesystem glob"),
@@ -504,9 +671,181 @@ PATTERNS = [
     # namespace alias before it can hide a later `Alias::Command::new` call.
     # Bare Command::new covers an imported, unaliased constructor.
     (re.compile(r'\bCommand::new\s*\(|\bprocess\s*(?:::|\bas\b)'), "subprocess execution in answer authority"),
-    (re.compile(r'\bstd::fs::[a-zA-Z0-9_]+'), "std::fs API usage"),
-    (re.compile(r'(?<![_a-z])fs::(read|read_to_string|read_dir|metadata|write|copy|create_dir|create_dir_all|remove_file|remove_dir|remove_dir_all)\b'), "fs API usage"),
+    # Form 1. The module, not the item: complete over the whole surface of
+    # every filesystem module, including items that do not exist yet.
+    (NAMESPACE_REACH, "filesystem module namespace reach"),
+    # Retained beneath the namespace reach rather than folded into it. This
+    # catches a bare `fs::` alias in a file whose `use` the parser could not
+    # read, so the two mechanisms fail independently.
+    (re.compile(r'(?<![_a-z])fs::(read|read_to_string|read_dir|metadata|write|copy|create_dir|create_dir_all|remove_file|remove_dir|remove_dir_all|rename|set_permissions|hard_link|exists)\b'), "fs API usage"),
 ]
+
+# Deliberately NOT a pattern: a bare `symlink(` regex. It reads as the obvious
+# addition and it false-positives three times in this tree on
+# `TreeEntry::symlink(...)`, a graph type constructor that touches no
+# filesystem. Detecting the operation removes the need for it, because the real
+# call is `std::os::unix::fs::symlink`, which NAMESPACE_REACH already matches
+# through its module. SELF_TEST_CASES keeps both halves of that honest.
+
+
+USE_HEAD = re.compile(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?use\s+(.*)$", re.S)
+USE_START = re.compile(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?use\b")
+USE_ALIAS = re.compile(r"^(.*?)\s+as\s+([A-Za-z0-9_]+)$")
+
+
+def expand_use_tree(text):
+    """Yield (full path, bound name) for every leaf of one `use` declaration.
+
+    `text` is the declaration body after `use`, with its trailing `;` removed.
+    Nesting, `self`, `as` aliases and globs all resolve here, because the point
+    of reading the tree at all is to learn what a file actually bound rather
+    than to guess which spellings it might have used. `use std::fs::{self,
+    OpenOptions};` binds `fs` and `OpenOptions`; `use std::fs::File as F;`
+    binds `F`, which no list of spellings can know.
+    """
+    out = []
+
+    def members_of(body):
+        depth, current, members = 0, [], []
+        for ch in body:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            if ch == "," and depth == 0:
+                members.append("".join(current))
+                current = []
+                continue
+            current.append(ch)
+        if "".join(current).strip():
+            members.append("".join(current))
+        return members
+
+    def walk(prefix, body):
+        body = body.strip()
+        if not body:
+            return
+        members = members_of(body)
+        if len(members) > 1:
+            for member in members:
+                walk(prefix, member)
+            return
+
+        member = members[0].strip() if members else ""
+        if not member:
+            return
+
+        brace = member.find("{")
+        if brace >= 0:
+            close = member.rfind("}")
+            if close < brace:
+                return
+            head = member[:brace].strip().rstrip(":").strip()
+            joined = f"{prefix}::{head}" if prefix and head else (head or prefix)
+            walk(joined, member[brace + 1 : close])
+            return
+
+        alias = None
+        aliased = USE_ALIAS.match(member)
+        if aliased:
+            member, alias = aliased.group(1).strip(), aliased.group(2)
+        if member == "self":
+            full = prefix
+            name = alias or (prefix.split("::")[-1] if prefix else "")
+        else:
+            full = f"{prefix}::{member}" if prefix else member
+            name = alias or member.split("::")[-1]
+        if full:
+            out.append((full.lstrip(":"), name))
+
+    walk("", text)
+    return out
+
+
+def use_declarations(lexed):
+    """Yield (line index, declaration body) for every `use` item in a file.
+
+    Bounded with the same `item_span` the test-gate tracker uses, so a use tree
+    spanning lines is read whole. Read off the lexically stripped text, so a
+    `use` inside a comment or a string literal is not one.
+    """
+    n = len(lexed)
+    i = 0
+    while i < n:
+        if not USE_START.match(lexed[i][0]):
+            i += 1
+            continue
+        span = item_span(lexed, i)
+        if span is None:
+            i += 1
+            continue
+        body = " ".join(lexed[j][0] for j in range(span[0], span[1] + 1))
+        head = USE_HEAD.match(body)
+        if head:
+            yield i, head.group(1).strip().rstrip(";").strip()
+        i = span[1] + 1
+
+
+def rooted_in_filesystem(path):
+    """Whether a resolved `use` path names an item inside a filesystem module."""
+    return any(path == root or path.startswith(root + "::") for root in FS_USE_ROOTS)
+
+
+def filesystem_bindings(lexed):
+    """Names this file bound out of a filesystem module, as a deny set.
+
+    Derived from the file's own `use` declarations BEFORE any allowlist pin is
+    masked, and that ordering is the point. Pinning the import line is the
+    natural way to excuse `use std::fs::{self, OpenOptions};`, and if bindings
+    were read after masking, that one pin would silence every
+    `OpenOptions::new()` in the file forever. Read before, the pin buys silence
+    on its own line and nothing else.
+
+    A binding of `_` is skipped: `use std::os::unix::fs::PermissionsExt as _;`
+    imports a trait for its methods and names nothing a later line can spell.
+    The declaration itself still trips NAMESPACE_REACH, which is the honest
+    limit here: a trait extension makes its methods reachable with no syntactic
+    marker of their own, so the guard reports the import and whoever pins it
+    owns that trait's whole surface.
+
+    Only lines the scan reads contribute. An import inside `#[cfg(test)] mod
+    tests` binds nothing in a production build, and counting it would deny a
+    name across code that never sees it.
+    """
+    bindings = set()
+    scanned = {index for index, _ in scannable_lines(lexed)}
+    for index, body in use_declarations(lexed):
+        if index not in scanned:
+            continue
+        for path, name in expand_use_tree(body):
+            if not rooted_in_filesystem(path):
+                continue
+            if name == "*":
+                bindings.update(FS_GLOB_VOCABULARY)
+            elif name and name != "_":
+                bindings.add(name)
+    return bindings
+
+
+def binding_pattern(bindings):
+    """One compiled matcher for a file's filesystem bindings, or None.
+
+    A bound name is a path root or a type, never the tail of a field access, so
+    a preceding `.` disqualifies it. Without that, `use std::fs;` would deny
+    every `self.fs` in the file.
+
+    Matched against the lexically stripped `structure` rather than `code`, which
+    is the opposite choice from `PATTERNS` and is forced by what a binding is. A
+    bound NAME is an ordinary identifier, so it collides with English: with
+    `use std::fs;` in scope, matching literals reported the path
+    `"/sys/fs/cgroup"` four times, and with `use std::process;` in scope it
+    reported the word "process" inside an `eprintln!`. `PATTERNS` keeps literals
+    because its members are call shapes that cannot occur in prose by accident.
+    """
+    if not bindings:
+        return None
+    names = "|".join(re.escape(name) for name in sorted(bindings, key=len, reverse=True))
+    return re.compile(r"(?<![.\w])(?:" + names + r")\b")
 
 
 class LexState:
@@ -1075,6 +1414,10 @@ def scan_file(filepath, rel_path, exempt_fn_names=None, allowed_matches=None):
     lexed = lex_lines(lines)
     ranges = exempt_body_ranges(lines, exempt_fn_names, lexed)
 
+    # Read before masking, deliberately. See `filesystem_bindings`: a pin on the
+    # import line must not license every use of what that import bound.
+    bindings = binding_pattern(filesystem_bindings(lexed))
+
     for idx, line in scannable_lines(lexed):
         if any(lo <= idx <= hi for lo, hi in ranges):
             continue
@@ -1086,14 +1429,307 @@ def scan_file(filepath, rel_path, exempt_fn_names=None, allowed_matches=None):
         # line once with every primitive it tripped, so the violation count
         # tracks offending lines rather than pattern hits.
         descs = [desc for pattern, desc in PATTERNS if pattern.search(scan_line)]
+        # Both, and the conjunction carries the whole meaning. `structure` has
+        # literal contents blanked, so a name that only ever appears inside a
+        # string is not an operation. `scan_line` has the validated pins masked,
+        # so a name a boundary pin already declared is not reported twice. A
+        # site has to survive both to be a use of the binding this file made.
+        if bindings is not None and bindings.search(lexed[idx][0]) and bindings.search(scan_line):
+            descs.append("filesystem name bound by this file's own `use`")
         if descs:
             violations.append((idx + 1, line.strip(), ", ".join(dict.fromkeys(descs))))
 
     return violations
 
 
+# One case per primitive the guard claims, plus the negatives that keep the
+# claim from being satisfied by a matcher that reports everything.
+#
+# This is what makes the residual enumeration checkable. Forms 1 and 2 are
+# complete by construction and need no inventory; form 3, the `Path` inherent
+# methods, is enumerated because the language leaves no alternative, and this
+# table is what stops that enumeration silently shrinking. Deleting a pattern
+# turns a positive case red. Widening one until it matches prose turns a
+# negative case red. Both run on every invocation, so both grade the pull
+# request that would introduce them rather than main a release later.
+#
+# Fields: (label, source line, this file's fs bindings, must be reported).
+SELF_TEST_CASES = [
+    # Form 3: the closed Path/PathBuf set, one case each.
+    ("Path::exists", "if path.exists() {", (), True),
+    ("Path::try_exists", "if path.try_exists().unwrap_or(false) {", (), True),
+    ("Path::is_file", "if path.is_file() {", (), True),
+    ("Path::is_dir", "if path.is_dir() {", (), True),
+    ("Path::is_symlink", "if path.is_symlink() {", (), True),
+    ("Path::metadata", "let m = path.metadata()?;", (), True),
+    ("Path::symlink_metadata", "let m = symlink_metadata(path)?;", (), True),
+    ("Path::canonicalize", "let p = path.canonicalize()?;", (), True),
+    ("Path::read_link", "let t = read_link(path)?;", (), True),
+    ("Path::read_dir", "for e in read_dir(path)? {", (), True),
+    # Form 1: the module, whatever the item is.
+    ("qualified fs call", "let s = std::fs::read_to_string(p)?;", (), True),
+    ("grouped fs import", "use std::fs::{self, OpenOptions};", (), True),
+    ("bare fs module import", "use std::fs;", (), True),
+    ("std::fs item that did not exist in 1.80",
+     "if std::fs::exists(p)? {", (), True),
+    ("os-specific fs module", "std::os::unix::fs::symlink(target, dest)?;", (), True),
+    ("third-party fs crate", "use fs2::FileExt;", (), True),
+    ("async fs module", "let b = tokio::fs::read(p).await?;", (), True),
+    ("walkdir traversal", "for e in WalkDir::new(root) {", (), True),
+    ("glob", "for p in glob::glob(\"**/*.rs\")? {", (), True),
+    ("subprocess", "Command::new(\"rg\").arg(needle).output()?;", (), True),
+    # Form 2: names this file bound, including the alias no list can hold.
+    ("imported constructor", "let f = OpenOptions::new().read(true).open(p)?;",
+     ("OpenOptions",), True),
+    ("aliased constructor", "let f = Opener::new().read(true).open(p)?;",
+     ("Opener",), True),
+    ("imported File", "let f = File::create(p)?;", ("File",), True),
+    ("bare fs alias call", "fs::set_permissions(p, perms)?;", ("fs",), True),
+    # Negative controls. A deny set that reports these is matching prose, and a
+    # run where every case passes because everything matches proves nothing.
+    ("graph symlink constructor", "TreeEntry::symlink(record.body_hash),", (), False),
+    ("path join is not IO", "let p = root.join(\"kin\").join(name);", (), False),
+    ("compile-time include", "const H: &str = include_str!(\"index.html\");", (), False),
+    ("reader over a pipe", "let reader = BufReader::new(stdin);", (), False),
+    ("field named fs", "self.fs_state = FsState::Ready;", ("fs",), False),
+    ("prose mentioning a file", "// read the manifest from the graph, not the tree",
+     (), False),
+]
+
+
+# The LEARNER behind form 2, exercised over real `use` declarations.
+#
+# This table exists because the four form-2 cases above could not catch the
+# learner's deletion. They hand their bindings in as a literal tuple, so they
+# exercise `binding_pattern` and never `filesystem_bindings`, and an independent
+# review of kin#1458 proved the consequence rather than arguing it: with
+# `filesystem_bindings` stubbed to return an empty set, both guards stayed green
+# over the whole tree, all 30 cases above still passed, and a planted
+# `OpenOptions::new().read(true).open(p)` in a file whose entry pins its import
+# went silent. The one mechanism that closes FIR-3151 had no check anywhere that
+# failed when it was removed, which is precisely the class this guard exists to
+# stop, reproduced inside the fix for it.
+#
+# `scripts/falsify-zero-file-search.py` could not host this, for two independent
+# reasons. A probe that carries its own `use` is reported on that import line by
+# NAMESPACE_REACH whether or not the learner ran, so it passes with the learner
+# gone and proves nothing. And `Falsify guards` carries
+# `github.event_name != 'pull_request'`, so it never grades a pull request at
+# all. `self_test()` runs inside the scan, which `fast-gate-lint` runs on every
+# pull request, so this is the only surface that fails on the commit that breaks
+# it rather than on main a release later.
+#
+# Cases are the learner's own decision branches, not one happy path.
+BINDING_LEARNER_CASES = [
+    # The alias no global spelling list can hold. This is the whole argument for
+    # reading use trees, so it is the first thing that has to break.
+    ("alias", "use std::fs::OpenOptions as Opener;\n", {"Opener"}),
+    # `self` beside an item, which is the FIR-3151 import verbatim in shape.
+    ("self beside an item", "use std::fs::{self, File};\n", {"fs", "File"}),
+    ("third-party fs crate", "use fs2::FileExt;\n", {"FileExt"}),
+    # A glob binds no name the declaration names, so the vocabulary is the
+    # fallback for that one shape.
+    #
+    # The expectation is a LITERAL set, not `set(FS_GLOB_VOCABULARY)`. Written
+    # against the constant it was testing, both sides of the comparison moved
+    # together: dropping the glob branch was caught, and SHRINKING the
+    # vocabulary was not, because the case would have shrunk with it. That is
+    # the same self-referential shape as the defect this whole table exists to
+    # stop, one level down, and it was found by review rather than by the table.
+    # Naming the items here means removing one fails.
+    ("glob", "use std::fs::*;\n",
+     {"File", "OpenOptions", "DirBuilder", "DirEntry", "ReadDir", "Metadata",
+      "Permissions", "FileType", "FileTimes"}),
+    # `as _` imports a trait for its methods and binds nothing a later line can
+    # spell. The learner must return nothing here and leave the import to
+    # NAMESPACE_REACH, which is the honest limit recorded on the function.
+    ("trait imported as _", "use std::os::unix::fs::PermissionsExt as _;\n", set()),
+    # Negative control. A learner that returned every name it saw, or that
+    # returned its input unfiltered, would satisfy every case above.
+    ("not a filesystem module", "use std::collections::HashMap;\n", set()),
+]
+
+
+def line_is_reported(line, bindings=()):
+    """Whether the scan's matcher would report this line. One code path only.
+
+    The self-test asks the question through the same two matchers `scan_file`
+    uses rather than restating them, so a case cannot pass against a copy of
+    the deny set that the scan no longer consults.
+    """
+    structure, code = split_code(line, LexState())
+    if any(pattern.search(code) for pattern, _ in PATTERNS):
+        return True
+    bound = binding_pattern(set(bindings))
+    return bound is not None and bound.search(structure) is not None
+
+
+def check_guard_seam(policies):
+    """Require both guards to agree on what an answer module is.
+
+    This is the check whose absence produced FIR-2282's quieter half. Two
+    hand-maintained opt-in lists covered the same directory, they had drifted to
+    different sets, and nothing anywhere compared them, so
+    `contextbench_locate.rs`, `locate_cursor.rs` and `locate_debug.rs` were
+    answer modules to one guard and did not exist to the other. Both lists are
+    now derived from this allowlist, which makes them agree today; this makes
+    them stay agreeing.
+
+    It runs the shell guard's OWN enumeration rather than reimplementing it.
+    A Python copy of that logic would be a third list to drift, and it would
+    pass while the shell guard did something else entirely, which is the shape
+    of every defect this file has been fixed for.
+    """
+    errors = []
+    guard = os.path.join(SCRIPT_DIR, "zero_file_search_guard.sh")
+    if not os.path.exists(guard):
+        return [f"  the shell guard is missing at {guard}, so the two guards' notion "
+                "of an answer module cannot be compared"]
+    try:
+        result = subprocess.run(
+            ["bash", guard, "--list-scanned", KIN_ROOT],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as error:  # noqa: BLE001 - reported, never swallowed
+        return [f"  could not run the shell guard's --list-scanned: {error}"]
+    if result.returncode != 0:
+        return [
+            "  the shell guard refused to enumerate its answer modules "
+            f"(rc={result.returncode}): {result.stderr.strip()[:200]}"
+        ]
+
+    theirs = {line.strip() for line in result.stdout.split("\n") if line.strip()}
+    ours = command_modules_scanned(policies)
+
+    # The control. Both sides empty would compare equal and prove nothing, which
+    # is exactly how an opt-in list reports PASSED over a surface it never read.
+    if not ours or not theirs:
+        return [
+            f"  the answer-module set is empty (python {len(ours)}, shell "
+            f"{len(theirs)}); an empty set compares equal to an empty set, so "
+            "this comparison would pass while neither guard read anything"
+        ]
+
+    for name in sorted(theirs - ours):
+        errors.append(
+            f"  {name} is an answer module to the shell guard and not to this "
+            "one. One list, two answers: give it an allowlist entry or remove "
+            "the shell guard's reason for scanning it"
+        )
+    for name in sorted(ours - theirs):
+        errors.append(
+            f"  {name} is an answer module to this guard and not to the shell "
+            "guard, so a raw read there is graded by only one of the two"
+        )
+    return errors
+
+
+def self_test():
+    """Check the deny set and the binding learner, returning a list of errors.
+
+    Two tables, because they fail for different reasons. SELF_TEST_CASES asks
+    whether the MATCHERS still recognise each primitive.
+    BINDING_LEARNER_CASES asks whether the learner that feeds one of those
+    matchers still reads a `use` tree at all, which no case in the first table
+    can answer.
+    """
+    errors = []
+    for label, line, want in BINDING_LEARNER_CASES:
+        got = filesystem_bindings(lex_lines([line]))
+        if got != want:
+            errors.append(
+                f"  binding learner {label!r}: {line.strip()!r} bound "
+                f"{sorted(got)}, want {sorted(want)}. Form 2 of the deny set is "
+                "whatever this function returns, so a wrong answer here is a "
+                "silent hole rather than a failing pattern"
+            )
+    for label, line, bindings, want in SELF_TEST_CASES:
+        got = line_is_reported(line, bindings)
+        if got != want:
+            errors.append(
+                f"  deny-set self-test {label!r}: "
+                f"{'missed a primitive it claims to detect' if want else 'reported a line that touches no filesystem'}"
+                f" -> {line.strip()!r}"
+            )
+    covered = sum(1 for _, _, _, want in SELF_TEST_CASES if want)
+    if covered < len(PATH_FS_METHODS):
+        errors.append(
+            f"  deny-set self-test has {covered} positive cases for "
+            f"{len(PATH_FS_METHODS)} enumerated Path methods; the inventory "
+            "cannot be smaller than what it claims to cover"
+        )
+    return errors
+
+
+def audit_std():
+    """Re-derive the closed `Path` set from the toolchain's own std source.
+
+    Not a CI gate: it needs the `rust-src` component, and a check that skips
+    when a component is missing reports nothing and looks like a pass. It is
+    the lane tool that makes PATH_FS_METHODS checkable rather than remembered,
+    and the date and rustc version of the last run are recorded beside that
+    constant. Run it when a toolchain bump lands.
+    """
+    import subprocess
+
+    sysroot = subprocess.run(
+        ["rustc", "--print", "sysroot"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    version = subprocess.run(
+        ["rustc", "--version"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    source = os.path.join(sysroot, "lib/rustlib/src/rust/library/std/src/path.rs")
+    if not os.path.exists(source):
+        print(f"rust-src is not installed; {source} is missing.")
+        print("Install it with `rustup component add rust-src` and re-run.")
+        return 2
+
+    with open(source, "r", encoding="utf-8") as handle:
+        raw = handle.read().split("\n")
+    # Doc comments carry examples full of `fs::`, and an example is not a call.
+    code = "\n".join("" if re.match(r"\s*//", line) else line for line in raw)
+
+    found = set()
+    for match in re.finditer(r"\n    pub fn ([a-z_0-9]+)\s*[(<]", code):
+        tail = code[match.end() :]
+        stop = tail.find("\n    pub fn ")
+        body = tail[:stop] if stop > 0 else tail[:2000]
+        if re.search(r"\bfs::", body):
+            found.add(match.group(1))
+
+    if not found:
+        # The positive control. An extraction that finds nothing would confirm
+        # any inventory at all, which is the trap this whole guard exists to
+        # avoid, so it is a failure rather than a clean sheet.
+        print(f"AUDIT FAILED: found no fs-reaching Path methods in {source}.")
+        print("The extraction is broken, not the inventory.")
+        return 1
+
+    declared = set(PATH_FS_METHODS)
+    print(f"{version}\n{source}")
+    print(f"std declares {len(found)} fs-reaching Path/PathBuf methods.")
+    missing = sorted(found - declared)
+    extra = sorted(declared - found)
+    for name in missing:
+        print(f"  MISSING from PATH_FS_METHODS: {name}")
+    for name in extra:
+        print(f"  no longer in std: {name}")
+    uncovered = [n for n in sorted(found) if not line_is_reported(f"let _ = path.{n}();")]
+    for name in uncovered:
+        print(f"  NOT MATCHED by any pattern: {name}")
+    if missing or extra or uncovered:
+        return 1
+    print(f"AUDIT PASSED: all {len(found)} are declared and all are matched.")
+    return 0
+
+
 def main():
     policies, allowlist_errors = load_allowlist()
+    deny_set_errors = self_test()
+    seam_errors = check_guard_seam(policies)
+    expiry_warnings, expiry_summary = expiry_report()
     total_violations = 0
     scanned = 0
     whole_file_exempt = 0
@@ -1148,13 +1784,41 @@ def main():
         f"{whole_file_exempt} exempt whole-file)."
     )
 
+    # Printed on every run, red or green. An approaching expiry is not a verdict
+    # about this tree, it is a schedule, and a schedule nobody is shown is how 47
+    # entries came to share two dates without anyone noticing.
+    if expiry_summary:
+        print(expiry_summary)
+    if expiry_warnings:
+        print("\nAllowlist expiry WARNING (not a failure, yet):")
+        print("\n".join(expiry_warnings))
+
     if total_violations > 0:
         print(f"Verification FAILED: Found {total_violations} zero-file-search violations.")
     if allowlist_errors:
         report_allowlist_errors(allowlist_errors)
-    if total_violations or allowlist_errors:
+    if seam_errors:
+        # Its own section. A seam failure is not a dirty tree and not a broken
+        # deny set: it says the two guards disagree about what they are guarding,
+        # which makes both their verdicts partial.
+        print("\nGuard seam FAILED (the two guards disagree on the answer-module set):")
+        print("\n".join(seam_errors))
+    if deny_set_errors:
+        # Last, and separate from the scan's own verdict. A scan is only worth
+        # its deny set, so a broken deny set has to be reported as its own
+        # failure rather than folded into a violation count that would read as
+        # a clean tree.
+        print("\nDeny-set self-test FAILED:")
+        print("\n".join(deny_set_errors))
+    if total_violations or allowlist_errors or deny_set_errors or seam_errors:
         sys.exit(1)
 
+    print(
+        f"Deny-set self-test passed: {len(SELF_TEST_CASES)} matcher cases "
+        f"({sum(1 for c in SELF_TEST_CASES if not c[3])} negative controls) and "
+        f"{len(BINDING_LEARNER_CASES)} binding-learner cases "
+        f"({sum(1 for c in BINDING_LEARNER_CASES if not c[2])} negative controls)."
+    )
     print("Verification PASSED: Zero File-Search Invariant holds.")
     sys.exit(0)
 
@@ -1170,4 +1834,6 @@ def report_allowlist_errors(errors):
 
 
 if __name__ == "__main__":
+    if "--audit-std" in sys.argv[1:]:
+        sys.exit(audit_std())
     main()

@@ -62,7 +62,7 @@ use kin_db::{
 /// `storage_backend_surface_is_audited_against_the_pinned_kin_db` fails when
 /// the workspace pin moves past it, which is the only moment a method can have
 /// appeared.
-pub const AUDITED_KIN_DB_VERSION: &str = "0.7.96";
+pub const AUDITED_KIN_DB_VERSION: &str = "0.7.99";
 
 /// Wraps a [`StorageBackendDelegate`] so it can be handed anywhere a
 /// `Box<dyn StorageBackend>` is expected.

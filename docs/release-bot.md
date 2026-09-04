@@ -165,6 +165,25 @@ gh variable set KIN_STRANGER_RUNNER --repo firelock-ai/kin --body '<runner label
 gh secret set KIN_STRANGER_ANTHROPIC_API_KEY --repo firelock-ai/kin
 ```
 
+**The stranger's home is a local run, and the hosted job is optional.** Founder
+decision, 2026-09-04: "the damn smoke should never block release it is a nice to
+have ONLY ... it should be mainly run locally not in the CI." The ordinary way to
+measure first contact is `bin/kin-stranger` from the umbrella, against the
+candidate archive before a tag or the published npm bytes after one:
+
+```
+bin/kin-stranger run --archive <path>   # the release-candidate bytes
+bin/kin-stranger run --npm <version>    # what a stranger who types the install line gets
+```
+
+The hosted job in `release-cut.yml` is a convenience that runs the same tool on a
+runner the fleet owns when `KIN_STRANGER_RUNNER` names one. It carries
+`continue-on-error: true` and can never redden a cut run, because a driver out of
+limit or an offline runner is not a fact about the candidate. Whatever it does,
+it writes a summary line naming the state, and `publish-stranger` keys on that
+job's own `recorded` output rather than on its result, since `continue-on-error`
+masks a failed job's result to success for everything downstream.
+
 With the variable unset the cut still selects, arms and preflights, and the
 `stranger-standby` job prints the exact local command with all three arms named
 and raises a warning. The mint tags either way. What a missing `stranger.env`

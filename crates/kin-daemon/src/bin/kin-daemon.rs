@@ -57,6 +57,9 @@ fn usage(program: &str) {
     eprintln!(
         "  KIN_SUPERVISOR_IDLE_TIMEOUT_SECS  optional supervisor idle shutdown timeout; 0 disables"
     );
+    eprintln!(
+        "\n--compat-json also declares this build's hosted start requirements under\n  \"hosted_start_requirements\"; see docs/hosted-daemon-start.md"
+    );
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -211,46 +214,40 @@ fn create_state(
         StorageMode::Local => Ok(DaemonState::open_with_repo_id(layout, Some(repo_id))?),
         #[cfg(feature = "gcs")]
         StorageMode::Gcs => {
-            let bucket = env::var("KIN_GCS_BUCKET")
-                .map_err(|_| "KIN_GCS_BUCKET env var required for --storage gcs")?;
-            let prefix = env::var("KIN_GCS_PREFIX")
+            use kin_daemon::hosted_start::{self, Stage};
+
+            // Every bind-stage requirement is admitted before the first object
+            // store call, so a misconfigured deployment fails on its own config
+            // rather than on a storage timeout that hides which value is wrong.
+            // Each message comes from the requirement's own declaration, which
+            // is what `--compat-json` prints, so the two cannot drift.
+            let bucket = hosted_start::GCS_BUCKET.require(Stage::Bind)?;
+            let prefix = hosted_start::GCS_PREFIX
+                .read()
                 .unwrap_or_default()
                 .trim_matches('/')
                 .to_string();
-            let runtime_reader_identity = env::var("KIN_RELEASE_DAEMON_DIGEST_INTERNAL").map_err(
-                |_| {
-                    "KIN_RELEASE_DAEMON_DIGEST_INTERNAL is required for GCS graph publication admission"
-                },
-            )?;
-            let daemon_auth_token = env::var("KIN_DAEMON_AUTH_TOKEN")
-                .ok()
-                .map(|token| token.trim().to_string())
-                .filter(|token| !token.is_empty());
-            if daemon_auth_token.is_none() {
-                return Err(
-                    "KIN_DAEMON_AUTH_TOKEN is required for the hosted publication-control API"
-                        .into(),
-                );
-            }
-            let publication_control_auth_token =
-                env::var("KIN_PUBLICATION_CONTROL_AUTH_TOKEN")
-                    .ok()
-                    .map(|token| token.trim().to_string())
-                    .filter(|token| !token.is_empty())
-                    .ok_or(
-                        "KIN_PUBLICATION_CONTROL_AUTH_TOKEN is required for hosted rollout administration",
-                    )?;
-            if daemon_auth_token.as_deref() == Some(publication_control_auth_token.as_str()) {
+            let runtime_reader_identity =
+                hosted_start::RELEASE_DAEMON_DIGEST.require(Stage::Bind)?;
+            let daemon_auth_token = hosted_start::DAEMON_AUTH_TOKEN
+                .require(Stage::Bind)?
+                .trim()
+                .to_string();
+            let publication_control_auth_token = hosted_start::PUBLICATION_CONTROL_AUTH_TOKEN
+                .require(Stage::Bind)?
+                .trim()
+                .to_string();
+            if daemon_auth_token == publication_control_auth_token {
                 return Err(
                     "KIN_PUBLICATION_CONTROL_AUTH_TOKEN must differ from KIN_DAEMON_AUTH_TOKEN"
                         .into(),
                 );
             }
-            let (backend, object_store) = open_gcs_backend(&bucket, prefix.clone())?;
             let fleet_repositories = parse_repo_id_list();
             if fleet_repositories.is_empty() || allowed_repo_ids.is_none() {
-                return Err("KIN_REPO_IDS is required for GCS graph publication fencing".into());
+                return Err(hosted_start::REPO_IDS.refusal(Stage::Bind).into());
             }
+            let (backend, object_store) = open_gcs_backend(&bucket, prefix.clone())?;
             let scope = if prefix.is_empty() {
                 format!("gcs://{bucket}/")
             } else {
@@ -303,10 +300,7 @@ fn create_state(
             )?;
             let spine_startup = if let Some(pending) = bootstrap {
                 let legacy_writer_drain_proof_sha256 =
-                    env::var("KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL")
-                        .ok()
-                        .map(|digest| digest.trim().to_string())
-                        .filter(|digest| !digest.is_empty());
+                    kin_daemon::hosted_start::SPINE_LEGACY_DRAIN_PROOF.read();
                 // The sequence itself lives on the state so the same bytes run
                 // under a test clock; see `complete_hosted_startup_rollout`.
                 runtime.block_on(state.complete_hosted_startup_rollout(
@@ -405,8 +399,8 @@ fn acquire_before_state<T>(
 
 #[cfg(feature = "gcs")]
 fn parse_repo_id_list() -> Vec<String> {
-    env::var("KIN_REPO_IDS")
-        .ok()
+    kin_daemon::hosted_start::REPO_IDS
+        .read()
         .map(|raw| {
             raw.split(',')
                 .map(str::trim)
@@ -653,6 +647,11 @@ async fn async_main() -> i32 {
                     "branch": build.branch,
                     "built_at": build.built_at,
                 },
+                // What this image needs before it can serve hosted, declared by
+                // the same table its start path refuses from. A deployment can
+                // grade its config against the image it pins instead of against
+                // a list typed after the last rollback.
+                "hosted_start_requirements": kin_daemon::hosted_start::declaration(),
             })
         );
         return 0;
@@ -1198,6 +1197,147 @@ mod tests {
         assert!(
             logged.contains("daemon is up and ready"),
             "expected info lifecycle log in the writer, got: {logged:?}"
+        );
+    }
+    /// The full hosted environment, from which one requirement at a time is
+    /// removed below. `KIN_GCS_ENDPOINT` points at a closed port on purpose:
+    /// with every requirement present, startup must get past every env check
+    /// and fail reaching for storage, which is what proves an arm's refusal
+    /// came from the missing value rather than from the fixture.
+    #[cfg(feature = "gcs")]
+    fn complete_hosted_environment() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("KIN_GCS_BUCKET", "fixture-bucket"),
+            ("KIN_GCS_PREFIX", "fixture"),
+            ("KIN_GCS_ENDPOINT", "http://127.0.0.1:9"),
+            (
+                "KIN_RELEASE_DAEMON_DIGEST_INTERNAL",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            ("KIN_REPO_IDS", "kin,kin-db"),
+            ("KIN_DAEMON_AUTH_TOKEN", "ordinary-daemon-token"),
+            (
+                "KIN_PUBLICATION_CONTROL_AUTH_TOKEN",
+                "publication-admin-token",
+            ),
+        ]
+    }
+
+    /// Run `create_state` in GCS mode under an environment with `omitted`
+    /// removed, resolving the repo key space exactly as `async_main` does so
+    /// the allowlist argument tracks the environment rather than being faked.
+    #[cfg(feature = "gcs")]
+    fn hosted_startup_without(omitted: Option<&str>) -> String {
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        for (name, value) in complete_hosted_environment() {
+            if Some(name) == omitted {
+                environment.apply::<_, &str>(name, None);
+            } else {
+                environment.apply(name, Some(value));
+            }
+        }
+        let repo_id = "kin";
+        let allowed = served_repo_key_space(&StorageMode::Gcs, repo_id)
+            .expect("the fixture allowlist must admit the served repo");
+        let repo = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(repo.path().join(".kin"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        match create_state(
+            layout,
+            &StorageMode::Gcs,
+            repo_id,
+            runtime.handle(),
+            allowed,
+        ) {
+            Ok(_) => panic!("the fixture endpoint is closed, so startup cannot succeed"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    /// Every requirement `--compat-json` declares as refused at bind actually
+    /// refuses the real start path, with the declared message.
+    ///
+    /// This is the arm that catches a declaration nothing enforces: add a row
+    /// with a `Stage::Bind` refusal that no code performs and its arm here
+    /// reaches the storage probe instead and fails.
+    ///
+    /// The companion direction, a refusal added without a declaration, is held
+    /// by `hosted_start::tests::the_hosted_start_path_reads_no_environment_of_its_own`.
+    #[cfg(feature = "gcs")]
+    #[test]
+    #[serial_test::serial]
+    fn every_declared_bind_requirement_refuses_startup() {
+        use kin_daemon::hosted_start::{Stage, HOSTED_START_REQUIREMENTS};
+
+        let bind_requirements: Vec<_> = HOSTED_START_REQUIREMENTS
+            .iter()
+            .filter(|requirement| requirement.enforced_at(Stage::Bind))
+            .collect();
+
+        // Positive control: an empty list would make the loop below vacuous.
+        assert!(
+            bind_requirements.len() >= 4,
+            "the declaration lists {} bind requirements, which is too few to be the real set",
+            bind_requirements.len()
+        );
+
+        // With nothing missing, startup must reach storage. If it refused here
+        // the fixture would be incomplete and every arm below would pass for
+        // the wrong reason.
+        let complete = hosted_startup_without(None);
+        for requirement in &bind_requirements {
+            let declared = requirement.refusal(Stage::Bind);
+            assert!(
+                !complete.contains(declared),
+                "a complete hosted environment still refused on {}: {complete}",
+                requirement.name
+            );
+        }
+
+        for requirement in &bind_requirements {
+            let refusal = hosted_startup_without(Some(requirement.name));
+            assert!(
+                refusal.contains(requirement.refusal(Stage::Bind)),
+                "removing {} produced {refusal:?}, not the refusal --compat-json declares: {:?}",
+                requirement.name,
+                requirement.refusal(Stage::Bind)
+            );
+        }
+    }
+
+    /// An empty value is not a set value. A deployment that renders a blank
+    /// into its config has not supplied the requirement, and startup says so
+    /// with the same message absence gets rather than carrying the blank into
+    /// publication fencing.
+    #[cfg(feature = "gcs")]
+    #[test]
+    #[serial_test::serial]
+    fn a_blank_hosted_requirement_refuses_like_an_absent_one() {
+        use kin_daemon::hosted_start::{Stage, RELEASE_DAEMON_DIGEST};
+
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        for (name, value) in complete_hosted_environment() {
+            environment.apply(name, Some(value));
+        }
+        environment.apply(RELEASE_DAEMON_DIGEST.name, Some("   "));
+        let repo_id = "kin";
+        let allowed = served_repo_key_space(&StorageMode::Gcs, repo_id).unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(repo.path().join(".kin"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let error = create_state(
+            layout,
+            &StorageMode::Gcs,
+            repo_id,
+            runtime.handle(),
+            allowed,
+        )
+        .err()
+        .expect("a blank reader identity must not start")
+        .to_string();
+        assert!(
+            error.contains(RELEASE_DAEMON_DIGEST.refusal(Stage::Bind)),
+            "{error}"
         );
     }
 }

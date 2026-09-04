@@ -90,10 +90,11 @@ no bump.
 ## Landing
 
 kin is a classic direct-merge repo. Its merge-queue ruleset was disabled on 2026-08-27 under
-FIR-2815 and preserved only for a one-step rollback. Six required contexts on main, read from
+FIR-2815 and preserved only for a one-step rollback. Seven required contexts on main, read from
 `/repos/firelock-ai/kin/rules/branches/main`: `DCO Sign-off`, `PR text hygiene`, `cargo-deny`,
-`gitleaks (full history)`, `Fast gate lint and policy` and `Fast gate build and tests`. Commit with
-`git commit -s`, and keep assistant-session traces out of the PR title and body, which
+`gitleaks (full history)`, `Fast gate lint and policy`, `Fast gate build and tests` and
+`MCP surface contract`. Commit with `git commit -s`, and keep assistant-session traces out of the
+PR title and body, which
 `PR text hygiene` refuses. From the umbrella root, `bin/kin-lane merge enqueue kin <lane> <pr>`
 records the row and `bin/kin-lane merge land kin <lane> <pr>` merges once every check has concluded
 with zero failures.

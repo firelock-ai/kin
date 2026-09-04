@@ -148,6 +148,43 @@ jobs:
             echo "${tag} is GitHub Latest"
           done < <(node scripts/read-promotion-plan.mjs promotions)
 
+      # The other half of finishing the record, and the half that had no owner
+      # until 2026-09-04. A release that is ALREADY Latest and whose stranger
+      # record has now landed still carries the pending notice on its body, so
+      # it goes on telling every reader that nobody measured it. That is a false
+      # claim in the same direction the strip above exists to prevent; it just
+      # arrives by a different door now that release.yml promotes rather than
+      # holds.
+      #
+      # Deliberately NOT the promote path. These releases are already Latest, so
+      # there is nothing to flip, the npm ordering check would compare against
+      # whatever npm serves today rather than at their publication, and
+      # `--latest` on an older tag would be a rollback.
+      - name: Take the pending notice out of a release the stranger has now measured
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIN_PROMOTION_PLAN: ${{ runner.temp }}/promotion-plan.json
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r tag driver; do
+            [ -n "$tag" ] || continue
+            echo "::notice::first-contact proof landed for ${tag}, driven on the ${driver} endpoint; taking its pending notice out"
+            gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body --jq '.body' \
+              | node scripts/read-promotion-plan.mjs strip-notice > "$RUNNER_TEMP/measured-body.md"
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" \
+              --notes-file "$RUNNER_TEMP/measured-body.md"
+
+            # Read it back. An edit returning 200 is not the same fact as a body
+            # that no longer carries the marker, and this loop's whole job is
+            # that the body stops making a claim that is no longer true.
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body --jq '.body' \
+              | grep -qF 'kin-first-contact-proof'; then
+              echo "::error::${tag} still carries the first-contact pending notice after the strip"
+              exit 1
+            fi
+            echo "${tag} no longer claims its first contact is pending"
+          done < <(node scripts/read-promotion-plan.mjs notice-clears)
+
       # The alarm runs whatever the promotion did, because the releases it
       # reports are exactly the ones the promotion could NOT touch.
       - name: Report releases still waiting for first-contact proof

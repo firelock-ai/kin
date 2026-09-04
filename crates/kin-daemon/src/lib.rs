@@ -123,6 +123,7 @@ pub mod daemon;
 pub mod error;
 pub mod gcs_endpoint;
 pub mod graph_only_members;
+pub mod hosted_start;
 pub mod lifecycle;
 mod local_repository_authority;
 pub mod loop_runner;

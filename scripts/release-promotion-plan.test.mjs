@@ -10,6 +10,7 @@ import test from 'node:test';
 import {
   ALARM_TITLE,
   DEFAULT_ALARM_AFTER_MINUTES,
+  DEFAULT_PROMOTED_ALARM_AFTER_MINUTES,
   PENDING_MARKER,
   buildBody,
   buildPlan,
@@ -34,9 +35,13 @@ const release = (over = {}) => ({
 test('selectCandidates takes exactly the shape this design creates', () => {
   const picked = selectCandidates([
     release(),
-    // Already Latest. Nothing to do, and promoting it again would be a no-op
-    // that still rewrites its body.
+    // Already Latest AND still carrying the notice. Since 2026-09-04 that is
+    // the ordinary state of every release the stranger has not reached, and it
+    // is this chain's business: the notice has to come out when the record
+    // lands. Keying on the prerelease flag alone made this invisible.
     release({ tag_name: 'v0.6.4', prerelease: false }),
+    // Already Latest and carrying NO notice. A finished release, nothing owed.
+    release({ tag_name: 'v0.6.3', prerelease: false, body: 'clean release notes' }),
     // A draft is not published, so it is not a claim yet.
     release({ tag_name: 'v0.6.6', draft: true }),
     // A prerelease TAG is meant to stay a prerelease. Promoting one would be
@@ -45,8 +50,79 @@ test('selectCandidates takes exactly the shape this design creates', () => {
     // Not a version tag at all.
     release({ tag_name: 'nightly' }),
   ]);
-  assert.deepEqual(picked.map((entry) => entry.tag), ['v0.6.5']);
+  assert.deepEqual(picked.map((entry) => entry.tag), ['v0.6.5', 'v0.6.4']);
   assert.equal(picked[0].held, true);
+  assert.equal(picked[0].promoted, false);
+  assert.equal(picked[1].held, true);
+  assert.equal(picked[1].promoted, true);
+});
+
+test('a promoted release carrying no notice is not this sweep\'s business', () => {
+  // The guard against the opposite overreach. Widening the filter to catch
+  // promoted releases must not make every finished release in the listing a
+  // candidate, or the sweep would resolve and judge every tag kin has ever cut
+  // on every tick.
+  const picked = selectCandidates([
+    release({ tag_name: 'v0.6.3', prerelease: false, body: 'clean release notes' }),
+    release({ tag_name: 'v0.6.2', prerelease: false, body: '' }),
+    release({ tag_name: 'v0.6.1', prerelease: false, body: null }),
+  ]);
+  assert.deepEqual(picked, []);
+});
+
+test('a proven release that is already Latest is cleared, never re-promoted', () => {
+  // The rollback this split exists to prevent. The promote path ends in
+  // `gh release edit --latest` plus an assertion that the tag IS Latest, so
+  // running it on an older already-promoted release would move Latest
+  // backwards and then fail the readback.
+  const plan = planPromotion([
+    { tag: 'v0.6.6', held: true, promoted: true, proven: true, driver: 'account', publishedAt: ago(30) },
+    { tag: 'v0.5.9', held: true, promoted: false, proven: true, driver: 'local', publishedAt: ago(30) },
+  ], { now: NOW });
+  assert.deepEqual(plan.clearNotice.map((e) => e.tag), ['v0.6.6']);
+  assert.deepEqual(plan.promote.map((e) => e.tag), ['v0.5.9']);
+});
+
+test('an unmeasured release that is already Latest still reaches the alarm', () => {
+  // The gap FIR-3152 names. Before this, nothing was ever held, so nothing was
+  // ever waiting, and the alarm could not fire at all. v0.6.6 was the first
+  // release to sit in exactly this state.
+  const promoted = {
+    tag: 'v0.6.6',
+    held: true,
+    promoted: true,
+    proven: false,
+    reason: 'stranger.env does not exist',
+    publishedAt: ago(DEFAULT_PROMOTED_ALARM_AFTER_MINUTES + 1),
+  };
+  const plan = planPromotion([promoted], { now: NOW });
+  assert.deepEqual(plan.overdue.map((e) => e.tag), ['v0.6.6']);
+  assert.equal(plan.alarm, 'open');
+  assert.equal(plan.waiting[0].promoted, true);
+});
+
+test('a promoted release gets a longer fuse than a held one', () => {
+  // Two states, two impatiences. A held release is stuck; a promoted one
+  // shipped and is merely unmeasured, which is now the normal state of every
+  // release the stranger has not reached. One threshold for both would ring on
+  // every healthy release six hours after it shipped.
+  const at = (minutes, over) => ({
+    tag: 'v0.9.9', held: true, proven: false, reason: 'no stranger.env',
+    publishedAt: ago(minutes), ...over,
+  });
+  const between = DEFAULT_ALARM_AFTER_MINUTES + 1;
+  assert.equal(between < DEFAULT_PROMOTED_ALARM_AFTER_MINUTES, true, 'the two thresholds must differ');
+
+  assert.deepEqual(
+    planPromotion([at(between, { promoted: true })], { now: NOW }).overdue.map((e) => e.tag),
+    [],
+    'a promoted release inside its own window is not overdue',
+  );
+  assert.deepEqual(
+    planPromotion([at(between, { promoted: false })], { now: NOW }).overdue.map((e) => e.tag),
+    ['v0.9.9'],
+    'a held release past the held threshold is overdue',
+  );
 });
 
 test('selectCandidates refuses a listing it cannot read rather than returning nothing', () => {
@@ -164,24 +240,25 @@ test('buildBody renders a gate refusal into one table cell whatever it contains'
       .find((line) => line.startsWith('| `v1.0.0`'));
 
   // A bare pipe: one escape, one cell.
-  assert.equal(row('a | b'), '| `v1.0.0` | 400 min | a \\| b |');
+  assert.equal(row('a | b'), '| `v1.0.0` | held, not Latest | 400 min | a \\| b |');
 
   // A backslash BEFORE a pipe. Escaping the pipe alone turns this into a
   // literal backslash followed by an unescaped delimiter, and the row silently
   // gains a column. Both characters have to be escaped in one pass.
-  assert.equal(row('a\\|b'), '| `v1.0.0` | 400 min | a\\\\\\|b |');
+  assert.equal(row('a\\|b'), '| `v1.0.0` | held, not Latest | 400 min | a\\\\\\|b |');
 
   // A newline inside a table row ends the row.
-  assert.equal(row('line one\nline two'), '| `v1.0.0` | 400 min | line one line two |');
+  assert.equal(row('line one\nline two'), '| `v1.0.0` | held, not Latest | 400 min | line one line two |');
 
-  // Every rendered row has exactly the four pipes of a three-column row, so a
-  // cell can never smuggle in a fifth.
+  // Every rendered row has exactly the five pipes of a four-column row, so a
+  // cell can never smuggle in a sixth. The count moved with the `state` column
+  // this alarm gained; the property it guards did not.
   for (const reason of ['a | b', 'a\\|b', 'line one\nline two', '|||', '\\\\']) {
     const rendered = row(reason);
     const unescaped = rendered.replace(/\\./g, '');
     assert.equal(
       unescaped.split('|').length - 1,
-      4,
+      5,
       `reason ${JSON.stringify(reason)} rendered ${JSON.stringify(rendered)}`,
     );
   }

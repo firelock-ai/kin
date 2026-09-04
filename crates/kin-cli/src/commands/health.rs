@@ -306,12 +306,14 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_relation_census(&graph_status).await);
     checks.push(check_hydration_semantics());
     checks.push(check_parse_coverage(&graph_status).await);
+    checks.push(check_graph_section(&graph_status).await);
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
     checks.push(check_memory_floor());
     checks.push(check_commit_memory_headroom());
     checks.push(check_daemon_kill_record());
     checks.push(check_interrupted_init());
+    checks.push(check_stranded_init_stage());
     checks.push(check_suspended_sweep());
     checks.extend(check_memory_pressure_rows(embedding_coverage));
     checks.push(check_retrieval_profile());
@@ -1990,6 +1992,198 @@ fn interrupted_init_check_for(roots: &[PathBuf]) -> HealthCheck {
         ),
     }
 }
+
+/// Reports, never reaps, exactly like the interrupted-conversion row above it.
+///
+/// Separate from that row rather than folded into it, because the two find
+/// different things. `abandoned_init_attempts` scans `.kin-git-capture-*`
+/// directories and learns about a repository stage only by reading a surviving
+/// capture record, which the native `kin init` path never writes at all. This
+/// row scans the `.kin.init-<uuid>.owner` records themselves, which is the same
+/// evidence `recover_orphaned_repository_stages` reaps by, so a stage whose
+/// capture directory is already gone is still named here. FIR-3146.
+fn check_stranded_init_stage() -> HealthCheck {
+    let cwd = env::current_dir().unwrap_or_default();
+    stranded_init_stage_check_for(&interrupted_init_scan_roots(&cwd))
+}
+
+fn stranded_init_stage_check_for(roots: &[PathBuf]) -> HealthCheck {
+    let survey = survey_stranded_stages(roots);
+    match kin_core::init::stranded_stage_doctor_row(&survey) {
+        Some((detail, fix)) => HealthCheck::new(
+            "stranded_init_stage",
+            "Stranded init staging",
+            HealthStatus::Degraded,
+            detail,
+        )
+        .with_manual_fix(fix),
+        None => HealthCheck::new(
+            "stranded_init_stage",
+            "Stranded init staging",
+            HealthStatus::Healthy,
+            "no crashed `kin init` left a staged store beside this directory",
+        ),
+    }
+}
+
+/// Survey every scan root once, keeping each stage the first time it is seen.
+///
+/// Deduplicated on the owner record's path, which is unique per stage. The
+/// roots are a directory and its parent, so they hold disjoint entries today
+/// and the dedupe is insurance against a caller that passes overlapping roots
+/// rather than against the pair `staging_scan_roots` returns.
+///
+/// A root that could not be read is recorded, not dropped. Reporting a parent
+/// as clean because `read_dir` refused it would be the false negative this row
+/// exists to end, and it is the parent, one level up from where an operator
+/// stands, that these stages strand in.
+pub(crate) fn survey_stranded_stages(roots: &[PathBuf]) -> kin_core::StrandedStageSurvey {
+    let mut survey = kin_core::StrandedStageSurvey::default();
+    let mut seen = std::collections::BTreeSet::new();
+    for root in roots {
+        let found = match kin_core::survey_orphaned_repository_stages(root) {
+            Ok(found) => found,
+            Err(error) => {
+                survey
+                    .unreadable
+                    .push(format!("{}: {error}", root.display()));
+                continue;
+            }
+        };
+        survey.live += found.live;
+        for stage in found.stages {
+            if seen.insert(stage.owner_path.clone()) {
+                survey.stages.push(stage);
+            }
+        }
+    }
+    survey
+}
+
+/// Where a reclaim looks, which is exactly where the row that reported it
+/// looked.
+///
+/// Shared rather than re-derived: a reclaim that scanned a different set of
+/// directories than the row an operator just read would take back something
+/// they were never shown, or nothing at all.
+pub fn stranded_stage_scan_roots() -> Vec<PathBuf> {
+    let cwd = env::current_dir().unwrap_or_default();
+    interrupted_init_scan_roots(&cwd)
+}
+
+/// Take back every stranded stage the `stranded_init_stage` row just named.
+///
+/// The row is the dry run. `kin doctor` names every stage this would remove
+/// with its size and leaves the disk untouched, so an operator sees the list
+/// before anything is deleted and there is no second `--dry-run` flag to teach
+/// them. `kin cache gc` needs one because its default is destructive; this
+/// command's default surface is a diagnostic.
+///
+/// Removes only what `kin_core::reclaim_orphaned_repository_stages` proves
+/// abandoned, which is the same proof the reaper inside `kin init` uses: a free
+/// owner lock, a private owner record and stage directory owned by this user,
+/// the exact recorded stage path, and a matching device and inode. A stage a
+/// live `kin init` holds is never touched.
+///
+/// That owner lock is host-local, so the proof holds on local storage and not
+/// on a shared mount, where a stage another machine is still writing can read
+/// as abandoned. FIR-3155 carries the fix, a host identifier on the owner
+/// record.
+///
+/// Refuses rather than returning zero when no root could be examined at all. A
+/// caller reading only the exit status would otherwise take "I could not look"
+/// for "there was nothing there".
+pub fn reclaim_stranded_stages(json: bool) -> anyhow::Result<()> {
+    reclaim_stranded_stages_in(&stranded_stage_scan_roots(), json)
+}
+
+/// [`reclaim_stranded_stages`] against explicit roots.
+///
+/// Split out so the refusal below is reachable from a test. Resolving the roots
+/// from `env::current_dir` is process-global state, and a test that changed the
+/// working directory to drive this would reach every other test running beside
+/// it in the same binary.
+pub(crate) fn reclaim_stranded_stages_in(roots: &[PathBuf], json: bool) -> anyhow::Result<()> {
+    let mut recovered = 0usize;
+    let mut bytes = 0u64;
+    let mut retained = 0usize;
+    let mut live = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for root in roots {
+        match kin_core::reclaim_orphaned_repository_stages(root) {
+            Ok(outcome) => {
+                recovered += outcome.recovered;
+                bytes = bytes.saturating_add(outcome.bytes_recovered);
+                retained += outcome.retained;
+                live += outcome.live;
+            }
+            // Named, not swallowed. A root that could not be scanned is the one
+            // thing an operator must not read as "nothing was stranded there".
+            Err(error) => failures.push(format!("{}: {error}", root.display())),
+        }
+    }
+    // Fail loud. `recovered == 0` beside a failure for every root is not a clean
+    // parent, and the summary sentence below says "nothing to reclaim here",
+    // which is the one thing this must not tell a script that reads only the
+    // exit status.
+    if failures.len() == roots.len() && !roots.is_empty() {
+        anyhow::bail!(
+            "kin doctor --reclaim-staging: no directory could be examined, so this run says \
+             nothing about what is stranded here: {}",
+            failures.join("; ")
+        );
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": STRANDED_STAGE_RECLAIM_SCHEMA,
+                "roots": roots.iter().map(|root| root.display().to_string()).collect::<Vec<_>>(),
+                "recovered": recovered,
+                "bytes_recovered": bytes,
+                "retained": retained,
+                "live": live,
+                "unreadable_roots": failures,
+            }))?
+        );
+    } else if recovered == 0 {
+        println!("kin doctor --reclaim-staging: nothing to reclaim here.");
+    } else {
+        let noun = if recovered == 1 { "stage" } else { "stages" };
+        println!(
+            "kin doctor --reclaim-staging: reclaimed {} from {recovered} stranded init {noun}.",
+            kin_core::init_attempt::human_bytes(bytes)
+        );
+    }
+    if !json {
+        if retained > 0 {
+            let (noun, pronoun) = if retained == 1 {
+                ("store", "it")
+            } else {
+                ("stores", "them")
+            };
+            println!(
+                "  {retained} further staged {noun} left alone, because this run could not prove \
+                 {pronoun} unused."
+            );
+        }
+        if live > 0 {
+            let (noun, verb) = if live == 1 {
+                ("store", "is")
+            } else {
+                ("stores", "are")
+            };
+            println!("  {live} staged {noun} {verb} owned by a `kin init` running right now.");
+        }
+        for failure in &failures {
+            println!("  could not be examined, {failure}");
+        }
+    }
+    Ok(())
+}
+
+/// Schema of the `--reclaim-staging --json` payload.
+pub const STRANDED_STAGE_RECLAIM_SCHEMA: &str = "kin.stranded-stage-reclaim.v1";
 
 fn check_repo_init() -> HealthCheck {
     let cwd = env::current_dir().unwrap_or_default();
@@ -4935,6 +5129,115 @@ pub(crate) fn parse_coverage_health(
     )
 }
 
+/// Whether this store serves its graph from the persisted section or folds its
+/// history at every open.
+async fn check_graph_section(graph_status: &RunGraphStatus) -> HealthCheck {
+    const ID: &str = "graph_section";
+    const LABEL: &str = "Graph section";
+
+    let response = match graph_section_row_for_unread_graph(graph_status.get().await) {
+        Ok(response) => response,
+        Err(row) => return row,
+    };
+    let Some(state) = response.graph_section.as_ref() else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            "the daemon serving this repository does not report whether it folds this store's \
+             history at every open; it predates the measurement",
+        )
+        .with_manual_fix(
+            "stop the daemon (`kin daemon stop`) so the next kin command starts one on this build",
+        );
+    };
+    graph_section_health(state)
+}
+
+/// This row's words for a graph status the run could not read.
+///
+/// Phrased here rather than shared with the other graph-truth rows because a
+/// row that reads graph truth must never render the same whether the graph was
+/// healthy or unreadable.
+fn graph_section_row_for_unread_graph(
+    status: &GraphStatusForRun,
+) -> Result<&crate::commands::graph::GraphCommandResponse, HealthCheck> {
+    const ID: &str = "graph_section";
+    const LABEL: &str = "Graph section";
+
+    match status {
+        GraphStatusForRun::Answered(response) => Ok(response),
+        GraphStatusForRun::NotInRepository => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "not in a Kin repository, so there is no store whose open cost could be read",
+        )),
+        GraphStatusForRun::NoDaemon => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "no daemon is serving this repository, so whether its opens fold history was not read",
+        )
+        .with_manual_fix("run any `kin` command in the repo to auto-start the daemon")),
+        GraphStatusForRun::DaemonUrlInvalid { daemon_url, error } => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
+        )
+        .with_manual_fix("check the daemon URL recorded for this repository")),
+        GraphStatusForRun::Unavailable { daemon_url, error } => Err(HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Stale,
+            format!(
+                "daemon reachable ({daemon_url}), but the graph section state is unavailable: \
+                 {error}"
+            ),
+        )
+        .with_manual_fix("run `kin graph status` and resolve the reported daemon error")),
+    }
+}
+
+/// Turn the section state into a row, split from its fetch so every branch is
+/// testable without a daemon.
+///
+/// `Degraded` for a folding store, and the severity is chosen rather than
+/// inherited. A store that folds is completely correct; it is only paying a full
+/// history replay at every open, which on the kin store was 47 seconds of a 95
+/// second one. `Missing` and `Misconfigured` fail the whole report, and a store
+/// that answers every question correctly must not do that. `Degraded` costs it
+/// the all-clear and nothing else, which is exactly the claim the evidence
+/// supports, and it names the one command that changes it.
+///
+/// A refused section is reported with kin-db's own refusal word because that is
+/// the word its own log carries, so an operator comparing this row against
+/// `.kin/daemon.log` is matching a term rather than guessing at a paraphrase.
+pub(crate) fn graph_section_health(
+    state: &kin_core::graph_section::GraphSectionState,
+) -> HealthCheck {
+    const ID: &str = "graph_section";
+    const LABEL: &str = "Graph section";
+
+    let status = match state.standing {
+        kin_core::graph_section::GraphSectionStanding::Serving
+        | kin_core::graph_section::GraphSectionStanding::Unborn => HealthStatus::Healthy,
+        kin_core::graph_section::GraphSectionStanding::Folding => HealthStatus::Degraded,
+        // Never healthy. A state that could not be read is not a state that is
+        // fine, and rendering it as one is the invisibility this row replaces.
+        kin_core::graph_section::GraphSectionStanding::Unknown => HealthStatus::Stale,
+    };
+    let check = HealthCheck::new(ID, LABEL, status, state.doctor_detail());
+    if state.folds() {
+        return check.with_manual_fix(
+            "run `kin graph materialize` to persist this workspace's base graph, so later opens \
+             read it instead of folding the history again",
+        );
+    }
+    check
+}
+
 /// Core of [`check_commit_memory_headroom`] with both readings as inputs, so
 /// every branch is testable on any host.
 fn commit_memory_headroom_check_for(
@@ -5656,6 +5959,132 @@ mod tests {
             matches!(forced.status, HealthStatus::Healthy),
             "a forced performance tier runs the full budget, whoever chose it: {}",
             forced.detail
+        );
+    }
+
+    /// The stranded-stage row scans where an operator stands, and reaps
+    /// nothing.
+    ///
+    /// A repository stage sits beside the repository that was never created,
+    /// not inside it, so the row that finds it has to look at the parent as
+    /// well as the working directory. Scanned here from one level down, which
+    /// is the standpoint the reported case had: a real `redis-full` clone with
+    /// the crashed init's 1.5 GB stage sitting next to it.
+    ///
+    /// The clean parent beside it is the control. Without it a row that
+    /// reported every directory as degraded would pass this test.
+    #[cfg(unix)]
+    #[test]
+    fn the_stranded_stage_row_scans_the_working_directory_and_its_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let corpus = parent.join("redis-full");
+        std::fs::create_dir(&corpus).unwrap();
+        let (stage, owner) =
+            kin_core::init::strand_repository_stage(&parent, &corpus.join(".kin")).unwrap();
+
+        let check =
+            stranded_init_stage_check_for(&kin_core::init_attempt::staging_scan_roots(&corpus));
+        assert!(matches!(check.status, HealthStatus::Degraded), "{check:?}");
+        assert!(
+            check.detail.contains(&stage.display().to_string()),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .manual_fix
+                .as_deref()
+                .unwrap_or_default()
+                .contains("kin doctor --reclaim-staging"),
+            "{check:?}"
+        );
+        assert!(
+            stage.is_dir(),
+            "doctor reports and must never reap what it reports"
+        );
+        assert!(owner.is_file());
+
+        let clean = tempfile::tempdir().unwrap();
+        let quiet = stranded_init_stage_check_for(&[clean.path().to_path_buf()]);
+        assert!(matches!(quiet.status, HealthStatus::Healthy), "{quiet:?}");
+        assert!(quiet.manual_fix.is_none(), "{quiet:?}");
+    }
+
+    /// A scan root the process cannot read is reported, not reported as clean.
+    ///
+    /// The row used to drop the error and fall through to Healthy, printing
+    /// "no crashed `kin init` left a staged store beside this directory" about
+    /// a directory it had never managed to open. The reclaim beside it already
+    /// refused to do that, so the two surfaces disagreed on the same machine.
+    ///
+    /// The clean tempdir above is the control for the Healthy arm; this one is
+    /// the control for the other direction, so neither reading is an accident.
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_root_that_cannot_be_read_is_reported_rather_than_read_as_clean() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = directory.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let check = stranded_init_stage_check_for(std::slice::from_ref(&sealed));
+        // Restored before any assertion, so a failing assertion still leaves a
+        // directory the tempdir can remove.
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(check.status, HealthStatus::Degraded), "{check:?}");
+        assert!(
+            check.detail.contains(&sealed.display().to_string()),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("does not say whether anything is stranded"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// A reclaim that could examine nothing refuses, rather than exiting clean.
+    ///
+    /// `main` exits non-zero only on `Err`, so returning `Ok(())` after every
+    /// root failed would tell a script that reads the exit status that the disk
+    /// was examined and found clean. The human summary in that case even prints
+    /// "nothing to reclaim here", which is the one sentence this must never say
+    /// about a directory it could not open.
+    ///
+    /// The readable tempdir is the control: a genuinely clean parent still
+    /// succeeds, so this is not a refusal that fires on everything.
+    #[cfg(unix)]
+    #[test]
+    fn a_reclaim_that_could_examine_nothing_refuses_rather_than_reporting_clean() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = directory.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let refused = reclaim_stranded_stages_in(std::slice::from_ref(&sealed), false);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = refused.expect_err("a root that could not be examined is not a clean parent");
+        let message = error.to_string();
+        assert!(message.contains(&sealed.display().to_string()), "{message}");
+        assert!(
+            message.contains("no directory could be examined"),
+            "{message}"
+        );
+
+        let clean = tempfile::tempdir().unwrap();
+        assert!(
+            reclaim_stranded_stages_in(&[clean.path().to_path_buf()], false).is_ok(),
+            "a readable empty parent still succeeds"
         );
     }
 
@@ -6568,7 +6997,40 @@ mod tests {
                 kin_core::reference_coverage::ReferenceEdgeCoverage::default(),
             ),
             relation_census: Some(census_pair(&[], &[], Vec::new())),
+            graph_section: Some(serving_section_state()),
         }))
+    }
+
+    /// A store whose persisted section answers for its base.
+    fn serving_section_state() -> kin_core::graph_section::GraphSectionState {
+        kin_core::graph_section::GraphSectionState {
+            schema: kin_core::graph_section::GRAPH_SECTION_STATE_SCHEMA.to_string(),
+            standing: kin_core::graph_section::GraphSectionStanding::Serving,
+            section_present: true,
+            refusal: None,
+            unreadable: None,
+            base_target: Some("2b".repeat(32)),
+            section_resolved_at: Some("2b".repeat(32)),
+            changes_in_store: 3005,
+            fold: kin_core::graph_section::FoldSize::Nothing,
+            prepared_may_preempt: false,
+        }
+    }
+
+    /// The same store with no section, which is every store written before v14.
+    fn folding_section_state() -> kin_core::graph_section::GraphSectionState {
+        kin_core::graph_section::GraphSectionState {
+            schema: kin_core::graph_section::GRAPH_SECTION_STATE_SCHEMA.to_string(),
+            standing: kin_core::graph_section::GraphSectionStanding::Folding,
+            section_present: false,
+            refusal: Some("absent".to_string()),
+            unreadable: None,
+            base_target: Some("2b".repeat(32)),
+            section_resolved_at: None,
+            changes_in_store: 3005,
+            fold: kin_core::graph_section::FoldSize::Exact(3005),
+            prepared_may_preempt: false,
+        }
     }
 
     /// FIR-2560. One `graph status` per doctor run, however many rows read it.
@@ -6683,6 +7145,173 @@ mod tests {
         assert!(
             relation_census_row_for_unread_graph(&answered_graph_status()).is_ok(),
             "a graph the run did read must hand its response to the census row"
+        );
+    }
+
+    /// A store that folds its whole history at every open is completely correct
+    /// and materially slower than it needs to be, and doctor has to say the
+    /// second without claiming the first. `Degraded` costs the report its
+    /// all-clear and nothing else; `Missing` or `Misconfigured` would fail a
+    /// report about a store answering every question correctly.
+    #[test]
+    fn a_folding_store_loses_the_all_clear_without_failing_the_report() {
+        let row = graph_section_health(&folding_section_state());
+        assert!(
+            matches!(row.status, HealthStatus::Degraded),
+            "a folding store is degraded, not broken: {:?}",
+            row.status
+        );
+        assert!(
+            !blocks_readiness(&row),
+            "a correct store must never fail the readiness verdict: {:?}",
+            row.status
+        );
+        assert!(
+            needs_attention(&row),
+            "a 47 second fold at every open must withhold the all-clear"
+        );
+        assert!(
+            row.detail.contains("folds"),
+            "the row must say what the store does: {}",
+            row.detail
+        );
+        assert!(
+            row.detail.contains("3005"),
+            "the row must name the size of the fold: {}",
+            row.detail
+        );
+        assert!(
+            row.manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("kin graph materialize")),
+            "a reported cost with no named fix is a nag: {:?}",
+            row.manual_fix
+        );
+    }
+
+    /// The control for the row above. A store whose section answers is healthy
+    /// and offers no repair, or the row would report every store as needing one
+    /// and could never distinguish the two.
+    #[test]
+    fn a_store_whose_section_answers_reads_healthy_with_nothing_to_fix() {
+        let row = graph_section_health(&serving_section_state());
+        assert!(
+            matches!(row.status, HealthStatus::Healthy),
+            "a served base is healthy: {:?}",
+            row.status
+        );
+        assert!(!needs_attention(&row));
+        assert_eq!(row.manual_fix, None, "there is nothing to repair");
+        assert!(
+            row.detail.contains("folds nothing"),
+            "the row must say the fold did not run: {}",
+            row.detail
+        );
+    }
+
+    /// A state doctor could not read is not a state that is fine. Rendering it
+    /// as healthy is the invisibility this row replaces, restated one layer up.
+    #[test]
+    fn a_section_state_that_could_not_be_read_is_never_healthy() {
+        let mut state = folding_section_state();
+        state.standing = kin_core::graph_section::GraphSectionStanding::Unknown;
+        state.unreadable = Some("this authority holds no workspace 0".to_string());
+        let row = graph_section_health(&state);
+        assert!(
+            !matches!(row.status, HealthStatus::Healthy),
+            "an unread state must never render as healthy: {:?}",
+            row.status
+        );
+        assert!(row.detail.contains("could not be read"), "{}", row.detail);
+    }
+
+    /// This row's own four unreadable arms. Shared wording would let one row go
+    /// quiet about a graph another row could not read, and a row that goes quiet
+    /// is indistinguishable from one reporting a healthy store.
+    #[test]
+    fn an_unread_graph_reaches_the_graph_section_row_in_its_own_words() {
+        let unreadable = [
+            (
+                GraphStatusForRun::NotInRepository,
+                "not in a Kin repository",
+            ),
+            (GraphStatusForRun::NoDaemon, "no daemon is serving"),
+            (
+                GraphStatusForRun::DaemonUrlInvalid {
+                    daemon_url: "http://127.0.0.1:0".to_string(),
+                    error: "invalid port".to_string(),
+                },
+                "its URL is invalid",
+            ),
+            (
+                GraphStatusForRun::Unavailable {
+                    daemon_url: "http://127.0.0.1:4242".to_string(),
+                    error: "connection refused".to_string(),
+                },
+                "unavailable",
+            ),
+        ];
+        for (status, expected) in unreadable {
+            let row = graph_section_row_for_unread_graph(&status)
+                .expect_err("an unread graph must produce a row rather than a response");
+            assert!(
+                !matches!(row.status, HealthStatus::Healthy),
+                "an unread graph must never render as healthy: {status:?} gave {:?}",
+                row.status
+            );
+            assert!(
+                row.detail.contains(expected),
+                "the row must name what happened: {status:?} gave {}",
+                row.detail
+            );
+        }
+        assert!(
+            graph_section_row_for_unread_graph(&answered_graph_status()).is_ok(),
+            "a graph the run did read must hand its response to this row"
+        );
+    }
+
+    /// A daemon built before this measurement existed sends no section state,
+    /// and the absence must read as a stale daemon rather than as a store with
+    /// nothing to report.
+    #[tokio::test]
+    async fn a_daemon_that_reports_no_section_state_reads_stale_rather_than_healthy() {
+        let older = RunGraphStatus::with_fetch(|| {
+            Box::pin(async {
+                GraphStatusForRun::Answered(Box::new(
+                    crate::commands::graph::GraphCommandResponse {
+                        lines: vec!["graph status".to_string()],
+                        error: None,
+                        source: None,
+                        reference_edge_coverage: None,
+                        relation_census: None,
+                        graph_section: None,
+                    },
+                ))
+            })
+        });
+        let row = check_graph_section(&older).await;
+        assert!(
+            matches!(row.status, HealthStatus::Stale),
+            "an older daemon is stale, not healthy: {:?}",
+            row.status
+        );
+        assert!(
+            row.manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("kin daemon stop")),
+            "the row must name how to get a daemon that reports it: {:?}",
+            row.manual_fix
+        );
+
+        // The control: a daemon that DOES report it reaches the measurement,
+        // or the arm above would be the only outcome this row can produce.
+        let current = RunGraphStatus::with_fetch(|| Box::pin(async { answered_graph_status() }));
+        let row = check_graph_section(&current).await;
+        assert!(
+            matches!(row.status, HealthStatus::Healthy),
+            "a reported serving section reads healthy: {:?}",
+            row.status
         );
     }
 

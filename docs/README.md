@@ -25,6 +25,9 @@ repository, and walks the everyday loop end to end. Once Kin is running, the
 - **[Environment variables](env-vars.md)** is the generated list of supported
   `KIN_*` variables, their defaults, and which ones change results rather than
   performance.
+- **[Hosted daemon start requirements](hosted-daemon-start.md)** explains the
+  `hosted_start_requirements` block `kin-daemon --compat-json` prints, which is
+  how a deployment reads what an image needs instead of tracking it by hand.
 - **[Language support](language-support.md)** states what semantic enrichment
   each language actually gets. No tier is implied beyond what extraction emits.
 - **[Store size](store-size.md)** explains what drives the size of `.kin/` and
