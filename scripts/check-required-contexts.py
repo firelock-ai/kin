@@ -46,17 +46,28 @@ limit, but it runs with neither set, which is the shape `bin/kin-precheck kin` r
                         rule); or GitHub answered fine and the two lists disagree. None of these
                         is "could not check"; all of them are "checked, and it is wrong."
   SKIP (exit 0, loud)  GitHub could not be reached at all (DNS, timeout, connection refused) or
-                        refused the read in a way indistinguishable from rate-limiting or a bad
-                        token (401, 403, 429). This is the one outcome that does not fail the
-                        pull request, and it prints `::warning::` plus a `SKIP:` line so it is
-                        never mistaken for a pass in the log. A check that exits 0 having read
-                        nothing is worse than no check, so this path is narrow on purpose: a 404
-                        is DRIFT, not SKIP, because a 404 means the path the doc names is itself
-                        wrong, which is squarely this check's job to catch.
+                        refused the read in a way indistinguishable from rate-limiting, a bad
+                        token, or GitHub's own server having an issue (401, 403, 429, or any
+                        5xx). This is the one outcome that does not fail the pull request, and it
+                        prints `::warning::` plus a `SKIP:` line so it is never mistaken for a
+                        pass in the log. A check that exits 0 having read nothing is worse than no
+                        check, so this path is narrow on purpose: a 404 is DRIFT, not SKIP,
+                        because a 404 means the path the doc names is itself wrong, which is
+                        squarely this check's job to catch.
+
+This gates `Fast gate lint and policy`, a required context every pull request lands through, so a
+transient GitHub-side blip must never read as DRIFT. Before treating the read as unreachable, it
+retries up to three times, two seconds apart, but only on the shapes that are plausibly transient
+(429, 403, any 5xx, or the connection failing outright): 401 and 404 are never retried, because a
+bad token or a wrong path will not fix itself between one request and the next, and retrying them
+would spend the budget for no chance of a different answer. A 500 measured as DRIFT before this
+paragraph was added: kin#1456 was paused for review over the exact risk of a network-dependent
+required context, and raising one through the classifier (not reading the code and assuming)
+confirmed the gap before any review reported back.
 
 Falsified with `--self-test`, offline and hermetic: every control below injects a fake network
-call rather than reaching GitHub, including the exact six-doc/seven-live shape of the regression
-this check exists for.
+call and a no-op sleep rather than reaching GitHub or waiting in real time, including the exact
+six-doc/seven-live shape of the regression this check exists for.
 """
 
 import argparse
@@ -64,10 +75,19 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 
 API_HOST = "https://api.github.com"
+
+# HTTP statuses worth one more try before giving up and calling the read Unreachable: GitHub's own
+# rate limiting or abuse detection (403, 429) and a server-side error on GitHub's end (any 5xx).
+# 401 (a bad token) and 404 (the wrong path) are deliberately absent: neither fixes itself between
+# one request and the next, so retrying them spends the budget for no chance of a different answer.
+RETRYABLE_HTTP_CODES = frozenset({403, 429, 500, 502, 503, 504})
+MAX_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 2
 
 WORD_TO_NUMBER = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
@@ -120,14 +140,25 @@ def parse_sentence(text):
     return match.group("count_word"), match.group("api_path"), items
 
 
-def fetch_required_contexts(api_path, token=None, timeout=10, opener=None):
+def fetch_required_contexts(api_path, token=None, timeout=10, opener=None,
+                             max_attempts=MAX_ATTEMPTS, sleep=None):
     """Return the live list of required_status_checks contexts, or raise Unreachable/Drift.
 
     `opener` is a callable(request) -> response, injected in --self-test so the real network is
-    never touched there. The default opens the real URL with the given timeout.
+    never touched there. The default opens the real URL with the given timeout. `sleep` is
+    likewise injectable (a no-op in --self-test, so retries never make the offline suite slow);
+    the default is the real `time.sleep`.
+
+    Retries up to `max_attempts` times, two seconds apart, but only on the codes in
+    RETRYABLE_HTTP_CODES or the connection failing outright (urlopen wraps a socket timeout in
+    URLError, not a bare TimeoutError, confirmed by actually raising one rather than assuming the
+    Python docs' shape holds; there is no separate TimeoutError handler here for that reason). A
+    404 or a 401 is raised on the first attempt with no retry, because neither is transient.
     """
     if opener is None:
         opener = lambda req: urllib.request.urlopen(req, timeout=timeout)  # noqa: E731
+    if sleep is None:
+        sleep = time.sleep
 
     url = API_HOST + api_path
     request = urllib.request.Request(
@@ -141,23 +172,41 @@ def fetch_required_contexts(api_path, token=None, timeout=10, opener=None):
     if token:
         request.add_header("Authorization", "Bearer %s" % token)
 
-    try:
-        with opener(request) as response:
-            body = response.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403, 429):
-            raise Unreachable(
-                "%s answered %d %s; read as rate-limited or an invalid token, not as a doc "
-                "problem" % (url, exc.code, exc.reason)
-            ) from exc
-        raise Drift(
-            "%s answered %d %s; the path AGENTS.md names may no longer resolve"
-            % (url, exc.code, exc.reason)
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise Unreachable("could not reach %s: %s" % (url, exc.reason)) from exc
-    except TimeoutError as exc:
-        raise Unreachable("timed out reaching %s" % url) from exc
+    body = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with opener(request) as response:
+                body = response.read()
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise Drift(
+                    "%s answered %d %s; the path AGENTS.md names may no longer resolve"
+                    % (url, exc.code, exc.reason)
+                ) from exc
+            if exc.code not in RETRYABLE_HTTP_CODES:
+                # 401, or any status this endpoint has never been seen to answer with: not a
+                # doc problem, and retrying will not turn a permanent refusal into an answer.
+                raise Unreachable(
+                    "%s answered %d %s; read as an invalid token or an unrecognized refusal, "
+                    "not as a doc problem" % (url, exc.code, exc.reason)
+                ) from exc
+            unreachable = Unreachable(
+                "%s answered %d %s after %d attempt(s); read as rate-limited or a GitHub-side "
+                "error, not as a doc problem" % (url, exc.code, exc.reason, attempt)
+            )
+            if attempt < max_attempts:
+                sleep(RETRY_DELAY_SECONDS)
+                continue
+            raise unreachable from exc
+        except urllib.error.URLError as exc:
+            unreachable = Unreachable(
+                "could not reach %s after %d attempt(s): %s" % (url, attempt, exc.reason)
+            )
+            if attempt < max_attempts:
+                sleep(RETRY_DELAY_SECONDS)
+                continue
+            raise unreachable from exc
 
     try:
         rules = json.loads(body)
@@ -331,6 +380,27 @@ def _raises(exc):
     return opener
 
 
+def _no_sleep(_seconds):
+    """Stands in for time.sleep in every self-test call, so a retryable control proves the
+    retry happened (via the call counter below) without making --self-test slow."""
+
+
+def _counting_opener(fail_times, exc_factory, payload=None):
+    """An opener that raises exc_factory() for the first `fail_times` calls, then succeeds with
+    `payload` (REAL_RULES_PAYLOAD if omitted). Returns (opener, calls), where calls['count'] is
+    how many times the opener was actually invoked, so a control can assert retry happened the
+    right number of times rather than merely that no exception escaped."""
+    calls = {"count": 0}
+
+    def opener(req):
+        calls["count"] += 1
+        if calls["count"] <= fail_times:
+            raise exc_factory()
+        return _FakeResponse(REAL_RULES_PAYLOAD if payload is None else payload)
+
+    return opener, calls
+
+
 def self_test():
     """Grade every outcome by name. A grader that cannot fail is not evidence: the controls
     below include both directions of disagreement, the count-word-vs-list-length check
@@ -354,42 +424,81 @@ def self_test():
     except Drift:
         check("unparseable text raises Drift rather than passing silent", True)
 
-    # fetch_required_contexts, offline via injected openers
+    # fetch_required_contexts, offline via injected openers. sleep is always the no-op stub here:
+    # a retryable control must prove the retry happened (via the opener's own call counter, not
+    # via elapsed time), and it must not make --self-test slow.
     fetched = fetch_required_contexts("/repos/firelock-ai/kin/rules/branches/main",
-                                       opener=_returns(REAL_RULES_PAYLOAD))
+                                       opener=_returns(REAL_RULES_PAYLOAD), sleep=_no_sleep)
     check("fetch extracts all seven contexts, ignoring unrelated rule types", fetched == REAL_LIVE_SEVEN)
 
+    # A connection error retries up to MAX_ATTEMPTS times before giving up, same as an HTTP one.
+    opener_url, calls_url = _counting_opener(99, lambda: urllib.error.URLError("mock DNS failure"))
     try:
-        fetch_required_contexts("/x", opener=_raises(urllib.error.URLError("mock DNS failure")))
-        check("a connection error raises Unreachable, not Drift", False)
+        fetch_required_contexts("/x", opener=opener_url, sleep=_no_sleep)
+        check("a connection error raises Unreachable after retrying, not Drift", False)
     except Unreachable:
-        check("a connection error raises Unreachable, not Drift", True)
+        check("a connection error raises Unreachable after retrying, not Drift",
+              calls_url["count"] == MAX_ATTEMPTS)
     except Drift:
-        check("a connection error raises Unreachable, not Drift", False)
+        check("a connection error raises Unreachable after retrying, not Drift", False)
 
-    for code in (401, 403, 429):
-        try:
-            fetch_required_contexts(
-                "/x", opener=_raises(urllib.error.HTTPError("https://api.github.com/x", code, "nope", None, None))
-            )
-            check("HTTP %d raises Unreachable (rate-limit/auth shape)" % code, False)
-        except Unreachable:
-            check("HTTP %d raises Unreachable (rate-limit/auth shape)" % code, True)
-        except Drift:
-            check("HTTP %d raises Unreachable (rate-limit/auth shape)" % code, False)
-
+    # 401 is a permanent refusal (a bad token will not fix itself): raised on the first attempt,
+    # never retried.
+    opener_401, calls_401 = _counting_opener(
+        99, lambda: urllib.error.HTTPError("https://api.github.com/x", 401, "bad credentials", None, None)
+    )
     try:
-        fetch_required_contexts(
-            "/x", opener=_raises(urllib.error.HTTPError("https://api.github.com/x", 404, "missing", None, None))
+        fetch_required_contexts("/x", opener=opener_401, sleep=_no_sleep)
+        check("HTTP 401 raises Unreachable without retrying", False)
+    except Unreachable:
+        check("HTTP 401 raises Unreachable without retrying", calls_401["count"] == 1)
+    except Drift:
+        check("HTTP 401 raises Unreachable without retrying", False)
+
+    # 403, 429 and every 5xx read as transient and are retried up to MAX_ATTEMPTS times before
+    # giving up. 500 is named explicitly, not just folded into the loop, because it is the exact
+    # case kin#1456's review paused on: measured as Drift before this fix, which would have
+    # stopped a required context on a GitHub-side blip rather than skipped past it.
+    for code in (403, 429, 500, 502, 503, 504):
+        opener_x, calls_x = _counting_opener(
+            99, lambda code=code: urllib.error.HTTPError("https://api.github.com/x", code, "nope", None, None)
         )
-        check("a 404 on the named path raises Drift, not Unreachable (the path itself is wrong)", False)
+        try:
+            fetch_required_contexts("/x", opener=opener_x, sleep=_no_sleep)
+            check("HTTP %d raises Unreachable after retrying, not Drift" % code, False)
+        except Unreachable:
+            check("HTTP %d raises Unreachable after retrying, not Drift" % code,
+                  calls_x["count"] == MAX_ATTEMPTS)
+        except Drift:
+            check("HTTP %d raises Unreachable after retrying, not Drift" % code, False)
+
+    # A transient failure that clears within the retry budget returns the real answer instead of
+    # raising at all: retry exists to recover a genuine transient blip, not just to spend time
+    # before giving up.
+    opener_recovers, calls_recovers = _counting_opener(
+        2, lambda: urllib.error.HTTPError("https://api.github.com/x", 503, "unavailable", None, None)
+    )
+    fetched_after_retry = fetch_required_contexts("/x", opener=opener_recovers, sleep=_no_sleep)
+    check("a 503 that clears within the retry budget still returns the real answer",
+          fetched_after_retry == REAL_LIVE_SEVEN and calls_recovers["count"] == 3)
+
+    # 404 is also never retried: retrying a wrong path cannot make it right, so it is raised (as
+    # Drift, not Unreachable, since the path itself is the doc's own claim) on the first attempt.
+    opener_404, calls_404 = _counting_opener(
+        99, lambda: urllib.error.HTTPError("https://api.github.com/x", 404, "missing", None, None)
+    )
+    try:
+        fetch_required_contexts("/x", opener=opener_404, sleep=_no_sleep)
+        check("a 404 on the named path raises Drift without retrying (the path itself is wrong)", False)
     except Drift:
-        check("a 404 on the named path raises Drift, not Unreachable (the path itself is wrong)", True)
+        check("a 404 on the named path raises Drift without retrying (the path itself is wrong)",
+              calls_404["count"] == 1)
     except Unreachable:
-        check("a 404 on the named path raises Drift, not Unreachable (the path itself is wrong)", False)
+        check("a 404 on the named path raises Drift without retrying (the path itself is wrong)", False)
 
     try:
-        fetch_required_contexts("/x", opener=_returns([{"type": "deletion"}, {"type": "pull_request"}]))
+        fetch_required_contexts("/x", opener=_returns([{"type": "deletion"}, {"type": "pull_request"}]),
+                                 sleep=_no_sleep)
         check("a response with no required_status_checks rule raises Drift, not empty agreement", False)
     except Drift:
         check("a response with no required_status_checks rule raises Drift, not empty agreement", True)
@@ -418,8 +527,7 @@ def self_test():
           any("Umpteen" in p for p in unknown_word))
 
     # run(): end-to-end, still fully offline
-    exit_code, lines = run.__wrapped__(REGRESSION_DOC_TEXT_SIX, None, _returns(REAL_RULES_PAYLOAD)) \
-        if hasattr(run, "__wrapped__") else _run_on_text(REGRESSION_DOC_TEXT_SIX, _returns(REAL_RULES_PAYLOAD))
+    exit_code, lines = _run_on_text(REGRESSION_DOC_TEXT_SIX, _returns(REAL_RULES_PAYLOAD))
     check("THE REGRESSION: six-name doc vs real seven-name live goes red (exit 1)", exit_code == 1)
     check("THE REGRESSION: red output names the missing context",
           any("MCP surface contract" in line for line in lines))
@@ -441,13 +549,15 @@ def self_test():
 
 
 def _run_on_text(text, opener):
-    """run(), but against in-memory text instead of a file on disk (self-test only)."""
+    """run(), but against in-memory text instead of a file on disk (self-test only). Always
+    passes the no-op sleep: every caller here is offline, and a retryable opener must not make
+    --self-test slow."""
     try:
         count_word, api_path, doc_contexts = parse_sentence(text)
     except Drift as exc:
         return 1, ["::error::%s" % exc]
     try:
-        live_contexts = fetch_required_contexts(api_path, opener=opener)
+        live_contexts = fetch_required_contexts(api_path, opener=opener, sleep=_no_sleep)
     except Unreachable as exc:
         return 0, ["::warning::SKIP required-contexts check: %s" % exc, "SKIP: %s" % exc]
     except Drift as exc:
