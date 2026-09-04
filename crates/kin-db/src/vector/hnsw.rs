@@ -29,7 +29,17 @@ const MAX_PRODUCER_TRAILER_BYTES: usize =
 const KVEC_V2_MAGIC: [u8; 4] = *b"KVEC";
 const KVEC_V1_VERSION: u8 = 1;
 const KVEC_V2_VERSION: u32 = 2;
-const KVEC_V2_PREAMBLE_LEN: usize = 64;
+const KVEC_V3_VERSION: u32 = 3;
+/// Oldest magic-prefixed container version this producer binding reads. Version
+/// 1 predates the magic and is detected by its absence.
+const KVEC_MIN_READABLE_VERSION: u32 = KVEC_V2_VERSION;
+/// Newest container version this producer binding reads. A file above it is
+/// refused by name rather than misread.
+const KVEC_MAX_READABLE_VERSION: u32 = KVEC_V3_VERSION;
+/// Preamble length, shared by every magic-prefixed version. kin-vector defines
+/// its v3 constant as its v2 one for the same reason: the fixed fields this
+/// code reads did not move.
+const KVEC_PREAMBLE_LEN: usize = 64;
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 /// Legacy classification is compatibility-only: an attributable index must use
 /// the current streamed v2+trailer format. Bound the exact v1 schema decode so
@@ -111,29 +121,102 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, KinDbError> {
     Ok(u64::from_le_bytes(value))
 }
 
-/// Return the exact end of a v2 kin-vector payload from its fixed preamble.
-fn kvec_v2_payload_end_from_preamble(preamble: &[u8]) -> Result<Option<u64>, KinDbError> {
+/// Where a container version puts its fp32 payload relative to the rest of the
+/// file.
+///
+/// This is the only reason the producer binding reads the container version at
+/// all. KinDB appends its trailer directly after kin-vector's bytes, so it has
+/// to know where those bytes end, and the fixed preamble is the only thing it
+/// reads to find out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvecPayloadPlacement {
+    /// Version 2: the payload block is the last thing in the container, so the
+    /// preamble locates the container's end exactly.
+    LastInContainer,
+    /// Version 3: the payload is the FIRST entry in a table of sections, and a
+    /// container whose squared-norm table is whole carries a second section
+    /// after it, aligned up from the payload's end. That table lives inside the
+    /// MessagePack header, which this crate deliberately does not decode, so the
+    /// preamble locates only a floor.
+    FirstOfSections,
+}
+
+/// Classify a container version, or refuse it by name.
+///
+/// The accepted range and the exactness split are ONE decision here rather than
+/// two, so no version can be admitted without somebody deciding what its
+/// preamble proves. The const block below refuses to compile if the range ever
+/// admits a version this function does not classify.
+///
+/// Verified against kin-vector's own encoders rather than taken from its prose.
+/// `encode_v2` writes `payload_offset + slots * dimensions * 4` bytes and stops.
+/// `encode_v3`, at kin-vector `f772f2cbdc847688bd27bad921c94a2320196d0d`, sizes
+/// its output as the maximum end over its section table, and writes a `SqNorms`
+/// section after `PayloadF32` whenever the norm table is whole. Both write the
+/// same six fields into the first 40 bytes of the preamble, which is what lets
+/// the reads below stay shared.
+const fn kvec_payload_placement(version: u32) -> Option<KvecPayloadPlacement> {
+    match version {
+        KVEC_V2_VERSION => Some(KvecPayloadPlacement::LastInContainer),
+        KVEC_V3_VERSION => Some(KvecPayloadPlacement::FirstOfSections),
+        _ => None,
+    }
+}
+
+const _: () = {
+    let mut version = KVEC_MIN_READABLE_VERSION;
+    while version <= KVEC_MAX_READABLE_VERSION {
+        assert!(
+            kvec_payload_placement(version).is_some(),
+            "every kvec container version inside the readable range must declare whether its \
+             preamble locates the container's end exactly or only a floor"
+        );
+        version += 1;
+    }
+};
+
+/// What a kin-vector container's fixed preamble proves about where it ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvecBaseExtent {
+    /// The container ends exactly here.
+    Exact(u64),
+    /// The container ends at or after here.
+    AtLeast(u64),
+}
+
+impl KvecBaseExtent {
+    /// The smallest container end this preamble allows.
+    fn floor(self) -> u64 {
+        match self {
+            Self::Exact(end) | Self::AtLeast(end) => end,
+        }
+    }
+}
+
+/// Read what a kin-vector container's fixed preamble proves about its extent.
+fn kvec_base_extent_from_preamble(preamble: &[u8]) -> Result<Option<KvecBaseExtent>, KinDbError> {
     if !preamble.starts_with(&KVEC_V2_MAGIC) {
         return Ok(None);
     }
-    if preamble.len() < KVEC_V2_PREAMBLE_LEN {
+    if preamble.len() < KVEC_PREAMBLE_LEN {
         return Err(KinDbError::StorageError(
-            "kvec v2 preamble is truncated".to_string(),
+            "kvec preamble is truncated".to_string(),
         ));
     }
     let mut version = [0u8; 4];
     version.copy_from_slice(&preamble[4..8]);
     let version = u32::from_le_bytes(version);
-    if version != KVEC_V2_VERSION {
-        return Err(KinDbError::StorageError(format!(
-            "unsupported kvec container version {version} for producer binding"
-        )));
-    }
+    let placement = kvec_payload_placement(version).ok_or_else(|| {
+        KinDbError::StorageError(format!(
+            "unsupported kvec container version {version} for producer binding, which reads \
+             {KVEC_MIN_READABLE_VERSION} through {KVEC_MAX_READABLE_VERSION}"
+        ))
+    })?;
     let header_len = read_u64_le(preamble, 8)?;
     let payload_offset = read_u64_le(preamble, 16)?;
     let slots = read_u64_le(preamble, 24)?;
     let dimensions = read_u64_le(preamble, 32)?;
-    let header_end = (KVEC_V2_PREAMBLE_LEN as u64)
+    let header_end = (KVEC_PREAMBLE_LEN as u64)
         .checked_add(header_len)
         .ok_or_else(|| KinDbError::StorageError("kvec header extent overflows".to_string()))?;
     if payload_offset < header_end {
@@ -148,24 +231,62 @@ fn kvec_v2_payload_end_from_preamble(preamble: &[u8]) -> Result<Option<u64>, Kin
     let payload_end = payload_offset
         .checked_add(payload_len)
         .ok_or_else(|| KinDbError::StorageError("kvec payload extent overflows".to_string()))?;
-    Ok(Some(payload_end))
+    Ok(Some(match placement {
+        KvecPayloadPlacement::LastInContainer => KvecBaseExtent::Exact(payload_end),
+        KvecPayloadPlacement::FirstOfSections => KvecBaseExtent::AtLeast(payload_end),
+    }))
 }
 
-/// Return the exact end of a v2 kin-vector payload, before KinDB's trailer.
-fn kvec_v2_payload_end(bytes: &[u8]) -> Result<Option<usize>, KinDbError> {
+/// Read what complete `.kvec` bytes prove about the kin-vector container in
+/// them, before KinDB's trailer.
+fn kvec_base_extent(bytes: &[u8]) -> Result<Option<KvecBaseExtent>, KinDbError> {
     if !bytes.starts_with(&KVEC_V2_MAGIC) {
         return Ok(None);
     }
-    let payload_end = kvec_v2_payload_end_from_preamble(bytes)?.expect("v2 magic was checked");
-    let payload_end = usize::try_from(payload_end).map_err(|_| {
+    let extent = kvec_base_extent_from_preamble(bytes)?.expect("kvec magic was checked");
+    let floor = usize::try_from(extent.floor()).map_err(|_| {
         KinDbError::StorageError("kvec payload extent does not fit usize".to_string())
     })?;
-    if payload_end > bytes.len() {
+    if floor > bytes.len() {
         return Err(KinDbError::StorageError(
             "kvec payload extends beyond available bytes".to_string(),
         ));
     }
-    Ok(Some(payload_end))
+    Ok(Some(extent))
+}
+
+/// Decide whether an artifact carries a producer trailer at all.
+///
+/// A v2 preamble settles it alone: the container either fills the artifact or
+/// something was appended to it. A v3 preamble cannot, because the container
+/// runs past its payload by a section table this crate does not decode, so the
+/// trailer's own end magic is what says whether one is there.
+fn artifact_carries_producer_trailer(
+    extent: KvecBaseExtent,
+    total_len: u64,
+    ends_with_end_magic: impl FnOnce() -> Result<bool, KinDbError>,
+) -> Result<bool, KinDbError> {
+    match extent {
+        KvecBaseExtent::Exact(end) => Ok(end != total_len),
+        KvecBaseExtent::AtLeast(_) => ends_with_end_magic(),
+    }
+}
+
+/// Confirm a trailer beginning at `start` agrees with what the preamble proved,
+/// and return the container extent that implies.
+fn producer_trailer_start_within_extent(
+    extent: KvecBaseExtent,
+    start: u64,
+) -> Result<u64, KinDbError> {
+    match extent {
+        KvecBaseExtent::Exact(end) if start != end => Err(KinDbError::StorageError(
+            "vector producer trailer does not begin at the exact kvec payload end".to_string(),
+        )),
+        KvecBaseExtent::AtLeast(floor) if start < floor => Err(KinDbError::StorageError(
+            "vector producer trailer begins inside the kvec payload".to_string(),
+        )),
+        _ => Ok(start),
+    }
 }
 
 fn validate_legacy_kvec_reader<R: Read + Seek>(
@@ -215,14 +336,17 @@ fn validate_legacy_kvec_bytes(bytes: &[u8]) -> Result<(), KinDbError> {
 fn parse_producer_trailer_from_bytes(
     bytes: &[u8],
 ) -> Result<Option<ParsedProducerTrailer>, KinDbError> {
-    let Some(base_end) = kvec_v2_payload_end(bytes)? else {
+    let Some(extent) = kvec_base_extent(bytes)? else {
         validate_legacy_kvec_bytes(bytes)?;
         return Ok(None);
     };
-    if base_end == bytes.len() {
+    if !artifact_carries_producer_trailer(extent, bytes.len() as u64, || {
+        Ok(bytes.ends_with(&PRODUCER_TRAILER_END_MAGIC))
+    })? {
         return Ok(None);
     }
-    let minimum_current_len = base_end.checked_add(32 + 8 + 8).ok_or_else(|| {
+    let floor = usize::try_from(extent.floor()).expect("kvec_base_extent bounded the floor");
+    let minimum_current_len = floor.checked_add(32 + 8 + 8).ok_or_else(|| {
         KinDbError::StorageError("vector producer trailer extent overflows".to_string())
     })?;
     if bytes.len() < minimum_current_len || !bytes.ends_with(&PRODUCER_TRAILER_END_MAGIC) {
@@ -248,15 +372,11 @@ fn parse_producer_trailer_from_bytes(
             "vector producer trailer length exceeds the index bytes".to_string(),
         )
     })?;
-    if unsigned_start != base_end {
-        return Err(KinDbError::StorageError(
-            "vector producer trailer does not begin at the exact kvec payload end".to_string(),
-        ));
-    }
+    let base_end = producer_trailer_start_within_extent(extent, unsigned_start as u64)?;
     let unsigned = bytes[unsigned_start..digest_start].to_vec();
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&bytes[digest_start..unsigned_len_start]);
-    parse_unsigned_producer_trailer(unsigned, digest, base_end as u64).map(Some)
+    parse_unsigned_producer_trailer(unsigned, digest, base_end).map(Some)
 }
 
 fn parse_unsigned_producer_trailer(
@@ -322,13 +442,20 @@ pub(crate) fn bind_vector_index_producers_to_bytes(
     base_index: &[u8],
     producers: &EmbeddingProducerSet,
 ) -> Result<Vec<u8>, KinDbError> {
-    if kvec_v2_payload_end(base_index)? != Some(base_index.len()) {
-        return Err(KinDbError::StorageError(
-            "producer binding requires one exact raw kvec v2 base".to_string(),
-        ));
-    }
     let base_len = u64::try_from(base_index.len())
         .map_err(|_| KinDbError::StorageError("kvec base length exceeds u64".to_string()))?;
+    let acceptable = match kvec_base_extent(base_index)? {
+        Some(KvecBaseExtent::Exact(end)) => end == base_len,
+        Some(KvecBaseExtent::AtLeast(floor)) => {
+            floor <= base_len && !base_index.ends_with(&PRODUCER_TRAILER_END_MAGIC)
+        }
+        None => false,
+    };
+    if !acceptable {
+        return Err(KinDbError::StorageError(
+            "producer binding requires one raw kvec base with no trailer of its own".to_string(),
+        ));
+    }
     let unsigned = encode_unsigned_producer_trailer(base_len, producers)?;
     let digest = producer_binding_digest(base_index, &unsigned);
     let unsigned_len = u64::try_from(unsigned.len()).expect("bounded trailer length fits u64");
@@ -368,7 +495,10 @@ fn decode_vector_index_producers(bytes: &[u8]) -> Result<VectorProducerProvenanc
     }
 }
 
-fn read_kvec_v2_base_extent(file: &mut File, file_len: u64) -> Result<Option<u64>, KinDbError> {
+fn read_kvec_base_extent(
+    file: &mut File,
+    file_len: u64,
+) -> Result<Option<KvecBaseExtent>, KinDbError> {
     file.seek(SeekFrom::Start(0)).map_err(|error| {
         KinDbError::StorageError(format!("failed to seek vector index preamble: {error}"))
     })?;
@@ -382,23 +512,44 @@ fn read_kvec_v2_base_extent(file: &mut File, file_len: u64) -> Result<Option<u64
     if magic != KVEC_V2_MAGIC {
         return Ok(None);
     }
-    if file_len < KVEC_V2_PREAMBLE_LEN as u64 {
+    if file_len < KVEC_PREAMBLE_LEN as u64 {
         return Err(KinDbError::StorageError(
-            "kvec v2 preamble is truncated".to_string(),
+            "kvec preamble is truncated".to_string(),
         ));
     }
-    let mut preamble = [0u8; KVEC_V2_PREAMBLE_LEN];
+    let mut preamble = [0u8; KVEC_PREAMBLE_LEN];
     preamble[..4].copy_from_slice(&magic);
     file.read_exact(&mut preamble[4..]).map_err(|error| {
         KinDbError::StorageError(format!("failed to read vector index preamble: {error}"))
     })?;
-    let base_end = kvec_v2_payload_end_from_preamble(&preamble)?.expect("v2 magic was checked");
-    if base_end > file_len {
+    let extent = kvec_base_extent_from_preamble(&preamble)?.expect("kvec magic was checked");
+    if extent.floor() > file_len {
         return Err(KinDbError::StorageError(
             "kvec payload extends beyond available bytes".to_string(),
         ));
     }
-    Ok(Some(base_end))
+    Ok(Some(extent))
+}
+
+/// Whether the artifact's last eight bytes are the producer trailer's end magic.
+fn file_ends_with_producer_end_magic(file: &mut File, file_len: u64) -> Result<bool, KinDbError> {
+    let magic_len = PRODUCER_TRAILER_END_MAGIC.len() as u64;
+    if file_len < magic_len {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-(magic_len as i64)))
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to seek vector producer trailer footer: {error}"
+            ))
+        })?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to read vector producer trailer footer: {error}"
+        ))
+    })?;
+    Ok(magic == PRODUCER_TRAILER_END_MAGIC)
 }
 
 fn parse_producer_trailer_from_file(
@@ -408,14 +559,17 @@ fn parse_producer_trailer_from_file(
         .metadata()
         .map_err(|error| KinDbError::StorageError(format!("failed to stat vector index: {error}")))?
         .len();
-    let Some(base_end) = read_kvec_v2_base_extent(file, file_len)? else {
+    let Some(extent) = read_kvec_base_extent(file, file_len)? else {
         validate_legacy_kvec_reader(file, file_len)?;
         return Ok(None);
     };
-    if base_end == file_len {
+    if !artifact_carries_producer_trailer(extent, file_len, || {
+        file_ends_with_producer_end_magic(file, file_len)
+    })? {
         return Ok(None);
     }
-    let minimum_current_len = base_end
+    let minimum_current_len = extent
+        .floor()
         .checked_add(PRODUCER_TRAILER_FIXED_UNSIGNED_BYTES as u64)
         .and_then(|length| length.checked_add(32 + 8 + 8))
         .ok_or_else(|| {
@@ -464,11 +618,7 @@ fn parse_producer_trailer_from_file(
             "vector producer trailer length exceeds the index bytes".to_string(),
         )
     })?;
-    if unsigned_start != base_end {
-        return Err(KinDbError::StorageError(
-            "vector producer trailer does not begin at the exact kvec payload end".to_string(),
-        ));
-    }
+    let base_end = producer_trailer_start_within_extent(extent, unsigned_start)?;
     let unsigned_len = usize::try_from(unsigned_len).expect("bounded trailer length fits usize");
     let mut unsigned = vec![0u8; unsigned_len];
     file.seek(SeekFrom::Start(unsigned_start))
@@ -580,9 +730,22 @@ fn append_vector_index_producer_trailer(
             ))
         })?
         .len();
-    if read_kvec_v2_base_extent(&mut file, base_len)? != Some(base_len) {
+    // The staged file is exactly what kin-vector just wrote to a process-private
+    // path, so its length IS the container's. What has to be refused here is a
+    // truncated base, or one that already carries a trailer. A v2 preamble
+    // proves both on its own, because its payload ends the container. A v3
+    // preamble proves only the floor, so the trailer's own end magic answers the
+    // second half.
+    let acceptable = match read_kvec_base_extent(&mut file, base_len)? {
+        Some(KvecBaseExtent::Exact(end)) => end == base_len,
+        Some(KvecBaseExtent::AtLeast(floor)) => {
+            floor <= base_len && !file_ends_with_producer_end_magic(&mut file, base_len)?
+        }
+        None => false,
+    };
+    if !acceptable {
         return Err(KinDbError::StorageError(
-            "producer binding requires one exact raw kvec v2 base".to_string(),
+            "producer binding requires one raw kvec base with no trailer of its own".to_string(),
         ));
     }
     let unsigned = encode_unsigned_producer_trailer(base_len, producers)?;
@@ -1443,6 +1606,276 @@ mod tests {
         bytes
     }
 
+    /// The exact end of a version 2 container, asserting on the way through
+    /// that v2 still claims exactness.
+    ///
+    /// The split between an exact extent and a floor is the whole subject of the
+    /// version 3 tests below, so every version 2 fixture in this module pins its
+    /// own side of it rather than reading a bare number.
+    fn exact_v2_base_end(bytes: &[u8]) -> usize {
+        match kvec_base_extent(bytes).unwrap().unwrap() {
+            KvecBaseExtent::Exact(end) => usize::try_from(end).unwrap(),
+            KvecBaseExtent::AtLeast(floor) => {
+                panic!("a v2 preamble must locate the container end exactly, got a floor {floor}")
+            }
+        }
+    }
+
+    fn align_up_u64(value: u64, align: u64) -> u64 {
+        value.div_ceil(align) * align
+    }
+
+    /// Bytes shaped exactly like a kin-vector version 3 container.
+    ///
+    /// kin-db pins kin-vector 0.1.12, which has no version 3 writer, so a
+    /// synthetic container is the only way this repo can exercise the shape its
+    /// own producer binding has to survive. That is the point of the fixture
+    /// rather than a weakness of it: two repos each hold half of this invariant
+    /// and neither builds against the other's change, so the half that lives
+    /// here gets a guard here.
+    ///
+    /// The layout is taken from kin-vector's `encode_v3` at
+    /// `f772f2cbdc847688bd27bad921c94a2320196d0d`, read rather than assumed: a
+    /// 64-byte preamble whose first 40 bytes mean what version 2's mean, an
+    /// opaque MessagePack header, then a table of sections of which the fp32
+    /// payload is the FIRST and a whole squared-norm table is the last, each
+    /// section starting on a 64-byte boundary. Nothing in KinDB's producer
+    /// binding decodes that header, so filler bytes are the same input to this
+    /// code as a real header.
+    ///
+    /// A `norm_nodes` of zero writes no norm section, which is what `encode_v3`
+    /// does when the norm table is not whole.
+    fn synthetic_v3_container(slots: u64, dimensions: u64, norm_nodes: u64) -> Vec<u8> {
+        const SECTION_ALIGN: u64 = 64;
+        let header_len: u64 = 96;
+        let first_offset = align_up_u64(KVEC_PREAMBLE_LEN as u64 + header_len, SECTION_ALIGN);
+        let payload_end = first_offset + slots * dimensions * 4;
+        let total = if norm_nodes > 0 {
+            align_up_u64(payload_end, SECTION_ALIGN) + norm_nodes * 4
+        } else {
+            payload_end
+        };
+
+        let mut bytes = vec![0u8; usize::try_from(total).unwrap()];
+        // Everything past the preamble gets a ramp rather than zeroes, so a
+        // reader that lands on the wrong offset reads visibly wrong bytes
+        // instead of a plausible run of nulls. Consecutive ramp bytes differ by
+        // one, so no run of it can spell the trailer's end magic.
+        for (index, byte) in bytes.iter_mut().enumerate().skip(KVEC_PREAMBLE_LEN) {
+            *byte = (index % 251) as u8;
+        }
+        bytes[0..4].copy_from_slice(&KVEC_V2_MAGIC);
+        bytes[4..8].copy_from_slice(&KVEC_V3_VERSION.to_le_bytes());
+        bytes[8..16].copy_from_slice(&header_len.to_le_bytes());
+        bytes[16..24].copy_from_slice(&first_offset.to_le_bytes());
+        bytes[24..32].copy_from_slice(&slots.to_le_bytes());
+        bytes[32..40].copy_from_slice(&dimensions.to_le_bytes());
+        bytes
+    }
+
+    fn every_producer() -> EmbeddingProducerSet {
+        let mut set = EmbeddingProducerSet::new();
+        for producer in [
+            EmbeddingProducer::Cpu,
+            EmbeddingProducer::Metal,
+            EmbeddingProducer::Cuda,
+            EmbeddingProducer::Remote,
+            EmbeddingProducer::Unspecified,
+        ] {
+            set.insert(producer);
+        }
+        set
+    }
+
+    /// A version 3 container binds and reads its producer trailer, through both
+    /// the byte path and the file path.
+    ///
+    /// This is the half of FIR-3150's invariant that lives in kin-db. The
+    /// observed production failure was `unsupported kvec container version 3 for
+    /// producer binding` on an ordinary embed against a store a `save()` had
+    /// promoted to version 3, and widening the version alone would not have
+    /// fixed it: the container runs past its payload, so every caller that read
+    /// the payload end as the container end would have refused the same file
+    /// with a different message.
+    #[test]
+    fn a_version_three_container_binds_and_reads_its_producer_trailer() {
+        let container = synthetic_v3_container(3, 4, 3);
+        let extent = kvec_base_extent(&container).unwrap().unwrap();
+        let floor = match extent {
+            KvecBaseExtent::AtLeast(floor) => floor,
+            KvecBaseExtent::Exact(end) => {
+                panic!("a v3 preamble cannot locate the container end exactly, got {end}")
+            }
+        };
+        assert!(
+            floor < container.len() as u64,
+            "the fixture must carry a section after its payload or this proves nothing about v3: \
+             floor {floor}, length {}",
+            container.len()
+        );
+
+        // A bare version 3 container carries no producer evidence and has to say
+        // so, rather than reading its own norm section as a truncated trailer.
+        assert!(matches!(
+            VectorIndex::producer_provenance_from_bytes(&container).unwrap(),
+            VectorProducerProvenance::UnknownLegacy { .. }
+        ));
+
+        let mut producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+        producers.insert(EmbeddingProducer::Metal);
+        let bound = bind_vector_index_producers_to_bytes(&container, &producers).unwrap();
+        assert_eq!(
+            VectorIndex::producer_provenance_from_bytes(&bound).unwrap(),
+            VectorProducerProvenance::Known(producers.clone())
+        );
+
+        // The same shape through the file path, which is the caller that
+        // produced the observed failure.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3-container.kvec");
+        std::fs::write(&path, &container).unwrap();
+        assert!(matches!(
+            VectorIndex::producer_provenance_from_path(&path).unwrap(),
+            VectorProducerProvenance::UnknownLegacy { .. }
+        ));
+        append_vector_index_producer_trailer(&path, &producers).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bound,
+            "the file binder and the byte binder must agree on a v3 base"
+        );
+        assert_eq!(
+            VectorIndex::producer_provenance_from_path(&path).unwrap(),
+            VectorProducerProvenance::Known(producers.clone())
+        );
+
+        // Binding again must refuse rather than stack a second trailer on the
+        // first. A version 2 base proves it is unbound from its preamble alone,
+        // because its payload ends the container. A version 3 base has only the
+        // trailer's own end magic to prove it with.
+        for error in [
+            append_vector_index_producer_trailer(&path, &producers)
+                .expect_err("an already bound v3 base must refuse a second trailer"),
+            bind_vector_index_producers_to_bytes(&bound, &producers)
+                .expect_err("the byte binder must refuse the same"),
+        ] {
+            assert!(
+                error.to_string().contains("no trailer of its own"),
+                "the refusal must come from the existing-trailer guard: {error}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bound,
+            "a refused second binding must leave the artifact untouched"
+        );
+    }
+
+    /// `encode_v3` writes no norm section when the norm table is not whole, so
+    /// that container really does end at its payload. The floor is then the
+    /// exact end, and the reader must still treat the artifact as bare.
+    #[test]
+    fn a_version_three_container_with_no_norm_section_ends_at_its_payload() {
+        let container = synthetic_v3_container(3, 4, 0);
+        assert_eq!(
+            kvec_base_extent(&container).unwrap().unwrap(),
+            KvecBaseExtent::AtLeast(container.len() as u64)
+        );
+        assert!(matches!(
+            VectorIndex::producer_provenance_from_bytes(&container).unwrap(),
+            VectorProducerProvenance::UnknownLegacy { .. }
+        ));
+    }
+
+    /// A version outside the readable range is refused by name, so the next
+    /// container bump is loud here rather than silently misread.
+    #[test]
+    fn a_container_version_outside_the_readable_range_is_refused_by_name() {
+        let above = KVEC_MAX_READABLE_VERSION + 1;
+        let mut future = synthetic_v3_container(3, 4, 3);
+        future[4..8].copy_from_slice(&above.to_le_bytes());
+        let error = VectorIndex::producer_provenance_from_bytes(&future)
+            .expect_err("a container above the readable range must fail closed");
+        assert!(
+            error.to_string().contains(&format!(
+                "unsupported kvec container version {above} for producer binding, which reads \
+                 {KVEC_MIN_READABLE_VERSION} through {KVEC_MAX_READABLE_VERSION}"
+            )),
+            "the refusal must name the version it saw and the range it reads: {error}"
+        );
+
+        let mut below = synthetic_v3_container(3, 4, 3);
+        below[4..8].copy_from_slice(&(KVEC_MIN_READABLE_VERSION - 1).to_le_bytes());
+        assert!(VectorIndex::producer_provenance_from_bytes(&below).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future-version.kvec");
+        std::fs::write(&path, &future).unwrap();
+        assert!(VectorIndex::producer_provenance_from_path(&path).is_err());
+
+        // Positive control. The same fixture at a version inside the range is
+        // accepted, so this test cannot pass by refusing everything.
+        assert!(matches!(
+            VectorIndex::producer_provenance_from_bytes(&synthetic_v3_container(3, 4, 3)).unwrap(),
+            VectorProducerProvenance::UnknownLegacy { .. }
+        ));
+    }
+
+    /// The version 3 floor is a real refusal, not a rubber stamp.
+    ///
+    /// Version 2 gets an exact container end from its preamble and refuses a
+    /// trailer that does not begin there. Version 3 can only be given a floor,
+    /// so the floor has to refuse a trailer that begins before it, or the check
+    /// it replaced would be gone rather than weakened.
+    #[test]
+    fn a_version_three_trailer_that_starts_inside_the_payload_is_refused() {
+        let container = synthetic_v3_container(3, 4, 3);
+        let producers = every_producer();
+        let bound = bind_vector_index_producers_to_bytes(&container, &producers).unwrap();
+        assert_eq!(
+            VectorIndex::producer_provenance_from_bytes(&bound).unwrap(),
+            VectorProducerProvenance::Known(producers),
+            "positive control: the untampered fixture must decode"
+        );
+
+        // Move the payload floor four bytes past where the trailer actually
+        // begins. Four is close enough that the trailer's own minimum-length
+        // check still passes, so the floor check is the only thing left that can
+        // refuse this. One f32 per slot makes that offset reachable.
+        let trailer_start = container.len() as u64;
+        let first_offset = read_u64_le(&bound, 16).unwrap();
+        let overlap_floor = trailer_start + 4;
+        assert_eq!(
+            (overlap_floor - first_offset) % 4,
+            0,
+            "the forged slot count has to land on the byte it was chosen for"
+        );
+        let mut overlapping = bound.clone();
+        overlapping[24..32].copy_from_slice(&((overlap_floor - first_offset) / 4).to_le_bytes());
+        overlapping[32..40].copy_from_slice(&1u64.to_le_bytes());
+
+        for (surface, error) in [
+            (
+                "bytes",
+                VectorIndex::producer_provenance_from_bytes(&overlapping)
+                    .expect_err("a trailer beginning inside the payload must fail closed"),
+            ),
+            ("file", {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("overlapping.kvec");
+                std::fs::write(&path, &overlapping).unwrap();
+                VectorIndex::producer_provenance_from_path(&path)
+                    .expect_err("the file path must refuse the same overlap")
+            }),
+        ] {
+            assert!(
+                error.to_string().contains("begins inside the kvec payload"),
+                "the floor check must be what refuses this on the {surface} path, \
+                 not the length check: {error}"
+            );
+        }
+    }
+
     fn genuine_legacy_kvec_bytes(format_version: u8) -> Vec<u8> {
         let graph = kin_vector::HnswGraph::<RetrievalKey> {
             nodes: Vec::new(),
@@ -1818,7 +2251,7 @@ mod tests {
         index.save(&path).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
-        let base_end = kvec_v2_payload_end(&bytes).unwrap().unwrap();
+        let base_end = exact_v2_base_end(&bytes);
         let rebound = bind_vector_index_producers_to_bytes(&bytes[..base_end], &producers).unwrap();
         assert_eq!(bytes, rebound, "save and byte binding must be canonical");
         assert_eq!(
@@ -1930,7 +2363,7 @@ mod tests {
             .unwrap();
         index.save(&path).unwrap();
         let bytes = std::fs::read(path).unwrap();
-        let base_end = kvec_v2_payload_end(&bytes).unwrap().unwrap();
+        let base_end = exact_v2_base_end(&bytes);
 
         assert!(matches!(
             VectorIndex::producer_provenance_from_bytes(&bytes[..base_end]).unwrap(),
@@ -2065,7 +2498,7 @@ mod tests {
             .unwrap();
         index.save(&path).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        let base_end = kvec_v2_payload_end(&bytes).unwrap().unwrap();
+        let base_end = exact_v2_base_end(&bytes);
         let base = &bytes[..base_end];
 
         for (offset, value) in [
