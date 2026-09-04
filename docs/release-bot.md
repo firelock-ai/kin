@@ -169,11 +169,20 @@ gh secret set KIN_STRANGER_ANTHROPIC_API_KEY --repo firelock-ai/kin
 decision, 2026-09-04: "the damn smoke should never block release it is a nice to
 have ONLY ... it should be mainly run locally not in the CI." The ordinary way to
 measure first contact is `bin/kin-stranger` from the umbrella, against the
-candidate archive before a tag or the published npm bytes after one:
+candidate archive before a tag or the published npm bytes after one.
+
+It is two stages and both take the same `--run` id. `prepare` builds or reuses the
+image and creates one container per arm; `run` drives both phases against whichever
+source you name. `run` refuses without a run id, so the one-line form does not work
+and never did. Archive mode also refuses without a candidate sha unless the archive's
+own `.provenance.json` names one, and it refuses AFTER staging the archive into the
+container, so leaving it out costs a prepared run. npm mode needs no sha. The two
+`run` lines below are alternatives, not a sequence:
 
 ```
-bin/kin-stranger run --archive <path>   # the release-candidate bytes
-bin/kin-stranger run --npm <version>    # what a stranger who types the install line gets
+bin/kin-stranger prepare --run <id> --arms green,brown,vcs
+bin/kin-stranger run --run <id> --archive <path> --candidate-sha <sha>   # the candidate bytes
+bin/kin-stranger run --run <id> --npm <version>     # or the published npm bytes instead
 ```
 
 The hosted job in `release-cut.yml` is a convenience that runs the same tool on a

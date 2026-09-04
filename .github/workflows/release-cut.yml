@@ -813,9 +813,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${RECORDED:-}" = true ]; then
-            echo "### First contact measured for \`${CANDIDATE}\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "The three arms completed and the record is on its way to the evidence branch." >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "### First contact measured for \`${CANDIDATE}\`"
+              echo ""
+              echo "The three arms completed and the record is on its way to the evidence branch."
+            } >> "$GITHUB_STEP_SUMMARY"
             echo "::notice::stranger completed for ${CANDIDATE}"
           else
             {
@@ -827,10 +829,13 @@ jobs:
               echo "what a first-time user meets."
               echo ""
               echo "To measure it, run the stranger locally against the archive or the published"
-              echo "npm bytes, which is the ordinary path:"
+              echo "npm bytes, which is the ordinary path. Two stages, both taking the same"
+              echo "\`--run\` id; the two \`run\` lines are alternatives, not a sequence:"
               echo ""
               echo '```'
-              echo "bin/kin-stranger run --npm <version>      # what a stranger who types the install line gets"
+              echo "bin/kin-stranger prepare --run <id> --arms green,brown,vcs"
+              echo "bin/kin-stranger run --run <id> --archive <path> --candidate-sha <sha>   # the candidate bytes"
+              echo "bin/kin-stranger run --run <id> --npm <version>     # or the published npm bytes instead"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::notice::stranger left no record for ${CANDIDATE}; first contact stays pending and nothing is held"
