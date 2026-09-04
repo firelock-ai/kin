@@ -1036,6 +1036,22 @@ jobs:
       - name: Falsify Docker daemon production feature guard
         run: bash scripts/check-docker-daemon-features.test.sh
 
+      # kin#1450 (`app/kin-workflow-pin`) bumped kin-actions to v0.1.34 in
+      # three `uses: firelock-ai/kin-actions/.github/workflows/*.yml@vX.Y.Z`
+      # files; kin#1449 had to move `kin-registry-release.yml`'s own
+      # `KIN_ACTIONS_SHA` pin by hand the same night, because that pin is a
+      # job-level env var feeding an `actions/checkout` `ref:`, not a `uses:`
+      # value, and the bot only ever looks at `uses:`. Nothing graded that
+      # gap before tonight, so it would have drifted again on the next
+      # kin-actions release. This is a pure scanner over `.github/workflows`
+      # with no toolchain and no network, so it belongs beside the two
+      # guards above for the same reason they do.
+      - name: Check kin-actions pin visibility
+        run: python3 scripts/verify-kin-actions-pin-visibility.py
+
+      - name: Falsify kin-actions pin visibility guard
+        run: python3 scripts/falsify-kin-actions-pin-visibility.py
+
       # ADDED here rather than moved out of `check`, for the reason the kin-vfs
       # step below records. `check` carries `github.event_name != 'pull_request'`,
       # so for as long as these two guards ran only there, a pull request could
