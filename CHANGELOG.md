@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-09-04
+
+### Changed
+
+- Declare the daemon's hosted start requirements in --compat-json (#1462)
+- Stop the stranded-stage row calling an unreadable directory clean (FIR-3146) (#1465)
+- Make the zero-file-search guards detect the operation, and retire BOUNDARY_DIRS (FIR-3151, FIR-3149) (#1458)
+
+
 ## [0.6.6] - 2026-09-04
 
 ### Changed
