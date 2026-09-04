@@ -3619,6 +3619,16 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     let refs_overlay_ms = timer.lap_ms();
     drop(lap);
 
+    // Before the replay graph below borrows the snapshot, because collaboration
+    // records are snapshot content and this is the last point the snapshot is
+    // still mutable. The replay graph does not need them: a review note is a
+    // sibling collection of `entities` and `relations`, not an entity, so
+    // nothing admission verifies can see it.
+    let lap = tracing::info_span!("kindb.prepare.collaboration").entered();
+    apply_collaboration(&mut snapshot, transaction)?;
+    let collaboration_ms = timer.lap_ms();
+    drop(lap);
+
     let lap = tracing::info_span!("kindb.prepare.workspace").entered();
     // Every remaining validation reads the same authority-free payload:
     // `changes` is final once admission above returns, and the steps below
@@ -3785,6 +3795,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
             clone_ms,
             admit_ms,
             refs_overlay_ms,
+            collaboration_ms,
             workspace_ms,
             merge_ms,
             admission_verify_ms,
@@ -3802,6 +3813,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
             clone_ms,
             admit_ms,
             refs_overlay_ms,
+            collaboration_ms,
             workspace_ms,
             merge_ms,
             admission_verify_ms,
@@ -3821,6 +3833,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
             ("clone_ms", clone_ms),
             ("admit_ms", admit_ms),
             ("refs_overlay_ms", refs_overlay_ms),
+            ("collaboration_ms", collaboration_ms),
             ("workspace_ms", workspace_ms),
             ("merge_ms", merge_ms),
             ("admission_verify_ms", admission_verify_ms),
@@ -4879,6 +4892,99 @@ fn apply_local_overlay(
 /// happened. Citations the previous record already carried were proven the same
 /// way when they were applied, so they are not rechecked here, which also keeps
 /// this sound across operation-log compaction.
+/// Admit the collaboration records a transaction carries into the successor
+/// snapshot.
+///
+/// `RootBundle::collaboration` is replicated truth and
+/// `has_same_replicated_truth` compares it, but until this existed nothing
+/// could move it through a transaction. `prepare_successor` admitted eight
+/// things and no collaboration domain, so two replicas could complete a
+/// transfer and hold different collaboration roots with nothing erroring. The
+/// collections below are the seventeen `collaboration_root` folds, in fold
+/// order.
+///
+/// # Idempotent by construction, which a transfer needs
+///
+/// A keyed entry replaces whatever is held under its key; an unkeyed one is
+/// admitted only when an identical record is not already present. Applying the
+/// same delta twice therefore lands the same snapshot, which is what lets a
+/// replayed pack report `IdempotentReplay` rather than duplicate a review note.
+/// The delta's own `validate` has already refused a repeated key, so the
+/// upserts here cannot be hiding an ambiguity from the sender.
+///
+/// # Every key travels rather than being re-derived
+///
+/// `contracts` is keyed by `ContractId` while `Contract::id` is an `EntityId`,
+/// and this module derives that key at its own write site. The delta carries
+/// the key the sender used, so the record lands where the sender put it and the
+/// two collaboration roots can actually agree. Re-deriving here would be the
+/// same silent divergence one layer down.
+fn apply_collaboration(
+    snapshot: &mut GraphSnapshot,
+    transaction: &RepositoryTransaction,
+) -> Result<(), KinDbError> {
+    let Some(delta) = &transaction.collaboration_delta else {
+        return Ok(());
+    };
+    delta.validate().map_err(|error| {
+        ModelError::InvalidOperation(format!("invalid collaboration delta: {error}"))
+    })?;
+
+    /// Admit one unkeyed record, skipping one the receiver already holds.
+    fn admit<T: PartialEq + Clone>(into: &mut Vec<T>, records: &[T]) {
+        for record in records {
+            if !into.contains(record) {
+                into.push(record.clone());
+            }
+        }
+    }
+
+    for entry in &delta.work_items {
+        snapshot.work_items.insert(entry.key, entry.value.clone());
+    }
+    for entry in &delta.annotations {
+        snapshot.annotations.insert(entry.key, entry.value.clone());
+    }
+    admit(&mut snapshot.work_links, &delta.work_links);
+    for entry in &delta.reviews {
+        snapshot.reviews.insert(entry.key, entry.value.clone());
+    }
+    for entry in &delta.review_decisions {
+        snapshot
+            .review_decisions
+            .insert(entry.key, entry.value.clone());
+    }
+    admit(&mut snapshot.review_notes, &delta.review_notes);
+    admit(&mut snapshot.review_discussions, &delta.review_discussions);
+    for entry in &delta.review_assignments {
+        snapshot
+            .review_assignments
+            .insert(entry.key, entry.value.clone());
+    }
+    for entry in &delta.test_cases {
+        snapshot.test_cases.insert(entry.key, entry.value.clone());
+    }
+    for entry in &delta.assertions {
+        snapshot.assertions.insert(entry.key, entry.value.clone());
+    }
+    for entry in &delta.verification_runs {
+        snapshot
+            .verification_runs
+            .insert(entry.key, entry.value.clone());
+    }
+    admit(&mut snapshot.mock_hints, &delta.mock_hints);
+    for entry in &delta.contracts {
+        snapshot.contracts.insert(entry.key, entry.value.clone());
+    }
+    for entry in &delta.actors {
+        snapshot.actors.insert(entry.key, entry.value.clone());
+    }
+    admit(&mut snapshot.delegations, &delta.delegations);
+    admit(&mut snapshot.approvals, &delta.approvals);
+    admit(&mut snapshot.audit_events, &delta.audit_events);
+    Ok(())
+}
+
 fn apply_merge_transaction(
     metadata: &mut PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
@@ -9369,6 +9475,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         }
     }
 
@@ -14755,6 +14862,418 @@ mod tests {
             !reopened_source_roots.has_same_replicated_truth(&moved_ref),
             "receiver-local receipt differences must not hide a replicated ref-state move"
         );
+    }
+
+    /// One review and one note on it, fixed in every byte, so two sides can be
+    /// seeded with the same record and a digest comparison means something.
+    ///
+    /// Fixed UUIDs rather than `ReviewId::new()`: that constructor is v4 random,
+    /// and two sides seeded with random ids would fold different collaboration
+    /// roots for a reason that has nothing to do with replication, which is the
+    /// exact confusion this test exists to remove.
+    fn transferred_review_and_note() -> (kin_model::Review, kin_model::ReviewNote) {
+        let review_id = kin_model::ReviewId(Uuid::from_u128(0xc0_11_ab_00));
+        let at = Timestamp(
+            chrono::DateTime::parse_from_rfc3339("2026-09-03T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let author = kin_model::IdentityRef::human("collaboration-source");
+        let review = kin_model::Review {
+            review_id,
+            title: "transferred review".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "topic".to_string(),
+            state: kin_model::ReviewDecisionState::Pending,
+            completion: kin_model::ReviewCompletionState::InReview,
+            created_by: author.clone(),
+            created_at: at.clone(),
+            updated_at: at.clone(),
+            scopes: Vec::new(),
+        };
+        let note = kin_model::ReviewNote {
+            note_id: kin_model::ReviewNoteId(Uuid::from_u128(0xc0_11_ab_01)),
+            review_id,
+            body: "the model calls this replicated truth".to_string(),
+            scope: None,
+            authored_by: author,
+            created_at: at,
+        };
+        (review, note)
+    }
+
+    /// A manager over a store whose graph already holds whatever `shape` wrote.
+    ///
+    /// This exists because there is no other way in. The collaboration domains
+    /// have no transaction door: `RepositoryTransaction` carries seventeen
+    /// fields and not one of them is a collaboration domain, and
+    /// `prepare_successor` admits exactly eight things (external objects,
+    /// changes, aliases, Git authority, ref mutations, the local overlay, the
+    /// workspace and the merge transaction), none of which is collaboration. So
+    /// the record is written through `ReviewStore`, which is the API kin-db
+    /// actually offers for it, the graph is exported, a generation-zero
+    /// authority is folded over those exact contents, and the manager opens on
+    /// the persisted bytes. Every step is the crate's own path; nothing is
+    /// hand-built to make the fold come out a particular way.
+    fn manager_over_graph(
+        backend: Arc<MemoryBackend>,
+        shape: impl FnOnce(&InMemoryGraph),
+    ) -> RepositoryAuthorityManager<MemoryBackend> {
+        let graph = InMemoryGraph::new();
+        shape(&graph);
+        let mut snapshot = graph.to_snapshot();
+        snapshot.repository_authority = Some(
+            PersistedRepositoryAuthority::empty(repository_id(), &snapshot)
+                .expect("a generation-zero authority folds over these contents"),
+        );
+        let bytes = snapshot.to_bytes().expect("the seeded snapshot serializes");
+        backend
+            .save_snapshot(repository_id().as_str(), &bytes, 0)
+            .expect("the seeded snapshot persists");
+        RepositoryAuthorityManager::open(repository_id(), backend).expect("the seeded store opens")
+    }
+
+    /// Seed one store with the review alone, through the real API.
+    ///
+    /// The pair with [`manager_holding_the_note`] differ in the note and in
+    /// nothing else, which is what lets the first control below say the NOTE
+    /// moved the collaboration root rather than the review beside it.
+    fn manager_holding_the_review(
+        backend: Arc<MemoryBackend>,
+    ) -> RepositoryAuthorityManager<MemoryBackend> {
+        let (review, _) = transferred_review_and_note();
+        manager_over_graph(backend, |graph| {
+            use kin_model::ReviewStore;
+            graph.create_review(&review).expect("the review is created");
+        })
+    }
+
+    /// Seed one store with the review and its note, through the real API.
+    ///
+    /// `add_review_note` has no other caller anywhere in this crate. This is
+    /// the door a collaboration record comes in by, and it opens onto nothing
+    /// the commit path can see.
+    fn manager_holding_the_note(
+        backend: Arc<MemoryBackend>,
+    ) -> RepositoryAuthorityManager<MemoryBackend> {
+        let (review, note) = transferred_review_and_note();
+        manager_over_graph(backend, |graph| {
+            use kin_model::ReviewStore;
+            graph.create_review(&review).expect("the review is created");
+            graph.add_review_note(&note).expect("the note is added");
+        })
+    }
+
+    /// Every field a repository transaction carries is either admitted by
+    /// `prepare_successor` or named here as not a mutation, and the list is
+    /// checked against the function's own source.
+    ///
+    /// This is the guard whose absence let the collaboration domain sit
+    /// unreplicated for the whole life of the merge and sealed fields too.
+    /// `prepare_successor` admits an explicit hand-written list. A field the
+    /// transaction grows and that function never learns is SILENTLY INERT:
+    /// every existing test passes, the commit succeeds, the roots recompute,
+    /// and the only symptom is two replicas quietly disagreeing. kin-model
+    /// guards its own field list in eight mirrors behind five deny-by-default
+    /// registries. This crate had no equivalent.
+    ///
+    /// Two independent halves, because each catches what the other cannot.
+    ///
+    /// The ARITY half fails closed on a new field. `RepositoryTransaction`
+    /// serializes positionally, so its own encoding counts its fields, and a
+    /// field added to it without a row below stops this test rather than
+    /// slipping past. Falsify it by adding a field to `RepositoryTransaction`
+    /// in kin-model and not touching this list.
+    ///
+    /// The SOURCE half fails when an admit call leaves `prepare_successor`. The
+    /// arity is unchanged in that case, so nothing above can see it, and the
+    /// hash-shaped guards elsewhere cannot either: the successor is still valid,
+    /// it is just missing what that call would have admitted. Falsify it by
+    /// deleting the `apply_collaboration` call from `prepare_successor`.
+    ///
+    /// The source scan reads this file rather than a copy of it, and asserts it
+    /// found the function at all, because a scan that silently matched nothing
+    /// would report every row as satisfied.
+    #[test]
+    fn prepare_successor_admits_every_mutation_a_transaction_can_carry() {
+        /// Each mutation-bearing field, and the call inside `prepare_successor`
+        /// that admits it.
+        const ADMITTED: [(&str, &str); 10] = [
+            ("external_objects", "admit_external_objects("),
+            ("changes", "admit_changes("),
+            ("aliases", "admit_aliases("),
+            ("git_authority_delta", "apply_git_authority("),
+            ("ref_mutations", "apply_ref_mutations("),
+            ("default_ref_mutation", "apply_ref_mutations("),
+            ("workspace_mutation", "apply_workspace("),
+            ("local_overlay_delta", "apply_local_overlay("),
+            ("collaboration_delta", "apply_collaboration("),
+            ("merge_transaction_delta", "apply_merge_transaction("),
+        ];
+
+        /// Fields that are precondition or identity rather than admitted
+        /// payload, with the reason each one moves no authority by itself.
+        const NOT_A_MUTATION: [(&str, &str); 8] = [
+            (
+                "schema_version",
+                "a version gate, checked by RepositoryTransaction::validate",
+            ),
+            (
+                "operation_id",
+                "the operation's identity, bound into the receipt",
+            ),
+            ("repository_id", "names the repository this may commit to"),
+            ("expected_generation", "a compare-and-swap precondition"),
+            ("expected_roots", "a compare-and-swap precondition"),
+            ("actor", "provenance carried into the operation record"),
+            ("reason", "provenance carried into the operation record"),
+            (
+                "sealed_observation",
+                "binds the admitted content closure and is verified by \
+                 verify_transaction_admission; it qualifies a mutation rather than being one, \
+                 which kin-model states as a_sealed_observation_binds_a_real_mutation_but_is_not \
+                 _one_by_itself",
+            ),
+        ];
+
+        fn messagepack_array_len(bytes: &[u8]) -> usize {
+            match bytes.first() {
+                Some(marker) if (0x90..=0x9f).contains(marker) => usize::from(marker & 0x0f),
+                Some(0xdc) => usize::from(u16::from_be_bytes([bytes[1], bytes[2]])),
+                other => panic!("not a MessagePack array: {other:?}"),
+            }
+        }
+
+        // Every optional tail present, so the encoding counts every field the
+        // type has rather than only the ones this fixture happened to fill.
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let mut complete = arbitrary_repository_transaction(&manager);
+        complete.collaboration_delta = Some(transferred_collaboration_delta());
+        assert!(
+            complete.merge_transaction_delta.is_some()
+                || complete.sealed_observation.is_some()
+                || complete.collaboration_delta.is_some(),
+            "the fixture must occupy the last tail slot, or the arity below undercounts"
+        );
+        let arity = messagepack_array_len(&rmp_serde::to_vec(&complete).unwrap());
+
+        assert_eq!(
+            arity,
+            ADMITTED.len() + NOT_A_MUTATION.len(),
+            "RepositoryTransaction carries {arity} fields and this test accounts for {}. \
+             prepare_successor admits an explicit list and NOTHING fails when the two disagree, \
+             which is exactly how the collaboration domain stayed unreplicated. Add the field to \
+             ADMITTED with the call that admits it, or to NOT_A_MUTATION with the reason.",
+            ADMITTED.len() + NOT_A_MUTATION.len()
+        );
+
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/repository.rs"),
+        )
+        .expect("this file must be readable; the scan below is worthless without it");
+        let start = source
+            .find("fn prepare_successor<B: StorageBackend + ?Sized>(")
+            .expect(
+                "prepare_successor was not found in this file, so the scan matched nothing and \
+                 would have reported every row below as satisfied",
+            );
+        let body = &source[start..];
+        let end = body
+            .find("\nfn ")
+            .expect("prepare_successor must be followed by another top-level fn");
+        let body = &body[..end];
+        assert!(
+            body.contains("let mut snapshot = current.snapshot.clone();"),
+            "the extracted span does not look like prepare_successor's body, so the scan is \
+             reading the wrong text"
+        );
+
+        for (field, call) in ADMITTED {
+            assert!(
+                body.contains(call),
+                "`{field}` is admitted by `{call}` according to this list, but that call is not in \
+                 prepare_successor's body. Either it was removed, in which case `{field}` is now \
+                 silently inert, or it was renamed and this row must follow it."
+            );
+        }
+    }
+
+    /// A review note reaches a second replica, because the transaction that
+    /// moves the authority now carries it.
+    ///
+    /// This test landed RED and ignored, as
+    /// `a_review_note_on_one_side_is_replicated_truth_the_other_never_receives`
+    /// in kin-db #292, and the name is worth keeping findable: it recorded that
+    /// `RootBundle::collaboration` is documented "Replicated collaboration
+    /// authority" and compared by `has_same_replicated_truth`, while nothing
+    /// replicated it. `RepositoryTransaction` had no collaboration domain,
+    /// `prepare_successor` admitted none, and `add_review_note` had no call
+    /// site anywhere in this crate, so a review note entered a store through a
+    /// door the commit path did not know existed and left by no door at all.
+    ///
+    /// **Why the existing guard did not catch it.**
+    /// `equivalent_receivers_reopen_with_the_same_replicated_truth` above
+    /// asserts `source_roots.collaboration == receiver_roots.collaboration`
+    /// inside a test where neither side ever writes a collaboration record. It
+    /// was an empty fold compared against an empty fold: it passed for the same
+    /// reason `0 == 0` passes, and would have kept passing if the collaboration
+    /// root were deleted from the bundle entirely.
+    ///
+    /// **The controls, because a comparison that cannot report DIFFER is not
+    /// evidence.** Four now, three of them from the red version and the fourth
+    /// only askable once a delta existed:
+    ///
+    /// - the note must MOVE the collaboration root. Without this the equality
+    ///   at the end could hold for reasons unrelated to the note.
+    /// - two sides that BOTH hold the note must agree on every replicated root,
+    ///   so the final assertion is a claim about replication rather than an
+    ///   unsatisfiable one about the seed.
+    /// - a transaction carrying NO collaboration delta must leave the
+    ///   collaboration root exactly where it found it, which is what makes the
+    ///   delta the thing that moved it below rather than some side effect of
+    ///   committing at all.
+    /// - the same delta applied twice must land the same root. A transfer
+    ///   reports `IdempotentReplay` for a pack it has already applied, so a
+    ///   replayed pack has to be a no-op rather than a second copy of every
+    ///   record it carries.
+    ///
+    /// **What closed it.** kin-model gained `RepositoryTransaction::collaboration_delta`
+    /// carrying the seventeen collections `collaboration_root` folds, and
+    /// `apply_collaboration` above admits them into the successor snapshot. The
+    /// receiver below applies exactly the transferred authority the source
+    /// applied, which is the whole vocabulary a transfer has, and that
+    /// vocabulary now includes the note.
+    #[test]
+    fn a_review_note_reaches_a_receiver_because_the_transaction_carries_it() {
+        // Control one: the collaboration root is sensitive to the note itself.
+        // The two stores differ in the note and in nothing else, so this cannot
+        // pass on the review that carries it.
+        let carrying = manager_holding_the_note(Arc::new(MemoryBackend::default()));
+        let without = manager_holding_the_review(Arc::new(MemoryBackend::default()));
+        assert_ne!(
+            carrying.read_authority().roots().collaboration,
+            without.read_authority().roots().collaboration,
+            "a review note must move the collaboration root, or nothing below means anything"
+        );
+        drop(carrying);
+        drop(without);
+
+        // Control two: agreement is reachable. Both sides hold the same note and
+        // both apply the same transferred authority.
+        let agreeing_source = manager_holding_the_note(Arc::new(MemoryBackend::default()));
+        let agreeing_receiver = manager_holding_the_note(Arc::new(MemoryBackend::default()));
+        agreeing_source
+            .commit_repository_transaction(receiver_ref_transaction(
+                &agreeing_source,
+                0xfb01,
+                "collaboration-source",
+            ))
+            .unwrap();
+        agreeing_receiver
+            .commit_repository_transaction(receiver_ref_transaction(
+                &agreeing_receiver,
+                0xfb02,
+                "collaboration-destination",
+            ))
+            .unwrap();
+        let agreeing_source_roots = agreeing_source.read_authority().roots().clone();
+        let agreeing_receiver_roots = agreeing_receiver.read_authority().roots().clone();
+        assert_eq!(
+            agreeing_source_roots.collaboration, agreeing_receiver_roots.collaboration,
+            "two sides holding the same note must fold the same collaboration root"
+        );
+        assert!(
+            agreeing_source_roots.has_same_replicated_truth(&agreeing_receiver_roots),
+            "two sides holding the same note must agree on replicated truth"
+        );
+
+        // Control three: the richest transaction this module can build moves the
+        // replicated history and ref roots and leaves collaboration exactly where
+        // it found it. This is the runnable half of "no transaction carries it".
+        let commuter = initial_manager(Arc::new(MemoryBackend::default()));
+        let before = commuter.read_authority().roots().clone();
+        commuter
+            .commit_repository_transaction(arbitrary_repository_transaction(&commuter))
+            .unwrap();
+        let after = commuter.read_authority().roots().clone();
+        assert_ne!(before.history, after.history, "the fixture commits changes");
+        assert_ne!(before.ref_state, after.ref_state, "the fixture moves a ref");
+        assert_eq!(
+            before.collaboration, after.collaboration,
+            "a transaction carrying no collaboration delta must leave the collaboration root \
+             exactly where it found it, or the delta is not what moves it and the claim below \
+             proves nothing about the delta"
+        );
+
+        // The claim. The source holds the note. The receiver applies exactly the
+        // transferred authority the source applied, which is the whole vocabulary
+        // a transfer has, and ends up without it.
+        let source = manager_holding_the_note(Arc::new(MemoryBackend::default()));
+        let receiver = manager_over_graph(Arc::new(MemoryBackend::default()), |_| {});
+        source
+            .commit_repository_transaction(receiver_ref_transaction(
+                &source,
+                0xfb03,
+                "collaboration-source",
+            ))
+            .unwrap();
+        let mut receiving =
+            receiver_ref_transaction(&receiver, 0xfb04, "collaboration-destination");
+        receiving.collaboration_delta = Some(transferred_collaboration_delta());
+        receiver.commit_repository_transaction(receiving).unwrap();
+
+        let source_roots = source.read_authority().roots().clone();
+        let receiver_roots = receiver.read_authority().roots().clone();
+
+        // Every other replicated root already agrees, so collaboration is the one
+        // root left that could disagree, and a failure below has exactly one cause.
+        assert_eq!(source_roots.history, receiver_roots.history);
+        assert_eq!(source_roots.ref_state, receiver_roots.ref_state);
+        assert_eq!(source_roots.replication, receiver_roots.replication);
+        assert_eq!(
+            source_roots.collaboration, receiver_roots.collaboration,
+            "`RootBundle` documents `collaboration` as replicated authority and \
+             `has_same_replicated_truth` compares it, so a receiver that applied the \
+             source's transferred authority must hold the source's review note"
+        );
+        assert!(
+            source_roots.has_same_replicated_truth(&receiver_roots),
+            "a root the model calls replicated must actually replicate"
+        );
+
+        // Control four, which only became askable once the delta existed: a
+        // replayed pack must be a no-op rather than a duplicate. A transfer
+        // reports `IdempotentReplay` for a pack it has already applied, so
+        // applying the same collaboration delta twice has to land the same
+        // collaboration root. An `admit` that pushed unconditionally would
+        // duplicate the note here and move the root a second time.
+        // Deliberately a transaction whose ONLY mutation is the collaboration
+        // delta. It replays the delta without re-creating a ref, and it proves
+        // a second thing on the way: collaboration alone counts as a mutation,
+        // so a pack carrying nothing but review notes is a transaction the
+        // model will accept rather than refuse as empty.
+        let mut replayed = transaction_shell(&receiver, 0xfb05);
+        replayed.actor = AuthorId::new("collaboration-destination");
+        replayed.reason = "replay the same collaboration delta".to_string();
+        replayed.collaboration_delta = Some(transferred_collaboration_delta());
+        receiver.commit_repository_transaction(replayed).unwrap();
+        assert_eq!(
+            receiver.read_authority().roots().collaboration,
+            receiver_roots.collaboration,
+            "applying the same collaboration delta twice moved the collaboration root, so a \
+             replayed transfer pack duplicates every record it carries"
+        );
+    }
+
+    /// The review and note from [`transferred_review_and_note`], in the form a
+    /// transaction carries them.
+    fn transferred_collaboration_delta() -> kin_model::CollaborationDelta {
+        let (review, note) = transferred_review_and_note();
+        kin_model::CollaborationDelta {
+            reviews: vec![kin_model::Keyed::new(review.review_id, review)],
+            review_notes: vec![note],
+            ..kin_model::CollaborationDelta::default()
+        }
     }
 
     #[test]
@@ -22094,6 +22613,7 @@ mod replaywall_measurements {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         }
     }
 
@@ -22216,6 +22736,7 @@ mod replaywall_measurements {
                 local_overlay_delta: None,
                 merge_transaction_delta: None,
                 sealed_observation: None,
+                collaboration_delta: None,
             };
             drop(lease);
 
@@ -22462,6 +22983,7 @@ mod clockhalf_whole_history {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         drop(lease);
 
@@ -23024,6 +23546,7 @@ mod native_admission_lineage {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         drop(lease);
         transaction

@@ -630,6 +630,7 @@ fn hashing_the_replication_root_does_not_materialize_the_authority() {
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     drop(lease);
 

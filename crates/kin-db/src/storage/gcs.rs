@@ -2594,6 +2594,7 @@ pub(crate) mod tests {
             local_overlay_delta: Some(FrozenLocalOverlayDelta::initialize(overlay)),
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         drop(lease);
         transaction
