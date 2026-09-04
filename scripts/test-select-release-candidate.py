@@ -41,6 +41,7 @@ SELECTOR_PATH = ROOT / "scripts" / "select-release-candidate.py"
 CUT_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "release-cut.yml"
 RELEASE_TAG_PATH = ROOT / ".github" / "workflows" / "release-tag.yml"
 RC_BUILD_PATH = ROOT / ".github" / "workflows" / "rc-build.yml"
+RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
 REPO = "firelock-ai/kin"
 VERSION = "0.6.5"
 NEWEST = "a" * 40
@@ -993,6 +994,119 @@ class TriggerTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Contracts against the mint and the workflow.
 # ---------------------------------------------------------------------------
+
+
+class StrangerCommandRenderingTests(unittest.TestCase):
+    """Every public instruction renders the two-stage form, and nothing renders the old one.
+
+    `bin/kin-stranger run` REFUSES without `--run <id>`, and the run id comes from
+    `prepare`, so a one-line `run --archive <path>` is not a shortcut, it is a
+    command that cannot work. Two places told a reader to type exactly that:
+    `docs/release-bot.md` and the summary `release-cut.yml` writes when the
+    hosted stranger leaves no record. Both were added by this lane on
+    2026-09-04 and both were wrong the moment they shipped.
+
+    The rendering lives in two files that cannot share a string, one Markdown
+    and one shell heredoc, so the coupling is asserted here instead.
+    """
+
+    #: The one shape a reader may be handed. `prepare` first, and every `run`
+    #: carrying the same `--run` id.
+    PREPARE = "bin/kin-stranger prepare --run"
+    RUN = "bin/kin-stranger run --run"
+
+    def rendered_lines(self, text: str) -> list[str]:
+        """Every kin-stranger command line in a file, stripped of shell quoting."""
+
+        lines = []
+        for raw in text.splitlines():
+            stripped = raw.strip()
+            # A workflow renders its lines through `echo "..."`; a doc renders
+            # them bare. Take the payload either way.
+            match = re.fullmatch(r"""echo ["'](.*)["']""", stripped)
+            if match:
+                stripped = match.group(1)
+            if "bin/kin-stranger " in stripped and not stripped.startswith("#"):
+                lines.append(stripped)
+        return lines
+
+    def command_lines(self, text: str) -> list[str]:
+        """Only the lines that render a command, not prose that names the tool."""
+
+        return [
+            line
+            for line in self.rendered_lines(text)
+            if re.search(r"bin/kin-stranger (prepare|run|resume) ", line)
+        ]
+
+    def test_the_doc_and_the_cut_summary_render_the_same_block(self) -> None:
+        doc = self.command_lines(RELEASE_BOT_DOC.read_text(encoding="utf-8"))
+        cut = self.command_lines(CUT_WORKFLOW_PATH.read_text(encoding="utf-8"))
+        # The summary renders the same three lines the doc does. Anything the
+        # workflow renders beyond them belongs to the standby job or to the job
+        # actually driving the tool, which are not this assertion's business.
+        self.assertTrue(doc, "docs/release-bot.md renders no kin-stranger command at all")
+        for line in doc:
+            self.assertIn(
+                line,
+                cut,
+                "the cut summary and the doc have drifted; a reader is handed two "
+                f"different commands for the same job: {line!r}",
+            )
+
+    def test_every_rendered_run_carries_a_run_id(self) -> None:
+        """The defect itself. `run` without `--run` is refused by the tool."""
+
+        for path in (RELEASE_BOT_DOC, CUT_WORKFLOW_PATH, SELECTOR_PATH):
+            for line in self.command_lines(path.read_text(encoding="utf-8")):
+                if "bin/kin-stranger run" not in line:
+                    continue
+                self.assertIn(
+                    self.RUN,
+                    line,
+                    f"{path.name} renders a run with no --run id, which the tool "
+                    f"refuses: {line!r}",
+                )
+
+    def test_a_rendered_run_is_always_preceded_by_a_prepare(self) -> None:
+        """A run id has to come from somewhere, and `prepare` is the only source."""
+
+        for path in (RELEASE_BOT_DOC, CUT_WORKFLOW_PATH):
+            lines = self.command_lines(path.read_text(encoding="utf-8"))
+            seen_prepare = False
+            for line in lines:
+                if line.startswith(self.PREPARE):
+                    seen_prepare = True
+                    continue
+                if line.startswith(self.RUN):
+                    self.assertTrue(
+                        seen_prepare,
+                        f"{path.name} renders a run before any prepare, so the run "
+                        f"id it names was never created: {line!r}",
+                    )
+
+    def test_the_selector_still_renders_the_two_stage_form(self) -> None:
+        """The positive control, and the shape the other two were corrected to.
+
+        `stranger_command` has rendered prepare-then-run since it was written.
+        If this ever goes red the needles above are wrong rather than the tree.
+        """
+
+        command = selector.stranger_command(VERSION, MIDDLE, 34_000_000_001)
+        rendered = command.splitlines()
+        self.assertTrue(
+            any(line.startswith(self.PREPARE) for line in rendered),
+            f"the selector stopped rendering a prepare line: {command}",
+        )
+        self.assertTrue(
+            any(line.startswith(self.RUN) for line in rendered),
+            f"the selector stopped rendering a run with a run id: {command}",
+        )
+        self.assertLess(
+            next(i for i, l in enumerate(rendered) if l.startswith(self.PREPARE)),
+            next(i for i, l in enumerate(rendered) if l.startswith(self.RUN)),
+            f"the selector renders run before prepare: {command}",
+        )
 
 
 class ContractTests(unittest.TestCase):
