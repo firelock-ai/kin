@@ -83,14 +83,20 @@ agent-driven setup should branch on it rather than treating the run as done.
 
 Clone a repository
 
+A hosted locator such as `kinlab://<org>/<repository-id>` carries its repository identity with it. A plain peer daemon HTTP endpoint does not, so `--repository` supplies the identity to adopt there. A Git clone URL takes neither, and passing `--repository` with one is refused before any negotiation rather than failing later against a remote that was never a Kin peer.
+
 ```
-kin clone <url> [path]
+kin clone <url> [path] [options]
 ```
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<url>` | yes | Git repository URL (native Kin transport is an explicit open gate) |
+| `<url>` | yes | Native Kin locator or Git repository URL |
 | `[path]` | no | Target directory (defaults to repo name) |
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--repository <repository>` |  | Native repository identity when URL is a peer daemon HTTP endpoint |
 
 ### `kin status`
 

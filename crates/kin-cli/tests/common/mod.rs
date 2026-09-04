@@ -1522,6 +1522,19 @@ impl<'runtime> Command<'runtime> {
         self
     }
 
+    /// Preserve a token minted by a fixture peer after inherited authority is scrubbed.
+    pub fn fixture_remote_bearer_token<V: AsRef<OsStr>>(&mut self, value: V) -> &mut Self {
+        assert!(
+            self.runtime.is_some(),
+            "fixture_remote_bearer_token requires an IsolatedDaemonRuntime command"
+        );
+        let key = OsString::from("KIN_REMOTE_BEARER_TOKEN");
+        let value = value.as_ref().to_os_string();
+        self.inner_mut().env(&key, &value);
+        upsert_intentional_env(&mut self.intentional_env, key, Some(value));
+        self
+    }
+
     pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
     where
         I: IntoIterator<Item = (K, V)>,

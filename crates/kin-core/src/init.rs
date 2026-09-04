@@ -31,6 +31,8 @@ use crate::error::{KinError, Result};
 use crate::layout::{KinLayout, KIN_LAYOUT_VERSION};
 use crate::manifest::KinManifest;
 
+pub mod replica;
+
 const INIT_STAGE_PREFIX: &str = ".kin.init-";
 const INIT_STAGE_OWNER_SUFFIX: &str = ".owner";
 const INIT_STAGE_OWNER_SCHEMA_VERSION: u32 = 1;
@@ -306,6 +308,14 @@ impl PreparedRepositoryInit {
         &mut self,
         transaction: RepositoryTransaction,
     ) -> Result<&RepositoryBootstrap> {
+        self.commit_bootstrap(transaction, None)
+    }
+
+    fn commit_bootstrap(
+        &mut self,
+        transaction: RepositoryTransaction,
+        receiver_case: Option<AdmissionCase>,
+    ) -> Result<&RepositoryBootstrap> {
         verify_metadata_seal(&self.layout, &self.metadata_seal)?;
         let operation_id = transaction.operation_id;
         let repository_id = &self.repository_id;
@@ -355,6 +365,7 @@ impl PreparedRepositoryInit {
                     transaction,
                     repository_id,
                     workspace_id,
+                    receiver_case,
                 )?;
                 if bootstrap.receipt.generation != 1
                     || bootstrap.receipt.roots_before != *initial_roots
@@ -1448,7 +1459,7 @@ where
         &prepared_default_ref,
         &initial_roots,
     )?;
-    commit_bootstrap_transaction(authority, transaction, &repository_id, workspace_id)
+    commit_bootstrap_transaction(authority, transaction, &repository_id, workspace_id, None)
 }
 
 fn build_repository_bootstrap_transaction(
@@ -1570,6 +1581,7 @@ fn commit_bootstrap_transaction<B>(
     transaction: RepositoryTransaction,
     repository_id: &RepositoryId,
     workspace_id: WorkspaceId,
+    receiver_case: Option<AdmissionCase>,
 ) -> Result<RepositoryBootstrap>
 where
     B: StorageBackend + 'static,
@@ -1604,9 +1616,13 @@ where
             changes = transaction.changes.len()
         )
         .entered();
-        authority
-            .commit_repository_transaction(transaction)
-            .map_err(graph_error)?
+        match receiver_case {
+            Some(case) => {
+                authority.commit_transferred_repository_transaction(transaction, Some(case))
+            }
+            None => authority.commit_repository_transaction(transaction),
+        }
+        .map_err(graph_error)?
     };
     let workspace = {
         crate::report_admission_progress("binding workspace to committed roots");

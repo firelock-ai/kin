@@ -973,6 +973,21 @@
       "expiration": "2027-02-26"
     },
     {
+      "file": "crates/kin-core/src/init/replica.rs",
+      "reason": "Explicit replica initialization and projection boundary. These operations inspect only the requested clone destination and private staging directories, then publish a verified repository and its graph-derived workspace. No filesystem content answers a semantic query. Each filesystem operation is pinned so new access requires review.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26",
+      "allow_match": [
+        "std::fs::create_dir_all(parent)",
+        "parent.canonicalize()",
+        "stage.path().canonicalize()",
+        "std::fs::remove_dir(&target)",
+        "std::fs::symlink_metadata(target)",
+        "!metadata.file_type().is_dir()",
+        "std::fs::read_dir(target)"
+      ]
+    },
+    {
       "file": "crates/kin-core/src/init_attempt.rs",
       "reason": "The post-mortem for an interrupted init, and the same boundary as init_staging.rs beside it. It reads only the staging directories init itself minted in the repository's parent, to report where a killed conversion stopped and how much disk it is holding. It answers no locate, search, context, trace, review or xref query, reads no repository content, and runs before any graph exists. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
       "owner": "kin-core",

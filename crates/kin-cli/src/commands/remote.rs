@@ -538,7 +538,7 @@ pub async fn add(
     let layout = crate::commands::require_repository_layout()?;
     let host = RemoteHostKind::from_str(&host).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown remote host '{}'; expected github, gitlab, bitbucket, or kinlab",
+            "unknown remote host '{}'; expected github, gitlab, bitbucket, kinlab, or peer",
             host
         )
     })?;
@@ -899,6 +899,7 @@ fn map_to_remote_ref(remote: &RemoteRefConfig) -> kin_remote::RemoteRef {
             RemoteHostKind::GitLab => kin_remote::HostKind::GitLab,
             RemoteHostKind::Bitbucket => kin_remote::HostKind::Bitbucket,
             RemoteHostKind::KinLab => kin_remote::HostKind::KinLab,
+            RemoteHostKind::Peer => kin_remote::HostKind::Peer,
         },
         transport: match remote.transport {
             RemoteTransportKind::GitExport => kin_remote::TransportKind::GitExport,

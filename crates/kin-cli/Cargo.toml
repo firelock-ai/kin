@@ -49,7 +49,7 @@ similar = { workspace = true }
 kin-infer = { version = ">=0.2.1", registry = "kin", default-features = false }
 kin-ranking = { workspace = true }
 kin-lsp = { workspace = true }
-kin-remote = { workspace = true }
+kin-remote = { workspace = true, features = ["http"] }
 kin-vfs-core = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
