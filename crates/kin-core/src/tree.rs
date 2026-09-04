@@ -14450,10 +14450,13 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(
-            error.to_string().contains("injected authority refusal"),
-            "{error}"
-        );
+        // Asserted without reporting the value. `assert!`'s message argument is a
+        // sink for CodeQL's `rust/cleartext-logging`, and the flow it reads runs
+        // from the `ProjectionAuthorityCommit` construction above into that
+        // message, so interpolating `error` raised a high-severity alert. The
+        // token the heuristic matches is in the type name, which no rewording of
+        // the injected literal reaches. The needle still names what went missing.
+        assert!(error.to_string().contains("injected authority refusal"));
         assert_eq!(
             std::fs::read(root.path().join("authored.rs")).unwrap(),
             chosen
