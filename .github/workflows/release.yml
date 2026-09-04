@@ -2440,20 +2440,24 @@ jobs:
       # a bridged answer can only ever shape a refusal; it can no longer admit
       # one.
       #
-      # WHY THIS GATE READS `preflight` AND STILL BLOCKS LATEST.
+      # WHY THIS GATE READS `preflight` AND BLOCKS NOTHING.
       #
       # `require: preflight` does not lower this job's bar. It changes what an
       # ABSENT stranger record does: instead of throwing here, it comes back as
       # a reported pending state that the steps below act on. Every other
       # stranger failure -- unreadable, about another build, an incomplete arm,
-      # bytes no preflight leg judged -- still throws exactly as before.
+      # bytes no preflight leg judged -- still throws exactly as before. That
+      # narrowing is the whole of it, and it is why a relaxed gate cannot be
+      # used to ship a record that is WRONG rather than one that is missing.
       #
-      # The distinction the release chain now makes is between a tag and Latest.
-      # A tag is an artifact somebody must name to install. Latest is what an
-      # installer resolves when a stranger types the install line, so Latest is
-      # the claim of first-contact coverage and Latest is where the stranger
-      # record is required. A pending release is published, installable, and
-      # marked prerelease until its record lands.
+      # What the pending state buys is a label, not a hold. Until 2026-09-04
+      # Latest was where the stranger record was required, on the reasoning that
+      # Latest is what an installer resolves and so is the claim of first-contact
+      # coverage. Holding there put the line in the wrong place: it kept a
+      # finished, installable release out of every default install path for want
+      # of a driver nobody could summon. A pending release is now published,
+      # installable, promoted, and carries a notice on its own body saying
+      # nobody has measured what a first-time user meets.
       - name: Require proof-loop artifacts for the tagged candidate
         id: proof
         env:

@@ -43,6 +43,18 @@ export const PENDING_MARKER = '<!-- kin-first-contact-proof -->';
 // first and short enough that a forgotten one is found the same day.
 export const DEFAULT_ALARM_AFTER_MINUTES = 360;
 
+// How long a release that is ALREADY Latest may go unmeasured before it is
+// worth an issue. Longer than the held threshold on purpose, because the two
+// states are not equally urgent and one alarm for both would be noise.
+//
+// A held release is stuck: nothing reaches an installer until somebody acts,
+// and six hours is the right impatience. A promoted release shipped. Its only
+// gap is that nobody has measured what a first-time user meets, and under the
+// rule of 2026-09-03 that gap is expected on every release the stranger has
+// not reached yet. Alarming on it inside a day would ring on every healthy
+// release and train every reader to skim the one issue that matters.
+export const DEFAULT_PROMOTED_ALARM_AFTER_MINUTES = 1440;
+
 const STABLE_TAG = /^v\d+\.\d+\.\d+$/;
 
 // Which releases this promoter is even allowed to touch.
@@ -60,7 +72,18 @@ export function selectCandidates(releases) {
     .filter((release) => release && typeof release.tag_name === 'string')
     .filter((release) => STABLE_TAG.test(release.tag_name))
     .filter((release) => release.draft !== true)
-    .filter((release) => release.prerelease === true)
+    // Either shape this chain can leave behind. Keying on the prerelease flag
+    // ALONE is what went blind on 2026-09-04: once release.yml stopped holding
+    // Latest, no release was ever a prerelease again, this sweep selected
+    // nothing, and both the notice-stripping and the alarm went quiet with no
+    // signal that they had. v0.6.6 was the first release to sit in exactly that
+    // state. A notice-bearing release is this chain's business whether or not
+    // it is still held.
+    .filter(
+      (release) =>
+        release.prerelease === true ||
+        (typeof release.body === 'string' && release.body.includes(PENDING_MARKER)),
+    )
     .map((release) => ({
       tag: release.tag_name,
       publishedAt: release.published_at ?? null,
@@ -69,6 +92,12 @@ export function selectCandidates(releases) {
       // reported and never promoted: the promoter finishes what the release
       // chain started and does not overrule a person.
       held: typeof release.body === 'string' && release.body.includes(PENDING_MARKER),
+      // Already GitHub Latest. Such a release needs its notice taken out and
+      // nothing else: flipping it again would move Latest onto whatever tag
+      // this sweep happened to reach, which for an older release is a
+      // rollback, and asserting it IS Latest afterwards would fail on any
+      // release but the newest.
+      promoted: release.prerelease !== true,
     }));
 }
 
@@ -79,18 +108,33 @@ function minutesSince(iso, now) {
   return (now - then) / 60000;
 }
 
-// Turn one judgement per candidate into the three lists the workflow acts on.
+// Turn one judgement per candidate into the four lists the workflow acts on.
 //
-// A judgement is `{ tag, publishedAt, held, proven, reason }`. `proven` true
-// means the full gate passed for that tag's commit. `proven` false with a
-// reason is every other answer, and the reason is carried verbatim into the
-// alarm, because "which record was missing" is the first thing a reader needs
-// and a generic "not proven" sends them to read three logs.
+// A judgement is `{ tag, publishedAt, held, promoted, proven, reason }`.
+// `proven` true means the full gate passed for that tag's commit. `proven`
+// false with a reason is every other answer, and the reason is carried
+// verbatim into the alarm, because "which record was missing" is the first
+// thing a reader needs and a generic "not proven" sends them to read three
+// logs.
+//
+// A proven candidate goes to ONE of two lists, and the split is not cosmetic.
+// `promote` is a release still held as a prerelease: it needs the npm ordering
+// checks, the notice taken out, the flip to Latest, and the readback.
+// `clearNotice` is a release that is already Latest and only carries a stale
+// notice: it needs the notice taken out and nothing else. Running the promote
+// path on one of those would move GitHub Latest onto whichever tag the sweep
+// reached, which for anything but the newest release is a rollback.
 export function planPromotion(
   judgements,
-  { now = Date.now(), alarmAfterMinutes = DEFAULT_ALARM_AFTER_MINUTES, openIssue = null } = {},
+  {
+    now = Date.now(),
+    alarmAfterMinutes = DEFAULT_ALARM_AFTER_MINUTES,
+    promotedAlarmAfterMinutes = DEFAULT_PROMOTED_ALARM_AFTER_MINUTES,
+    openIssue = null,
+  } = {},
 ) {
   const promote = [];
+  const clearNotice = [];
   const waiting = [];
   const foreign = [];
   for (const judgement of judgements ?? []) {
@@ -104,22 +148,31 @@ export function planPromotion(
       continue;
     }
     if (judgement.proven === true) {
-      promote.push({ tag: judgement.tag, driver: judgement.driver ?? null });
+      const entry = { tag: judgement.tag, driver: judgement.driver ?? null };
+      (judgement.promoted === true ? clearNotice : promote).push(entry);
       continue;
     }
     waiting.push({
       tag: judgement.tag,
       reason: judgement.reason || 'the proof gate gave no reason',
       minutes: minutesSince(judgement.publishedAt, now),
+      promoted: judgement.promoted === true,
     });
   }
 
-  // Alarm only on a release that has waited past the threshold. A release
+  // Alarm only on a release that has waited past its own threshold. A release
   // whose publication time cannot be read counts as overdue rather than as
   // fresh: an unreadable timestamp must not buy silence.
-  const overdue = waiting.filter(
-    (entry) => entry.minutes === null || entry.minutes >= alarmAfterMinutes,
-  );
+  //
+  // Two thresholds, because the two waiting states are not the same finding. A
+  // held release is stuck and six hours is the right impatience. A promoted one
+  // shipped and is merely unmeasured, which since 2026-09-04 is the normal
+  // state of every release the stranger has not reached, so it gets a day
+  // before it is worth anybody's attention.
+  const overdue = waiting.filter((entry) => {
+    const threshold = entry.promoted ? promotedAlarmAfterMinutes : alarmAfterMinutes;
+    return entry.minutes === null || entry.minutes >= threshold;
+  });
   let alarm = 'none';
   if (overdue.length > 0) {
     alarm = openIssue ? 'update' : 'open';
@@ -129,7 +182,7 @@ export function planPromotion(
     // closing on it would reopen the alarm an hour later.
     alarm = 'close';
   }
-  return { promote, waiting, foreign, overdue, alarm };
+  return { promote, clearNotice, waiting, foreign, overdue, alarm };
 }
 
 // One gate refusal, rendered safely into one Markdown table cell.
@@ -155,22 +208,36 @@ function tableCell(text) {
     .trim();
 }
 
-export function buildBody(overdue, { alarmAfterMinutes = DEFAULT_ALARM_AFTER_MINUTES } = {}) {
+export function buildBody(
+  overdue,
+  {
+    alarmAfterMinutes = DEFAULT_ALARM_AFTER_MINUTES,
+    promotedAlarmAfterMinutes = DEFAULT_PROMOTED_ALARM_AFTER_MINUTES,
+  } = {},
+) {
+  // The `state` column is the whole point of this table now. Before
+  // 2026-09-04 every row meant the same thing, a release stuck off Latest, and
+  // the prose above could say so once. Two states share this alarm today and
+  // they need different things done about them, so a body that described only
+  // the held one would misreport whichever row a reader happened to act on.
   const lines = [
-    `These releases are published, are not GitHub Latest, and have been waiting more than ${alarmAfterMinutes} minutes for first-contact proof.`,
+    'These published releases have not been through the green, brown and vcs stranger arms, so none of them may be described as first-contact proven.',
     '',
-    'Each one cleared the machine preflight on its own bytes. None has been through the green, brown and vcs stranger arms, so none may be described as first-contact proven, and none will become Latest until its `stranger.env` lands under its commit on the `release-evidence` branch.',
+    `A release still **held** off GitHub Latest is stuck and appears here after ${alarmAfterMinutes} minutes. One that is already **Latest** shipped on its machine preflight alone under the rule of 2026-09-03 and appears here after ${promotedAlarmAfterMinutes} minutes, because nobody has measured what a first-time user meets and its release body still says so.`,
     '',
-    '| tag | waiting | what the gate said |',
-    '| --- | --- | --- |',
+    '| tag | state | waiting | what the gate said |',
+    '| --- | --- | --- | --- |',
   ];
   for (const entry of overdue) {
     const waited = entry.minutes === null ? 'unknown' : `${Math.floor(entry.minutes)} min`;
-    lines.push(`| \`${entry.tag}\` | ${waited} | ${tableCell(entry.reason)} |`);
+    const state = entry.promoted ? 'Latest, unmeasured' : 'held, not Latest';
+    lines.push(`| \`${entry.tag}\` | ${state} | ${waited} | ${tableCell(entry.reason)} |`);
   }
   lines.push(
     '',
-    'To clear one: run the stranger on that candidate with all three arms, let it publish, and the promoter takes Latest on its next tick. A local-model run is allowed and is a weaker stranger; the record says which driver produced it and every reader of this rail is told.',
+    'To clear one: run the stranger on that candidate with all three arms and let it publish. `bin/kin-stranger` against the archive or the published npm bytes is the ordinary way to do that, and the hosted job is optional. On its next tick the promoter takes a held release to Latest, and takes the pending notice out of one that is already Latest.',
+    '',
+    'A local-model run is allowed and is a weaker stranger; the record says which driver produced it and every reader of this rail is told.',
     '',
     'This issue closes itself when no published release is waiting.',
   );

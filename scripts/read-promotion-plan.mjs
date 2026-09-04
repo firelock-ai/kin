@@ -30,6 +30,18 @@ export function renderPromotions(plan) {
     .join('\n');
 }
 
+// The releases that are already Latest and only carry a stale pending notice.
+//
+// A separate list rather than a flag on the promotion lines, because the two
+// need different work done to them and a workflow reading one list would have
+// to branch on a column to avoid flipping GitHub Latest onto an older tag.
+// Same tab-separated shape, so the workflow reads it the same way.
+export function renderNoticeClears(plan) {
+  return (plan.clearNotice ?? [])
+    .map((entry) => `${entry.tag}\t${entry.driver ?? 'unrecorded'}`)
+    .join('\n');
+}
+
 // action, issue number and title on one tab-separated line, with the body
 // written to its own file. The title travels with the decision because the
 // alarm's title is the only thing that makes a second run update the first
@@ -89,6 +101,8 @@ async function readStdin() {
 export async function run(argv) {
   const [command, ...rest] = argv;
   switch (command) {
+    case 'notice-clears':
+      return `${renderNoticeClears(readPlan())}\n`;
     case 'promotions':
       return `${renderPromotions(readPlan())}\n`;
     case 'alarm': {
@@ -103,7 +117,7 @@ export async function run(argv) {
     default:
       throw new Error(
         `unknown command ${JSON.stringify(command ?? '')}; this reader knows ` +
-        'promotions, alarm and strip-notice',
+        'promotions, notice-clears, alarm and strip-notice',
       );
   }
 }

@@ -882,10 +882,12 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
         "stranger-standby": "Report the stranger a runner cannot take",
         "report": "Report the cut's decision",
     },
-    # The second tier of the proof contract. A tag now mints on the machine
-    # preflight alone and the release is published as a prerelease; this sweep
-    # is what takes it to GitHub Latest once its stranger record lands, and what
-    # alarms while it has not. None of its jobs runs on a pull_request or
+    # The far end of the proof contract. A tag mints on the machine preflight
+    # alone and the release is published AND promoted; this sweep is what
+    # finishes the record afterwards, taking the pending notice back out once a
+    # stranger record lands, promoting the older shape that was held as a
+    # prerelease, and alarming while neither has happened. None of its jobs
+    # runs on a pull_request or
     # merge_group event, so none can claim a required context; it is registered
     # here because this census is what would otherwise let a new workflow's job
     # NAME appear unreviewed.
@@ -1153,8 +1155,17 @@ def require(content: str, needle: str, context: str) -> None:
 #
 # The contract now has two tiers, and these assertions are what stop the tiers
 # collapsing back into one in either direction. Collapsing UP puts the outage
-# back. Collapsing DOWN promotes a release to GitHub Latest with no first-contact
-# proof, which is the 2026-08-20 failure this whole gate exists for.
+# back: a release the stranger cannot reach is held off Latest indefinitely
+# while every machine signal is green.
+#
+# Collapsing DOWN is subtler than it was, because promoting without a stranger
+# record is now the INTENDED behaviour. What must not collapse is the label. The
+# 2026-08-20 failure was a release promoted to Latest with no PREFLIGHT record
+# and no stranger run on its bytes, and nothing anywhere saying so; the machine
+# proof is still required and the missing first-contact record still has to be
+# stated on the release, in the mint's summary and in the promote summary. A
+# release that is unmeasured and silent about it is the failure. A release that
+# is unmeasured and says so is the design.
 #
 # Every assertion reads active lines, never raw text, because each of these
 # files carries prose ABOUT the thing being asserted and a check satisfied by
@@ -1230,6 +1241,56 @@ def assert_the_mint_lists_preflight_only_candidates(release_tag: str) -> None:
             "release-tag.yml computes a stranger state and reads it back "
             "nowhere, so a release minted without first-contact proof is "
             "indistinguishable from one that has it"
+        )
+
+
+def assert_the_hosted_stranger_never_reddens_the_rail(release_cut: str) -> None:
+    """A nice-to-have must not be able to fail a release run.
+
+    Founder decision, 2026-09-04: "the damn smoke should never block release it
+    is a nice to have ONLY ... it should be mainly run locally not in the CI."
+    A driver out of limit, an offline runner or a container that would not start
+    is not a fact about the candidate, and a red cut run for any of them is a
+    rail that looks broken while behaving exactly as designed.
+
+    The second half is the trap that makes the first half dangerous.
+    `continue-on-error` masks `needs.<job>.result` to 'success' for every
+    downstream job, including one whose upstream failed. The record publisher
+    therefore has to key on the stranger job's own output, which is written only
+    after a record exists on disk. Keyed on `.result` under this flag it would
+    run over a failed arm and publish nothing while reporting success.
+    """
+
+    jobs = workflow_job_blocks(release_cut)
+    for name in ("stranger", "publish-stranger"):
+        if name not in jobs:
+            raise AssertionError(f"release-cut.yml no longer declares a {name} job")
+    block = jobs["stranger"]
+    if "continue-on-error: true" not in block:
+        raise AssertionError(
+            "release-cut.yml's stranger job can redden the cut run; it is a "
+            "nice-to-have and must carry continue-on-error: true"
+        )
+
+    publisher = "\n".join(active_lines(jobs["publish-stranger"].split("\n    steps:", 1)[0]))
+    if "needs.stranger.result" in publisher:
+        raise AssertionError(
+            "publish-stranger keys on needs.stranger.result, which "
+            "continue-on-error masks to 'success' even for a failed stranger, "
+            "so it would publish over an arm that produced no record"
+        )
+    if "needs.stranger.outputs.recorded == 'true'" not in publisher:
+        raise AssertionError(
+            "publish-stranger must key on the stranger job's own recorded "
+            f"output, which is written only after a record exists: {publisher}"
+        )
+
+    # Silence is the other way a nice-to-have becomes invisible. A job allowed
+    # to fail has to say what it left behind, in the word this rail acts on.
+    if "pending" not in "\n".join(active_lines(block)).lower():
+        raise AssertionError(
+            "release-cut.yml's stranger job never names the pending state, so a "
+            "cycle that measured nothing leaves no record saying so"
         )
 
 
@@ -16909,6 +16970,23 @@ def main() -> None:
             '            echo "| first contact | recorded |"\n',
             1,
         ): assert_the_mint_records_the_state_it_tagged_on(mutant),
+    )
+    assert_the_hosted_stranger_never_reddens_the_rail(release_cut)
+    expect_assertion(
+        "the hosted stranger can fail a cut run again",
+        "must carry continue-on-error: true",
+        lambda mutant=release_cut.replace("    continue-on-error: true\n", "", 1): (
+            assert_the_hosted_stranger_never_reddens_the_rail(mutant)
+        ),
+    )
+    expect_assertion(
+        "the record publisher trusts a result continue-on-error has masked",
+        "which continue-on-error masks",
+        lambda mutant=release_cut.replace(
+            "needs.stranger.outputs.recorded == 'true'",
+            "needs.stranger.result == 'success'",
+            1,
+        ): assert_the_hosted_stranger_never_reddens_the_rail(mutant),
     )
     assert_the_stranger_labels_a_release_and_never_holds_it(release)
     assert_latest_claims_gate_on_promotion(release)
