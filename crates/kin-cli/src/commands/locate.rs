@@ -2718,6 +2718,12 @@ pub async fn run(
         max_files = max_files
     )
     .entered();
+    // Read BEFORE the query and again after it, so the window this measures is
+    // one the caller was going to spend anyway. Growth across it is a running
+    // fetch; anything less is reported as anything less. See
+    // `EmbedModelFetch::with_progress_since` for why a CLI process may not
+    // simply assert that the daemon's embed pass is at work.
+    let model_before = crate::embed_model::EmbedModelFetch::probe(false);
     let result = capture(
         text,
         queries,
@@ -2733,10 +2739,13 @@ pub async fn run(
         scope,
     )
     .await?;
+    let model_fetch = embedding_model_fetch_note(result.semantic_coverage.as_ref(), || {
+        crate::embed_model::EmbedModelFetch::probe(false).with_progress_since(&model_before)
+    });
     // Persist the paging cursor so `kin locate --next` can fetch the next page
     // without the caller re-supplying the query. Best-effort; never fatal.
     super::locate_cursor::persist_locate_cursor(result.next_cursor.as_deref());
-    output_result(&result, json, explain, text, surface);
+    output_result(&result, json, explain, text, surface, model_fetch);
     Ok(())
 }
 
@@ -2929,6 +2938,10 @@ pub fn run_with_graph(
         explain,
         text,
         super::locate_compact::LocateSurface::Full,
+        // No window: this path answers from a graph already in hand, so there is
+        // no interval across which a fetch could be observed moving. An
+        // unobserved fetch says nothing rather than guessing.
+        None,
     );
     Ok(())
 }
@@ -18893,9 +18906,10 @@ fn output_result(
     explain: bool,
     query: &str,
     surface: super::locate_compact::LocateSurface,
+    model_fetch: Option<String>,
 ) {
     if !json {
-        output_text(result, explain, query);
+        output_text(result, explain, query, model_fetch);
         return;
     }
     match surface {
@@ -18934,18 +18948,17 @@ fn output_result(
 /// the emitted rank is explicit, and the per-row score is held back for
 /// `--explain`, where it is one diagnostic among the per-signal and per-stage
 /// breakdowns rather than an implied ordering.
-fn output_text(result: &LocateResult, explain: bool, query: &str) {
+fn output_text(
+    result: &LocateResult,
+    explain: bool,
+    query: &str,
+    // Taken as an argument rather than computed here, because deciding it needs
+    // a probe from before the query ran and this function is called after it.
+    model_fetch: Option<String>,
+) {
     for line in coverage_note_lines(result, explain) {
         eprintln!("⚠ {line}");
     }
-    // Computed before the empty-result return so both shapes of answer carry
-    // it. A query that returned nothing at all is the reading a store with no
-    // vectors produces most often, and it is the one where a reader is likeliest
-    // to conclude the store does not hold what they asked for.
-    let model_fetch = embedding_model_fetch_note(
-        result.semantic_coverage.as_ref(),
-        crate::embed_model::EmbedModelFetch::probe,
-    );
     if result.files.is_empty() {
         println!("No relevant files found.");
         for line in locate_trailing_notes(result, query, model_fetch) {
@@ -19192,16 +19205,22 @@ fn embedding_work_is_owed(coverage: &SemanticCoverage) -> bool {
 /// the answer floor. That sentence sends a reader to name a symbol, which does
 /// not help, when the fix is to run the query again once the download lands.
 ///
-/// `probe` is taken as an argument so the decision is gradable without a hub
+/// What it does NOT do is assert that the daemon's embed pass is running.
+/// `EmbedModelFetch::probe` takes that as an argument and this path has no way
+/// to know it, so the observation handed in here is expected to have been taken
+/// across a window with `EmbedModelFetch::with_progress_since`, and the wording
+/// it renders is chosen by what that window measured.
+///
+/// `observe` is taken as an argument so the decision is gradable without a hub
 /// cache on the host running the test.
 fn embedding_model_fetch_note(
     coverage: Option<&SemanticCoverage>,
-    probe: impl FnOnce(bool) -> crate::embed_model::EmbedModelFetch,
+    observe: impl FnOnce() -> crate::embed_model::EmbedModelFetch,
 ) -> Option<String> {
     if !coverage.is_some_and(embedding_work_is_owed) {
         return None;
     }
-    probe(true).retrieval_clause()
+    observe().retrieval_clause()
 }
 
 /// The stdout lines `output_text` prints for the ranked file list, in order.
@@ -32780,26 +32799,38 @@ mod tests {
         }
     }
 
-    fn weights_arriving(embed_pass_working: bool) -> crate::embed_model::EmbedModelFetch {
+    fn partial_weights(fetched_bytes: u64) -> crate::embed_model::EmbedModelFetch {
         crate::embed_model::EmbedModelFetch {
             model_id: crate::embed_model::DEFAULT_EMBED_MODEL_ID.to_string(),
             cache_dir: Some("/home/dev/.cache/huggingface/hub/models--x".to_string()),
             present: false,
-            fetched_bytes: 137 * 1024 * 1024,
+            fetched_bytes,
             expected_bytes: Some(crate::embed_model::DEFAULT_EMBED_MODEL_BYTES),
-            fetching: embed_pass_working,
+            fetching: false,
             no_fetch_reason: None,
             relocated_hf_home: None,
         }
     }
 
-    fn weights_cached(_embed_pass_working: bool) -> crate::embed_model::EmbedModelFetch {
+    /// Bytes measured arriving across the window: 120 MB before the query,
+    /// 137 MB after it.
+    fn weights_arriving() -> crate::embed_model::EmbedModelFetch {
+        partial_weights(137 * 1024 * 1024).with_progress_since(&partial_weights(120 * 1024 * 1024))
+    }
+
+    /// The same partial cache with nothing moving, which is what a dead fetch
+    /// and an air-gapped host both look like.
+    fn weights_stalled() -> crate::embed_model::EmbedModelFetch {
+        partial_weights(137 * 1024 * 1024).with_progress_since(&partial_weights(137 * 1024 * 1024))
+    }
+
+    fn weights_cached() -> crate::embed_model::EmbedModelFetch {
         crate::embed_model::EmbedModelFetch {
             present: true,
-            fetching: false,
             fetched_bytes: 0,
-            ..weights_arriving(false)
+            ..partial_weights(0)
         }
+        .with_progress_since(&partial_weights(0))
     }
 
     /// The download line needs both facts and neither is sufficient alone: the
@@ -32832,6 +32863,21 @@ mod tests {
             embedding_model_fetch_note(Some(&nothing_indexed), weights_cached),
             None,
             "a cached model is never reported as still arriving"
+        );
+
+        // kin#1491 review: the same owed work over a cache that did not move.
+        // The rows are still lexical and the model is still why, so the note
+        // stays, but nothing in it may promise an arrival.
+        let stalled = embedding_model_fetch_note(Some(&nothing_indexed), weights_stalled)
+            .expect("an absent model still explains the rows");
+        assert!(
+            stalled.contains("none of it arrived while this answer was produced")
+                && stalled.contains("run `kin embed` to fetch it now"),
+            "it reports the window it measured and hands over the command: {stalled}"
+        );
+        assert!(
+            !stalled.contains("still downloading") && !stalled.contains("until it lands"),
+            "and never tells the reader to wait on a fetch nothing observed: {stalled}"
         );
 
         // Work not owed: nothing about this answer waits on a download,
@@ -32905,6 +32951,17 @@ mod tests {
             lines[0].contains("no row cleared the answer floor"),
             "and the floor sentence is the one that survives: {:?}",
             lines[0]
+        );
+
+        // A cache that did not move still gets its second line, and that line
+        // still refuses to promise an arrival.
+        let fetch = embedding_model_fetch_note(weak.semantic_coverage.as_ref(), weights_stalled);
+        let lines = locate_trailing_notes(&weak, "where is the request body size limit", fetch);
+        assert_eq!(lines.len(), 2, "the cause is still owed: {lines:?}");
+        assert!(
+            !lines[1].contains("until it lands"),
+            "and it is not the waiting one: {:?}",
+            lines[1]
         );
     }
 
