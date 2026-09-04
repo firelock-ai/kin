@@ -229,7 +229,7 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
         ),
         (
             "get_context_pack",
-            "Assemble a bundle around one entity within a token budget: the focal body plus the signatures of what it depends on, optionally its tests and transitive dependencies. Call it instead of several get_entity_source reads.",
+            "Assemble a token-bounded bundle from one entity, several entities, or a plain-language question: focal bodies plus dependency signatures and connecting routes. Call it instead of several get_entity_source and traversal reads.",
         ),
         (
             "get_entity_source",
@@ -381,6 +381,7 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
                 "depth",
                 "include_body",
                 "compact",
+                "limit_per_step",
                 "max_response_chars",
                 "max_chars",
             ] as &[&str],
@@ -415,7 +416,14 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
         ),
         (
             "get_context_pack",
-            &["entity_id", "depth", "token_budget", "max_chars"] as &[&str],
+            &[
+                "entity_id",
+                "entities",
+                "question",
+                "depth",
+                "token_budget",
+                "max_chars",
+            ] as &[&str],
         ),
         ("kin_provenance_query", &["entity_id", "limit"] as &[&str]),
         // Both, written out rather than left absent. The tool registers exactly
@@ -672,6 +680,18 @@ fn tool_property_descriptions() -> BTreeMap<(&'static str, &'static str), &'stat
         (
             ("trace_data_flow", "direction"),
             "Which way to walk: `calls` for callees, `callers` for callers, `both` merges.",
+        ),
+        (
+            ("trace_data_flow", "limit_per_step"),
+            "Edges kept per hop. Raise it for a node `clipped_steps` reports as cut.",
+        ),
+        (
+            ("get_context_pack", "entities"),
+            "Several focal entity names or UUIDs when the question is about how they connect.",
+        ),
+        (
+            ("get_context_pack", "question"),
+            "A plain-language question resolved to one or more focal entities before packing.",
         ),
         (
             ("trace_path", "direction"),
@@ -1400,6 +1420,206 @@ mod tests {
         assert!(
             problems.is_empty(),
             "agent-default trimmed a knob a shipped acceptance check reads: {problems:#?}"
+        );
+    }
+
+    /// Every remediation or invocation alternative the agent-facing response
+    /// names must be present in the schema that same agent receives.
+    ///
+    /// The first-contact run was told to widen `limit_per_step`, but the belt
+    /// had removed that property. It also left `question` and `entities` in
+    /// `get_context_pack`'s input alternatives after removing both property
+    /// definitions, producing a schema that described only one of its three
+    /// valid ways to call the tool.
+    #[test]
+    fn agent_default_advertises_every_answer_recovery_and_input_alternative() {
+        let served = served_agent_default();
+        let properties = |name: &str| {
+            served
+                .tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("agent-default does not serve {name}"))
+                .input_schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} has no property map"))
+        };
+
+        let trace = properties("trace_data_flow");
+        assert!(
+            trace.contains_key("limit_per_step"),
+            "trace remediation tells this profile to widen limit_per_step, so its served schema \
+             must advertise the knob: {:?}",
+            trace.keys().collect::<Vec<_>>()
+        );
+
+        let context = properties("get_context_pack");
+        for alternative in ["entity_id", "entities", "question"] {
+            assert!(
+                context.contains_key(alternative),
+                "get_context_pack names `{alternative}` as a valid input alternative but the \
+                 served property map omits it: {:?}",
+                context.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Every property name a schema requires, directly or inside an `anyOf`,
+    /// `oneOf` or `allOf` branch. Combinator branches only: a nested object's
+    /// own `required` names ITS properties, not the tool's.
+    fn required_property_names(schema: &serde_json::Value) -> Vec<(&str, bool)> {
+        let mut names = Vec::new();
+        if let Some(required) = schema.get("required").and_then(|value| value.as_array()) {
+            names.extend(
+                required
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(|name| (name, false)),
+            );
+        }
+        for combinator in ["anyOf", "oneOf", "allOf"] {
+            let Some(branches) = schema.get(combinator).and_then(|value| value.as_array()) else {
+                continue;
+            };
+            for branch in branches {
+                names.extend(
+                    required_property_names(branch)
+                        .into_iter()
+                        .map(|(name, _)| (name, true)),
+                );
+            }
+        }
+        names
+    }
+
+    /// Every backtick-quoted identifier in `text`. Multi-word phrases and
+    /// quoted values are not identifiers and are left alone.
+    fn backticked_identifiers(text: &str) -> Vec<&str> {
+        text.split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|token| {
+                !token.is_empty()
+                    && token
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                    && token.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_')
+            })
+            .collect()
+    }
+
+    /// A short property description may not introduce an identifier the tool's
+    /// own registered contract never uses.
+    ///
+    /// This belt shortens a vetted description; it does not get to write a new
+    /// claim. The `limit_per_step` short form in this bundle first shipped
+    /// naming `truncated_steps`, a response field that exists nowhere in Kin,
+    /// while the real disclosure is `clipped_steps` carrying `fanout_truncated`
+    /// and `fanout_dropped`. To the agent reading it, an invented field name is
+    /// indistinguishable from a real one, and the remediation it anchors is
+    /// unfollowable.
+    ///
+    /// The haystack is the tool's WHOLE registered definition, description and
+    /// schema together, so an enum value and a response field both count as
+    /// vetted. Scoped to the per-tool table, which is where a description can
+    /// name a fact about one tool; the shared table's entries are written to be
+    /// true of every tool that takes the property.
+    #[test]
+    fn no_short_property_description_names_an_identifier_the_tool_never_publishes() {
+        let registered = crate::tools::tool_definitions();
+        let mut checked = 0usize;
+        let mut unknown: Vec<String> = Vec::new();
+
+        for ((tool, property), short) in tool_property_descriptions() {
+            let definition = registered
+                .tools
+                .iter()
+                .find(|candidate| candidate.name == tool)
+                .unwrap_or_else(|| {
+                    panic!("tool_property_descriptions() names unregistered tool {tool}")
+                });
+            let contract = serde_json::to_string(&definition.input_schema)
+                .expect("a registered schema serializes");
+            for token in backticked_identifiers(short) {
+                checked += 1;
+                if contract.contains(token) || definition.description.contains(token) {
+                    continue;
+                }
+                unknown.push(format!("{tool}.{property} names `{token}`"));
+            }
+        }
+
+        assert!(
+            unknown.is_empty(),
+            "these short property descriptions name identifiers absent from the tool's own \
+             registered description and schema, so an agent is told to read a field that does \
+             not exist: {unknown:?}"
+        );
+        assert!(
+            checked >= 10,
+            "the sweep read {checked} backticked identifiers out of the per-tool table, so it is \
+             not reaching the text it grades"
+        );
+    }
+
+    /// A served schema must not require a property it does not define.
+    ///
+    /// [`trim_schema`] filters `properties` and the top-level `required` against
+    /// the keep list and touches nothing else, so a constraint nested in a
+    /// combinator keeps naming a property the trim removed. `get_context_pack`
+    /// shipped exactly that on all three belt profiles: its `anyOf` offers
+    /// `entity_id`, `entities` and `question`, and the keep list defined only
+    /// the first, so two of the three documented ways to call the tool were
+    /// required by the schema and absent from it.
+    ///
+    /// A sweep rather than those two names, because the next keep-list edit that
+    /// drops a constrained property is the same defect, and a test naming the
+    /// properties of the last one stays green through it.
+    #[test]
+    fn no_belt_profile_serves_a_schema_that_requires_a_property_it_does_not_define() {
+        let mut names_read = 0usize;
+        let mut branch_names_read = 0usize;
+        let mut missing: Vec<String> = Vec::new();
+
+        for (profile, names) in [
+            ("agent-default", crate::tools::agent_default_tool_names()),
+            ("agent-query", crate::tools::agent_query_tool_names()),
+            ("agent-search", crate::tools::agent_search_tool_names()),
+        ] {
+            let allowed: std::collections::HashSet<String> =
+                names.iter().map(|name| (*name).to_string()).collect();
+            for tool in crate::tools::served_tools_list(Some(&allowed), true).tools {
+                let defined: std::collections::HashSet<&str> = tool.input_schema["properties"]
+                    .as_object()
+                    .map(|properties| properties.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                for (required, from_branch) in required_property_names(&tool.input_schema) {
+                    names_read += 1;
+                    if from_branch {
+                        branch_names_read += 1;
+                    }
+                    if !defined.contains(required) {
+                        missing.push(format!("{profile}/{}: `{required}`", tool.name));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these served schemas require a property their own `properties` map does not define, \
+             so the profile advertises a way to call the tool it never describes: {missing:?}; add \
+             the property to that tool's entry in schema_keep_lists()"
+        );
+        // Anti-vacuity. A top-level `required` cannot fail this, because
+        // `trim_schema` filters that list too, so the sweep is only grading the
+        // class while it reads combinator branches. Reading none means the
+        // schemas moved out from under it, not that they are clean.
+        assert!(
+            branch_names_read >= 3,
+            "the sweep read {names_read} required names across three profiles and only \
+             {branch_names_read} of them from an anyOf/oneOf/allOf branch, which is the only \
+             place this defect can live"
         );
     }
 

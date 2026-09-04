@@ -43,7 +43,9 @@ radius, answering \"if I change this, what else might break?\", from the graph i
 call instead of hand-tracing callers. Pair it with semantic_diff (what changed) or use \
 semantic_review when you want diff + impact + risk together in a single report. \
 Per-entity counts separate `consumer_count` (every inbound edge) from \
-`proven_consumer_count` (only edges resolved above `name_only`). This response carries \
+`proven_consumer_count` (only edges resolved above `name_only`). `covering_tests` is a \
+graph-observed lower bound, labeled beside every count rather than a claim about every \
+test in the working copy. This response carries \
 counts and buckets rather than ranked paths: the per-hop ranked report, where every step \
 carries its own `resolution` and a confidence score, is produced only by \
 `kin impact --json` on the CLI and is not reachable from here. Read a used/unused claim \
@@ -56,6 +58,17 @@ build cannot produce, or on a graph holding none of them, an empty blast radius 
 the query could not observe what it was asked about rather than that nothing depends on \
 the change. Check it before reading a zero consumer count as safe to change.";
 
+/// The field a serialized impact row carries beside `covering_tests`, and the
+/// one value it takes.
+///
+/// Named once rather than spelled at each surface. The budget-survival test in
+/// [`crate::envelope`] builds its impact rows by hand, so a literal there would
+/// go on asserting a spelling this producer had renamed, and the pair would
+/// drift with both halves green.
+pub(crate) const COVERING_TESTS_BOUND_KEY: &str = "covering_tests_bound";
+/// See [`COVERING_TESTS_BOUND_KEY`].
+pub(crate) const COVERING_TESTS_BOUND: &str = "graph_observed_lower_bound";
+
 /// The blast-radius buckets of an [`kin_review::ImpactReport`] that serialize as
 /// arrays of raw entities, paired with their key in the response object.
 const IMPACT_ENTITY_BUCKETS: [&str; 4] = [
@@ -65,8 +78,7 @@ const IMPACT_ENTITY_BUCKETS: [&str; 4] = [
     "affected_tests",
 ];
 
-/// Give every entity in an impact response the same 1-based `start_line` /
-/// `end_line` fields its sibling surfaces emit.
+/// Add the presentation fields and explicit bounds an impact response needs.
 ///
 /// `ImpactReport` holds raw `Entity` values, so serializing it exposes only the
 /// nested `span`, whose rows are the graph's 0-based tree-sitter positions. An
@@ -101,6 +113,24 @@ fn annotate_impact_presentation_lines(
             object.insert(
                 "end_line".to_string(),
                 serde_json::json!(entity_presentation_end_line(entity)),
+            );
+        }
+    }
+
+    let Some(entity_impacts) = result
+        .get_mut("entity_impacts")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for row in entity_impacts {
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        if object.contains_key("covering_tests") {
+            object.insert(
+                COVERING_TESTS_BOUND_KEY.to_string(),
+                serde_json::json!(COVERING_TESTS_BOUND),
             );
         }
     }
@@ -1145,7 +1175,17 @@ mod tests {
             changed_ids: vec![],
             unreviewed_agent_changes: vec![],
             actor_attribution: vec![],
-            entity_impacts: vec![],
+            entity_impacts: vec![kin_review::EntityImpact {
+                entity_id: direct.id,
+                consumer_count: 0,
+                strong_consumer_count: 0,
+                proven_consumer_count: 0,
+                contract_consumer_count: 0,
+                consumer_files: vec![],
+                covering_tests: 0,
+                consumers_migrated_in_diff: 0,
+                call_shapes: kin_review::impact::ConsumerCallShapeSummary::default(),
+            }],
         };
 
         let mut value = serde_json::to_value(&report).unwrap();
@@ -1168,6 +1208,14 @@ mod tests {
             rows[1]["start_line"].is_null(),
             "an entity with no span has no line to report: {}",
             rows[1]
+        );
+
+        let coverage = &value["entity_impacts"][0];
+        assert_eq!(coverage["covering_tests"], 0);
+        assert_eq!(
+            coverage[COVERING_TESTS_BOUND_KEY], COVERING_TESTS_BOUND,
+            "a zero must say beside the number that missing local-variable property edges can \
+             make it a false negative: {coverage}"
         );
     }
 

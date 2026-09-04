@@ -13196,7 +13196,7 @@ fn readiness_line(report: &crate::commands::health::HealthReport) -> ReadinessLi
     } else {
         "Each row above carries the fix it needs."
     };
-    let sentence = if waiting.len() == 1 {
+    let mut sentence = if waiting.len() == 1 {
         format!("1 check needs attention: {}. {advice}", labels.join(", "))
     } else {
         format!(
@@ -13205,6 +13205,28 @@ fn readiness_line(report: &crate::commands::health::HealthReport) -> ReadinessLi
             labels.join(", ")
         )
     };
+    let pending = waiting
+        .iter()
+        .filter(|check| matches!(check.status, HealthStatus::Pending))
+        .map(|check| check.label.as_str())
+        .collect::<Vec<_>>();
+    if !pending.is_empty() {
+        sentence.push_str(&format!(
+            " Pending rows are expected first-run work: {}.",
+            pending.join(", ")
+        ));
+    }
+    let degraded = waiting
+        .iter()
+        .filter(|check| matches!(check.status, HealthStatus::Degraded))
+        .map(|check| check.label.as_str())
+        .collect::<Vec<_>>();
+    if !degraded.is_empty() {
+        sentence.push_str(&format!(
+            " Degraded rows are host limits: {}.",
+            degraded.join(", ")
+        ));
+    }
     ReadinessLine {
         ready: false,
         severe,
@@ -14161,14 +14183,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     println!();
     print_human_report(&after);
 
-    let still_manual: Vec<&crate::commands::health::HealthCheck> = after
-        .checks
-        .iter()
-        .filter(|c| {
-            !matches!(c.status, crate::commands::health::HealthStatus::Healthy)
-                && c.manual_fix.is_some()
-        })
-        .collect();
+    let still_manual = manual_attention_checks(&after);
     if !still_manual.is_empty() {
         println!();
         println!("Still needs manual steps:");
@@ -14182,6 +14197,19 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     print_unfinished_repairs(&unfinished);
 
     fix_verdict(&unfinished)
+}
+
+/// Rows the post-fix footer may truthfully call manual work.
+fn manual_attention_checks(
+    report: &crate::commands::health::HealthReport,
+) -> Vec<&crate::commands::health::HealthCheck> {
+    report
+        .checks
+        .iter()
+        .filter(|check| {
+            crate::commands::health::needs_attention(check) && check.manual_fix.is_some()
+        })
+        .collect()
 }
 
 /// Start the daemon for the repo containing the current directory, if any.
@@ -15870,6 +15898,18 @@ mod tests {
             "the printed count must be the tally: tally={attention}, line={}",
             line.sentence
         );
+        assert!(
+            line.sentence
+                .contains("Pending rows are expected first-run work: Embedding model"),
+            "the footer must distinguish expected warming from a broken install: {}",
+            line.sentence
+        );
+        assert!(
+            line.sentence
+                .contains("Degraded rows are host limits: Memory floor"),
+            "the footer must distinguish a host limit from a broken install: {}",
+            line.sentence
+        );
         // The control that keeps the assertion above from passing for any
         // report at all: turn the three rows healthy and the line has to stop
         // counting entirely.
@@ -15896,6 +15936,25 @@ mod tests {
             readiness_line(&ready).ready,
             "{}",
             readiness_line(&ready).sentence
+        );
+    }
+
+    /// The post-fix manual list must use the same attention predicate as the
+    /// summary. An unsupported row can carry a way to opt into an optional
+    /// surface, but that does not make it unfinished repair work.
+    #[test]
+    fn the_post_fix_manual_list_excludes_not_applicable_rows() {
+        let mut optional = check("editor", "Editor extension", HealthStatus::Unsupported);
+        optional.manual_fix = Some("install the optional editor extension".to_string());
+        let mut pending = check("embedding_model", "Embedding model", HealthStatus::Pending);
+        pending.manual_fix = Some("allow the first model download".to_string());
+        let report = HealthReport::from_checks("linux".to_string(), vec![optional, pending]);
+
+        let rows = manual_attention_checks(&report);
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["embedding_model"],
+            "not-applicable rows must not reappear under 'Still needs manual steps'"
         );
     }
 

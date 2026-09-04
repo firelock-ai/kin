@@ -5422,6 +5422,15 @@ pub enum GraphStatusStaleReason {
     SelectedGraphChanging,
 }
 
+impl GraphStatusStaleReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EmbeddingCoverageChanging => "embedding_coverage_changing",
+            Self::SelectedGraphChanging => "selected_graph_changing",
+        }
+    }
+}
+
 /// The disclosure that makes a replayed reading honest.
 ///
 /// Present exactly when `sampling` is [`GraphStatusSampling::LastSettledSelectedGraph`],
@@ -5651,7 +5660,7 @@ impl GraphStatusReport {
         &self,
         envelope: &crate::envelope::Envelope,
     ) -> std::result::Result<(), String> {
-        use crate::envelope::{Runtime, ENVELOPE_VERSION};
+        use crate::envelope::{GraphFreshness, Runtime, ENVELOPE_VERSION};
 
         if envelope.envelope_version != ENVELOPE_VERSION {
             return Err(format!(
@@ -5708,6 +5717,32 @@ impl GraphStatusReport {
                 "_kin semantic_coverage.note must be present exactly when coverage is incomplete"
                     .to_string(),
             );
+        }
+        match (&self.stale, &envelope.freshness) {
+            (
+                Some(stale),
+                Some(GraphFreshness::Stale {
+                    basis,
+                    reason,
+                    settled_age_ms,
+                    observed_authority_epoch,
+                    live_attempts,
+                }),
+            ) if basis == "selected_graph_sample"
+                && reason == stale.reason.as_str()
+                && *settled_age_ms == stale.settled_age_ms
+                && *observed_authority_epoch == stale.observed_authority_epoch
+                && *live_attempts == stale.live_attempts => {}
+            (Some(_), _) => {
+                return Err(
+                    "_kin freshness does not carry the exact stale selected-graph observation"
+                        .to_string(),
+                );
+            }
+            (None, Some(GraphFreshness::Stale { .. })) => {
+                return Err("_kin freshness marks a point-in-time selected graph stale".to_string());
+            }
+            (None, _) => {}
         }
         Ok(())
     }

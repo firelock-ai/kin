@@ -1334,6 +1334,40 @@ fn locate_ranking_names_nothing(payload: &Value) -> bool {
         })
 }
 
+/// True when locate returned only fallback neighbours for a prose query.
+///
+/// `all_fallback` is computed over the full retained ranking, so this reads the
+/// producer's observation rather than guessing from one page. A prose query
+/// does not name a symbol whose absence can be checked. The relevant fact is
+/// instead that the ranking has no calibrated floor saying any returned row
+/// answers the concept the caller described.
+///
+/// This gate replaced one that deliberately said the opposite, and that
+/// argument is answered rather than dropped. It held that `all_fallback` fires
+/// on prose queries whose top hits are correct, so a qualifier there is one an
+/// agent learns to ignore. True of the [`locate_ranking_names_nothing`] wording
+/// beside it, which asserts a named symbol was not found and would be a false
+/// statement over a correct hit. It is not true of this one, which asserts only
+/// that the ranking publishes no measured relevance threshold. That sentence is
+/// exactly as true over a correct top hit as over a wrong one, which is the
+/// whole reason the answer cannot be certified: nothing in the response can
+/// tell the two apart. So the block says `relevance_unverified` and
+/// `nearest_neighbors_only`, never that the concept is absent.
+///
+/// Answered HERE, at the absence gate, and not by folding the producer's
+/// `query_shape` degradation into the run-quality verdict. That exemption is
+/// correct and stays: the run lost no capability, embeddings ranked, and
+/// [`describes_advice_not_run_quality`] keeps a query's shape out of a verdict
+/// about how well the query ran. How far the returned rows can be trusted is
+/// this gate's question, not that one's.
+fn locate_relevance_unverified(payload: &Value) -> bool {
+    let Some(query) = payload.get("query").and_then(Value::as_str) else {
+        return false;
+    };
+    !query_names_a_symbol(query)
+        && payload.get("all_fallback").and_then(Value::as_bool) == Some(true)
+}
+
 /// The wire word for the one embedding verdict, so the absence object and the
 /// completeness block publish the same vocabulary for the same fact.
 fn embedding_state_word(coverage: &crate::envelope::SemanticCoverage) -> &'static str {
@@ -2002,6 +2036,14 @@ fn unnamed_ranking_consequence() -> &'static str {
      settle that with find_references or semantic_search, which resolve a name directly."
 }
 
+/// The consequence for a prose locate page containing fallback neighbours.
+fn unverified_relevance_consequence() -> &'static str {
+    "Inspect the returned code before treating these nearest neighbours as relevant. The ranking \
+     has no calibrated relevance floor and returns candidates from any non-empty index, so do not \
+     conclude the concept is absent or present from this page alone. Refine the query or confirm \
+     the behavior through a graph surface that answers a concrete entity or relation question."
+}
+
 /// The kind the payload reports for its focal entity, whichever shape carries
 /// it: `find_references` nests the focal under `focal_entity`, `trace_data_flow`
 /// reports it flat as `focal_kind`.
@@ -2302,6 +2344,7 @@ pub fn negative_for(
     // this reports rather than filters, and a weak-but-real hit is never dropped
     // to hide a wrong one.
     let ranking_names_nothing = tool == "semantic_locate" && locate_ranking_names_nothing(payload);
+    let relevance_unverified = tool == "semantic_locate" && locate_relevance_unverified(payload);
     // Whether this response asserts that something is NOT there. An answer with
     // rows asserts nothing of the kind, and still gets qualified: the gates
     // below decide how far its rows can be trusted as the whole set, which is
@@ -2312,7 +2355,7 @@ pub fn negative_for(
     // readings of one question are how a caveat about absences came to ride on
     // an answer with rows (FIR-2496).
     let claims_absence = answer_claims_absence(tool, payload);
-    if !claims_absence && !qualifies_populated_answers(tool) {
+    if !claims_absence && !qualifies_populated_answers(tool) && !relevance_unverified {
         return None;
     }
 
@@ -2510,6 +2553,16 @@ pub fn negative_for(
              candidate set rather than an enumeration of the graph, so the name may belong to an \
              entity this query never ranked; observed substrate state: {trust_reason}"
         );
+    } else if relevance_unverified {
+        kind = "relevance_unverified";
+        subject = "the query described a concept and every returned row is a nearest neighbour; \
+                   this ranking publishes no measured relevance floor";
+        trustworthy = false;
+        trust_reason = format!(
+            "relevance_floor_unmeasured: every ranked row was a fallback neighbour and the \
+             response publishes no calibrated threshold establishing that any row answers the \
+             concept; observed substrate state: {trust_reason}"
+        );
     }
     if tool == "graph_neighborhood" {
         // The emitted edge array is capped by the caller's `limit`, and a
@@ -2620,6 +2673,8 @@ pub fn negative_for(
 
     let interpretation = if ranking_names_nothing {
         "unnamed_ranking"
+    } else if relevance_unverified {
+        "nearest_neighbors_only"
     } else if spec.always {
         "qualified_verdicts"
     } else if claims_absence {
@@ -2627,13 +2682,15 @@ pub fn negative_for(
     } else {
         "qualified_answer"
     };
-    if !claims_absence {
+    if !claims_absence && !relevance_unverified {
         kind = "qualified_answer";
         subject = "this answer returned rows, so it asserts no absence; the verdict below says \
                    how far those rows can be trusted as the whole set";
     }
     let consequence = if ranking_names_nothing {
         unnamed_ranking_consequence().to_string()
+    } else if relevance_unverified {
+        unverified_relevance_consequence().to_string()
     } else if claims_absence {
         absence_advice_consequence(tool, spec.always, trustworthy, &trust_reason)
     } else {
@@ -6926,20 +6983,39 @@ mod tests {
     }
 
     #[test]
-    fn prose_query_over_fallback_hits_is_not_qualified_as_unnamed() {
-        // `all_fallback` fires on natural-language queries whose top hits are
-        // correct, so it cannot be the whole rule. A qualifier that fired there
-        // too is one an agent learns to ignore.
-        let mut payload = empty_fused_locate_page("merge queue captain lane arbitration");
-        payload["entities"] = json!([fused_locate_hit("submit_to_queue")]);
-        payload["total_ranked"] = json!(3);
+    fn prose_query_over_fallback_hits_refuses_to_certify_relevance() {
+        // The exact first-contact shape: a natural-language concept the
+        // repository does not contain still gets a full page because locate is
+        // a nearest-neighbour ranking. Complete embedding coverage says every
+        // candidate could rank. It does not provide a calibrated relevance
+        // floor, so it cannot turn the neighbours into a certified answer.
+        let mut payload = empty_fused_locate_page("password hashing and session token expiry");
+        payload["entities"] = json!([
+            fused_locate_hit("Hit"),
+            fused_locate_hit("Link"),
+            fused_locate_hit("build_match_query"),
+            fused_locate_hit("SearchError"),
+        ]);
+        payload["total_ranked"] = json!(40);
         payload["all_fallback"] = json!(true);
-        assert!(negative_for(
+        let negative = negative_for(
             "semantic_locate",
             &payload,
-            &semantic_authoritative_envelope()
+            &semantic_authoritative_envelope(),
         )
-        .is_none());
+        .expect("fallback-only prose rankings must qualify their relevance");
+        assert_eq!(negative["kind"], json!("relevance_unverified"));
+        assert_eq!(negative["interpretation"], json!("nearest_neighbors_only"));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("relevance_floor_unmeasured"), "{reason}");
+        let advice = negative["advice"].as_str().unwrap();
+        assert!(
+            advice.contains("Inspect the returned code")
+                && advice.contains("do not conclude the concept is absent"),
+            "{advice}"
+        );
     }
 
     #[test]
