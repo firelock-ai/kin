@@ -203,6 +203,21 @@ release still becomes GitHub Latest. A partial record is still refused rather
 than accepted, because a record that overstates its own coverage is worse than
 no record.
 
+**A stranger record is linked to its candidate by one of two receipts, and both
+are the release chain's own.** `stranger.env` names the archive sha256 the
+stranger ran, and `scripts/check-release-proof-artifacts.mjs` accepts that
+archive when it appears among the preflight legs for that commit, or among
+`artifacts[].archive.sha256` in the `release-provenance.json` asset of the
+release whose tag resolves to that commit. Two receipts rather than one because
+there are two honest sets of bytes: the preflight judges the rc-build archives,
+and `release.yml` rebuilds at the tag, so the archive a developer downloads is
+never a preflight leg. With only the first link, the released-byte proof of any
+release could never lift that release's own pending notice. The release receipt
+is held to the same standard: its `kin.commit`, and every artifact's, must be
+the candidate, so a release whose provenance describes another build refuses
+rather than being passed over. An archive in neither receipt is still a stranger
+that ran on some other build, and it is still refused.
+
 The driver takes its credential from `KIN_STRANGER_ANTHROPIC_API_KEY`, exported
 as `ANTHROPIC_API_KEY`. No harness change was needed: `driver_env_argv` unsets
 that variable on exactly one branch, the local endpoint, and the endpoint

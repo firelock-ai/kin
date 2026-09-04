@@ -20,10 +20,21 @@
 // The gate reads the proof loop's own records, not a summary of them. A
 // preflight record names, per leg, the commit that leg judged and the archive
 // sha256 it judged there. A stranger run.env names the archive sha256 the
-// stranger actually ran. Requiring the stranger's archive to appear among the
-// preflight's legs is what links the two: it proves the stranger ran on the
-// bytes the preflight judged FOR THIS COMMIT, rather than on some other build
-// that merely also exists. Two independent existence checks would not.
+// stranger actually ran. Requiring the stranger's archive to appear in a record
+// the release chain wrote FOR THIS COMMIT is what links the two, rather than
+// two independent existence checks, which would let a stranger run on some
+// other build that merely also exists satisfy this candidate.
+//
+// There are two such records and the gate accepts either, because there are two
+// sets of bytes a stranger can honestly run and both belong to this commit. The
+// preflight's legs are the rc-build archives the machine proof judged. The
+// release's own release-provenance.json names the archives release.yml built
+// and published AT THE TAG, which are different bytes by construction: the tag
+// build is a fresh one, so the archive a developer downloads is never a
+// preflight leg. Requiring the preflight link alone therefore made the
+// released-byte proof of any release unable to lift that release's own pending
+// notice, which is what v0.6.7 measured on 2026-09-04: three complete arms on
+// the public Linux aarch64 archive, refused as "not on these bytes".
 
 import process from 'node:process';
 import { realpathSync } from 'node:fs';
@@ -72,6 +83,10 @@ export const REFERENCE_DRIVER_ENDPOINT = 'account';
 // the same literal, and the authority suite pins the two together so they
 // cannot drift into a bridge that resolves somewhere nothing was ever proven.
 export const BUMP_BRANCH = 'automation/release-next';
+// The release's own signed receipt. release.yml writes and attests it onto
+// every release beside a sha256 sidecar, and it is the second record that can
+// link a stranger run to this candidate's bytes.
+export const PROVENANCE_ASSET = 'release-provenance.json';
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/;
 const ARCHIVE_SHA = /^[0-9a-f]{64}$/;
@@ -282,7 +297,13 @@ export function describeDriver(driver) {
   );
 }
 
-export function judgeStranger(env, sha, archives) {
+// The bytes a stranger record claims, and whether it finished claiming them.
+//
+// Split out of judgeStranger so main() can read them without judging anything
+// else: which receipt has to be fetched depends on the archive, and fetching
+// the release provenance for every candidate would put a network read on the
+// ordinary path that the preflight legs already answer.
+export function readStrangerArchive(env, sha) {
   const where = evidencePath(sha, STRANGER_RECORD);
   const archive = env?.archive_sha256;
   if (!archive) {
@@ -297,11 +318,32 @@ export function judgeStranger(env, sha, archives) {
       'complete and its verdict is unknown',
     );
   }
-  if (!archives.includes(archive)) {
+  return archive;
+}
+
+// `provenance` is the release receipt, and its three states are distinct on
+// purpose. null means it was never consulted, because the preflight legs
+// already answered or because a caller is judging without a transport, and the
+// refusal then names only the legs. A receipt with a tag means a release of
+// this commit was found and read. A receipt whose tag is null means the search
+// ran and no published release of this commit carries one, which a refusal has
+// to say out loud rather than reporting as though only the preflight was ever
+// asked.
+export function judgeStranger(env, sha, archives, provenance = null) {
+  const where = evidencePath(sha, STRANGER_RECORD);
+  const archive = readStrangerArchive(env, sha);
+  if (!archives.includes(archive) && !(provenance?.archives ?? []).includes(archive)) {
+    let shipped = '';
+    if (provenance) {
+      shipped = provenance.tag === null
+        ? `, and no published release of ${sha} carries a ${PROVENANCE_ASSET}`
+        : `, and release ${provenance.tag} shipped ` +
+          `(${provenance.archives.join(', ')})`;
+    }
     throw new Error(
       `${where} ran archive sha256 ${archive}, which no preflight leg for ` +
-      `${sha} judged (${archives.join(', ')}); the stranger ran, but not on ` +
-      'these bytes',
+      `${sha} judged (${archives.join(', ')})${shipped}; the stranger ran, ` +
+      'but not on these bytes',
     );
   }
 
@@ -401,6 +443,190 @@ export async function fetchEvidence(
     );
   }
   return response.text();
+}
+
+// One authenticated read of the GitHub API, in the shape the two readers below
+// need. Written beside fetchEvidence rather than folded into it because that
+// function reads a file off a branch and reports a 404 as a flag a caller may
+// act on, while these read the release surface and treat every non-OK answer
+// the same way: fail closed, because a release we could not read is not a
+// release that agrees with us.
+function apiHeaders(token, accept) {
+  const headers = {
+    accept,
+    'user-agent': 'kin-release-proof-gate',
+    'x-github-api-version': '2022-11-28',
+  };
+  if (token) {
+    headers.authorization = `Bearer ${token}`;
+  }
+  return headers;
+}
+
+async function apiRead(url, what, { token, fetchImpl = fetch } = {}, accept) {
+  let response;
+  try {
+    response = await fetchImpl(url, { headers: apiHeaders(token, accept) });
+  } catch (cause) {
+    throw new Error(`could not reach GitHub to ${what}: ${cause.message}`, { cause });
+  }
+  if (!response.ok) {
+    throw new Error(
+      `could not ${what}: HTTP ${response.status} ${response.statusText}`,
+    );
+  }
+  return response;
+}
+
+const apiJson = async (url, what, options) =>
+  (await apiRead(url, what, options, 'application/vnd.github+json')).json();
+
+// Resolve a tag to the commit it names, dereferencing an annotated tag. The
+// same two steps scripts/release-promotion-plan.mjs takes, and written here
+// rather than imported from it: release-tag.yml runs THIS FILE ALONE out of
+// $RUNNER_TEMP (`git show refs/remotes/origin/main:scripts/...` into a temp
+// path), so a relative import of a sibling script would not exist there and the
+// gate would fail to load on a release night.
+//
+// A tag that resolves to no commit sha answers null rather than throwing,
+// because the caller is searching a listing for the ONE tag that names this
+// candidate: a ref it cannot resolve is not that tag, and refusing the whole
+// judgement over an unrelated malformed ref would make an old tag able to hold
+// every future release.
+async function resolveReleaseTagCommit(tag, options) {
+  const base = `https://api.github.com/repos/${options.repository}`;
+  const ref = await apiJson(
+    `${base}/git/ref/tags/${encodeURIComponent(tag)}`,
+    `resolve the tag ${tag} of ${options.repository}`,
+    options,
+  );
+  let sha = ref?.object?.sha;
+  if (ref?.object?.type === 'tag' && COMMIT_SHA.test(sha ?? '')) {
+    sha = (
+      await apiJson(
+        `${base}/git/tags/${sha}`,
+        `dereference the annotated tag ${tag} of ${options.repository}`,
+        options,
+      )
+    )?.object?.sha;
+  }
+  return COMMIT_SHA.test(sha ?? '') ? sha : null;
+}
+
+// What a release's own receipt says about the bytes it shipped.
+//
+// Two statements have to agree before this record links anything, and they are
+// independent. The release's TAG must resolve to the candidate, which is the
+// caller's half. The record itself must say it is about that commit, which is
+// this half: `kin.commit` at the top and `kin.commit` on every artifact. A
+// release whose tag points at this candidate while its provenance describes
+// another build is REFUSED rather than skipped, because a receipt that
+// disagrees with the release carrying it is evidence of tampering and not of
+// absence, and quietly moving on to the next release would let the disagreement
+// pick the answer.
+export function judgeReleaseProvenance(record, sha, tag) {
+  const where = `${PROVENANCE_ASSET} on release ${tag}`;
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    throw new Error(`${where} did not parse as a release provenance record`);
+  }
+  const commit = record?.kin?.commit;
+  if (commit !== sha) {
+    throw new Error(
+      `${where} records commit ${commit ?? '<none>'}, not ${sha}; the release ` +
+      'exists but its provenance is about a different build',
+    );
+  }
+  const artifacts = Array.isArray(record.artifacts) ? record.artifacts : [];
+  const archives = [];
+  artifacts.forEach((artifact, index) => {
+    const name = artifact?.artifact ?? artifact?.target ?? `artifact ${index}`;
+    const built = artifact?.kin?.commit;
+    if (built !== sha) {
+      throw new Error(
+        `${where} artifact "${name}" records commit ${built ?? '<none>'}, not ` +
+        `${sha}; the record exists but that artifact is about a different build`,
+      );
+    }
+    const archive = artifact?.archive?.sha256;
+    if (typeof archive !== 'string' || !ARCHIVE_SHA.test(archive)) {
+      throw new Error(
+        `${where} artifact "${name}" records no archive sha256, so nothing ` +
+        'can link a stranger run to the bytes it shipped',
+      );
+    }
+    archives.push(archive);
+  });
+  if (archives.length === 0) {
+    throw new Error(
+      `${where} lists no artifacts, so it names no released bytes`,
+    );
+  }
+  return { tag, commit, archives };
+}
+
+// Find the release of this candidate and read the bytes it shipped.
+//
+// Newest first, which is the order GitHub lists releases in, stopping at the
+// first release whose tag resolves to the candidate. A re-tag of the same
+// commit publishes a NEWER release, and the bytes on offer are that one's, so
+// taking the newest match is reading the current answer rather than guessing
+// between two.
+//
+// Draft releases are skipped because nothing about them is a claim yet, and a
+// release carrying no PROVENANCE_ASSET is skipped BEFORE its tag is resolved,
+// which is what keeps the cost of this search at one extra request in the
+// ordinary case: the candidate's own release is at the top of the listing.
+// Returning a receipt whose tag is null rather than throwing is deliberate, so
+// the caller's refusal can name both the legs it checked and the release
+// surface it searched.
+export async function findReleaseProvenance(sha, options = {}) {
+  const { repository } = options;
+  const base = `https://api.github.com/repos/${repository}`;
+  for (let page = 1; ; page += 1) {
+    const releases = await apiJson(
+      `${base}/releases?per_page=100&page=${page}`,
+      `list the releases of ${repository}`,
+      options,
+    );
+    if (!Array.isArray(releases)) {
+      throw new Error(
+        `release listing page ${page} of ${repository} did not come back as ` +
+        `an array, so no release can be resolved to ${sha}`,
+      );
+    }
+    for (const release of releases) {
+      if (release?.draft === true) continue;
+      const tag = typeof release?.tag_name === 'string' ? release.tag_name : '';
+      if (!tag) continue;
+      const asset = (Array.isArray(release?.assets) ? release.assets : []).find(
+        (entry) => entry?.name === PROVENANCE_ASSET && typeof entry?.url === 'string',
+      );
+      if (!asset) continue;
+      if ((await resolveReleaseTagCommit(tag, options)) !== sha) continue;
+      const response = await apiRead(
+        asset.url,
+        `read ${PROVENANCE_ASSET} from release ${tag}`,
+        options,
+        'application/octet-stream',
+      );
+      const text = await response.text();
+      let record;
+      try {
+        record = JSON.parse(text);
+      } catch (cause) {
+        throw new Error(
+          `${PROVENANCE_ASSET} on release ${tag} is not valid JSON: ${cause.message}`,
+          { cause },
+        );
+      }
+      return judgeReleaseProvenance(record, sha, tag);
+    }
+    // A full final page is indistinguishable from a truncated listing without
+    // one more request, which is the same reason buildPlan pages this way.
+    if (releases.length < 100) {
+      return { tag: null, commit: null, archives: [] };
+    }
+  }
 }
 
 // The bridge for tags cut before the candidate became a main commit.
@@ -635,17 +861,27 @@ export async function main({
     return { sha, archives, archive: null, stranger };
   }
 
-  const { archive, arms, driver } = judgeStranger(
-    parseRunEnv(strangerText),
-    sha,
-    archives,
-  );
-  const stranger = { state: 'complete', arms, archive, driver };
+  const record = parseRunEnv(strangerText);
+  // Read the bytes the record names before deciding which receipt has to
+  // answer for them. A stranger run on the candidate's rc-build archive is
+  // linked by the preflight legs already in hand and costs no request; only a
+  // run on other bytes reaches the release's own provenance, which is the
+  // released-byte case this gate used to refuse outright.
+  const provenance = archives.includes(readStrangerArchive(record, sha))
+    ? null
+    : await findReleaseProvenance(sha, options);
+  const { archive, arms, driver } = judgeStranger(record, sha, archives, provenance);
+  const link = provenance === null ? 'preflight' : 'release-provenance';
+  const stranger = { state: 'complete', arms, archive, driver, link };
 
   log(
     `Verified release proof artifacts for ${sha}: preflight PASS across ` +
     `${archives.length} leg(s), stranger completed ${arms.join(', ')} on archive sha256 ${archive}, ` +
-    `driven ${describeDriver(driver)}`,
+    `linked to this candidate by ${
+      provenance === null
+        ? 'a preflight leg'
+        : `release ${provenance.tag}'s ${PROVENANCE_ASSET}`
+    }, driven ${describeDriver(driver)}`,
   );
   return { sha, archives, archive, stranger };
 }
