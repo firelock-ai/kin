@@ -35411,7 +35411,11 @@ mod tests {
         let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
         state.blobs.delete(&body_hash).unwrap();
 
-        std::fs::write(repo.path().join("other.rs"), b"pub fn other() -> u32 { 1 }\n").unwrap();
+        std::fs::write(
+            repo.path().join("other.rs"),
+            b"pub fn other() -> u32 { 1 }\n",
+        )
+        .unwrap();
         let response = app
             .clone()
             .oneshot(

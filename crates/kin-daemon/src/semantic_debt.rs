@@ -154,12 +154,12 @@ pub(crate) fn partition_against_tree(
             spent.push(entry.path.clone());
             continue;
         };
-        let still_owed = tree
-            .artifact_at_path(&repo_path)
-            .is_some_and(|artifact| match artifact.entry {
-                TreeEntry::Blob { hash, .. } => hash.to_string() == entry.body,
-                _ => false,
-            });
+        let still_owed =
+            tree.artifact_at_path(&repo_path)
+                .is_some_and(|artifact| match artifact.entry {
+                    TreeEntry::Blob { hash, .. } => hash.to_string() == entry.body,
+                    _ => false,
+                });
         if still_owed {
             owed.insert(repo_path);
         } else {

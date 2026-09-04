@@ -8412,12 +8412,13 @@ pub(crate) async fn readmit_semantics_for_paths(
                         "published bytes were read but no semantic transaction came back, so \
                          this path still answers at the positions its previous parse recorded"
                     );
-                    outcome.failed.push(if matches!(reconciled, ReconcileOutcome::BrokenAst { .. })
-                    {
-                        SemanticFailure::unparseable(file_id.0.clone())
-                    } else {
-                        SemanticFailure::unresolved(file_id.0.clone())
-                    });
+                    outcome.failed.push(
+                        if matches!(reconciled, ReconcileOutcome::BrokenAst { .. }) {
+                            SemanticFailure::unparseable(file_id.0.clone())
+                        } else {
+                            SemanticFailure::unresolved(file_id.0.clone())
+                        },
+                    );
                     continue;
                 }
                 {
