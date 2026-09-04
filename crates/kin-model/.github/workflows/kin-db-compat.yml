@@ -12,15 +12,24 @@
 # class, and it can only be caught by building the actual consumer against the
 # proposed types.
 #
-# So: check out kin-db at main, point its kin-model dependency at this PR head,
-# and run kin-db's suite. Both repos are public and the kin registry index is
-# anonymously readable, so kin-db's other registry dependencies resolve with no
-# credentials and this workflow needs no secrets.
+# So: check out kin-db, point its kin-model dependency at this PR head, and run
+# kin-db's suite. Which kin-db is main, unless the PR body names a branch for
+# the one case main cannot compile against yet; see the resolve step below.
+#
+# Both repos are public and the kin registry index is anonymously readable, so
+# kin-db's other registry dependencies resolve with no credentials and this
+# workflow needs no secrets.
 
 name: kin-db Compatibility
 
 on:
   pull_request:
+    # `edited` because the ref is read from the PR body, and a body edited
+    # after the PR opened would otherwise never be re-read: the check would
+    # keep reporting a verdict from the body as it was at open.
+    # `pr-text-hygiene.yml` in this repo carries the same trigger for the same
+    # reason.
+    types: [opened, reopened, synchronize, edited]
     branches: [main]
     paths:
       # Any type change at all, rather than an enumerated list of the files
@@ -30,6 +39,10 @@ on:
       - "src/**"
       - "Cargo.toml"
       - ".github/workflows/kin-db-compat.yml"
+      # The resolver decides WHICH kin-db grades a PR, so a change to it has to
+      # be graded by the gate it steers. Omitting this would let the one file
+      # that picks the consumer change without the consumer ever being built.
+      - ".github/scripts/**"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -48,12 +61,60 @@ jobs:
         with:
           path: kin-model
 
-      - name: Check out kin-db at main
+      # Which kin-db grades this PR. `main` for almost every change, and the
+      # branch a PR body names for the one kind that main cannot compile
+      # against yet: a field ADDED to a type kin-db builds by exhaustive struct
+      # literal. kin-db main cannot take such a field until the kin-model
+      # version carrying it is published, and this gate would not let that
+      # version land, so neither side could go first. The resolver's own
+      # docstring carries the full reasoning and the refusal rules, and
+      # `tests/kin_db_compat_ref.rs` pins its behaviour.
+      - name: Resolve which kin-db grades this PR
+        id: compat_ref
+        env:
+          # Through the environment rather than inline, so a PR body cannot
+          # become shell.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          ref="$(printf '%s' "$PR_BODY" \
+            | python3 kin-model/.github/scripts/resolve-kin-db-compat-ref.py)"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "resolved kin-db ref: $ref"
+
+      - name: Check out kin-db
         uses: actions/checkout@v6
         with:
           repository: firelock-ai/kin-db
-          ref: main
+          # `refs/heads/` explicitly, so the value is resolved as a BRANCH by
+          # the checkout action rather than left to its own classification.
+          # actions/checkout reads a bare 40 or 64 character hex ref as a
+          # commit, and honours refs/pull/<n>/head; the resolver refuses both,
+          # and this makes the intent unambiguous on the other side too.
+          ref: refs/heads/${{ steps.compat_ref.outputs.ref }}
           path: kin-db
+
+      # A reader of this check has to be able to see WHICH kin-db graded the
+      # PR. Without this the gate reads identically whether it built main or a
+      # coordinated branch, and "the consumer still builds" means two different
+      # things in those two cases.
+      - name: Report which kin-db graded this PR
+        working-directory: kin-db
+        env:
+          RESOLVED_REF: ${{ steps.compat_ref.outputs.ref }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          printf 'graded against firelock-ai/kin-db ref=%s sha=%s\n' "$RESOLVED_REF" "$sha"
+          {
+            echo "### Downstream consumer graded"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| repository | \`firelock-ai/kin-db\` |"
+            echo "| ref | \`$RESOLVED_REF\` |"
+            echo "| sha | \`$sha\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install Rust toolchain
         uses: ./kin-model/.github/actions/rust-toolchain
