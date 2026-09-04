@@ -83,3 +83,9 @@ KIN_RECEIVER_HOP_FOCAL
 KIN_LKG_STORE
 KIN_LKG_REPO
 KIN_LKG_WORKSPACE
+# Read only by the #[ignore]d FIR-3064 decode-versus-fold harness in
+# src/graph_section.rs: one names the repository root it opens, the other picks
+# between its combined and split modes. The test refuses to run without the
+# first, no runtime behaviour keys on either, and nothing an operator sets.
+KIN_FOLD_SPLIT_REPO
+KIN_FOLD_SPLIT_MODE

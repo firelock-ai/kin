@@ -23,6 +23,7 @@ pub mod error;
 pub mod exact_tree;
 pub mod file_limit;
 pub mod git_init;
+pub mod graph_section;
 pub mod hooks;
 pub mod hydration_semantics;
 pub mod identity;

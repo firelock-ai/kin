@@ -434,6 +434,18 @@
       ]
     },
     {
+      "file": "crates/kin-core/src/graph_section.rs",
+      "reason": "Repository authority lease accessor, not a filesystem probe. The one scanned `.metadata()` is `RepositoryAuthorityState::metadata()`, which returns the graph-owned repository-v6 authority envelope; this module reads the workspace set out of it to find one workspace's base target and semantic overlay. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. Nothing in this module answers from the filesystem: it reports whether an open serves a workspace base from the persisted materialized graph section or folds it out of history, and every fact it reports comes from the authority envelope and the change map header the open already holds. Pinned by exact occurrence count rather than by exempting the surrounding function body, so any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified. The module's only filesystem primitives are in `#[cfg(test)]` code the scan does not read: a Git fixture that seeds a repository for the section-detection test, and the ignored FIR-3064 open-cost harness, which discovers a store named by an environment variable and shells out to `ps` for a resident-set reading.",
+      "owner": "kin-core",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 1
+        }
+      ]
+    },
+    {
       "file": "crates/kin-core/src/last_admission.rs",
       "reason": "Durable bookkeeping marker published beside the authority head, not an answer authority. The excused bodies read and write .kin/kindb/last-admission, which records when a complete exact-tree admission last succeeded and how many artifacts it covered. It is written only where an admission actually completed and read only by freshness surfaces, which is what lets `kin graph status` state how far graph truth has fallen behind instead of printing an all-clear over a store admitted months ago. The record names no entity, carries no repository content, and cannot change what any query returns: a reader that lied in either direction would change only the wording of a freshness line, never a locate, search, context, trace, review, or xref answer. Publication is a temp-and-rename with an fsync of the staged file and then of the containing directory, the same shape write_generation_marker and read_generation_marker in crates/kin-daemon/src/state.rs use for the authority head marker this sits beside, and the two cfg-gated sync_directory_metadata bodies are that directory fsync. Routing through a shared boundary helper instead was not available: kin-core exposes no public atomic-write path, and config.rs, registry.rs, and the daemon's state.rs each open-code their own. Function-scoped rather than whole-file so the rest of the module stays scanned, including the three-way read classification and the age arithmetic the surfaces render, and so any newly added filesystem primitive here fails the guard until it is justified.",
       "owner": "kin-core",

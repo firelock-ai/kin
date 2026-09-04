@@ -47,6 +47,17 @@ pub struct GraphCommandResponse {
     /// and an older daemon sends none at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relation_census: Option<kin_core::relation_census::RelationCensusComparison>,
+    /// Whether this store serves its workspace base from the persisted graph
+    /// section or folds it out of history at every open.
+    ///
+    /// Carried structurally as well as in `lines` for the reason the two fields
+    /// above are: `kin doctor` reads the state rather than parsing prose out of
+    /// a terminal rendering. Optional because a subcommand that reports no
+    /// store state has none, and because an older daemon sends none at all,
+    /// which the doctor row reports as a stale daemon rather than as a healthy
+    /// store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_section: Option<kin_core::graph_section::GraphSectionState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -600,8 +611,28 @@ fn build_graph_status_response_for_store(
     // the health report, which used to take its own and clone every entity in
     // the graph a second time.
     let entities = graph.list_all_entities()?;
+    // One authority open for this whole response, and the section state read
+    // off it.
+    //
+    // Opened here rather than left to the health inspection below because two
+    // readers of the same store must not be two opens of it: each open
+    // re-verifies every persisted body, which is the cost `kin graph status` is
+    // already known for. The wrapper handed downward resolves to this exact
+    // open, so the artifact coverage and the section state describe one
+    // publication rather than two reads that merely ran close together. On a
+    // daemon both already resolved to its shared open and nothing changes; on a
+    // one-shot CLI invocation this removes an open rather than adding one.
+    let opened = authority.open()?;
+    let graph_section = opened.graph_section_state();
+    let coherent = {
+        let opened = std::sync::Arc::clone(&opened);
+        super::repository_authority::RequestRepositoryAuthority::shared(
+            authority.binding().clone(),
+            std::sync::Arc::new(move || Ok(std::sync::Arc::clone(&opened))),
+        )
+    };
     let mut health =
-        inspect_graph_with_entities(authority, graph, &entities, Some(embed_status.pending))?;
+        inspect_graph_with_entities(&coherent, graph, &entities, Some(embed_status.pending))?;
 
     // An external reference target is a node this repository references without
     // owning: no file, no span, no signature, and a uniform kind. Counting it
@@ -1020,6 +1051,15 @@ fn build_graph_status_response_for_store(
         ));
     }
 
+    // What every counter above cost to produce, which until this line no kin
+    // surface stated at all. A store with no usable graph section folds its
+    // whole base out of history at every open, kin-db logs that at `trace` and
+    // the daemon runs at `info`, so an operator on the slow path had nothing to
+    // read. This line says which arm the open took and how big the fold is; it
+    // decides nothing and writes nothing.
+    lines.push(String::new());
+    lines.push(graph_section.status_line());
+
     // How much of the parsed reference surface reached the graph. Every counter
     // above describes what the graph HOLDS; none of them could say what it is
     // MISSING, so a graph carrying a fifth of its call edges reported density
@@ -1150,6 +1190,7 @@ fn build_graph_status_response_for_store(
         source: None,
         reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
         relation_census: Some(census_comparison),
+        graph_section: Some(graph_section),
     })
 }
 
@@ -1367,6 +1408,7 @@ fn build_graph_validate_response(
         source: None,
         reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
         relation_census: None,
+        graph_section: None,
     })
 }
 
@@ -1391,6 +1433,7 @@ fn build_graph_inspect_response(
             source: None,
             reference_edge_coverage: None,
             relation_census: None,
+            graph_section: None,
         });
     }
 
@@ -1439,6 +1482,7 @@ fn build_graph_inspect_response(
         source: None,
         reference_edge_coverage: None,
         relation_census: None,
+        graph_section: None,
     })
 }
 
@@ -1605,6 +1649,7 @@ pub fn build_graph_source_response(
                 source: Some(record),
                 reference_edge_coverage: None,
                 relation_census: None,
+                graph_section: None,
             })
         }
         EntitySourceOutcome::NotFound(message) => Ok(GraphCommandResponse {
@@ -1613,6 +1658,7 @@ pub fn build_graph_source_response(
             source: None,
             reference_edge_coverage: None,
             relation_census: None,
+            graph_section: None,
         }),
         // A valid entity with no retrievable source is an error for the text/`?`
         // command paths (the CLI `kin graph source` and `trace_data_flow`, which

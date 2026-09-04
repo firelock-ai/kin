@@ -4998,6 +4998,11 @@ impl DaemonState {
                 }
             }
         };
+        // Prepared-state serves counted before and after the phase below, which
+        // is the only way to know that arm ran: the counter lives inside kin-db
+        // and a durable prepared artifact answers before the section is
+        // consulted at all.
+        let prepared_serves_before = authority.prepared_workspace_graph_stats().serves;
         let workspace_snapshot = phases
             .record("workspace_snapshot", || {
                 lease.workspace_graph_snapshot(&workspace_id)
@@ -5009,6 +5014,47 @@ impl DaemonState {
                     repository_id, workspace_id
                 )))
             })?;
+        // Which arm the phase above took, and what it cost.
+        //
+        // This phase was the largest term of a cold open on the kin store, 47
+        // seconds of 95, and it was completely silent: kin-db logs an absent
+        // section at `trace!` and this daemon runs at `info`, so an operator
+        // watching a slow reopen had nothing to read but a duration. `info`
+        // rather than `debug` for the reason the `authority_open` line above it
+        // is: a level nobody turns on is a line nobody reads.
+        //
+        // The prepared arm is observed. The section-versus-fold question is not
+        // observed but asked, with kin-db's own predicate against kin-db's own
+        // resolved base, so this cannot report an arm different from the one
+        // just taken.
+        //
+        // Read AFTER the phase on purpose. A store that folded has decoded its
+        // change map as a side effect of folding, and that decode is what makes
+        // the exact fold count free here; asked before the phase, the same call
+        // would have to report an upper bound or pay for the answer itself.
+        let prepared_served =
+            authority.prepared_workspace_graph_stats().serves > prepared_serves_before;
+        let graph_section = kin_core::graph_section::read(&lease, &workspace_id);
+        let open_arm = if prepared_served {
+            "prepared"
+        } else {
+            graph_section.arm()
+        };
+        info!(
+            repository = %repository_id,
+            workspace = %workspace_id,
+            arm = open_arm,
+            section_present = graph_section.section_present,
+            section_refusal = graph_section.refusal.as_deref().unwrap_or("none"),
+            folded_changes = if open_arm == "fold" {
+                graph_section.fold.changes()
+            } else {
+                0
+            },
+            folded_changes_bound = graph_section.fold.bound(),
+            changes_in_store = graph_section.changes_in_store,
+            "resolved the workspace base graph"
+        );
         let text_index_path = layout.text_index_dir();
         let locate_only = Self::locate_only_snapshot_mode();
         let generation = lease.roots().generation;
