@@ -114,6 +114,17 @@ pub enum DaemonError {
     #[error("{0}")]
     RepoOwnedByAnotherDaemon(String),
 
+    /// Paths whose exact bytes are already durable authority and whose
+    /// semantics could not be re-derived from them.
+    ///
+    /// Typed rather than folded into [`Io`](Self::Io) because the two need
+    /// different answers. Membership is not in doubt here and nothing needs
+    /// repairing; what the caller has to say is that the graph will answer
+    /// about these files at positions their bytes no longer hold, and it has to
+    /// name them.
+    #[error("{0}")]
+    SemanticReadmissionFailed(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
