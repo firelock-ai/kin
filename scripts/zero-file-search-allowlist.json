@@ -1154,6 +1154,305 @@
       "reason": "Inline TODO/FIXME/HACK extraction, per the module's own doc, and the one genuine recursive source-tree walk among the six directories: read_dir, recurse on is_dir, read_to_string every file with a matching extension, depth-bounded. It is legal today and that was checked rather than assumed: both live callers, `work.rs:895` for `kin work todo-import` and `handlers/work.rs:570` for the agent-facing `kin_todo_import` MCP tool, persist every extracted marker through `create_work_item` and return counts, so the walk builds graph-owned truth, which the rule permits. It is one caller away from illegal: the day something returns the extracted list instead of importing it, this walk becomes the answer. That is exactly why it needs an owner and a date rather than a crate-wide silence. Converted from the whole-directory BOUNDARY_DIRS entry `crates/kin-parser/` on 2026-09-03, which carried no owner, no expiry and no reason. That directory covered 33 .rs files, 20 of them on the scanned runtime path, and only 1 contain any filesystem primitive at all, so the exemption was several times wider than anything it protected. Every other file in that crate is now scanned by default, including any added later.",
       "owner": "kin-parser",
       "expiration": "2027-09-24"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/setup.rs",
+      "reason": "The installer. `kin setup` writes MCP client configurations, installs binaries and language servers, and keeps an install ledger, which is the largest filesystem surface in the CLI at 445 reported sites and answers no locate, search, context, trace, review or xref query. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-23"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/update.rs",
+      "reason": "The updater: downloads, verifies and swaps the installed binaries, holding file locks over the install root. 359 sites, all install-time IO, and it resolves no semantic query. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-23"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/update_windows.rs",
+      "reason": "The Windows half of the updater, per its own doc: path binding and private preflight directories for candidate programs that are statically inspected and never launched. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-23"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/setup_verify.rs",
+      "reason": "Proves a written MCP client config can actually reach Kin, per its own doc (FIR-1882). The subprocess sites are that proof: it launches the client path it just wrote to confirm the wiring, rather than answering anything. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-23"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/language_server_release.rs",
+      "reason": "Installs a language server from its project's own release binaries, per its own doc, for a host carrying none of the toolchains the package route needs. Download and unpack IO. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-23"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/language_servers.rs",
+      "reason": "Reports which language servers this build enriches with and how to install them, per its own doc. The subprocess sites probe for installed servers. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-23"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/publish.rs",
+      "reason": "Release publication transport. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-23"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/release_orch.rs",
+      "reason": "The cross-repo release orchestrator, per its own doc: it drives a bottom-up publish wave across repositories. Subprocess and workspace IO, no query. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-23"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/release_cmd.rs",
+      "reason": "Release command surface. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-23"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/verify.rs",
+      "reason": "Release artifact verification, via subprocess. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-23"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/bench.rs",
+      "reason": "Benchmark harness entry point. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/bench_meta.rs",
+      "reason": "Benchmark metadata collection. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/init.rs",
+      "reason": "Clean-slate repository authority initialization, per its own doc: `kin init` captures a Git worktree as exact reachable history. It runs before graph truth for that repository exists, which is the ingestion boundary the rule allows explicitly. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-05-21"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/clone.rs",
+      "reason": "Exact Git transport followed by atomic repository-v6 admission, per its own doc. Ingestion boundary. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-05-21"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/eject.rs",
+      "reason": "Leaving Kin through one exact repository-v6 to Git projection, per its own doc, which adds that eject never treats working files or an ambient `.git/` as repository authority. Materialization out, not answer-by-search. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-05-21"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/git.rs",
+      "reason": "Exact repository-v6 projection into a new Git repository, per its own doc, which states Git is an interoperability projection and never an authority fallback. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-05-21"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/backup.rs",
+      "reason": "Store backup and restore IO over `.kin/`. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-05-21"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/admit.rs",
+      "reason": "Wire types and CLI transport for requesting one exact-tree admission, per its own doc. The single site is subprocess, not a read. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-05-21"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/commit.rs",
+      "reason": "The commit surface. Two of its three sites are the authority-lease `.metadata()` accessor rather than a filesystem probe, the collision FIR-3162 tracks; the third is subprocess. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-05-21"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/commit_progress.rs",
+      "reason": "What `kin commit` shows while the daemon commits, per its own doc. Progress rendering and the daemon's own progress file, never repository content. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-05-21"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/reconcile.rs",
+      "reason": "The explicit repository-v6 session observation boundary, and its own doc is the justification: it is the only runtime path permitted to observe editable session bytes, and it never answers a semantic query from the filesystem. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-05-21"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/projection.rs",
+      "reason": "Which of three ways Kin is showing graph truth as ordinary files, per its own doc. It reports on and manages projections; the graph stays the authority. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-05-21"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/prepared_state.rs",
+      "reason": "Prepared-state reuse and reopen bookkeeping over `.kin/`. Kin-owned state files, not repository content. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-05-21"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/daemon.rs",
+      "reason": "`kin daemon`: inspect and gracefully stop the daemon topology, per its own doc. Its sites are the daemon's own pid, port and socket records. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/session_run.rs",
+      "reason": "Runs a process inside an exact graph-derived session workspace, per its own doc: the daemon materializes repository-authority bodies and this launches into them. The subprocess IS the product. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/agent.rs",
+      "reason": "`kin agent`: runs a task through Kin's own agent loop, per its own doc, writing the run's output directory. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/assistant.rs",
+      "reason": "Assistant launch surface. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/assistant_adapter.rs",
+      "reason": "One adapter per assistant CLI in a registry, per its own doc, owning the launch program and capability profile. All three sites are that launch. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/auth.rs",
+      "reason": "Local credential storage and the token file it owns. No repository content and no query result. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/allow.rs",
+      "reason": "`kin allow`: records an explicit approval for one blocked sensitive artifact, per its own doc. It reads the named path to confirm the digest admission refused, which is an admission boundary. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/cache.rs",
+      "reason": "`kin cache`: inspects and bounds the on-disk embedding cache, per its own doc. The traversal is over `~/.kin/cache/embeddings`, which is Kin's own derived data, never repository source. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/telemetry.rs",
+      "reason": "Telemetry consent and the local consent marker. Opt-in and local-first. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/locate_telemetry.rs",
+      "reason": "Opt-in local telemetry for `kin locate`, per its own doc: default off, gated on an env var or a `.kin/telemetry/consent` marker. The marker check is the gate, not the answer. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/store_footprint.rs",
+      "reason": "What the store costs on disk beside the Git object store it was admitted from, per its own doc. It measures sizes; it reads no content and answers no semantic query. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/graph_export.rs",
+      "reason": "The consumer-facing projection of the live graph, per its own doc, which records that it replaced a render payload built by reading a snapshot off disk. The single remaining site is the export's own output path. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/managed_config_scope.rs",
+      "reason": "The scope boundary for managed-config discovery, per its own doc: managed MCP client configs are addressed from the home directory. Both sites canonicalize that scope so IO cannot escape it, which is the boundary enforcing itself. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/locate_cursor.rs",
+      "reason": "The per-repo paging cursor for `kin locate --next`, per its own doc. It holds a continuation token, never repository content, and a miss restarts paging rather than answering. Read, written and cleared here, and those three expressions are the whole of its filesystem surface. PINNED rather than whole-file, and that distinction is the correction this entry exists to record. `scripts/zero_file_search_guard.sh` enforced this module before FIR-2282, with these exact expressions declared in its own `allow_for`. A whole-file entry drops the path during that guard's enumeration, one step before the deferral logic, so the first cut of FIR-2282 left neither guard scanning it: a coverage REGRESSION inside the change that widens coverage, found by review. Pinning keeps both guards on every other line of the file, which is what the shell guard already had.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18",
+      "allow_match": [
+        "std::fs::read_to_string(&path)",
+        "let _ = std::fs::write(&path, cursor);",
+        "let _ = std::fs::remove_file(&path);"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/commands/locate_debug.rs",
+      "reason": "`kin locate-debug`: the offline signal-breakdown reader, per its own doc. The single read is the dump file an operator names on the command line, never repository content. PINNED rather than whole-file, and that distinction is the correction this entry exists to record. `scripts/zero_file_search_guard.sh` enforced this module before FIR-2282, with these exact expressions declared in its own `allow_for`. A whole-file entry drops the path during that guard's enumeration, one step before the deferral logic, so the first cut of FIR-2282 left neither guard scanning it: a coverage REGRESSION inside the change that widens coverage, found by review. Pinning keeps both guards on every other line of the file, which is what the shell guard already had.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18",
+      "allow_match": [
+        "std::fs::read_to_string(path)"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/commands/contextbench_locate.rs",
+      "reason": "The benchmark task-input boundary: it reads the task file a benchmark run names. That file is the harness's input, not repository content, and no locate result derives from it. PINNED rather than whole-file, and that distinction is the correction this entry exists to record. `scripts/zero_file_search_guard.sh` enforced this module before FIR-2282, with these exact expressions declared in its own `allow_for`. A whole-file entry drops the path during that guard's enumeration, one step before the deferral logic, so the first cut of FIR-2282 left neither guard scanning it: a coverage REGRESSION inside the change that widens coverage, found by review. Pinning keeps both guards on every other line of the file, which is what the shell guard already had.",
+      "owner": "kin-cli",
+      "expiration": "2027-06-18",
+      "allow_match": [
+        "std::fs::read_to_string(&task_file)"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/commands/status.rs",
+      "reason": "Coherent repository-v6 status, and its own doc is the point: every count comes from one immutable authority lease and nothing here inspects checkout contents, Git or legacy sidecars. NOT a filesystem call. The reported `.metadata()` is `RepositoryAuthorityState::metadata()`, which returns the graph-owned repository-v6 authority envelope; this module reads workspace, alias, external-object or merge-transaction state out of it. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here, and pinning by exact occurrence count rather than exempting the file keeps every other line scanned. Measured across the whole scan on 2026-09-04, 57 of 78 `.metadata()` hits are this in-memory accessor rather than a filesystem probe. Tracked as FIR-3162, which makes the pattern precise; these pins retire with it.",
+      "owner": "kin-cli",
+      "expiration": "2027-01-29",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/commands/diff.rs",
+      "reason": "Exact repository-v6 diffs, per its own doc: one immutable authority lease and two graph-owned endpoint states. NOT a filesystem call. The reported `.metadata()` is `RepositoryAuthorityState::metadata()`, which returns the graph-owned repository-v6 authority envelope; this module reads workspace, alias, external-object or merge-transaction state out of it. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here, and pinning by exact occurrence count rather than exempting the file keeps every other line scanned. Measured across the whole scan on 2026-09-04, 57 of 78 `.metadata()` hits are this in-memory accessor rather than a filesystem probe. Tracked as FIR-3162, which makes the pattern precise; these pins retire with it.",
+      "owner": "kin-cli",
+      "expiration": "2027-01-29",
+      "allow_match": [
+        ".metadata()"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/commands/log.rs",
+      "reason": "Immutable repository-v6 history reads, per its own doc, which states it never asks Git or legacy branch sidecars. NOT a filesystem call. The reported `.metadata()` is `RepositoryAuthorityState::metadata()`, which returns the graph-owned repository-v6 authority envelope; this module reads workspace, alias, external-object or merge-transaction state out of it. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here, and pinning by exact occurrence count rather than exempting the file keeps every other line scanned. Measured across the whole scan on 2026-09-04, 57 of 78 `.metadata()` hits are this in-memory accessor rather than a filesystem probe. Tracked as FIR-3162, which makes the pattern precise; these pins retire with it.",
+      "owner": "kin-cli",
+      "expiration": "2027-01-29",
+      "allow_match": [
+        ".metadata()"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/commands/ref_grammar.rs",
+      "reason": "The one endpoint grammar every read surface speaks, per its own doc, shared by `kin diff`, `kin blame --ref` and `kin history --ref`. NOT a filesystem call. The reported `.metadata()` is `RepositoryAuthorityState::metadata()`, which returns the graph-owned repository-v6 authority envelope; this module reads workspace, alias, external-object or merge-transaction state out of it. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here, and pinning by exact occurrence count rather than exempting the file keeps every other line scanned. Measured across the whole scan on 2026-09-04, 57 of 78 `.metadata()` hits are this in-memory accessor rather than a filesystem probe. Tracked as FIR-3162, which makes the pattern precise; these pins retire with it.",
+      "owner": "kin-cli",
+      "expiration": "2027-01-29",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/commands/repository_authority.rs",
+      "reason": "Coherent read access to the active repository-v6 authority, per its own doc, used instead of reconstructing refs or workspace state from legacy sidecars. NOT a filesystem call. The reported `.metadata()` is `RepositoryAuthorityState::metadata()`, which returns the graph-owned repository-v6 authority envelope; this module reads workspace, alias, external-object or merge-transaction state out of it. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here, and pinning by exact occurrence count rather than exempting the file keeps every other line scanned. Measured across the whole scan on 2026-09-04, 57 of 78 `.metadata()` hits are this in-memory accessor rather than a filesystem probe. Tracked as FIR-3162, which makes the pattern precise; these pins retire with it.",
+      "owner": "kin-cli",
+      "expiration": "2027-01-29",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 2
+        }
+      ]
     }
   ]
 }
