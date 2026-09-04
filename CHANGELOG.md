@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-09-04
+
+### Changed
+
+- Say which half of readiness refused, and how long it waited (#1486)
+
+
 ## [0.6.7] - 2026-09-04
 
 ### Changed

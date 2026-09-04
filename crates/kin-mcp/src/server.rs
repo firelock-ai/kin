@@ -1581,7 +1581,7 @@ fn finalize_daemon_graph_status(
             );
         }
     };
-    let selected_env = base_env
+    let mut selected_env = base_env
         .with_selected_graph_observation(
             entity_count,
             indexed,
@@ -1590,6 +1590,14 @@ fn finalize_daemon_graph_status(
             report.durable_entity_count,
         )
         .with_memory_pressure(pressure_refusal.as_ref());
+    if let Some(stale) = report.stale.as_ref() {
+        selected_env = selected_env.with_selected_graph_staleness(
+            stale.reason.as_str(),
+            stale.settled_age_ms,
+            stale.observed_authority_epoch,
+            stale.live_attempts,
+        );
+    }
     let enveloped = envelope::finalize(result, selected_env, "kin_graph_status");
     if let Err(error) = daemon_delegate::parse_graph_status_report(&enveloped) {
         return envelope::finalize(
@@ -1788,6 +1796,75 @@ mod tests {
         assert_eq!(coverage.pending, 1);
         assert_eq!(coverage.total, 2);
         assert!(!coverage.complete);
+    }
+
+    /// A replayed status sample must own the envelope's freshness reading.
+    ///
+    /// The first-contact run received counters from 359601 ms earlier beside
+    /// `_kin.freshness.state=recorded` and `age_seconds=6`, because the latter
+    /// came from HEAD admission health. A reader scanning the standard envelope
+    /// therefore saw a fresh-looking status over an empty past graph.
+    #[test]
+    fn replayed_graph_status_marks_the_standard_envelope_stale() {
+        let stale_result = ToolCallResult::text(
+            serde_json::json!({
+                "schema": "kin.graph-status.v1",
+                "view": "daemon_selected_graph",
+                "scope": "head",
+                "authority": "repo-daemon",
+                "sampling": "last_settled_selected_graph",
+                "authority_epoch": 7,
+                "entity_count": 0,
+                "durable_entity_count": 0,
+                "relation_count": 0,
+                "embedding_source": "selected_graph",
+                "embeddings_indexed": 0,
+                "embeddings_pending": 0,
+                "embeddings_total": 0,
+                "completion_attested": false,
+                "stale": {
+                    "reason": "embedding_coverage_changing",
+                    "settled_age_ms": 359601,
+                    "observed_authority_epoch": 8,
+                    "live_attempts": 3,
+                    "note": "the live sample was abandoned while embedding coverage changed"
+                }
+            })
+            .to_string(),
+        );
+        let admission_health = serde_json::json!({
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
+                "last_admission_success_at": "2026-09-04T14:00:00Z",
+                "last_admission_success_age_seconds": 6
+            }
+        });
+        let enveloped = finalize_daemon_graph_status(
+            stale_result,
+            Envelope::daemon().with_working_copy_health(&admission_health),
+            &[],
+            2,
+        );
+        let report = daemon_delegate::parse_graph_status_report(&enveloped)
+            .expect("the stdio contract validates")
+            .expect("the status call succeeds");
+        let freshness = serde_json::to_value(
+            report
+                .response_envelope
+                .expect("stdio status carries an envelope")
+                .freshness
+                .expect("a replayed sample carries freshness"),
+        )
+        .unwrap();
+        assert_eq!(freshness["state"], "stale");
+        assert_eq!(freshness["basis"], "selected_graph_sample");
+        assert_eq!(freshness["settled_age_ms"], 359601);
+        assert_eq!(freshness["live_attempts"], 3);
+        assert!(
+            freshness.get("age_seconds").is_none(),
+            "the unrelated six-second admission clock must not survive: {freshness}"
+        );
     }
 
     #[test]

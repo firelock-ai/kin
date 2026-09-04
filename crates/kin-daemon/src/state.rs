@@ -2961,6 +2961,18 @@ pub struct DaemonState {
     /// The backend independently keeps a pass-wide incomplete lease; this gate
     /// prevents daemon request paths from racing that lease with a new ingest.
     spine_refresh_gate: tokio::sync::RwLock<()>,
+    /// How long the most recent reader waited to take `spine_refresh_gate`,
+    /// in microseconds. Written by `acquire_spine_read_authority`, read by
+    /// `/readiness` so a refusal can say whether it was waiting on this lock.
+    ///
+    /// It exists because the alternative is guessing. On 2026-09-04 a hosted
+    /// daemon bound its port at 464 s, then failed its rollout without ever
+    /// reporting ready, and nothing on the daemon side recorded why: the
+    /// refresh passes that hold this gate for write ran back to back for the
+    /// whole window, and a tokio RwLock is write-preferring, but no evidence
+    /// separated that from the rest of the authority check. One relaxed store
+    /// on a path that already awaits a lock is cheap enough to keep always on.
+    spine_gate_read_wait_micros: std::sync::atomic::AtomicU64,
     /// Maps repo_id to a lazily-loaded graph. Graphs are loaded from the
     /// storage backend on first access. Only active when `storage_backend`
     /// is `Some` (cloud / multi-repo mode).
@@ -5211,6 +5223,7 @@ impl DaemonState {
             #[cfg(all(test, feature = "embeddings"))]
             vector_checkpoint_reopen_test_hook: Mutex::new(None),
             spine_refresh_gate: tokio::sync::RwLock::new(()),
+            spine_gate_read_wait_micros: std::sync::atomic::AtomicU64::new(0),
             repo_graphs: RwLock::new(HashMap::new()),
             repo_graph_load_gates: hosted_repo_reload_gates(),
             repo_graph_load_gate_hasher: RandomState::new(),
@@ -5569,6 +5582,7 @@ impl DaemonState {
             #[cfg(all(test, feature = "embeddings"))]
             vector_checkpoint_reopen_test_hook: Mutex::new(None),
             spine_refresh_gate: tokio::sync::RwLock::new(()),
+            spine_gate_read_wait_micros: std::sync::atomic::AtomicU64::new(0),
             repo_graphs: RwLock::new(HashMap::new()), // populated below
             repo_graph_load_gates: hosted_repo_reload_gates(),
             repo_graph_load_gate_hasher: RandomState::new(),
@@ -6444,7 +6458,12 @@ impl DaemonState {
     /// read. Hosted and local writers use the same gate, so the proof cannot be
     /// invalidated in the gap between readiness and response construction.
     pub(crate) async fn acquire_spine_read_authority(&self) -> Option<SpineAuthorityReadGuard<'_>> {
+        let gate_started = Instant::now();
         let publication_gate = self.spine_refresh_gate.read().await;
+        self.spine_gate_read_wait_micros.store(
+            u64::try_from(gate_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         if let Some(control) = self.publication_control.as_ref() {
             if let Err(error) =
                 control.assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
@@ -7059,6 +7078,15 @@ impl DaemonState {
     /// Whether a complete lazy spine initialization pass is in progress.
     pub fn spine_warming(&self) -> bool {
         self.spine_warming.load(Ordering::Relaxed)
+    }
+
+    /// How long the most recent `acquire_spine_read_authority` waited for the
+    /// publication gate. Zero before the first acquisition, and a diagnostic
+    /// rather than an input to any decision: readiness reports it so a refused
+    /// probe says whether the authority check was blocked on the refresh
+    /// passes that hold that gate for write.
+    pub fn last_spine_gate_read_wait(&self) -> Duration {
+        Duration::from_micros(self.spine_gate_read_wait_micros.load(Ordering::Relaxed))
     }
 
     #[cfg(test)]

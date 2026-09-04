@@ -223,8 +223,9 @@ pub(crate) struct ProjectionAuthorityCache {
     held: std::sync::Mutex<Option<HeldProjectionAuthority>>,
     query: std::sync::Mutex<Option<HeldQueryAuthority>>,
     command: std::sync::Mutex<Option<HeldCommandAuthority>>,
-    /// The admission pair every reconcile task needs, which is not a fourth
-    /// wrapper over the authority but two small values read out of one.
+    /// The admission values every reconcile task needs, plus the small
+    /// open-merge summary a commit gate needs. This is not a fourth wrapper
+    /// over the authority, only values read out of one.
     ///
     /// `current_authority_admission` wants a root bundle and a compiled
     /// admission matcher, and neither can differ between tasks inside one
@@ -277,6 +278,7 @@ struct HeldAdmission {
     published: LocalPublicationIdentity,
     roots: kin_model::RootBundle,
     policy: Option<kin_index::ResolvedAdmissionMatcher>,
+    open_merge: Option<crate::repository_merge_state::OpenMergeSummary>,
 }
 
 impl ProjectionAuthorityCache {
@@ -336,30 +338,15 @@ impl ProjectionAuthorityCache {
         });
     }
 
-    fn reuse_admission(
-        &self,
-        published: &LocalPublicationIdentity,
-    ) -> Option<(
-        kin_model::RootBundle,
-        Option<kin_index::ResolvedAdmissionMatcher>,
-    )> {
+    fn reuse_admission(&self, published: &LocalPublicationIdentity) -> Option<HeldAdmission> {
         lock_recover(&self.admission)
             .as_ref()
             .filter(|held| &held.published == published)
-            .map(|held| (held.roots.clone(), held.policy.clone()))
+            .cloned()
     }
 
-    fn install_admission(
-        &self,
-        published: LocalPublicationIdentity,
-        roots: kin_model::RootBundle,
-        policy: Option<kin_index::ResolvedAdmissionMatcher>,
-    ) {
-        *lock_recover(&self.admission) = Some(HeldAdmission {
-            published,
-            roots,
-            policy,
-        });
+    fn install_admission(&self, admission: HeldAdmission) {
+        *lock_recover(&self.admission) = Some(admission);
     }
 
     fn reuse_command(
@@ -616,15 +603,9 @@ fn command_repository_authority(
 /// at 2.205 seconds, which is what one open costs warm there. Neither value it
 /// reads can differ between tasks inside one publication, so the cost was paid
 /// per arrival for an answer that could not vary.
-pub(crate) fn cached_authority_admission(
+fn cached_authority_admission_entry(
     state: &DaemonState,
-) -> Result<
-    (
-        kin_model::RootBundle,
-        Option<kin_index::ResolvedAdmissionMatcher>,
-    ),
-    (StatusCode, String),
-> {
+) -> Result<HeldAdmission, (StatusCode, String)> {
     let backend = state.local_repository_backend().ok_or_else(|| {
         repository_authority_error("local daemon is missing its startup storage capability")
     })?;
@@ -634,8 +615,8 @@ pub(crate) fn cached_authority_admission(
     let repository_id = binding.repository_id().clone();
 
     let published = read_local_publication_identity(&backend, &repository_id)?;
-    if let Some(pair) = state.projection_authority.reuse_admission(&published) {
-        return Ok(pair);
+    if let Some(admission) = state.projection_authority.reuse_admission(&published) {
+        return Ok(admission);
     }
 
     let _load = lock_recover(&state.projection_authority.load_gate);
@@ -643,8 +624,8 @@ pub(crate) fn cached_authority_admission(
     // waited, and the label installed below must be the one taken before the
     // open it describes.
     let published = read_local_publication_identity(&backend, &repository_id)?;
-    if let Some(pair) = state.projection_authority.reuse_admission(&published) {
-        return Ok(pair);
+    if let Some(admission) = state.projection_authority.reuse_admission(&published) {
+        return Ok(admission);
     }
 
     let context =
@@ -654,20 +635,73 @@ pub(crate) fn cached_authority_admission(
         .open()
         .map_err(|error| repository_authority_error(error.to_string()))?;
     state.projection_authority.record_load();
-    let roots = authority.read_authority().roots().clone();
+    let lease = authority.read_authority();
+    let roots = lease.roots().clone();
+    let open_merge =
+        crate::repository_merge_state::open_merge_summary(&lease, context.workspace_id());
+    drop(lease);
     let policy = authority
         .workspace_admission_snapshot(context.repository_id(), &context.workspace_id())
         .map_err(|error| repository_authority_error(error.to_string()))?
         .map(|snapshot| snapshot.matcher);
+    let admission = HeldAdmission {
+        published,
+        roots,
+        policy,
+        open_merge,
+    };
     state
         .projection_authority
-        .install_admission(published, roots.clone(), policy.clone());
+        .install_admission(admission.clone());
     tracing::debug!(
         repository = %repository_id,
         loads = state.projection_authority.loads(),
         "admission pair loaded"
     );
-    Ok((roots, policy))
+    Ok(admission)
+}
+
+pub(crate) fn cached_authority_admission(
+    state: &DaemonState,
+) -> Result<
+    (
+        kin_model::RootBundle,
+        Option<kin_index::ResolvedAdmissionMatcher>,
+    ),
+    (StatusCode, String),
+> {
+    let admission = cached_authority_admission_entry(state)?;
+    Ok((admission.roots, admission.policy))
+}
+
+fn refuse_commit_during_open_merge(state: &DaemonState) -> Result<(), (StatusCode, String)> {
+    let admission = cached_authority_admission_entry(state)?;
+    let Some(open_merge) = admission.open_merge else {
+        return Ok(());
+    };
+    let resolved_count = open_merge.conflict_count - open_merge.unresolved_count;
+    let completion = if open_merge.unresolved_count == 0 {
+        "publish it with `kin resolve --do-continue`".to_string()
+    } else {
+        format!(
+            "settle its remaining {} conflict(s) with `kin resolve`, then publish it with `kin \
+             resolve --do-continue`",
+            open_merge.unresolved_count
+        )
+    };
+    Err((
+        StatusCode::CONFLICT,
+        format!(
+            "commit refused: merge transaction {} for {} into {} is still open ({} of {} \
+             conflict(s) settled); {completion}, or abandon it with `kin resolve --abort` before \
+             committing",
+            open_merge.transaction,
+            open_merge.source_ref,
+            open_merge.target_ref,
+            resolved_count,
+            open_merge.conflict_count,
+        ),
+    ))
 }
 
 /// Hand a command helper an authority this daemon already resolved.
@@ -3880,11 +3914,13 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let initialized = state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed);
+    let authority_started = Instant::now();
     let hosted_spine_ready = if initialized && state.hosted_spine_readiness_required() {
         state.acquire_spine_read_authority().await.is_some()
     } else {
         true
     };
+    let authority_wait = authority_started.elapsed();
     let warming = state.spine_warming() || (initialized && !hosted_spine_ready);
 
     if initialized && hosted_spine_ready {
@@ -3896,6 +3932,34 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
             }),
         )
     } else {
+        // Say which half refused, and how long the authority check spent
+        // waiting, because a refusal that says nothing is how a rollout gets
+        // read as a broken daemon.
+        //
+        // On 2026-09-04 a hosted daemon bound port 4219 at 464 s into its
+        // start, then failed its rollout 134 s later having never reported
+        // ready. Nothing in that pod's log said whether it was still
+        // uninitialized or whether the spine authority was refusing, and
+        // Kubernetes records only the status code, so the post-mortem could
+        // name a mechanism and not confirm it. This is the line that would
+        // have answered it.
+        //
+        // WARN rather than DEBUG on purpose: a hosted daemon that cannot
+        // serve is the operator's problem whether or not anyone raised the
+        // log level first, and this stops as soon as the daemon is ready.
+        tracing::warn!(
+            initialized,
+            hosted_spine_ready,
+            warming,
+            refused_on = if !initialized {
+                "initialization"
+            } else {
+                "hosted spine authority"
+            },
+            authority_wait_ms = authority_wait.as_millis() as u64,
+            spine_gate_wait_ms = state.last_spine_gate_read_wait().as_millis() as u64,
+            "readiness refused"
+        );
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ReadinessResponse {
@@ -6163,6 +6227,10 @@ async fn command_commit(
         state.coordination_gate.lock(),
     )
     .await;
+    // A merge record is bound to the workspace generation that opened it.
+    // Refuse before forced admission can advance that generation and strand
+    // resolutions already persisted on the transaction.
+    refuse_commit_during_open_merge(&state)?;
     // The admission derives the exact tree from the working copy but does not
     // publish it. This commit's own transaction carries that tree transition
     // beside the semantic change, so one repository-authority successor is
@@ -42766,6 +42834,138 @@ mod tests {
         assert!(
             !readiness.warming,
             "an idle daemon must not claim to be warming"
+        );
+    }
+
+    // ── A refusal has to say what refused ────────────────────────────────
+    //
+    // Kubernetes records the status code and nothing else. On 2026-09-04 a
+    // hosted daemon bound its port at 464 s, failed its rollout 134 s later
+    // without ever reporting ready, and the pod log carried no line saying
+    // whether it was still uninitialized or whether the spine authority was
+    // refusing. The post-mortem could name a mechanism and not confirm it.
+    //
+    // These two tests are a pair on purpose. The first fails if the line is
+    // removed or stops naming which half refused. The second fails if the
+    // line is emitted unconditionally, which would satisfy the first while
+    // making the log useless and noisy on every healthy probe.
+
+    /// Collects formatted tracing output so a test can assert on it.
+    #[derive(Clone)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(
+                &self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_readiness_says_which_half_refused() {
+        let captured = CapturedLog::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        // `set_default` is thread-local and `#[tokio::test]` runs the future on
+        // this thread, so the handler below writes into `captured`.
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        // `test_state()` opens a real repo, and `DaemonState::open` sets
+        // `is_initialized` from whether a snapshot loaded, so the fixture
+        // arrives ready. Put it back to the state a starting daemon is in, so
+        // the first half is what refuses.
+        let state = test_state();
+        state
+            .is_initialized
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let response = router(state)
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let logged = captured.text();
+        assert!(
+            logged.contains("readiness refused"),
+            "a 503 from /readiness must say so in the log; Kubernetes keeps only \
+             the status code, so an unlogged refusal is an unanswerable rollout \
+             failure. Captured output was: {logged:?}"
+        );
+        assert!(
+            logged.contains("refused_on=\"initialization\""),
+            "the refusal must name which half refused, so a reader does not have \
+             to guess between initialization and the spine authority. Captured \
+             output was: {logged:?}"
+        );
+        assert!(
+            logged.contains("spine_gate_wait_ms="),
+            "the refusal must report how long the authority check waited for the \
+             publication gate, which is the measurement that separates a slow \
+             open from starvation behind the refresh passes. Captured output \
+             was: {logged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ready_daemon_logs_no_readiness_refusal() {
+        let captured = CapturedLog::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let response = router(state)
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let logged = captured.text();
+        assert!(
+            !logged.contains("readiness refused"),
+            "a ready daemon must not log a refusal. The probe runs every few \
+             seconds for the life of the pod, so an unconditional line would \
+             bury the one case that matters. Captured output was: {logged:?}"
         );
     }
 

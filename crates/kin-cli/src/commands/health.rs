@@ -1267,7 +1267,9 @@ fn check_projection_mode() -> HealthCheck {
         }
     };
     let cwd = env::current_dir().unwrap_or_default();
-    let repo_root = kin_core::KinLayout::discover(&cwd)
+    let layout = kin_core::KinLayout::discover(&cwd);
+    let inside_repository = layout.is_some();
+    let repo_root = layout
         .map(|layout| layout.root().to_path_buf())
         .unwrap_or(cwd);
     let report = crate::commands::projection::report_for(
@@ -1278,7 +1280,7 @@ fn check_projection_mode() -> HealthCheck {
     );
     let outside = probe_outside_repo(home_dir().ok().as_deref(), report.shim.engaged);
     let hook = probe_shell_hook(&kin_home, detect_shell(), &report.shim.path);
-    projection_mode_check_for(&report, env::consts::OS, &outside, &hook)
+    projection_mode_check_for_context(&report, env::consts::OS, &outside, &hook, inside_repository)
 }
 
 /// Whether Kin's own shell hook is live in the shell that started this process.
@@ -1939,6 +1941,35 @@ fn projection_mode_check_for(
              available here"
         },
     )
+}
+
+/// Qualify the projection row by whether this doctor run has a repository to
+/// project. Kept as a separate seam so first-contact context can be tested
+/// without asking a fixture to discover the process working directory.
+fn projection_mode_check_for_context(
+    report: &crate::commands::projection::ProjectionReport,
+    os: &str,
+    outside: &OutsideRepoProbe,
+    hook: &ShellHook,
+    inside_repository: bool,
+) -> HealthCheck {
+    let check = projection_mode_check_for(report, os, outside, hook);
+    if !inside_repository && hook.is_live() && matches!(check.status, HealthStatus::Stale) {
+        return HealthCheck::new(
+            "projection_mode",
+            "Projection in force",
+            HealthStatus::Unsupported,
+            format!(
+                "this command is not inside a Kin repository, so there is no repository root for \
+                 the live shell hook to project; the hook itself is live; underlying probe: {}",
+                check.detail
+            ),
+        )
+        .with_platform_note(
+            "Run `kin doctor` from inside the Kin repository whose projection you want to check.",
+        );
+    }
+    check
 }
 
 /// Report staging an interrupted `kin init` left on disk, and where it stopped.
@@ -7975,6 +8006,37 @@ mod tests {
                 .is_some_and(|fix| fix.contains("new interactive shell")),
             "the no-hook fix is still the shell, and it is still the right one: {stale:?}"
         );
+    }
+
+    /// Outside a Kin repository there is no graph-backed root for a live hook
+    /// to project. That is expected context, not a stale install.
+    #[test]
+    fn a_live_hook_outside_a_repository_is_not_an_attention_row() {
+        let mut unbound = correctly_hooked_report();
+        unbound.live.unengaged_here_only = false;
+
+        let outside = projection_mode_check_for_context(
+            &unbound,
+            "macos",
+            &not_probed(),
+            &hook_live(),
+            false,
+        );
+        assert!(
+            matches!(outside.status, HealthStatus::Unsupported),
+            "outside a repository no projection can be in force, got {:?}: {}",
+            outside.status,
+            outside.detail
+        );
+        assert!(!needs_attention(&outside));
+        assert!(outside.detail.contains("not inside a Kin repository"));
+
+        // The falsification control: the same probe from inside a repository
+        // is still stale because its bound root is not serving this process.
+        let inside =
+            projection_mode_check_for_context(&unbound, "macos", &not_probed(), &hook_live(), true);
+        assert!(matches!(inside.status, HealthStatus::Stale));
+        assert!(needs_attention(&inside));
     }
 
     /// The negative controls for the green above. Each one removes a single
