@@ -21,3 +21,16 @@ which = "7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+
+# Not a real dependency of this crate. tinyvec 1.13.0, published 2026-09-03, does
+# not compile: src/tinyvec.rs:3 does `use alloc::vec::{self, Vec}`, which binds
+# `vec` to the module and shadows the `vec!` macro that line 710 then calls.
+# This repo gitignores Cargo.lock, so CI resolves fresh on every run and takes the
+# broken release, while a developer's older local lock still pins a good one. Same
+# tree, different resolution. tinyvec is reachable only transitively, through
+# kin-model -> gix-object -> gix-utils -> unicode-normalization,
+# so a direct requirement here is the only in-tree lever.
+# A bare "<1.13" does NOT work: it admits the 0.x line, so cargo takes tinyvec
+# 0.4.1 for this entry and leaves 1.13.0 in the graph for the transitive users.
+# Remove this entry once 1.13.0 is yanked or a fixed tinyvec is published.
+tinyvec = ">=1.6, <1.13"
