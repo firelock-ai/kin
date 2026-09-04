@@ -1551,6 +1551,7 @@ fn build_repository_bootstrap_transaction(
         local_overlay_delta: Some(FrozenLocalOverlayDelta::initialize(local_overlay)),
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
 
     if let Some(change_id) = initial_change_id {
@@ -3760,6 +3761,7 @@ mod tests {
         )
         .unwrap();
         assert!(prepared.bootstrap.is_none());
+        assert!(transaction.collaboration_delta.is_none());
         (prepared, transaction)
     }
 

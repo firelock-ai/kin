@@ -12653,6 +12653,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
 
         let error = validate_repository_projection_transaction(
@@ -13728,6 +13729,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         let marker = ReconciliationAuthorityCommit {
             repository_id: transaction.repository_id.clone(),
@@ -13864,6 +13866,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         let marker = ReconciliationAuthorityCommit {
             repository_id: transaction.repository_id.clone(),
@@ -14006,6 +14009,7 @@ mod tests {
             local_overlay_delta: None,
             merge_transaction_delta: None,
             sealed_observation: None,
+            collaboration_delta: None,
         };
         let competing_transaction = RepositoryTransaction {
             operation_id: OperationId::new(),

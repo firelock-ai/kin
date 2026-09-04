@@ -571,6 +571,7 @@ fn fast_forward(
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     publish(
         state,
@@ -818,6 +819,7 @@ fn three_way(
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     let mut execution = publish(
         state,
@@ -1190,6 +1192,7 @@ pub(crate) fn publish_resolved_merge(
             terminated.clone(),
         )),
         sealed_observation: None,
+        collaboration_delta: None,
     };
     transaction
         .validate()
@@ -2377,6 +2380,7 @@ fn open_conflicted_merge(
         local_overlay_delta: None,
         merge_transaction_delta: Some(delta),
         sealed_observation: None,
+        collaboration_delta: None,
     };
     transaction
         .validate()

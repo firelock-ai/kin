@@ -408,6 +408,7 @@ fn plan_and_commit(
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     transaction
         .validate()

@@ -306,6 +306,7 @@ fn bootstrap_probe_wide(files: usize, bytes_each: usize) {
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
     match transaction.validate() {
         Ok(()) => eprintln!("PROBE wide model validate: OK"),
@@ -490,6 +491,7 @@ fn bootstrap_probe(commits: usize) {
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
+        collaboration_delta: None,
     };
 
     // Model validation first, because a refusal here and a refusal from storage
