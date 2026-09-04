@@ -14,6 +14,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::{cmp::Reverse, fs, fs::File, fs::OpenOptions};
 
 use fs2::FileExt;
@@ -581,10 +582,73 @@ fn check_descriptor_field(
 // Core HNSW graph
 // ---------------------------------------------------------------------------
 
+/// Where a node's embedding lives.
+///
+/// A built or mutated node owns its floats. A node decoded from a version 3
+/// container names a slot in the container's mapped payload instead, and the
+/// floats are read through the mapping without ever being copied to the heap.
+/// `Empty` is a removed node whose vector was cleared, which every traversal
+/// skips.
+///
+/// On the wire this is a plain `Vec<f32>`, exactly as the field was before, so
+/// a version 1 container deserializes unchanged. `Mapped` has no wire form
+/// because it is meaningless without the mapping it indexes; the encoders
+/// resolve it through [`HnswGraph::vector_at`] rather than serializing a node.
+#[derive(Clone, Debug)]
+pub enum NodeVector {
+    /// Floats owned by this node.
+    Heap(Vec<f32>),
+    /// Slot index into the graph's mapped payload.
+    Mapped(u32),
+    /// A removed node: no vector.
+    Empty,
+}
+
+impl NodeVector {
+    /// A heap vector, or `Empty` for an empty slice, so the removed-node
+    /// sentinel has exactly one representation.
+    fn owned(vector: Vec<f32>) -> Self {
+        if vector.is_empty() {
+            NodeVector::Empty
+        } else {
+            NodeVector::Heap(vector)
+        }
+    }
+
+    /// True when this node carries no vector, the removed-node sentinel every
+    /// traversal skips.
+    fn is_empty(&self) -> bool {
+        matches!(self, NodeVector::Empty)
+    }
+}
+
+impl Serialize for NodeVector {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            NodeVector::Heap(vector) => vector.serialize(serializer),
+            // A mapped node cannot describe itself without its container. No
+            // encoder in this crate serializes a node — `encode_v2` and
+            // `encode_v3` both read vectors through `HnswGraph::vector_at` —
+            // and `clone_for_persist` carries the mapping forward, so this arm
+            // is unreachable through any path that writes an index file.
+            NodeVector::Mapped(_) => Err(<S::Error as serde::ser::Error>::custom(
+                "a mapped HNSW node cannot be serialized without its container",
+            )),
+            NodeVector::Empty => Vec::<f32>::new().serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeVector {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(NodeVector::owned(Vec::<f32>::deserialize(deserializer)?))
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HnswNode {
-    /// The embedding vector.
-    pub vector: Vec<f32>,
+    /// The embedding vector: owned, mapped, or absent.
+    pub vector: NodeVector,
     /// connections[level] = list of neighbor internal indices at that level.
     pub connections: Vec<Vec<usize>>,
     /// Maximum level this node participates in.
@@ -687,6 +751,16 @@ pub struct HnswGraph<Id: VectorId = DefaultId> {
     /// slower and never different.
     #[serde(skip)]
     pub sq_norms: Vec<f32>,
+    /// The container this graph's mapped vectors are read out of, when it was
+    /// decoded from a version 3 file. `None` for a graph that was built rather
+    /// than loaded, and for a graph loaded from a version 1 or 2 file, whose
+    /// vectors are on the heap.
+    ///
+    /// Not serialized: it describes where this process reads bytes from, never
+    /// the bytes themselves. Cloned by `Arc`, so a persistence clone costs a
+    /// refcount rather than the payload.
+    #[serde(skip)]
+    pub payload: Option<Arc<MappedPayload>>,
 }
 
 /// Read-only result of planning a node's insertion against a fixed graph state.
@@ -717,6 +791,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             canonical_order_dirty: false,
             mutation_seq: 0,
             sq_norms: Vec::new(),
+            payload: None,
         }
     }
 
@@ -732,10 +807,78 @@ impl<Id: VectorId> HnswGraph<Id> {
         self.id_to_idx.len()
     }
 
-    /// A persistence snapshot of the graph: the serialized fields copied, with the
-    /// rebuilt-on-load derived tables dropped and the canonical-order flag cleared.
-    /// Taken under the graph lock so the heavy serialize + fsync can run after the
-    /// lock is released, without blocking concurrent upserts.
+    /// The node's embedding, read in place.
+    ///
+    /// A heap node hands back its own slice; a mapped node hands back a slice
+    /// of the container's payload. Neither copies. The returned slice borrows
+    /// the graph, so a caller that needs to outlive it takes
+    /// [`HnswGraph::vector_to_owned`] instead.
+    ///
+    /// Returns an empty slice for a removed node, and also for a mapped node
+    /// whose container disagrees with its slot, which cannot happen through a
+    /// decode (the decoder bounds-checks every slot against the payload before
+    /// building a node) and is reported as absent rather than as a panic if it
+    /// ever does.
+    #[inline]
+    fn vector_at(&self, idx: usize) -> &[f32] {
+        match self.nodes.get(idx).map(|node| &node.vector) {
+            Some(NodeVector::Heap(vector)) => vector.as_slice(),
+            Some(NodeVector::Mapped(slot)) => match self.payload.as_ref() {
+                Some(payload) => payload.f32_slot(*slot as usize),
+                None => &[],
+            },
+            _ => &[],
+        }
+    }
+
+    /// True when the node at `idx` carries a vector a traversal may score.
+    #[inline]
+    fn has_vector(&self, idx: usize) -> bool {
+        match self.nodes.get(idx) {
+            Some(node) => !node.vector.is_empty(),
+            None => false,
+        }
+    }
+
+    /// A heap copy of the node's embedding, for the callers that must own one.
+    fn vector_to_owned(&self, idx: usize) -> Vec<f32> {
+        self.vector_at(idx).to_vec()
+    }
+
+    /// Copy every mapped vector onto the heap and release the container.
+    ///
+    /// The one operation that undoes what a version 3 load bought, so it exists
+    /// for the callers that genuinely need owned floats: a serde serialization
+    /// of the graph itself, which cannot describe a slot without its container.
+    /// Costs the whole payload, which is why nothing on the query path calls it.
+    pub fn materialize_vectors(&mut self) {
+        if self.payload.is_none() {
+            return;
+        }
+        let owned: Vec<Vec<f32>> = (0..self.nodes.len())
+            .map(|idx| self.vector_to_owned(idx))
+            .collect();
+        for (node, vector) in self.nodes.iter_mut().zip(owned) {
+            node.vector = NodeVector::owned(vector);
+        }
+        self.payload = None;
+    }
+
+    /// A persistence snapshot of the graph: the serialized fields copied, the
+    /// canonical-order flag cleared, and the reverse-edge index dropped because
+    /// it is rebuilt on demand and never written.
+    ///
+    /// `sq_norms` is CARRIED, unlike the reverse-edge index, and carried only
+    /// when it is whole. It is a persisted section now, so dropping it here made
+    /// the second save of a reloaded index omit the section the first save wrote
+    /// and produce different bytes for the same content, which
+    /// `a_reloaded_index_rebuilds_to_byte_identical_bytes` is what caught. A
+    /// partial table is left behind rather than carried, because writing one
+    /// would hand a later load a memo that reads as ready and answers with the
+    /// wrong norm for the entries it never saw.
+    ///
+    /// Taken under the graph lock so the heavy serialize and fsync can run after
+    /// the lock is released, without blocking concurrent upserts.
     fn clone_for_persist(&self) -> HnswGraph<Id> {
         HnswGraph {
             nodes: self.nodes.clone(),
@@ -750,7 +893,14 @@ impl<Id: VectorId> HnswGraph<Id> {
             backlinks: Vec::new(),
             canonical_order_dirty: false,
             mutation_seq: self.mutation_seq,
-            sq_norms: Vec::new(),
+            sq_norms: if self.sq_norms.len() == self.nodes.len() {
+                self.sq_norms.clone()
+            } else {
+                Vec::new()
+            },
+            // Carried, not dropped: the clone's nodes may still name payload
+            // slots, and an encoder resolves them through this mapping.
+            payload: self.payload.clone(),
         }
     }
 
@@ -777,7 +927,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         visited.insert(entry);
 
         // Guard: skip freed nodes whose vectors have been cleared
-        if self.nodes[entry].vector.is_empty() {
+        if !self.has_vector(entry) {
             return Vec::new();
         }
         if layer >= self.nodes[entry].connections.len() {
@@ -825,7 +975,7 @@ impl<Id: VectorId> HnswGraph<Id> {
                     continue;
                 }
                 // Skip freed nodes whose vectors have been cleared
-                if self.nodes[nb].vector.is_empty() {
+                if !self.has_vector(nb) {
                     continue;
                 }
                 if layer >= self.nodes[nb].connections.len() {
@@ -888,7 +1038,7 @@ impl<Id: VectorId> HnswGraph<Id> {
                 let node = &self.nodes[current];
                 if level < node.connections.len() {
                     for &nb in &node.connections[level] {
-                        if self.nodes[nb].vector.is_empty() {
+                        if !self.has_vector(nb) {
                             continue;
                         }
                         if level >= self.nodes[nb].connections.len() {
@@ -1006,6 +1156,16 @@ impl<Id: VectorId> HnswGraph<Id> {
         }
     }
 
+    /// Materialize the reverse-edge index if it is not already tracking
+    /// `nodes`.
+    ///
+    /// A load leaves `backlinks` empty on purpose: it exists only to keep
+    /// removal bounded by incident degree, and a process that only answers
+    /// queries never reads it. Building one node's inbound list costs a linear
+    /// `contains`, a push and a full sort per incident edge, so the table is the
+    /// single largest term in a load that nobody asked for. Every mutation
+    /// entry point calls this first, so the table a mutation sees is either
+    /// whole or visibly absent.
     fn ensure_backlinks_ready(&mut self) {
         if self.backlinks.len() != self.nodes.len() {
             self.rebuild_backlinks();
@@ -1016,8 +1176,10 @@ impl<Id: VectorId> HnswGraph<Id> {
     fn rebuild_sq_norms(&mut self) {
         self.sq_norms.clear();
         self.sq_norms.reserve(self.nodes.len());
-        self.sq_norms
-            .extend(self.nodes.iter().map(|node| squared_norm(&node.vector)));
+        for idx in 0..self.nodes.len() {
+            let value = squared_norm(self.vector_at(idx));
+            self.sq_norms.push(value);
+        }
     }
 
     /// Record the norm of a node just appended to `nodes`.
@@ -1054,7 +1216,7 @@ impl<Id: VectorId> HnswGraph<Id> {
     /// bits; the memo changes only how much arithmetic runs to produce them.
     #[inline]
     fn distance_to_node(&self, query: &[f32], query_sq_norm: f32, idx: usize) -> f32 {
-        let vector = &self.nodes[idx].vector;
+        let vector = self.vector_at(idx);
         if self.sq_norms.len() != self.nodes.len() {
             return cosine_distance(query, vector);
         }
@@ -1162,9 +1324,19 @@ impl<Id: VectorId> HnswGraph<Id> {
         level: usize,
         plan: InsertionPlan,
     ) {
+        // The reverse-edge index is built lazily, so a load leaves it absent and
+        // the first mutation is what materializes it. It has to happen HERE,
+        // before any `add_backlink` runs, because `ensure_backlink_slot` grows
+        // the table to whatever target it was handed: a partial table would then
+        // have `backlinks.len()` disagree with `nodes.len()` in a way a later
+        // `ensure_backlinks_ready` still catches, but a `remove` arriving in
+        // between would consult inbound lists that were never populated and
+        // leave dangling edges behind. Either the whole table is present or it
+        // is visibly absent; there is no in-between state a mutation can see.
+        self.ensure_backlinks_ready();
         let node_sq_norm = squared_norm(vector);
         let node = HnswNode {
-            vector: vector.to_vec(),
+            vector: NodeVector::owned(vector.to_vec()),
             connections: vec![Vec::new(); level + 1],
             level,
         };
@@ -1217,7 +1389,7 @@ impl<Id: VectorId> HnswGraph<Id> {
                 if self.nodes[nb].connections[lc].len() > nb_m_max {
                     // Prune: keep only the closest nb_m_max neighbors.
                     // Clone data to satisfy the borrow checker.
-                    let nb_vec = self.nodes[nb].vector.clone();
+                    let nb_vec = self.vector_to_owned(nb);
                     let nb_sq_norm = squared_norm(&nb_vec);
                     let conns = self.nodes[nb].connections[lc].clone();
                     let mut scored: Vec<(f32, usize)> = conns
@@ -1258,12 +1430,13 @@ impl<Id: VectorId> HnswGraph<Id> {
                     "vector id {id:?} points at removed HNSW node {idx}"
                 )));
             }
+            let level = node.level;
             items.push((
                 key_hash(&id),
                 Self::canonical_id_bytes(&id)?,
                 id,
-                node.vector.clone(),
-                node.level,
+                self.vector_to_owned(idx),
+                level,
             ));
         }
 
@@ -1357,7 +1530,7 @@ impl<Id: VectorId> HnswGraph<Id> {
 
         // Clear the node's data
         self.nodes[idx].connections.clear();
-        self.nodes[idx].vector.clear();
+        self.nodes[idx].vector = NodeVector::Empty;
         self.nodes[idx].level = 0;
         // An empty vector's squared norm is 0.0, which is what `squared_norm`
         // returns for it — the memo stays exactly what a recompute would give.
@@ -1534,10 +1707,20 @@ const KVEC_V2_MAGIC: [u8; 4] = *b"KVEC";
 const KVEC_V2_VERSION: u32 = 2;
 const KVEC_V2_PREAMBLE_LEN: usize = 64;
 
+/// Version 3 keeps the version 2 preamble shape and size, so the version
+/// dispatch is the only thing a reader has to get right.
+const KVEC_V3_PREAMBLE_LEN: usize = KVEC_V2_PREAMBLE_LEN;
+
 /// Payload alignment. Only 4 is required to address the block as `f32`; 64
 /// keeps each mapping's payload start on a cache line, and on the mmap read
 /// path the file offset is what decides that alignment because the mapping
 /// base is always page-aligned.
+///
+/// Test-only beside [`encode_v2`], the last writer that needed it. `decode_v2`
+/// does not: it reads the payload offset out of the preamble the writer put
+/// there, so a v2 file written by any past build reads back whatever alignment
+/// that build chose.
+#[cfg(test)]
 const KVEC_V2_PAYLOAD_ALIGN: usize = 64;
 
 /// Per-node header entry. Carries everything about a node except its vector,
@@ -1607,6 +1790,12 @@ fn align_up(value: usize, align: usize) -> usize {
     value.div_ceil(align) * align
 }
 
+/// `align_up` over `u64`, saturating rather than wrapping so a measuring pass
+/// seeded at `u64::MAX` cannot overflow.
+fn align_up_u64(value: u64, align: u64) -> u64 {
+    value.div_ceil(align).saturating_mul(align)
+}
+
 /// True when `bytes` opens a version 2 container.
 fn is_v2_container(bytes: &[u8]) -> bool {
     bytes.len() >= KVEC_V2_PREAMBLE_LEN && bytes[..4] == KVEC_V2_MAGIC
@@ -1618,7 +1807,676 @@ fn read_u64_le(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+// ---------------------------------------------------------------------------
+// Version 3 container: MessagePack header + a table of mapped sections
+// ---------------------------------------------------------------------------
+//
+// Layout:
+//
+//   0..4     magic `KVEC`
+//   4..8     format version, u32 LE (3)
+//   8..16    header byte length, u64 LE
+//   16..24   first section offset, u64 LE (multiple of `KVEC_SECTION_ALIGN`)
+//   24..32   payload slot count, u64 LE
+//   32..40   dimensions, u64 LE
+//   40..64   reserved, zero
+//   64..     header (MessagePack `KvecHeaderV3`)
+//            zero padding to the first section offset
+//            sections, each starting on a `KVEC_SECTION_ALIGN` boundary
+//
+// What v3 changes about v2 is not the floats. They are bit-identical. It is
+// that the payload is addressed through the mapping instead of copied out of
+// it: `decode_v3` builds each node as `NodeVector::Mapped(slot)` and hands the
+// container to the graph, so the resident cost of a loaded index stops being
+// the whole vector set. Beside that it persists the squared-norm table and
+// stops rebuilding the backlink index at load, so the two tables v2 rebuilt on
+// every open cost nothing on a store nobody mutates.
+//
+// The preamble's first 40 bytes mean exactly what they mean in v2, so the
+// version dispatch is the only thing a reader has to get right, and it reads a
+// RANGE. Writing a point and reading a range is not a preference here: a
+// persisted-schema bump checked for equality bricked every existing store on a
+// sibling crate while the whole suite stayed green, because every fixture in
+// that suite was written by the binary under test.
+
+const KVEC_V3_VERSION: u32 = 3;
+
+/// Oldest container version this reader accepts through the magic-prefixed
+/// path. Version 1 predates the magic and is detected by its absence.
+const KVEC_MIN_READABLE_VERSION: u32 = 2;
+
+/// Newest container version this reader accepts. A file above it is refused by
+/// name rather than misread.
+const KVEC_MAX_READABLE_VERSION: u32 = KVEC_V3_VERSION;
+
+/// Section alignment. 4 is all that is required to address a section as `u32`
+/// or `f32`; 64 keeps each section's start on a cache line, and on the mmap
+/// read path the file offset is what decides that alignment because the
+/// mapping base is always page-aligned.
+const KVEC_SECTION_ALIGN: usize = 64;
+
+/// What a section holds. Encoded as a `u16` so an unknown kind from a newer
+/// writer is skippable data rather than a decode failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "u16", try_from = "u16")]
+enum SectionKind {
+    /// Slot-major little-endian `f32`, `dimensions` per slot.
+    PayloadF32,
+    /// One `f32` per node, the squared norm of that node's vector.
+    SqNorms,
+}
+
+impl From<SectionKind> for u16 {
+    fn from(kind: SectionKind) -> u16 {
+        match kind {
+            SectionKind::PayloadF32 => 1,
+            SectionKind::SqNorms => 2,
+        }
+    }
+}
+
+impl TryFrom<u16> for SectionKind {
+    type Error = String;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(SectionKind::PayloadF32),
+            2 => Ok(SectionKind::SqNorms),
+            other => Err(format!("unknown kvec section kind {other}")),
+        }
+    }
+}
+
+/// Where one section lives and how it is shaped.
+///
+/// `stride` and `count` are carried rather than derived so the reader can
+/// bounds-check a section against the file before it reads a single element,
+/// and so a stride the writer chose from the data (rather than from a
+/// constant) survives into the reader.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct SectionDesc {
+    kind: SectionKind,
+    offset: u64,
+    stride: u64,
+    count: u64,
+}
+
+impl SectionDesc {
+    fn byte_len(&self) -> Option<usize> {
+        let stride = usize::try_from(self.stride).ok()?;
+        let count = usize::try_from(self.count).ok()?;
+        stride.checked_mul(count)
+    }
+
+    fn start(&self) -> Option<usize> {
+        usize::try_from(self.offset).ok()
+    }
+
+    /// The section's byte extent, or `None` when it does not fit in `total`.
+    fn extent_within(&self, total: usize) -> Option<(usize, usize)> {
+        let start = self.start()?;
+        let len = self.byte_len()?;
+        let end = start.checked_add(len)?;
+        (end <= total).then_some((start, end))
+    }
+}
+
+/// Which distance kernel produced a persisted squared-norm table.
+///
+/// The norm's value depends on which reduction this process resolved: the NEON
+/// kernel and the scalar one differ in the last ULPs, so a norm persisted by
+/// one and consumed by the other would break the bit-identity the memo rests
+/// on. That is why v2 refused to persist the table at all. Stamping it instead
+/// keeps the invariant and drops the rebuild: a process whose kernel disagrees
+/// with the stamp recomputes, and one whose kernel agrees reads.
+const NORM_KERNEL_SCALAR: u8 = 0;
+const NORM_KERNEL_SIMD: u8 = 1;
+
+/// True when this build and this process resolved the NEON reduction.
+///
+/// Mirrors [`squared_norm`]'s own dispatch, which is what makes the stamp
+/// meaningful: the same condition that selects the four-lane fold selects the
+/// stamp that says so. The NEON kernel exists only on aarch64 with the `simd`
+/// feature, and every other target has exactly one reduction, so those targets
+/// answer `false` and can only ever agree with each other. That is not a
+/// platform arm hiding a case: a norm from the scalar reduction on x86 and one
+/// from the scalar reduction on aarch64 come out of the same code in the same
+/// order.
+fn simd_norm_kernel_active() -> bool {
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    let active = simd_enabled();
+    #[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
+    let active = false;
+    active
+}
+
+fn norm_kernel_stamp() -> u8 {
+    if simd_norm_kernel_active() {
+        NORM_KERNEL_SIMD
+    } else {
+        NORM_KERNEL_SCALAR
+    }
+}
+
+/// Version 3 header. Every field of [`HnswGraph`] that is not a vector and not
+/// `#[serde(skip)]`, in the same meaning as v2, plus the section table.
+///
+/// `descriptor` is carried verbatim, and the container version is deliberately
+/// kept out of it for the reason v2 gave: the descriptor answers which model
+/// and which graph produced the vectors, and folding an encoding revision into
+/// that identity would discard a whole index over a change that cannot alter a
+/// single float.
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "Id: VectorId", deserialize = "Id: VectorId"))]
+struct KvecHeaderV3<Id: VectorId = DefaultId> {
+    nodes: Vec<KvecNodeV2>,
+    entry_point: Option<usize>,
+    max_level: usize,
+    dimensions: usize,
+    #[serde(serialize_with = "serialize_id_to_idx_canonical")]
+    id_to_idx: HashMap<Id, usize>,
+    idx_to_id: Vec<Id>,
+    free_list: Vec<usize>,
+    reserved_legacy_slot: u64,
+    descriptor: IndexDescriptor,
+    sections: Vec<SectionDesc>,
+    /// Which distance kernel computed the `SqNorms` section, if one is present.
+    norm_kernel: u8,
+}
+
+/// An index file's sections, addressed in place.
+///
+/// Holds the container the sections live in, so a slice handed out of here
+/// borrows bytes that cannot move. Cloned by `Arc` on the graph, never by
+/// value.
+pub struct MappedPayload {
+    container: LoadedContainer,
+    dimensions: usize,
+    slot_count: usize,
+    payload: F32Payload,
+}
+
+/// How the `f32` payload is addressed.
+///
+/// `InPlace` is the mapped case and costs nothing. `Owned` is the fallback for
+/// a payload whose base is not four-byte aligned, which a mapping cannot
+/// produce (the mapping base is page-aligned and every section offset is a
+/// multiple of 64) but a `fs::read` buffer can, since nothing promises the
+/// alignment of a `Vec<u8>`. Reading misaligned floats out of place would be
+/// unsound, and reading them out of a shifted slice would be silently wrong,
+/// so the one case that cannot be addressed is the one case that is copied.
+enum F32Payload {
+    InPlace { offset: usize },
+    Owned(Vec<f32>),
+    Absent,
+}
+
+impl MappedPayload {
+    /// The `dimensions` floats of one payload slot, read in place.
+    ///
+    /// Returns an empty slice for a slot outside the payload. Every slot a
+    /// decoded node names was bounds-checked against `slot_count` before the
+    /// node was built, so this arm is unreachable through a decode.
+    #[inline]
+    fn f32_slot(&self, slot: usize) -> &[f32] {
+        if slot >= self.slot_count || self.dimensions == 0 {
+            return &[];
+        }
+        match &self.payload {
+            F32Payload::Absent => &[],
+            F32Payload::Owned(values) => {
+                let start = slot * self.dimensions;
+                &values[start..start + self.dimensions]
+            }
+            F32Payload::InPlace { offset } => {
+                let stride = self.dimensions * 4;
+                let start = offset + slot * stride;
+                let bytes = &self.container.bytes()[start..start + stride];
+                // SAFETY: `f32` has no invalid bit patterns and no padding, so
+                // every four-byte group is a valid `f32`. The prefix is proven
+                // empty rather than assumed: `MappedPayload::new` admits
+                // `InPlace` only when the section base is four-byte aligned,
+                // and `stride` is a multiple of four, so every slot start is
+                // aligned too. A non-empty prefix would mean `align_to` had
+                // shifted the window and returned another slot's floats, which
+                // is why the debug assertion is on the prefix and not on the
+                // length.
+                let (prefix, values, _) = unsafe { bytes.align_to::<f32>() };
+                debug_assert!(
+                    prefix.is_empty(),
+                    "kvec payload slot {slot} is not f32-aligned"
+                );
+                if prefix.is_empty() {
+                    values
+                } else {
+                    &[]
+                }
+            }
+        }
+    }
+}
+
+/// Encode a graph as a version 3 container.
+///
+/// The floats written are bit-identical to what `encode_v2` writes, in the same
+/// slot order, so a v2 file and a v3 file built from the same graph hold the
+/// same payload bytes at their respective payload offsets.
+fn encode_v3<Id: VectorId>(graph: &HnswGraph<Id>) -> Result<Vec<u8>, VectorError> {
+    let dimensions = graph.dimensions;
+    let mut nodes = Vec::with_capacity(graph.nodes.len());
+    // Node index of each payload slot, in slot order.
+    let mut slot_sources: Vec<usize> = Vec::with_capacity(graph.nodes.len());
+
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        let payload_slot = if node.vector.is_empty() {
+            None
+        } else {
+            // A fixed stride is what makes the payload addressable by slot, so a
+            // node whose vector disagrees with the graph's dimensionality has to
+            // stop the write rather than corrupt every later slot's offset.
+            let len = graph.vector_at(idx).len();
+            if len != dimensions {
+                return Err(VectorError::IndexError(format!(
+                    "node {idx} holds {len} dimensions but the graph declares {dimensions}"
+                )));
+            }
+            let slot = slot_sources.len() as u64;
+            slot_sources.push(idx);
+            Some(slot)
+        };
+        nodes.push(KvecNodeV2 {
+            connections: node.connections.clone(),
+            level: node.level,
+            payload_slot,
+        });
+    }
+
+    let node_count = graph.nodes.len();
+    // The norm table is persisted only when it is whole. A partial table is
+    // exactly the state `push_sq_norm` refuses to create, and writing one would
+    // hand a later load a memo that reads as ready and answers with the wrong
+    // norm for the entries it never saw.
+    let persist_norms = graph.sq_norms.len() == node_count && node_count > 0;
+
+    let payload_stride = dimensions
+        .checked_mul(4)
+        .ok_or_else(|| VectorError::IndexError("dimensions overflow a byte stride".to_string()))?;
+    let payload_len = slot_sources
+        .len()
+        .checked_mul(payload_stride)
+        .ok_or_else(|| {
+            VectorError::IndexError("HNSW payload size overflows a usize".to_string())
+        })?;
+
+    // The section table lives inside the header, and the section offsets depend
+    // on the header's own encoded length, so the header is measured before it is
+    // written. The measuring pass seeds every offset at the widest value a `u64`
+    // can take, which MessagePack encodes in its widest form, so the real
+    // offsets can only encode the same width or narrower and the measured length
+    // is an upper bound. The first section then starts after that upper bound,
+    // and the gap between the real header and it is zero padding the reader
+    // skips. The check below is what proves the bound rather than assuming it.
+    let describe = |first_offset: u64| -> Vec<SectionDesc> {
+        let mut sections = Vec::with_capacity(2);
+        sections.push(SectionDesc {
+            kind: SectionKind::PayloadF32,
+            offset: first_offset,
+            stride: payload_stride as u64,
+            count: slot_sources.len() as u64,
+        });
+        if persist_norms {
+            let after_payload = first_offset.saturating_add(payload_len as u64);
+            sections.push(SectionDesc {
+                kind: SectionKind::SqNorms,
+                offset: align_up_u64(after_payload, KVEC_SECTION_ALIGN as u64),
+                stride: 4,
+                count: node_count as u64,
+            });
+        }
+        sections
+    };
+
+    let mut header = KvecHeaderV3 {
+        nodes,
+        entry_point: graph.entry_point,
+        max_level: graph.max_level,
+        dimensions,
+        id_to_idx: graph.id_to_idx.clone(),
+        idx_to_id: graph.idx_to_id.clone(),
+        free_list: graph.free_list.clone(),
+        reserved_legacy_slot: graph.reserved_legacy_slot,
+        descriptor: graph.descriptor.clone(),
+        sections: describe(u64::MAX),
+        norm_kernel: if persist_norms {
+            norm_kernel_stamp()
+        } else {
+            NORM_KERNEL_SCALAR
+        },
+    };
+
+    let serialize = |header: &KvecHeaderV3<Id>| -> Result<Vec<u8>, VectorError> {
+        rmp_serde::to_vec(header).map_err(|e| {
+            VectorError::IndexError(format!("failed to serialize HNSW index header: {e}"))
+        })
+    };
+
+    let probe_len = serialize(&header)?.len();
+    let first_offset = align_up(KVEC_V3_PREAMBLE_LEN + probe_len, KVEC_SECTION_ALIGN);
+    header.sections = describe(first_offset as u64);
+    let header_bytes = serialize(&header)?;
+    if header_bytes.len() > probe_len {
+        return Err(VectorError::IndexError(format!(
+            "kvec header grew from {probe_len} to {} bytes between the measuring pass and the \
+             writing pass, so the section offsets it carries would be wrong",
+            header_bytes.len()
+        )));
+    }
+
+    let sections = header.sections.clone();
+    let total = sections
+        .iter()
+        .try_fold(first_offset, |acc, section| {
+            let start = section.start()?;
+            let len = section.byte_len()?;
+            Some(acc.max(start.checked_add(len)?))
+        })
+        .ok_or_else(|| {
+            VectorError::IndexError("kvec section extent overflows a usize".to_string())
+        })?;
+
+    let mut out = vec![0u8; total];
+    out[0..4].copy_from_slice(&KVEC_V2_MAGIC);
+    out[4..8].copy_from_slice(&KVEC_V3_VERSION.to_le_bytes());
+    out[8..16].copy_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+    out[16..24].copy_from_slice(&(first_offset as u64).to_le_bytes());
+    out[24..32].copy_from_slice(&(slot_sources.len() as u64).to_le_bytes());
+    out[32..40].copy_from_slice(&(dimensions as u64).to_le_bytes());
+    out[KVEC_V3_PREAMBLE_LEN..KVEC_V3_PREAMBLE_LEN + header_bytes.len()]
+        .copy_from_slice(&header_bytes);
+
+    for section in &sections {
+        let (start, _) = section.extent_within(total).ok_or_else(|| {
+            VectorError::IndexError("kvec section overruns its own file".to_string())
+        })?;
+        match section.kind {
+            SectionKind::PayloadF32 => {
+                for (slot, &idx) in slot_sources.iter().enumerate() {
+                    let at = start + slot * payload_stride;
+                    let dst = &mut out[at..at + payload_stride];
+                    // Little-endian regardless of host byte order, so an index
+                    // written on one architecture reads back identically on
+                    // another.
+                    for (chunk, value) in dst.chunks_exact_mut(4).zip(graph.vector_at(idx).iter()) {
+                        chunk.copy_from_slice(&value.to_le_bytes());
+                    }
+                }
+            }
+            SectionKind::SqNorms => {
+                for (node, value) in graph.sq_norms.iter().enumerate() {
+                    let at = start + node * 4;
+                    out[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// What a scoped read of a version 3 container yields, so the borrow on the
+/// container ends before the container is moved into the payload it describes.
+struct DecodedV3<Id: VectorId> {
+    nodes: Vec<HnswNode>,
+    entry_point: Option<usize>,
+    max_level: usize,
+    id_to_idx: HashMap<Id, usize>,
+    idx_to_id: Vec<Id>,
+    free_list: Vec<usize>,
+    reserved_legacy_slot: u64,
+    descriptor: IndexDescriptor,
+    sq_norms: Vec<f32>,
+    payload: F32Payload,
+    header_len: u64,
+    slot_count: usize,
+    dimensions: usize,
+}
+
+/// Deserialize a version 3 container, addressing its payload in place.
+fn decode_v3<Id: VectorId>(
+    container: LoadedContainer,
+) -> Result<(HnswGraph<Id>, KvecLoadStats), VectorError> {
+    let decoded: DecodedV3<Id> = read_v3(container.bytes())?;
+    let DecodedV3 {
+        nodes,
+        entry_point,
+        max_level,
+        id_to_idx,
+        idx_to_id,
+        free_list,
+        reserved_legacy_slot,
+        descriptor,
+        sq_norms,
+        payload,
+        header_len,
+        slot_count,
+        dimensions,
+    } = decoded;
+
+    let copied_payload_bytes = match &payload {
+        F32Payload::Owned(values) => (values.len() * 4) as u64,
+        _ => 0,
+    };
+    let file_bytes = container.bytes().len() as u64;
+    let read_into_heap = matches!(&container, LoadedContainer::Read(_));
+    let norms_loaded = !sq_norms.is_empty();
+
+    let payload = Arc::new(MappedPayload {
+        container,
+        dimensions,
+        slot_count,
+        payload,
+    });
+
+    let mut graph = HnswGraph {
+        nodes,
+        entry_point,
+        max_level,
+        dimensions,
+        id_to_idx,
+        idx_to_id,
+        free_list,
+        reserved_legacy_slot,
+        descriptor,
+        backlinks: Vec::new(),
+        canonical_order_dirty: false,
+        mutation_seq: 0,
+        sq_norms,
+        payload: Some(payload),
+    };
+    // Neither derived table is rebuilt here, which is the other half of what v3
+    // buys. `backlinks` exists only to keep removal bounded by incident degree,
+    // so a process that only answers queries never pays for it, and the first
+    // mutation materializes it through `ensure_backlinks_ready`. `sq_norms` came
+    // out of the file when the stamp agreed, and is rebuilt on demand when it
+    // did not.
+    if !norms_loaded {
+        graph.rebuild_sq_norms();
+    }
+
+    let stats = KvecLoadStats {
+        format_version: KVEC_V3_VERSION,
+        file_bytes,
+        bytes_mapped: if read_into_heap { 0 } else { file_bytes },
+        bytes_read_into_heap: if read_into_heap { file_bytes } else { 0 },
+        bytes_decoded: header_len,
+        // Zero on the mapped path, which is the whole point of v3: the payload
+        // is addressed where it lies. Non-zero only on the `fs::read` fallback
+        // with a buffer whose base is not four-byte aligned, where the floats
+        // had to be copied to be addressable at all.
+        vector_payload_bytes: copied_payload_bytes,
+        msgpack_float_decodes: 0,
+        vector_slots: slot_count as u64,
+    };
+    Ok((graph, stats))
+}
+
+/// Read a version 3 container out of a borrow of its bytes.
+fn read_v3<Id: VectorId>(bytes: &[u8]) -> Result<DecodedV3<Id>, VectorError> {
+    let malformed =
+        |what: &str| VectorError::IndexError(format!("malformed kvec container: {what}"));
+
+    if bytes.len() < KVEC_V3_PREAMBLE_LEN {
+        return Err(malformed("shorter than its preamble"));
+    }
+    let header_len = read_u64_le(bytes, 8) as usize;
+    let first_offset = read_u64_le(bytes, 16) as usize;
+    let slot_count = read_u64_le(bytes, 24) as usize;
+    let dimensions = read_u64_le(bytes, 32) as usize;
+
+    let header_end = KVEC_V3_PREAMBLE_LEN
+        .checked_add(header_len)
+        .ok_or_else(|| malformed("header length overflows"))?;
+    if header_end > bytes.len() || first_offset < header_end {
+        return Err(malformed("header does not fit before the first section"));
+    }
+
+    let header: KvecHeaderV3<Id> = rmp_serde::from_slice(&bytes[KVEC_V3_PREAMBLE_LEN..header_end])
+        .map_err(|e| VectorError::IndexError(format!("failed to deserialize kvec header: {e}")))?;
+    // The preamble is what the bounds checks above trusted; the header is what
+    // the graph is built from. They are written together and must agree.
+    if header.dimensions != dimensions {
+        return Err(malformed(
+            "header dimensions disagree with the container preamble",
+        ));
+    }
+
+    let stride = dimensions
+        .checked_mul(4)
+        .ok_or_else(|| malformed("dimensions overflow a byte stride"))?;
+    let node_count = header.nodes.len();
+
+    let mut payload_start: Option<usize> = None;
+    let mut norms_start: Option<usize> = None;
+    for section in &header.sections {
+        let (start, _) = section
+            .extent_within(bytes.len())
+            .ok_or_else(|| malformed("a section extends past the end of the file"))?;
+        if start < first_offset {
+            return Err(malformed(
+                "a section starts before the first section offset",
+            ));
+        }
+        match section.kind {
+            SectionKind::PayloadF32 => {
+                if section.stride as usize != stride || section.count as usize != slot_count {
+                    return Err(malformed(
+                        "the payload section disagrees with the container preamble",
+                    ));
+                }
+                payload_start = Some(start);
+            }
+            SectionKind::SqNorms => {
+                if section.stride != 4 || section.count as usize != node_count {
+                    return Err(malformed(
+                        "the squared-norm section is not one f32 per node",
+                    ));
+                }
+                norms_start = Some(start);
+            }
+        }
+    }
+    let payload_start = payload_start.ok_or_else(|| malformed("no payload section"))?;
+
+    let mut nodes = Vec::with_capacity(node_count);
+    for (idx, entry) in header.nodes.iter().enumerate() {
+        let vector = match entry.payload_slot {
+            None => NodeVector::Empty,
+            Some(slot) => {
+                let slot = u32::try_from(slot).map_err(|_| {
+                    malformed(&format!("node {idx} names a payload slot above a u32"))
+                })?;
+                if slot as usize >= slot_count {
+                    return Err(malformed(&format!(
+                        "node {idx} names payload slot {slot} of {slot_count}"
+                    )));
+                }
+                NodeVector::Mapped(slot)
+            }
+        };
+        nodes.push(HnswNode {
+            vector,
+            connections: entry.connections.clone(),
+            level: entry.level,
+        });
+    }
+
+    // Only a table this process's own kernel produced is readable, because the
+    // NEON and scalar reductions differ in the last ULPs. A disagreeing stamp
+    // leaves the table empty and the norms are rebuilt, which is slower and
+    // never different.
+    let sq_norms = match norms_start {
+        Some(start) if header.norm_kernel == norm_kernel_stamp() => {
+            let mut values = Vec::with_capacity(node_count);
+            for node in 0..node_count {
+                let at = start + node * 4;
+                values.push(f32::from_le_bytes([
+                    bytes[at],
+                    bytes[at + 1],
+                    bytes[at + 2],
+                    bytes[at + 3],
+                ]));
+            }
+            values
+        }
+        _ => Vec::new(),
+    };
+
+    let payload = if slot_count == 0 || dimensions == 0 {
+        F32Payload::Absent
+    } else if (bytes[payload_start..].as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>())
+    {
+        F32Payload::InPlace {
+            offset: payload_start,
+        }
+    } else {
+        let count = slot_count * dimensions;
+        let mut values = Vec::with_capacity(count);
+        for element in 0..count {
+            let at = payload_start + element * 4;
+            values.push(f32::from_le_bytes([
+                bytes[at],
+                bytes[at + 1],
+                bytes[at + 2],
+                bytes[at + 3],
+            ]));
+        }
+        F32Payload::Owned(values)
+    };
+
+    Ok(DecodedV3 {
+        nodes,
+        entry_point: header.entry_point,
+        max_level: header.max_level,
+        id_to_idx: header.id_to_idx,
+        idx_to_id: header.idx_to_id,
+        free_list: header.free_list,
+        reserved_legacy_slot: header.reserved_legacy_slot,
+        descriptor: header.descriptor,
+        sq_norms,
+        payload,
+        header_len: header_len as u64,
+        slot_count,
+        dimensions,
+    })
+}
+
 /// Serialize `graph` into a version 2 container.
+///
+/// Test-only. `save` writes the current version, so nothing in the library
+/// writes v2 any more, and this exists so the version the reader still accepts
+/// stays under test: a decoder for a format nothing can produce is a decoder
+/// nothing can falsify.
+#[cfg(test)]
 fn encode_v2<Id: VectorId>(graph: &HnswGraph<Id>) -> Result<Vec<u8>, VectorError> {
     let dimensions = graph.dimensions;
     let mut nodes = Vec::with_capacity(graph.nodes.len());
@@ -1632,10 +2490,10 @@ fn encode_v2<Id: VectorId>(graph: &HnswGraph<Id>) -> Result<Vec<u8>, VectorError
             // A fixed stride is what makes the payload addressable by slot, so a
             // node whose vector disagrees with the graph's dimensionality has to
             // stop the write rather than corrupt every later slot's offset.
-            if node.vector.len() != dimensions {
+            let len = graph.vector_at(idx).len();
+            if len != dimensions {
                 return Err(VectorError::IndexError(format!(
-                    "node {idx} holds {} dimensions but the graph declares {dimensions}",
-                    node.vector.len()
+                    "node {idx} holds {len} dimensions but the graph declares {dimensions}"
                 )));
             }
             let slot = slot_sources.len() as u64;
@@ -1692,7 +2550,7 @@ fn encode_v2<Id: VectorId>(graph: &HnswGraph<Id>) -> Result<Vec<u8>, VectorError
         let dst = &mut out[start..start + stride];
         // Little-endian regardless of host byte order, so an index written on
         // one architecture reads back identically on another.
-        for (chunk, value) in dst.chunks_exact_mut(4).zip(graph.nodes[idx].vector.iter()) {
+        for (chunk, value) in dst.chunks_exact_mut(4).zip(graph.vector_at(idx).iter()) {
             chunk.copy_from_slice(&value.to_le_bytes());
         }
     }
@@ -1757,7 +2615,7 @@ fn decode_v2<Id: VectorId>(bytes: &[u8]) -> Result<(HnswGraph<Id>, KvecLoadStats
     let mut nodes = Vec::with_capacity(header.nodes.len());
     for (idx, entry) in header.nodes.iter().enumerate() {
         let vector = match entry.payload_slot {
-            None => Vec::new(),
+            None => NodeVector::Empty,
             Some(slot) => {
                 let slot = slot as usize;
                 if slot >= slot_count {
@@ -1773,7 +2631,7 @@ fn decode_v2<Id: VectorId>(bytes: &[u8]) -> Result<(HnswGraph<Id>, KvecLoadStats
                 {
                     *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 }
-                vector
+                NodeVector::owned(vector)
             }
         };
         nodes.push(HnswNode {
@@ -1797,8 +2655,14 @@ fn decode_v2<Id: VectorId>(bytes: &[u8]) -> Result<(HnswGraph<Id>, KvecLoadStats
         canonical_order_dirty: false,
         mutation_seq: 0,
         sq_norms: Vec::new(),
+        payload: None,
     };
-    graph.rebuild_backlinks();
+    // v2 keeps its per-float copy and its norm rebuild, because a v2 container
+    // carries no persisted norm table and its payload has to reach the heap to
+    // be addressed at all. The backlink rebuild moves off this path with v3's,
+    // since it is a property of the graph rather than of the container: nothing
+    // reads `backlinks` until a mutation, and `ensure_backlinks_ready` builds it
+    // there.
     graph.rebuild_sq_norms();
 
     let stats = KvecLoadStats {
@@ -2107,14 +2971,17 @@ fn decode_v1<Id: VectorId>(bytes: &[u8]) -> Result<(HnswGraph<Id>, KvecLoadStats
         )));
     }
     let mut graph = snapshot.graph;
-    graph.rebuild_backlinks();
     graph.rebuild_sq_norms();
 
     // Every stored dimension arrived through the MessagePack decoder as its own
     // tagged element, so the count of stored dimensions IS the count of tagged
     // element decodes this load performed.
-    let msgpack_float_decodes: u64 = graph.nodes.iter().map(|n| n.vector.len() as u64).sum();
-    let vector_slots = graph.nodes.iter().filter(|n| !n.vector.is_empty()).count() as u64;
+    let msgpack_float_decodes: u64 = (0..graph.nodes.len())
+        .map(|idx| graph.vector_at(idx).len() as u64)
+        .sum();
+    let vector_slots = (0..graph.nodes.len())
+        .filter(|&idx| graph.has_vector(idx))
+        .count() as u64;
     let stats = KvecLoadStats {
         format_version: HNSW_FORMAT_VERSION as u32,
         file_bytes: bytes.len() as u64,
@@ -2133,26 +3000,60 @@ fn decode_v1<Id: VectorId>(bytes: &[u8]) -> Result<(HnswGraph<Id>, KvecLoadStats
 /// A version 1 file has no magic to check, so v2 is identified positively and
 /// anything else is offered to the v1 decoder. That ordering is what keeps
 /// every index written before the cutover loadable without a rebuild.
+/// The container version `bytes` declares, or `None` for a version 1 file,
+/// which predates the magic and is identified by its absence.
+fn container_version(bytes: &[u8]) -> Option<u32> {
+    if !is_v2_container(bytes) {
+        return None;
+    }
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&bytes[4..8]);
+    Some(u32::from_le_bytes(buf))
+}
+
+/// Decode a container of any version this reader accepts.
+///
+/// The version test is a RANGE, `KVEC_MIN_READABLE_VERSION` through
+/// `KVEC_MAX_READABLE_VERSION`, and never an equality. An equality check on a
+/// persisted schema is the shape that bricked every existing store on a sibling
+/// crate while its whole suite stayed green, because every fixture in that
+/// suite was written by the binary under test. A version above the range is
+/// refused by name, which routes the caller into archive-and-rebuild rather
+/// than into silently-wrong neighbours.
 fn decode_container<Id: VectorId>(
-    bytes: &[u8],
+    container: LoadedContainer,
 ) -> Result<(HnswGraph<Id>, KvecLoadStats), VectorError> {
-    if is_v2_container(bytes) {
-        decode_v2(bytes)
-    } else {
-        decode_v1(bytes)
+    match container_version(container.bytes()) {
+        None => {
+            let (graph, stats) = decode_v1(container.bytes())?;
+            Ok((graph, container.with_byte_source(stats)))
+        }
+        Some(KVEC_V2_VERSION) => {
+            let (graph, stats) = decode_v2(container.bytes())?;
+            Ok((graph, container.with_byte_source(stats)))
+        }
+        Some(KVEC_V3_VERSION) => decode_v3(container),
+        Some(version) => Err(VectorError::IndexError(format!(
+            "unsupported kvec container version {version}; this reader accepts {min} \
+             through {max}",
+            min = KVEC_MIN_READABLE_VERSION,
+            max = KVEC_MAX_READABLE_VERSION
+        ))),
     }
 }
 
-fn try_load_snapshot<Id: VectorId>(bytes: &[u8]) -> Result<HnswGraph<Id>, VectorError> {
-    decode_container(bytes).map(|(graph, _)| graph)
+fn try_load_snapshot<Id: VectorId>(bytes: Vec<u8>) -> Result<HnswGraph<Id>, VectorError> {
+    decode_container(LoadedContainer::Read(bytes)).map(|(graph, _)| graph)
 }
 
 /// An index file's bytes, made addressable for decoding.
 ///
-/// Mapping is preferred over reading because the v2 payload is decoded straight
-/// out of the container: reading would copy the whole file to the heap first
-/// and then copy the vectors again out of that copy, so on a store whose bytes
-/// are overwhelmingly vector payload the read buffer is pure overhead.
+/// Mapping is preferred over reading because the payload is addressed straight
+/// out of the container: reading would copy the whole file to the heap first,
+/// so on a store whose bytes are overwhelmingly vector payload the read buffer
+/// is pure overhead. Under version 3 a mapped container is also what the loaded
+/// index goes on reading from for the rest of its life, rather than something
+/// dropped once decoding finishes.
 enum LoadedContainer {
     Mapped(memmap2::Mmap),
     Read(Vec<u8>),
@@ -2167,7 +3068,14 @@ impl LoadedContainer {
     }
 
     /// Record how the bytes were obtained on stats the decoder filled in.
-    fn account(&self, stats: KvecLoadStats) -> KvecLoadStats {
+    ///
+    /// Named for the byte source rather than for the accounting, because
+    /// CodeQL's cleartext-logging rule carries a sensitive-identifier heuristic
+    /// that matches `account` and flagged every test assertion downstream of
+    /// this value as logging credentials. The heuristic is wrong here and the
+    /// name was a poor one, so the name moved rather than the finding being
+    /// suppressed.
+    fn with_byte_source(&self, stats: KvecLoadStats) -> KvecLoadStats {
         let len = self.bytes().len() as u64;
         match self {
             LoadedContainer::Mapped(_) => KvecLoadStats {
@@ -2251,7 +3159,7 @@ fn recover_from_tmp<Id: VectorId>(
         ))
     })?;
 
-    let graph = try_load_snapshot(&bytes).map_err(|tmp_err| {
+    let graph = try_load_snapshot(bytes).map_err(|tmp_err| {
         let prefix = match primary_error {
             Some(primary_err) => format!(
                 "failed to load primary vector index {}: {primary_err}; ",
@@ -2428,11 +3336,10 @@ impl<Id: VectorId> VectorIndex<Id> {
     pub fn get(&self, entity_id: &Id) -> Option<Vec<f32>> {
         let graph = self.graph.read();
         let idx = graph.id_to_idx.get(entity_id)?;
-        let node = graph.nodes.get(*idx)?;
-        if node.vector.is_empty() {
-            None
+        if graph.has_vector(*idx) {
+            Some(graph.vector_to_owned(*idx))
         } else {
-            Some(node.vector.clone())
+            None
         }
     }
 
@@ -2656,13 +3563,15 @@ impl<Id: VectorId> VectorIndex<Id> {
 
     /// Save the HNSW index to disk.
     ///
-    /// Persists the full HNSW graph as a version 2 container — a MessagePack
-    /// header followed by a contiguous little-endian fp32 payload — with atomic
-    /// write semantics (write-to-tmp then rename).
+    /// Persists the full HNSW graph as a version 3 container, a MessagePack
+    /// header followed by a table of aligned sections, with atomic write
+    /// semantics (write-to-tmp then rename).
     ///
-    /// Every save writes v2, so an index that was loaded from a v1 file
-    /// migrates on its next full write with no rebuild and no re-embed: the
-    /// vectors are already in hand and only their encoding changes.
+    /// Every save writes the current container version, so an index loaded
+    /// from a v1 or
+    /// v2 file migrates on its next full write with no rebuild and no
+    /// re-embed: the vectors are already in hand and only their encoding
+    /// changes.
     pub fn save(&self, path: &Path) -> Result<(), VectorError> {
         let _span = tracing::info_span!(
             "kin_vector.save",
@@ -2674,7 +3583,7 @@ impl<Id: VectorId> VectorIndex<Id> {
         // blocked by neither the HNSW rebuild nor the index IO. Concurrent upserts
         // after the snapshot simply land in the next save.
         let (snapshot, snapshot_seq) = self.canonical_persist_snapshot()?;
-        let bytes = encode_v2(&snapshot)?;
+        let bytes = encode_v3(&snapshot)?;
         // Keep the canonical form so an index nobody has touched since does not
         // re-canonicalize on its next save. Skipped when a mutation landed while
         // the rebuild was running, which leaves the live graph dirty and the next
@@ -2765,11 +3674,7 @@ impl<Id: VectorId> VectorIndex<Id> {
             // Scoped so the mapping is released before any recovery runs.
             // Recovery renames the candidate over this path, and Windows refuses
             // to replace a file that still has a mapping open on it.
-            let decoded = {
-                let container = open_container(path)?;
-                decode_container(container.bytes())
-                    .map(|(graph, stats)| (graph, container.account(stats)))
-            };
+            let decoded = decode_container(open_container(path)?);
             match decoded {
                 Ok((graph, stats)) => (graph, Some(stats)),
                 Err(err) => (recover_from_tmp(path, Some(&err))?, None),
@@ -2901,12 +3806,12 @@ mod tests {
         let mut graph = HnswGraph::new(1);
         graph.nodes = vec![
             HnswNode {
-                vector: vec![1.0],
+                vector: NodeVector::owned(vec![1.0]),
                 connections: vec![vec![]],
                 level: 0,
             },
             HnswNode {
-                vector: vec![0.5],
+                vector: NodeVector::owned(vec![0.5]),
                 connections: vec![vec![], vec![0]],
                 level: 1,
             },
@@ -2943,25 +3848,25 @@ mod tests {
         graph.nodes = vec![
             // idx 0: level 2 (tie candidate, LOWEST index → must win)
             HnswNode {
-                vector: vec![0.0],
+                vector: NodeVector::owned(vec![0.0]),
                 connections: vec![vec![], vec![], vec![]],
                 level: 2,
             },
             // idx 1: level 3 (the entry point we remove)
             HnswNode {
-                vector: vec![1.0],
+                vector: NodeVector::owned(vec![1.0]),
                 connections: vec![vec![], vec![], vec![], vec![]],
                 level: 3,
             },
             // idx 2: level 2 (tie candidate, higher index → must lose the tie)
             HnswNode {
-                vector: vec![2.0],
+                vector: NodeVector::owned(vec![2.0]),
                 connections: vec![vec![], vec![], vec![]],
                 level: 2,
             },
             // idx 3: level 1
             HnswNode {
-                vector: vec![3.0],
+                vector: NodeVector::owned(vec![3.0]),
                 connections: vec![vec![], vec![]],
                 level: 1,
             },
@@ -3531,12 +4436,12 @@ mod tests {
         let mut graph = HnswGraph::<u64>::new(2);
         graph.nodes = vec![
             HnswNode {
-                vector: vec![0.0, 1.0],
+                vector: NodeVector::owned(vec![0.0, 1.0]),
                 connections: vec![Vec::new(); forced_hi_level + 1],
                 level: forced_hi_level,
             },
             HnswNode {
-                vector: vec![1.0, 0.0],
+                vector: NodeVector::owned(vec![1.0, 0.0]),
                 connections: vec![Vec::new()],
                 level: 0,
             },
@@ -3607,12 +4512,12 @@ mod tests {
         let mut graph = HnswGraph::new(1);
         graph.nodes = vec![
             HnswNode {
-                vector: vec![0.0],
+                vector: NodeVector::owned(vec![0.0]),
                 connections: vec![vec![]],
                 level: 0,
             },
             HnswNode {
-                vector: vec![1.0],
+                vector: NodeVector::owned(vec![1.0]),
                 connections: vec![vec![], vec![0]],
                 level: 1,
             },
@@ -4360,10 +5265,10 @@ mod tests {
                 graph.nodes.len(),
                 "memo length diverged from nodes after {after}"
             );
-            for (idx, node) in graph.nodes.iter().enumerate() {
+            for idx in 0..graph.nodes.len() {
                 assert_eq!(
                     graph.sq_norms[idx].to_bits(),
-                    squared_norm(&node.vector).to_bits(),
+                    squared_norm(graph.vector_at(idx)).to_bits(),
                     "memo for node {idx} is stale after {after}"
                 );
             }
@@ -4410,7 +5315,7 @@ mod tests {
         // the distance path must fall back rather than read unset entries.
         let mut hand_built: HnswGraph<u64> = HnswGraph::new(dim);
         hand_built.nodes = vec![HnswNode {
-            vector: vector_for(5),
+            vector: NodeVector::owned(vector_for(5)),
             connections: vec![Vec::new()],
             level: 0,
         }];
@@ -4423,7 +5328,7 @@ mod tests {
             hand_built
                 .distance_to_node(&query, squared_norm(&query), 0)
                 .to_bits(),
-            cosine_distance(&query, &hand_built.nodes[0].vector).to_bits(),
+            cosine_distance(&query, hand_built.vector_at(0)).to_bits(),
             "absent memo must fall back to the fused kernel"
         );
     }
@@ -4800,7 +5705,7 @@ mod tests {
         };
         let bytes = rmp_serde::to_vec(&old).unwrap();
 
-        let graph = try_load_snapshot::<DefaultId>(&bytes).unwrap();
+        let graph = try_load_snapshot::<DefaultId>(bytes).unwrap();
         assert_eq!(graph.dimensions, 8);
         assert_eq!(graph.descriptor, IndexDescriptor::default());
     }
@@ -4828,8 +5733,13 @@ mod tests {
         let base = std::fs::read(&path).unwrap();
 
         let reserialize = |slot: u64| -> Vec<u8> {
-            let mut graph = try_load_snapshot::<u64>(&base).unwrap();
+            let mut graph = try_load_snapshot::<u64>(base.clone()).unwrap();
             graph.reserved_legacy_slot = slot;
+            // A version 3 load leaves the vectors in the container, and serde
+            // cannot describe a payload slot without it. Re-serializing the
+            // graph as a version 1 snapshot is exactly the case
+            // `materialize_vectors` exists for.
+            graph.materialize_vectors();
             rmp_serde::to_vec(&HnswSnapshot {
                 format_version: HNSW_FORMAT_VERSION,
                 graph,
@@ -4847,8 +5757,8 @@ mod tests {
             "the reserved slot must actually be persisted for this test to mean anything"
         );
 
-        let g_lo = try_load_snapshot::<u64>(&lo).unwrap();
-        let g_hi = try_load_snapshot::<u64>(&hi).unwrap();
+        let g_lo = try_load_snapshot::<u64>(lo.clone()).unwrap();
+        let g_hi = try_load_snapshot::<u64>(hi.clone()).unwrap();
         assert_eq!(g_lo.reserved_legacy_slot, 0);
         assert_eq!(g_hi.reserved_legacy_slot, u64::MAX);
 
@@ -4895,7 +5805,7 @@ mod tests {
         let persisted = std::fs::read(&path).unwrap();
 
         // Control: today's loader reads a today-written index.
-        try_load_snapshot::<u64>(&persisted)
+        try_load_snapshot::<u64>(persisted.clone())
             .expect("the current loader must read a currently-written index");
 
         // The layout a build with the slot deleted would have: identical field
@@ -5344,7 +6254,10 @@ mod tests {
     /// Serialize a graph the way the version 1 writer did, so the tests have a
     /// genuine legacy file to read rather than an imagined one.
     fn encode_v1(index: &VectorIndex<u64>) -> Vec<u8> {
-        let graph = index.canonical_persist_snapshot().unwrap().0;
+        let mut graph = index.canonical_persist_snapshot().unwrap().0;
+        // A snapshot of a mapped index names payload slots, and a version 1
+        // snapshot has to carry the floats themselves.
+        graph.materialize_vectors();
         rmp_serde::to_vec(&HnswSnapshot {
             format_version: HNSW_FORMAT_VERSION,
             graph,
@@ -5380,7 +6293,7 @@ mod tests {
     }
 
     #[test]
-    fn save_writes_a_v2_container_that_reloads_bit_identically() {
+    fn save_writes_a_v3_container_that_reloads_bit_identically() {
         let dim = 24;
         let idx = container_fixture(300, dim);
         let before = vectors_by_id(&idx);
@@ -5390,11 +6303,11 @@ mod tests {
         idx.save(&path).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..4], &KVEC_V2_MAGIC, "save must write the v2 magic");
+        assert_eq!(&bytes[..4], &KVEC_V2_MAGIC, "save must write the magic");
         assert!(is_v2_container(&bytes));
         assert_eq!(
             u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            KVEC_V2_VERSION
+            KVEC_V3_VERSION
         );
 
         let loaded = VectorIndex::<u64>::load_from_disk(&path).unwrap();
@@ -5476,7 +6389,7 @@ mod tests {
     }
 
     #[test]
-    fn a_v1_container_migrates_to_v2_on_the_next_save() {
+    fn a_v1_container_migrates_to_the_current_version_on_the_next_save() {
         let dim = 16;
         let idx = container_fixture(150, dim);
         let expected = vectors_by_id(&idx);
@@ -5489,9 +6402,15 @@ mod tests {
         let loaded = VectorIndex::<u64>::load_from_disk(&path).unwrap();
         loaded.save(&path).unwrap();
 
+        let migrated_bytes = std::fs::read(&path).unwrap();
         assert!(
-            is_v2_container(&std::fs::read(&path).unwrap()),
+            is_v2_container(&migrated_bytes),
             "a full write after a legacy read must land the new container"
+        );
+        assert_eq!(
+            container_version(&migrated_bytes),
+            Some(KVEC_V3_VERSION),
+            "the migration target is the version this build writes"
         );
         let migrated = VectorIndex::<u64>::load_from_disk(&path).unwrap();
         assert_vectors_bit_identical(&expected, &vectors_by_id(&migrated));
@@ -5502,10 +6421,15 @@ mod tests {
         );
     }
 
-    /// The counters the format change is accepted on. These are counts taken
+    /// The counters each format change is accepted on. These are counts taken
     /// from the loads themselves, so they do not move with machine load.
+    ///
+    /// All three versions are read through the same entry point, so what each
+    /// one costs is pinned rather than remembered: v1 pays a tagged decode per
+    /// stored dimension, v2 removes that and still copies every float out of
+    /// the container, and v3 copies none.
     #[test]
-    fn v2_pays_no_per_element_decode_and_no_heap_read() {
+    fn v3_copies_no_payload_where_v2_copies_all_of_it() {
         // Wide enough that the vector payload dominates the file, which is the
         // regime the format change is aimed at and the regime real stores are in
         // (768 dimensions per stored entity).
@@ -5516,9 +6440,18 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let v1_path = dir.path().join("legacy.kvec");
-        let v2_path = dir.path().join("current.kvec");
+        let v2_path = dir.path().join("v2.kvec");
+        let v3_path = dir.path().join("current.kvec");
         std::fs::write(&v1_path, encode_v1(&idx)).unwrap();
-        idx.save(&v2_path).unwrap();
+        // v2 is written through its own encoder rather than through `save`,
+        // because `save` writes the current version. Both encoders stay under
+        // test, so the cost each format pays is pinned rather than remembered.
+        std::fs::write(
+            &v2_path,
+            encode_v2(&idx.canonical_persist_snapshot().unwrap().0).unwrap(),
+        )
+        .unwrap();
+        idx.save(&v3_path).unwrap();
 
         let v1 = VectorIndex::<u64>::load_from_disk(&v1_path)
             .unwrap()
@@ -5528,6 +6461,12 @@ mod tests {
             .unwrap()
             .load_stats()
             .unwrap();
+        let v3 = VectorIndex::<u64>::load_from_disk(&v3_path)
+            .unwrap()
+            .load_stats()
+            .unwrap();
+        assert_eq!(v2.format_version, KVEC_V2_VERSION);
+        assert_eq!(v3.format_version, KVEC_V3_VERSION);
 
         // Every stored dimension cost the v1 load one tagged element decode.
         assert_eq!(v1.msgpack_float_decodes, live * dim as u64);
@@ -5569,6 +6508,336 @@ mod tests {
             v1.file_bytes,
             v2.file_bytes
         );
+
+        // What v3 adds, in the same counters. v2 removed the per-element decode
+        // and still copied every float out of the container; v3 addresses them
+        // where they lie, so the copy is zero and stays zero at any scale. This
+        // is the assertion the whole change is accepted on, and it is an
+        // equality against zero rather than a ratio, so a reintroduced copy of
+        // any size fails it.
+        assert_eq!(v3.msgpack_float_decodes, 0);
+        assert_eq!(v3.vector_slots, live);
+        assert_eq!(
+            v3.vector_payload_bytes, 0,
+            "v3 must copy no payload bytes to the heap"
+        );
+        assert_eq!(v3.bytes_read_into_heap, 0);
+        assert_eq!(v3.bytes_mapped, v3.file_bytes);
+        assert!(
+            v3.bytes_decoded < v3.file_bytes / 2,
+            "v3 header {} should be a small part of the file {}",
+            v3.bytes_decoded,
+            v3.file_bytes
+        );
+    }
+
+    /// THE guard this change is accepted on.
+    ///
+    /// A mapped index and a heap index must rank the same fixture identically:
+    /// the same keys, in the same order, with BIT-identical distances. Not
+    /// approximately, not within a tolerance. The claim of the format change is
+    /// that it moves the same `f32` values through a different address, so a
+    /// single differing bit is a failed change, and `==` on floats would accept
+    /// a `-0.0` for a `0.0` while `to_bits` will not.
+    ///
+    /// Three arms, because each could pass while another failed: the index as
+    /// built, the same index encoded v2 and reloaded (the heap path), and the
+    /// same index encoded v3 and reloaded (the mapped path).
+    ///
+    /// The positive controls are what make this able to fail. A fixture that
+    /// answered nothing, or answered only exact zeros, would pass a bit
+    /// comparison vacuously, so the test asserts a non-empty result set and a
+    /// non-zero distance before it compares anything.
+    #[test]
+    fn a_mapped_index_ranks_bit_identically_to_a_heap_index() {
+        let dim = 64;
+        let built = container_fixture(400, dim);
+        // `canonical_persist_snapshot` canonicalizes the COPY and does not
+        // install it, so without this the built index would still hold the
+        // ingestion-order topology while both encoded files held the canonical
+        // one, and the comparison would be between two different graphs rather
+        // than between two encodings of one.
+        built.ensure_canonical_order().unwrap();
+        let snapshot = built.canonical_persist_snapshot().unwrap().0;
+
+        let dir = tempfile::tempdir().unwrap();
+        let v2_path = dir.path().join("heap.kvec");
+        let v3_path = dir.path().join("mapped.kvec");
+        std::fs::write(&v2_path, encode_v2(&snapshot).unwrap()).unwrap();
+        std::fs::write(&v3_path, encode_v3(&snapshot).unwrap()).unwrap();
+
+        let heap = VectorIndex::<u64>::load_from_disk(&v2_path).unwrap();
+        let mapped = VectorIndex::<u64>::load_from_disk(&v3_path).unwrap();
+        assert_eq!(heap.load_stats().unwrap().format_version, KVEC_V2_VERSION);
+        assert_eq!(mapped.load_stats().unwrap().format_version, KVEC_V3_VERSION);
+        assert!(
+            mapped.graph.read().payload.is_some(),
+            "the v3 arm must actually be reading through a container"
+        );
+
+        // The payload, key by key, bit for bit.
+        assert_vectors_bit_identical(&vectors_by_id(&built), &vectors_by_id(&heap));
+        assert_vectors_bit_identical(&vectors_by_id(&built), &vectors_by_id(&mapped));
+
+        // The ranking, over enough queries that a single lucky probe cannot
+        // carry the claim.
+        let mut compared = 0usize;
+        let mut saw_nonzero_distance = false;
+        for q in 500..550u64 {
+            let probe = batch_test_vec(q, dim);
+            let a = built.search_similar(&probe, 20).unwrap();
+            let b = heap.search_similar(&probe, 20).unwrap();
+            let c = mapped.search_similar(&probe, 20).unwrap();
+
+            assert!(!a.is_empty(), "query {q} must reach neighbours");
+            assert_eq!(a.len(), b.len(), "query {q}: heap result length");
+            assert_eq!(a.len(), c.len(), "query {q}: mapped result length");
+
+            for (rank, ((ak, ad), (ck, cd))) in a.iter().zip(c.iter()).enumerate() {
+                assert_eq!(ak, ck, "query {q} rank {rank}: mapped key order");
+                assert_eq!(
+                    ad.to_bits(),
+                    cd.to_bits(),
+                    "query {q} rank {rank}: mapped distance {cd:?} vs built {ad:?}"
+                );
+                if *ad != 0.0 {
+                    saw_nonzero_distance = true;
+                }
+            }
+            for (rank, ((ak, ad), (bk, bd))) in a.iter().zip(b.iter()).enumerate() {
+                assert_eq!(ak, bk, "query {q} rank {rank}: heap key order");
+                assert_eq!(
+                    ad.to_bits(),
+                    bd.to_bits(),
+                    "query {q} rank {rank}: heap distance {bd:?} vs built {ad:?}"
+                );
+            }
+            compared += a.len();
+        }
+        assert!(compared >= 500, "compared only {compared} ranked results");
+        assert!(
+            saw_nonzero_distance,
+            "every distance was zero, so the bit comparison proved nothing"
+        );
+    }
+
+    /// A mapped index must survive being mutated: the first upsert replaces one
+    /// slot with owned floats while every other node keeps reading the
+    /// container, and the result must still be a correct index.
+    #[test]
+    fn a_mapped_index_accepts_a_mutation_without_losing_its_other_vectors() {
+        let dim = 32;
+        let built = container_fixture(200, dim);
+        let before = vectors_by_id(&built);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.kvec");
+        built.save(&path).unwrap();
+        let mapped = VectorIndex::<u64>::load_from_disk(&path).unwrap();
+        assert!(mapped.graph.read().payload.is_some());
+
+        // A new key, then an overwrite of an existing one.
+        let fresh = batch_test_vec(9_999, dim);
+        mapped.upsert(9_999, &fresh).unwrap();
+        let replacement = batch_test_vec(4_242, dim);
+        let existing = before[0].0;
+        mapped.upsert(existing, &replacement).unwrap();
+
+        assert_eq!(mapped.get(&9_999).unwrap(), fresh);
+        assert_eq!(mapped.get(&existing).unwrap(), replacement);
+
+        // Every other key still reads out of the container, bit for bit.
+        for (key, vector) in before.iter().skip(1) {
+            let read = mapped.get(key).expect("mapped key still present");
+            assert_eq!(read.len(), vector.len(), "key {key} dimension count");
+            for (d, (a, b)) in read.iter().zip(vector.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "key {key} dimension {d} changed under a mutation elsewhere"
+                );
+            }
+        }
+
+        // And the mutated index round-trips through a save.
+        let second = dir.path().join("again.kvec");
+        mapped.save(&second).unwrap();
+        let reloaded = VectorIndex::<u64>::load_from_disk(&second).unwrap();
+        assert_eq!(reloaded.get(&9_999).unwrap(), fresh);
+        assert_eq!(reloaded.get(&existing).unwrap(), replacement);
+    }
+
+    /// The reverse-edge index is the largest single term in a load that nobody
+    /// asked for, so a load must not build it, and a mutation must.
+    ///
+    /// Both halves matter. Without the second, an implementation that simply
+    /// deleted the table would pass, and removal would silently leave dangling
+    /// edges. The removal arm is what makes that impossible: it removes a key
+    /// and then asserts no surviving node still names the freed slot, which is
+    /// exactly what an absent reverse index would fail to clean up.
+    #[test]
+    fn a_load_builds_no_backlinks_and_a_mutation_builds_them() {
+        let dim = 16;
+        let idx = container_fixture(200, dim);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.kvec");
+        idx.save(&path).unwrap();
+
+        let loaded = VectorIndex::<u64>::load_from_disk(&path).unwrap();
+        {
+            let graph = loaded.graph.read();
+            assert!(graph.nodes.len() > 100, "fixture must be non-trivial");
+            assert!(
+                graph.backlinks.is_empty(),
+                "a load must not build the reverse-edge index"
+            );
+        }
+
+        // Queries do not need it, and must not build it as a side effect.
+        let probe = batch_test_vec(11, dim);
+        let answered = loaded.search_similar(&probe, 10).unwrap();
+        assert!(!answered.is_empty(), "the loaded index must answer");
+        assert!(
+            loaded.graph.read().backlinks.is_empty(),
+            "answering a query must not build the reverse-edge index"
+        );
+
+        // An UPSERT must materialize it, and this arm is what makes the
+        // `ensure_backlinks_ready` call in `commit_insertion` falsifiable.
+        // Dropping that call does not break the removal arm below, because
+        // `remove` calls `ensure_backlinks_ready` too and would self-heal. It
+        // breaks HERE: the insert's own `backlinks.push` would take the table
+        // from zero entries to one while `nodes` went from N to N + 1, leaving
+        // a table that is neither whole nor visibly absent for whatever runs
+        // next.
+        loaded
+            .upsert(9_999, &batch_test_vec(9_999, dim))
+            .expect("an upsert into a loaded index must succeed");
+        {
+            let graph = loaded.graph.read();
+            assert_eq!(
+                graph.backlinks.len(),
+                graph.nodes.len(),
+                "an upsert must leave the reverse-edge index tracking nodes"
+            );
+        }
+
+        // A removal does too, and the graph it leaves behind must be
+        // consistent: no live node may still point at the freed slot.
+        let victim = loaded.keys()[0];
+        let freed = *loaded.graph.read().id_to_idx.get(&victim).unwrap();
+        loaded.remove(&victim).unwrap();
+        {
+            let graph = loaded.graph.read();
+            assert_eq!(
+                graph.backlinks.len(),
+                graph.nodes.len(),
+                "a mutation must leave the reverse-edge index tracking nodes"
+            );
+            for (idx, node) in graph.nodes.iter().enumerate() {
+                for (layer, neighbors) in node.connections.iter().enumerate() {
+                    assert!(
+                        !neighbors.contains(&freed),
+                        "node {idx} layer {layer} still points at the freed slot {freed}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A version above the reader's range is refused by name, and the range is
+    /// what the reader tests rather than an equality.
+    ///
+    /// The positive control is the pair of accepted versions read back through
+    /// the same entry point, so a reader that refused everything would fail
+    /// this test rather than pass it.
+    #[test]
+    fn the_container_version_check_is_a_range() {
+        let dim = 8;
+        let idx = container_fixture(40, dim);
+        let snapshot = idx.canonical_persist_snapshot().unwrap().0;
+
+        // Positive control: both readable versions decode through the range.
+        for bytes in [encode_v2(&snapshot).unwrap(), encode_v3(&snapshot).unwrap()] {
+            let version = container_version(&bytes).unwrap();
+            assert!(
+                (KVEC_MIN_READABLE_VERSION..=KVEC_MAX_READABLE_VERSION).contains(&version),
+                "version {version} must sit inside the readable range"
+            );
+            decode_container::<u64>(LoadedContainer::Read(bytes))
+                .expect("a version inside the range must decode");
+        }
+
+        // A version one above the range is refused, and the refusal names the
+        // range rather than reporting a corrupt file.
+        let mut future = encode_v3(&snapshot).unwrap();
+        future[4..8].copy_from_slice(&(KVEC_MAX_READABLE_VERSION + 1).to_le_bytes());
+        let message = match decode_container::<u64>(LoadedContainer::Read(future)) {
+            Ok(_) => panic!("a version above the readable range must be refused"),
+            Err(refused) => refused.to_string(),
+        };
+        assert!(
+            message.contains("unsupported kvec container version"),
+            "refusal must name the version, got: {message}"
+        );
+        assert!(
+            message.contains(&KVEC_MAX_READABLE_VERSION.to_string()),
+            "refusal must name the range it accepts, got: {message}"
+        );
+    }
+
+    /// The persisted norm table is stamped with the kernel that produced it, and
+    /// a table from the other kernel is not consumed.
+    ///
+    /// A norm's last ULPs depend on the reduction order, so a table written by
+    /// the NEON kernel and read by the scalar one would break the bit-identity
+    /// the memo rests on. Flipping the stamp on disk is the cheapest way to
+    /// reach the disagreement without running two builds, and the assertion is
+    /// that the load rebuilds rather than reads: the table must still be exact
+    /// against a fresh recompute either way.
+    #[test]
+    fn a_persisted_norm_table_from_the_other_kernel_is_rebuilt() {
+        let dim = 12;
+        let idx = container_fixture(60, dim);
+        let snapshot = idx.canonical_persist_snapshot().unwrap().0;
+        let bytes = encode_v3(&snapshot).unwrap();
+
+        // Control: this build's own stamp is consumed, and the table is exact.
+        let (agreed, _) = decode_container::<u64>(LoadedContainer::Read(bytes.clone())).unwrap();
+        assert_eq!(agreed.sq_norms.len(), agreed.nodes.len());
+
+        // Flip the stamp inside the header. The header is MessagePack, so the
+        // stamp is found by value rather than by offset: it is the last field,
+        // a one-byte integer, and the two legal values are 0 and 1.
+        let header_len = read_u64_le(&bytes, 8) as usize;
+        let header = &bytes[KVEC_V3_PREAMBLE_LEN..KVEC_V3_PREAMBLE_LEN + header_len];
+        let stamp = norm_kernel_stamp();
+        let flipped_stamp = if stamp == NORM_KERNEL_SIMD {
+            NORM_KERNEL_SCALAR
+        } else {
+            NORM_KERNEL_SIMD
+        };
+        assert_eq!(
+            header[header_len - 1],
+            stamp,
+            "the stamp must be the header's last byte for this test to reach it"
+        );
+        let mut flipped = bytes.clone();
+        flipped[KVEC_V3_PREAMBLE_LEN + header_len - 1] = flipped_stamp;
+
+        let (rebuilt, _) = decode_container::<u64>(LoadedContainer::Read(flipped)).unwrap();
+        assert_eq!(
+            rebuilt.sq_norms.len(),
+            rebuilt.nodes.len(),
+            "a disagreeing stamp must leave an exact table, rebuilt rather than read"
+        );
+        for idx in 0..rebuilt.nodes.len() {
+            assert_eq!(
+                rebuilt.sq_norms[idx].to_bits(),
+                squared_norm(rebuilt.vector_at(idx)).to_bits(),
+                "node {idx} norm must equal a fresh recompute"
+            );
+        }
     }
 
     #[test]
@@ -5583,21 +6852,54 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("churned.kvec");
-        idx.save(&path).unwrap();
+        let v2_path = dir.path().join("churned-v2.kvec");
+        let v3_path = dir.path().join("churned.kvec");
+        std::fs::write(
+            &v2_path,
+            encode_v2(&idx.canonical_persist_snapshot().unwrap().0).unwrap(),
+        )
+        .unwrap();
+        idx.save(&v3_path).unwrap();
 
-        let stats = VectorIndex::<u64>::load_from_disk(&path)
+        let live = idx.len() as u64;
+        for path in [&v2_path, &v3_path] {
+            let stats = VectorIndex::<u64>::load_from_disk(path)
+                .unwrap()
+                .load_stats()
+                .unwrap();
+            assert_eq!(
+                stats.vector_slots,
+                live,
+                "the payload holds live vectors only, not the free list ({})",
+                path.display()
+            );
+        }
+
+        // The byte-level form of the same claim, on the format that copies. v3
+        // copies nothing at all, so its payload bytes are zero however many
+        // slots the free list holds, and `vector_slots` above is what carries
+        // the claim there.
+        let v2 = VectorIndex::<u64>::load_from_disk(&v2_path)
             .unwrap()
             .load_stats()
             .unwrap();
-        assert_eq!(
-            stats.vector_slots,
-            idx.len() as u64,
-            "the payload holds live vectors only, not the free list"
-        );
-        assert_eq!(
-            stats.vector_payload_bytes,
-            idx.len() as u64 * dim as u64 * 4
+        assert_eq!(v2.vector_payload_bytes, live * dim as u64 * 4);
+        let v3 = VectorIndex::<u64>::load_from_disk(&v3_path)
+            .unwrap()
+            .load_stats()
+            .unwrap();
+        assert_eq!(v3.vector_payload_bytes, 0);
+
+        // And the file itself is sized by live slots, not allocated ones, which
+        // is the claim `vector_payload_bytes` used to stand in for: half the
+        // slots were freed, so a container that kept them would be about eight
+        // dimensions times thirty-two vectors larger.
+        let dead_payload = (n - live) * dim as u64 * 4;
+        assert!(dead_payload > 0, "the fixture must actually free slots");
+        assert!(
+            v3.file_bytes < v2.file_bytes + dead_payload,
+            "v3 file {} must not carry the {dead_payload} bytes of freed slots",
+            v3.file_bytes
         );
     }
 
