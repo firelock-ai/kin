@@ -1509,6 +1509,49 @@ SELF_TEST_CASES = [
 ]
 
 
+# The LEARNER behind form 2, exercised over real `use` declarations.
+#
+# This table exists because the four form-2 cases above could not catch the
+# learner's deletion. They hand their bindings in as a literal tuple, so they
+# exercise `binding_pattern` and never `filesystem_bindings`, and an independent
+# review of kin#1458 proved the consequence rather than arguing it: with
+# `filesystem_bindings` stubbed to return an empty set, both guards stayed green
+# over the whole tree, all 30 cases above still passed, and a planted
+# `OpenOptions::new().read(true).open(p)` in a file whose entry pins its import
+# went silent. The one mechanism that closes FIR-3151 had no check anywhere that
+# failed when it was removed, which is precisely the class this guard exists to
+# stop, reproduced inside the fix for it.
+#
+# `scripts/falsify-zero-file-search.py` could not host this, for two independent
+# reasons. A probe that carries its own `use` is reported on that import line by
+# NAMESPACE_REACH whether or not the learner ran, so it passes with the learner
+# gone and proves nothing. And `Falsify guards` carries
+# `github.event_name != 'pull_request'`, so it never grades a pull request at
+# all. `self_test()` runs inside the scan, which `fast-gate-lint` runs on every
+# pull request, so this is the only surface that fails on the commit that breaks
+# it rather than on main a release later.
+#
+# Cases are the learner's own decision branches, not one happy path.
+BINDING_LEARNER_CASES = [
+    # The alias no global spelling list can hold. This is the whole argument for
+    # reading use trees, so it is the first thing that has to break.
+    ("alias", "use std::fs::OpenOptions as Opener;\n", {"Opener"}),
+    # `self` beside an item, which is the FIR-3151 import verbatim in shape.
+    ("self beside an item", "use std::fs::{self, File};\n", {"fs", "File"}),
+    ("third-party fs crate", "use fs2::FileExt;\n", {"FileExt"}),
+    # A glob binds no name the declaration names, so the vocabulary is the
+    # fallback for that one shape.
+    ("glob", "use std::fs::*;\n", set(FS_GLOB_VOCABULARY)),
+    # `as _` imports a trait for its methods and binds nothing a later line can
+    # spell. The learner must return nothing here and leave the import to
+    # NAMESPACE_REACH, which is the honest limit recorded on the function.
+    ("trait imported as _", "use std::os::unix::fs::PermissionsExt as _;\n", set()),
+    # Negative control. A learner that returned every name it saw, or that
+    # returned its input unfiltered, would satisfy every case above.
+    ("not a filesystem module", "use std::collections::HashMap;\n", set()),
+]
+
+
 def line_is_reported(line, bindings=()):
     """Whether the scan's matcher would report this line. One code path only.
 
@@ -1524,8 +1567,24 @@ def line_is_reported(line, bindings=()):
 
 
 def self_test():
-    """Check the deny set against SELF_TEST_CASES, returning a list of errors."""
+    """Check the deny set and the binding learner, returning a list of errors.
+
+    Two tables, because they fail for different reasons. SELF_TEST_CASES asks
+    whether the MATCHERS still recognise each primitive.
+    BINDING_LEARNER_CASES asks whether the learner that feeds one of those
+    matchers still reads a `use` tree at all, which no case in the first table
+    can answer.
+    """
     errors = []
+    for label, line, want in BINDING_LEARNER_CASES:
+        got = filesystem_bindings(lex_lines([line]))
+        if got != want:
+            errors.append(
+                f"  binding learner {label!r}: {line.strip()!r} bound "
+                f"{sorted(got)}, want {sorted(want)}. Form 2 of the deny set is "
+                "whatever this function returns, so a wrong answer here is a "
+                "silent hole rather than a failing pattern"
+            )
     for label, line, bindings, want in SELF_TEST_CASES:
         got = line_is_reported(line, bindings)
         if got != want:
@@ -1688,8 +1747,10 @@ def main():
         sys.exit(1)
 
     print(
-        f"Deny-set self-test passed: {len(SELF_TEST_CASES)} cases, "
-        f"{sum(1 for c in SELF_TEST_CASES if not c[3])} of them negative controls."
+        f"Deny-set self-test passed: {len(SELF_TEST_CASES)} matcher cases "
+        f"({sum(1 for c in SELF_TEST_CASES if not c[3])} negative controls) and "
+        f"{len(BINDING_LEARNER_CASES)} binding-learner cases "
+        f"({sum(1 for c in BINDING_LEARNER_CASES if not c[2])} negative controls)."
     )
     print("Verification PASSED: Zero File-Search Invariant holds.")
     sys.exit(0)
