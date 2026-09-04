@@ -8102,6 +8102,266 @@ pub(crate) async fn sync_filesystem_with_graph_deferring_tree_publication(
     sync_filesystem_with_graph_publishing(state, TreePublication::DeferredToCaller).await
 }
 
+/// What re-deriving the semantic layer for one set of already-admitted paths
+/// produced.
+#[derive(Debug, Default)]
+pub(crate) struct SemanticReadmission {
+    /// Paths whose semantic layer was re-derived from the bytes graph authority
+    /// now holds.
+    pub(crate) enriched: usize,
+    /// Entity-source paths whose bytes moved and whose semantics could not be
+    /// re-derived, named so a caller can refuse in words rather than report a
+    /// count of zero.
+    pub(crate) failed: Vec<String>,
+}
+
+/// Re-derive the semantic layer for paths whose exact bytes are already graph
+/// authority.
+///
+/// [`sync_filesystem_with_graph_publishing_inner`] runs enrichment as the second
+/// half of admitting a transition it planned itself, and returns before that
+/// half when the transition is empty. A disposable session publishes a complete
+/// exact tree through a different route and parses none of it, so by the time
+/// the next commit forces an admission the working copy and the graph tree
+/// already agree, the transition really is empty, and the file whose bytes just
+/// moved is never offered to a parser. Its entities keep the spans they were
+/// parsed at, and every read surface serves those spans under an envelope with
+/// nothing to report. On a converted `psf/requests` an edit that prepended
+/// seventeen lines left every line number in the file seventeen short of the
+/// bytes on disk.
+///
+/// So the parse belongs where the bytes were published rather than at the commit
+/// after it. This is that half on its own, driven by a caller that already knows
+/// which paths its publication moved.
+///
+/// Content comes from the body the exact tree names, and the host is re-read
+/// only to prove it still holds that same body, which is the same
+/// [`host_entry_matches_graph`] guard the admission's own enrichment uses: bytes
+/// written after a publication may not enrich against the tree that publication
+/// established. A path the graph no longer carries, a symlink, a Gitlink and a
+/// path with no UTF-8 rendering are skipped rather than failed. None of them is
+/// source owned by that path, and the exact tree already records what each one
+/// is.
+///
+/// Failure is reported and never fatal here. Membership is durable before this
+/// runs and a parser may not retract it, which is the invariant stated beside
+/// the admission's own enrichment loop. What a re-parse it could not perform
+/// means for the reply is the caller's decision, not this function's.
+pub(crate) async fn readmit_semantics_for_paths(
+    state: &DaemonState,
+    paths: &BTreeSet<RepoPath>,
+) -> SemanticReadmission {
+    let mut outcome = SemanticReadmission::default();
+    if paths.is_empty() {
+        return outcome;
+    }
+    let working_dir = state.layout.working_dir();
+    let tree = state.graph.resolved_tree();
+    let enrichment_pipeline = IndexPipeline::new();
+    let mut reconciler = state.reconciler.write().await;
+    let mut graph_changed = false;
+
+    for repo_path in paths {
+        let Some(artifact) = tree.artifact_at_path(repo_path) else {
+            continue;
+        };
+        // Symlinks and Gitlinks are never parsed as source owned by the link
+        // path, which is the rule the layout backfill and the admission loop
+        // both apply.
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        let Some(file_id) = semantic_file_id(repo_path) else {
+            continue;
+        };
+        let Ok(host_path) = kin_index::host_path_from_repo_path(working_dir, repo_path) else {
+            continue;
+        };
+        // `TreeEntry` carries kin-model's hash and the blob store speaks
+        // kin-blobs', so the identity crosses that boundary by bytes.
+        let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        let content = match state.blobs.read(&body_hash) {
+            Ok(content) => content,
+            Err(error) => {
+                warn!(
+                    file = %file_id,
+                    error = %error,
+                    "the body this path's exact tree entry names is not readable, so its \
+                     semantics cannot be re-derived from graph-owned truth"
+                );
+                outcome.failed.push(file_id.0.clone());
+                continue;
+            }
+        };
+
+        let classification = FileClassifier::classify_with_content(&host_path, &content);
+        if classification != FileClassification::EntitySource {
+            match enrichment_pipeline.index_any_content(&file_id, &content, body_hash) {
+                Ok(indexed) => match persist_non_entity_enrichment(state, indexed) {
+                    Ok((persisted, cleanup)) => {
+                        for id in cleanup.removed_entities {
+                            state.emit_event(DaemonEvent::EntityChanged {
+                                entity_id: id,
+                                node: None,
+                                change_type: ChangeType::Deleted,
+                                file_path: Some(persisted.0.clone()),
+                                session_id: None,
+                            });
+                        }
+                        graph_changed = true;
+                        outcome.enriched += 1;
+                    }
+                    Err(error) => {
+                        warn!(
+                            file = %file_id,
+                            error = %error,
+                            "published bytes re-indexed but facet persistence failed"
+                        );
+                    }
+                },
+                Err(error) => warn!(
+                    file = %file_id,
+                    error = %error,
+                    "published bytes could not be re-indexed as a non-entity artifact"
+                ),
+            }
+            continue;
+        }
+
+        // The host is consulted for identity only. A working copy that no longer
+        // holds the published body is a path some other writer has moved past,
+        // and enriching from it would publish facets against a tree entry this
+        // publication did not establish.
+        match host_entry_matches_graph(state, &host_path, repo_path) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    file = %file_id,
+                    "the host entry no longer matches the body this path's exact tree entry \
+                     names, so its semantics were left for the admission that observes those \
+                     bytes"
+                );
+                outcome.failed.push(file_id.0.clone());
+                continue;
+            }
+            Err(error) => {
+                warn!(
+                    file = %file_id,
+                    error = %error,
+                    "could not compare the host entry to graph authority before re-deriving \
+                     this path's semantics"
+                );
+                outcome.failed.push(file_id.0.clone());
+                continue;
+            }
+        }
+
+        if let Err(error) =
+            clear_incompatible_facets(state, &file_id, EnrichmentFacet::EntitySource)
+        {
+            warn!(
+                file = %file_id,
+                error = %error,
+                "incompatible facet cleanup failed before re-deriving this path's semantics"
+            );
+        }
+
+        let event = FileEvent::Changed(host_path);
+        match reconciler.reconcile_file_change(&event, &state.blobs, state.graph.as_ref()) {
+            Ok(result) => {
+                let (reconciled, delta) = result.into_parts();
+                use kin_reconcile::ReconcileOutcome;
+                let should_apply = matches!(
+                    &reconciled,
+                    ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. }
+                );
+                // `BrokenAst` and `Conflict` retain last-known-good state and
+                // derive nothing, so the file keeps the spans its previous parse
+                // recorded. Counting either as enrichment would be this whole
+                // change's own defect one level down: a clean summary over a
+                // file that still answers at its old positions. The daemon
+                // reconciles under `ReconcilePolicy::FallbackToLkg`, so a
+                // syntactically broken file is the ordinary case rather than an
+                // edge, and it is exactly the case an agent produces mid-edit.
+                if !should_apply {
+                    warn!(
+                        file = %file_id,
+                        outcome = ?reconciled,
+                        "published bytes were read but no semantic transaction came back, so \
+                         this path still answers at the positions its previous parse recorded"
+                    );
+                    outcome.failed.push(file_id.0.clone());
+                    continue;
+                }
+                {
+                    let derived_entities = !delta.entity_deltas.is_empty();
+                    if let Err(error) = state.graph.apply_transaction_delta(&delta) {
+                        warn!(
+                            file = %file_id,
+                            error = %error,
+                            "re-derived semantics for published bytes but the transaction would \
+                             not apply"
+                        );
+                        outcome.failed.push(file_id.0.clone());
+                        continue;
+                    }
+                    if derived_entities {
+                        mark_enrichment_unpublished(state, &file_id);
+                    }
+                    // The file's declarations just moved, so whatever a language
+                    // server said about them was said at positions this delta
+                    // retired.
+                    crate::daemon::retire_enrichment_marker(
+                        state,
+                        std::slice::from_ref(&file_id.0),
+                    );
+                    if let Err(error) =
+                        state.persist_projection_truth_from_reconcile(&reconciler, &reconciled)
+                    {
+                        warn!(
+                            file = %file_id,
+                            error = %error,
+                            "failed to persist projection truth after re-deriving semantics"
+                        );
+                    }
+                    if let ReconcileOutcome::FileRemoved {
+                        removed, file_id, ..
+                    } = &reconciled
+                    {
+                        for id in removed {
+                            state.emit_event(DaemonEvent::EntityChanged {
+                                entity_id: *id,
+                                node: None,
+                                change_type: ChangeType::Deleted,
+                                file_path: Some(file_id.0.clone()),
+                                session_id: None,
+                            });
+                        }
+                    }
+                    graph_changed = true;
+                    outcome.enriched += 1;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    file = %file_id,
+                    error = %error,
+                    "published bytes could not be re-parsed, so this path's entities still \
+                     answer at the positions they were parsed at"
+                );
+                outcome.failed.push(file_id.0.clone());
+            }
+        }
+    }
+
+    drop(reconciler);
+    if graph_changed {
+        state.mark_dirty();
+        state.bump_version();
+    }
+    outcome
+}
+
 async fn sync_filesystem_with_graph_publishing(
     state: &DaemonState,
     publication: TreePublication,

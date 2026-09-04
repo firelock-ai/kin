@@ -6041,14 +6041,19 @@ async fn reconcile_session_workspace(
         ));
     }
 
-    let (authority_generation, workspace_generation, idempotent_replay) = if observation
-        .deltas()
-        .is_empty()
-    {
+    let (
+        authority_generation,
+        workspace_generation,
+        idempotent_replay,
+        semantic_enriched,
+        semantic_failures,
+    ) = if observation.deltas().is_empty() {
         (
             observation.base().authority_roots.generation,
             observation.base().source_workspace.generation,
             false,
+            0,
+            Vec::new(),
         )
     } else {
         let authority_context =
@@ -6111,6 +6116,22 @@ async fn reconcile_session_workspace(
             old_root_hash: Some(previous_tree_hash.to_string()),
             new_root_hash: desired_tree_hash.to_string(),
         });
+        // The exact tree is published and nothing has parsed it. Re-derive the
+        // semantic layer for the paths this publication moved, here, under the
+        // gate that published them.
+        //
+        // Leaving it to the next commit does not work, and that is the whole
+        // defect. A commit forces one complete admission, and that admission
+        // plans its transition from the working copy this publication has
+        // already made current, so the transition is empty and it returns before
+        // its own enrichment half ever runs. The bytes moved, the parse never
+        // happened, and every read surface kept answering at the positions the
+        // previous parse recorded. On a converted `psf/requests` an edit that
+        // prepended seventeen lines left the whole file answering seventeen
+        // lines short, under an envelope with nothing to report.
+        let readmitted =
+            crate::loop_runner::readmit_semantics_for_paths(&state, &published_paths(&observation))
+                .await;
         (
             committed.receipt.generation,
             observation
@@ -6119,11 +6140,13 @@ async fn reconcile_session_workspace(
                 .generation
                 .saturating_add(1),
             committed.idempotent_replay,
+            readmitted.enriched,
+            readmitted.failed,
         )
     };
 
     drop(graph_mutation);
-    Ok(Json(kin_cli::commands::reconcile::ReconcileSummary {
+    let summary = kin_cli::commands::reconcile::ReconcileSummary {
         schema: kin_cli::commands::reconcile::RECONCILE_SUMMARY_SCHEMA.to_string(),
         operation_id: observation.base().reconcile_operation_id,
         repository_id: observation.base().repository_id.clone(),
@@ -6139,10 +6162,68 @@ async fn reconcile_session_workspace(
         observed_materialized_artifacts: observation.observed_materialized_artifacts(),
         preserved_graph_only_artifacts: observation.preserved_graph_only_artifacts(),
         observed_body_bytes: observation.observed_body_bytes(),
-        semantic_files_enriched: 0,
-        semantic_enrichment_failures: 0,
+        semantic_files_enriched: semantic_enriched,
+        semantic_enrichment_failures: semantic_failures.len(),
         changes,
-    }))
+    };
+    if !semantic_failures.is_empty() {
+        return Err(semantic_readmission_refused(&summary, &semantic_failures));
+    }
+    Ok(Json(summary))
+}
+
+/// Every repository path one session publication moved.
+///
+/// Both sides of every delta. A rename's old path leaves the tree and its new
+/// path enters it, and the readmission skips whatever the tree no longer
+/// carries, so naming both sides costs nothing and misses nothing.
+fn published_paths(
+    observation: &kin_cli::commands::reconcile::SessionReconcileObservation,
+) -> std::collections::BTreeSet<RepoPath> {
+    let mut paths = std::collections::BTreeSet::new();
+    for delta in observation.deltas() {
+        if let Some(old) = delta.old_state() {
+            paths.insert(old.path.clone());
+        }
+        if let Some(new) = delta.new_state() {
+            paths.insert(new.path.clone());
+        }
+    }
+    paths
+}
+
+/// Refuse a reconcile whose exact tree published but whose semantics did not.
+///
+/// The bytes are durable before this is reached and a parser may not retract
+/// them, so this is not a rollback and the body says so outright: the tree
+/// moved, and the graph cannot answer about these files at the positions their
+/// new bytes hold. Returning it as a refusal rather than as a degradation block
+/// inside a 200 is what makes `kin reconcile` exit non-zero, because the CLI
+/// treats any non-success status as an error and prints the body; a caller that
+/// reads a clean summary and a zero has no way to learn that the file it just
+/// edited still answers at its old spans, which is the failure this whole change
+/// exists to end.
+///
+/// The complete summary travels inside the refusal, so nothing a success would
+/// have reported is lost by refusing.
+fn semantic_readmission_refused(
+    summary: &kin_cli::commands::reconcile::ReconcileSummary,
+    failed: &[String],
+) -> (StatusCode, String) {
+    let body = serde_json::json!({
+        "error": "semantic_readmission_failed",
+        "message": format!(
+            "the exact tree published as {} but {} of the files it moved could not be \
+             re-parsed, so the graph still answers about them at the positions their previous \
+             bytes held: {}",
+            summary.desired_tree_hash,
+            failed.len(),
+            failed.join(", ")
+        ),
+        "files": failed,
+        "summary": summary,
+    });
+    (StatusCode::CONFLICT, body.to_string())
 }
 
 fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String) {
@@ -34915,6 +34996,345 @@ mod tests {
             "a refused commit must record no change at all"
         );
     }
+    /// FIR-3200. Read the published start line of the sole entity a path holds.
+    #[cfg(unix)]
+    fn published_start_line(state: &Arc<DaemonState>, path: &str) -> u32 {
+        let entities = state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new(path)),
+                ..Default::default()
+            })
+            .unwrap();
+        let spanned = entities
+            .iter()
+            .filter_map(|entity| entity.span.as_ref().map(|span| span.start_line))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spanned.len(),
+            1,
+            "the fixture holds exactly one spanned entity at {path}, found {spanned:?}"
+        );
+        spanned[0]
+    }
+
+    /// FIR-3200 measurement. Reproduce the brownfield stranger's stale span:
+    /// an edit that arrives through a disposable session, the session reconcile
+    /// that publishes its exact tree, and the ordinary commit after it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_after_a_session_reconcile_republishes_the_moved_span() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let host_path = repo.path().join("shifted.rs");
+        std::fs::write(&host_path, b"pub fn shifted() -> u32 { 7 }\n").unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+        eprintln!("FIR-3200 measurement: committed start_line={before}");
+
+        let session_dir = state.layout.root().join("runs/session-fir3200");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        let summary = reconcile_session_through_api(&app, &session_dir).await;
+        eprintln!(
+            "FIR-3200 measurement: reconcile modified={} enriched={} after_reconcile_start_line={}",
+            summary.modified,
+            summary.semantic_files_enriched,
+            published_start_line(&state, "shifted.rs")
+        );
+        assert_eq!(
+            summary.semantic_files_enriched, 1,
+            "the reconcile must report the file it re-parsed rather than a hardcoded zero"
+        );
+        assert_eq!(summary.semantic_enrichment_failures, 0);
+
+        let commit = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
+                            "message": "commit the session's edit"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let commit_status = commit.status();
+        let commit_body = axum::body::to_bytes(commit.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        eprintln!(
+            "FIR-3200 measurement: commit status={commit_status} body={}",
+            String::from_utf8_lossy(&commit_body)
+        );
+
+        let after = published_start_line(&state, "shifted.rs");
+        eprintln!("FIR-3200 measurement: after_commit start_line={after}");
+        assert_eq!(
+            after,
+            before + PREPENDED_LINES,
+            "the published span must move with the bytes the session changed"
+        );
+    }
+
+    /// FIR-3200. A session that publishes a file the parser cannot parse is
+    /// refused in words, and the bytes stay published.
+    ///
+    /// This is the arm I could not build a deterministic trigger for until
+    /// review found the defect underneath it. The daemon reconciles under
+    /// `ReconcilePolicy::FallbackToLkg`, so unparseable source comes back as
+    /// `ReconcileOutcome::BrokenAst`: last-known-good state retained, no
+    /// transaction derived, the file still answering at the positions its
+    /// previous parse recorded. Counting that as enrichment reproduced this
+    /// change's own defect one level down, on the most ordinary agent case there
+    /// is, a file caught mid-edit.
+    ///
+    /// So the trigger is the ordinary case: prepend the seventeen lines and
+    /// leave the file syntactically broken. The reconcile must name the file
+    /// rather than report a clean summary, and the tree must still carry the
+    /// bytes, because a parser never retracts membership.
+    ///
+    /// Falsify by restoring the unconditional `outcome.enriched += 1` outside
+    /// the applied-delta arm: this returns 200 with enriched 1 and failures 0
+    /// over a file whose span never moved.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_session_publishing_unparseable_source_is_refused_and_keeps_its_bytes() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = state.layout.root().join("runs/session-fir3200-broken");
+        materialize_session_through_api(&app, &session_dir).await;
+        let session_file = session_dir.join("shifted.rs");
+        prepend_session_lines(&session_file, 17);
+        let mut broken = std::fs::read(&session_file).unwrap();
+        broken.extend_from_slice(b"pub fn half_written(\n");
+        std::fs::write(&session_file, &broken).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_dir": session_dir,
+                            "confirm_mass_deletion": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a reconcile that could not re-parse what it published must not read as a clean \
+             success: {body}"
+        );
+        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(refusal["error"], "semantic_readmission_failed");
+        assert_eq!(refusal["files"], json!(["shifted.rs"]));
+        assert_eq!(refusal["summary"]["semantic_files_enriched"], json!(0));
+        assert_eq!(refusal["summary"]["semantic_enrichment_failures"], json!(1));
+
+        // Membership is not in doubt, and a parser may not retract it. The
+        // refusal is a report of a graph gap, never a rollback.
+        let tree = state.graph.resolved_tree();
+        let published = tree
+            .artifact_at_path(&RepoPath::from_utf8("shifted.rs".to_string()).unwrap())
+            .expect("the path stays in the exact tree");
+        let kin_model::TreeEntry::Blob { hash, .. } = published.entry else {
+            panic!("the fixture is a regular file");
+        };
+        assert_eq!(
+            state
+                .blobs
+                .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
+                .expect("the published body is readable"),
+            broken,
+            "the refusal reports a gap in the graph and never retracts the bytes"
+        );
+        assert_eq!(
+            published_start_line(&state, "shifted.rs"),
+            before,
+            "an unparseable file keeps its last-known-good spans, which is what the refusal is \
+             telling the caller about"
+        );
+    }
+
+    /// FIR-3200. The refusal a reconcile returns when its bytes published and
+    /// their semantics did not.
+    ///
+    /// The shape is the whole point, so the shape is what is asserted: a status
+    /// the CLI turns into a non-zero exit, every file named, and the complete
+    /// summary carried inside so refusing costs a caller nothing a success would
+    /// have told them. A 200 with a degradation block would satisfy none of
+    /// that: `daemon_client::reconcile` returns `Ok` for any success status and
+    /// the caller reads a clean summary, which is the exact failure this change
+    /// exists to end.
+    ///
+    /// Falsify by returning `StatusCode::OK` from `semantic_readmission_refused`,
+    /// or by dropping `files` from its body: the first assertion goes red on the
+    /// status, the second on the name.
+    #[test]
+    fn a_reconcile_whose_semantics_did_not_publish_refuses_and_names_the_files() {
+        let summary = kin_cli::commands::reconcile::ReconcileSummary {
+            schema: kin_cli::commands::reconcile::RECONCILE_SUMMARY_SCHEMA.to_string(),
+            operation_id: kin_model::OperationId::new(),
+            repository_id: RepositoryId::new("refusal-shape".to_string()).unwrap(),
+            authority_generation: 7,
+            workspace_generation: 9,
+            previous_tree_hash: Hash256::from_bytes([0x11; 32]),
+            desired_tree_hash: Hash256::from_bytes([0x22; 32]),
+            idempotent_replay: false,
+            changed: true,
+            added: 0,
+            modified: 1,
+            removed: 0,
+            observed_materialized_artifacts: 1,
+            preserved_graph_only_artifacts: 0,
+            observed_body_bytes: 512,
+            semantic_files_enriched: 0,
+            semantic_enrichment_failures: 1,
+            changes: Vec::new(),
+        };
+
+        let (status, body) =
+            semantic_readmission_refused(&summary, &["src/shifted.rs".to_string()]);
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the CLI turns any non-success status into a non-zero exit; a 2xx here reads as a \
+             clean reconcile over a file that still answers at its old spans"
+        );
+        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(refusal["error"], "semantic_readmission_failed");
+        assert_eq!(
+            refusal["files"],
+            json!(["src/shifted.rs"]),
+            "a reader cannot act on a count; the refusal has to name the file"
+        );
+        assert!(
+            refusal["message"]
+                .as_str()
+                .unwrap()
+                .contains("src/shifted.rs"),
+            "the sentence a person reads must name the file too: {body}"
+        );
+        assert_eq!(
+            refusal["summary"]["semantic_enrichment_failures"],
+            json!(1),
+            "refusing must not cost the caller what a success would have reported"
+        );
+        assert_eq!(refusal["summary"]["modified"], json!(1));
+    }
+
+    /// FIR-3200. Materialize a disposable session projection, the way
+    /// `kin exec` does before it runs anything.
+    #[cfg(unix)]
+    async fn materialize_session_through_api(app: &axum::Router, session_dir: &std::path::Path) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/session-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_dir": session_dir.display().to_string(),
+                            "strategy": null,
+                            "scope": null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    }
+
+    /// FIR-3200. The edit shape the stranger arm hit: content prepended above
+    /// every declaration in the file, so a stale parse is visible as an offset
+    /// rather than as a missing entity.
+    #[cfg(unix)]
+    fn prepend_session_lines(session_file: &std::path::Path, lines: u32) {
+        let original = std::fs::read(session_file).unwrap();
+        let mut shifted = b"// prepended by the session\n".repeat(lines as usize);
+        shifted.extend_from_slice(&original);
+        std::fs::write(session_file, &shifted).unwrap();
+    }
+
+    /// FIR-3200. Admit one session's observation and return its summary.
+    #[cfg(unix)]
+    async fn reconcile_session_through_api(
+        app: &axum::Router,
+        session_dir: &std::path::Path,
+    ) -> kin_cli::commands::reconcile::ReconcileSummary {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_dir": session_dir,
+                            "confirm_mass_deletion": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        serde_json::from_slice(&body).unwrap()
+    }
 
     async fn amend_request_through_api(
         app: &axum::Router,
@@ -41011,7 +41431,14 @@ mod tests {
         assert_eq!(summary.preserved_graph_only_artifacts, 2);
         #[cfg(not(target_os = "macos"))]
         assert_eq!(summary.preserved_graph_only_artifacts, 1);
-        assert_eq!(summary.semantic_files_enriched, 0);
+        // Four of the five paths this observation moved carry a body the
+        // publication can re-index: `compose.yaml`, `assets/policy.unknown`,
+        // `bin/verify` and `notes/new.odd`. The symlink and the removal are
+        // skipped, because neither is source owned by its path. The zero this
+        // assertion used to carry was a literal in the handler rather than a
+        // measurement, and it read as "nothing needed parsing" over files that
+        // had just changed.
+        assert_eq!(summary.semantic_files_enriched, 4);
         assert_eq!(summary.semantic_enrichment_failures, 0);
 
         let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
