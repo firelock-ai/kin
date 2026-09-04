@@ -13297,47 +13297,68 @@ fn fix_verdict(unfinished: &[UnfinishedRepair]) -> Result<()> {
     )
 }
 
-/// Provision the language servers behind Kin's cross-file reference edges, and
-/// report each one in the operator's own words.
-///
-/// Shared by the wizard and by `kin doctor --fix` so a person gets the same
-/// disclosure, the same prompt, and the same restart advice on both paths. The
-/// returned lines are the "what was applied" list both surfaces already print;
-/// anything not applied is printed here instead, because a declined or failed
-/// install is a fact the operator needs and an empty applied-list is not.
-/// Ask a running daemon to re-probe and re-enrich after a server was installed.
-///
-/// Readiness taken once latches: a daemon that probed before the install would
-/// keep reporting that language unavailable for the rest of its life, and that
-/// stale answer is an input under an agent-facing verdict. The sweep route
-/// re-probes at its start, so one call refreshes the verdict and produces the
-/// edges the new server can finally resolve.
-///
-/// Returns whether a daemon was actually poked, so the caller can fall back to
-/// telling the user to restart when there was none.
-async fn refresh_running_daemon_after_install(cwd: &std::path::Path) -> bool {
+/// What a daemon confirmed after a language server was installed.
+#[derive(Debug, PartialEq, Eq)]
+enum PostInstallDaemonRefresh {
+    NoDaemon,
+    SweepRequested,
+    Unavailable,
+    Unconfirmed,
+    Failed,
+}
+
+impl PostInstallDaemonRefresh {
+    fn message(&self) -> Option<String> {
+        let reason = match self {
+            Self::NoDaemon => return None,
+            Self::SweepRequested => {
+                return Some(
+                    "asked the running daemon to re-check its language servers and enrich again"
+                        .to_string(),
+                );
+            }
+            Self::Unavailable => "the running daemon has no language-server enrichment channel",
+            Self::Unconfirmed => "the running daemon did not confirm language-server enrichment",
+            Self::Failed => "could not ask the running daemon to refresh its language servers",
+        };
+        Some(format!(
+            "{reason}; {}",
+            language_servers::RESTART_AFTER_INSTALL
+        ))
+    }
+}
+
+/// Ask only an already-running daemon to refresh after a server was installed.
+/// A successful request still needs an enrichment channel before the daemon
+/// can act on it. An absent daemon needs no restart: its next start discovers
+/// the newly installed servers.
+async fn refresh_running_daemon_after_install(cwd: &std::path::Path) -> PostInstallDaemonRefresh {
     let Some(layout) = kin_core::KinLayout::discover(cwd) else {
-        return false;
+        return PostInstallDaemonRefresh::NoDaemon;
     };
     let Some(url) = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await else {
-        return false;
+        return PostInstallDaemonRefresh::NoDaemon;
     };
-    // For_layout, not from_base_url: the latter resolves the bearer token from
-    // the process working directory, which is the silent-wrong-target class
-    // that made kin init's conversion phase 401 on runners.
     let Ok(client) = crate::daemon_client::DaemonClient::from_base_url_for_layout(&url, &layout)
     else {
-        return false;
+        return PostInstallDaemonRefresh::Failed;
     };
+    request_post_install_sweep(&client).await
+}
+
+async fn request_post_install_sweep(
+    client: &crate::daemon_client::DaemonClient,
+) -> PostInstallDaemonRefresh {
     match client.queue_lsp_sweep().await {
-        Ok(_) => {
-            println!(
-                "  {} asked the running daemon to re-check its language servers and enrich again",
-                style("✓").green()
-            );
-            true
-        }
-        Err(_) => false,
+        Ok(response) => match response
+            .get("enrichment_available")
+            .and_then(|value| value.as_bool())
+        {
+            Some(true) => PostInstallDaemonRefresh::SweepRequested,
+            Some(false) => PostInstallDaemonRefresh::Unavailable,
+            None => PostInstallDaemonRefresh::Unconfirmed,
+        },
+        Err(_) => PostInstallDaemonRefresh::Failed,
     }
 }
 
@@ -13616,18 +13637,14 @@ async fn apply_language_server_provisioning(
             }
         }
         if !unusable {
-            // Poke the sweep the daemon already exposes, rather than only
-            // telling the user to restart. That one route re-probes readiness
-            // AND re-enriches, which is exactly what someone wants after
-            // installing a server, and it is why no dedicated route is needed.
-            //
-            // Best effort by design: outside a repository, or with no daemon
-            // running, there is nothing holding a stale verdict to refresh, and
-            // the restart advice below still covers a daemon this process
-            // cannot reach.
-            let refreshed = refresh_running_daemon_after_install(&cwd).await;
-            if !refreshed {
-                println!("  {}", language_servers::RESTART_AFTER_INSTALL);
+            let refresh = refresh_running_daemon_after_install(&cwd).await;
+            if let Some(message) = refresh.message() {
+                let mark = if refresh == PostInstallDaemonRefresh::SweepRequested {
+                    style("✓").green()
+                } else {
+                    style("!").yellow()
+                };
+                println!("  {mark} {message}");
             }
         }
     }
@@ -15647,6 +15664,90 @@ mod tests {
     use super::{fix_verdict, readiness_line, UnfinishedRepair};
     use crate::commands::health::{HealthCheck, HealthReport, HealthStatus, HealthVerdict};
     use kin_model::LanguageId;
+
+    #[tokio::test]
+    async fn post_install_refresh_requires_an_available_enrichment_channel() {
+        use super::{request_post_install_sweep, PostInstallDaemonRefresh};
+        use axum::{http::StatusCode, routing::post, Router};
+
+        let cases = [
+            (
+                StatusCode::OK,
+                serde_json::json!({"status": "sweep_queued", "enrichment_available": true}),
+                PostInstallDaemonRefresh::SweepRequested,
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"status": "sweep_queued", "enrichment_available": false}),
+                PostInstallDaemonRefresh::Unavailable,
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"status": "sweep_queued"}),
+                PostInstallDaemonRefresh::Unconfirmed,
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"enrichment_available": "true"}),
+                PostInstallDaemonRefresh::Unconfirmed,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "sweep refused"}),
+                PostInstallDaemonRefresh::Failed,
+            ),
+        ];
+        for (status, body, expected) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind isolated response fixture");
+            let address = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/lsp/sweep",
+                post(move || async move { (status, axum::Json(body)) }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client = crate::daemon_client::DaemonClient::from_base_url_with_explicit_authority(
+                format!("http://{address}"),
+                None,
+                None,
+            )
+            .unwrap();
+            let observed = request_post_install_sweep(&client).await;
+            server.abort();
+            assert_eq!(observed, expected);
+            let message = observed.message().expect("a running daemon has a notice");
+            if expected == PostInstallDaemonRefresh::SweepRequested {
+                assert!(message.contains("asked the running daemon"), "{message}");
+                assert!(!message.contains("kin daemon stop"), "{message}");
+            } else {
+                assert!(
+                    message.contains(super::language_servers::RESTART_AFTER_INSTALL),
+                    "{message}"
+                );
+                assert!(!message.contains("asked the running daemon"), "{message}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn post_install_refresh_without_a_daemon_needs_no_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let _endpoint = EnvVarGuard::unset("KIN_DAEMON_URL");
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
+        let _kin_home = EnvVarGuard::set("KIN_HOME", directory.path().join("home"));
+        for inside_repository in [false, true] {
+            if inside_repository {
+                std::fs::create_dir(directory.path().join(".kin")).unwrap();
+            }
+            let observed = super::refresh_running_daemon_after_install(directory.path()).await;
+            assert_eq!(observed, super::PostInstallDaemonRefresh::NoDaemon);
+            assert!(observed.message().is_none());
+        }
+    }
 
     fn check(id: &str, label: &str, status: HealthStatus) -> HealthCheck {
         HealthCheck {
