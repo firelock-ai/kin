@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-09-04
+
+### Changed
+
+- chore(deps): refresh Kin registry pins after kin-db@0.7.92 (#1403)
+- Judge a release candidate by the archives its rc-build holds (#1404)
+- Raise Kin's own open-file limit so a stock Mac can admit a repository (#1405)
+- Let the preflight publisher survive the arm job's skip (#1407)
+- Free a daemon start lock whose holder is gone, and name the wait (#1408)
+- Identify preflight tooling by its ref, not by the runner that read it (#1409)
+- Cut a release on the machine proof and gate Latest on first contact (#1406)
+- Keep the open-file helper inside the cfg gate that owns its caller (#1410)
+- Re-vendor the evidence publisher from the landed umbrella fix (#1411)
+- Spend one budget on the lexical parity floor's prose lifts (#1412)
+- Make the evidence publisher's refusal name its own evidence (#1413)
+- Judge a daemon start lock by what holds it, not by how old it is (#1414)
+- Re-vendor the evidence publisher's permission door from umbrella 2a0d6d265 (#1415)
+- Grade the Windows target on every pull request (#1416)
+- Stop a full runner disk in Code Coverage from reddening CI (#1422)
+- Keep npm out of the CI disk reclaim list (#1425)
+- Wire Go reference enrichment and install gopls where the daemon looks (#1418)
+- Wait for a spawned stand-in to exec before asking what image it runs (#1428)
+- Record what the coverage runner disk actually measured (#1429)
+- Serve a five-tool always-on MCP profile and find the rest through search (#1424)
+- Close six local attack-surface findings before launch (#1426)
+- Resume a startup rollout lease its holder can no longer hold (#1421)
+- Excuse the supervisor's own bearer-token read from the file-search guard (#1434)
+- Ask kin-vfs for a writable NFS mount and name tar absolutely (#1432)
+- Bound the default MCP route and cap transaction staging (#1423)
+- Choose the archive extractor by host and the layout by target (#1435)
+- Move the immutable kin-vfs release checkout to the tree that builds 0.4.24 (#1431)
+- Say where the Windows admission proof lives now that there is no merge group (#1437)
+- Filter the multihop walk to walkable relation kinds before it budgets (#1438)
+- Admit the successor a promotion named on the publication-control record (#1436)
+- Hold a fingerprint in the last-known-good store instead of a whole entity (#1419)
+- Exempt the ignored real-store heap test's three fixture variables (#1439)
+- Bump kin-db to 0.7.96 (#1440)
+- Fold the lexical name-match pass's top entity into priority_hits by score (#1441)
+- Refuse a projection miss instead of reading the working copy (#1442)
+- Delete the write-only projection cache from the daemon (#1443)
+- Test that a rename keeps its annotations attached (#1446)
+- fix(daemon): keep the hosted publication probe metadata-only and memoize source bodies (#1447)
+- Scan kin-projection and kin-reconcile, and grade both guards on the PR (#1448)
+- chore(ci): pin kin-actions v0.1.34 (#1450)
+- ci(registry): teach the dependency wave about the detached fuzz workspace lock (#1449)
+- Correct four overclaiming allowlist reasons, and stop the falsifier poisoning a checkout (#1452)
+- Make the publication gate forward by default instead of inheriting (FIR-3147) (#1453)
+- Answer placement presence from the graph's exact tree, not the working copy (FIR-3148) (#1454)
+- Let a release mint and promote on its preflight record alone (#1455)
+- ci(kin-actions): guard the pin the workflow-pin bot cannot see (#1457)
+- Correct AGENTS.md's required-contexts count and add a drift check (#1456)
+- Give a crashed kin init's stranded stage a way back (FIR-3146) (#1461)
+- Record v0.6.5 as abandoned so the rail can step past it (#1463)
+
+
 ## [0.6.5] - 2026-09-02
 
 ### Changed
