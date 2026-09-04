@@ -771,6 +771,21 @@ pub enum GraphFreshness {
     /// succeeded in this daemon's life. An answer taken over that store is
     /// answering from a graph nothing in this process ever brought level.
     NoAdmissionRecorded,
+    /// The selected graph could not be sampled live, so this response replays
+    /// an earlier observation whose age and failure mode are known.
+    ///
+    /// This is deliberately distinct from the admission clock above. The
+    /// selected graph may be stale even when HEAD was admitted seconds ago,
+    /// and copying that unrelated clock onto this answer would report the
+    /// opposite of what the status producer observed.
+    Stale {
+        basis: String,
+        reason: String,
+        settled_age_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_authority_epoch: Option<u64>,
+        live_attempts: u32,
+    },
 }
 
 impl GraphFreshness {
@@ -812,6 +827,16 @@ impl GraphFreshness {
                  unmeasured and an answer here cannot be read as covering current code"
                     .to_string(),
             ),
+            Self::Stale {
+                reason,
+                settled_age_ms,
+                live_attempts,
+                ..
+            } => Some(format!(
+                "selected_graph_sample_stale: the selected graph could not be sampled live after \
+                 {live_attempts} attempt(s) because {reason}; these counters replay an observation \
+                 from {settled_age_ms} ms earlier"
+            )),
         }
     }
 }
@@ -1874,6 +1899,25 @@ impl Envelope {
         // is, and dropping it here would leave graph status carrying the
         // compatibility boolean with none of the direction an agent acts on.
         // `self.hydration_semantics` is deliberately not reassigned.
+        self
+    }
+
+    /// Replace an unrelated HEAD admission clock with the selected graph's own
+    /// stale-sample disclosure.
+    pub fn with_selected_graph_staleness(
+        mut self,
+        reason: impl Into<String>,
+        settled_age_ms: u64,
+        observed_authority_epoch: Option<u64>,
+        live_attempts: u32,
+    ) -> Self {
+        self.freshness = Some(GraphFreshness::Stale {
+            basis: "selected_graph_sample".to_string(),
+            reason: reason.into(),
+            settled_age_ms,
+            observed_authority_epoch,
+            live_attempts,
+        });
         self
     }
 
@@ -4286,6 +4330,187 @@ mod tests {
                 .count(),
             1,
             "reconciliation must not repeat the negative reason"
+        );
+    }
+
+    /// First-contact impact answers keep both kinds of uncertainty after the
+    /// response ladder cuts rows: the host content the graph has not admitted,
+    /// and the explicit lower bound on graph-observed covering tests.
+    #[test]
+    fn impact_bounds_and_working_copy_caveats_survive_response_budgeting() {
+        let entity_id = |index: usize| format!("9b9f577c-2cb3-43fd-a59b-ced58218{index:04}");
+        let impacts = (0..120)
+            .map(|index| {
+                json!({
+                    "entity_id": entity_id(index),
+                    "consumer_count": 0,
+                    "strong_consumer_count": 0,
+                    "proven_consumer_count": 0,
+                    "contract_consumer_count": 0,
+                    "consumer_files": [format!("src/feature_{index}.rs")],
+                    "covering_tests": 0,
+                    "covering_tests_bound": "graph_observed_lower_bound",
+                    "consumers_migrated_in_diff": 0,
+                    "call_shapes": {},
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = ToolCallResult::text(
+            json!({
+                "affected_callers": [],
+                "affected_dependents": [],
+                "affected_contract_consumers": [],
+                "affected_tests": [],
+                "affected_work_items": [],
+                "affected_annotations": [],
+                "changed_ids": (0..120).map(entity_id).collect::<Vec<_>>(),
+                "unreviewed_agent_changes": [],
+                "actor_attribution": [],
+                "entity_impacts": impacts,
+                "edge_coverage": {
+                    "scope": "language",
+                    "language": "Rust",
+                    "requested_classes": ["calls", "imports", "references"],
+                    "classes": {
+                        "calls": "present",
+                        "imports": "present",
+                        "references": "present"
+                    },
+                    "reference_enrichment": "present",
+                    "budget_exhausted": false
+                }
+            })
+            .to_string(),
+        );
+        let envelope = ready_daemon_envelope().with_working_copy_health(&json!({
+            "reconcile": {
+                "untracked_path_count": 17,
+                "untracked_paths_sample": ["src/not_admitted.rs"],
+                "untracked_observed_age_seconds": 0,
+                "last_admission_success_at": "2026-09-04T14:00:00Z"
+            }
+        }));
+        let budget = ResponseBudget {
+            max_chars: 5_000,
+            ..ResponseBudget::default()
+        };
+        let annotated = finalize_bounded(payload, envelope, "impact_analysis", &budget);
+        let final_payload = annotated_value(&annotated);
+        assert_eq!(final_payload[ENVELOPE_KEY]["response"]["bounded"], true);
+
+        let kept = final_payload["entity_impacts"]
+            .as_array()
+            .expect("impact rows survive the budget floor");
+        assert!(
+            !kept.is_empty(),
+            "a cut must not turn impact into no impact"
+        );
+        assert!(kept.iter().all(|row| {
+            row[crate::handlers::review::COVERING_TESTS_BOUND_KEY]
+                == json!(crate::handlers::review::COVERING_TESTS_BOUND)
+        }));
+
+        let negative = &final_payload[crate::negative::NEGATIVE_KEY];
+        assert_eq!(negative["safe_to_conclude_absent"], false);
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("graph_behind_working_tree"), "{reason}");
+        assert!(reason.contains("response_bounded"), "{reason}");
+    }
+
+    /// The first-contact answer a stranger's agent actually receives: a prose
+    /// question, a full page of nearest neighbours, and complete embedding
+    /// coverage so nothing else in the response can be what refuses.
+    ///
+    /// The served instructions tell an agent to read `_kin.verdict` first, so
+    /// proving the absence gate built a block is half the contract. This proves
+    /// the block reaches the one field the reader acts on. It matters here more
+    /// than on other tools because `qualifies_populated_answers` excludes
+    /// `semantic_locate`, so a populated page reached the verdict with the
+    /// absence gate silent, and a silent input leaves every other reading to
+    /// certify the answer on its own.
+    ///
+    /// The shape is the COMPACT surface, because that is the one `agent-default`
+    /// asks for on its agents' behalf: no `results` array, no `degradations`,
+    /// and `query` inserted after projection rather than carried by
+    /// `CompactLocate` itself. A guard reading `query` only where the full shape
+    /// puts it would be absent from every response an agent sees.
+    #[test]
+    fn a_prose_locate_page_of_neighbours_never_certifies_on_the_compact_surface() {
+        let page = |all_fallback: bool| {
+            let mut payload = json!({
+                "query": "password hashing and session token expiry",
+                "granularity": "entity",
+                "routing": "fused-v1",
+                "page": 0,
+                "surface": "compact",
+                "entities": [
+                    {
+                        "id": "00000000-0000-0000-0000-0000000000aa",
+                        "name": "Hit",
+                        "kind": "struct",
+                        "file": "src/search.rs",
+                        "line": 12,
+                        "score": 0.41
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-0000000000ab",
+                        "name": "build_match_query",
+                        "kind": "function",
+                        "file": "src/search.rs",
+                        "line": 88,
+                        "score": 0.39
+                    }
+                ],
+                "files": ["src/search.rs"],
+                "total_ranked": 40,
+                "ranked_by": "vector similarity over graph bodies",
+                "semantic_coverage": {
+                    "indexed": 100,
+                    "total": 100,
+                    "pending": 0,
+                    "complete": true
+                }
+            });
+            if all_fallback {
+                payload["all_fallback"] = json!(true);
+            }
+            annotated_value(&finalize(
+                ToolCallResult::text(payload.to_string()),
+                ready_daemon_envelope(),
+                "semantic_locate",
+            ))
+        };
+
+        let neighbours = page(true);
+        let verdict = &neighbours[ENVELOPE_KEY]["verdict"];
+        assert_eq!(verdict["state"], "inconclusive", "{neighbours}");
+        assert_eq!(verdict["safe_to_conclude_absent"], false, "{neighbours}");
+        let factor = verdict["limiting_factor"]
+            .as_str()
+            .expect("an inconclusive verdict names what limited it");
+        assert!(factor.contains("relevance_floor_unmeasured"), "{factor}");
+        assert_eq!(
+            neighbours[crate::negative::NEGATIVE_KEY]["kind"],
+            "relevance_unverified",
+            "{neighbours}"
+        );
+        assert!(
+            crate::verdict::disagreements(&neighbours).is_empty(),
+            "a response may not contradict its own verdict: {neighbours}"
+        );
+
+        // The control that stops the assertions above passing for any locate
+        // answer at all, and that pins the repair's scope: the same page whose
+        // ranking DID name what the query asked for keeps its certified verdict
+        // and carries no absence object.
+        let named = page(false);
+        assert_eq!(
+            named[ENVELOPE_KEY]["verdict"]["state"], "certified",
+            "{named}"
+        );
+        assert!(
+            named.get(crate::negative::NEGATIVE_KEY).is_none(),
+            "a ranking that named the query's symbol needs no relevance caveat: {named}"
         );
     }
 
