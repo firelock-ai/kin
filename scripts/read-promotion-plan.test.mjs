@@ -96,6 +96,49 @@ test('stripPendingNotice returns the original body byte for byte', () => {
   assert.equal(stripPendingNotice(written), notes);
 });
 
+// The coupling the fixtures above cannot provide.
+//
+// Every other test here builds its own notice text, so `stripPendingNotice`
+// is only ever asked to strip a shape this FILE invented. release.yml is what
+// actually writes the notice, and its wording changed on 2026-09-04 when the
+// sentence claiming the release stays a prerelease became false. Nothing would
+// have gone red if that edit had also broken the strip: the stripper would
+// simply stop matching in production, a promoted release would keep claiming
+// its proof is pending forever, and every test here would still pass.
+//
+// So read the real heredoc out of the workflow and strip THAT.
+test('stripPendingNotice strips the notice release.yml actually writes', () => {
+  const workflow = fs.readFileSync(
+    path.join(import.meta.dirname, '..', '.github', 'workflows', 'release.yml'),
+    'utf8',
+  );
+  const lines = workflow.split('\n');
+  const open = lines.findIndex((line) => line.includes("<<NOTE"));
+  assert.notEqual(open, -1, 'release.yml no longer writes the notice with a <<NOTE heredoc');
+  const indent = lines[open].length - lines[open].trimStart().length;
+  const body = [];
+  for (let i = open + 1; i < lines.length; i += 1) {
+    if (lines[i].trim() === 'NOTE') break;
+    body.push(lines[i].slice(indent));
+  }
+
+  // The guard this file's own history argues for. An extraction that silently
+  // found nothing would make every assertion below compare two empty-ish
+  // values and pass, which is the shape that reports a green harness over a
+  // fixture that never built.
+  assert.ok(body.length >= 2, `extracted ${body.length} notice line(s) from release.yml`);
+  assert.ok(
+    body.some((line) => line.includes('First-contact proof pending')),
+    `the extracted block is not the notice: ${JSON.stringify(body)}`,
+  );
+
+  const notice = body.join('\n').replace('${marker}', PENDING_MARKER);
+  assert.ok(notice.includes(PENDING_MARKER), 'the extracted notice carries no marker to key on');
+
+  const notes = '## Notes\n\n> a quote the author wrote\n';
+  assert.equal(stripPendingNotice(`${notice}\n${notes}`), notes);
+});
+
 test('run refuses a command it does not know rather than doing nothing', async () => {
   await assert.rejects(run(['publish']), /unknown command "publish"/);
   await assert.rejects(run([]), /unknown command ""/);

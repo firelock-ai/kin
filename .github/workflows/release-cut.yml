@@ -647,6 +647,23 @@ jobs:
     needs: select
     if: needs.select.outputs.decision == 'stranger' && vars.KIN_STRANGER_RUNNER != ''
     runs-on: ${{ vars.KIN_STRANGER_RUNNER }}
+    # The stranger never reddens this rail. Founder decision, 2026-09-04: "the
+    # damn smoke should never block release it is a nice to have ONLY ... it
+    # should be mainly run locally not in the CI." A driver that ran out of
+    # limit, a runner that went offline, a container that could not start: none
+    # of those is a fact about the candidate, and a red cut run for any of them
+    # is a rail that looks broken while behaving exactly as designed. The
+    # stranger's home is `bin/kin-stranger` against the archive or the published
+    # npm bytes; this hosted job is the optional convenience.
+    #
+    # `continue-on-error` has TWO axes and only one of them is wanted here. It
+    # keeps the run green, and it ALSO masks `needs.stranger.result` to
+    # 'success' for every downstream job, including a stranger that failed. So
+    # `publish-stranger` below keys on this job's own `recorded` output instead,
+    # which is written only after a record exists on disk. Gating it on
+    # `.result` under this flag would publish nothing over a failed arm and
+    # report success for doing it.
+    continue-on-error: true
     # Three concurrent arms plus image and container setup. The arms run
     # concurrently, so the wall clock is one phase 1 plus one phase 2, not three
     # of each.
@@ -785,6 +802,40 @@ jobs:
           echo "recorded=true" >> "$GITHUB_OUTPUT"
           echo "stranger record at ${record}"
 
+      # Whatever happened, the cut's own record says so. A job that is allowed
+      # to fail quietly is a job nobody reads, and "pending" is the answer this
+      # rail acts on everywhere else, so it is the word used here too.
+      - name: Say what the stranger left behind
+        if: always()
+        env:
+          RECORDED: ${{ steps.run.outputs.recorded }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          if [ "${RECORDED:-}" = true ]; then
+            echo "### First contact measured for \`${CANDIDATE}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The three arms completed and the record is on its way to the evidence branch." >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::stranger completed for ${CANDIDATE}"
+          else
+            {
+              echo "### First contact stays PENDING for \`${CANDIDATE}\`"
+              echo ""
+              echo "The hosted stranger did not leave a record this cycle, and that does not hold"
+              echo "the release. The tag, the GitHub release and Latest all move on the machine"
+              echo "preflight alone, and the release carries a notice saying nobody has measured"
+              echo "what a first-time user meets."
+              echo ""
+              echo "To measure it, run the stranger locally against the archive or the published"
+              echo "npm bytes, which is the ordinary path:"
+              echo ""
+              echo '```'
+              echo "bin/kin-stranger run --npm <version>      # what a stranger who types the install line gets"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::stranger left no record for ${CANDIDATE}; first contact stays pending and nothing is held"
+          fi
+
       - name: Upload the stranger record
         if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
@@ -797,7 +848,11 @@ jobs:
   publish-stranger:
     name: Publish the candidate's stranger record
     needs: [select, stranger]
-    if: needs.select.outputs.decision == 'stranger' && needs.stranger.result == 'success'
+    # `outputs.recorded`, never `result`. The stranger job is
+    # continue-on-error, which masks its result to 'success' even when it
+    # failed, so a `.result` gate here would run this publisher over an arm
+    # that produced no record.
+    if: needs.select.outputs.decision == 'stranger' && needs.stranger.outputs.recorded == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: release-tag
