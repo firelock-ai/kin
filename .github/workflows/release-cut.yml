@@ -90,6 +90,7 @@ jobs:
       candidate: ${{ steps.select.outputs.candidate }}
       rc_run: ${{ steps.select.outputs.rc_run }}
       move: ${{ steps.select.outputs.move }}
+      stranger_state: ${{ steps.select.outputs.stranger_state }}
       reason: ${{ steps.select.outputs.reason }}
     steps:
       # The literal trusted context value, as in kin-registry-wave-land.yml.
@@ -872,8 +873,9 @@ jobs:
           {
             echo "## Both proof records are filed for \`${CANDIDATE}\`"
             echo ""
-            echo "The mint selects the newest fully evidenced sha in the version range on its"
-            echo "next evaluation, which is its cron or any completed CI run for a main push."
+            echo "The mint already selects any sha in the range carrying \`preflight.json\`. With"
+            echo "\`stranger.env\` filed too, the release it cuts also claims first-contact coverage"
+            echo "and is eligible for GitHub Latest instead of shipping as a prerelease."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # No runner, so say so loudly and hand over the exact command. This is the

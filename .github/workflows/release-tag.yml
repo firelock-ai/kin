@@ -260,7 +260,18 @@ jobs:
             done < <(git log --first-parent --format=%H "$sha" -- Cargo.toml)
 
             # The release is the NEWEST reviewed main commit in that range for
-            # which the proof loop published both records. This is what lets
+            # which the proof loop published `preflight.json`. The machine
+            # preflight alone is what makes a candidate mint-eligible, matching
+            # the preflight-only require tier the gate below runs: a
+            # stranger that has not run, because a runner is offline or a
+            # weekly limit was reached, must not hold a release. It used to
+            # take both records, and that made the listing stricter than the
+            # gate it feeds, so a preflight-only sha was never proposed and the
+            # mint no-opped in silence while the gate that would have admitted
+            # it never saw a candidate. `stranger.env` still decides what the
+            # release may CLAIM: release.yml keeps a stranger-pending release a
+            # prerelease and off GitHub Latest, and the summary below records
+            # which of the two this mint tagged. This is what lets
             # main keep moving through a proof window. The candidate used to be
             # the head of the version bump branch, and the train rewrites that
             # head every cycle it finds drift, so evidence published for it went
@@ -313,13 +324,12 @@ jobs:
             fi
             jq -r '
               [.tree[] | select(.type == "blob") | .path]
-              | map(capture("^evidence/(?<sha>[0-9a-f]{40})/(?<name>preflight\\.json|stranger\\.env)$"))
-              | group_by(.sha)
-              | map(select((map(.name) | unique | length) == 2) | .[0].sha)
+              | map(capture("^evidence/(?<sha>[0-9a-f]{40})/preflight\\.json$") | .sha)
+              | unique
               | .[]
             ' <<< "$listing" > "$proven"
             recorded="$(command grep -c '' "$proven" || true)"
-            echo "proof loop has recorded ${recorded} fully-evidenced candidate(s)"
+            echo "proof loop has recorded ${recorded} mint-eligible candidate(s) carrying preflight.json"
 
             candidate=""
             if [ -s "$proven" ]; then
@@ -1925,6 +1935,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ACTOR: ${{ github.actor }}
+          # What the proof gate decided this tag is allowed to claim. The mint
+          # computed it three steps ago and, until 2026-09-04, wrote it only to
+          # GITHUB_OUTPUT, which nothing in this workflow read back. A mint that
+          # now tags on the machine preflight alone has to say so in its own
+          # record, or a release minted without first-contact proof is
+          # indistinguishable from one that has it.
+          STRANGER_STATE: ${{ steps.proof.outputs.stranger_state }}
+          STRANGER_ARMS: ${{ steps.proof.outputs.stranger_arms }}
+          STRANGER_DRIVER: ${{ steps.proof.outputs.stranger_driver }}
         run: |
           set -euo pipefail
           # The ref was just created, and the API is read-after-write eventually
@@ -1964,6 +1983,13 @@ jobs:
             echo "::error::post-verify failed: tag $TAG points at $got, not $SHA"
             exit 1
           fi
+          if [ "$STRANGER_STATE" = complete ]; then
+            first_contact="complete on arms \`${STRANGER_ARMS}\`, driven on the \`${STRANGER_DRIVER}\` endpoint"
+            claim="This tag carries first-contact proof and its release is eligible for GitHub Latest."
+          else
+            first_contact="**pending** (no \`stranger.env\`)"
+            claim="This tag was minted on the machine preflight alone. Nothing has measured what a first-time user meets, so \`release.yml\` publishes it as a prerelease and holds GitHub Latest until the stranger record lands."
+          fi
           {
             echo "## Release tag minted"
             echo ""
@@ -1973,7 +1999,11 @@ jobs:
             echo "| sha | \`$SHA\` |"
             echo "| actor | \`$ACTOR\` |"
             echo "| repo | \`$REPO\` |"
+            echo "| first contact | ${first_contact} |"
+            echo ""
+            echo "$claim"
             echo ""
             echo "Tag ref created with the kin-release-bot installation token, which triggers the fail-closed \`release.yml\` DAG."
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::minted $TAG at $SHA with first-contact proof ${STRANGER_STATE}"
           echo "release tag $TAG minted and verified at $SHA"

@@ -554,6 +554,7 @@ class JudgeTests(unittest.TestCase):
         )
         self.assertDecision(decision, selector.STAND_DOWN, "awaits the mint")
         self.assertEqual(decision.candidate, MIDDLE)
+        self.assertEqual(decision.stranger_state, selector.STRANGER_COMPLETE)
         self.assertEqual(grader.calls, [])
 
     def test_a_half_evidenced_candidate_asks_for_the_stranger_and_names_its_archive(self) -> None:
@@ -566,10 +567,11 @@ class JudgeTests(unittest.TestCase):
             ),
             grader,
         )
-        self.assertDecision(decision, selector.STRANGER, "the stranger record is the missing half")
+        self.assertDecision(decision, selector.STRANGER, "promotes the release to GitHub Latest")
         # The rc-build run travels with the decision, because the stranger has
         # to run on the very bytes the published preflight judged.
         self.assertEqual(decision.rc_run, 34_000_000_001)
+        self.assertEqual(decision.stranger_state, selector.STRANGER_PENDING)
         command = decision.details["stranger_command"]
         self.assertIn("bin/kin-stranger prepare", command)
         self.assertIn("--arms green,brown,vcs", command)
@@ -585,6 +587,12 @@ class JudgeTests(unittest.TestCase):
         )
         self.assertDecision(decision, selector.REFUSE, "no rc-build still holds the archives it judged")
         self.assertEqual(decision.candidate, MIDDLE)
+        # The refusal is about the cut, not about the mint. Since 2026-09-04 a
+        # preflight-only sha is mint-eligible, so this candidate is going to be
+        # tagged with first contact permanently unrecordable, and the reason a
+        # human reads has to say that rather than implying the release is held.
+        self.assertIn("the mint may still tag it", decision.reason)
+        self.assertEqual(decision.stranger_state, selector.STRANGER_PENDING)
 
     def test_an_expired_rc_build_is_not_a_usable_archive_source(self) -> None:
         stale = rc_build(MIDDLE, artifacts=[])
@@ -615,6 +623,50 @@ class JudgeTests(unittest.TestCase):
             Grader({}),
         )
         self.assertDecision(decision, selector.STAND_DOWN, "awaits the mint")
+
+    def test_a_preflight_only_sha_is_mint_eligible_and_stands_the_cut_down(self) -> None:
+        """The founder decision of 2026-09-03: a missing stranger must not hold a release.
+
+        release-tag.yml lists any sha carrying `preflight.json` and runs its
+        proof gate with `KIN_RELEASE_REQUIRE=preflight`, so this sha is already
+        a tag. The cut arming a newer candidate for the same version would only
+        race that tag.
+        """
+
+        grader = Grader({})
+        decision = selector.judge(
+            snapshot(evidence={MIDDLE: [selector.PREFLIGHT_RECORD]}),
+            grader,
+        )
+        self.assertDecision(decision, selector.STAND_DOWN, "awaits the mint")
+        self.assertEqual(decision.candidate, MIDDLE)
+        self.assertEqual(decision.stranger_state, selector.STRANGER_PENDING)
+        self.assertIn("prerelease naming that gap", decision.reason)
+        self.assertEqual(decision.details["mintable"], [MIDDLE])
+        self.assertEqual(grader.calls, [], "a filed preflight must cost no grading")
+
+    def test_the_stranger_still_runs_for_a_mint_eligible_candidate(self) -> None:
+        """Mint-eligible is not stranger-optional for the cut.
+
+        `release-cut.yml`'s stranger job is gated on
+        `needs.select.outputs.decision == 'stranger'`. If a preflight-only sha
+        stood the cut down before reaching the candidate block, that job would
+        never run again and "nice to have" would quietly become "deleted".
+        """
+
+        grader = Grader({})
+        decision = selector.judge(
+            snapshot(
+                candidate=MIDDLE,
+                evidence={MIDDLE: [selector.PREFLIGHT_RECORD]},
+                rc_builds=[rc_build(MIDDLE)],
+            ),
+            grader,
+        )
+        self.assertDecision(decision, selector.STRANGER)
+        self.assertEqual(decision.candidate, MIDDLE)
+        self.assertEqual(decision.details["mintable"], [MIDDLE])
+        self.assertEqual(grader.calls, [])
 
     def test_the_newest_green_sha_is_armed(self) -> None:
         grader = Grader({NEWEST: green_grade(NEWEST)})
@@ -977,6 +1029,24 @@ class ContractTests(unittest.TestCase):
                 f"{name} is bound to a different workflow id in release-tag.yml: {body}",
             )
             self.assertIn(path, body, f"{name} is bound to a different workflow path")
+
+    def test_every_emitted_output_is_republished_as_a_select_job_output(self) -> None:
+        """A value decided here and dropped in the workflow is decided nowhere.
+
+        `_emit` writes one line per key to GITHUB_OUTPUT, and only the keys
+        release-cut.yml lists under the `select` job's `outputs:` reach any
+        other job. `stranger_state` was added on both sides at once; this
+        assertion is what stops a future key landing on one side alone.
+        """
+
+        source = CUT_WORKFLOW_PATH.read_text(encoding="utf-8")
+        select = job_block(source, "select")
+        for key in (*selector.OUTPUT_KEYS, "reason"):
+            self.assertRegex(
+                select,
+                rf"(?m)^      {re.escape(key)}: \$\{{\{{ steps\.select\.outputs\.{re.escape(key)}",
+                f"release-cut.yml's select job does not republish {key}",
+            )
 
     def test_the_usable_artifacts_are_the_names_rc_build_actually_uploads(self) -> None:
         """The deadlock, as an assertion.

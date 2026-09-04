@@ -15,15 +15,16 @@ first candidate unmintable, and the host carrying the proof ran out of memory.
 This script is the selection half of the pipeline. `select` reads everything
 the decision rests on and answers one of four things:
 
-  stand-down  nothing to do now: the version is tagged, a fully evidenced sha
+  stand-down  nothing to do now: the version is tagged, a mint-eligible sha
               is waiting on the mint, an rc-build is still running, or no
               complete green sha exists yet
   arm         move release/v<version>-candidate to the chosen sha and dispatch
               rc-build.yml there
   proof       an rc-build for the current candidate succeeded and still holds
               the candidate archives; preflight them and publish the record
-  stranger    preflight.json is filed for the candidate and stranger.env is the
-              only missing half; run the three-arm stranger on the same archive
+  stranger    preflight.json is filed for the candidate, so the mint can tag it
+              already, and stranger.env is what would let the release claim
+              GitHub Latest; run the three-arm stranger on the same archive
   refuse      no reviewed main commit carrying the version qualifies, named sha
               by sha with the context that disqualified it
 
@@ -31,7 +32,8 @@ The rule, in the order it is applied:
 
 1. v<version> exists as a tag: the cut is done and the train owns the next
    version.
-2. A sha in the range carries both records: the mint owns it.
+2. A sha in the range carries both records: the mint owns it, and its release
+   may claim first-contact coverage.
 3. A current candidate, the branch tip, which must lie in the range, is kept
    until it is proven or dead. With its preflight recorded the stranger is what
    is left, and it must run on the very bytes that preflight judged, so a
@@ -42,7 +44,14 @@ The rule, in the order it is applied:
    attempts. Dead means a required
    context that is red or duplicated, a CI or Acceptance push run that did not
    conclude success, or exhausted rc-build attempts.
-4. Otherwise the newest main commit in the range whose CI and Acceptance push
+4. A sha in the range carries preflight.json alone: the mint owns it too. Since
+   2026-09-04 the mint tags on the machine preflight alone, matching the
+   KIN_RELEASE_REQUIRE=preflight tier its gate runs, so a stranger that cannot
+   run does not hold a release. The cut stands down rather than arming a newer
+   sha it would only race. `stranger_state` on the decision says which of the
+   two records backed it, and release.yml keeps a pending release a prerelease
+   and off GitHub Latest.
+5. Otherwise the newest main commit in the range whose CI and Acceptance push
    runs concluded success, and whose required contexts each appear exactly once
    under push provenance and concluded green, becomes the candidate. A sha still
    being graded is skipped rather than waited for: on a busy night the newest
@@ -73,6 +82,15 @@ BASE_BRANCH = "main"
 EVIDENCE_REF = "release-evidence"
 PREFLIGHT_RECORD = "preflight.json"
 STRANGER_RECORD = "stranger.env"
+# The first-contact vocabulary check-release-proof-artifacts.mjs returns in
+# `result.stranger.state`, and that release-tag.yml and release.yml both case
+# on. It is deliberately the gate's words rather than new ones, so a decision
+# this selector emits and a state a workflow read from the gate compare
+# directly. STRANGER_PENDING shares its value with the grading verdict PENDING
+# and means something else: PENDING is "this sha is still being graded",
+# STRANGER_PENDING is "no stranger.env exists for this candidate yet".
+STRANGER_COMPLETE = "complete"
+STRANGER_PENDING = "pending"
 CI_WORKFLOW = ".github/workflows/ci.yml"
 CI_WORKFLOW_NAME = "CI"
 ACCEPTANCE_WORKFLOW = ".github/workflows/acceptance.yml"
@@ -143,6 +161,12 @@ MOVE_CREATE = "create"
 MOVE_FAST_FORWARD = "fast-forward"
 MOVE_RESET = "reset"
 MOVE_NONE = "none"
+# Every key `_emit` writes to GITHUB_OUTPUT, in order. release-cut.yml's select
+# job republishes these as job outputs, and scripts/test-select-release-candidate.py
+# holds the two lists equal, so a value this selector decides cannot go missing
+# between the step that decided it and the jobs that read it. `reason` is written
+# separately because its newlines have to be flattened first.
+OUTPUT_KEYS = ("decision", "version", "branch", "candidate", "rc_run", "move", "stranger_state")
 
 
 class SelectionError(RuntimeError):
@@ -664,6 +688,12 @@ class Decision:
     candidate: str | None = None
     rc_run: int | None = None
     move: str | None = None
+    # First-contact state for the candidate this decision names, in the proof
+    # gate's own vocabulary, or None when the decision names no candidate. It
+    # is a field rather than a `details` key because `details` is a free-form
+    # bag that never reaches GITHUB_OUTPUT, and the whole point of this value
+    # is that a workflow reads it back.
+    stranger_state: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
     def document(self) -> dict[str, Any]:
@@ -675,6 +705,7 @@ class Decision:
             "candidate": self.candidate,
             "rc_run": self.rc_run,
             "move": self.move,
+            "stranger_state": self.stranger_state,
             "details": self.details,
         }
 
@@ -752,8 +783,20 @@ def judge(snapshot: dict[str, Any], grade: Grader) -> Decision:
             version,
             branch,
             candidate=proven[0],
+            stranger_state=STRANGER_COMPLETE,
             details={"proven": proven},
         )
+
+    # Mint-eligible on the machine preflight alone. release-tag.yml lists any
+    # sha carrying preflight.json and runs its proof gate with
+    # KIN_RELEASE_REQUIRE=preflight, so a filed preflight is already a tag
+    # whether or not a stranger ever runs. The cut still files the stranger
+    # when it can, because that record is what promotes a release to GitHub
+    # Latest; what it no longer does is treat a missing one as a reason to hold
+    # the version. Computed here and consumed after the candidate block, so the
+    # STRANGER decision below stays reachable and release-cut.yml's stranger
+    # job keeps running.
+    mintable = [sha for sha in shas if PREFLIGHT_RECORD in records(sha)]
 
     dead: dict[str, list[str]] = {}
     notes: list[str] = []
@@ -782,20 +825,27 @@ def judge(snapshot: dict[str, Any], grade: Grader) -> Decision:
                     REFUSE,
                     f"preflight is recorded for {candidate} but no rc-build still holds the "
                     "archives it judged, so the stranger cannot run on the bytes the record "
-                    "names; this candidate can no longer be proven and the next landing "
-                    "supplies a new one",
+                    f"names; first contact can never be recorded for {candidate}, and the "
+                    "mint may still tag it with the stranger pending",
                     version,
                     branch,
                     candidate=candidate,
+                    stranger_state=STRANGER_PENDING,
                 )
             return Decision(
                 STRANGER,
-                f"preflight is recorded for {candidate}; the stranger record is the missing half",
+                f"preflight is recorded for {candidate}, which the mint can already tag; the "
+                "stranger record is what promotes the release to GitHub Latest, so run it "
+                "while the archives it must judge still exist",
                 version,
                 branch,
                 candidate=candidate,
                 rc_run=rc_run,
-                details={"stranger_command": stranger_command(version, candidate, rc_run)},
+                stranger_state=STRANGER_PENDING,
+                details={
+                    "stranger_command": stranger_command(version, candidate, rc_run),
+                    "mintable": mintable,
+                },
             )
         grade_of = grade(candidate)
         if grade_of.get("verdict") == PENDING:
@@ -847,6 +897,23 @@ def judge(snapshot: dict[str, Any], grade: Grader) -> Decision:
                     move=MOVE_NONE,
                     details={"attempts": spent},
                 )
+
+    if mintable:
+        # Nothing left for the cut to do on this version. The candidate block
+        # above already returned for a mintable current candidate, so reaching
+        # here means the mint owns a sha the cut has no further work on, and
+        # arming a newer one would only race the tag.
+        return Decision(
+            STAND_DOWN,
+            f"{mintable[0]} carries {PREFLIGHT_RECORD} and awaits the mint, which tags on the "
+            "machine preflight alone; first contact is still unrecorded, so the release will "
+            "ship as a prerelease naming that gap",
+            version,
+            branch,
+            candidate=mintable[0],
+            stranger_state=STRANGER_PENDING,
+            details={"mintable": mintable, "notes": notes},
+        )
 
     pending: dict[str, list[str]] = {}
     disqualified: dict[str, list[str]] = {}
@@ -982,7 +1049,7 @@ def _emit(decision: Decision) -> int:
     output = os.environ.get("GITHUB_OUTPUT")
     if output:
         with open(output, "a", encoding="utf-8") as handle:
-            for key in ("decision", "version", "branch", "candidate", "rc_run", "move"):
+            for key in OUTPUT_KEYS:
                 value = document.get(key)
                 handle.write(f"{key}={'' if value is None else value}\n")
             handle.write(f"reason={decision.reason.replace(chr(10), ' ')}\n")

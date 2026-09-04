@@ -1183,27 +1183,94 @@ def assert_tag_tier_requires_only_the_machine_proof(release_tag: str) -> None:
         )
 
 
-def assert_latest_requires_the_stranger(release: str) -> None:
-    """GitHub Latest is the claim of first-contact coverage, so it needs the record."""
+# ── the mint's candidate listing ──────────────────────────────────────────
+#
+# The tier above is what the proof GATE requires. This is what the mint ever
+# OFFERS it, and until 2026-09-04 the two disagreed. The gate ran the preflight
+# tier while the listing proposed only a sha carrying BOTH records, so a
+# preflight-only candidate never reached the gate that would have admitted it,
+# and the mint reported "no candidate" and exited 0. That path is a deliberate
+# no-op rather than a decline, so it raises nothing: half the rail was relaxed
+# and the half that picks the sha was not, silently. Nothing guarded the
+# listing expression at all before this assertion.
+CANDIDATE_LISTING_CAPTURE = 'capture("^evidence/'
+MINT_FIRST_CONTACT_ROW = "| first contact |"
+
+
+def assert_the_mint_lists_preflight_only_candidates(release_tag: str) -> None:
+    """A missing stranger must label a release, never hide its candidate.
+
+    Three things together, because any one of them alone ships inert: the
+    listing has to propose a preflight-only sha, the mint has to read back the
+    stranger state it computes, and it has to write that state where a person
+    reading the mint run finds it.
+    """
+
+    lines = active_lines(release_tag)
+    listing = [line for line in lines if CANDIDATE_LISTING_CAPTURE in line]
+    if len(listing) != 1:
+        raise AssertionError(
+            "release-tag.yml must build its candidate list from exactly one "
+            f"evidence path capture; found {len(listing)}"
+        )
+    if "preflight" not in listing[0]:
+        raise AssertionError(
+            "release-tag.yml's candidate listing no longer keys on preflight.json"
+        )
+    if "stranger" in listing[0]:
+        raise AssertionError(
+            "release-tag.yml's candidate listing requires a stranger record "
+            "again, so a candidate whose stranger has not run is never offered "
+            "to the gate that would admit it and the mint no-ops in silence. "
+            "The rule is that a missing stranger labels a release; it does not "
+            "hold one"
+        )
+    if not any("steps.proof.outputs.stranger_state" in line for line in lines):
+        raise AssertionError(
+            "release-tag.yml computes a stranger state and reads it back "
+            "nowhere, so a release minted without first-contact proof is "
+            "indistinguishable from one that has it"
+        )
+
+
+def assert_the_stranger_labels_a_release_and_never_holds_it(release: str) -> None:
+    """First contact is a label on the release, not a gate in front of it.
+
+    Until 2026-09-04 GitHub Latest required the stranger record, and the
+    outage that bought was real: an offline runner or a spent weekly limit kept
+    a finished, installable release off /releases/latest while every machine
+    signal was green. The founder's ruling is to ship anyway and say what is
+    missing. These assertions hold both halves at once, because either one
+    alone is a different failure. Losing the hold and the label together
+    promotes an unmeasured release silently, which is the 2026-08-20 failure.
+    Keeping the hold puts the outage back.
+    """
 
     lines = active_lines(release)
-    gate = f'"$STRANGER_STATE" != {PROMOTION_STATE}'
-    if not any(gate in line for line in lines):
+    if any("promoted=false" in line for line in lines):
         raise AssertionError(
-            "release.yml must refuse to promote a release to GitHub Latest "
-            f"unless its stranger state is {PROMOTION_STATE}; Latest is what an "
-            "installer resolves, so it is the claim first-contact proof backs"
+            "release.yml holds a release back from GitHub Latest again; first "
+            "contact is a label, not a gate, and a stranger that cannot run "
+            "must not keep a finished release off the channel an installer "
+            "resolves"
         )
-    if not any("promoted=false" in line for line in lines):
+    if not any("promoted=true" in line for line in lines):
         raise AssertionError(
-            "release.yml must record promoted=false when it holds a release, so "
-            "a downstream job can tell 'held' from 'this step never ran'"
+            "release.yml must record promoted=true when it promotes, so a "
+            "downstream job can tell a decision from a step that never ran"
         )
-    # The pending notice explains why a STABLE release is not Latest. A
-    # prerelease tag is a prerelease because that is what it is, and it never
-    # becomes Latest whatever its record says, so telling its reader that it
-    # "stays a prerelease until its record lands" promises something no path in
-    # this chain delivers.
+    labelled = f'"$STRANGER_STATE" != {PROMOTION_STATE}'
+    if not any(labelled in line for line in lines):
+        raise AssertionError(
+            "release.yml must still branch on the stranger state to label the "
+            "release it promotes; a promotion that stops reading the state "
+            "cannot say which releases were measured, and unmeasured then "
+            "looks exactly like measured"
+        )
+    # The pending notice is what carries the label onto the release itself, and
+    # it is for STABLE releases only. A prerelease tag is a prerelease because
+    # that is what it is, and it never becomes Latest whatever its record says,
+    # so the notice would answer a question nobody installing an rc is asking.
     anchor = "      - name: Record the missing first-contact proof on the release itself\n"
     if release.count(anchor) != 1:
         raise AssertionError(
@@ -1216,13 +1283,19 @@ def assert_latest_requires_the_stranger(release: str) -> None:
     for required in ("stranger_state == 'pending'", "!contains(github.ref_name, '-')"):
         if required not in condition:
             raise AssertionError(
-                "the first-contact notice must be written only for a held "
+                "the first-contact notice must be written only for a pending "
                 f"STABLE release; its condition is missing {required}"
             )
 
 
 def assert_latest_claims_gate_on_promotion(release: str) -> None:
-    """Every job whose meaning is "this IS Latest" must gate on the promotion, not the job."""
+    """Every job whose meaning is "this IS Latest" must gate on the promotion, not the job.
+
+    `finalize_release` succeeding is not the same fact as this tag having been
+    promoted. The promote step does not run at all on a prerelease tag, and a
+    job that read the job's result instead of its output would move a mutable
+    `latest` alias for a release that never became Latest.
+    """
 
     needed = "needs.finalize_release.outputs.promoted == 'true'"
     for job in ("promote_ghcr_latest", "seal_release_completion"):
@@ -1231,8 +1304,8 @@ def assert_latest_claims_gate_on_promotion(release: str) -> None:
         if needed not in "\n".join(active_lines(release[start:end])):
             raise AssertionError(
                 f"{job} must gate on {needed}; it claims that this release IS "
-                "Latest, and finalize_release now succeeds without promoting "
-                "when first-contact proof is pending"
+                "Latest, which finalize_release succeeding on its own does not "
+                "say"
             )
 
 
@@ -7575,8 +7648,20 @@ def tag_readback_source(release_tag: str) -> str:
 def execute_tag_readback(
     source: str,
     responses: list[tuple[int, str]],
+    *,
+    stranger_state: str = "pending",
+    stranger_arms: str = "none",
+    stranger_driver: str = "unrecorded",
+    summary: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run the readback against a scripted sequence of API answers."""
+    """Run the readback against a scripted sequence of API answers.
+
+    The first-contact values are the ones the step's own `env:` block binds
+    from the proof step's outputs, so the fixture has to bind them too: the
+    step runs under `set -u` and an unbound one would die here for a reason
+    production never has. `summary`, when given, collects the step summary the
+    run wrote, which is where the mint records what its tag may claim.
+    """
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -7620,13 +7705,85 @@ def execute_tag_readback(
                 "RUNNER_TEMP": str(root),
             }
         )
-        return subprocess.run(
+        environment.update(
+            {
+                "STRANGER_STATE": stranger_state,
+                "STRANGER_ARMS": stranger_arms,
+                "STRANGER_DRIVER": stranger_driver,
+            }
+        )
+        completed = subprocess.run(
             ["bash", str(script)],
             capture_output=True,
             text=True,
             env=environment,
             timeout=30,
             check=False,
+        )
+        if summary is not None:
+            written = root / "summary.md"
+            summary.append(
+                written.read_text(encoding="utf-8") if written.exists() else ""
+            )
+        return completed
+
+
+def assert_the_mint_records_the_state_it_tagged_on(release_tag: str) -> None:
+    """A release minted without first-contact proof must say so in the mint's record.
+
+    Run the real readback step twice, once per state the proof gate can report,
+    and read the step summary it wrote. Two identical summaries mean the mint
+    tagged on the machine preflight alone and left no trace of it, which is the
+    gap this whole change exists to close: the mint has computed this state
+    since 2026-09-02 and, until 2026-09-04, wrote it only to GITHUB_OUTPUT,
+    where nothing in the workflow read it back.
+    """
+
+    source = tag_readback_source(release_tag)
+    readable = (0, RELEASE_GATE_FIXTURE_SHA)
+
+    held: list[str] = []
+    held_run = execute_tag_readback(
+        source, [readable], stranger_state="pending", summary=held
+    )
+    if held_run.returncode != 0:
+        raise AssertionError(
+            "the mint failed on a stranger-pending tag, which is the release "
+            f"the founder asked to ship: {held_run.stdout}{held_run.stderr}"
+        )
+    proven: list[str] = []
+    proven_run = execute_tag_readback(
+        source,
+        [readable],
+        stranger_state="complete",
+        stranger_arms="green+brown+vcs",
+        stranger_driver="account",
+        summary=proven,
+    )
+    if proven_run.returncode != 0:
+        raise AssertionError(
+            f"the mint failed on a fully proven tag: {proven_run.stdout}{proven_run.stderr}"
+        )
+
+    if MINT_FIRST_CONTACT_ROW not in held[0]:
+        raise AssertionError(
+            "the minted-tag summary must carry a first-contact row "
+            f"({MINT_FIRST_CONTACT_ROW}); the step summary is the mint's own "
+            f"record of what the tag it just created may claim: {held[0]}"
+        )
+    if held[0] == proven[0]:
+        raise AssertionError(
+            "the mint writes the same record whether or not the tag carries "
+            "first-contact proof, so a release minted on the machine preflight "
+            "alone is indistinguishable from a proven one"
+        )
+    if "pending" not in held[0]:
+        raise AssertionError(
+            f"the minted-tag summary must name a pending first contact: {held[0]}"
+        )
+    if "green+brown+vcs" not in proven[0]:
+        raise AssertionError(
+            f"the minted-tag summary must name the arms that proved it: {proven[0]}"
         )
 
 
@@ -16688,7 +16845,57 @@ def main() -> None:
         ): assert_stranger_driver_credential_is_either(mutant),
     )
     assert_tag_tier_requires_only_the_machine_proof(release_tag)
-    assert_latest_requires_the_stranger(release)
+    assert_the_mint_lists_preflight_only_candidates(release_tag)
+    expect_assertion(
+        "the mint goes back to listing only fully evidenced candidates",
+        "requires a stranger record again",
+        lambda mutant=release_tag.replace(
+            r'map(capture("^evidence/(?<sha>[0-9a-f]{40})/preflight\\.json$") | .sha)'
+            "\n              | unique",
+            r'map(capture("^evidence/(?<sha>[0-9a-f]{40})/(?<name>preflight\\.json|stranger\\.env)$"))'
+            "\n              | group_by(.sha)"
+            "\n              | map(select((map(.name) | unique | length) == 2) | .[0].sha)",
+            1,
+        ): assert_the_mint_lists_preflight_only_candidates(mutant),
+    )
+    expect_assertion(
+        "the mint computes a stranger state and reads it back nowhere",
+        "reads it back",
+        lambda mutant=release_tag.replace(
+            "          STRANGER_STATE: ${{ steps.proof.outputs.stranger_state }}\n",
+            "",
+            1,
+        ): assert_the_mint_lists_preflight_only_candidates(mutant),
+    )
+    assert_the_mint_records_the_state_it_tagged_on(release_tag)
+    expect_assertion(
+        "the minted-tag summary drops its first-contact row",
+        "must carry a first-contact row",
+        lambda mutant=release_tag.replace(
+            '            echo "| first contact | ${first_contact} |"\n', "", 1
+        ): assert_the_mint_records_the_state_it_tagged_on(mutant),
+    )
+    expect_assertion(
+        "the mint calls every tag proven regardless of the state it read",
+        "must name a pending first contact",
+        lambda mutant=release_tag.replace(
+            '          if [ "$STRANGER_STATE" = complete ]; then\n',
+            '          if true; then\n',
+            1,
+        ): assert_the_mint_records_the_state_it_tagged_on(mutant),
+    )
+    expect_assertion(
+        "the mint writes one fixed record for both first-contact states",
+        "indistinguishable from a proven one",
+        lambda mutant=release_tag.replace(
+            '            echo "| first contact | ${first_contact} |"\n',
+            '            echo "| first contact | recorded |"\n',
+            1,
+        ).replace(
+            '            echo "$claim"\n', '            echo "recorded"\n', 1
+        ): assert_the_mint_records_the_state_it_tagged_on(mutant),
+    )
+    assert_the_stranger_labels_a_release_and_never_holds_it(release)
     assert_latest_claims_gate_on_promotion(release)
     assert_require_modes_match_the_gate(release_tag, release, proof_gate)
     expect_assertion(
@@ -16699,23 +16906,32 @@ def main() -> None:
         ): assert_tag_tier_requires_only_the_machine_proof(mutant),
     )
     expect_assertion(
-        "promotion to Latest stops asking about the stranger",
-        "must refuse to promote a release to GitHub Latest",
+        "GitHub Latest waits on the stranger again",
+        "holds a release back from GitHub Latest again",
+        lambda mutant=release.replace(
+            '            echo "### Promoted with first contact ${STRANGER_STATE}"\n',
+            '            echo "promoted=false" >> "$GITHUB_OUTPUT"\n',
+            1,
+        ): assert_the_stranger_labels_a_release_and_never_holds_it(mutant),
+    )
+    expect_assertion(
+        "promotion stops reading the state, so nothing is labelled",
+        "must still branch on the stranger state",
         lambda mutant=release.replace(
             'if [ "$STRANGER_STATE" != complete ]; then',
-            'if [ "$STRANGER_STATE" = never ]; then',
+            'if [ "$GITHUB_REF_NAME" = never ]; then',
             1,
-        ): assert_latest_requires_the_stranger(mutant),
+        ): assert_the_stranger_labels_a_release_and_never_holds_it(mutant),
     )
     expect_assertion(
         "the pending notice is written onto a prerelease tag too",
-        "written only for a held",
+        "written only for a pending",
         lambda mutant=release.replace(
             "            steps.proof.outputs.stranger_state == 'pending' &&\n"
             "            !contains(github.ref_name, '-')\n",
             "            steps.proof.outputs.stranger_state == 'pending'\n",
             1,
-        ): assert_latest_requires_the_stranger(mutant),
+        ): assert_the_stranger_labels_a_release_and_never_holds_it(mutant),
     )
     expect_assertion(
         "GHCR latest moves on a release that was held as a prerelease",
