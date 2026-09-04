@@ -35068,7 +35068,8 @@ mod tests {
             changes: Vec::new(),
         };
 
-        let (status, body) = semantic_readmission_refused(&summary, &["src/shifted.rs".to_string()]);
+        let (status, body) =
+            semantic_readmission_refused(&summary, &["src/shifted.rs".to_string()]);
 
         assert_eq!(
             status,
@@ -35166,7 +35167,6 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         serde_json::from_slice(&body).unwrap()
     }
-
 
     /// Changes in repository authority, read the way `kin log` reads them.
     #[cfg(unix)]

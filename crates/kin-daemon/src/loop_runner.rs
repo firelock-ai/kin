@@ -8249,7 +8249,8 @@ pub(crate) async fn readmit_semantics_for_paths(
             }
         }
 
-        if let Err(error) = clear_incompatible_facets(state, &file_id, EnrichmentFacet::EntitySource)
+        if let Err(error) =
+            clear_incompatible_facets(state, &file_id, EnrichmentFacet::EntitySource)
         {
             warn!(
                 file = %file_id,
@@ -8285,7 +8286,10 @@ pub(crate) async fn readmit_semantics_for_paths(
                     // The file's declarations just moved, so whatever a language
                     // server said about them was said at positions this delta
                     // retired.
-                    crate::daemon::retire_enrichment_marker(state, &[file_id.0.clone()]);
+                    crate::daemon::retire_enrichment_marker(
+                        state,
+                        std::slice::from_ref(&file_id.0),
+                    );
                     if let Err(error) =
                         state.persist_projection_truth_from_reconcile(&reconciler, &reconciled)
                     {
