@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gate the stale-span certification tests to unix beside their helper (#1517)
 - Skip the hosted spine legacy migration seal a previous image wrote (#1518)
 - Carry relation-only pending enrichment across a branch switch (#1521)
+- Drop the spine evidence an abandoned rollout never released (#1522)
+- Converge a merged graph's enrichment and let graph validate see a census gap (#1523)
 
 
 ## [0.7.0] - 2026-09-05
