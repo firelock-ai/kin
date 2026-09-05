@@ -1672,6 +1672,28 @@ const SPINE_GRAPH_CAPTURE_ATTEMPTS: usize = 3;
 /// constant while still allowing unrelated repositories to reload in parallel.
 const HOSTED_REPO_RELOAD_GATE_SHARDS: usize = 64;
 const HOSTED_REPO_RELOAD_ATTEMPTS: usize = 3;
+
+/// How often a hosted reader re-proves its spine authority in the background.
+///
+/// One pass hydrates the whole durable cache and then double-collects the fleet,
+/// loading every repository graph and recomputing every root. A five-repo
+/// production fleet measured a 10.46 s median for one of them on 2026-09-05, so
+/// this interval has to be long enough that the pod is mostly idle between
+/// passes and short enough that a reader nobody queries still tracks its
+/// siblings. It is never on a request path; the readiness probe reads the proof
+/// this pass maintains and never waits for it.
+const HOSTED_SPINE_AUTHORITY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How soon the background pass retries after a failed one, doubling up to
+/// [`HOSTED_SPINE_AUTHORITY_REFRESH_INTERVAL`].
+///
+/// A failed pass invalidates the cached proof, so the daemon reports unready
+/// until a pass succeeds. Waiting a whole minute to retry would turn a single
+/// transient durable read into a minute out of service; retrying in a second
+/// turns it into a second. It is also the floor between passes when a probe
+/// wakes one, so a persistent drift cannot turn the probe back into the thing
+/// that drives a continuous refresh.
+const HOSTED_SPINE_AUTHORITY_RETRY_FLOOR: Duration = Duration::from_secs(1);
 const HOSTED_SPINE_FLEET_SIZE: usize = 5;
 const HOSTED_SPINE_CURSOR_CAS_REQUIRED: &str =
     "hosted persistent spine is unavailable until its durable backend can stage rows and compare-and-swap a head bound to the exact source publication cursor";
@@ -1718,17 +1740,79 @@ struct SpineGraphCapture {
     relations: Vec<kin_model::Relation>,
 }
 
+/// One repository's durable identity, as a caller can read it without loading
+/// a graph or a single entity row: the committed spine head with the store
+/// revision that carried it, and the GCS source publication cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostedRepoDurableIdentity {
+    head: kin_spine::RepoPublicationHead,
+    head_revision: String,
+    source_cursor: kin_spine::SpineSourceCursor,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HostedSpineRepoAuthorityProof {
     durable_head_cursor: kin_spine::SpineSourceCursor,
     current_source_cursor: kin_spine::SpineSourceCursor,
     root_hash: String,
+    /// The exact durable identity this proof was built against.
+    ///
+    /// A cursor and a root hash do not pin a publication on their own. The head
+    /// also carries its publication id and its manifest and metadata digests,
+    /// and an identity check that compares less than all of it can accept a
+    /// different publication that happens to sit at the same cursor.
+    identity: HostedRepoDurableIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HostedSpineAuthorityProof {
     rollout_fence: kin_spine::LoadedSpineRolloutFence,
     repositories: BTreeMap<String, HostedSpineRepoAuthorityProof>,
+}
+
+/// The durable control-plane authority a cached proof is read under: the
+/// admitted fence evidence, the active Firestore fence with the store revision
+/// that carried it, and the registered fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostedControlAuthority {
+    durable: kin_spine::SpineRolloutFenceEvidence,
+    active_fence: kin_spine::LoadedSpineRolloutFence,
+    registered: std::collections::BTreeSet<String>,
+}
+
+/// Why a cached hosted authority proof cannot answer, and whether re-proving it
+/// now would help.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedAuthorityRefusal {
+    reason: String,
+    /// The durable identity moved under the proof, or the proof is gone. A
+    /// fresh pass can install one for the identity that is there now.
+    ///
+    /// A lost admission or an active rollout is not this: re-proving cannot fix
+    /// either, and waking the background pass for them would run it back to
+    /// back for as long as the condition lasts, which is the behaviour this
+    /// whole path exists to remove from the probe.
+    superseded: bool,
+}
+
+impl CachedAuthorityRefusal {
+    fn blocked(reason: String) -> Self {
+        Self {
+            reason,
+            superseded: false,
+        }
+    }
+
+    fn superseded(reason: String) -> Self {
+        Self {
+            reason,
+            superseded: true,
+        }
+    }
+
+    pub(crate) fn into_reason(self) -> String {
+        self.reason
+    }
 }
 
 fn hosted_spine_authority_vector_is_stable(
@@ -2931,6 +3015,24 @@ pub struct DaemonState {
     #[cfg(test)]
     #[cfg_attr(not(feature = "firestore"), allow(dead_code))]
     spine_backend_hydrations: AtomicUsize,
+    /// Shortens the background refresh interval so a test can watch the pass
+    /// actually run. `None`, and every production build, uses
+    /// [`HOSTED_SPINE_AUTHORITY_REFRESH_INTERVAL`].
+    #[cfg(test)]
+    hosted_spine_refresh_interval_for_test: Mutex<Option<Duration>>,
+    /// Whether the background pass that keeps the hosted spine authority proof
+    /// current has been started. It is started once, by whichever hosted
+    /// request route runs first, and never again.
+    hosted_spine_refresh_cadence_started: AtomicBool,
+    /// Wakes that pass when a probe observes that durable identity moved under
+    /// the cached proof, so readiness returns on the next successful pass
+    /// rather than at the end of the interval.
+    hosted_spine_refresh_wake: Arc<tokio::sync::Notify>,
+    /// Tickets handed to authority passes, and the highest ticket whose result
+    /// has been applied. Two passes can overlap, and without an order an older
+    /// one that finishes second overwrites the newer one's result.
+    hosted_spine_authority_pass_seq: AtomicU64,
+    hosted_spine_authority_applied_seq: AtomicU64,
     /// Test-only escape hatch for process-local spine behavior. Production
     /// hosted states have no corresponding field or bypass: they remain held
     /// until the durable backend owns cursor-bound publication CAS.
@@ -5271,6 +5373,12 @@ impl DaemonState {
             #[cfg(test)]
             spine_backend_hydrations: AtomicUsize::new(0),
             #[cfg(test)]
+            hosted_spine_refresh_interval_for_test: Mutex::new(None),
+            hosted_spine_refresh_cadence_started: AtomicBool::new(false),
+            hosted_spine_refresh_wake: Arc::new(tokio::sync::Notify::new()),
+            hosted_spine_authority_pass_seq: AtomicU64::new(0),
+            hosted_spine_authority_applied_seq: AtomicU64::new(0),
+            #[cfg(test)]
             hosted_in_memory_spine_allowed: AtomicBool::new(false),
             #[cfg(test)]
             hosted_durable_spine_for_test: Mutex::new(None),
@@ -5640,6 +5748,12 @@ impl DaemonState {
             spine_backend_constructions: AtomicUsize::new(0),
             #[cfg(test)]
             spine_backend_hydrations: AtomicUsize::new(0),
+            #[cfg(test)]
+            hosted_spine_refresh_interval_for_test: Mutex::new(None),
+            hosted_spine_refresh_cadence_started: AtomicBool::new(false),
+            hosted_spine_refresh_wake: Arc::new(tokio::sync::Notify::new()),
+            hosted_spine_authority_pass_seq: AtomicU64::new(0),
+            hosted_spine_authority_applied_seq: AtomicU64::new(0),
             #[cfg(test)]
             hosted_in_memory_spine_allowed: AtomicBool::new(false),
             #[cfg(test)]
@@ -6219,6 +6333,13 @@ impl DaemonState {
                     selected_fence.evidence()
                 ));
             }
+            // The committed heads are read before the collection and again
+            // after it, and the attempt restarts unless both reads agree. The
+            // collector below stabilizes the per-repository cursors and roots;
+            // stabilizing only one of the two sources still lets a bundle mix
+            // two fleet instants, which is the same A-out/B-in mistake one
+            // level up.
+            let selected_heads = self.committed_head_identities(spine)?;
             // A single sequential collection can accept a fleet vector that
             // never existed at one instant: A can match then advance before B
             // advances into the expected value. Snapshot cursors are monotonic,
@@ -6226,6 +6347,9 @@ impl DaemonState {
             // collections. The same helper is driven by the A-out/B-in mutant.
             let repositories =
                 collect_stable_hosted_spine_authority_vector(&fleet, 1, |repo_id| {
+                    let Some((head, head_revision)) = selected_heads.get(repo_id) else {
+                        return Ok(None);
+                    };
                     let loaded = self.load_repo_graph(repo_id).map_err(|error| {
                         format!("load {repo_id} for hosted spine root proof: {error}")
                     })?;
@@ -6247,10 +6371,21 @@ impl DaemonState {
                     {
                         return Ok(None);
                     }
+                    // The durable head must say the same thing this process's
+                    // cache says. A head that disagrees is a cache the proof
+                    // would otherwise bind to the wrong publication.
+                    if head.source_cursor != durable_head_cursor || head.root_hash != root_hash {
+                        return Ok(None);
+                    }
                     Ok(Some(HostedSpineRepoAuthorityProof {
                         durable_head_cursor,
                         current_source_cursor,
                         root_hash,
+                        identity: HostedRepoDurableIdentity {
+                            head: head.clone(),
+                            head_revision: head_revision.clone(),
+                            source_cursor: current_source_cursor,
+                        },
                     }))
                 })?;
             let Some(repositories) = repositories else {
@@ -6263,6 +6398,9 @@ impl DaemonState {
                     "hosted spine committed heads do not expose one complete exact-fleet edge authority"
                         .to_string(),
                 );
+            }
+            if self.committed_head_identities(spine)? != selected_heads {
+                continue 'attempt;
             }
             let observed_fence = spine
                 .active_rollout_fence()
@@ -6283,18 +6421,54 @@ impl DaemonState {
     ) -> std::result::Result<(), String> {
         #[cfg(test)]
         self.spine_backend_hydrations.fetch_add(1, Ordering::SeqCst);
-        spine
+        let ticket = self
+            .hosted_spine_authority_pass_seq
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        let refreshed = spine
             .refresh_committed_publications()
-            .map_err(|error| format!("refresh committed hosted spine heads: {error}"))?;
-        // Always rebuild the proof through the real double-collect path. A
-        // cached single-pass shortcut can accept an A-out/B-in fleet vector
-        // that never existed at one instant.
-        let proof = self.validate_hosted_spine_authority(spine)?;
-        *self
+            .map_err(|error| format!("refresh committed hosted spine heads: {error}"))
+            // Always rebuild the proof through the real double-collect path. A
+            // cached single-pass shortcut can accept an A-out/B-in fleet vector
+            // that never existed at one instant.
+            .and_then(|()| self.validate_hosted_spine_authority(spine));
+        // A FAILED pass clears the proof. Leaving the previous one installed
+        // is how a process that has already determined its authority is
+        // invalid goes on certifying reads from it: the caller records the
+        // error and returns None, but every cached-authority reader still
+        // finds a `Some` proof whose fleet names and rollout fence are intact
+        // and answers yes. Hydration can also have replaced the cache before
+        // validation failed, so the surviving proof would then describe a
+        // generation the cache no longer holds.
+        let mut cached = self
             .hosted_spine_authority_proof
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(proof);
-        Ok(())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Read and write the applied ticket under the proof lock, so a pass
+        // that started earlier and finished later reports its own result and
+        // leaves a newer pass's state alone.
+        let stale = self
+            .hosted_spine_authority_applied_seq
+            .load(Ordering::SeqCst)
+            >= ticket;
+        if !stale {
+            self.hosted_spine_authority_applied_seq
+                .store(ticket, Ordering::SeqCst);
+        }
+        match refreshed {
+            Ok(proof) => {
+                if !stale {
+                    *cached = Some(proof);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if !stale {
+                    *cached = None;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Construct the durable hosted backend without acquiring a GCS
@@ -6584,6 +6758,291 @@ impl DaemonState {
         })
     }
 
+    /// The already-initialized backend, or the reason it cannot be read.
+    ///
+    /// A recovery-only process opened its primary graph before the GCS
+    /// generation fence completed, so it must never serve a cached view as
+    /// current authority even though a backend exists.
+    fn initialized_spine_backend(
+        &self,
+    ) -> std::result::Result<&dyn kin_spine::SpineBackend, String> {
+        if self.hosted_restart_required() {
+            return Err(self.spine_unavailable_reason());
+        }
+        self.spine
+            .get()
+            .map(AsRef::as_ref)
+            .ok_or_else(|| "spine is disabled or has not been initialized".to_string())
+    }
+
+    /// The committed spine heads, read from the durable store.
+    fn committed_head_identities(
+        &self,
+        spine: &dyn kin_spine::SpineBackend,
+    ) -> std::result::Result<BTreeMap<String, (kin_spine::RepoPublicationHead, String)>, String>
+    {
+        without_blocking_runtime_worker(|| spine.committed_head_identities())
+            .map_err(|error| format!("read durable committed spine heads: {error}"))
+    }
+
+    /// Probe every named repository's GCS source publication cursor at once.
+    ///
+    /// One point read per repository, issued together rather than in series. A
+    /// readiness probe runs every few seconds against a one-second timeout, and
+    /// five sequential object reads is five round trips of latency it has no
+    /// reason to pay one after another.
+    ///
+    /// A read that FAILS is an error, never an absence: a repository whose
+    /// metadata could not be read is unknown, not unpublished, and folding the
+    /// two together lets a broken object store read as a moved cursor.
+    fn probe_fleet_publication_cursors(
+        &self,
+        repo_ids: &[String],
+    ) -> std::result::Result<BTreeMap<String, kin_spine::SpineSourceCursor>, String> {
+        without_blocking_runtime_worker(|| {
+            std::thread::scope(|scope| {
+                let probes = repo_ids
+                    .iter()
+                    .map(|repo_id| {
+                        scope.spawn(move || (repo_id, self.probe_repo_publication(repo_id)))
+                    })
+                    .collect::<Vec<_>>();
+                let mut observed = BTreeMap::new();
+                for probe in probes {
+                    let (repo_id, result) = probe
+                        .join()
+                        .map_err(|_| "a hosted publication cursor probe panicked".to_string())?;
+                    let cursor = result.map_err(|error| {
+                        format!("probe {repo_id} source publication cursor: {error}")
+                    })?;
+                    let Some(cursor) = cursor else {
+                        return Err(format!(
+                            "repo {repo_id} has no source publication cursor to bind authority to"
+                        ));
+                    };
+                    observed.insert(
+                        repo_id.clone(),
+                        Self::snapshot_cursor_for_spine(Some(cursor)),
+                    );
+                }
+                Ok(observed)
+            })
+        })
+    }
+
+    /// One observation of the fleet's durable identity: committed spine heads
+    /// and GCS source publication cursors, with no graph load and no row read.
+    fn observe_hosted_fleet_identity(
+        &self,
+        spine: &dyn kin_spine::SpineBackend,
+        repo_ids: &[String],
+    ) -> std::result::Result<BTreeMap<String, HostedRepoDurableIdentity>, String> {
+        let heads = self.committed_head_identities(spine)?;
+        let cursors = self.probe_fleet_publication_cursors(repo_ids)?;
+        let mut identity = BTreeMap::new();
+        for repo_id in repo_ids {
+            let Some((head, head_revision)) = heads.get(repo_id) else {
+                return Err(format!(
+                    "repo {repo_id} has no committed durable spine head"
+                ));
+            };
+            let Some(source_cursor) = cursors.get(repo_id) else {
+                return Err(format!(
+                    "repo {repo_id} was not probed for its source cursor"
+                ));
+            };
+            identity.insert(
+                repo_id.clone(),
+                HostedRepoDurableIdentity {
+                    head: head.clone(),
+                    head_revision: head_revision.clone(),
+                    source_cursor: *source_cursor,
+                },
+            );
+        }
+        Ok(identity)
+    }
+
+    /// The same observation, taken twice and required to agree.
+    ///
+    /// Stabilizing one source is not enough. The bundle spans two stores, and a
+    /// writer that advances a GCS cursor between the head read and the cursor
+    /// read produces a vector that never existed at any instant, which is the
+    /// A-out/B-in shape the full proof's double collection refuses one level
+    /// up. Both halves are therefore collected twice and compared whole.
+    fn observe_stable_hosted_fleet_identity(
+        &self,
+        spine: &dyn kin_spine::SpineBackend,
+        repo_ids: &[String],
+    ) -> std::result::Result<BTreeMap<String, HostedRepoDurableIdentity>, String> {
+        let mut last_movement = String::new();
+        for attempt in 1..=HOSTED_REPO_RELOAD_ATTEMPTS {
+            let selected = self.observe_hosted_fleet_identity(spine, repo_ids)?;
+            let observed = self.observe_hosted_fleet_identity(spine, repo_ids)?;
+            if selected == observed {
+                return Ok(selected);
+            }
+            last_movement =
+                format!("hosted fleet durable identity moved during observation attempt {attempt}");
+        }
+        Err(format!(
+            "{last_movement}; it did not stabilize after {HOSTED_REPO_RELOAD_ATTEMPTS} attempts"
+        ))
+    }
+
+    /// The durable control-plane authority a cached proof is read under: the
+    /// admitted fence evidence, the active Firestore fence with the revision
+    /// that carried it, and the registered fleet.
+    ///
+    /// Read once before the identity bundle and once after, and required to be
+    /// identical, so a rollout or an admission change DURING the bundle reads
+    /// cannot be answered through.
+    fn read_hosted_control_authority(
+        &self,
+        control: &crate::publication_lease::PublicationControl,
+        backend: &dyn kin_spine::SpineBackend,
+    ) -> std::result::Result<HostedControlAuthority, CachedAuthorityRefusal> {
+        control
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .map_err(|error| {
+                CachedAuthorityRefusal::blocked(format!(
+                    "hosted spine reader is not durably admitted: {error}"
+                ))
+            })?;
+        let durable = match control.runtime_spine_authority().map_err(|error| {
+            CachedAuthorityRefusal::blocked(format!("load hosted spine runtime authority: {error}"))
+        })? {
+            crate::publication_lease::RuntimeSpineAuthority::Completed(evidence) => evidence,
+            crate::publication_lease::RuntimeSpineAuthority::RolloutActive(blocking) => {
+                return Err(CachedAuthorityRefusal::blocked(format!(
+                    "hosted spine {blocking}; cached authority is not readable"
+                )))
+            }
+        };
+        let active_fence = without_blocking_runtime_worker(|| backend.active_rollout_fence())
+            .map_err(|error| {
+                CachedAuthorityRefusal::blocked(format!(
+                    "load active Firestore spine fence: {error}"
+                ))
+            })?;
+        Ok(HostedControlAuthority {
+            durable,
+            active_fence,
+            registered: backend.registered_repo_ids().into_iter().collect(),
+        })
+    }
+
+    /// Prove the cached hosted authority against durable identity, with no
+    /// hydration and no graph load.
+    ///
+    /// The reuse is conditional on identity, never on age: the durable reader
+    /// admission, the runtime spine authority, the admitted fence evidence, the
+    /// active Firestore fence, the registered fleet, and then the exact durable
+    /// identity of every repository the proof was built against, must all still
+    /// be what they were. Any drift, and any error reading them, refuses.
+    ///
+    /// Names are not identity, and the rollout fence is not identity either. An
+    /// ordinary publication lease advances a committed head while the admitted
+    /// rollout evidence stays exactly where it is, so a check that stops at the
+    /// fleet's names certifies a proof built against a generation that has
+    /// already been superseded.
+    ///
+    /// The control-plane authority is read on BOTH sides of the identity bundle
+    /// and required to be identical. Reading it only before would answer a probe
+    /// through a rollout that began, or an admission that lapsed, while the
+    /// heads and cursors were being read; the full proof re-reads its fence at
+    /// the end for the same reason.
+    ///
+    /// What it does NOT re-establish is the graph root, because it does not have
+    /// to: the root was fully validated against an immutable source cursor, and
+    /// this check proves that both the committed head and the source cursor are
+    /// still the exact ones it was validated at. Recomputing it would mean
+    /// loading every repository graph on every probe, which is the cost this
+    /// whole path exists to remove.
+    ///
+    /// Callers hold the publication read gate, so a writer in this process
+    /// cannot install a new committed generation between this proof and the
+    /// answer it authorizes.
+    fn assert_cached_hosted_spine_authority(
+        &self,
+        backend: &dyn kin_spine::SpineBackend,
+    ) -> std::result::Result<(), CachedAuthorityRefusal> {
+        let Some(control) = self.publication_control.as_ref() else {
+            return Ok(());
+        };
+        let before = self.read_hosted_control_authority(control, backend)?;
+        let expected = self
+            .expected_hosted_spine_rollout_fence()
+            .map_err(CachedAuthorityRefusal::blocked)?;
+        if expected != before.durable {
+            return Err(CachedAuthorityRefusal::blocked(
+                "cached hosted spine evidence differs from the GCS publication-control record"
+                    .to_string(),
+            ));
+        }
+        let cached = self
+            .hosted_spine_authority_proof
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                CachedAuthorityRefusal::superseded(format!(
+                    "hosted spine has no completed cursor/root authority proof: {}",
+                    self.spine_unavailable_reason()
+                ))
+            })?;
+        if before.active_fence != cached.rollout_fence
+            || before.active_fence.evidence() != before.durable
+        {
+            return Err(CachedAuthorityRefusal::blocked(
+                "cached hosted spine proof differs from active Firestore authority".to_string(),
+            ));
+        }
+        if cached.repositories.len() != before.registered.len()
+            || cached
+                .repositories
+                .keys()
+                .any(|repo_id| !before.registered.contains(repo_id))
+        {
+            return Err(CachedAuthorityRefusal::blocked(
+                "cached hosted spine proof does not cover the exact registered fleet".to_string(),
+            ));
+        }
+        let repo_ids = cached.repositories.keys().cloned().collect::<Vec<_>>();
+        let observed = self
+            .observe_stable_hosted_fleet_identity(backend, &repo_ids)
+            .map_err(CachedAuthorityRefusal::superseded)?;
+        for (repo_id, proved) in &cached.repositories {
+            let Some(current) = observed.get(repo_id) else {
+                return Err(CachedAuthorityRefusal::superseded(format!(
+                    "repo {repo_id} has no durable identity to bind the cached proof to"
+                )));
+            };
+            if current != &proved.identity {
+                return Err(CachedAuthorityRefusal::superseded(format!(
+                    "repo {repo_id} durable identity moved under the cached proof: committed head \
+                     publication {} at source cursor {:?}, proof built against publication {} at \
+                     source cursor {:?}",
+                    current.head.publication_id,
+                    current.source_cursor,
+                    proved.identity.head.publication_id,
+                    proved.identity.source_cursor,
+                )));
+            }
+        }
+        // Close the bracket. Everything the answer rests on must still be what
+        // it was when the bundle reads started.
+        let after = self.read_hosted_control_authority(control, backend)?;
+        if after != before {
+            return Err(CachedAuthorityRefusal::superseded(
+                "hosted control-plane authority moved while the durable identity bundle was \
+                 being read"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Guard an already-initialized spine for side-effect-free diagnostics.
     /// Hosted health must never warm, hydrate, or publish, but it also must not
     /// report an unadmitted cached generation as healthy. The durable reader
@@ -6593,73 +7052,162 @@ impl DaemonState {
         &self,
     ) -> std::result::Result<SpineAuthorityReadGuard<'_>, String> {
         let publication_gate = self.spine_refresh_gate.read().await;
-        // Health reads the already-constructed backend rather than entering
-        // `ensure_spine_initialized`, so it needs the recovery-only refusal of
-        // its own. Without it a recovery process that repaired durable state
-        // would report a cached view as current authority over a primary graph
-        // that predates the fence.
-        if self.hosted_restart_required() {
-            return Err(self.spine_unavailable_reason());
-        }
-        let backend = self
-            .spine
-            .get()
-            .map(AsRef::as_ref)
-            .ok_or_else(|| "spine is disabled or has not been initialized".to_string())?;
-        if let Some(control) = self.publication_control.as_ref() {
-            control
-                .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
-                .map_err(|error| format!("hosted spine reader is not durably admitted: {error}"))?;
-            let durable = match control
-                .runtime_spine_authority()
-                .map_err(|error| format!("load hosted spine runtime authority: {error}"))?
-            {
-                crate::publication_lease::RuntimeSpineAuthority::Completed(evidence) => evidence,
-                crate::publication_lease::RuntimeSpineAuthority::RolloutActive(blocking) => {
-                    return Err(format!(
-                        "hosted spine {blocking}; cached authority is not readable"
-                    ))
-                }
-            };
-            let expected = self.expected_hosted_spine_rollout_fence()?;
-            if expected != durable {
-                return Err(
-                    "cached hosted spine evidence differs from the GCS publication-control record"
-                        .to_string(),
-                );
-            }
-            let cached = self
-                .hosted_spine_authority_proof
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-                .ok_or_else(|| {
-                    "hosted spine has no completed cursor/root authority proof".to_string()
-                })?;
-            let active = without_blocking_runtime_worker(|| backend.active_rollout_fence())
-                .map_err(|error| format!("load active Firestore spine fence: {error}"))?;
-            if active != cached.rollout_fence || active.evidence() != durable {
-                return Err(
-                    "cached hosted spine proof differs from active Firestore authority".to_string(),
-                );
-            }
-            let registered = backend.registered_repo_ids();
-            if cached.repositories.len() != registered.len()
-                || cached
-                    .repositories
-                    .keys()
-                    .any(|repo_id| !registered.contains(repo_id))
-            {
-                return Err(
-                    "cached hosted spine proof does not cover the exact registered fleet"
-                        .to_string(),
-                );
-            }
-        }
+        let backend = self.initialized_spine_backend()?;
+        self.assert_cached_hosted_spine_authority(backend)
+            .map_err(CachedAuthorityRefusal::into_reason)?;
         Ok(SpineAuthorityReadGuard {
             backend,
             _publication_gate: publication_gate,
         })
+    }
+
+    /// Answer one hosted readiness probe. Nothing here hydrates the durable
+    /// cache or loads a repository graph.
+    ///
+    /// A probe is a report, not an authority transition. Establishing authority
+    /// costs one full durable cache hydration plus a whole-fleet double-collect
+    /// that loads every repository graph and recomputes every root; on a
+    /// five-repo production fleet on 2026-09-05 that measured a 10.46 s median,
+    /// against a 3 s startup-probe timeout and a 1 s readiness-probe timeout.
+    /// Worse, the hydration takes one process-wide lock, so probes did not even
+    /// overlap: they queued, and end-to-end readiness answers took 141 s, 156 s
+    /// and 175.7 s while the answer itself was `ready: true`. The pod never went
+    /// Ready and the rollout was reverted.
+    ///
+    /// So the probe reads the proof that the authority transitions establish and
+    /// [`Self::start_hosted_spine_authority_refresh_cadence`] keeps current, and
+    /// it re-proves durable identity every time so a lost admission, an active
+    /// rollout or drifted evidence still refuses.
+    pub(crate) async fn hosted_readiness_spine_authority(&self) -> std::result::Result<(), String> {
+        let gate_started = Instant::now();
+        let _publication_gate = self.spine_refresh_gate.read().await;
+        self.spine_gate_read_wait_micros.store(
+            u64::try_from(gate_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        // The refusal `ensure_spine_initialized` would have reached first. A
+        // build or configuration that cannot construct the hosted backend must
+        // not report ready on the strength of a proof cached before it broke.
+        if self.hosted_persistent_spine_blocked() {
+            return Err(self.spine_unavailable_reason());
+        }
+        let backend = self.initialized_spine_backend()?;
+        match self.assert_cached_hosted_spine_authority(backend) {
+            Ok(()) => Ok(()),
+            Err(refusal) => {
+                if refusal.superseded {
+                    // Re-prove now rather than at the end of the interval, so
+                    // Ready comes back on the next successful pass instead of a
+                    // minute later. The pass keeps its own floor between runs,
+                    // so a drift that persists cannot turn the probe back into
+                    // the thing that drives a continuous refresh.
+                    self.hosted_spine_refresh_wake.notify_one();
+                }
+                Err(refusal.into_reason())
+            }
+        }
+    }
+
+    /// How long the background authority refresh sleeps between passes.
+    fn hosted_spine_authority_refresh_interval(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(interval) = *self
+            .hosted_spine_refresh_interval_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return interval;
+        }
+        HOSTED_SPINE_AUTHORITY_REFRESH_INTERVAL
+    }
+
+    /// Start the one background pass that keeps the hosted spine authority
+    /// proof current, if it is not already running.
+    ///
+    /// Idempotent, so a request route may call it unconditionally. It exists
+    /// because the readiness probe used to be what refreshed this proof: taking
+    /// that off the probe path without putting it anywhere would leave a reader
+    /// that nobody queries proving its authority once, at admission, and never
+    /// again.
+    ///
+    /// A failed pass does not by itself make this daemon unready. The three
+    /// conditions a probe must refuse on, a lost durable admission, an active
+    /// rollout and drifted evidence, are re-read on every probe and decide the
+    /// answer; flapping a serving pod out of the fleet over one transient
+    /// durable read would take out the whole pool on a blip.
+    pub(crate) fn start_hosted_spine_authority_refresh_cadence(self: &Arc<Self>) {
+        if !self.hosted_spine_readiness_required() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            // Nothing to spawn on. Leave the flag clear so a later caller that
+            // does have a runtime still starts the pass.
+            return;
+        };
+        if self
+            .hosted_spine_refresh_cadence_started
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        // The pass holds a WEAK reference and takes a strong one only while it
+        // is working. A background task that owns the daemon state keeps every
+        // graph, cache and index it holds alive for as long as the task runs,
+        // which is forever, and it cannot notice that the state it exists to
+        // maintain has gone.
+        let wake = Arc::clone(&self.hosted_spine_refresh_wake);
+        let state = Arc::downgrade(self);
+        runtime.spawn(async move {
+            // `Some` only while a pass is failing, and it doubles from the
+            // retry floor up to the interval. A failed pass invalidates the
+            // cached proof, so the daemon reports unready until one succeeds:
+            // waiting a whole interval to retry would turn one transient
+            // durable read into a minute out of service.
+            let mut retry: Option<Duration> = None;
+            loop {
+                let (interval, floor) = {
+                    let Some(state) = state.upgrade() else { return };
+                    let interval = state.hosted_spine_authority_refresh_interval();
+                    (interval, HOSTED_SPINE_AUTHORITY_RETRY_FLOOR.min(interval))
+                };
+                tokio::select! {
+                    () = tokio::time::sleep(retry.unwrap_or(interval)) => {}
+                    () = wake.notified() => {
+                        // A probe saw durable identity move. Re-prove soon, but
+                        // never faster than the floor.
+                        tokio::time::sleep(floor).await;
+                    }
+                }
+                let Some(state) = state.upgrade() else { return };
+                let started = Instant::now();
+                let refreshed = {
+                    let _publication_gate = state.spine_refresh_gate.read().await;
+                    state.ensure_spine().is_some()
+                };
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if refreshed {
+                    retry = None;
+                    debug!(
+                        elapsed_ms,
+                        "hosted spine authority refreshed on the background cadence"
+                    );
+                } else {
+                    retry = Some(
+                        retry
+                            .map_or(floor, |backoff| backoff.saturating_mul(2))
+                            .min(interval),
+                    );
+                    warn!(
+                        elapsed_ms,
+                        retry_in_ms = retry.unwrap_or(interval).as_millis() as u64,
+                        reason = %state.spine_unavailable_reason(),
+                        "background hosted spine authority refresh failed; the cached proof is \
+                         invalidated and readiness refuses until a pass succeeds"
+                    );
+                }
+                drop(state);
+            }
+        });
     }
 
     /// Refuse hosted operation unless the deployed bytes and configuration can
@@ -7198,6 +7746,16 @@ impl DaemonState {
             .spine_initialization_test_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    /// Shorten the background authority refresh interval for a test that has
+    /// to watch the pass run. Production has no such override.
+    #[cfg(test)]
+    pub(crate) fn set_hosted_spine_refresh_interval_for_test(&self, interval: Duration) {
+        *self
+            .hosted_spine_refresh_interval_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(interval);
     }
 
     #[cfg(all(test, feature = "embeddings"))]
@@ -12169,12 +12727,36 @@ mod tests {
         );
     }
 
+    /// A committed head whose every field moves with the generation and root
+    /// under test, so the A-out/B-in control still discriminates now that the
+    /// proof carries the whole head identity rather than three fields of it.
+    fn hosted_repo_head(generation: u64, root_hash: &str) -> kin_spine::RepoPublicationHead {
+        kin_spine::RepoPublicationHead {
+            schema_version: kin_spine::REPO_PUBLICATION_SCHEMA_VERSION,
+            repo_id: "fixture".to_string(),
+            source_cursor: kin_spine::SpineSourceCursor::from_backend_generation(generation),
+            root_hash: root_hash.to_string(),
+            phase: kin_spine::RepoPublicationPhase::Edges,
+            publication_id: format!("{root_hash}-{generation}"),
+            manifest_sha256: format!("manifest-{root_hash}-{generation}"),
+            metadata_sha256: format!("metadata-{root_hash}-{generation}"),
+            entity_count: 1,
+            edge_count: 0,
+            resolution_roots: BTreeMap::new(),
+        }
+    }
+
     fn hosted_repo_proof(generation: u64, root_hash: &str) -> HostedSpineRepoAuthorityProof {
         let cursor = kin_spine::SpineSourceCursor::from_backend_generation(generation);
         HostedSpineRepoAuthorityProof {
             durable_head_cursor: cursor,
             current_source_cursor: cursor,
             root_hash: root_hash.to_string(),
+            identity: HostedRepoDurableIdentity {
+                head: hosted_repo_head(generation, root_hash),
+                head_revision: format!("rev-{generation}"),
+                source_cursor: cursor,
+            },
         }
     }
 
