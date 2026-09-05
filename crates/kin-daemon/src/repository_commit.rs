@@ -237,6 +237,7 @@ pub struct SessionWorkspaceAdmissionPlan {
     /// retirement from the live graph with the same set, because the two can
     /// hold different payloads for the same entity and each must drop its own.
     pub vacated: VacatedPaths,
+    pub(crate) module_relocations: Vec<SessionModuleRelocation>,
     pub workspace_id: WorkspaceId,
     source_hashes: Vec<Hash256>,
     recovered_receipt: Option<RepositoryCommitReceipt>,
@@ -302,15 +303,40 @@ pub(crate) fn plan_session_workspace_admission(
     // refusal surfaced as a 500, and the file's entities kept answering
     // queries with nothing on disk behind them.
     let vacated = VacatedPaths::from_deltas(&deltas);
-    let semantic_delta = if vacated.is_empty() {
+    let moves = session_artifact_moves(&deltas);
+    let module_relocations = plan_session_module_relocations(blobs, &authority, &deltas)?;
+    let semantic_delta = if vacated.is_empty() && moves.is_empty() {
         WorkspaceSemanticDelta::default()
     } else {
         let snapshot = {
             let lease = authority.read_authority();
-            lease.workspace_graph_snapshot(&workspace_id)?
+            let mut snapshot = lease.workspace_graph_snapshot(&workspace_id)?;
+            let current = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+                .ok_or_else(|| invalid("session workspace is absent from authority"))?;
+            if current != &base.source_workspace {
+                if let Some(snapshot) = &mut snapshot {
+                    restore_retained_session_semantics(snapshot, current, &base.source_workspace)?;
+                }
+            }
+            snapshot
         };
         match snapshot {
-            Some(snapshot) => retire_semantics_on_vacated(&snapshot, &vacated)?,
+            Some(snapshot) => {
+                let retirement = retire_semantics_on_vacated(&snapshot, &vacated)?;
+                let mut entities = retirement.entity_deltas().to_vec();
+                if !moves.is_empty() {
+                    let graph = kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)?;
+                    for (from, to) in &moves {
+                        entities.extend(plan_session_entity_relocations(&graph, from, to)?);
+                    }
+                    bind_session_module_relocations(&mut entities, &module_relocations)?;
+                }
+                WorkspaceSemanticDelta::new(entities, retirement.relation_deltas().to_vec())?
+            }
             None => WorkspaceSemanticDelta::default(),
         }
     };
@@ -409,8 +435,8 @@ pub(crate) fn plan_session_workspace_admission(
     source_hashes.extend(shared_policy.sources.iter().map(|source| source.body_hash));
 
     let lease = authority.read_authority();
-    let current_workspace = lease
-        .metadata()
+    let metadata = lease.metadata();
+    let current_workspace = metadata
         .workspaces
         .iter()
         .find(|workspace| workspace.workspace_id == workspace_id)
@@ -428,7 +454,7 @@ pub(crate) fn plan_session_workspace_admission(
         // operation it names: a persisted receipt stopped repeating that record
         // in kin-db 0.7.89 (FIR-3064), and `rejoined_receipt` does the pairing
         // and the validation the `validate` here used to do.
-        let receipt = kin_core::rejoined_receipt(lease.metadata(), base.reconcile_operation_id)
+        let receipt = kin_core::rejoined_receipt(metadata, base.reconcile_operation_id)
             .ok_or_else(|| {
                 invalid(
                     "repository authority moved after session materialization; exact reconcile \
@@ -450,19 +476,236 @@ pub(crate) fn plan_session_workspace_admission(
         target_tree: desired_tree.clone(),
         deltas,
         vacated,
+        module_relocations,
         workspace_id,
         source_hashes: source_hashes.into_iter().collect(),
         recovered_receipt,
     })
 }
 
+#[derive(Clone)]
+pub(crate) struct SessionModuleRelocation {
+    from: kin_model::FilePathId,
+    to: kin_model::FilePathId,
+    old_name: String,
+    old_signature: String,
+    new_name: String,
+    new_signature: String,
+}
+
+/// A file module's name can derive from its path. Parse the same immutable
+/// body at both locations and bind modules by exact kind, fingerprint and
+/// source span, never by a guessed basename. This lets the subsequent ordinary
+/// reconciliation retain their IDs even when their parser-owned names change.
+fn plan_session_module_relocations(
+    blobs: &kin_blobs::BlobStore,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    deltas: &[kin_model::TreeDelta],
+) -> Result<Vec<SessionModuleRelocation>> {
+    let pipeline = kin_index::IndexPipeline::new();
+    let mut bindings = Vec::new();
+    for delta in deltas {
+        let kin_model::TreeDelta::Updated { old, new, .. } = delta else {
+            continue;
+        };
+        if old.path == new.path || old.entry != new.entry {
+            continue;
+        }
+        let kin_model::TreeEntry::Blob { hash, .. } = new.entry else {
+            continue;
+        };
+        let (Some(from), Some(to)) = (old.path.as_utf8(), new.path.as_utf8()) else {
+            continue;
+        };
+        let from = kin_model::FilePathId::new(from);
+        let to = kin_model::FilePathId::new(to);
+        let body = read_publishable_source(blobs, authority, hash)?;
+        let digest = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        let before = pipeline
+            .index_any_content(&from, body.body(), digest)
+            .map_err(|error| invalid(format!("parse moved source {from}: {error}")))?;
+        let after = pipeline
+            .index_any_content(&to, body.body(), digest)
+            .map_err(|error| invalid(format!("parse moved source {to}: {error}")))?;
+        let (
+            kin_index::IndexedAny::EntitySource(before),
+            kin_index::IndexedAny::EntitySource(after),
+        ) = (before, after)
+        else {
+            continue;
+        };
+        let mut claimed = std::collections::HashSet::new();
+        for old_module in before
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == kin_model::EntityKind::Module)
+        {
+            if before.language != after.language
+                || !matches!(before.parse_state, kin_model::ParseState::Valid)
+                || !matches!(after.parse_state, kin_model::ParseState::Valid)
+            {
+                return Err(invalid(format!(
+                    "moved module in {from} requires complete parses in the same language at {to}"
+                )));
+            }
+            let matches = after
+                .entities
+                .iter()
+                .filter(|entity| {
+                    let mut relocated_span = entity.span.clone();
+                    if let Some(span) = &mut relocated_span {
+                        span.file = from.clone();
+                    }
+                    entity.kind == old_module.kind
+                        && entity.fingerprint.algorithm == old_module.fingerprint.algorithm
+                        && entity.fingerprint.ast_hash == old_module.fingerprint.ast_hash
+                        && entity.fingerprint.behavior_hash == old_module.fingerprint.behavior_hash
+                        && relocated_span.is_some()
+                        && relocated_span == old_module.span
+                })
+                .collect::<Vec<_>>();
+            let [new_module] = matches.as_slice() else {
+                return Err(invalid(format!(
+                    "moved module in {from} has no unambiguous exact-byte identity at {to}"
+                )));
+            };
+            if !claimed.insert(new_module.id) {
+                return Err(invalid(format!(
+                    "moved modules in {from} share one exact-byte identity at {to}"
+                )));
+            }
+            bindings.push(SessionModuleRelocation {
+                from: from.clone(),
+                to: to.clone(),
+                old_name: old_module.name.clone(),
+                old_signature: old_module.signature.clone(),
+                new_name: new_module.name.clone(),
+                new_signature: new_module.signature.clone(),
+            });
+        }
+    }
+    Ok(bindings)
+}
+
+pub(crate) fn bind_session_module_relocations(
+    deltas: &mut [kin_model::EntityDelta],
+    bindings: &[SessionModuleRelocation],
+) -> Result<()> {
+    for binding in bindings {
+        let mut matched = false;
+        for delta in deltas.iter_mut() {
+            let kin_model::EntityDelta::Modified { old, new } = delta else {
+                continue;
+            };
+            if old.kind == kin_model::EntityKind::Module
+                && old.file_origin.as_ref() == Some(&binding.from)
+                && new.file_origin.as_ref() == Some(&binding.to)
+                && old.name == binding.old_name
+                && old.signature == binding.old_signature
+            {
+                if matched {
+                    return Err(invalid(
+                        "more than one graph module claims the moved parser identity",
+                    ));
+                }
+                matched = true;
+                new.name.clone_from(&binding.new_name);
+                new.signature.clone_from(&binding.new_signature);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recover the semantic input of an exact session retry from persisted
+/// overlays over the same immutable base. Replanning against the already
+/// relocated workspace would produce an empty delta and a different hash.
+/// The caller still requires the reconstructed transaction hash to match the
+/// original durable receipt before it can return an idempotent result.
+fn restore_retained_session_semantics(
+    snapshot: &mut kin_db::GraphSnapshot,
+    current: &kin_model::WorkspaceState,
+    retained: &kin_model::WorkspaceState,
+) -> Result<()> {
+    if current.base_target != retained.base_target
+        || current.base_tree_hash != retained.base_tree_hash
+        || current.semantic_overlay.external_reference_deltas()
+            != retained.semantic_overlay.external_reference_deltas()
+    {
+        return Err(invalid(
+            "session retry no longer shares its retained semantic base",
+        ));
+    }
+    for delta in current.semantic_overlay.entity_deltas() {
+        if snapshot.entities.get(&delta.target_id()) != delta.new_state() {
+            return Err(invalid(
+                "current session entity overlay does not match authority",
+            ));
+        }
+        match delta.old_state() {
+            Some(old) => {
+                snapshot.entities.insert(old.id, old.clone());
+            }
+            None => {
+                snapshot.entities.remove(&delta.target_id());
+            }
+        }
+    }
+    for delta in current.semantic_overlay.relation_deltas() {
+        if snapshot.relations.get(&delta.target_id()) != delta.new_state() {
+            return Err(invalid(
+                "current session relation overlay does not match authority",
+            ));
+        }
+        match delta.old_state() {
+            Some(old) => {
+                snapshot.relations.insert(old.id, old.clone());
+            }
+            None => {
+                snapshot.relations.remove(&delta.target_id());
+            }
+        }
+    }
+    for delta in retained.semantic_overlay.entity_deltas() {
+        if snapshot.entities.get(&delta.target_id()) != delta.old_state() {
+            return Err(invalid(
+                "retained session entity overlay does not match its base",
+            ));
+        }
+        match delta.new_state() {
+            Some(new) => {
+                snapshot.entities.insert(new.id, new.clone());
+            }
+            None => {
+                snapshot.entities.remove(&delta.target_id());
+            }
+        }
+    }
+    for delta in retained.semantic_overlay.relation_deltas() {
+        if snapshot.relations.get(&delta.target_id()) != delta.old_state() {
+            return Err(invalid(
+                "retained session relation overlay does not match its base",
+            ));
+        }
+        match delta.new_state() {
+            Some(new) => {
+                snapshot.relations.insert(new.id, new.clone());
+            }
+            None => {
+                snapshot.relations.remove(&delta.target_id());
+            }
+        }
+    }
+    snapshot.resolved_tree = retained.tree.clone();
+    Ok(())
+}
+
 /// The paths a tree transition leaves with nothing at them, and the artifact
 /// identities that held them.
 ///
-/// A path some delta's old state held and no delta's new state holds. A
-/// modification keeps its path and a rename vacates only its old one, so a
-/// moved file retires its semantics here and the enrichment that follows the
-/// publication re-derives them at the new path. Paths are kept only in their
+/// A removed artifact whose old path no new state holds. A surviving artifact
+/// keeps its semantic identity when its path changes; its entities relocate
+/// in the same transaction as the tree. Paths are kept only in their
 /// UTF-8 rendering, because only those can own entities; artifact identities
 /// are kept for every vacated entry, because the cross-file linker binds
 /// relations to artifact nodes whatever the path is made of.
@@ -480,6 +723,9 @@ impl VacatedPaths {
             .collect::<BTreeSet<_>>();
         let mut vacated = Self::default();
         for delta in deltas {
+            if delta.new_state().is_some() {
+                continue;
+            }
             let Some(old) = delta.old_state() else {
                 continue;
             };
@@ -497,6 +743,45 @@ impl VacatedPaths {
     pub(crate) fn is_empty(&self) -> bool {
         self.artifacts.is_empty()
     }
+}
+
+/// Artifact identity, carried by the exact tree delta, binds each relocation.
+/// Entity deltas are planned from each graph's own payloads before any move is
+/// applied, so swaps cannot accidentally relocate an entity twice.
+pub(crate) fn session_artifact_moves(
+    deltas: &[kin_model::TreeDelta],
+) -> Vec<(kin_model::FilePathId, kin_model::FilePathId)> {
+    deltas
+        .iter()
+        .filter_map(|delta| {
+            let kin_model::TreeDelta::Updated { old, new, .. } = delta else {
+                return None;
+            };
+            if old.path == new.path {
+                return None;
+            }
+            Some((
+                kin_model::FilePathId::new(old.path.as_utf8()?),
+                kin_model::FilePathId::new(new.path.as_utf8()?),
+            ))
+        })
+        .collect()
+}
+
+pub(crate) fn plan_session_entity_relocations(
+    graph: &kin_db::InMemoryGraph,
+    from: &kin_model::FilePathId,
+    to: &kin_model::FilePathId,
+) -> Result<Vec<kin_model::EntityDelta>> {
+    let mut deltas = crate::mcp_commit::plan_entity_relocations(graph, from, to)?;
+    for delta in &mut deltas {
+        if let kin_model::EntityDelta::Modified { new, .. } = delta {
+            if let Some(span) = &mut new.span {
+                span.file = to.clone();
+            }
+        }
+    }
+    Ok(deltas)
 }
 
 /// The canonical semantic transition that retires everything one graph holds

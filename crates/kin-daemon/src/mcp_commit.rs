@@ -8772,14 +8772,9 @@ mod tests {
     /// a carried removal becomes reachable, so the arm it guards has something
     /// to guard.
     ///
-    /// A move is NOT a removal beside an addition, and an earlier version of
-    /// this comment said it was. `TreeDelta::Updated` carries an old and a new
-    /// state and nothing requires their paths to match, so a move is one delta
-    /// that keeps its artifact identity;
-    /// `a_pending_move_is_one_updated_delta_and_ambient_admission_refuses_it`
-    /// asserts that from the product's own tree correction. What a move shares
-    /// with a removal is only this refusal, because it vacates its old path the
-    /// same way.
+    /// A surviving artifact can move through one `TreeDelta::Updated`. Session
+    /// admission carries its entity relocations in the same transaction; the
+    /// move tests below cover that path through an MCP commit and cold reopen.
     #[test]
     fn ambient_admission_cannot_vacate_a_path_without_retiring_its_semantics() {
         let (_dir, state) = test_state();
@@ -9160,18 +9155,7 @@ mod tests {
         );
     }
 
-    /// Leave one working file moved the way a session leaves it, and hand back
-    /// whatever refused if something did.
-    ///
-    /// Same shape as the removal helper, and for the same reason: the ambient
-    /// publication path can refuse this, and which layer refuses is the answer
-    /// worth having rather than a panic.
-    /// The same tree with one artifact at a different path and the same
-    /// identity, which is what a move leaves behind.
-    ///
-    /// Built by naming the artifacts rather than by assembling the delta the
-    /// assertion is about, so the correction under test is derived from two
-    /// states rather than read back from an answer the fixture supplied.
+    /// Preserve each artifact identity while moving one path in the desired tree.
     fn moved_workspace_tree(
         tree: &kin_model::ResolvedTree,
         from: &RepoPath,
@@ -9188,224 +9172,236 @@ mod tests {
         .expect("moving one artifact keeps every identity and every path unique")
     }
 
-    fn admit_pending_working_tree_move(
-        state: &Arc<DaemonState>,
-        from: &str,
-        to: &str,
-    ) -> crate::error::Result<()> {
-        let from_path = RepoPath::from_utf8(from).unwrap();
-        let to_path = RepoPath::from_utf8(to).unwrap();
-        let working = state.layout.working_dir();
-        if let Some(parent) = working.join(to).parent() {
-            std::fs::create_dir_all(parent).unwrap();
+    fn move_incoming_edge(caller: &Entity, moved: &Entity) -> Relation {
+        Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::relation::RelationKind::Calls,
+            src: GraphNodeId::Entity(caller.id),
+            dst: GraphNodeId::Entity(moved.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Manual,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
         }
-        std::fs::rename(working.join(from), working.join(to)).unwrap();
-        let artifact = state
-            .graph
-            .resolved_tree()
-            .artifact_at_path(&from_path)
-            .cloned()
-            .expect("a move takes an already admitted artifact");
-        state.graph.apply_transaction_delta(&TransactionDelta {
-            tree_deltas: vec![TreeDelta::Updated {
-                artifact_id: artifact.artifact_id,
-                old: artifact.located_entry(),
-                new: LocatedEntry::new(to_path, artifact.entry),
-            }],
-            ..TransactionDelta::default()
-        })?;
-        try_publish_pending_workspace_tree(state)
     }
 
-    /// `TreeDelta::Updated` can carry a path change, and ambient admission
-    /// cannot publish the transition either way.
-    ///
-    /// An earlier comment in this module asserted the opposite, that a moved
-    /// path must arrive as a `Removed` beside an `Added` because `TreeDelta` has
-    /// no move variant. The variant count does not settle it: `Updated` carries
-    /// an old and a new state and nothing requires their paths to match, so the
-    /// carry code cannot assume it will see a pair, and this holds that where it
-    /// can see it.
-    ///
-    /// What follows from either shape is the same, and is the second half: the
-    /// old path ends with no artifact while its entities still stand there,
-    /// which is the transition repository authority refuses, in the same words
-    /// it refuses a pending deletion.
-    /// The scope of the first half is exactly the correction, and not the
-    /// scanner that feeds it. `exact_tree_correction` is handed two tree states
-    /// in which one artifact keeps its identity at a different path, and it
-    /// answers with a single `Updated` carrying both paths, which is what says
-    /// `TreeDelta::Updated` does not require its old and new paths to match.
-    /// Whether any particular scanner produces that input is a separate
-    /// question with a separate answer: a scanner that mints fresh identity for
-    /// the new path yields a `Removed` beside an `Added` instead. Both shapes
-    /// leave the old path with no artifact and its entities still standing,
-    /// which is the state the refusal below is about, so the second half holds
-    /// either way.
-    #[test]
-    fn a_relocated_artifact_corrects_to_one_updated_delta_ambient_admission_refuses() {
+    fn assert_carried_move_identity(
+        state: &DaemonState,
+        original: &Entity,
+        artifact: kin_model::ArtifactId,
+        incoming: &Relation,
+    ) {
+        let moved = state
+            .graph
+            .get_entity(&original.id)
+            .unwrap()
+            .expect("a carried move must preserve entity identity");
+        assert_eq!(moved.file_origin, Some(FilePathId::new("src/new.rs")));
+        assert_eq!(
+            moved.span.as_ref().unwrap().file,
+            FilePathId::new("src/new.rs")
+        );
+        assert_eq!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&RepoPath::from_utf8("src/new.rs").unwrap())
+                .unwrap()
+                .artifact_id,
+            artifact
+        );
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&RepoPath::from_utf8("src/old.rs").unwrap())
+            .is_none());
+        assert_eq!(
+            state
+                .graph
+                .get_all_relations_for_node(&incoming.dst)
+                .unwrap()
+                .iter()
+                .find(|edge| edge.id == incoming.id),
+            Some(incoming)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn session_move_keeps_identity_and_incoming_edges_through_mcp_commit_and_reopen() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
         let (_dir, state) = test_state();
-        install_exact_source(
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (caller, _) = install_exact_source(
             &state,
             "src/lib.rs",
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
-        install_exact_source(
-            &state,
-            "src/old.rs",
-            b"pub fn moved() -> u8 { 1 }\n",
-            "moved",
-        );
-        let before = load_native_commit_base(&state.layout).unwrap();
-
-        // The tree transition a move actually produces, from the product's own
-        // correction rather than from a delta assembled to look like one.
-        let from_path = RepoPath::from_utf8("src/old.rs").unwrap();
-        let to_path = RepoPath::from_utf8("src/new.rs").unwrap();
-        let artifact = before
-            .tree
-            .artifact_at_path(&from_path)
-            .cloned()
-            .expect("the fixture installed this path");
-        let moved_tree = moved_workspace_tree(&before.tree, &from_path, &to_path);
-        let deltas = kin_core::exact_tree_correction(&before.tree, &moved_tree).unwrap();
-        assert_eq!(
-            deltas.len(),
-            1,
-            "an artifact that keeps its identity at a new path corrects to one delta: {deltas:#?}"
-        );
-        assert!(
-            matches!(
-                &deltas[0],
-                TreeDelta::Updated { artifact_id, old, new }
-                    if *artifact_id == artifact.artifact_id
-                        && old.path == from_path
-                        && new.path == to_path
-            ),
-            "and that delta is an Updated whose paths differ, so a path change is not necessarily \
-             a Removed beside an Added: {:#?}",
-            deltas[0]
-        );
-
-        let refusal = admit_pending_working_tree_move(&state, "src/old.rs", "src/new.rs")
-            .expect_err("authority must refuse a move whose old path's semantics still stand");
-        let message = refusal.to_string();
-        assert!(
-            message.contains("src/old.rs"),
-            "the refusal must name the path being vacated: {message}"
-        );
-        assert!(
-            message.contains("carry its exact entity removal or relocation in the same delta"),
-            "the refusal must say what a caller has to carry instead: {message}"
-        );
-        assert_eq!(
-            load_native_commit_base(&state.layout).unwrap().roots,
-            before.roots,
-            "no repository authority may move behind a refused admission"
-        );
-    }
-
-    /// The seam that CAN admit a move retires the moved path's identity before
-    /// any MCP commit could see it.
-    ///
-    /// This is the half the ambient refusal above does not settle. Session
-    /// admission carries the retirement the refusal demands, and it derives that
-    /// retirement from the vacated set rather than from a relocation: an entity
-    /// on the old path is removed outright, and so is every relation incident to
-    /// it. So a carried move reaches the MCP commit planner with the file at its
-    /// new path and no entities anywhere, which is why the derivation in this
-    /// module can make that file answerable again but cannot give it back the
-    /// identity it had. The loss happens here, in the admission, not in the
-    /// carry.
-    ///
-    /// Driven through the product's own `VacatedPaths::from_deltas` and
-    /// `retire_semantics_on_vacated`, which is what `plan_session_workspace_
-    /// admission` calls, rather than through a hand-built delta.
-    ///
-    /// **Every assertion here describes retirement, and retirement is not the
-    /// behaviour a preserved move identity would have.** The whole set inverts
-    /// under a relocating admission: the moved entity becomes an
-    /// `EntityDelta::Modified` carrying its original id at the new path, its
-    /// incident relations survive with both endpoints intact, and the assertion
-    /// that nothing relocates it becomes the failing one. Replace them together
-    /// when that is what the admission does. This test is a record of a
-    /// mechanism, not an argument that the mechanism is right.
-    #[test]
-    fn session_admission_retires_a_moved_path_identity_and_its_incoming_edges() {
-        let (_dir, state) = test_state();
-        let (caller, _) = install_exact_source(
-            &state,
-            "src/caller.rs",
-            b"pub fn caller() -> u8 { 1 }\n",
-            "caller",
-        );
         let (moved, _) = install_exact_source(
             &state,
             "src/old.rs",
-            b"pub fn moved() -> u8 { 1 }\n",
+            b"pub fn moved() -> u8 { 7 }\n",
             "moved",
         );
-        // An incoming edge, so the retirement's reach is asserted rather than
-        // assumed.
+        let artifact = state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&RepoPath::from_utf8("src/old.rs").unwrap())
+            .unwrap()
+            .artifact_id;
+        let incoming = move_incoming_edge(&caller, &moved);
         state
             .graph
             .apply_transaction_delta(&TransactionDelta {
                 relation_deltas: vec![RelationDelta::Added {
-                    new: Relation {
-                        id: kin_model::RelationId::new(),
-                        kind: kin_model::relation::RelationKind::Calls,
-                        src: GraphNodeId::Entity(caller.id),
-                        dst: GraphNodeId::Entity(moved.id),
-                        confidence: 1.0,
-                        origin: RelationOrigin::Manual,
-                        created_in: None,
-                        import_source: None,
-                        evidence: Vec::new(),
-                    },
+                    new: incoming.clone(),
                 }],
                 ..TransactionDelta::default()
             })
             .unwrap();
-        commit_live_graph(&state, "install the incoming edge", false);
+        commit_live_graph(&state, "publish incoming edge before move", true);
+        let layout = state.layout.clone();
+        let session = layout.runs_dir().join("session-mcp-carried-move");
+        let app = crate::api::router(Arc::clone(&state));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/session-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"session_dir": session}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        std::fs::rename(session.join("src/old.rs"), session.join("src/new.rs")).unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"session_dir": session, "confirm_mass_deletion": false})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        assert_carried_move_identity(&state, &moved, artifact, &incoming);
+        drop(app);
+        drop(state);
 
+        let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        assert_carried_move_identity(&state, &moved, artifact, &incoming);
+        crate::loop_runner::drain_semantic_debt(&state)
+            .await
+            .unwrap();
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(&sessions, &caller, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        let reply = commit_reply(&result);
+        assert_eq!(
+            reply["carried_pending_files"],
+            serde_json::json!(["src/new.rs"])
+        );
+        assert_carried_move_identity(&state, &moved, artifact, &incoming);
+        assert_eq!(semantic_disagreement(&state, "src/new.rs"), None);
+        assert_eq!(semantic_disagreement(&state, "src/lib.rs"), None);
+        drop(state);
+
+        let cold = Arc::new(DaemonState::open(layout).unwrap());
+        assert_carried_move_identity(&cold, &moved, artifact, &incoming);
+        assert_eq!(semantic_disagreement(&cold, "src/new.rs"), None);
+        assert_eq!(semantic_disagreement(&cold, "src/lib.rs"), None);
+    }
+
+    #[test]
+    fn session_move_plans_relocation_without_retiring_identity_or_incoming_edges() {
+        let (_dir, state) = test_state();
+        let (caller, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let (moved, _) = install_exact_source(
+            &state,
+            "src/old.rs",
+            b"pub fn moved() -> u8 { 7 }\n",
+            "moved",
+        );
+        let incoming = move_incoming_edge(&caller, &moved);
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                relation_deltas: vec![RelationDelta::Added {
+                    new: incoming.clone(),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        commit_live_graph(&state, "publish incoming edge before move", false);
         let base = load_native_commit_base(&state.layout).unwrap();
         let from_path = RepoPath::from_utf8("src/old.rs").unwrap();
         let to_path = RepoPath::from_utf8("src/new.rs").unwrap();
+        let artifact = base.tree.artifact_at_path(&from_path).unwrap().artifact_id;
         let moved_tree = moved_workspace_tree(&base.tree, &from_path, &to_path);
         let deltas = kin_core::exact_tree_correction(&base.tree, &moved_tree).unwrap();
-
+        assert_eq!(deltas.len(), 1);
+        assert!(
+            matches!(&deltas[0], TreeDelta::Updated { artifact_id, old, new }
+                if *artifact_id == artifact && old.path == from_path && new.path == to_path)
+        );
         let vacated = crate::repository_commit::VacatedPaths::from_deltas(&deltas);
         assert!(
-            !vacated.is_empty(),
-            "a move's old path is vacated, because the kept set is built from new paths only"
+            vacated.is_empty(),
+            "a surviving artifact must not be retired"
         );
-
         let retirement = crate::repository_commit::retire_semantics_on_vacated(
             &base.graph.to_snapshot(),
             &vacated,
         )
         .unwrap();
-        assert!(
-            retirement.entity_deltas().iter().any(|delta| matches!(
-                delta,
-                EntityDelta::Removed { old } if old.id == moved.id
-            )),
-            "session admission removes the moved entity outright rather than relocating it: {:#?}",
-            retirement.entity_deltas()
-        );
-        assert!(
-            !retirement.relation_deltas().is_empty(),
-            "and takes every edge incident to it with it: {:#?}",
-            retirement.relation_deltas()
-        );
-        assert!(
-            retirement.entity_deltas().iter().all(|delta| !matches!(
-                delta,
-                EntityDelta::Modified { new, .. } if new.id == moved.id
-            )),
-            "nothing here relocates the entity, which is why the identity is gone by the time a \
-             carried move reaches an MCP commit"
-        );
+        assert!(retirement.entity_deltas().is_empty());
+        assert!(retirement.relation_deltas().is_empty());
+        let relocations = crate::repository_commit::plan_session_entity_relocations(
+            state.graph.as_ref(),
+            &FilePathId::new("src/old.rs"),
+            &FilePathId::new("src/new.rs"),
+        )
+        .unwrap();
+        assert!(relocations.iter().any(|delta| matches!(delta,
+                EntityDelta::Modified { old, new }
+                    if old.id == moved.id && new.id == moved.id
+                        && new.file_origin == Some(FilePathId::new("src/new.rs")))));
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: deltas,
+                entity_deltas: relocations,
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        assert_carried_move_identity(&state, &moved, artifact, &incoming);
     }
 }

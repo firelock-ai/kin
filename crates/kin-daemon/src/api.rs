@@ -6314,6 +6314,7 @@ async fn reconcile_session_workspace(
         )
         .map_err(repository_commit_error)?;
         let vacated = plan.vacated.clone();
+        let module_relocations = plan.module_relocations.clone();
         let committed = crate::repository_commit::commit_session_workspace_admission(
             &state.layout,
             state.blobs.as_ref(),
@@ -6353,12 +6354,28 @@ async fn reconcile_session_workspace(
             // here was refused after authority had already moved, leaving the
             // two graphs holding different trees. Targeted reads rather than a
             // snapshot of the whole store, which this path cannot afford.
-            let (retired_entity_deltas, retired_relation_deltas) =
+            let (mut retired_entity_deltas, retired_relation_deltas) =
                 crate::repository_commit::retire_live_semantics_on_vacated(
                     state.graph.as_ref(),
                     &vacated,
                 )
                 .map_err(repository_commit_error)?;
+            let moves = crate::repository_commit::session_artifact_moves(observation.deltas());
+            for (from, to) in &moves {
+                retired_entity_deltas.extend(
+                    crate::repository_commit::plan_session_entity_relocations(
+                        state.graph.as_ref(),
+                        from,
+                        to,
+                    )
+                    .map_err(repository_commit_error)?,
+                );
+            }
+            crate::repository_commit::bind_session_module_relocations(
+                &mut retired_entity_deltas,
+                &module_relocations,
+            )
+            .map_err(repository_commit_error)?;
             state
                 .graph
                 .apply_transaction_delta(&TransactionDelta {
@@ -6368,6 +6385,24 @@ async fn reconcile_session_workspace(
                     ..TransactionDelta::default()
                 })
                 .map_err(internal_error)?;
+            // Destination facets are re-derived below from exact admitted
+            // bytes. Clear only departed keys; a swap's keys still belong to
+            // surviving artifacts and must not erase each other's records.
+            for (from, _) in &moves {
+                let old_path = RepoPath::from_utf8(from.0.clone()).map_err(internal_error)?;
+                if observation
+                    .desired_tree()
+                    .artifact_at_path(&old_path)
+                    .is_none()
+                {
+                    crate::loop_runner::clear_incompatible_facets_in(
+                        state.graph.as_ref(),
+                        from,
+                        crate::loop_runner::EnrichmentFacet::None,
+                    )
+                    .map_err(internal_error)?;
+                }
+            }
             for delta in &retired_entity_deltas {
                 let kin_model::EntityDelta::Removed { old } = delta else {
                     continue;
@@ -19282,6 +19317,8 @@ fn bind_std_listener(
 
 #[cfg(test)]
 mod tests {
+    mod session_identity;
+    mod session_move_identity;
     /// THE WIRING SPINE (FIR-2524, captain's rider). The envelope the impact
     /// route hands the CLI must carry the daemon's degraded signals.
     ///

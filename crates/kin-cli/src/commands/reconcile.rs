@@ -16,9 +16,9 @@ use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use kin_model::{ArtifactId, Hash256, RepoPath, ResolvedTree, TreeDelta};
 #[cfg(any(unix, test))]
-use kin_model::{ResolvedArtifact, TreeEntry};
+use kin_model::TreeEntry;
+use kin_model::{ArtifactId, Hash256, RepoPath, ResolvedTree, TreeDelta};
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
@@ -465,18 +465,18 @@ fn build_desired_tree(base: &SessionWorkspaceBase, scan: &SessionScan) -> Result
         .copied()
         .collect::<BTreeSet<_>>();
     let scoped = base.scope.is_some();
-    let mut by_path = base
+    let mut observed = base
         .source_workspace
         .tree
         .artifacts_by_path()
         .filter(|artifact| !materialized.contains(&artifact.artifact_id))
-        .map(|artifact| (artifact.path.clone(), artifact.clone()))
+        .map(|artifact| (artifact.path.clone(), artifact.entry))
         .collect::<BTreeMap<_, _>>();
 
-    for (path, observed) in &scan.entries {
+    for (path, entry) in &scan.entries {
         let existing = base.source_workspace.tree.artifact_at_path(path);
-        let artifact_id = match existing {
-            Some(existing) if materialized.contains(&existing.artifact_id) => existing.artifact_id,
+        match existing {
+            Some(existing) if materialized.contains(&existing.artifact_id) => {}
             Some(existing) => {
                 bail!(
                     "session observation attempted to mutate unmaterialized artifact {} ({})",
@@ -487,15 +487,23 @@ fn build_desired_tree(base: &SessionWorkspaceBase, scan: &SessionScan) -> Result
             None if scoped => {
                 bail!("scoped session cannot add artifact {path} outside its retained capability")
             }
-            None => deterministic_added_artifact_id(base.reconcile_operation_id, path),
-        };
-        by_path.insert(
-            path.clone(),
-            ResolvedArtifact::new(artifact_id, path.clone(), observed.entry),
-        );
+            None => {}
+        }
+        observed.insert(path.clone(), entry.entry);
     }
 
-    ResolvedTree::from_artifacts(by_path.into_values())
+    let mut deltas = kin_core::plan_observed_tree_deltas(&base.source_workspace.tree, observed)?;
+    // The shared planner retains unique moves and refuses ambiguous identity.
+    // New members additionally need session-stable identity so observing the
+    // same retained directory twice reconstructs the same transaction.
+    for delta in &mut deltas {
+        if let TreeDelta::Added { artifact_id, new } = delta {
+            *artifact_id = deterministic_added_artifact_id(base.reconcile_operation_id, &new.path);
+        }
+    }
+    base.source_workspace
+        .tree
+        .apply(&deltas)
         .map_err(|error| anyhow!("build complete desired session tree: {error}"))
 }
 
@@ -1068,6 +1076,7 @@ fn require_directory_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::ResolvedArtifact;
 
     #[test]
     fn byte_safe_paths_never_require_lossy_utf8() {
