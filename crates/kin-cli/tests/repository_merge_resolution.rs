@@ -2422,3 +2422,115 @@ fn authored_merge_accepts_in_place_input_and_preserves_unrelated_or_later_edits(
         b"keep this\n"
     );
 }
+
+/// FIR-3242. The census a merge records has to be a reading of the graph the
+/// merge left live.
+///
+/// `settle_merged_graph` ran from inside the publication path, and the
+/// publication path returns to `execute`, which is where
+/// `finalize_local_repository_commit` derives and applies the merged live
+/// entity and relation correction. The `create_change` calls above the settle
+/// install immutable history and revision lineage, not the merged entity and
+/// relation table, so the record carried this merge's timestamp and source over
+/// a reading of the PREVIOUS live relation set. Every later comparison is
+/// judged against that baseline, so a kind this merge introduced can disappear
+/// without the store ever having recorded that it existed.
+///
+/// Read off disk, with enrichment off, and needing no barrier: the merged tree
+/// holds a source file the target branch never had, so the merged graph holds
+/// strictly more entities than the graph before it, and a record written after
+/// finalization has to show that. A record written before finalization holds
+/// the pre-merge count instead, and nothing between the merge and this reading
+/// can move either side.
+#[test]
+fn a_published_merge_records_the_census_of_the_graph_it_finalized() {
+    let root = tempdir().expect("temp root");
+    let repo = disjoint_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
+        "kin init",
+    );
+    let layout = kin_core::KinLayout::discover(&repo).expect("discover exact layout");
+    assert!(
+        kin_core::relation_census::read(&layout)
+            .recorded()
+            .is_none(),
+        "the recorder runs at the end of a sweep and at the end of a commit, and this init is \
+         neither, so the record read below is the one this merge wrote and nothing else"
+    );
+
+    let merged = ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+    assert!(
+        merged.contains("Merged refs/heads/feature into refs/heads/main"),
+        "the fixture has to publish rather than park, or nothing below is about a merge: {merged}"
+    );
+
+    let recorded = kin_core::relation_census::read(&layout)
+        .recorded()
+        .cloned()
+        .expect("a published merge records the baseline the next comparison is judged against");
+    let published = graph_at(&layout, &branch_change(&layout, "main"));
+    let published_entities = published
+        .entities
+        .values()
+        .filter(|entity| !kin_index::is_external_reference_target(entity))
+        .count() as u64;
+
+    assert_eq!(
+        recorded.entities,
+        Some(published_entities),
+        "the record has to describe the graph this merge published, and this one describes the \
+         graph before the merged live delta was applied: the merged tree holds {published_entities} \
+         entities and the record claims {:?}",
+        recorded.entities
+    );
+}
+
+/// FIR-3242. A parked merge settles nothing, because it published no merged
+/// graph.
+///
+/// A merge that parks its conflicts still writes a merge transaction record and
+/// finalizes like any other repository transition, so it reaches the same
+/// executor the settle now runs in. It composed no merged entity and relation
+/// table: a census recorded there would describe the unmerged graph under this
+/// merge's timestamp and source, and retiring every file's enrichment evidence
+/// would buy a full re-derivation for a merge that published nothing.
+///
+/// Green before the settle moved, because `open_conflicted_merge` reaches a
+/// `bail!` rather than the publication path the settle used to live in. This is
+/// the lock that keeps it green.
+#[test]
+fn a_parked_merge_records_no_census_because_it_published_no_merged_graph() {
+    let root = tempdir().expect("temp root");
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
+        "kin init",
+    );
+    let layout = kin_core::KinLayout::discover(&repo).expect("discover exact layout");
+    assert!(
+        kin_core::relation_census::read(&layout)
+            .recorded()
+            .is_none(),
+        "the recorder runs at the end of a sweep and at the end of a commit, and this init is \
+         neither, so anything read below was written by the merge"
+    );
+
+    parked_merge(
+        &run_kin_without_enrichment(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+
+    assert!(
+        kin_core::relation_census::read(&layout)
+            .recorded()
+            .is_none(),
+        "a parked merge composed no merged relation set, so it has none to record; a record \
+         written here would describe the graph before the merge and carry this merge's timestamp"
+    );
+}
