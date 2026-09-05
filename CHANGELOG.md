@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-05
+
+### Changed
+
+- Settle a merged graph after finalization applies its live delta (#1528)
+- Use shared history snapshots for repository operations (#1526)
+- Keep a merge's convergence demand and its evidence across an in-flight sweep (#1530)
+- Preserve prepared binding preflight through storage decorators (#1531)
+
+
 ## [0.7.1] - 2026-09-05
 
 ### Changed
