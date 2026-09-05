@@ -9217,29 +9217,33 @@ mod tests {
         try_publish_pending_workspace_tree(state)
     }
 
-    /// A move is one `Updated` delta whose paths differ, not a removal beside an
-    /// addition, and ambient admission cannot publish one either.
+    /// `TreeDelta::Updated` can carry a path change, and ambient admission
+    /// cannot publish the transition either way.
     ///
-    /// An earlier comment in this module claimed a move must be a `Removed` and
-    /// an `Added` pair because `TreeDelta` has no move variant. That was wrong:
-    /// `TreeDelta::Updated` carries an old and a new state and nothing requires
-    /// their paths to match, and `commit_deltas.rs` already asserts a real move
-    /// through admission produces exactly one such delta with the artifact
-    /// identity unchanged. This holds that fact where the carry code can see it,
-    /// and then shows the consequence: the old path is vacated with its entities
-    /// still standing, which is the transition repository authority refuses,
-    /// exactly as it refuses a pending deletion.
-    /// One half of this is durable and one half is not, and the difference
-    /// matters for FIR-3278. That a move is a single `Updated` delta keeping its
-    /// artifact identity is a fact about the model and stays true. That the old
-    /// path is left with its entities standing, which is what forces the refusal
-    /// below, is the state FIR-3278 removes by relocating those entities instead
-    /// of retiring them. The refusal itself should survive that repair, because
-    /// `publish_workspace_tree` always sends an empty semantic delta and so can
-    /// never carry a relocation either; if FIR-3278 makes this arm fail, the
-    /// refusal moved and this test is the place to record where.
+    /// An earlier comment in this module asserted the opposite, that a moved
+    /// path must arrive as a `Removed` beside an `Added` because `TreeDelta` has
+    /// no move variant. The variant count does not settle it: `Updated` carries
+    /// an old and a new state and nothing requires their paths to match, so the
+    /// carry code cannot assume it will see a pair, and this holds that where it
+    /// can see it.
+    ///
+    /// What follows from either shape is the same, and is the second half: the
+    /// old path ends with no artifact while its entities still stand there,
+    /// which is the transition repository authority refuses, in the same words
+    /// it refuses a pending deletion.
+    /// The scope of the first half is exactly the correction, and not the
+    /// scanner that feeds it. `exact_tree_correction` is handed two tree states
+    /// in which one artifact keeps its identity at a different path, and it
+    /// answers with a single `Updated` carrying both paths, which is what says
+    /// `TreeDelta::Updated` does not require its old and new paths to match.
+    /// Whether any particular scanner produces that input is a separate
+    /// question with a separate answer: a scanner that mints fresh identity for
+    /// the new path yields a `Removed` beside an `Added` instead. Both shapes
+    /// leave the old path with no artifact and its entities still standing,
+    /// which is the state the refusal below is about, so the second half holds
+    /// either way.
     #[test]
-    fn a_pending_move_is_one_updated_delta_and_ambient_admission_refuses_it() {
+    fn a_relocated_artifact_corrects_to_one_updated_delta_ambient_admission_refuses() {
         let (_dir, state) = test_state();
         install_exact_source(
             &state,
@@ -9266,7 +9270,11 @@ mod tests {
             .expect("the fixture installed this path");
         let moved_tree = moved_workspace_tree(&before.tree, &from_path, &to_path);
         let deltas = kin_core::exact_tree_correction(&before.tree, &moved_tree).unwrap();
-        assert_eq!(deltas.len(), 1, "a move is one delta: {deltas:#?}");
+        assert_eq!(
+            deltas.len(),
+            1,
+            "an artifact that keeps its identity at a new path corrects to one delta: {deltas:#?}"
+        );
         assert!(
             matches!(
                 &deltas[0],
@@ -9275,7 +9283,8 @@ mod tests {
                         && old.path == from_path
                         && new.path == to_path
             ),
-            "a move is an Updated whose paths differ, with the artifact identity kept: {:#?}",
+            "and that delta is an Updated whose paths differ, so a path change is not necessarily \
+             a Removed beside an Added: {:#?}",
             deltas[0]
         );
 
@@ -9314,15 +9323,14 @@ mod tests {
     /// `retire_semantics_on_vacated`, which is what `plan_session_workspace_
     /// admission` calls, rather than through a hand-built delta.
     ///
-    /// **This test asserts the CURRENT behaviour, and that behaviour is the
-    /// defect (FIR-3278).** It is here so the mechanism is pinned with output
-    /// rather than argued in prose, and so the repair has evidence to work
-    /// against. When FIR-3278 lands, every assertion below inverts: the moved
-    /// entity is expected as `EntityDelta::Modified` carrying its original id at
-    /// the new path, its incident relations are expected to survive with both
-    /// endpoints intact, and the "nothing relocates it" assertion is expected to
-    /// be the one that fails. Replace them then. Do not read this test's green
-    /// as a reason to leave the retirement alone.
+    /// **Every assertion here describes retirement, and retirement is not the
+    /// behaviour a preserved move identity would have.** The whole set inverts
+    /// under a relocating admission: the moved entity becomes an
+    /// `EntityDelta::Modified` carrying its original id at the new path, its
+    /// incident relations survive with both endpoints intact, and the assertion
+    /// that nothing relocates it becomes the failing one. Replace them together
+    /// when that is what the admission does. This test is a record of a
+    /// mechanism, not an argument that the mechanism is right.
     #[test]
     fn session_admission_retires_a_moved_path_identity_and_its_incoming_edges() {
         let (_dir, state) = test_state();
