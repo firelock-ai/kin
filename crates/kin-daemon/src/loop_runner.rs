@@ -488,40 +488,27 @@ pub(crate) fn publish_exact_workspace_tree(
     // tracked-file edit (FIR-3203); reusing it costs nothing.
     let authority = crate::api::held_write_authority(state)
         .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
-    let published = crate::repository_commit::publish_workspace_tree_through(
-        state.blobs.as_ref(),
-        authority_context.repository_id().clone(),
-        authority_context.workspace_id(),
-        &authority,
-        admitted,
-        kin_model::OperationId::new(),
-        // The daemon's own loop is the actor here, and naming it is a statement
-        // rather than a stand-in: nobody typed a command, this publishes no
-        // history node and advances no ref, and the workspace transition it
-        // records was observed by the watcher. A person's identity would be the
-        // fabrication on this path, not the honest answer. Every path that mints
-        // a change a person authored takes that person's resolved identity from
-        // the caller instead.
-        kin_model::AuthorId::new(DAEMON_ADMISSION_ACTOR),
-    );
-    let admission = match published {
-        Ok(Some(published)) => published,
-        Ok(None) => return Ok(None),
-        Err(error) => {
-            // A refused publication says nothing certain about the held
-            // manager, and one refused because another writer moved authority
-            // says the manager is behind it. Either way the next publication
-            // starts from a fresh open of what storage holds now.
-            state.projection_authority.forget_writer();
-            return Err(error);
-        }
+    // Everything that runs while the tick's manager is alive, in one place, so
+    // that whichever path it returns by (published, nothing to publish, refused,
+    // or a label that could not be read) the manager is dropped and the slot
+    // forgotten exactly once below. An audit of the first shape of this found
+    // the no-op return and two `?` returns leaving the manager resident with no
+    // finalization armed to forget it, which is the held design's floor arriving
+    // through the back door.
+    let outcome = publish_through_held_authority(state, &authority_context, &authority, admitted);
+    // The admission pair keeps its relabelled values; the manager itself goes
+    // now, unconditionally. Measured on a converted psf/requests: a manager alive
+    // across the boundary between this publication and the persist flush that
+    // follows it holds the decoded successor while the flush's enrichment
+    // publish and read-index finalization allocate on top, and the edit-window
+    // peak landed 2 to 4 GiB above the pre-fix peak. Dropped here, the flush
+    // opens its own manager and frees it, exactly the pre-fix profile, with one
+    // open fewer per edit and the plan-time values shared.
+    drop(authority);
+    state.projection_authority.forget_writer();
+    let Some(admission) = outcome? else {
+        return Ok(None);
     };
-    // The label is read the instant after the commit; see
-    // `publication_identity_after_commit` for the window and its backstop.
-    let published = crate::api::publication_identity_after_commit(state)
-        .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
-    crate::api::install_write_authority(state, &authority, published)
-        .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
     // What this cost is what the reconcile tick is deciding whether to spend, so
     // it is measured here rather than modelled from the store's size.
     state.record_authority_publication(started.elapsed());
@@ -534,6 +521,48 @@ pub(crate) fn publish_exact_workspace_tree(
         "admitted exact workspace tree into repository authority"
     );
     Ok(Some(admission.receipt.generation))
+}
+
+/// The part of [`publish_exact_workspace_tree`] that runs while the tick's
+/// held manager is alive: publish through it, then read the label the
+/// publication produced and relabel the admission pair with it.
+///
+/// A refused publication says nothing certain about the held manager, and one
+/// refused because another writer moved authority says the manager is behind
+/// it; the caller forgets the manager on every return of this function, so no
+/// branch here has to.
+fn publish_through_held_authority(
+    state: &DaemonState,
+    authority_context: &crate::local_repository_authority::LocalRepositoryAuthorityContext,
+    authority: &Arc<kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>>,
+    admitted: &crate::repository_commit::AdmittedWorkspaceTree,
+) -> Result<Option<crate::repository_commit::WorkspaceAdmissionResult>> {
+    let Some(admission) = crate::repository_commit::publish_workspace_tree_through(
+        state.blobs.as_ref(),
+        authority_context.repository_id().clone(),
+        authority_context.workspace_id(),
+        authority,
+        admitted,
+        kin_model::OperationId::new(),
+        // The daemon's own loop is the actor here, and naming it is a statement
+        // rather than a stand-in: nobody typed a command, this publishes no
+        // history node and advances no ref, and the workspace transition it
+        // records was observed by the watcher. A person's identity would be the
+        // fabrication on this path, not the honest answer. Every path that mints
+        // a change a person authored takes that person's resolved identity from
+        // the caller instead.
+        kin_model::AuthorId::new(DAEMON_ADMISSION_ACTOR),
+    )?
+    else {
+        return Ok(None);
+    };
+    // The label is read the instant after the commit; see
+    // `publication_identity_after_commit` for the window and its backstop.
+    let published = crate::api::publication_identity_after_commit(state)
+        .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
+    crate::api::install_write_authority(state, authority, published)
+        .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
+    Ok(Some(admission))
 }
 
 fn invalid_tree_transition(error: impl std::fmt::Display) -> DaemonError {

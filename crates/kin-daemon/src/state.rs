@@ -10659,15 +10659,15 @@ impl DaemonState {
                     )))
                 })?;
             drop(lease);
-            // This is the last reader of the generation the held writer
-            // published: the admission pair, the publication and the enrichment
-            // publish came before it on the same held manager. Forgetting it
-            // here bounds the manager's life to one publication, so its decoded
-            // change map (about 2.7 GiB on a converted psf/requests) does not
-            // stay resident between edits. Measured on that store, a manager
-            // held across edits kept the transient peaks about a gigabyte above
-            // the pre-fix peaks at a 12 GiB ceiling; one open per edit, against
-            // two or three before, is the bound this ships with.
+            // This is the last reader in the persist flush's scope: the
+            // enrichment publish installed the held manager, this reuses it,
+            // and forgetting it here ends the scope, so its decoded change map
+            // (about 2.7 GiB on a converted psf/requests) is not resident past
+            // the flush. The reconcile tick has its own scope and drops its
+            // manager the moment the publication returns; measured on that
+            // store, a manager alive across the two scopes stacked the flush's
+            // allocations on the decoded successor and put the edit-window peak
+            // 2 to 4 GiB above the pre-fix peak.
             self.projection_authority.forget_writer();
             Arc::new(kin_db::InMemoryGraph::from_snapshot(snapshot).map_err(DaemonError::from)?)
         };

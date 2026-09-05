@@ -239,13 +239,14 @@ pub(crate) struct ProjectionAuthorityCache {
     /// The refs routes' envelope, keyed on the same publication identity as
     /// every slot above it.
     ref_metadata: std::sync::Mutex<Option<HeldRefMetadata>>,
-    /// The manager this daemon publishes through, held for the life of one
-    /// publication; see [`HeldWriteAuthority`]. The admission pair's open
-    /// installs it, the publication and the enrichment publish go through it,
-    /// and the read-index finalization forgets it, so one edit costs one
-    /// whole-store open rather than the two or three it cost before and nothing
-    /// decoded stays resident between edits. The admission slot above is derived
-    /// from it and relabelled with it.
+    /// The manager this daemon publishes through, held for one scope at a time;
+    /// see [`HeldWriteAuthority`]. On the reconcile tick the admission pair's
+    /// open installs it, the publication goes through it, and the publication
+    /// drops it. On the persist flush the enrichment publish installs it, the
+    /// read-index finalization reuses it and forgets it. Two whole-store opens
+    /// per edit rather than the three or four it cost before, and no manager
+    /// alive across the boundary between the two scopes. The admission slot
+    /// above is derived from it and relabelled with it.
     writer: std::sync::Mutex<Option<HeldWriteAuthority>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
@@ -296,7 +297,7 @@ struct HeldRefMetadata {
     metadata: Arc<kin_db::PersistedRepositoryAuthority>,
 }
 
-/// The authority this daemon publishes through, held for one publication.
+/// The authority this daemon publishes through, held for one scope.
 ///
 /// A publication used to open the persisted authority, commit through it and
 /// drop it, and the open is O(store): kin-db decodes the change map (93.8 percent
@@ -306,10 +307,13 @@ struct HeldRefMetadata {
 /// every change. One tracked-file edit cost the stranger's daemon 3.6 GiB of
 /// resident set that way before any commit ran (FIR-3203).
 ///
-/// After its own commit the manager's in-memory state IS the durable successor,
-/// so every later reader of that publication can go through it with no open at
-/// all: the enrichment publish and then the read-index finalization, which is
-/// the last of them and forgets the slot.
+/// After its own commit the manager's in-memory state IS the durable successor.
+/// Readers inside the same scope go through it with no open at all; the scope
+/// ends with the publication on the tick, and with the read-index finalization
+/// on the persist flush, and each end forgets the slot. Holding it across the
+/// two was measured on a converted psf/requests: the flush's allocations
+/// stacked on the decoded successor and the edit-window peak rose 2 to 4 GiB
+/// above the pre-fix peak.
 ///
 /// The label says which publication this manager is at. It is read the instant
 /// after a plain commit, under no lock at all, so a foreign publication landing
@@ -43861,10 +43865,15 @@ mod tests {
     /// change map and, with no durable validation proof for the generation the
     /// last publication just produced, replays the whole history and clones
     /// every change: that is the 3.6 GiB the stranger's daemon grew from one
-    /// edit before any commit ran. The daemon now opens once per edit: the
-    /// admission pair's open is held, the publication and the finalization
-    /// read through it, and the finalization forgets it, so nothing decoded
-    /// stays resident between edits.
+    /// edit before any commit ran. The tick now opens once: the admission
+    /// pair's open is held for the publication and dropped the moment the
+    /// publication returns, so nothing decoded is alive when the persist flush
+    /// that follows does its own work. The flush opens once for its own scope
+    /// (the enrichment publish installs, the read-index finalization reuses and
+    /// forgets). Two opens per edit against three or four before, and no
+    /// manager alive across the boundary between them, which is where a held
+    /// manager stacked the flush's allocations on the decoded successor and put
+    /// the edit-window peak 2 to 4 GiB above the pre-fix peak on psf/requests.
     ///
     /// Counted at kin-core's own funnel, which every route into kin-db's
     /// recovery passes through, so an open reintroduced through a different
@@ -43875,7 +43884,7 @@ mod tests {
     /// `.gitignore` rule source so the admission pair does read a blob.
     #[cfg(unix)]
     #[test]
-    fn an_edit_costs_one_open_and_the_finalization_holds_nothing() {
+    fn an_edit_pays_one_open_for_its_pair_and_publish_and_holds_nothing_after() {
         let state = test_state();
         state
             .is_initialized
@@ -43924,8 +43933,8 @@ mod tests {
                 .expect("the finalization reads the committed graph");
             assert_eq!(
                 kin_core::authority_opens() - before,
-                0,
-                "the finalization must read the manager the publication held, not open another"
+                1,
+                "the flush opens once for its own scope, after the publication's manager is gone"
             );
             assert!(
                 !state.projection_authority.holds_writer(),
@@ -43943,8 +43952,8 @@ mod tests {
             "the first publication of a daemon's life pays for an open, or this counter is dead"
         );
         assert!(
-            state.projection_authority.holds_writer(),
-            "the open that served the publication is held until the finalization"
+            !state.projection_authority.holds_writer(),
+            "the publication's manager must not outlive the publication"
         );
         finalize(&state);
 
@@ -43965,6 +43974,41 @@ mod tests {
                 - generation_before,
             4,
             "four edits must be four publications"
+        );
+
+        // A publication with nothing to publish: the desired tree is the tree
+        // authority already holds. It returns `None`, and it must hold nothing
+        // afterwards either; the first shape of this returned early with the
+        // manager still installed and no finalization armed to forget it.
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let (roots, tree) = {
+            let manager = held_write_authority(&state).unwrap();
+            let lease = manager.read_authority();
+            let tree = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == context.workspace_id())
+                .map(|workspace| workspace.tree.clone())
+                .unwrap_or_default();
+            (lease.roots().clone(), tree)
+        };
+        let unchanged = crate::repository_commit::admitted_workspace_tree_for_test(
+            &working,
+            roots,
+            tree.clone(),
+            tree,
+        );
+        assert_eq!(
+            crate::loop_runner::publish_exact_workspace_tree(&state, &unchanged).unwrap(),
+            None,
+            "a desired tree authority already holds publishes nothing"
+        );
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "a publication that moved nothing must not keep its manager either"
         );
     }
 
@@ -43987,7 +44031,9 @@ mod tests {
         let observation =
             std::collections::BTreeSet::from([RepoPath::from_utf8("src/lib.py").unwrap()]);
         assert!(!crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
-        assert!(state.projection_authority.holds_writer());
+        // The publication drops its manager as it returns, so nothing is held
+        // here; the resolver below opens the one this test then holds.
+        assert!(!state.projection_authority.holds_writer());
 
         // A writer beside the daemon publishes a tree the daemon's graph has not
         // seen, through a fresh open of the same store.
@@ -44087,7 +44133,9 @@ mod tests {
         let observation =
             std::collections::BTreeSet::from([RepoPath::from_utf8("src/lib.py").unwrap()]);
         assert!(!crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
-        assert!(state.projection_authority.holds_writer());
+        // The publication drops its manager as it returns, so nothing is held
+        // here; the resolver below opens the one this test then holds.
+        assert!(!state.projection_authority.holds_writer());
 
         let context =
             crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
