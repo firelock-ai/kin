@@ -1165,6 +1165,10 @@ impl SpineBackend for FirestoreSpineBackend {
         })
     }
 
+    fn legacy_migration_complete(&self) -> Result<bool, SpineError> {
+        self.store.legacy_migration_complete()
+    }
+
     fn complete_legacy_migration(
         &self,
         writer_drain: LegacySpineWriterDrainAttestation,
@@ -5585,6 +5589,70 @@ mod tests {
             Some(cursor(3))
         );
         assert!(state.manifests.contains_key(&winner_id));
+    }
+
+    /// The seal is created once per database, and the backend can now be asked
+    /// whether that already happened.
+    ///
+    /// Every daemon image carries its own writer-drain attestation, so a second
+    /// image's seal can never equal the stored one and the store refuses it.
+    /// That refusal stays: an unsealed-versus-sealed race between two writers
+    /// must not let the loser overwrite the winner's evidence. What a caller
+    /// holding a drain proof needs instead is a way to ask whether the database
+    /// is already sealed before it tries, which is what `legacy_migration_complete`
+    /// answers on the backend.
+    ///
+    /// Both halves are here on purpose. The question alone would pass on a
+    /// backend that had quietly stopped refusing anything, and the refusal
+    /// alone would pass on one whose question always answered false, which is
+    /// the state that sent every promoted image into the refusal.
+    #[test]
+    fn a_sealed_database_answers_complete_and_still_refuses_a_second_image_seal() {
+        let store = Arc::new(FakeSpineStore::default());
+        *store.rollout_fence_state.lock().unwrap() =
+            Some((1, test_rollout_fence(1, "legacy-cutover", &["repo"])));
+        let backend = FirestoreSpineBackend::with_store(store.clone());
+        let current = test_entry("repo", "current", EntityKind::Function);
+        publish_success(
+            &backend,
+            metadata_publication("repo", 100, "current-root", vec![current.clone()]),
+        );
+        publish_success(
+            &backend,
+            edge_publication(
+                "repo",
+                100,
+                "current-root",
+                vec![current],
+                Vec::new(),
+                [("repo", "current-root")],
+            ),
+        );
+        assert!(
+            !backend.legacy_migration_complete().unwrap(),
+            "an unsealed database must answer false, or a caller skips the seal it owes"
+        );
+
+        let first_image = test_writer_drain(&store);
+        backend
+            .complete_legacy_migration(first_image.clone())
+            .expect("the first image seals an unsealed database");
+        assert!(
+            backend.legacy_migration_complete().unwrap(),
+            "a sealed database answers true, which is what lets a later image skip the seal"
+        );
+
+        let mut second_image = first_image;
+        second_image.daemon_image_sha256 = format!("sha256:{}", "c".repeat(64));
+        let refusal = backend
+            .complete_legacy_migration(second_image)
+            .expect_err("a second image must never overwrite the seal a first image wrote");
+        assert!(
+            refusal
+                .to_string()
+                .contains("legacy migration seal already exists"),
+            "{refusal}"
+        );
     }
 
     #[test]
