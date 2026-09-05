@@ -187,14 +187,25 @@ pub async fn repo_compare(
         )
     })?;
 
+    // Both sides are required and neither may be blank, checked before anything
+    // is opened. The shared resolver reads a blank reference as no reference
+    // given and answers the repository's default ref, which is correct for a
+    // route that has a default and wrong for one that does not: a blank base
+    // would quietly become the head's own ref, and the answer would be zero
+    // files, zero ahead and zero behind, which is the shape this route exists
+    // not to invent. The refusal travels through this route's own error so it
+    // carries the refusal header like every other.
+    let base = nonblank_ref("base", &query.base)?;
+    let head = nonblank_ref("head", &query.head)?;
+
     // Three views because `resolve_tree_at` consumes one and this needs two
     // trees plus a history walk. On a hosted daemon each is a generation-cache
     // read, which is the path that exists to make repeated reads cheap.
     let walk_view = open_view(&state, &repo_id).await?;
-    let base_change = resolve_read_point(&walk_view, Some(&query.base), &repo_id)
+    let base_change = resolve_read_point(&walk_view, Some(base), &repo_id)
         .map_err(|error| RepoCompareError::from_read_point("base", error))?
         .0;
-    let head_change = resolve_read_point(&walk_view, Some(&query.head), &repo_id)
+    let head_change = resolve_read_point(&walk_view, Some(head), &repo_id)
         .map_err(|error| RepoCompareError::from_read_point("head", error))?
         .0;
 
@@ -223,6 +234,22 @@ pub async fn repo_compare(
         files: changed_files(&base_tree, &head_tree)?,
         conflicts: Vec::new(),
     }))
+}
+
+/// One side of the comparison, refused when it names nothing.
+fn nonblank_ref<'a>(side: &str, value: &'a str) -> Result<&'a str, RepoCompareError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(RepoCompareError::new(
+            StatusCode::BAD_REQUEST,
+            RepoCompareRefusal::BadRequest,
+            format!(
+                "{side} must name a ref or a change id, and this request left it blank. This \
+                 route compares two read points a caller chose and has no default for either."
+            ),
+        ));
+    }
+    Ok(trimmed)
 }
 
 async fn open_view(

@@ -24506,6 +24506,71 @@ mod tests {
         assert_eq!(refusal, None, "an answered comparison carries no refusal");
     }
 
+    /// A blank ref is refused rather than quietly becoming the default.
+    ///
+    /// `resolve_read_point` reads a blank reference as "none given" and answers
+    /// the default ref, which is right for the blob route and wrong here. This
+    /// route has no default: a blank base would become the head's own ref, and
+    /// the answer would be zero files, zero ahead and zero behind, which is the
+    /// exact shape a comparison route exists not to invent. The 200 that a
+    /// defaulted base produces is what these two arms would read without the
+    /// check, so they are written against that answer rather than against a
+    /// crash.
+    #[tokio::test]
+    async fn a_blank_compare_ref_on_either_side_is_refused_rather_than_defaulted() {
+        let repo_id = format!("hostedcompare-blank-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3279_0031,
+            "publish a generation to compare",
+            &[("first_symbol", "src/first.rs", "fn first_symbol() {}\n")],
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        // An empty base, and a head that is nothing but spaces. Both reach the
+        // shared resolver as a blank reference, and both would resolve to main.
+        for (query, side) in [
+            ("base=&head=main", "base"),
+            ("base=main&head=%20%20", "head"),
+        ] {
+            let (status, refusal, body) = repo_compare_route(
+                Arc::clone(&state),
+                &format!("/repos/{repo_id}/compare?{query}"),
+            )
+            .await;
+            let message = String::from_utf8_lossy(&body);
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{query} must be refused rather than defaulted: {message}"
+            );
+            assert_eq!(
+                refusal.as_deref(),
+                Some("bad-request"),
+                "{query} must be refused BY NAME: {message}"
+            );
+            assert!(
+                message.contains(side),
+                "{query}: the refusal must name the side that was blank: {message}"
+            );
+        }
+
+        // The control: the same repository answers when both sides are named,
+        // so the two above are refused for their blankness and not because this
+        // fixture refuses everything.
+        let (status, refusal, body) = repo_compare_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/compare?base=main&head=main"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(refusal, None, "an answered comparison carries no refusal");
+    }
+
     /// A daemon carrying the compare route says so on its health endpoint.
     ///
     /// A hosted control plane keys its fallback on this string, and the
