@@ -481,9 +481,18 @@ pub(crate) fn publish_exact_workspace_tree(
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
     let started = Instant::now();
-    let Some(admission) = crate::repository_commit::publish_workspace_tree(
+    // Through the authority this daemon already holds at the current
+    // publication, which after the daemon's own last publication is the very
+    // manager that performed it. Opening one afresh is O(store) and, on a
+    // converted psf/requests, the 3.6 GiB the stranger's daemon grew from one
+    // tracked-file edit (FIR-3203); reusing it costs nothing.
+    let authority = crate::api::held_write_authority(state)
+        .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
+    let published = crate::repository_commit::publish_workspace_tree_through(
         state.blobs.as_ref(),
-        &authority_context,
+        authority_context.repository_id().clone(),
+        authority_context.workspace_id(),
+        &authority,
         admitted,
         kin_model::OperationId::new(),
         // The daemon's own loop is the actor here, and naming it is a statement
@@ -494,10 +503,25 @@ pub(crate) fn publish_exact_workspace_tree(
         // a change a person authored takes that person's resolved identity from
         // the caller instead.
         kin_model::AuthorId::new(DAEMON_ADMISSION_ACTOR),
-    )?
-    else {
-        return Ok(None);
+    );
+    let admission = match published {
+        Ok(Some(published)) => published,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            // A refused publication says nothing certain about the held
+            // manager, and one refused because another writer moved authority
+            // says the manager is behind it. Either way the next publication
+            // starts from a fresh open of what storage holds now.
+            state.projection_authority.forget_writer();
+            return Err(error);
+        }
     };
+    // The label is read the instant after the commit; see
+    // `publication_identity_after_commit` for the window and its backstop.
+    let published = crate::api::publication_identity_after_commit(state)
+        .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
+    crate::api::install_write_authority(state, &authority, published)
+        .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
     // What this cost is what the reconcile tick is deciding whether to spend, so
     // it is measured here rather than modelled from the store's size.
     state.record_authority_publication(started.elapsed());
