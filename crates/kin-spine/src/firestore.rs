@@ -1176,6 +1176,12 @@ impl SpineBackend for FirestoreSpineBackend {
         FirestoreSpineBackend::complete_legacy_migration(self, writer_drain)
     }
 
+    fn committed_head_identities(
+        &self,
+    ) -> Result<BTreeMap<String, (RepoPublicationHead, String)>, SpineError> {
+        self.store.load_repo_heads()
+    }
+
     fn refresh_committed_publications(&self) -> Result<(), SpineError> {
         self.hydrate()
     }
@@ -3561,6 +3567,12 @@ impl SpineStore for FirestoreStore {
             return Ok(RepoPublicationCommit::Conflict(conflict));
         }
         self.commit_head_and_rollout_fence(prepared)
+    }
+
+    fn load_repo_heads(
+        &self,
+    ) -> Result<BTreeMap<String, (RepoPublicationHead, String)>, SpineError> {
+        self.list_repo_heads()
     }
 
     fn load_repo_publications(&self) -> Result<Vec<LoadedRepoPublication>, SpineError> {

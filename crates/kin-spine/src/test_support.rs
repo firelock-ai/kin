@@ -905,6 +905,26 @@ impl SpineStore for FakeSpineStore {
         })
     }
 
+    fn load_repo_heads(
+        &self,
+    ) -> Result<BTreeMap<String, (RepoPublicationHead, String)>, SpineError> {
+        if !self.atomicity_available.load(Ordering::SeqCst) {
+            return Err(SpineError::Backend(
+                "injected atomic publication unavailable".to_string(),
+            ));
+        }
+        Ok(self
+            .publication_state
+            .lock()
+            .unwrap()
+            .heads
+            .iter()
+            .map(|(repo_id, (revision, head))| {
+                (repo_id.clone(), (head.clone(), revision.to_string()))
+            })
+            .collect())
+    }
+
     fn load_repo_publications(&self) -> Result<Vec<LoadedRepoPublication>, SpineError> {
         if !self.atomicity_available.load(Ordering::SeqCst) {
             return Err(SpineError::Backend(

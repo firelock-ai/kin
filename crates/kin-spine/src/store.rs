@@ -418,6 +418,22 @@ pub trait SpineStore: Send + Sync {
         ))
     }
 
+    /// Load every committed repository head WITHOUT its entity rows.
+    ///
+    /// The head carries the whole durable identity of a publication: its source
+    /// cursor, its root hash, its publication id and its digests. Loading the
+    /// rows as well is what makes [`Self::load_repo_publications`] expensive,
+    /// and a caller that only needs to know whether an identity moved must not
+    /// pay for them. The second element is the store's own revision token for
+    /// that head, which the existing head read already carries.
+    fn load_repo_heads(
+        &self,
+    ) -> Result<BTreeMap<String, (RepoPublicationHead, String)>, SpineError> {
+        Err(SpineError::Backend(
+            "durable committed repository heads are unsupported by this store".to_string(),
+        ))
+    }
+
     /// Load only publications reachable from committed repository heads.
     fn load_repo_publications(&self) -> Result<Vec<LoadedRepoPublication>, SpineError> {
         Err(SpineError::Backend(
