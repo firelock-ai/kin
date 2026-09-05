@@ -1699,7 +1699,6 @@ const HOSTED_SPINE_AUTHORITY_REFRESH_INTERVAL: Duration = Duration::from_secs(60
 /// wakes one, so a persistent drift cannot turn the probe back into the thing
 /// that drives a continuous refresh.
 const HOSTED_SPINE_AUTHORITY_RETRY_FLOOR: Duration = Duration::from_secs(1);
-const HOSTED_SPINE_FLEET_SIZE: usize = 5;
 const HOSTED_SPINE_CURSOR_CAS_REQUIRED: &str =
     "hosted persistent spine is unavailable until its durable backend can stage rows and compare-and-swap a head bound to the exact source publication cursor";
 
@@ -5998,7 +5997,7 @@ impl DaemonState {
         {
             return Err("KIN_GCS_PREFIX must be a non-empty canonical object prefix".to_string());
         }
-        let mut fleet = self
+        let fleet = self
             .allowed_repo_ids
             .as_ref()
             .ok_or_else(|| {
@@ -6009,16 +6008,8 @@ impl DaemonState {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        fleet.sort();
-        if fleet.len() != HOSTED_SPINE_FLEET_SIZE
-            || fleet.iter().any(|repo_id| {
-                repo_id.is_empty() || repo_id.trim() != repo_id || repo_id.contains('/')
-            })
-        {
-            return Err(format!(
-                "hosted durable spine requires exactly {HOSTED_SPINE_FLEET_SIZE} canonical KIN_REPO_IDS entries"
-            ));
-        }
+        let fleet = crate::publication_lease::canonical_repositories(&fleet)
+            .map_err(|error| format!("hosted durable spine fleet is invalid: {error}"))?;
         Ok((format!("gcs://{bucket}/{prefix}"), fleet))
     }
 
@@ -11972,6 +11963,7 @@ impl Drop for EmbedPassGuard<'_> {
 
 #[cfg(test)]
 mod tests {
+    mod hosted_fleet;
     use super::*;
     use kin_model::{
         ArtifactId, ChangeOrigin, Entity, EntityKind, EntityMetadata, FileLayout, FilePathId,
@@ -19704,7 +19696,7 @@ mod tests {
     }
     /// The complete hosted spine contract, from which one requirement at a
     /// time is removed below.
-    fn hosted_spine_fleet() -> [&'static str; HOSTED_SPINE_FLEET_SIZE] {
+    fn hosted_spine_fleet() -> [&'static str; 5] {
         ["kin", "kin-db", "kin-lsp", "kin-model", "kin-search"]
     }
 

@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::backend::SpineError;
 use crate::firestore::{
     classify_rollout_fence_reconciliation, publication_stage_is_cleanup_safe,
-    RolloutFenceReconciliation,
+    validate_legacy_seal_fleet, RolloutFenceReconciliation,
 };
 use crate::index::{CrossRepoEdge, EntityEntry};
 use crate::publication::{
@@ -437,26 +437,25 @@ impl SpineStore for FakeSpineStore {
             .fence
             .repositories
             .iter()
-            .map(|row| row.repo_id.as_str())
+            .map(|row| row.repo_id.clone())
             .collect::<Vec<_>>();
-        let current_ids = current
-            .fence
-            .repositories
-            .iter()
-            .map(|row| row.repo_id.as_str())
-            .collect::<Vec<_>>();
+        validate_legacy_seal_fleet(
+            &sealed_fence.fence.scope,
+            &sealed_ids,
+            &sealed_fence.evidence(),
+            &current,
+        )?;
         let head_ids = sealed_heads
             .iter()
-            .map(|head| head.repo_id.as_str())
+            .map(|head| head.repo_id.clone())
             .collect::<Vec<_>>();
-        if sealed_fence.fence.scope != current.fence.scope
-            || sealed_ids != current_ids
-            || head_ids != current_ids
-            || sealed_fence.fence.rollout_fence > current.fence.rollout_fence
-            || writer_drain.rollout_fence_evidence != sealed_fence.evidence()
+        for head in sealed_heads {
+            head.validate()?;
+        }
+        if head_ids != sealed_ids || writer_drain.rollout_fence_evidence != sealed_fence.evidence()
         {
             return Err(SpineError::Backend(
-                "fake legacy migration seal does not match active authority".to_string(),
+                "fake legacy migration seal does not match its original authority".to_string(),
             ));
         }
         Ok(true)

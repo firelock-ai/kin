@@ -2592,7 +2592,9 @@ fn completed_lease_matches(
     completed.kind == kind && completed.token == proof.token && completed.fence == proof.fence
 }
 
-fn canonical_repositories(repositories: &[String]) -> Result<Vec<String>, PublicationControlError> {
+pub(crate) fn canonical_repositories(
+    repositories: &[String],
+) -> Result<Vec<String>, PublicationControlError> {
     if repositories.is_empty() {
         return Err(PublicationControlError::Invalid(
             "fleet repositories must not be empty".to_string(),

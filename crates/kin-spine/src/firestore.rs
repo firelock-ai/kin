@@ -373,29 +373,12 @@ impl LegacyMigrationSeal {
                 "legacy migration seal writer-drain evidence is not self-consistent".to_string(),
             ));
         }
-        let expected_repository_ids = active
-            .fence
-            .repositories
-            .iter()
-            .map(|row| row.repo_id.clone())
-            .collect::<Vec<_>>();
-        if self.scope != active.fence.scope
-            || self.repository_ids != expected_repository_ids
-            || self.rollout_fence_evidence.rollout_fence > active.fence.rollout_fence
-        {
-            return Err(SpineError::Backend(
-                "legacy migration seal does not belong to the active rollout scope and exact fleet"
-                    .to_string(),
-            ));
-        }
-        if self.rollout_fence_evidence.rollout_fence == active.fence.rollout_fence
-            && self.rollout_fence_evidence != active.evidence()
-        {
-            return Err(SpineError::Backend(
-                "legacy migration seal carries different evidence for the active rollout fence"
-                    .to_string(),
-            ));
-        }
+        validate_legacy_seal_fleet(
+            &self.scope,
+            &self.repository_ids,
+            &self.rollout_fence_evidence,
+            active,
+        )?;
         let observed_ids = self
             .sealed_heads
             .iter()
@@ -418,6 +401,58 @@ impl LegacyMigrationSeal {
         }
         Ok(())
     }
+}
+
+// The seal attests the original legacy writer drain. A later additive rollout
+// keeps that history, while hydration and reader admission independently prove
+// every current publication against the exact active fleet and GCS evidence.
+#[cfg(any(feature = "firestore", feature = "test-support", test))]
+pub(crate) fn validate_legacy_seal_fleet(
+    sealed_scope: &str,
+    sealed_repository_ids: &[String],
+    sealed_evidence: &SpineRolloutFenceEvidence,
+    active: &LoadedSpineRolloutFence,
+) -> Result<(), SpineError> {
+    active.fence.validate()?;
+    if active.update_time.is_empty()
+        || sealed_repository_ids.is_empty()
+        || sealed_repository_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(SpineError::Serialization(
+            "legacy seal fleet or active fence revision is not canonical".to_string(),
+        ));
+    }
+    if sealed_scope != active.fence.scope
+        || sealed_evidence.rollout_fence > active.fence.rollout_fence
+    {
+        return Err(SpineError::Backend(
+            "legacy migration seal does not belong to the active rollout scope and fence"
+                .to_string(),
+        ));
+    }
+    let active_repository_ids = active
+        .fence
+        .repositories
+        .iter()
+        .map(|row| row.repo_id.clone())
+        .collect::<Vec<_>>();
+    if sealed_evidence.rollout_fence == active.fence.rollout_fence {
+        if sealed_repository_ids != active_repository_ids || *sealed_evidence != active.evidence() {
+            return Err(SpineError::Backend(
+                "legacy migration seal carries different membership or evidence for the active rollout fence".to_string(),
+            ));
+        }
+    } else if sealed_repository_ids
+        .iter()
+        .any(|repo_id| active.fence.repository(repo_id).is_none())
+    {
+        return Err(SpineError::Backend(
+            "a later rollout must retain every sealed legacy repository".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "firestore")]
@@ -3901,6 +3936,8 @@ impl SpineStore for FirestoreStore {
 
 #[cfg(test)]
 mod tests {
+    mod hosted_fleet;
+
     use super::*;
     use crate::publication::RepoPublicationConflict;
     use crate::test_support::*;
