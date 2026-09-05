@@ -2653,6 +2653,12 @@ pub async fn run_loop_armed(
         // silence.
         if semantic_debt_drain_owed {
             semantic_debt_drain_owed = false;
+            // Under the gate every other graph-authority mutation takes,
+            // including the tick below, commit and checkout. The drain applies
+            // entity transactions to the live graph, and a mutation outside
+            // the gate can interleave with a commit planning its change from
+            // that same graph.
+            let _coordination = state.coordination_gate.lock().await;
             if let Err(error) = drain_semantic_debt(&state).await {
                 warn!(
                     error = %error,
@@ -3907,6 +3913,86 @@ mod tests {
             std::env::var_os("KIN_ALLOW_MASS_DELETION"),
             mass_delete_before,
             "graph-only mode must not set or clear the mass-deletion escape hatch"
+        );
+    }
+
+    /// FIR-3208. A daemon start pays the semantic debt a previous daemon left,
+    /// before the loop answers anything.
+    ///
+    /// The record is the only thing carrying a parse across a restart, and a
+    /// commit is the only other drain, so a loop that skipped this at startup
+    /// would serve the previous parse to every query until someone committed.
+    /// The store is put into exactly the shape a session publication leaves:
+    /// the exact tree published on its own, nothing parsed, the record naming
+    /// what is owed.
+    ///
+    /// Falsify by removing the once-per-life drain from `run_loop_armed`: the
+    /// span never moves and the poll below runs out.
+    #[tokio::test]
+    async fn a_daemon_start_pays_the_semantic_debt_a_previous_daemon_left() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let host = repo.path().join("shifted.rs");
+        let original = b"pub fn shifted() -> u32 { 7 }\n".to_vec();
+        std::fs::write(&host, &original).unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let start_line = |state: &DaemonState| -> Option<u32> {
+            state
+                .graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(FilePathId::new("shifted.rs")),
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find_map(|entity| entity.span.map(|span| span.start_line))
+        };
+        assert_eq!(start_line(&state), Some(0));
+
+        let mut shifted = b"// prepended\n".repeat(17);
+        shifted.extend_from_slice(&original);
+        std::fs::write(&host, &shifted).unwrap();
+        let admission = exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+        assert!(!admission.deltas.is_empty(), "the bytes moved");
+        crate::semantic_debt::record(&state, &crate::semantic_debt::owed_by(&admission.deltas));
+        let recorded = crate::semantic_debt::outstanding(&state);
+        let (owed, _) = crate::semantic_debt::partition_against_tree(&state, &recorded);
+        assert_eq!(owed.len(), 1, "the tree carries the body the record names");
+        assert_eq!(
+            start_line(&state),
+            Some(0),
+            "nothing has parsed the new bytes yet; that is the debt"
+        );
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let mut handle = tokio::spawn(run_loop(
+            Arc::clone(&state),
+            LoopConfig::default(),
+            cancel_rx,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while start_line(&state) != Some(17) {
+            assert!(
+                !handle.is_finished(),
+                "the loop exited before paying the debt a previous daemon left"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the loop never re-derived the path a previous daemon left owing; span is {:?}",
+                start_line(&state)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), &mut handle)
+            .await
+            .expect("the loop exits on shutdown")
+            .expect("the loop task must not panic")
+            .expect("the loop exits cleanly");
+        assert!(
+            !crate::semantic_debt::outstanding(&state).is_empty(),
+            "a startup drain pays the parse in the derived graph and leaves the record for the \
+             commit that makes it durable"
         );
     }
 
@@ -8129,12 +8215,12 @@ pub(crate) async fn sync_filesystem_with_graph_deferring_tree_publication(
 /// that makes a parse durable and a crash before one would otherwise clear the
 /// record for work nothing carried.
 pub(crate) async fn drain_semantic_debt(state: &DaemonState) -> Result<()> {
-    let recorded = crate::semantic_debt::outstanding(state.layout.root());
+    let recorded = crate::semantic_debt::outstanding(state);
     if recorded.is_empty() {
         return Ok(());
     }
     let (owed, spent) = crate::semantic_debt::partition_against_tree(state, &recorded);
-    crate::semantic_debt::settle(state.layout.root(), &spent);
+    crate::semantic_debt::settle(state, &spent);
     if owed.is_empty() {
         return Ok(());
     }

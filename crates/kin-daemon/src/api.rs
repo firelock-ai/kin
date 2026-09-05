@@ -6138,10 +6138,7 @@ async fn reconcile_session_workspace(
         // between this publication and its commit read the pre-edit span back,
         // and a synchronous snapshot immediately after the re-derivation did not
         // change that. The commit that publishes is what settles the record.
-        crate::semantic_debt::record(
-            state.layout.root(),
-            &crate::semantic_debt::owed_by(observation.deltas()),
-        );
+        crate::semantic_debt::record(&state, &crate::semantic_debt::owed_by(observation.deltas()));
         let readmitted =
             crate::loop_runner::readmit_semantics_for_paths(&state, &published_paths(&observation))
                 .await;
@@ -6436,7 +6433,7 @@ async fn command_commit(
             // is still owed. Settled here rather than at the drain because a
             // crash between the two would otherwise clear the record for work no
             // change carried, which is the loss the record exists to prevent.
-            crate::semantic_debt::settle_all(state.layout.root());
+            crate::semantic_debt::settle_all(&state);
             Ok(response)
         }
         Err(error) => {
@@ -35204,6 +35201,93 @@ mod tests {
         );
     }
 
+    /// FIR-3208. A drain that is not a commit settles nothing.
+    ///
+    /// The record exists because a re-derivation lives in the derived graph and
+    /// dies with the daemon that performed it; only a commit puts it in
+    /// history. So a drain at startup pays the parse and must leave the record
+    /// standing, or the next restart before a commit reads the pre-edit span
+    /// with nothing left to say otherwise.
+    ///
+    /// Falsify by moving `settle_all` into `drain_semantic_debt`: the first
+    /// assertion on the record goes red, and the second reopen reads the
+    /// pre-edit span with no record to pay it from.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_drain_without_a_commit_leaves_the_record_standing() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+        let session_dir = layout.root().join("runs/session-fir3208-standing");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        reconcile_session_through_api(&app, &session_dir).await;
+        drop(app);
+        drop(state);
+
+        // First restart: the drain pays the parse, and the record stands.
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        crate::loop_runner::drain_semantic_debt(&reopened)
+            .await
+            .unwrap();
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES
+        );
+        assert!(
+            !crate::semantic_debt::outstanding(&reopened).is_empty(),
+            "a drain pays the parse in the derived graph; only a commit may settle the record"
+        );
+        drop(reopened);
+
+        // Second restart, still no commit: the derived graph is stale again
+        // and the record is what makes that recoverable.
+        let again = Arc::new(DaemonState::open(layout).unwrap());
+        again
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            published_start_line(&again, "shifted.rs"),
+            before,
+            "nothing durable carried the parse across the restart"
+        );
+        crate::loop_runner::drain_semantic_debt(&again)
+            .await
+            .unwrap();
+        assert_eq!(
+            published_start_line(&again, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the standing record pays it again"
+        );
+
+        // The commit is what settles it.
+        let again_app = router(Arc::clone(&again));
+        commit_through_api(
+            &again_app,
+            kin_model::OperationId::new(),
+            "commit the session's edit",
+        )
+        .await;
+        assert!(
+            crate::semantic_debt::outstanding(&again).is_empty(),
+            "a commit that reached authority settles the whole record"
+        );
+    }
+
     /// FIR-3208. One unrelated edit must not settle a debt nothing has paid.
     ///
     /// The commit that carries an admission clears the whole record once its
@@ -35402,7 +35486,7 @@ mod tests {
         };
         drop(tree);
         crate::semantic_debt::record(
-            state.layout.root(),
+            &state,
             &[crate::semantic_debt::SemanticDebt {
                 path: "shifted.rs".to_string(),
                 body: hash.to_string(),

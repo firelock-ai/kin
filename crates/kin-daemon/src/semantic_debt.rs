@@ -52,7 +52,7 @@
 //! would clear the record for a parse the next crash could still lose.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use kin_model::{RepoPath, TreeEntry};
 use serde::{Deserialize, Serialize};
@@ -71,8 +71,13 @@ pub(crate) struct SemanticDebt {
 }
 
 /// Ingestion IO: the record of what is owed, under the store root.
-fn marker_path(root: &Path) -> PathBuf {
-    root.join("semantic-debt.json")
+///
+/// The root is read from the daemon's own layout here rather than taken as a
+/// parameter, the way the sibling markers in `loop_runner` and `daemon` read
+/// it, so the only path this module ever opens is a constant join under a root
+/// the daemon bound at open and nothing a caller passes can reach the join.
+fn marker_path(state: &DaemonState) -> PathBuf {
+    state.layout.root().join("semantic-debt.json")
 }
 
 /// Every path one publication moved, paired with the body it published there.
@@ -106,20 +111,20 @@ pub(crate) fn owed_by(deltas: &[kin_model::TreeDelta]) -> Vec<SemanticDebt> {
 /// recoverable; a store that cannot write it is no worse off than one built
 /// before this existed, and refusing a durable publication over it would trade a
 /// recoverable gap for an unrecoverable refusal.
-pub(crate) fn record(root: &Path, owed: &[SemanticDebt]) {
+pub(crate) fn record(state: &DaemonState, owed: &[SemanticDebt]) {
     if owed.is_empty() {
         return;
     }
-    let mut entries = outstanding(root);
+    let mut entries = outstanding(state);
     entries.retain(|entry| !owed.iter().any(|fresh| fresh.path == entry.path));
     entries.extend_from_slice(owed);
-    write(root, &entries);
+    write(state, &entries);
 }
 
 /// Read the record. An unreadable or unparseable one is treated as empty and
 /// said out loud, because the alternative is refusing every commit on the store.
-pub(crate) fn outstanding(root: &Path) -> Vec<SemanticDebt> {
-    let marker = marker_path(root);
+pub(crate) fn outstanding(state: &DaemonState) -> Vec<SemanticDebt> {
+    let marker = marker_path(state);
     let Ok(bytes) = std::fs::read(&marker) else {
         return Vec::new();
     };
@@ -170,17 +175,17 @@ pub(crate) fn partition_against_tree(
 }
 
 /// Drop the named paths from the record and rewrite it.
-pub(crate) fn settle(root: &Path, paths: &[String]) {
+pub(crate) fn settle(state: &DaemonState, paths: &[String]) {
     if paths.is_empty() {
         return;
     }
-    let mut entries = outstanding(root);
+    let mut entries = outstanding(state);
     let before = entries.len();
     entries.retain(|entry| !paths.contains(&entry.path));
     if entries.len() == before {
         return;
     }
-    write(root, &entries);
+    write(state, &entries);
 }
 
 /// Clear the whole record.
@@ -191,8 +196,8 @@ pub(crate) fn settle(root: &Path, paths: &[String]) {
 /// owed. The coordination gate spans both the publication that records a debt
 /// and the commit that clears it, so nothing can be recorded in between and lost
 /// here.
-pub(crate) fn settle_all(root: &Path) {
-    let marker = marker_path(root);
+pub(crate) fn settle_all(state: &DaemonState) {
+    let marker = marker_path(state);
     match std::fs::remove_file(&marker) {
         Ok(()) => debug!(
             marker = %marker.display(),
@@ -208,12 +213,12 @@ pub(crate) fn settle_all(root: &Path) {
     }
 }
 
-fn write(root: &Path, entries: &[SemanticDebt]) {
+fn write(state: &DaemonState, entries: &[SemanticDebt]) {
     if entries.is_empty() {
-        settle_all(root);
+        settle_all(state);
         return;
     }
-    let marker = marker_path(root);
+    let marker = marker_path(state);
     match serde_json::to_vec(entries) {
         Ok(bytes) => {
             if let Err(error) = std::fs::write(&marker, bytes) {
