@@ -136,7 +136,7 @@ const MAX_AUTHORITY_PUBLICATION_RECORD_BYTES: u64 = 1024 * 1024;
 /// whether an already-loaded authority may be reused, and every answer served
 /// still comes from repository-v6 graph truth.
 #[derive(Clone, PartialEq, Eq)]
-enum LocalPublicationIdentity {
+pub(crate) enum LocalPublicationIdentity {
     /// The repository has persisted no authority yet, so its authority is the
     /// unpublished generation-zero state.
     Unpublished,
@@ -239,6 +239,15 @@ pub(crate) struct ProjectionAuthorityCache {
     /// The refs routes' envelope, keyed on the same publication identity as
     /// every slot above it.
     ref_metadata: std::sync::Mutex<Option<HeldRefMetadata>>,
+    /// The manager this daemon publishes through, held for one scope at a time;
+    /// see [`HeldWriteAuthority`]. On the reconcile tick the admission pair's
+    /// open installs it, the publication goes through it, and the publication
+    /// drops it. On the persist flush the enrichment publish installs it, the
+    /// read-index finalization reuses it and forgets it. Two whole-store opens
+    /// per edit rather than the three or four it cost before, and no manager
+    /// alive across the boundary between the two scopes. The admission slot
+    /// above is derived from it and relabelled with it.
+    writer: std::sync::Mutex<Option<HeldWriteAuthority>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
     load_gate: std::sync::Mutex<()>,
@@ -286,6 +295,46 @@ struct HeldRefMetadata {
     /// for [`HeldProjectionAuthority::published`] and for the same reason.
     published: LocalPublicationIdentity,
     metadata: Arc<kin_db::PersistedRepositoryAuthority>,
+}
+
+/// The authority this daemon publishes through, held for one scope.
+///
+/// A publication used to open the persisted authority, commit through it and
+/// drop it, and the open is O(store): kin-db decodes the change map (93.8 percent
+/// of a 1051 MiB body on a converted psf/requests), and because every
+/// publication moves the generation the durable history-validation record never
+/// matches, so every such open also replays the whole history, which clones
+/// every change. One tracked-file edit cost the stranger's daemon 3.6 GiB of
+/// resident set that way before any commit ran (FIR-3203).
+///
+/// After its own commit the manager's in-memory state IS the durable successor.
+/// Readers inside the same scope go through it with no open at all; the scope
+/// ends with the publication on the tick, and with the read-index finalization
+/// on the persist flush, and each end forgets the slot. Holding it across the
+/// two was measured on a converted psf/requests: the flush's allocations
+/// stacked on the decoded successor and the edit-window peak rose 2 to 4 GiB
+/// above the pre-fix peak.
+///
+/// The label says which publication this manager is at. It is read the instant
+/// after a plain commit, under no lock at all, so a foreign publication landing
+/// between the commit and the read DOES leave this manager one generation behind
+/// while wearing the current label; see
+/// [`publication_identity_after_commit`]. That window is closed by kin-db, not
+/// by this label: an ordinary reuse reads the durable record first and misses
+/// the moment any other writer moved it, and a manager that slipped through the
+/// window is refused at the commit by kin-db's successor compare-and-swap with a
+/// generation mismatch, after which the slot is forgotten. Either way a stale
+/// manager can never overwrite a foreign publication. The test that pins the
+/// second path is
+/// `a_held_authority_that_fell_behind_is_refused_by_the_cas_and_forgotten`.
+struct HeldWriteAuthority {
+    /// Read strictly before the load, or immediately after the commit this
+    /// manager performed. The first case is the reason
+    /// [`HeldProjectionAuthority::published`] gives; the second carries the
+    /// window this type's own documentation names, and kin-db's compare-and-swap
+    /// is what closes it.
+    published: LocalPublicationIdentity,
+    manager: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
 }
 
 #[derive(Clone)]
@@ -409,12 +458,185 @@ impl ProjectionAuthorityCache {
         });
     }
 
+    fn reuse_writer(
+        &self,
+        published: &LocalPublicationIdentity,
+    ) -> Option<Arc<RepositoryAuthorityManager<LocalFileBackend>>> {
+        lock_recover(&self.writer)
+            .as_ref()
+            .filter(|held| &held.published == published)
+            .map(|held| Arc::clone(&held.manager))
+    }
+
+    fn install_writer(
+        &self,
+        published: LocalPublicationIdentity,
+        manager: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
+    ) {
+        *lock_recover(&self.writer) = Some(HeldWriteAuthority { published, manager });
+    }
+
+    /// Forget the held writer. Taken on any refused publication, so the next
+    /// one starts from a fresh open of whatever authority holds now.
+    pub(crate) fn forget_writer(&self) {
+        *lock_recover(&self.writer) = None;
+    }
+
+    /// Whether a writer is held right now. A test reads this beside
+    /// [`Self::loads`] to tell "reused" from "never loaded".
+    #[cfg(test)]
+    pub(crate) fn holds_writer(&self) -> bool {
+        lock_recover(&self.writer).is_some()
+    }
+
+    /// Cold the admission values slot, which [`Self::invalidate`] leaves alone.
+    /// A test whose act must pay the admission pair's own open, and so install
+    /// the writer that open serves, takes this first; a slot a reader warmed at
+    /// the current label would otherwise satisfy the act and install nothing.
+    #[cfg(test)]
+    pub(crate) fn forget_admission(&self) {
+        *lock_recover(&self.admission) = None;
+    }
+
     fn invalidate(&self) {
         *lock_recover(&self.held) = None;
         *lock_recover(&self.query) = None;
         *lock_recover(&self.command) = None;
         *lock_recover(&self.ref_metadata) = None;
+        *lock_recover(&self.writer) = None;
     }
+}
+
+/// The authority this daemon publishes through, at the publication local storage
+/// holds right now: the held one when its label still matches, otherwise one
+/// fresh open, which is then held.
+///
+/// Same shape as the three reader resolvers above and deliberately so: read the
+/// publication, try the slot, take the load gate, re-read under it because the
+/// publication may have moved while this caller waited, try again, and only then
+/// pay for the open. The difference is what the slot holds: the manager itself,
+/// because a publication needs a writer and not a value read out of one.
+pub(crate) fn held_write_authority(
+    state: &DaemonState,
+) -> Result<Arc<RepositoryAuthorityManager<LocalFileBackend>>, (StatusCode, String)> {
+    let backend = state.local_repository_backend().ok_or_else(|| {
+        repository_authority_error("local daemon is missing its startup storage capability")
+    })?;
+    let binding = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let repository_id = binding.repository_id().clone();
+
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(manager) = state.projection_authority.reuse_writer(&published) {
+        return Ok(manager);
+    }
+
+    let _load = lock_recover(&state.projection_authority.load_gate);
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(manager) = state.projection_authority.reuse_writer(&published) {
+        return Ok(manager);
+    }
+    let context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+            .map_err(|error| repository_authority_error(error.to_string()))?;
+    let manager = Arc::new(
+        context
+            .open()
+            .map_err(|error| repository_authority_error(error.to_string()))?,
+    );
+    state.projection_authority.record_load();
+    state
+        .projection_authority
+        .install_writer(published, Arc::clone(&manager));
+    tracing::debug!(
+        repository = %repository_id,
+        loads = state.projection_authority.loads(),
+        "write repository authority loaded"
+    );
+    Ok(manager)
+}
+
+/// The admission pair and open-merge summary, read out of one already-open
+/// manager. What [`cached_authority_admission_entry`] installs on a miss and what
+/// a publication reinstalls under its freeze, so the two cannot compute them
+/// differently.
+fn admission_values_from(
+    state: &DaemonState,
+    manager: &RepositoryAuthorityManager<LocalFileBackend>,
+    published: LocalPublicationIdentity,
+) -> Result<HeldAdmission, (StatusCode, String)> {
+    let binding = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let workspace_id = binding.workspace_id();
+    let lease = manager.read_authority();
+    let roots = lease.roots().clone();
+    let open_merge = crate::repository_merge_state::open_merge_summary(&lease, workspace_id);
+    drop(lease);
+    let policy = manager
+        .workspace_admission_snapshot(binding.repository_id(), &workspace_id)
+        .map_err(|error| repository_authority_error(error.to_string()))?
+        .map(|snapshot| snapshot.matcher);
+    Ok(HeldAdmission {
+        published,
+        roots,
+        policy,
+        open_merge,
+    })
+}
+
+/// The publication identity local storage holds, read the instant after the
+/// commit that produced it.
+///
+/// A plain file read and no backend lock. The first version read this under
+/// kin-db's commit-point freeze so no other writer could move the record between
+/// the commit and the read, and derived the admission pair there too; that
+/// deadlocked, because the pair's matcher resolves rule sources through the
+/// backend whose flock the freeze holds, and the freeze variant of the commit
+/// also deep-clones the whole successor state, 2.7 GiB on a converted
+/// psf/requests, per publication. So the identity is read after a plain commit
+/// instead. The window is the instant between two statements of this process; a
+/// foreign writer landing in it labels a manager one generation behind with the
+/// foreign identity, the next admission plans against that manager's roots, and
+/// kin-db's successor compare-and-swap refuses the commit with a generation
+/// mismatch, after which the slot is forgotten and the tick after reopens.
+/// Nothing stale is ever published.
+pub(crate) fn publication_identity_after_commit(
+    state: &DaemonState,
+) -> Result<LocalPublicationIdentity, (StatusCode, String)> {
+    let backend = state.local_repository_backend().ok_or_else(|| {
+        repository_authority_error("local daemon is missing its startup storage capability")
+    })?;
+    let repository_id = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?
+        .repository_id()
+        .clone();
+    read_local_publication_identity(&backend, &repository_id)
+}
+
+/// Install `manager` as the held writer under the label read by
+/// [`publication_identity_after_commit`], and the admission pair derived from
+/// it.
+///
+/// The values come from the manager's own in-memory state, which only its own
+/// commits advance, so they describe the labelled publication whenever they are
+/// computed. Deriving them reaches the backend for rule sources, so nothing may
+/// hold the repository lock while this runs. If another writer publishes before
+/// this install, the label is already behind the durable record, the next
+/// reader misses it and reopens, and nothing stale is served.
+pub(crate) fn install_write_authority(
+    state: &DaemonState,
+    manager: &Arc<RepositoryAuthorityManager<LocalFileBackend>>,
+    published: LocalPublicationIdentity,
+) -> Result<(), (StatusCode, String)> {
+    let admission = admission_values_from(state, manager, published.clone())?;
+    state.projection_authority.install_admission(admission);
+    state
+        .projection_authority
+        .install_writer(published, Arc::clone(manager));
+    Ok(())
 }
 
 /// Refuse a storage namespace that is no longer the one this daemon pinned.
@@ -724,6 +946,43 @@ fn command_repository_authority(
 fn cached_authority_admission_entry(
     state: &DaemonState,
 ) -> Result<HeldAdmission, (StatusCode, String)> {
+    admission_entry(state, InstallWriter::No)
+}
+
+/// Whether an admission-pair load may leave its manager installed as the held
+/// writer. Only the publishing tick may, because only the publishing tick has a
+/// drop for it; a reader that installed one would leave a decoded change map
+/// resident with nothing to forget it, which is the held design's floor by the
+/// back door (found by the reviewer at `62220167e`: the untracked-refresh probe,
+/// the catch-up planner and the open-merge checks all read the pair and none
+/// publishes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallWriter {
+    No,
+    Yes,
+}
+
+/// The admission pair for the publishing tick. The one entry that installs the
+/// writer, so the publication that follows in the same tick reuses the open;
+/// `exact_tree_admission` forgets it on every return that does not publish and
+/// the publication drops it itself.
+pub(crate) fn cached_authority_admission_for_publication(
+    state: &DaemonState,
+) -> Result<
+    (
+        kin_model::RootBundle,
+        Option<kin_index::ResolvedAdmissionMatcher>,
+    ),
+    (StatusCode, String),
+> {
+    let admission = admission_entry(state, InstallWriter::Yes)?;
+    Ok((admission.roots, admission.policy))
+}
+
+fn admission_entry(
+    state: &DaemonState,
+    install: InstallWriter,
+) -> Result<HeldAdmission, (StatusCode, String)> {
     let backend = state.local_repository_backend().ok_or_else(|| {
         repository_authority_error("local daemon is missing its startup storage capability")
     })?;
@@ -746,28 +1005,34 @@ fn cached_authority_admission_entry(
         return Ok(admission);
     }
 
-    let context =
-        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
-            .map_err(|error| repository_authority_error(error.to_string()))?;
-    let authority = context
-        .open()
-        .map_err(|error| repository_authority_error(error.to_string()))?;
-    state.projection_authority.record_load();
-    let lease = authority.read_authority();
-    let roots = lease.roots().clone();
-    let open_merge =
-        crate::repository_merge_state::open_merge_summary(&lease, context.workspace_id());
-    drop(lease);
-    let policy = authority
-        .workspace_admission_snapshot(context.repository_id(), &context.workspace_id())
-        .map_err(|error| repository_authority_error(error.to_string()))?
-        .map(|snapshot| snapshot.matcher);
-    let admission = HeldAdmission {
-        published,
-        roots,
-        policy,
-        open_merge,
+    // An installed writer at this label costs nothing to read through. Otherwise
+    // one local open serves this load, and whether it outlives this function is
+    // the caller's kind: the publishing tick keeps it for the publication that
+    // follows and drops it itself; every reader lets it go here.
+    let manager = match state.projection_authority.reuse_writer(&published) {
+        Some(manager) => manager,
+        None => {
+            let context =
+                crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(
+                    state,
+                )
+                .map_err(|error| repository_authority_error(error.to_string()))?;
+            let manager = Arc::new(
+                context
+                    .open()
+                    .map_err(|error| repository_authority_error(error.to_string()))?,
+            );
+            state.projection_authority.record_load();
+            if install == InstallWriter::Yes {
+                state
+                    .projection_authority
+                    .install_writer(published.clone(), Arc::clone(&manager));
+            }
+            manager
+        }
     };
+    let admission = admission_values_from(state, &manager, published)?;
+    drop(manager);
     state
         .projection_authority
         .install_admission(admission.clone());
@@ -38571,6 +38836,77 @@ mod tests {
         (bare, roots)
     }
 
+    /// The publishing tick's yield to an open merge returns before any
+    /// publication, after its admission pair has installed the writer. That
+    /// return must forget the writer: a merge stays open for as long as a person
+    /// takes to resolve it, and a manager left installed there is a decoded
+    /// change map resident for the whole of that time.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn a_tick_that_yields_to_an_open_merge_holds_no_writer() {
+        let (state, _layout, repository, _, _) = universal_branch_test_state("yield-open-merge");
+        let path = repository.join("selected/compose.yaml");
+        std::fs::write(&path, b"services:\n  api:\n    image: main-conflict\n").unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "create a real conflict",
+        )
+        .await;
+        let response = crate::repository_merge::execute(
+            &state,
+            &kin_cli::commands::merge::MergeRequest {
+                source: kin_model::RefName::branch(b"feature").unwrap(),
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("yield-merge-test"),
+            },
+        )
+        .unwrap_or_else(|refusal| {
+            panic!(
+                "fixture merge refused: {}",
+                axum::response::IntoResponse::into_response(refusal).status()
+            )
+        });
+        assert!(matches!(
+            response.report.unwrap().outcome,
+            kin_cli::commands::merge::MergeOutcome::Conflicted
+        ));
+        // Nothing reads the admission pair between here and the act. A reader
+        // here would install the pair at the current label, the tick would then
+        // take the pair from the slot and install no writer, and the guard would
+        // have nothing to forget: a deleted guard passed this test exactly that
+        // way. The slot is colded outright, since a commit and a merge ran above,
+        // and the open the act pays is asserted as the proof that it installed.
+        state.projection_authority.forget_admission();
+        std::fs::write(&path, b"services:\n  api:\n    image: hand-authored\n").unwrap();
+        let observation =
+            std::iter::once(RepoPath::from_utf8("selected/compose.yaml").unwrap()).collect();
+        let opens_before = kin_core::authority_opens();
+        let yielded = crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap();
+        assert!(
+            yielded,
+            "the tick must yield to the open merge, or this proves nothing"
+        );
+        assert_eq!(
+            kin_core::authority_opens() - opens_before,
+            1,
+            "the tick's pair read must be the one open that installs the writer, or the guard \
+             below is untested"
+        );
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "a tick that yielded to an open merge must not keep the manager its admission pair \
+             installed"
+        );
+        assert!(
+            cached_authority_has_open_merge(&state).unwrap(),
+            "the fixture must hold a durable open merge"
+        );
+        drop(app);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(repository_commit)]
@@ -43637,6 +43973,488 @@ mod tests {
             "eight CONCURRENT admission reads racing into a COLD slot must pay one load between \
              them, not one each; the load gate is what makes that true, and this is the only \
              arm that can watch it go"
+        );
+    }
+
+    /// FIR-3203. One tracked-file edit publishes a workspace admission, and a
+    /// publication used to cost two whole-store opens on the reconcile tick (the
+    /// admission pair, because the previous publication moved the identity its
+    /// slot is keyed on, and then the publish itself) plus one more on the
+    /// persist flush. On a converted psf/requests each open decodes a 1051 MiB
+    /// change map and, with no durable validation proof for the generation the
+    /// last publication just produced, replays the whole history and clones
+    /// every change: that is the 3.6 GiB the stranger's daemon grew from one
+    /// edit before any commit ran. The tick now opens once: the admission
+    /// pair's open is held for the publication and dropped the moment the
+    /// publication returns, so nothing decoded is alive when the persist flush
+    /// that follows does its own work. The flush opens once for its own scope
+    /// (the enrichment publish installs, the read-index finalization reuses and
+    /// forgets). Two opens per edit against three or four before, and no
+    /// manager alive across the boundary between them, which is where a held
+    /// manager stacked the flush's allocations on the decoded successor and put
+    /// the edit-window peak 2 to 4 GiB above the pre-fix peak on psf/requests.
+    ///
+    /// Counted at kin-core's own funnel, which every route into kin-db's
+    /// recovery passes through, so an open reintroduced through a different
+    /// wrapper still fails this. The counter is thread-local and is read on the
+    /// thread the admission ran on. Each admission runs under a deadline so a
+    /// lock held across a backend read (the freeze deadlock this fix once had)
+    /// is a named failure rather than a hung suite; the fixture carries a
+    /// `.gitignore` rule source so the admission pair does read a blob.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_pays_one_open_for_its_pair_and_publish_and_holds_nothing_after() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let working = state.layout.working_dir().to_path_buf();
+        std::fs::write(working.join(".gitignore"), b"*.pyc\n").unwrap();
+        let write = |body: &str| {
+            std::fs::create_dir_all(working.join("src")).unwrap();
+            std::fs::write(working.join("src/lib.py"), body).unwrap();
+        };
+        let observation = std::collections::BTreeSet::from([
+            RepoPath::from_utf8("src/lib.py").unwrap(),
+            RepoPath::from_utf8(".gitignore").unwrap(),
+        ]);
+        let admit = |state: &Arc<DaemonState>| -> u64 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let state = Arc::clone(state);
+            let observation = observation.clone();
+            std::thread::spawn(move || {
+                let before = kin_core::authority_opens();
+                let yielded = crate::loop_runner::ambient_admission_for_test(&state, &observation)
+                    .map_err(|error| error.to_string());
+                tx.send(yielded.map(|yielded| (yielded, kin_core::authority_opens() - before)))
+                    .ok();
+            });
+            let (yielded, opens) = rx
+                .recv_timeout(std::time::Duration::from_secs(120))
+                .expect(
+                    "the admission must finish: a publication that reaches the backend while it \
+                     still holds a repository lock deadlocks on its own flock",
+                )
+                .expect("the admission must publish");
+            assert!(!yielded, "the admission must publish rather than yield");
+            opens
+        };
+        // What the persist flush does after a publication: the enrichment
+        // publish resolves the write authority (one open, since the publication
+        // dropped its own), the read-index finalization reads that same manager,
+        // and the finalization forgets it. One open for the flush's two
+        // consumers, not one each.
+        let finalize = |state: &Arc<DaemonState>| {
+            let generation = state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let before = kin_core::authority_opens();
+            let for_enrichment =
+                held_write_authority(state).expect("the enrichment publish resolves the writer");
+            drop(for_enrichment);
+            state
+                .load_committed_authority_graph(generation)
+                .expect("the finalization reads the committed graph");
+            assert_eq!(
+                kin_core::authority_opens() - before,
+                1,
+                "the flush's enrichment publish and finalization must share one open, after the \
+                 publication's manager is gone"
+            );
+            assert!(
+                !state.projection_authority.holds_writer(),
+                "the finalization must forget the held writer so its decoded state is released"
+            );
+        };
+
+        write("def a():\n    return 1\n");
+        let generation_before = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let first = admit(&state);
+        assert!(
+            first >= 1,
+            "the first publication of a daemon's life pays for an open, or this counter is dead"
+        );
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "the publication's manager must not outlive the publication"
+        );
+        finalize(&state);
+
+        for round in 2..=4 {
+            write(&format!("def a():\n    return {round}\n"));
+            assert_eq!(
+                admit(&state),
+                1,
+                "edit {round} must cost exactly one whole-store open: the admission pair's, shared \
+                 with the publication; before this fix it cost two on the tick and one on the flush"
+            );
+            finalize(&state);
+        }
+        assert_eq!(
+            state
+                .snapshot_generation
+                .load(std::sync::atomic::Ordering::SeqCst)
+                - generation_before,
+            4,
+            "four edits must be four publications"
+        );
+
+        // A publication with nothing to publish: the desired tree is the tree
+        // authority already holds. It returns `None`, and it must hold nothing
+        // afterwards either; the first shape of this returned early with the
+        // manager still installed and no finalization armed to forget it.
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let (roots, tree) = {
+            let manager = held_write_authority(&state).unwrap();
+            let lease = manager.read_authority();
+            let tree = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == context.workspace_id())
+                .map(|workspace| workspace.tree.clone())
+                .unwrap_or_default();
+            (lease.roots().clone(), tree)
+        };
+        let unchanged = crate::repository_commit::admitted_workspace_tree_for_test(
+            &working,
+            roots,
+            tree.clone(),
+            tree,
+        );
+        assert_eq!(
+            crate::loop_runner::publish_exact_workspace_tree(&state, &unchanged).unwrap(),
+            None,
+            "a desired tree authority already holds publishes nothing"
+        );
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "a publication that moved nothing must not keep its manager either"
+        );
+    }
+
+    /// Readers of the admission pair install nothing. Five call sites read the
+    /// pair and never publish (the untracked-refresh probe, the catch-up planner,
+    /// the open-merge checks); if any of them left the manager it opened in the
+    /// writer slot, an idle daemon would carry a decoded change map that nothing
+    /// forgets, which is the held design's floor by the back door.
+    #[cfg(unix)]
+    #[test]
+    fn readers_of_the_admission_pair_install_no_writer() {
+        let state = test_state();
+        install_repository_file(&state, "src/lib.py", b"def handler():\n    return 1\n");
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let loads_before = state.projection_authority.loads();
+
+        cached_authority_admission(&state).expect("the pair resolves");
+        assert!(
+            state.projection_authority.loads() > loads_before,
+            "the fixture's first read must load, or the assertions below prove nothing"
+        );
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "cached_authority_admission must not install the writer"
+        );
+        cached_authority_has_open_merge(&state).expect("the merge check resolves");
+        assert!(!state.projection_authority.holds_writer());
+        refuse_commit_during_open_merge(&state).expect("no merge is open");
+        assert!(!state.projection_authority.holds_writer());
+        crate::loop_runner::current_authority_admission(&state)
+            .expect("the loop's reader resolves");
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "the loop's plain reader must not install the writer"
+        );
+    }
+
+    /// A publishing tick that returns without publishing holds nothing either.
+    /// The admission pair's open is installed for the publication that would
+    /// follow; when nothing moved, no publication follows and no drop runs, so
+    /// the tick's own scope has to forget it. The yield-to-open-merge and
+    /// yield-to-commit returns share this scope.
+    ///
+    /// The publication above this tick re-installs the admission values at the
+    /// label it produced, so a second tick would read the pair from the slot and
+    /// install no writer, and a deleted guard passed this test exactly that way.
+    /// The slot is colded first, and the one open the tick then pays is asserted
+    /// as the proof that it installed.
+    #[cfg(unix)]
+    #[test]
+    fn a_publishing_tick_that_moves_nothing_holds_nothing_after() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let working = state.layout.working_dir().to_path_buf();
+        std::fs::create_dir_all(working.join("src")).unwrap();
+        std::fs::write(working.join("src/lib.py"), "def a():\n    return 1\n").unwrap();
+        let observation =
+            std::collections::BTreeSet::from([RepoPath::from_utf8("src/lib.py").unwrap()]);
+        assert!(!crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
+        assert!(!state.projection_authority.holds_writer());
+        // The same bytes again: the tick plans, finds nothing to move, and
+        // returns before any publication.
+        state.projection_authority.forget_admission();
+        let opens_before = kin_core::authority_opens();
+        assert!(!crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
+        assert_eq!(
+            kin_core::authority_opens() - opens_before,
+            1,
+            "the tick's pair read must be the one open that installs the writer, or the guard \
+             below is untested"
+        );
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "a tick that published nothing must not keep the manager its admission pair opened"
+        );
+    }
+
+    /// The held writer is behind the moment another writer publishes, and it
+    /// must never publish over that writer. The next edit reads the durable
+    /// publication first, misses the held label, and reopens; the fresh
+    /// authority then refuses the daemon's stale plan exactly as it did before
+    /// any writer was held, and the slot is forgotten so nothing stale survives
+    /// into the tick after.
+    #[cfg(unix)]
+    #[test]
+    fn a_publication_by_another_writer_is_never_overwritten_by_the_held_one() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let working = state.layout.working_dir().to_path_buf();
+        std::fs::create_dir_all(working.join("src")).unwrap();
+        std::fs::write(working.join("src/lib.py"), "def a():\n    return 1\n").unwrap();
+        let observation =
+            std::collections::BTreeSet::from([RepoPath::from_utf8("src/lib.py").unwrap()]);
+        assert!(!crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
+        // The publication drops its manager as it returns, so nothing is held
+        // here; the resolver below opens the one this test then holds.
+        assert!(!state.projection_authority.holds_writer());
+
+        // A writer beside the daemon publishes a tree the daemon's graph has not
+        // seen, through a fresh open of the same store.
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let foreign = context.open().unwrap();
+        let (roots, previous) = {
+            let lease = foreign.read_authority();
+            let previous = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == context.workspace_id())
+                .map(|workspace| workspace.tree.clone())
+                .unwrap_or_default();
+            (lease.roots().clone(), previous)
+        };
+        let foreign_hash = Hash256::from_bytes(state.blobs.write(b"foreign\n").unwrap().0);
+        std::fs::write(working.join("foreign.txt"), b"foreign\n").unwrap();
+        let mut artifacts = previous.artifacts_by_path().cloned().collect::<Vec<_>>();
+        artifacts.push(kin_model::ResolvedArtifact::new(
+            kin_model::ArtifactId::new(),
+            RepoPath::from_utf8("foreign.txt").unwrap(),
+            TreeEntry::blob(foreign_hash, false),
+        ));
+        let desired = kin_model::ResolvedTree::from_artifacts(artifacts).unwrap();
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            &working, roots, previous, desired,
+        );
+        crate::repository_commit::publish_workspace_tree_through(
+            state.blobs.as_ref(),
+            context.repository_id().clone(),
+            context.workspace_id(),
+            &foreign,
+            &admitted,
+            kin_model::OperationId::new(),
+            AuthorId::new("writer-beside-the-daemon"),
+        )
+        .unwrap()
+        .expect("the foreign publication must move authority");
+        let foreign_generation = foreign.read_authority().roots().generation;
+
+        // The daemon's next edit. Its held writer is one generation behind.
+        std::fs::write(working.join("src/lib.py"), "def a():\n    return 2\n").unwrap();
+        let opens_before = kin_core::authority_opens();
+        let error = crate::loop_runner::ambient_admission_for_test(&state, &observation)
+            .expect_err("a plan against a graph that is behind authority is refused");
+        assert!(
+            kin_core::authority_opens() - opens_before >= 1,
+            "the moved publication must be observed by a fresh open, not served from the held one"
+        );
+        assert!(
+            error.to_string().contains("authority"),
+            "the refusal names authority: {error}"
+        );
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "a refused publication forgets the held writer"
+        );
+        // Nothing overwrote the foreign publication.
+        let reopened = context.open().unwrap();
+        let lease = reopened.read_authority();
+        assert_eq!(lease.roots().generation, foreign_generation);
+        assert!(
+            lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == context.workspace_id())
+                .unwrap()
+                .tree
+                .artifact_at_path(&RepoPath::from_utf8("foreign.txt").unwrap())
+                .is_some(),
+            "the foreign writer's artifact must survive the daemon's refused publication"
+        );
+    }
+
+    /// The backstop for the one window the label cannot close: a foreign
+    /// publication landing between the daemon's identity read and its commit.
+    /// The held manager is then one generation behind but labelled current,
+    /// exactly the state that window produces, and the daemon's own
+    /// publication path must be REFUSED by kin-db's successor compare-and-swap,
+    /// must forget the held authority, and must not overwrite the foreign
+    /// publication. Built directly rather than raced: the window is two adjacent
+    /// statements wide and a test that waits for it proves nothing on time.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_authority_that_fell_behind_is_refused_by_the_cas_and_forgotten() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let working = state.layout.working_dir().to_path_buf();
+        std::fs::create_dir_all(working.join("src")).unwrap();
+        std::fs::write(working.join("src/lib.py"), "def a():\n    return 1\n").unwrap();
+        let observation =
+            std::collections::BTreeSet::from([RepoPath::from_utf8("src/lib.py").unwrap()]);
+        assert!(!crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
+        // The publication drops its manager as it returns, so nothing is held
+        // here; the resolver below opens the one this test then holds.
+        assert!(!state.projection_authority.holds_writer());
+
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        // The daemon's plan, as the tick makes it: against the held manager's
+        // roots and this workspace's tree, both at the held generation.
+        let held = held_write_authority(&state).expect("the held writer resolves");
+        let (held_roots, held_tree) = {
+            let lease = held.read_authority();
+            let tree = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == context.workspace_id())
+                .map(|workspace| workspace.tree.clone())
+                .unwrap_or_default();
+            (lease.roots().clone(), tree)
+        };
+        let held_generation = held_roots.generation;
+
+        // The foreign writer lands now, through its own open.
+        let foreign = context.open().unwrap();
+        let foreign_hash = Hash256::from_bytes(state.blobs.write(b"foreign\n").unwrap().0);
+        std::fs::write(working.join("foreign.txt"), b"foreign\n").unwrap();
+        let mut artifacts = held_tree.artifacts_by_path().cloned().collect::<Vec<_>>();
+        artifacts.push(kin_model::ResolvedArtifact::new(
+            kin_model::ArtifactId::new(),
+            RepoPath::from_utf8("foreign.txt").unwrap(),
+            TreeEntry::blob(foreign_hash, false),
+        ));
+        let foreign_desired = kin_model::ResolvedTree::from_artifacts(artifacts).unwrap();
+        crate::repository_commit::publish_workspace_tree_through(
+            state.blobs.as_ref(),
+            context.repository_id().clone(),
+            context.workspace_id(),
+            &foreign,
+            &crate::repository_commit::admitted_workspace_tree_for_test(
+                &working,
+                held_roots.clone(),
+                held_tree.clone(),
+                foreign_desired,
+            ),
+            kin_model::OperationId::new(),
+            AuthorId::new("writer-beside-the-daemon"),
+        )
+        .unwrap()
+        .expect("the foreign publication must move authority");
+        let foreign_generation = foreign.read_authority().roots().generation;
+        assert_eq!(foreign_generation, held_generation + 1);
+
+        // The window's exact product: the held manager, one generation behind,
+        // wearing the label the foreign publication produced.
+        let current = publication_identity_after_commit(&state).unwrap();
+        state
+            .projection_authority
+            .install_writer(current, Arc::clone(&held));
+
+        // The daemon publishes its own edit through the production path. The
+        // identity read matches the (mis)label, the held manager is reused, its
+        // plan checks pass against its own stale roots, and the commit reaches
+        // kin-db's compare-and-swap.
+        std::fs::write(working.join("src/lib.py"), "def a():\n    return 2\n").unwrap();
+        let edited_hash =
+            Hash256::from_bytes(state.blobs.write(b"def a():\n    return 2\n").unwrap().0);
+        let mut artifacts = held_tree.artifacts_by_path().cloned().collect::<Vec<_>>();
+        for artifact in &mut artifacts {
+            if artifact.path == RepoPath::from_utf8("src/lib.py").unwrap() {
+                artifact.entry = TreeEntry::blob(edited_hash, false);
+            }
+        }
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            &working,
+            held_roots,
+            held_tree,
+            kin_model::ResolvedTree::from_artifacts(artifacts).unwrap(),
+        );
+        let opens_before = kin_core::authority_opens();
+        let error = crate::loop_runner::publish_exact_workspace_tree(&state, &admitted)
+            .expect_err("a held manager behind the durable record must be refused");
+        assert_eq!(
+            kin_core::authority_opens() - opens_before,
+            0,
+            "the refusal comes from the compare-and-swap through the held manager, not from a \
+             fresh open that noticed the move"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("generation"),
+            "the compare-and-swap names the generation: {message}"
+        );
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "a refused publication forgets the held authority"
+        );
+
+        // Nothing overwrote the foreign publication, and the next resolver
+        // reopens from storage rather than serving the manager that fell behind.
+        let reopened = context.open().unwrap();
+        let lease = reopened.read_authority();
+        assert_eq!(lease.roots().generation, foreign_generation);
+        assert!(lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == context.workspace_id())
+            .unwrap()
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("foreign.txt").unwrap())
+            .is_some());
+        drop(lease);
+        let opens_before = kin_core::authority_opens();
+        let fresh = held_write_authority(&state).unwrap();
+        assert!(kin_core::authority_opens() - opens_before >= 1);
+        assert_eq!(
+            fresh.read_authority().roots().generation,
+            foreign_generation
         );
     }
 

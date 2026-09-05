@@ -42,7 +42,9 @@ use kin_model::{entity::Entity, EntityKind, EntityRole, FilePathId, LanguageId, 
 use serde::Serialize;
 
 use crate::error::{McpError, Result};
-use crate::handlers::common::{entity_presentation_end_line, entity_presentation_start_line};
+use crate::handlers::common::{
+    entity_presentation_end_line, entity_presentation_start_line, recorded_span_source_digest,
+};
 use crate::types::ToolCallResult;
 
 /// The tool's registered name, spelled once so the registry, the dispatcher,
@@ -167,6 +169,96 @@ impl ParsedState {
     /// entity surface. Only a complete parse does.
     pub fn certifies_enumeration(self) -> bool {
         matches!(self, Self::Full)
+    }
+}
+
+/// Whether the spans this enumeration serves were derived from the bytes the
+/// repository tree holds at this path right now.
+///
+/// The entity table and the repository tree are updated in separate
+/// transactions: an admission publishes the exact tree first and the reconciler
+/// re-derives spans afterwards (`SpanCoherence` in [`crate::handlers::common`]).
+/// Between those two steps, and for as long as the second never runs, the graph
+/// holds the new blob at the path and the old spans into it. A layout that says
+/// `Full` describes the parse that produced those spans, not the bytes now at
+/// the path, so on its own it cannot license certifying them: on a converted
+/// psf/requests the stranger of FIR-3201 was served a module entity ending at
+/// line 921 of a 937-line file under `parsed: full` and no degradation.
+///
+/// Read from the same stamp `get_entity_source` checks before it slices a body:
+/// the entity's recorded source digest against the tree's blob at the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanProvenance {
+    /// Every entity carrying a digest was derived from the blob the tree holds,
+    /// and at least one carries a digest.
+    DigestVerified,
+    /// No entity records a digest, so the pair could not be checked. Honest
+    /// absence rather than a claim of coherence: entities admitted by paths that
+    /// do not stamp provenance, such as a Git import, arrive without one.
+    Unverified,
+    /// At least this many entities record a digest that is not the blob the
+    /// tree holds at this path. Their spans were provably derived from other
+    /// bytes, so the enumeration cannot be certified over them.
+    Stale { entities: usize },
+    /// The tree admits no blob at this path (a gitlink, or a path admitted at
+    /// no tier), so there is nothing to check the spans against.
+    NoTreeBlob,
+}
+
+impl SpanProvenance {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::DigestVerified => "digest_verified",
+            Self::Unverified => "unverified",
+            Self::Stale { .. } => "stale",
+            Self::NoTreeBlob => "no_tree_blob",
+        }
+    }
+
+    /// How many entities were provably derived from other bytes.
+    pub fn stale_entities(self) -> usize {
+        match self {
+            Self::Stale { entities } => entities,
+            _ => 0,
+        }
+    }
+
+    /// Whether this reading permits certifying the enumeration. Only a provable
+    /// mismatch refuses: an unverified pair is the ordinary state of a converted
+    /// store and refusing it would floor every enumeration there.
+    pub fn permits_certification(self) -> bool {
+        !matches!(self, Self::Stale { .. })
+    }
+}
+
+/// Decide [`SpanProvenance`] for one file's entities against the blob the tree
+/// holds at its path.
+///
+/// One map lookup per entity and no store read: `tree_blob` is the tree entry
+/// the caller already resolved, and the digest is read off entity metadata the
+/// caller already holds.
+pub fn span_provenance(
+    entities: &[Entity],
+    tree_blob: Option<&kin_model::Hash256>,
+) -> SpanProvenance {
+    let Some(tree_blob) = tree_blob else {
+        return SpanProvenance::NoTreeBlob;
+    };
+    let mut verified = 0usize;
+    let mut stale = 0usize;
+    for entity in entities {
+        match recorded_span_source_digest(entity) {
+            Some(recorded) if recorded.as_bytes() == tree_blob.as_bytes() => verified += 1,
+            Some(_) => stale += 1,
+            None => {}
+        }
+    }
+    if stale > 0 {
+        SpanProvenance::Stale { entities: stale }
+    } else if verified > 0 && verified == entities.len() {
+        SpanProvenance::DigestVerified
+    } else {
+        SpanProvenance::Unverified
     }
 }
 
@@ -502,6 +594,15 @@ pub fn handle_list_file_entities<G: GraphStore>(
             .count()
     });
 
+    // The spans against the bytes. A layout certifies the parse that produced
+    // these spans; this certifies that the parse was of the bytes the tree holds
+    // now. Both have to hold before the enumeration is read as the file.
+    let tree_blob = store
+        .get_tree_entry(&file_id)
+        .map_err(McpError::graph)?
+        .and_then(|entry| entry.blob_identity());
+    let provenance = span_provenance(&entities, tree_blob.as_ref());
+
     let tier = tracking_tier(store, &file_id)?;
     let opaque_reason = opaque_reason(&path, tier);
     // Admission identity, resolved through the repository tree rather than
@@ -596,8 +697,15 @@ pub fn handle_list_file_entities<G: GraphStore>(
             // disclosure here and never a decider. `_kin.completeness` carries
             // the store-grain reading beside it, labelled as store-grain.
             "embedded": "not_measured_per_file",
+            // Whether the spans served here were derived from the bytes the tree
+            // holds at this path now. `stale` is a provable mismatch and refuses
+            // certification below; `unverified` is the ordinary state of a
+            // converted store and does not.
+            "span_provenance": provenance.wire(),
+            "stale_spans": provenance.stale_entities(),
             "whole_file_in_response": whole_file_in_response,
             "certifies_enumeration": parsed.certifies_enumeration()
+                && provenance.permits_certification()
                 && whole_file_in_response
                 && !enumeration_shifted,
         },
@@ -1370,5 +1478,175 @@ mod tests {
         assert_eq!(counted["returned"], serde_json::json!(3));
         assert_eq!(counted["exact"], serde_json::json!(false));
         assert_eq!(counted["floor_reason"], serde_json::json!("page_bounded"));
+    }
+
+    /// Stamp an entity with the source digest the reconciler records, so the
+    /// provenance check has something to compare against the tree.
+    fn stamped(mut entity: Entity, blob: [u8; 32]) -> Entity {
+        entity.metadata.extra.insert(
+            "blob_hash".into(),
+            serde_json::Value::String(kin_blobs::Hash256::from_bytes(blob).to_string()),
+        );
+        entity
+    }
+
+    /// FIR-3201. The tree holds blob B at the path and the entities record that
+    /// they were derived from blob A, while the layout still says `Full`: the
+    /// stranger's state on psf/requests, where a module entity ending at line
+    /// 921 of a 937-line file was served as certified. A full parse of other
+    /// bytes must not certify the enumeration, and the response must say why.
+    ///
+    /// The control is the same store with A == B, which must still certify, so
+    /// a fix that floors every enumeration fails here rather than passing.
+    #[test]
+    fn a_span_derived_from_other_bytes_cannot_certify_the_enumeration() {
+        // `admit` puts blob [7; 32] at the path.
+        let store = InMemoryGraph::new();
+        admit(&store, FILE);
+        for index in 0..3 {
+            store
+                .upsert_entity(&stamped(
+                    entity_at(&format!("export{index}"), FILE, index * 100),
+                    [8; 32],
+                ))
+                .unwrap();
+        }
+        store
+            .upsert_file_layout(&layout_for(FILE, ParseCompleteness::Full, 3))
+            .unwrap();
+
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(coverage["parsed"], serde_json::json!("full"), "{payload}");
+        assert_eq!(
+            coverage["span_provenance"],
+            serde_json::json!("stale"),
+            "{payload}"
+        );
+        assert_eq!(coverage["stale_spans"], serde_json::json!(3), "{payload}");
+        assert_eq!(
+            coverage["certifies_enumeration"],
+            serde_json::json!(false),
+            "a full parse of bytes the tree no longer holds must not certify: {payload}"
+        );
+        // The rows are still served: withholding graph truth teaches nothing.
+        assert_eq!(payload["total_in_file"], serde_json::json!(3));
+
+        // The control: the same store, digests that name the tree's own blob.
+        let store = InMemoryGraph::new();
+        admit(&store, FILE);
+        for index in 0..3 {
+            store
+                .upsert_entity(&stamped(
+                    entity_at(&format!("export{index}"), FILE, index * 100),
+                    [7; 32],
+                ))
+                .unwrap();
+        }
+        store
+            .upsert_file_layout(&layout_for(FILE, ParseCompleteness::Full, 3))
+            .unwrap();
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(
+            coverage["span_provenance"],
+            serde_json::json!("digest_verified"),
+            "{payload}"
+        );
+        assert_eq!(coverage["stale_spans"], serde_json::json!(0));
+        assert_eq!(
+            coverage["certifies_enumeration"],
+            serde_json::json!(true),
+            "spans derived from the tree's own blob must still certify: {payload}"
+        );
+    }
+
+    /// Entities with no recorded digest are the ordinary state of a store
+    /// converted from Git, and refusing them would floor every enumeration on
+    /// every such store. They stay certifiable and the reading says `unverified`
+    /// rather than pretending a check ran.
+    #[test]
+    fn an_unstamped_entity_is_reported_unverified_and_still_certifies() {
+        let store = store_with(2, Some(ParseCompleteness::Full));
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(
+            coverage["span_provenance"],
+            serde_json::json!("unverified"),
+            "{payload}"
+        );
+        assert_eq!(coverage["certifies_enumeration"], serde_json::json!(true));
+    }
+
+    /// One stale entity among verified ones is enough: the enumeration is one
+    /// answer, and one row derived from other bytes makes the whole of it
+    /// describe a file that is not at the path.
+    #[test]
+    fn one_stale_span_among_verified_ones_refuses_certification() {
+        let store = InMemoryGraph::new();
+        admit(&store, FILE);
+        store
+            .upsert_entity(&stamped(entity_at("fresh", FILE, 0), [7; 32]))
+            .unwrap();
+        store
+            .upsert_entity(&stamped(entity_at("stale", FILE, 100), [9; 32]))
+            .unwrap();
+        store
+            .upsert_file_layout(&layout_for(FILE, ParseCompleteness::Full, 2))
+            .unwrap();
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(coverage["span_provenance"], serde_json::json!("stale"));
+        assert_eq!(coverage["stale_spans"], serde_json::json!(1));
+        assert_eq!(coverage["certifies_enumeration"], serde_json::json!(false));
+    }
+
+    /// The one verdict a reader acts on. Stale spans under a `Full` layout must
+    /// reach it as an absent `file_parsed` class, a named limit, and a floor on
+    /// the count, so the envelope cannot compute `certified` over them the way
+    /// the stranger's envelope did.
+    #[test]
+    fn stale_spans_reach_the_verdict_as_an_absent_class_and_a_named_limit() {
+        let envelope = structural_authoritative_envelope();
+        let store = InMemoryGraph::new();
+        admit(&store, FILE);
+        store
+            .upsert_entity(&stamped(entity_at("moved", FILE, 0), [8; 32]))
+            .unwrap();
+        store
+            .upsert_file_layout(&layout_for(FILE, ParseCompleteness::Full, 1))
+            .unwrap();
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let annotated = crate::envelope::finalize(
+            ToolCallResult::text(serde_json::to_string(&payload).unwrap()),
+            envelope,
+            TOOL_NAME,
+        );
+        let crate::types::ContentBlock::Text { text } = &annotated.content[0];
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            value["_kin"]["completeness"]["classes"]["file_parsed"],
+            serde_json::json!("absent"),
+            "{value}"
+        );
+        let limits = finalized_limits(&store, FILE);
+        assert!(
+            limits.split(',').any(|limit| limit == "file_spans_stale"),
+            "the limit must name the stale spans: {limits:?}"
+        );
+        assert_eq!(
+            value["_kin"]["completeness"]["counted"]["floor_reason"],
+            serde_json::json!("file_spans_stale"),
+            "{value}"
+        );
+        assert_eq!(
+            value["_kin"]["completeness"]["counted"]["exact"],
+            serde_json::json!(false)
+        );
+        assert_ne!(
+            value["_kin"]["verdict"]["state"],
+            serde_json::json!("certified"),
+            "a stale enumeration must not be certified: {value}"
+        );
     }
 }

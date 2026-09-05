@@ -10404,7 +10404,12 @@ impl DaemonState {
     /// against this one lease.
     fn publish_local_workspace_enrichment(&self, expected_generation: u64) -> Result<u64> {
         let binding = self.local_repository_authority_binding()?;
-        let authority = binding.open_manager().map_err(DaemonError::from)?;
+        // The manager this daemon last published through, when its publication
+        // is still the one storage holds; a fresh open only when it is not. An
+        // open here is O(store), and this runs on every persist flush after an
+        // edit (FIR-3203).
+        let authority = crate::api::held_write_authority(self)
+            .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
         let workspace_id = binding.workspace_id();
         let lease = authority.read_authority();
         let observed_generation = lease.roots().generation;
@@ -10519,9 +10524,17 @@ impl DaemonState {
             sealed_observation: None,
             collaboration_delta: None,
         };
-        let receipt = authority
-            .commit_repository_transaction(transaction)
-            .map_err(DaemonError::from)?;
+        let receipt = match authority.commit_repository_transaction(transaction) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.projection_authority.forget_writer();
+                return Err(DaemonError::from(error));
+            }
+        };
+        let identity = crate::api::publication_identity_after_commit(self)
+            .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
+        crate::api::install_write_authority(self, &authority, identity)
+            .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
         self.record_repository_authority_commit(receipt.generation)?;
         info!(
             repo_id = self.cached_repo_id.as_str(),
@@ -10583,7 +10596,7 @@ impl DaemonState {
         Ok((delta, unpublishable))
     }
 
-    fn load_committed_authority_graph(
+    pub(crate) fn load_committed_authority_graph(
         &self,
         generation: u64,
     ) -> Result<Arc<kin_db::InMemoryGraph>> {
@@ -10619,7 +10632,12 @@ impl DaemonState {
             }
         } else {
             let binding = self.local_repository_authority_binding()?;
-            let authority = binding.open_manager().map_err(DaemonError::from)?;
+            // The manager this daemon just committed through, when its
+            // publication is still the one storage holds. Measured on a
+            // converted psf/requests: this open was one of seven a single
+            // `kin commit` paid, each decoding the change map (FIR-3203).
+            let authority = crate::api::held_write_authority(self)
+                .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
             let lease = authority.read_authority();
             let observed_generation = lease.roots().generation;
             if observed_generation != generation {
@@ -10640,6 +10658,17 @@ impl DaemonState {
                         binding.workspace_id()
                     )))
                 })?;
+            drop(lease);
+            // This is the last reader in the persist flush's scope: the
+            // enrichment publish installed the held manager, this reuses it,
+            // and forgetting it here ends the scope, so its decoded change map
+            // (about 2.7 GiB on a converted psf/requests) is not resident past
+            // the flush. The reconcile tick has its own scope and drops its
+            // manager the moment the publication returns; measured on that
+            // store, a manager alive across the two scopes stacked the flush's
+            // allocations on the decoded successor and put the edit-window peak
+            // 2 to 4 GiB above the pre-fix peak.
+            self.projection_authority.forget_writer();
             Arc::new(kin_db::InMemoryGraph::from_snapshot(snapshot).map_err(DaemonError::from)?)
         };
         Ok(authority_graph)

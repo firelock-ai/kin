@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 use kin_index::{
     FileClassification, FileClassifier, FileEvent, FileWatcher, IndexPipeline, IndexedAny,
 };
+use kin_model::layout::ParseCompleteness;
 use kin_model::{
     EntityFilter, EntityId, EntityStore, FilePathId, Hash256, RepoPath, ShallowTrackedFile,
     TransactionDelta, TreeDelta, TreeEntry,
@@ -480,21 +481,32 @@ pub(crate) fn publish_exact_workspace_tree(
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
     let started = Instant::now();
-    let Some(admission) = crate::repository_commit::publish_workspace_tree(
-        state.blobs.as_ref(),
-        &authority_context,
-        admitted,
-        kin_model::OperationId::new(),
-        // The daemon's own loop is the actor here, and naming it is a statement
-        // rather than a stand-in: nobody typed a command, this publishes no
-        // history node and advances no ref, and the workspace transition it
-        // records was observed by the watcher. A person's identity would be the
-        // fabrication on this path, not the honest answer. Every path that mints
-        // a change a person authored takes that person's resolved identity from
-        // the caller instead.
-        kin_model::AuthorId::new(DAEMON_ADMISSION_ACTOR),
-    )?
-    else {
+    // Through the authority this daemon already holds at the current
+    // publication, which after the daemon's own last publication is the very
+    // manager that performed it. Opening one afresh is O(store) and, on a
+    // converted psf/requests, the 3.6 GiB the stranger's daemon grew from one
+    // tracked-file edit (FIR-3203); reusing it costs nothing.
+    let authority = crate::api::held_write_authority(state)
+        .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
+    // Everything that runs while the tick's manager is alive, in one place, so
+    // that whichever path it returns by (published, nothing to publish, refused,
+    // or a label that could not be read) the manager is dropped and the slot
+    // forgotten exactly once below. An audit of the first shape of this found
+    // the no-op return and two `?` returns leaving the manager resident with no
+    // finalization armed to forget it, which is the held design's floor arriving
+    // through the back door.
+    let outcome = publish_through_held_authority(state, &authority_context, &authority, admitted);
+    // The admission pair keeps its relabelled values; the manager itself goes
+    // now, unconditionally. Measured on a converted psf/requests: a manager alive
+    // across the boundary between this publication and the persist flush that
+    // follows it holds the decoded successor while the flush's enrichment
+    // publish and read-index finalization allocate on top, and the edit-window
+    // peak landed 2 to 4 GiB above the pre-fix peak. Dropped here, the flush
+    // opens its own manager and frees it, exactly the pre-fix profile, with one
+    // open fewer per edit and the plan-time values shared.
+    drop(authority);
+    state.projection_authority.forget_writer();
+    let Some(admission) = outcome? else {
         return Ok(None);
     };
     // What this cost is what the reconcile tick is deciding whether to spend, so
@@ -509,6 +521,48 @@ pub(crate) fn publish_exact_workspace_tree(
         "admitted exact workspace tree into repository authority"
     );
     Ok(Some(admission.receipt.generation))
+}
+
+/// The part of [`publish_exact_workspace_tree`] that runs while the tick's
+/// held manager is alive: publish through it, then read the label the
+/// publication produced and relabel the admission pair with it.
+///
+/// A refused publication says nothing certain about the held manager, and one
+/// refused because another writer moved authority says the manager is behind
+/// it; the caller forgets the manager on every return of this function, so no
+/// branch here has to.
+fn publish_through_held_authority(
+    state: &DaemonState,
+    authority_context: &crate::local_repository_authority::LocalRepositoryAuthorityContext,
+    authority: &Arc<kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>>,
+    admitted: &crate::repository_commit::AdmittedWorkspaceTree,
+) -> Result<Option<crate::repository_commit::WorkspaceAdmissionResult>> {
+    let Some(admission) = crate::repository_commit::publish_workspace_tree_through(
+        state.blobs.as_ref(),
+        authority_context.repository_id().clone(),
+        authority_context.workspace_id(),
+        authority,
+        admitted,
+        kin_model::OperationId::new(),
+        // The daemon's own loop is the actor here, and naming it is a statement
+        // rather than a stand-in: nobody typed a command, this publishes no
+        // history node and advances no ref, and the workspace transition it
+        // records was observed by the watcher. A person's identity would be the
+        // fabrication on this path, not the honest answer. Every path that mints
+        // a change a person authored takes that person's resolved identity from
+        // the caller instead.
+        kin_model::AuthorId::new(DAEMON_ADMISSION_ACTOR),
+    )?
+    else {
+        return Ok(None);
+    };
+    // The label is read the instant after the commit; see
+    // `publication_identity_after_commit` for the window and its backstop.
+    let published = crate::api::publication_identity_after_commit(state)
+        .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
+    crate::api::install_write_authority(state, authority, published)
+        .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?;
+    Ok(Some(admission))
 }
 
 fn invalid_tree_transition(error: impl std::fmt::Display) -> DaemonError {
@@ -560,6 +614,34 @@ pub(crate) fn current_authority_admission(
 )> {
     crate::api::cached_authority_admission(state)
         .map_err(|(_status, message)| DaemonError::Io(std::io::Error::other(message)))
+}
+
+/// [`current_authority_admission`] for the one caller that goes on to publish:
+/// the open this pays is kept as the held writer for the publication in the same
+/// tick. Every other reader takes the plain form, which keeps nothing.
+fn current_authority_admission_for_publication(
+    state: &DaemonState,
+) -> Result<(
+    kin_model::RootBundle,
+    Option<kin_index::ResolvedAdmissionMatcher>,
+)> {
+    crate::api::cached_authority_admission_for_publication(state)
+        .map_err(|(_status, message)| DaemonError::Io(std::io::Error::other(message)))
+}
+
+/// Forgets the held writer when it goes out of scope, so a publishing tick that
+/// returns without publishing (yielded to an open merge or a waiting commit,
+/// nothing to move, a refused mass deletion, any error) cannot leave the
+/// manager its admission pair installed resident. The publication drops the
+/// manager itself; a second forget is a no-op.
+struct HeldWriterScope<'a> {
+    state: &'a DaemonState,
+}
+
+impl Drop for HeldWriterScope<'_> {
+    fn drop(&mut self) {
+        self.state.projection_authority.forget_writer();
+    }
 }
 
 /// Measure host content graph truth does not carry, right now.
@@ -717,7 +799,12 @@ fn exact_tree_admission(
     // Publication compare-and-swaps on this bundle, so a repository that moves
     // while the host walk is running fails the whole admission instead of
     // having its desired tree replanned onto the newer authority.
-    let (expected_roots, policy) = current_authority_admission(state)?;
+    // Held for this tick only, whatever path it returns by. Bound before the
+    // read, because the read itself can fail after it installed the writer
+    // (deriving the admission values reaches the backend), and an error out of
+    // it must not leave the manager resident either.
+    let _writer_scope = HeldWriterScope { state };
+    let (expected_roots, policy) = current_authority_admission_for_publication(state)?;
     if publication == TreePublication::StandaloneUnlessACommitIsWaiting
         && crate::api::cached_authority_has_open_merge(state)
             .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?
@@ -2307,12 +2394,63 @@ pub(crate) struct LayoutBackfill {
     pub(crate) unreadable: usize,
     /// Artifacts another facet already owns, which this pass must not touch.
     pub(crate) other_facet: usize,
+    /// Artifacts whose graph entities disagree with a fresh parse of the bytes
+    /// the tree holds: published as `Partial` rather than `Full`, and owed a
+    /// re-derivation. Counted inside `published`.
+    pub(crate) stale: usize,
+    /// The host paths whose entities are owed a re-derivation, for the loop to
+    /// enqueue as ordinary `Changed` events.
+    pub(crate) rederive: Vec<PathBuf>,
 }
 
 impl LayoutBackfill {
     fn observed(&self) -> usize {
         self.already_published + self.published + self.unreadable + self.other_facet
     }
+}
+
+/// One entity's identity as a parse would reproduce it: what it is, what it is
+/// called, and exactly which bytes it spans. Two parses of the same bytes agree
+/// on every field; a parse of different bytes moves the span of everything after
+/// the edit.
+type ParsedSpanKey = (String, String, usize, usize);
+
+fn parsed_span_keys(entities: &[kin_model::Entity]) -> Vec<ParsedSpanKey> {
+    let mut keys = entities
+        .iter()
+        .filter(|entity| entity.role == kin_model::EntityRole::Source)
+        .filter_map(|entity| {
+            entity.span.as_ref().map(|span| {
+                (
+                    format!("{:?}", entity.kind),
+                    entity.name.clone(),
+                    span.start_byte,
+                    span.end_byte,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+/// How many of the graph's source entities for one file a fresh parse of the
+/// tree's bytes does not reproduce.
+///
+/// Compared by kind, name and byte span rather than by id, because the
+/// reconciler keeps an entity's id stable across an edit that moves it
+/// (`stable_entity_ids` in kin-reconcile), so ids agree on a store that is
+/// fresh and disagree on one that is not, which is backwards for this question.
+/// Spans are the thing that goes stale, so spans are what is compared.
+pub(crate) fn spans_a_fresh_parse_does_not_reproduce(
+    held: &[kin_model::Entity],
+    fresh: &[kin_model::Entity],
+) -> usize {
+    let fresh_keys = parsed_span_keys(fresh);
+    parsed_span_keys(held)
+        .into_iter()
+        .filter(|key| fresh_keys.binary_search(key).is_err())
+        .count()
 }
 
 /// Publish the per-file parse observation for every admitted entity-source
@@ -2414,20 +2552,20 @@ pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<Layou
             continue;
         }
 
-        let completeness =
-            match pipeline.index_file_content_with_tests(&file_id, &content, body_hash) {
-                Ok(indexed) => indexed.indexed_file.file_layout.parse_completeness,
-                Err(error) => {
-                    debug!(
-                        file = %file_id,
-                        error = %error,
-                        "graph-owned source could not be indexed, so its parse observation stays \
-                         unpublished rather than being guessed"
-                    );
-                    report.unreadable += 1;
-                    continue;
-                }
-            };
+        let indexed = match pipeline.index_file_content_with_tests(&file_id, &content, body_hash) {
+            Ok(indexed) => indexed.indexed_file,
+            Err(error) => {
+                debug!(
+                    file = %file_id,
+                    error = %error,
+                    "graph-owned source could not be indexed, so its parse observation stays \
+                     unpublished rather than being guessed"
+                );
+                report.unreadable += 1;
+                continue;
+            }
+        };
+        let mut completeness = indexed.file_layout.parse_completeness;
 
         let mut entities = state.graph.query_entities(&EntityFilter {
             file_path: Some(file_id.clone()),
@@ -2440,6 +2578,30 @@ pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<Layou
                 .map(|span| span.start_byte)
                 .unwrap_or(usize::MAX)
         });
+        // The parse just taken is of the bytes the tree holds NOW. The entities
+        // the graph holds may have been derived from an earlier blob at this
+        // path: a daemon that admitted new bytes into the tree and died before
+        // it re-derived and published their entities leaves exactly that, and
+        // nothing else about the store says so (FIR-3201, the restart window of
+        // FIR-3208). Publishing `Full` here would certify those spans over
+        // bytes they do not describe. The observation is recorded as partial,
+        // with the count, and the path is handed back to the loop as an
+        // ordinary host event so the reconciler re-derives it through the same
+        // bounded admission an edit takes.
+        let stale = spans_a_fresh_parse_does_not_reproduce(&entities, &indexed.entities);
+        if stale > 0 {
+            if let Ok(host_path) =
+                kin_index::host_path_from_repo_path(state.layout.working_dir(), &artifact.path)
+            {
+                report.rederive.push(host_path);
+            }
+            report.stale += 1;
+            completeness = ParseCompleteness::Partial(format!(
+                "{stale} of {} entity span(s) the graph holds for this file were not derived from \
+                 the bytes the repository tree holds at this path; they are being re-derived",
+                entities.len()
+            ));
+        }
         let layout =
             kin_core::build_entity_file_layout(&file_id, &entities, content.len(), completeness);
         state.graph.upsert_file_layout(&layout)?;
@@ -2750,10 +2912,24 @@ pub async fn run_loop_armed(
                         already_published = report.already_published,
                         unreadable = report.unreadable,
                         other_facet = report.other_facet,
+                        stale = report.stale,
                         observed = report.observed(),
                         "published the per-file parse observation for admitted source files that \
                          carried none, so an enumeration over them can be certified"
                     );
+                    if !report.rederive.is_empty() {
+                        warn!(
+                            count = report.rederive.len(),
+                            "these paths hold entities a fresh parse of the tree's bytes does not \
+                             reproduce, so their spans describe an earlier state of the file; \
+                             their parse observation was published as partial and they are being \
+                             re-derived"
+                        );
+                        enqueue_file_events(
+                            &mut pending_events,
+                            report.rederive.into_iter().map(FileEvent::Changed),
+                        );
+                    }
                     state.bump_version();
                 }
                 Err(error) => {
@@ -3753,6 +3929,284 @@ mod tests {
     fn open_test_state(repo: &tempfile::TempDir) -> Arc<DaemonState> {
         let init = kin_core::init(repo.path()).unwrap();
         Arc::new(DaemonState::open(init.layout).unwrap())
+    }
+
+    /// Write `content` to `rel_path` in the working copy, admit it into the
+    /// repository tree through the real ambient admission, and re-derive its
+    /// entities and layout the way the loop does after an admission. Returns
+    /// the blob the tree now holds at the path.
+    ///
+    /// This is the settled state a healthy edit reaches: tree, entities and
+    /// layout all describe the same bytes.
+    fn admit_and_derive(state: &Arc<DaemonState>, rel_path: &str, content: &str) -> Hash256 {
+        let host_path = state.layout.working_dir().join(rel_path);
+        std::fs::create_dir_all(host_path.parent().unwrap()).unwrap();
+        std::fs::write(&host_path, content).unwrap();
+        let repo_path = RepoPath::from_utf8(rel_path).unwrap();
+        let observation = BTreeSet::from([repo_path.clone()]);
+        let yielded = ambient_admission_for_test(state, &observation).expect("admission runs");
+        assert!(!yielded, "the fixture admission must not yield to a commit");
+        derive_semantics(state, rel_path);
+        state
+            .graph
+            .get_tree_entry(&FilePathId::new(rel_path))
+            .unwrap()
+            .and_then(|entry| entry.blob_identity())
+            .expect("the tree holds a blob at the admitted path")
+    }
+
+    /// The enrichment half of one reconcile round for one path: what the loop
+    /// runs after `exact_tree_admission`, without the loop.
+    fn derive_semantics(state: &Arc<DaemonState>, rel_path: &str) {
+        let host_path = state.layout.working_dir().join(rel_path);
+        let mut reconciler =
+            kin_reconcile::Reconciler::new(state.layout.working_dir().to_path_buf());
+        let result = reconciler
+            .reconcile_file_change(
+                &FileEvent::Changed(host_path),
+                &state.blobs,
+                state.graph.as_ref(),
+            )
+            .expect("the reconciler derives the file");
+        let (outcome, delta) = result.into_parts();
+        assert!(
+            matches!(outcome, kin_reconcile::ReconcileOutcome::Updated { .. }),
+            "the fixture file must reconcile cleanly: {outcome:?}"
+        );
+        state.graph.apply_transaction_delta(&delta).unwrap();
+        state
+            .persist_projection_truth_from_reconcile(&reconciler, &outcome)
+            .unwrap();
+    }
+
+    fn file_coverage(state: &Arc<DaemonState>, rel_path: &str) -> serde_json::Value {
+        let args = HashMap::from([("path".to_string(), serde_json::json!(rel_path))]);
+        let result = kin_mcp::handlers::file_entities::handle_list_file_entities(
+            &args,
+            state.graph.as_ref(),
+        )
+        .expect("the enumeration answers");
+        let kin_mcp::types::ContentBlock::Text { text } = &result.content[0];
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        payload[kin_mcp::handlers::file_entities::FILE_COVERAGE_KEY].clone()
+    }
+
+    /// Whether `kin graph status`'s parse census counts `rel_path` as a file that
+    /// produced an entity, read through the same kin-core function the census
+    /// renders from.
+    fn census_counts_file(state: &Arc<DaemonState>, rel_path: &str) -> bool {
+        let entities = state.graph.list_all_entities().unwrap();
+        let retained = kin_core::retained_parse::read(&state.layout);
+        let census = kin_core::reference_coverage::collect_parse_coverage_from(
+            &state.graph.resolved_tree(),
+            &entities,
+            &retained,
+        );
+        // The census counts a file when an entity names it as origin and the
+        // tree admits it as source, so the python row must be whole AND the
+        // file must be the one it counted.
+        census
+            .languages
+            .iter()
+            .any(|row| row.language == "python" && row.tracked > 0 && row.silent == 0)
+            && entities
+                .iter()
+                .any(|entity| entity.file_origin.as_ref().map(|id| id.0.as_str()) == Some(rel_path))
+    }
+
+    const TWO_FUNCTIONS: &str = "def alpha():\n    return 1\n\n\ndef beta():\n    return 2\n";
+    /// Different bytes from [`TWO_FUNCTIONS`] on purpose: the observation planner
+    /// refuses a transition in which one exact blob appears at two paths, because
+    /// a copy and a move-plus-replace cannot be told apart from the tree alone.
+    const TWO_OTHER_FUNCTIONS: &str =
+        "def gamma():\n    return 3\n\n\ndef delta():\n    return 4\n";
+    const SEVENTEEN_LINES: &str = "# 1\n# 2\n# 3\n# 4\n# 5\n# 6\n# 7\n# 8\n# 9\n# 10\n# 11\n# 12\n# 13\n# 14\n# 15\n# 16\n# 17\n";
+
+    /// FIR-3201, the window. A file is admitted and derived, so its enumeration
+    /// certifies. Seventeen lines are prepended on disk and ONE ambient
+    /// admission runs: the tree now holds the new blob and the entities still
+    /// carry the old spans. The layout must not stand over them: kin-db's
+    /// `apply_transaction_delta` retires every path-keyed facet for a tree
+    /// delta that invalidates the path before it publishes the new tree, so
+    /// the enumeration floors on `file_parsed_absent` until the reconciler
+    /// re-derives the file, after which it and the parse census agree again.
+    /// Pinned here, in kin's own pipeline, so a dependency that stopped
+    /// retiring would fail this rather than certify a stale span.
+    #[test]
+    fn a_replaced_blob_retires_its_layout_until_the_spans_are_re_derived() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        state.is_initialized.store(true, Ordering::Relaxed);
+        let path = "src/mod.py";
+
+        let first_blob = admit_and_derive(&state, path, TWO_FUNCTIONS);
+        let settled = file_coverage(&state, path);
+        assert_eq!(settled["parsed"], serde_json::json!("full"), "{settled}");
+        assert_eq!(
+            settled["certifies_enumeration"],
+            serde_json::json!(true),
+            "the settled fixture must certify, or the assertions below prove nothing: {settled}"
+        );
+        assert!(census_counts_file(&state, path));
+
+        // The edit lands on disk and the tree moves. Nothing re-derives yet.
+        let host_path = state.layout.working_dir().join(path);
+        std::fs::write(&host_path, format!("{SEVENTEEN_LINES}{TWO_FUNCTIONS}")).unwrap();
+        let observation = BTreeSet::from([RepoPath::from_utf8(path).unwrap()]);
+        assert!(!ambient_admission_for_test(&state, &observation).unwrap());
+        let second_blob = state
+            .graph
+            .get_tree_entry(&FilePathId::new(path))
+            .unwrap()
+            .and_then(|entry| entry.blob_identity())
+            .unwrap();
+        assert_ne!(first_blob, second_blob, "the tree must hold the new bytes");
+
+        // The window: new blob, old spans. The enumeration must not certify.
+        let window = file_coverage(&state, path);
+        assert_eq!(
+            window["parsed"],
+            serde_json::json!("absent"),
+            "a layout describing the replaced blob must not stand: {window}"
+        );
+        assert_eq!(
+            window["certifies_enumeration"],
+            serde_json::json!(false),
+            "stale spans were certified: {window}"
+        );
+        let stale_alpha = state
+            .graph
+            .query_entities(&EntityFilter {
+                file_path: Some(FilePathId::new(path)),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "alpha")
+            .expect("alpha is still held");
+        assert_eq!(
+            stale_alpha.span.as_ref().unwrap().start_byte,
+            0,
+            "the fixture's spans really are stale in the window, or the test proves nothing"
+        );
+
+        // Settled: the reconciler re-derives, and both surfaces agree again.
+        derive_semantics(&state, path);
+        let settled = file_coverage(&state, path);
+        assert_eq!(settled["parsed"], serde_json::json!("full"), "{settled}");
+        assert_eq!(
+            settled["certifies_enumeration"],
+            serde_json::json!(true),
+            "{settled}"
+        );
+        let fresh_alpha = state
+            .graph
+            .query_entities(&EntityFilter {
+                file_path: Some(FilePathId::new(path)),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "alpha")
+            .unwrap();
+        assert_eq!(
+            fresh_alpha.span.as_ref().unwrap().start_byte,
+            SEVENTEEN_LINES.len(),
+            "the re-derived span must move by exactly the prepended bytes"
+        );
+        assert!(census_counts_file(&state, path));
+    }
+
+    /// FIR-3201, the restart window (FIR-3208's shape). A daemon admitted new
+    /// bytes into the tree and died before it re-derived and published their
+    /// entities. The next daemon holds the new blob, the old entities and no
+    /// layout, and its backfill re-parses the tree's bytes to publish one.
+    /// Before this change it published `Full` over the old spans, which is the
+    /// exact 20:52:58 state the stranger read. Now it publishes `Partial` with
+    /// the count, and hands the path back for re-derivation.
+    ///
+    /// The control is a file whose entities a fresh parse reproduces exactly,
+    /// which must still get `Full`, or a backfill that floors everything passes.
+    #[test]
+    fn the_backfill_refuses_full_over_entities_a_fresh_parse_does_not_reproduce() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        state.is_initialized.store(true, Ordering::Relaxed);
+        let stale_path = "src/stale.py";
+        let fresh_path = "src/fresh.py";
+        admit_and_derive(&state, stale_path, TWO_FUNCTIONS);
+        admit_and_derive(&state, fresh_path, TWO_OTHER_FUNCTIONS);
+
+        // The tree moves to the new bytes with nothing re-derived: the dead
+        // daemon's admission. The layout goes with the blob it described, as it
+        // would have in that daemon, and the entities keep their old spans.
+        let host_path = state.layout.working_dir().join(stale_path);
+        std::fs::write(&host_path, format!("{SEVENTEEN_LINES}{TWO_FUNCTIONS}")).unwrap();
+        let observation = BTreeSet::from([RepoPath::from_utf8(stale_path).unwrap()]);
+        assert!(!ambient_admission_for_test(&state, &observation).unwrap());
+        // A restart loses every layout the backfill exists to republish.
+        state
+            .graph
+            .delete_file_layout(&FilePathId::new(fresh_path))
+            .unwrap();
+        assert!(state
+            .graph
+            .get_file_layout(&FilePathId::new(stale_path))
+            .unwrap()
+            .is_none());
+
+        let report = backfill_missing_file_layouts(&state).unwrap();
+        assert_eq!(report.published, 2, "{report:?}");
+        assert_eq!(report.stale, 1, "{report:?}");
+        assert_eq!(report.rederive.len(), 1, "{report:?}");
+        assert!(
+            report.rederive[0].ends_with(stale_path),
+            "the owed re-derivation names the stale path: {report:?}"
+        );
+
+        let stale_layout = state
+            .graph
+            .get_file_layout(&FilePathId::new(stale_path))
+            .unwrap()
+            .expect("a layout is published for the stale path");
+        let ParseCompleteness::Partial(reason) = &stale_layout.parse_completeness else {
+            panic!(
+                "a fresh parse the graph's spans disagree with must not publish Full: {:?}",
+                stale_layout.parse_completeness
+            );
+        };
+        // The module entity, `alpha` and `beta`: a prepend moves all three spans.
+        assert!(reason.contains("3 of 3 entity span(s)"), "{reason}");
+        let coverage = file_coverage(&state, stale_path);
+        assert_eq!(
+            coverage["parsed"],
+            serde_json::json!("partial"),
+            "{coverage}"
+        );
+        assert_eq!(coverage["certifies_enumeration"], serde_json::json!(false));
+
+        let fresh_layout = state
+            .graph
+            .get_file_layout(&FilePathId::new(fresh_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fresh_layout.parse_completeness,
+            ParseCompleteness::Full,
+            "the control's entities match a fresh parse and must certify"
+        );
+        assert_eq!(
+            file_coverage(&state, fresh_path)["certifies_enumeration"],
+            serde_json::json!(true)
+        );
+
+        // Settled: the owed re-derivation runs, and the file certifies again over
+        // spans that moved by the prepended bytes.
+        derive_semantics(&state, stale_path);
+        let coverage = file_coverage(&state, stale_path);
+        assert_eq!(coverage["parsed"], serde_json::json!("full"), "{coverage}");
+        assert_eq!(coverage["certifies_enumeration"], serde_json::json!(true));
+        assert!(census_counts_file(&state, stale_path));
     }
 
     /// FIR-2442. A dropped host event is disclosed through the reconcile health

@@ -16,9 +16,9 @@ use kin_model::{
     compute_resolved_tree_hash, compute_semantic_change_id, AuthorId, ChangeOrigin,
     EffectiveAdmissionPolicyStamp, Hash256, ModelError, OperationId, RefExpectation, RefMutation,
     RefName, RefTarget, RefUpdatePolicy, RepoPath, RepositoryCommitOutcome,
-    RepositoryCommitReceipt, RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId,
-    SharedAdmissionPolicy, Timestamp, WorkspaceExpectation, WorkspaceHead, WorkspaceId,
-    WorkspaceMutation, WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    RepositoryCommitReceipt, RepositoryId, RepositoryTransaction, RootBundle, SemanticChange,
+    SemanticChangeId, SharedAdmissionPolicy, Timestamp, WorkspaceExpectation, WorkspaceHead,
+    WorkspaceId, WorkspaceMutation, WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 
 use crate::commit_deltas::compute_deltas_vs_repository_authority;
@@ -692,10 +692,38 @@ pub(crate) fn publish_workspace_tree(
     operation_id: OperationId,
     actor: AuthorId,
 ) -> Result<Option<WorkspaceAdmissionResult>> {
-    let desired_tree = &admitted.desired_tree;
-    let repository_id = authority_context.repository_id().clone();
-    let workspace_id = authority_context.workspace_id();
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
+    publish_workspace_tree_through(
+        blobs,
+        authority_context.repository_id().clone(),
+        authority_context.workspace_id(),
+        &authority,
+        admitted,
+        operation_id,
+        actor,
+    )
+}
+
+/// [`publish_workspace_tree`] through an authority the caller already holds
+/// open.
+///
+/// The daemon's reconcile loop publishes through one held manager across ticks
+/// (`api::held_write_authority`) so a tracked-file edit costs no whole-store
+/// open. The commit is the plain one, not `commit_repository_transaction_and_freeze`:
+/// the freeze variant hands back a deep clone of the whole successor state, which
+/// on a converted psf/requests is a decoded 2.7 GiB change map per publication.
+/// Measured, that clone alone put the daemon 5 GiB above the pre-fix peaks and
+/// over its own derived memory budget, which then shut it down under a commit.
+pub(crate) fn publish_workspace_tree_through(
+    blobs: &kin_blobs::BlobStore,
+    repository_id: RepositoryId,
+    workspace_id: WorkspaceId,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    admitted: &AdmittedWorkspaceTree,
+    operation_id: OperationId,
+    actor: AuthorId,
+) -> Result<Option<WorkspaceAdmissionResult>> {
+    let desired_tree = &admitted.desired_tree;
     let lease = authority.read_authority();
     if lease.roots() != &admitted.expected_roots {
         return Err(invalid(
@@ -743,7 +771,7 @@ pub(crate) fn publish_workspace_tree(
             // Every rule file in the desired tree is measured here, changed or
             // not, because the policy is derived from the whole tree rather
             // than from what moved.
-            let source = read_publishable_source(blobs, &authority, hash).map_err(|error| {
+            let source = read_publishable_source(blobs, authority, hash).map_err(|error| {
                 ModelError::InvalidOperation(format!(
                     "{error}, while deriving the admitted workspace policy"
                 ))
@@ -757,7 +785,7 @@ pub(crate) fn publish_workspace_tree(
             Ok(length)
         },
         |hash| {
-            read_publishable_source(blobs, &authority, hash)
+            read_publishable_source(blobs, authority, hash)
                 .map(|source| source.body().to_vec())
                 .map_err(|error| {
                     ModelError::InvalidOperation(format!(
@@ -834,7 +862,7 @@ pub(crate) fn publish_workspace_tree(
     // source becomes durable. An unchanged rule source is already there and
     // needs no copy.
     for hash in source_hashes {
-        if let Some(body) = read_publishable_source(blobs, &authority, hash)?.body_to_publish() {
+        if let Some(body) = read_publishable_source(blobs, authority, hash)?.body_to_publish() {
             authority.save_source_blob(hash, body)?;
         }
     }
