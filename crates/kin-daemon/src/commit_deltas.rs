@@ -20,6 +20,7 @@
 //! already reflects the current working state — diffing against the DAG
 //! baseline captures exactly what changed since the last commit.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use kin_db::{GraphSnapshot, InMemoryGraph};
@@ -54,7 +55,7 @@ pub fn compute_deltas_vs_last_commit(
     let committed = graph
         .resolve_graph_at(branch_head)
         .map_err(DaemonError::Graph)?;
-    compute_deltas_from_resolved_state(graph, committed)
+    compute_deltas_from_resolved_state(graph, &committed)
 }
 
 /// Resolve the graph at one change out of persisted authority, without
@@ -90,12 +91,12 @@ pub fn compute_deltas_vs_last_commit(
 /// Public so the heap-ceiling guard can measure both arms against the
 /// graph-building path in the same process, which is the only way its ceiling is
 /// evidence rather than an arbitrary constant.
-pub fn resolve_authority_baseline(
-    authority_snapshot: &GraphSnapshot,
+pub fn resolve_authority_baseline<'a>(
+    authority_snapshot: &'a GraphSnapshot,
     parent: &SemanticChangeId,
-) -> Result<ResolvedGraphState> {
+) -> Result<Cow<'a, ResolvedGraphState>> {
     match baseline_from_materialized_section(authority_snapshot, parent) {
-        Ok(state) => Ok(state),
+        Ok(state) => Ok(Cow::Borrowed(state)),
         Err(refusal) => {
             tracing::debug!(
                 %parent,
@@ -103,7 +104,7 @@ pub fn resolve_authority_baseline(
                 "the materialized graph section did not answer for this commit's parent, so the \
                  baseline folds from history instead"
             );
-            baseline_from_history(authority_snapshot, parent)
+            baseline_from_history(authority_snapshot, parent).map(Cow::Owned)
         }
     }
 }
@@ -116,16 +117,16 @@ pub fn resolve_authority_baseline(
 /// hashes every immutable field including `parents`, so naming the change names
 /// its complete ancestry and therefore the graph. This mirrors kin-db's own
 /// provider for the same section rather than inventing a second policy.
-fn baseline_from_materialized_section(
-    authority_snapshot: &GraphSnapshot,
+fn baseline_from_materialized_section<'a>(
+    authority_snapshot: &'a GraphSnapshot,
     parent: &SemanticChangeId,
-) -> std::result::Result<ResolvedGraphState, kin_db::MaterializedGraphRefusal> {
+) -> std::result::Result<&'a ResolvedGraphState, kin_db::MaterializedGraphRefusal> {
     let section = authority_snapshot
         .materialized_graph
         .as_ref()
         .ok_or(kin_db::MaterializedGraphRefusal::Absent)?;
     section.validate_for(parent)?;
-    Ok(section.state.clone())
+    Ok(&section.state)
 }
 
 /// Fold the parent out of persisted history, borrowing the change map.
@@ -159,7 +160,7 @@ pub fn compute_deltas_vs_repository_authority(
 ) -> Result<CommitDeltas> {
     let committed = match parent {
         Some(parent) => resolve_authority_baseline(authority_snapshot, parent)?,
-        None => ResolvedGraphState {
+        None => Cow::Owned(ResolvedGraphState {
             entities: Default::default(),
             relations: Default::default(),
             entity_revisions: Default::default(),
@@ -167,9 +168,9 @@ pub fn compute_deltas_vs_repository_authority(
             entity_tombstones: Default::default(),
             relation_tombstones: Default::default(),
             external_references: HashMap::new(),
-        },
+        }),
     };
-    compute_deltas_from_resolved_state(graph, committed)
+    compute_deltas_from_resolved_state(graph, &committed)
 }
 
 /// Build the complete derived-graph transition for one selected-path checkout.
@@ -516,7 +517,7 @@ fn checkout_path_contains(selected: &RepoPath, path: &RepoPath) -> bool {
 
 fn compute_deltas_from_resolved_state(
     graph: &InMemoryGraph,
-    committed: ResolvedGraphState,
+    committed: &ResolvedGraphState,
 ) -> Result<CommitDeltas> {
     // One coherent live snapshot keeps entity, relation, and exact-tree deltas
     // on the same graph generation.
