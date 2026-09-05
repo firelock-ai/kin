@@ -157,6 +157,27 @@ pub enum DaemonError {
     #[error("{0}")]
     SemanticReadmissionFailed(String),
 
+    /// Paths a commit would seal whose graph entities a parse of the bytes it
+    /// is sealing does not reproduce.
+    ///
+    /// Separate from
+    /// [`SemanticReadmissionFailed`](Self::SemanticReadmissionFailed), which is
+    /// a re-derivation this daemon attempted and could not complete. This is one
+    /// that has not happened yet: the bytes are durable authority, the parse that
+    /// would move the spans onto them is still owed, and a commit planned inside
+    /// that window records the new bytes against the old spans. Nothing is broken
+    /// and nothing needs repairing, so the answer is to re-derive and ask again
+    /// rather than to report a fault, and the paths travel with the refusal
+    /// because a caller cannot do either without them.
+    #[error(
+        "these paths hold entities that a parse of the bytes this commit would seal does not \
+         reproduce, so their semantics have not caught up with their bytes and the change would \
+         record the new bytes against spans derived from the old ones; nothing was written, and \
+         the commit records them correctly once they are re-derived: {}",
+        paths.join(", ")
+    )]
+    SemanticsBehindTree { paths: Vec<String> },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
