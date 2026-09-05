@@ -765,6 +765,180 @@ impl Verdict {
     }
 }
 
+/// The observed retained growth at which an anchored refusal stops admitting.
+///
+/// Read this as an ADMISSION threshold and not as a bound on memory. The rule
+/// samples the tree, admits a batch, and then awaits that whole batch before it
+/// consults again, so a batch admitted just under the threshold can overshoot it
+/// and only the NEXT consultation latches. Nothing here proves a peak fits the
+/// cgroup, which is exactly why [`host_leaves_room`] gates the exception and is
+/// not optional.
+///
+/// What it does bound is drift that is observed and carried forward: the anchor
+/// never moves, so a tree that creeps upward is latched off the moment a sample
+/// lands above it, and it cannot ratchet by re-anchoring.
+///
+/// The number is chosen from both sides. It has to clear sampling jitter, or the
+/// rule latches on its own noise and changes nothing: a daemon's proportional
+/// footprint is resampled per wake while language servers and a reconcile loop
+/// are live under it, and a few tens of mebibytes of drift between two samples
+/// is ordinary. And it has to stay small against the smallest budget the
+/// derivation can produce: 64 MiB is 6% of [`DERIVED_BUDGET_FLOOR_BYTES`] and
+/// about 1% of the 6 GiB budget a twelve-gigabyte container derives.
+pub const REFUSED_EMBED_GROWTH_TOLERANCE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What one pressure consultation established about this daemon's OWN tree.
+///
+/// Three states, not a boolean, and that is the whole point. A boolean makes
+/// `false` mean both "measured, and it recovered" and "could not be measured",
+/// and the second must never be read as the first: a transient
+/// `sample_tree_footprint` failure would then clear an anchor with no evidence
+/// of recovery, and the next successful sample would anchor HIGHER. Repeat that
+/// and the fixed ceiling ratchets, which is the guarantee this type exists to
+/// keep.
+///
+/// This is the BUDGET arm on its own. The combined verdict folds in the host,
+/// so it cannot say whether a refusal came from this tree or from the machine,
+/// and only a budget refusal may ever be relaxed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetObservation {
+    /// Measured, and below the rung that refuses. The tree recovered.
+    Recovered { held_bytes: u64 },
+    /// Measured, and at or past the rung that refuses.
+    Refused { held_bytes: u64 },
+    /// Not measured. Evidence of neither recovery nor growth.
+    Unobserved,
+}
+
+/// What a worker carries between wakes while its embed batches are refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefusedEmbedState {
+    /// Not refused, or a MEASURED recovery has been seen since the last refusal.
+    #[default]
+    Clear,
+    /// Refused, holding the tree footprint the FIRST refusal measured.
+    ///
+    /// The anchor never moves while the state stays here. A mark that advanced
+    /// with each admitted batch would licence one batch of growth per wake for
+    /// ever, which is the runaway this module exists to stop.
+    Anchored(u64),
+    /// Refused, and the tree has grown past its anchor. Nothing is admitted
+    /// until a measured recovery clears it.
+    Latched,
+}
+
+/// Whether one refused embed wake may still run a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedEmbedAdmission {
+    /// Run nothing this wake.
+    Hold,
+    /// Run a floor-size batch: the tree has not grown since it was anchored.
+    AdmitFloorBatch,
+}
+
+/// Whether the machine itself has room to spare, as opposed to this daemon.
+///
+/// `Unknown` is deliberately not room. Everywhere else in this module an
+/// unreadable host is the lowest rung so it can never make a decision worse,
+/// which is right when the question is whether to STOP. Here the question is
+/// whether to relax a stop already in force, and the answers are not symmetric:
+/// an absent measurement must not buy an exception.
+pub fn host_leaves_room(level: PressureLevel) -> bool {
+    match level {
+        PressureLevel::Nominal | PressureLevel::Elevated => true,
+        PressureLevel::Unknown | PressureLevel::Critical => false,
+    }
+}
+
+/// Whether a daemon already refused for memory may still finish work it started.
+///
+/// A refusal is the right answer to a tree that is GROWING and the wrong answer
+/// to one that has simply settled above its budget, and the two are
+/// indistinguishable from a single sample. That gap is a measured defect, not a
+/// hypothetical: a daemon in a twelve-gigabyte container derives a 6.0 GiB
+/// budget, idles at 4.8 GiB (elevated, so its batch shrinks), and comes out of
+/// its FIRST completed batch holding 6.7 GiB, because an embedding pass leaves
+/// the model and index it loaded resident for the next one. From there every
+/// later batch is refused, on a five-second wake, for the life of the process,
+/// and the store stops converging one batch into a backlog of thousands. The
+/// refusal cannot end, either: what put the tree over its budget is the very
+/// state the next batch would reuse, so waiting reclaims nothing.
+///
+/// So this asks the question a single sample cannot: has the tree grown SINCE
+/// the refusal began. The first refusal after real progress anchors what was
+/// held and still holds that wake, which is the cautious reading of a level
+/// that has just changed. Later wakes at or below that anchor plus
+/// [`REFUSED_EMBED_GROWTH_TOLERANCE_BYTES`] run a floor-size batch, because a
+/// tree that is not growing is not the tree a refusal was written for. The
+/// first sample above it latches.
+///
+/// Two things gate the exception, and neither is optional.
+///
+/// `host_level` is the machine's own rung, before this daemon's budget was
+/// folded in. An anchored tree says this PROCESS is not growing; it says nothing
+/// about what the machine has left, because the budget is per daemon and derived
+/// from a ceiling every daemon shares. Both repo daemons in the measured
+/// container derived 6.0 GiB from the same 12 GiB cgroup, which is the entire
+/// cgroup between the two of them with nothing left for the three language
+/// servers each one starts. So a critical machine, or one that could not be
+/// read, keeps its refusal whatever the anchor says.
+///
+/// [`BudgetObservation`] is the other. Only a MEASURED recovery clears the
+/// state. An unobserved wake carries Anchored or Latched forward untouched, so a
+/// gap in sampling can neither grant an exception nor move the ceiling.
+///
+/// `completed_a_batch` keeps this pointed at the measured case. A worker that
+/// has never finished a batch in this process has not established that its
+/// footprint is a settled cost rather than a rising one, so it keeps today's
+/// behaviour and refuses.
+///
+/// Pure, so every arm is testable without a daemon, an embedder or a loaded
+/// machine.
+pub fn admit_refused_embed(
+    state: RefusedEmbedState,
+    observation: BudgetObservation,
+    host_level: PressureLevel,
+    completed_a_batch: bool,
+    tolerance_bytes: u64,
+) -> (RefusedEmbedState, RefusedEmbedAdmission) {
+    // Asked before anything is read, and before any state moves: a machine that
+    // is full, or one that could not be read, neither admits work nor supplies
+    // the evidence that would retire an anchor.
+    if !host_leaves_room(host_level) {
+        return (state, RefusedEmbedAdmission::Hold);
+    }
+    let held = match observation {
+        BudgetObservation::Unobserved => return (state, RefusedEmbedAdmission::Hold),
+        BudgetObservation::Recovered { .. } => {
+            return (RefusedEmbedState::Clear, RefusedEmbedAdmission::Hold)
+        }
+        BudgetObservation::Refused { held_bytes } => held_bytes,
+    };
+    match state {
+        RefusedEmbedState::Latched => (RefusedEmbedState::Latched, RefusedEmbedAdmission::Hold),
+        RefusedEmbedState::Clear => {
+            if completed_a_batch {
+                (
+                    RefusedEmbedState::Anchored(held),
+                    RefusedEmbedAdmission::Hold,
+                )
+            } else {
+                (RefusedEmbedState::Clear, RefusedEmbedAdmission::Hold)
+            }
+        }
+        RefusedEmbedState::Anchored(anchor) => {
+            if held <= anchor.saturating_add(tolerance_bytes) {
+                (
+                    RefusedEmbedState::Anchored(anchor),
+                    RefusedEmbedAdmission::AdmitFloorBatch,
+                )
+            } else {
+                (RefusedEmbedState::Latched, RefusedEmbedAdmission::Hold)
+            }
+        }
+    }
+}
+
 /// The disclosure sentence, in the register the commit post-kill diagnosis
 /// established: what was measured, against what ceiling, what Kin did about it,
 /// and what that costs.
@@ -3520,5 +3694,289 @@ mod tests {
                 panic!("nothing forces a level in this test, yet the probe returned {level:?}")
             }
         }
+    }
+
+    const IDLE: u64 = 5_153_960_755; // 4.8 GiB, elevated against a 6.0 GiB budget
+    const AFTER_FIRST_BATCH: u64 = 7_194_070_384; // 6.7 GiB, critical
+
+    fn refused_at(held_bytes: u64) -> BudgetObservation {
+        BudgetObservation::Refused { held_bytes }
+    }
+
+    fn recovered_at(held_bytes: u64) -> BudgetObservation {
+        BudgetObservation::Recovered { held_bytes }
+    }
+
+    /// The measured stranger sequence, in the bytes the daemon actually held.
+    ///
+    /// A twelve-gigabyte container derives a 6.0 GiB budget, the daemon idles at
+    /// 4.8 GiB (elevated), completes one batch, and comes out of it holding
+    /// 6.7 GiB (critical). Before this rule the drain stopped there for the life
+    /// of the process, on a five-second wake, 128 vectors into 1722.
+    #[test]
+    fn a_tree_that_settled_above_its_budget_keeps_draining() {
+        // Idle and below the refusing rung: nothing is anchored.
+        let (state, admission) = admit_refused_embed(
+            RefusedEmbedState::Clear,
+            recovered_at(IDLE),
+            PressureLevel::Elevated,
+            false,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(state, RefusedEmbedState::Clear);
+        assert_eq!(admission, RefusedEmbedAdmission::Hold);
+
+        // The first refusal after the first completed batch anchors and holds.
+        let (state, admission) = admit_refused_embed(
+            state,
+            refused_at(AFTER_FIRST_BATCH),
+            PressureLevel::Elevated,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(
+            state,
+            RefusedEmbedState::Anchored(AFTER_FIRST_BATCH),
+            "the first refusal records what the tree was holding"
+        );
+        assert_eq!(
+            admission,
+            RefusedEmbedAdmission::Hold,
+            "a level that has just changed is read cautiously for one wake"
+        );
+
+        // Every later wake at a settled footprint runs a floor-size batch. This
+        // is the arm the measured defect never reached.
+        for wake in 0..64 {
+            let jitter = AFTER_FIRST_BATCH + (wake % 8) * 1_048_576;
+            let (next, admission) = admit_refused_embed(
+                state,
+                refused_at(jitter),
+                PressureLevel::Elevated,
+                true,
+                REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+            );
+            assert_eq!(
+                admission,
+                RefusedEmbedAdmission::AdmitFloorBatch,
+                "wake {wake}: a tree that is not growing must keep converging"
+            );
+            assert_eq!(
+                next,
+                RefusedEmbedState::Anchored(AFTER_FIRST_BATCH),
+                "wake {wake}: the anchor must not move, or admission licences \
+                 one batch of growth per wake for ever"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tree_that_is_still_growing_stays_refused() {
+        let state = RefusedEmbedState::Anchored(AFTER_FIRST_BATCH);
+        let (state, admission) = admit_refused_embed(
+            state,
+            refused_at(AFTER_FIRST_BATCH + REFUSED_EMBED_GROWTH_TOLERANCE_BYTES + 1),
+            PressureLevel::Elevated,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(
+            admission,
+            RefusedEmbedAdmission::Hold,
+            "one byte past the tolerance is growth, and growth is what a refusal is for"
+        );
+        assert_eq!(state, RefusedEmbedState::Latched);
+
+        // The latch outlives a footprint that comes back down while still
+        // refused, so a tree sawtoothing across the tolerance cannot ride it up.
+        let (state, admission) = admit_refused_embed(
+            state,
+            refused_at(AFTER_FIRST_BATCH),
+            PressureLevel::Elevated,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(admission, RefusedEmbedAdmission::Hold);
+        assert_eq!(state, RefusedEmbedState::Latched);
+
+        // A MEASURED recovery is the one thing that clears it.
+        let (state, _) = admit_refused_embed(
+            state,
+            recovered_at(IDLE),
+            PressureLevel::Elevated,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(state, RefusedEmbedState::Clear);
+    }
+
+    /// A settled tree is not evidence of room when the machine itself is full.
+    ///
+    /// The budget is per daemon and derived from a ceiling every daemon shares.
+    /// Both repo daemons in the measured container derived 6.0 GiB from the same
+    /// 12 GiB cgroup, so an anchor proves only that THIS process stopped growing
+    /// while a sibling eats the headroom it cannot see.
+    #[test]
+    fn a_settled_tree_on_a_critical_machine_stays_refused() {
+        let anchored = RefusedEmbedState::Anchored(AFTER_FIRST_BATCH);
+
+        // Host critical, budget critical.
+        let (state, admission) = admit_refused_embed(
+            anchored,
+            refused_at(AFTER_FIRST_BATCH),
+            PressureLevel::Critical,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(
+            admission,
+            RefusedEmbedAdmission::Hold,
+            "a critical machine keeps its refusal whatever this tree has settled at"
+        );
+        assert_eq!(
+            state, anchored,
+            "and the anchor is held rather than latched, because the machine can recover"
+        );
+
+        // Host critical, budget NOMINAL. A recovery seen while the machine is
+        // full is not a recovery this rule may act on, so the anchor survives.
+        let (state, admission) = admit_refused_embed(
+            anchored,
+            recovered_at(IDLE),
+            PressureLevel::Critical,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(admission, RefusedEmbedAdmission::Hold);
+        assert_eq!(
+            state, anchored,
+            "a critical host supplies no evidence, in either direction"
+        );
+
+        // Positive control, or this test would pass for the wrong reason.
+        let (_, admission) = admit_refused_embed(
+            anchored,
+            refused_at(AFTER_FIRST_BATCH),
+            PressureLevel::Elevated,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(
+            admission,
+            RefusedEmbedAdmission::AdmitFloorBatch,
+            "positive control: the gate must be the host level and nothing else"
+        );
+    }
+
+    /// An absent measurement must not buy an exception, in either direction.
+    #[test]
+    fn a_settled_tree_with_unreadable_headroom_stays_refused() {
+        let anchored = RefusedEmbedState::Anchored(AFTER_FIRST_BATCH);
+        let (state, admission) = admit_refused_embed(
+            anchored,
+            refused_at(AFTER_FIRST_BATCH),
+            PressureLevel::Unknown,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(
+            admission,
+            RefusedEmbedAdmission::Hold,
+            "a host that could not be read is not a host with room"
+        );
+        assert_eq!(state, anchored);
+
+        assert!(!host_leaves_room(PressureLevel::Unknown));
+        assert!(!host_leaves_room(PressureLevel::Critical));
+        assert!(host_leaves_room(PressureLevel::Nominal));
+        assert!(host_leaves_room(PressureLevel::Elevated));
+    }
+
+    /// The ratchet. An unmeasured tree must not clear an anchor.
+    ///
+    /// `sample_tree_footprint` can fail transiently. When it does, the combined
+    /// verdict on a nominal host reads Proceed, and a rule that took that for
+    /// recovery would clear the anchor and re-anchor at the next, HIGHER sample.
+    /// Repeat that across wakes and the fixed ceiling walks upward, which is the
+    /// whole guarantee gone.
+    #[test]
+    fn an_unobserved_wake_cannot_move_the_anchor() {
+        let anchored = RefusedEmbedState::Anchored(AFTER_FIRST_BATCH);
+        let (state, admission) = admit_refused_embed(
+            anchored,
+            BudgetObservation::Unobserved,
+            PressureLevel::Nominal,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(
+            state, anchored,
+            "a wake that measured nothing carries the anchor forward untouched"
+        );
+        assert_eq!(admission, RefusedEmbedAdmission::Hold);
+
+        // Carried forward: the next critical sample above the ORIGINAL anchor
+        // plus tolerance must latch, not anchor higher.
+        let grown = AFTER_FIRST_BATCH + REFUSED_EMBED_GROWTH_TOLERANCE_BYTES + 1;
+        let (state, admission) = admit_refused_embed(
+            state,
+            refused_at(grown),
+            PressureLevel::Nominal,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(
+            state,
+            RefusedEmbedState::Latched,
+            "growth measured against the original anchor latches; re-anchoring here is the ratchet"
+        );
+        assert_eq!(admission, RefusedEmbedAdmission::Hold);
+    }
+
+    #[test]
+    fn an_unobserved_wake_cannot_clear_a_latch() {
+        let (state, admission) = admit_refused_embed(
+            RefusedEmbedState::Latched,
+            BudgetObservation::Unobserved,
+            PressureLevel::Nominal,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(
+            state,
+            RefusedEmbedState::Latched,
+            "a latched runaway is not released by a gap in sampling"
+        );
+        assert_eq!(admission, RefusedEmbedAdmission::Hold);
+
+        // And a repeated gap cannot wear it down.
+        let mut state = state;
+        for _ in 0..16 {
+            let (next, admission) = admit_refused_embed(
+                state,
+                BudgetObservation::Unobserved,
+                PressureLevel::Nominal,
+                true,
+                REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+            );
+            assert_eq!(next, RefusedEmbedState::Latched);
+            assert_eq!(admission, RefusedEmbedAdmission::Hold);
+            state = next;
+        }
+    }
+
+    #[test]
+    fn a_worker_that_never_finished_a_batch_is_refused_as_before() {
+        // Without a completed batch there is no evidence the footprint is a
+        // settled cost rather than a rising one, so the old behaviour stands.
+        let (state, admission) = admit_refused_embed(
+            RefusedEmbedState::Clear,
+            refused_at(AFTER_FIRST_BATCH),
+            PressureLevel::Elevated,
+            false,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(state, RefusedEmbedState::Clear, "nothing is anchored");
+        assert_eq!(admission, RefusedEmbedAdmission::Hold);
     }
 }
