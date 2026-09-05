@@ -10,6 +10,7 @@ pub mod envelope;
 pub mod error;
 pub mod handlers;
 pub mod negative;
+pub mod remediation;
 pub mod server;
 pub mod session;
 pub mod startup_binding;

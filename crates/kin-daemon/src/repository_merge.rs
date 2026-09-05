@@ -871,11 +871,12 @@ pub(crate) fn publish_resolved_merge(
 ) -> Result<MergeExecution> {
     if !record.is_fully_resolved() {
         return Err(merge_conflict(format!(
-            "merging {} into {} still has {} unresolved conflict(s): {}",
+            "merging {} into {} still has {} unresolved conflict(s): {}. {}",
             record.binding.source_ref,
             record.binding.target_ref,
             record.unresolved().count(),
-            crate::repository_merge_state::describe_unresolved(&record)
+            crate::repository_merge_state::describe_unresolved(&record),
+            kin_cli::commands::resolve::RESOLVE_NEXT_STEPS
         )));
     }
     if restore_point(&workspace) != record.restore {
@@ -2702,11 +2703,7 @@ fn open_conflicted_merge(
     lines.extend(render_conflict_lines(
         &record.unresolved().collect::<Vec<_>>(),
     ));
-    lines.push(
-        "Settle each conflict with `kin resolve`, then `kin resolve --continue`, or discard the \
-         merge with `kin resolve --abort`"
-            .to_string(),
-    );
+    lines.push(kin_cli::commands::resolve::RESOLVE_NEXT_STEPS.to_string());
     let report = MergeReport {
         schema: MERGE_REPORT_SCHEMA.to_string(),
         authority: "repository-v6".to_string(),

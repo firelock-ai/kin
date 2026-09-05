@@ -24,6 +24,20 @@ pub const MAX_RESOLVE_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// JSON encodes each byte using at most four bytes, including its separator.
 pub const MAX_RESOLVE_REQUEST_BYTES: usize = 4 * MAX_RESOLVE_FILE_BYTES + 1024 * 1024;
 
+/// Every form that moves a parked merge, in one sentence, for every line that
+/// hands a person the way out: the CLI's exit-8 line, the daemon's parked
+/// report, and the 409 that `--continue` answers with conflicts outstanding.
+///
+/// `--file <PATH> <FILE>` is here on purpose. It is the form that settles a
+/// conflict with exact merged bytes, which is what a person who has already
+/// merged the file by hand has in front of them, and the lines above used to
+/// name the side-picking forms and `--continue` while leaving it out, so the
+/// hand-merged file had no named way in.
+pub const RESOLVE_NEXT_STEPS: &str = "Settle a conflict with `kin resolve --ours <SUBJECT>` or \
+     `--theirs <SUBJECT>`, settle a whole file with its exact merged bytes with `kin resolve \
+     --file <PATH> <FILE>`, settle everything left with `--all-ours` or `--all-theirs`, then \
+     publish with `kin resolve --continue` or discard the merge with `kin resolve --abort`";
+
 /// How one named conflict is settled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "choice", rename_all = "snake_case", deny_unknown_fields)]
@@ -317,6 +331,31 @@ fn parse_record_hash(value: &str) -> Result<Hash256> {
 
 #[cfg(test)]
 mod tests {
+    /// The journey: a person hand-merges a conflicted file, reads the parked
+    /// line and the 409, and finds `--continue` and the side-picking forms but
+    /// not the one form that takes the bytes they just produced.
+    #[test]
+    fn the_next_steps_name_the_exact_bytes_form_beside_the_side_picking_ones() {
+        for form in [
+            "kin resolve --file <PATH> <FILE>",
+            "--all-ours",
+            "--all-theirs",
+            "kin resolve --continue",
+            "kin resolve --abort",
+        ] {
+            assert!(
+                super::RESOLVE_NEXT_STEPS.contains(form),
+                "the way out of a parked merge omits `{form}`: {}",
+                super::RESOLVE_NEXT_STEPS
+            );
+        }
+        assert!(
+            super::RESOLVE_NEXT_STEPS.contains("exact merged bytes"),
+            "and says what the --file form is for: {}",
+            super::RESOLVE_NEXT_STEPS
+        );
+    }
+
     use super::*;
 
     fn file_action(

@@ -2133,12 +2133,22 @@ fn configure_antigravity() -> Result<PathBuf> {
         .join("mcp_config.json");
     let workspace = repo_root.join(".agents").join("mcp_config.json");
     let topology = McpTopologyLock::acquire()?;
-    ensure_workspace_mcp_git_excluded(&repo_root)?.with_context(|| {
-        format!(
-            "Antigravity workspace binding requires trusted Git authority at {}",
-            repo_root.display()
-        )
-    })?;
+    // The workspace binding is kept out of Git through the repository's own
+    // exclude file. A repository with no Git directory has nothing to exclude
+    // it from, and a Kin-native repository is exactly that shape, so the
+    // binding is written all the same and the one thing a person can still do
+    // about the file is named. This used to refuse with "requires trusted Git
+    // authority", which sent a stranger who had skipped Git on purpose to go
+    // and get some.
+    if ensure_workspace_mcp_git_excluded(&repo_root)?.is_none() {
+        println!(
+            "      no Git directory at {}, so {} is not excluded from any version control; \
+             to keep it out of Kin's own admission, add `{}` to .kinignore",
+            repo_root.display(),
+            workspace.display(),
+            WORKSPACE_MCP_GIT_EXCLUDE_PATTERNS[0]
+        );
+    }
 
     let mut targets = vec![
         McpRepairTarget {
@@ -23309,6 +23319,58 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             status.stdout.is_empty(),
             "workspace MCP config or lock leaked into Git status: {}",
             String::from_utf8_lossy(&status.stdout)
+        );
+    }
+
+    /// A repository that never had Git in it, which is the shape `kin init`
+    /// produces when a person takes "skip Git entirely" at its word. Setup
+    /// used to refuse it with "requires trusted Git authority" and no next
+    /// step; it writes the binding now, because there is no Git to leak into.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn antigravity_setup_on_a_git_free_repository_writes_the_binding() {
+        struct CurrentDirGuard(PathBuf);
+        impl Drop for CurrentDirGuard {
+            fn drop(&mut self) {
+                let _ = env::set_current_dir(&self.0);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
+        assert!(
+            !repo.join(".git").exists(),
+            "the fixture is Git-free by construction"
+        );
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _scan_root =
+            EnvVarGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &repo);
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(&repo).unwrap();
+        let _cwd = CurrentDirGuard(previous);
+        let canonical_repo = repo.canonicalize().unwrap();
+
+        let global =
+            configure_antigravity().expect("a Git-free repository is a first-class setup target");
+        let workspace = repo.join(".agents/mcp_config.json");
+        assert_eq!(global, home.join(".gemini/config/mcp_config.json"));
+        for path in [&global, &workspace] {
+            let entry = read_kin_mcp_entry(path).unwrap();
+            assert_eq!(
+                entry["args"],
+                serde_json::json!(["mcp", "start", "--repo", canonical_repo.to_string_lossy()])
+            );
+        }
+        assert!(
+            !repo.join(".git").exists(),
+            "setup must not conjure a Git directory to satisfy its own exclude step"
         );
     }
 

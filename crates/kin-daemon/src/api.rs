@@ -13201,7 +13201,12 @@ fn validate_repo_scoped_tool_arguments(
                 )));
             }
             validate_optional_u64_range(arguments, "depth", 1, 8)?;
-            validate_optional_u64_range(arguments, "limit_per_step", 1, 25)?;
+            validate_optional_u64_range(
+                arguments,
+                "limit_per_step",
+                1,
+                kin_mcp::remediation::TRACE_MAX_LIMIT_PER_STEP as u64,
+            )?;
             for key in ["include_body", "compact", "include_type_edges"] {
                 validate_optional_bool(arguments, key)?;
             }
@@ -15440,6 +15445,11 @@ fn repository_transfer_error(
         RepositoryTransferError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
         RepositoryTransferError::Conflict(_) => StatusCode::CONFLICT,
         RepositoryTransferError::Storage(_) => StatusCode::FAILED_DEPENDENCY,
+        // The PEER wanted a credential, not this daemon. Relayed as the
+        // dependency failure it is rather than as a 401 of this daemon's own,
+        // which the CLI would read as its local token being refused. The
+        // message carries the credential the peer accepts and where it lives.
+        RepositoryTransferError::Unauthenticated(_) => StatusCode::FAILED_DEPENDENCY,
     };
     (status, error.to_string())
 }

@@ -65,7 +65,8 @@ stopped the walk and how much of the graph it explored, and the same-name twin c
 each end, so read `_kin.verdict` before concluding that A never reaches B.";
 
 const DEFAULT_MAX_DEPTH: usize = 6;
-const MAX_MAX_DEPTH: usize = 12;
+// The one number the schema declares and the gap's advice quotes.
+const MAX_MAX_DEPTH: usize = crate::remediation::PATH_MAX_MAX_DEPTH;
 const DEFAULT_LIMIT: usize = 3;
 const MAX_LIMIT: usize = 25;
 /// Relations examined before the walk stops regardless of the clock, so a
@@ -1436,8 +1437,12 @@ fn compose_gap(
         }
     }
     let remediation = match most_limiting.as_str() {
+        // At the ceiling there is no larger `max_depth` to name, and the
+        // sentence says so rather than sending the caller to set the value
+        // already in force.
         "depth_bound" => format!(
-            "raise max_depth (now {max_depth}, ceiling {MAX_MAX_DEPTH}), or name a pair that sits closer together"
+            "{}, or name a pair that sits closer together",
+            crate::remediation::raise_bounded_knob("max_depth", max_depth, MAX_MAX_DEPTH)
         ),
         "edge_ceiling" | "time_budget" | "cancelled" => {
             "narrow the walk with a smaller max_depth or a closer pair; the graph beyond the ceiling was not explored".to_string()
@@ -1974,6 +1979,58 @@ mod tests {
         assert_eq!(names(&one.routes[0]), vec!["a", "b1", "c"]);
         assert_eq!(one.routes_total, 2);
         assert!(one.routes_truncated);
+    }
+
+    /// A walk that stopped at the depth bound with `max_depth` already at the
+    /// schema ceiling has no larger value to be sent to, and the gap says so
+    /// rather than "raise max_depth (now 12, ceiling 12)".
+    #[test]
+    fn a_walk_at_the_depth_ceiling_is_not_told_to_raise_max_depth() {
+        let store = InMemoryGraph::new();
+        // Thirteen hops end to end, one more than the ceiling can walk.
+        let chain: Vec<_> = (0..=MAX_MAX_DEPTH + 1)
+            .map(|index| function(&format!("hop{index:02}"), &format!("src/hop{index:02}.ts")))
+            .collect();
+        let relations: Vec<_> = chain
+            .windows(2)
+            .map(|pair| relation(&pair[0], &pair[1], RelationKind::Calls))
+            .collect();
+        let entities: Vec<_> = chain.iter().collect();
+        seed(&store, &entities, &relations);
+
+        let bounded = build_path_response(
+            &store,
+            &PathRequest {
+                max_depth: Some(MAX_MAX_DEPTH),
+                direction: Some(PathDirection::Forward),
+                ..request("hop00", &format!("hop{:02}", MAX_MAX_DEPTH + 1))
+            },
+        )
+        .unwrap();
+        assert!(!bounded.found);
+        let gap = bounded
+            .gap
+            .as_ref()
+            .expect("a gap on every no-route answer");
+        assert_eq!(gap.reason, "depth_bound");
+        assert!(
+            !gap.remediation.contains("raise max_depth"),
+            "a walk at the ceiling was told to raise past it: {}",
+            gap.remediation
+        );
+        assert!(
+            gap.remediation.contains(&format!(
+                "max_depth is already at its {MAX_MAX_DEPTH} ceiling"
+            )),
+            "a walk at the ceiling must be told the knob is spent: {}",
+            gap.remediation
+        );
+        assert!(
+            gap.remediation
+                .contains("name a pair that sits closer together"),
+            "and still be handed the alternative: {}",
+            gap.remediation
+        );
     }
 
     /// The depth bound is a bound on walked hops, and a walk that stopped

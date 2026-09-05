@@ -932,6 +932,42 @@ impl KinConfig {
         }
     }
 
+    /// The `[table]` under which `key` sits in the document at `path`, when the
+    /// file carries that top-level key anywhere but at the top level.
+    ///
+    /// Read as a plain TOML document rather than through [`KinConfig`], because
+    /// the typed config is exactly what cannot see the key: every table type
+    /// ignores fields it does not declare, so a `default_author` appended
+    /// under `[resources]` is `resources.default_author` to TOML, dropped on
+    /// deserialization, and leaves no trace. The walk is depth-first so a key
+    /// nested two tables down is still named by its full dotted path. A
+    /// document that does not parse, or a file that is not there, yields
+    /// nothing, and the caller falls through to whatever it would have said
+    /// without this diagnosis.
+    pub fn misplaced_top_level_key(path: &Path, key: &str) -> Option<String> {
+        let contents = std::fs::read_to_string(path).ok()?;
+        let document: toml::Table = toml::from_str(&contents).ok()?;
+        fn find(table: &toml::Table, key: &str, prefix: &str) -> Option<String> {
+            for (name, value) in table {
+                let dotted = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                if let Some(nested) = value.as_table() {
+                    if nested.contains_key(key) {
+                        return Some(dotted);
+                    }
+                    if let Some(found) = find(nested, key, &dotted) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        find(&document, key, "")
+    }
+
     /// Atomically and durably replace `.kin/config.toml`.
     ///
     /// The writer retains the real `.kin` directory, creates and flushes an

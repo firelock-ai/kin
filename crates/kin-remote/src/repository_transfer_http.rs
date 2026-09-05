@@ -216,8 +216,8 @@ impl HttpRepositoryTransferTransport {
         }
         let response = request
             .call()
-            .map_err(|error| peer_error(error, what, repository_id))?;
-        read_json(response, what, repository_id)
+            .map_err(|error| peer_error(error, what, repository_id, &self.endpoint.base_url))?;
+        read_json(response, what, repository_id, &self.endpoint.base_url)
     }
 
     fn post_json<T: serde::Serialize, R: serde::de::DeserializeOwned>(
@@ -233,8 +233,8 @@ impl HttpRepositoryTransferTransport {
         }
         let response = request
             .send_json(body)
-            .map_err(|error| peer_error(error, what, repository_id))?;
-        read_json(response, what, repository_id)
+            .map_err(|error| peer_error(error, what, repository_id, &self.endpoint.base_url))?;
+        read_json(response, what, repository_id, &self.endpoint.base_url)
     }
 }
 
@@ -242,6 +242,7 @@ fn read_json<R: serde::de::DeserializeOwned>(
     response: ureq::http::Response<ureq::Body>,
     what: &str,
     repository_id: &RepositoryId,
+    base_url: &str,
 ) -> Result<R> {
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
@@ -251,7 +252,7 @@ fn read_json<R: serde::de::DeserializeOwned>(
             .limit(REPOSITORY_TRANSFER_HTTP_ERROR_BODY_LIMIT as u64 + 1)
             .read_to_string();
         return Err(match body {
-            Ok(body) => peer_status_error(status, &body, what, repository_id),
+            Ok(body) => peer_status_error(status, &body, what, repository_id, base_url),
             Err(ureq::Error::BodyExceedsLimit(_)) => peer_status_error(
                 status,
                 &format!(
@@ -259,6 +260,7 @@ fn read_json<R: serde::de::DeserializeOwned>(
                 ),
                 what,
                 repository_id,
+                base_url,
             ),
             Err(error) => RepositoryTransferError::Storage(format!(
                 "failed to read remote {what} refusal body (HTTP {status}): {error}"
@@ -316,6 +318,7 @@ fn peer_status_error(
     body: &str,
     what: &str,
     repository_id: &RepositoryId,
+    base_url: &str,
 ) -> RepositoryTransferError {
     let detail = body.trim();
     let with_detail = |message: String| {
@@ -326,6 +329,16 @@ fn peer_status_error(
         }
     };
     match code {
+        // The peer serves the repository and wants a credential. Its body is
+        // the bare `{"error":"Authentication required"}` the daemon's auth
+        // middleware writes, which a stranger met three times from a peer on
+        // the same machine with no next step; the step is named here, once,
+        // for every path that reaches this transport.
+        401 => RepositoryTransferError::Unauthenticated(format!(
+            "{}; {}",
+            with_detail(format!("remote refused {what} (HTTP 401)")),
+            crate::repository_transfer::bearer_token_next_step(base_url)
+        )),
         409 => RepositoryTransferError::Conflict(with_detail(format!(
             "remote refused {what} with a repository-v6 conflict (HTTP 409)"
         ))),
@@ -357,12 +370,13 @@ fn peer_error(
     error: ureq::Error,
     what: &str,
     repository_id: &RepositoryId,
+    base_url: &str,
 ) -> RepositoryTransferError {
     match error {
         // Defensive fallback for an Agent supplied by a future constructor
         // that restores status-as-error. The standard constructor above keeps
         // the body and routes statuses through `read_json`.
-        ureq::Error::StatusCode(code) => peer_status_error(code, "", what, repository_id),
+        ureq::Error::StatusCode(code) => peer_status_error(code, "", what, repository_id, base_url),
         other => {
             RepositoryTransferError::Storage(format!("remote {what} transport failed: {other}"))
         }
@@ -598,27 +612,62 @@ mod tests {
         RepositoryId::new("kin").unwrap()
     }
 
+    /// A peer daemon on this machine, which is where the stranger met the
+    /// refusal below.
+    const PEER: &str = "http://127.0.0.1:4010";
+
+    /// The stranger's shape: `kin clone` against a same-machine peer answered
+    /// with the daemon's bare `{"error":"Authentication required"}` and
+    /// nothing else. The refusal has to name the token that peer accepts and
+    /// where it lives, and it has to be its own class so the daemon relaying
+    /// it and a caller keying on it never have to parse the sentence.
+    #[test]
+    fn a_401_refusal_names_the_token_the_peer_accepts() {
+        let error = read_json::<serde_json::Value>(
+            response(401, r#"{"error":"Authentication required"}"#.to_string()),
+            "ref advertisement",
+            &asked_for(),
+            PEER,
+        )
+        .expect_err("the peer wants a credential");
+        let RepositoryTransferError::Unauthenticated(message) = error else {
+            panic!("a 401 is a missing credential, not a storage failure: {error}");
+        };
+        assert!(
+            message.contains("KIN_REMOTE_BEARER_TOKEN=$(cat <peer>/.kin/daemon.token)"),
+            "the refusal must name the token path a same-machine peer accepts: {message}"
+        );
+        assert!(
+            message.contains(&format!("kin auth login --base-url {PEER}")),
+            "and the hosted alternative, against the remote it refused: {message}"
+        );
+        assert!(
+            message.contains("Authentication required"),
+            "and still carry the peer's own words: {message}"
+        );
+    }
+
     #[test]
     fn peer_status_codes_keep_their_refusal_class() {
         let asked_for = asked_for();
         assert!(matches!(
-            peer_status_error(409, "", "transfer receive", &asked_for),
+            peer_status_error(409, "", "transfer receive", &asked_for, PEER),
             RepositoryTransferError::Conflict(_)
         ));
         assert!(matches!(
-            peer_status_error(422, "", "transfer receive", &asked_for),
+            peer_status_error(422, "", "transfer receive", &asked_for, PEER),
             RepositoryTransferError::Invalid(_)
         ));
         assert!(matches!(
-            peer_status_error(424, "", "transfer receive", &asked_for),
+            peer_status_error(424, "", "transfer receive", &asked_for, PEER),
             RepositoryTransferError::Storage(_)
         ));
         assert!(matches!(
-            peer_status_error(413, "", "transfer receive", &asked_for),
+            peer_status_error(413, "", "transfer receive", &asked_for, PEER),
             RepositoryTransferError::Invalid(_)
         ));
         assert!(matches!(
-            peer_status_error(500, "", "transfer receive", &asked_for),
+            peer_status_error(500, "", "transfer receive", &asked_for, PEER),
             RepositoryTransferError::Storage(_)
         ));
     }
@@ -630,6 +679,7 @@ mod tests {
             response(422, reason.to_string()),
             "transfer receive",
             &asked_for(),
+            PEER,
         )
         .expect_err("the receiver refused the pack");
         let RepositoryTransferError::Invalid(message) = error else {
@@ -654,7 +704,7 @@ mod tests {
             "transfer export",
             "transfer receive",
         ] {
-            let error = peer_status_error(404, "", what, &asked_for);
+            let error = peer_status_error(404, "", what, &asked_for, PEER);
             let RepositoryTransferError::Invalid(message) = error else {
                 panic!("a repository the peer does not serve is not a storage failure");
             };
@@ -678,9 +728,13 @@ mod tests {
         let payload = serde_json::json!({ "value": "a".repeat(11 * 1024 * 1024) }).to_string();
         assert!(payload.len() > 10 * 1024 * 1024);
 
-        let value: serde_json::Value =
-            read_json(json_response(payload), "transfer export", &asked_for())
-                .expect("a body under the bound");
+        let value: serde_json::Value = read_json(
+            json_response(payload),
+            "transfer export",
+            &asked_for(),
+            PEER,
+        )
+        .expect("a body under the bound");
         assert_eq!(value["value"].as_str().unwrap().len(), 11 * 1024 * 1024);
     }
 
@@ -718,16 +772,24 @@ mod tests {
         let filler = REPOSITORY_TRANSFER_HTTP_BODY_LIMIT - r#"{"value":""}"#.len();
         let payload = format!(r#"{{"value":"{}"}}"#, "a".repeat(filler));
         assert_eq!(payload.len(), REPOSITORY_TRANSFER_HTTP_BODY_LIMIT);
-        let value: serde_json::Value =
-            read_json(json_response(payload), "transfer export", &asked_for())
-                .expect("a body at the bound");
+        let value: serde_json::Value = read_json(
+            json_response(payload),
+            "transfer export",
+            &asked_for(),
+            PEER,
+        )
+        .expect("a body at the bound");
         assert_eq!(value["value"].as_str().unwrap().len(), filler);
 
         let payload = format!(r#"{{"value":"{}"}}"#, "a".repeat(filler + 1));
         assert_eq!(payload.len(), REPOSITORY_TRANSFER_HTTP_BODY_LIMIT + 1);
-        let error =
-            read_json::<serde_json::Value>(json_response(payload), "transfer export", &asked_for())
-                .expect_err("a body one byte past the bound is refused");
+        let error = read_json::<serde_json::Value>(
+            json_response(payload),
+            "transfer export",
+            &asked_for(),
+            PEER,
+        )
+        .expect_err("a body one byte past the bound is refused");
         let RepositoryTransferError::Invalid(message) = error else {
             panic!("a local read bound is not a remote storage failure");
         };
@@ -776,7 +838,12 @@ mod tests {
         // A peer that cannot be reached has not refused anything. Reporting
         // this as Invalid or Conflict would let a caller conclude the remote
         // evaluated the transfer and said no.
-        let error = peer_error(ureq::Error::HostNotFound, "ref advertisement", &asked_for());
+        let error = peer_error(
+            ureq::Error::HostNotFound,
+            "ref advertisement",
+            &asked_for(),
+            PEER,
+        );
         assert!(matches!(error, RepositoryTransferError::Storage(_)));
     }
 }

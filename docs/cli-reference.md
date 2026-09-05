@@ -693,7 +693,7 @@ kin resolve [options]
 | `--base <selector>` |  | Keep the merge base version of a conflicting identity. Repeatable. |
 | `--remove <selector>` |  | Settle a conflicting identity by dropping it from the merge. Repeatable. |
 | `--keep-path <path=artifact>` |  | Settle a contested path by naming the artifact that keeps it. Repeatable. |
-| `--file <path> <file>` |  | Resolve a conflicted repository path using the exact bytes in FILE. Repeatable. |
+| `--file <path> <file>` |  | Resolve a conflicted repository path using the exact bytes in `<file>`, which is the form that takes a file you merged by hand. `<path>` is the conflicted repository path or artifact identity from `kin conflicts`. Repeatable; the bodies of one request total at most 8 MiB. |
 | `--all-ours` |  | Resolve all remaining conflicts keeping your version |
 | `--all-theirs` |  | Resolve all remaining conflicts keeping the incoming version |
 | `--do-continue`, `--continue` |  | Complete the merge after all conflicts are resolved. `--continue` is an accepted alias that the CLI parses but does not list in `--help`, so a reader coming from Git will find it works. |
