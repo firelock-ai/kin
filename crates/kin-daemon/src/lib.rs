@@ -123,6 +123,12 @@ pub mod daemon;
 pub mod error;
 pub mod gcs_endpoint;
 pub mod graph_only_members;
+/// First contact with `kin_graph_status` while an embedding pass holds
+/// embedding-work serialization. Test-only, and its own module so the fixture
+/// can guarantee no status call has run against the state before the one under
+/// test.
+#[cfg(test)]
+mod graph_status_first_contact;
 pub mod hosted_start;
 pub mod lifecycle;
 mod local_repository_authority;

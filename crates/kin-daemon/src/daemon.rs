@@ -240,6 +240,20 @@ fn run_background_embedding_batch(
         }
     };
 
+    // Record a settled status reading before this batch makes one impossible.
+    //
+    // `kin_graph_status` samples every counter under this same lock, which this
+    // batch is about to hold for its whole length, so a status call landing
+    // inside the batch answers from the settled cache. This is where that
+    // reading is taken, at an instant when no embedding work is in flight.
+    //
+    // At the top of the batch and not the bottom: `embedding_status` is memoized
+    // on the graph truth epoch and the vector index key-set token, this batch
+    // changes that token, and the worker's own batch decision just filled the
+    // memo. A call here hits it; a call after `process` always misses and
+    // rescans the retrievable key set.
+    state.seed_settled_head_graph_status();
+
     match process(state) {
         Ok(count) => BackgroundEmbeddingBatchOutcome::Completed(count),
         Err(error)
