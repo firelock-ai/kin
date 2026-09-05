@@ -301,7 +301,7 @@ test('repository transfer declarations match the Rust schema authority', async (
 
   assert.ok(versionMatch, 'Rust transfer schema authority must remain readable');
   const schemaVersion = Number(versionMatch[1]);
-  assert.equal(schemaVersion, 4, 'update the shared declarations for each schema revision');
+  assert.equal(schemaVersion, 5, 'update the shared declarations for each schema revision');
 
   for (const contract of [
     'RepositoryTransferStatus',

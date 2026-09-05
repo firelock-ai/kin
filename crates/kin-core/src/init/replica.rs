@@ -9,6 +9,13 @@ use super::*;
 pub struct ReplicaBootstrapInput {
     pub transaction: RepositoryTransaction,
     pub bodies: Vec<(Hash256, Vec<u8>)>,
+    /// What the pack this history came from declared about its replay
+    /// semantics, or `None` when it declared nothing.
+    ///
+    /// `None` is what a caller with no pack at all passes, and it is the safe
+    /// value: a bootstrap whose provenance nobody declared leaves the published
+    /// replica unstamped rather than stamped over history it cannot speak for.
+    pub source_hydration_semantics: Option<u32>,
 }
 
 /// Publish a complete replica without exposing a partially initialized target.
@@ -60,6 +67,11 @@ pub fn initialize(
                 }
                 Ok(())
             })?;
+            // The staging above stamped this replica with THIS build's version,
+            // and the history about to be committed into it was authored
+            // somewhere else. This is the transfer receiver's rule, run at the
+            // one boundary a bootstrap actually crosses.
+            prepared.reconcile_bootstrap_hydration_semantics(input.source_hydration_semantics)?;
             input.transaction
         }
         None => build_repository_bootstrap_transaction(
@@ -199,6 +211,80 @@ mod tests {
         assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
     }
 
+    /// A bootstrap that declares the version this build stamps keeps the
+    /// record, which is what makes a clone between two stores of one build
+    /// certify instead of going inconclusive on arrival.
+    #[test]
+    fn a_bootstrap_declaring_this_builds_version_keeps_the_creation_record() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("replica");
+        let identity = RepositoryId::new("hosted-repository".to_string()).unwrap();
+        let initialized = initialize(&target, "trunk", &identity, |prepared, case| {
+            Ok(Some(ReplicaBootstrapInput {
+                transaction: transaction(prepared, case),
+                bodies: vec![],
+                source_hydration_semantics: Some(crate::hydration_semantics::binary_version()),
+            }))
+        })
+        .unwrap();
+        assert_eq!(
+            crate::hydration_semantics::standing(&initialized.layout),
+            crate::hydration_semantics::HydrationStanding::Current {
+                version: crate::hydration_semantics::binary_version()
+            }
+        );
+    }
+
+    /// A bootstrap whose declaration this build cannot match must publish no
+    /// creation record.
+    ///
+    /// This is the clone door, and before the pack declared anything it was open:
+    /// `kin clone` admits a peer's history inside the staging that writes this
+    /// stamp, never through the transfer receiver, so a replica of a peer whose
+    /// history was authored under another version published a store reading
+    /// `Current` over it. The `None` arm is the same door for a caller that
+    /// declares nothing at all.
+    #[test]
+    fn a_bootstrap_this_build_cannot_match_publishes_no_creation_record() {
+        for declared in [None, Some(crate::hydration_semantics::binary_version() - 1)] {
+            let parent = tempfile::tempdir().unwrap();
+            let target = parent.path().join("replica");
+            let identity = RepositoryId::new("hosted-repository".to_string()).unwrap();
+            let initialized = initialize(&target, "trunk", &identity, |prepared, case| {
+                Ok(Some(ReplicaBootstrapInput {
+                    transaction: transaction(prepared, case),
+                    bodies: vec![],
+                    source_hydration_semantics: declared,
+                }))
+            })
+            .unwrap();
+            assert_eq!(
+                crate::hydration_semantics::standing(&initialized.layout),
+                crate::hydration_semantics::HydrationStanding::Unstamped {
+                    derives: crate::hydration_semantics::binary_version()
+                },
+                "a bootstrap declaring {declared:?} published a creation record anyway"
+            );
+        }
+    }
+
+    /// The control that keeps both arms above honest: a replica created with no
+    /// bootstrap at all admits nothing from anywhere, so its own creation record
+    /// must survive untouched.
+    #[test]
+    fn a_replica_with_no_bootstrap_keeps_its_creation_record() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("replica");
+        let identity = RepositoryId::new("hosted-repository".to_string()).unwrap();
+        let initialized = initialize(&target, "trunk", &identity, |_, _| Ok(None)).unwrap();
+        assert_eq!(
+            crate::hydration_semantics::standing(&initialized.layout),
+            crate::hydration_semantics::HydrationStanding::Current {
+                version: crate::hydration_semantics::binary_version()
+            }
+        );
+    }
+
     #[test]
     fn replica_publication_rejects_wrong_identity_before_target_exists() {
         let parent = tempfile::tempdir().unwrap();
@@ -211,6 +297,7 @@ mod tests {
             Ok(Some(ReplicaBootstrapInput {
                 transaction,
                 bodies: vec![],
+                source_hydration_semantics: None,
             }))
         })
         .unwrap_err();
@@ -232,6 +319,7 @@ mod tests {
         let error = initialize(&target, "trunk", &identity, |prepared, case| {
             Ok(Some(ReplicaBootstrapInput {
                 transaction: transaction(prepared, case),
+                source_hydration_semantics: None,
                 bodies: vec![(
                     Hash256::from_bytes(Sha256::digest(b"original").into()),
                     b"corrupt".to_vec(),
@@ -282,6 +370,7 @@ mod tests {
             Ok(Some(ReplicaBootstrapInput {
                 transaction,
                 bodies: vec![],
+                source_hydration_semantics: None,
             }))
         })
         .unwrap_err();

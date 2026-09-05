@@ -3519,6 +3519,26 @@ impl DaemonState {
         self.local_kindb_capability.as_ref().map(Arc::clone)
     }
 
+    /// The creation-time replay-semantics version this daemon's own store
+    /// records, for declaration beside history this daemon publishes.
+    ///
+    /// Read through the startup-pinned handle rather than by resolving `.kin`
+    /// again, for the reason `HydrationStampCapability` states: a path resolved
+    /// at request time can name a directory this daemon never pinned, and a
+    /// sender that declared another store's number would make a receiver keep a
+    /// record over history that number never spoke for.
+    ///
+    /// `None` on a hosted daemon, which owns no such record, and `None` on a
+    /// local store whose record is absent or will not parse, because a sender
+    /// that cannot read its own record has nothing to declare. Both leave the
+    /// receiver discarding its own record, which is what every transfer did
+    /// before the wire carried this at all.
+    pub(crate) fn local_hydration_creation_version(&self) -> Option<u32> {
+        self.local_kindb_capability
+            .as_ref()
+            .and_then(|capability| capability.read().created_under())
+    }
+
     /// Clone the complete repository identity/storage capability pinned when
     /// this local daemon started. Daemon-owned CLI and MCP helpers must receive
     /// this binding explicitly instead of rediscovering mutable control files.

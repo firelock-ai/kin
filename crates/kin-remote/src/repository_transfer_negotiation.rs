@@ -649,12 +649,19 @@ where
 /// moment, and each is published in its own repository transaction with its own
 /// receipt. See [`RepositoryTransferOutcome`] for what that does and does not
 /// promise across packs.
+///
+/// `source_hydration_semantics` is the creation-time replay version this
+/// replica's own store records, declared into every pack this publication
+/// builds so the remote can decide whether to keep its own record. See
+/// [`crate::repository_transfer::build_repository_transfer_pack`] for why the
+/// caller supplies it rather than the authority answering for it.
 pub fn push_to_remote<B, T>(
     local: &RepositoryAuthorityManager<B>,
     transport: &T,
     repository_id: &RepositoryId,
     source_ref: &RefName,
     destination_ref: &RefName,
+    source_hydration_semantics: Option<u32>,
 ) -> Result<RepositoryTransferOutcome>
 where
     B: StorageBackend + ?Sized + 'static,
@@ -696,7 +703,12 @@ where
             break (source_head, plan);
         }
 
-        let segment = build_repository_transfer_segment(local, source_ref, &expectation)?;
+        let segment = build_repository_transfer_segment(
+            local,
+            source_ref,
+            &expectation,
+            source_hydration_semantics,
+        )?;
         if segment.pack.transfer_target_head != source_head {
             return Err(conflict(format!(
                 "local authority moved during negotiation: planned head {source_head}, packed transfer toward {}",
@@ -1272,7 +1284,7 @@ mod tests {
             if let Some(max_trees) = self.advertised_max_trees {
                 expectation.limits.max_trees = expectation.limits.max_trees.min(max_trees);
             }
-            build_repository_transfer_segment(self.authority, source_ref, &expectation)
+            build_repository_transfer_segment(self.authority, source_ref, &expectation, None)
                 .map(|segment| segment.pack)
         }
 
@@ -1362,6 +1374,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .unwrap();
 
@@ -1401,6 +1414,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .unwrap();
         assert_eq!(*peer.received.borrow(), 1);
@@ -1411,6 +1425,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .unwrap();
 
@@ -1442,6 +1457,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .unwrap();
 
@@ -1479,6 +1495,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1518,7 +1535,7 @@ mod tests {
 
         // Bring the destination to the mainline head, then merge the side line.
         let peer = LocalPeer::new(&destination);
-        push_to_remote(&source, &peer, &repository_id, &main, &main).unwrap();
+        push_to_remote(&source, &peer, &repository_id, &main, &main, None).unwrap();
         assert_eq!(head_of(&destination, &main), Some(published));
 
         let merged = publish_with_parents(
@@ -1536,7 +1553,7 @@ mod tests {
             panic!("a merge past the published head is a fast-forward");
         };
 
-        let outcome = push_to_remote(&source, &peer, &repository_id, &main, &main).unwrap();
+        let outcome = push_to_remote(&source, &peer, &repository_id, &main, &main, None).unwrap();
         let RepositoryTransferPlan::FastForward {
             change_count: packed,
             ..
@@ -1635,6 +1652,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .unwrap();
 
@@ -1681,7 +1699,7 @@ mod tests {
             negotiated_destination_lease(&peer, &fixture.repository_id, &fixture.main)
                 .expect("the remote lease is readable");
         let segment =
-            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation, None)
                 .unwrap();
         assert!(!segment.is_final());
         let receipt = peer
@@ -1706,6 +1724,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1785,7 +1804,7 @@ mod tests {
         );
 
         let peer = LocalPeer::new(&destination);
-        push_to_remote(&source, &peer, &repository_id, &main, &main).unwrap();
+        push_to_remote(&source, &peer, &repository_id, &main, &main, None).unwrap();
         assert_eq!(head_of(&destination, &main), Some(published));
 
         let merged = publish_with_parents(
@@ -1810,7 +1829,7 @@ mod tests {
         // so the first pack is the merge closure and the second is the single
         // change after it.
         let narrow = LocalPeer::advertising_max_changes(&destination, 1);
-        let outcome = push_to_remote(&source, &narrow, &repository_id, &main, &main)
+        let outcome = push_to_remote(&source, &narrow, &repository_id, &main, &main, None)
             .expect("an unsplittable step is taken whole, not refused");
 
         assert_eq!(
@@ -1885,7 +1904,7 @@ mod tests {
         );
 
         let peer = LocalPeer::new(destination);
-        push_to_remote(source, &peer, repository_id, main, main).unwrap();
+        push_to_remote(source, &peer, repository_id, main, main, None).unwrap();
 
         publish_with_parents(
             source,
@@ -1924,7 +1943,7 @@ mod tests {
             // entirely default limits, where max_trees equals max_changes.
             expectation.limits.max_trees = 1;
 
-            build_repository_transfer_segment(&source, &main, &expectation)
+            build_repository_transfer_segment(&source, &main, &expectation, None)
                 .map(|segment| segment.pack.changes.len())
         });
 
@@ -1962,7 +1981,7 @@ mod tests {
             merge_past_a_published_head(&source, &destination, &repository_id, &main);
 
             let narrow = LocalPeer::advertising_max_trees(&destination, 1);
-            push_to_remote(&source, &narrow, &repository_id, &main, &main)
+            push_to_remote(&source, &narrow, &repository_id, &main, &main, None)
                 .map(|outcome| outcome.receipts.len())
         });
 
@@ -1990,8 +2009,9 @@ mod tests {
         let mut expectation = RepositoryTransferExpectation::try_from(status).unwrap();
         expectation.limits.max_trees = 0;
 
-        let error = build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
-            .expect_err("an envelope that can carry nothing is refused");
+        let error =
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation, None)
+                .expect_err("an envelope that can carry nothing is refused");
 
         let RepositoryTransferError::Invalid(message) = error else {
             panic!("a bound that can carry nothing is a refusal: {error:?}");
@@ -2020,6 +2040,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .expect_err("a remote that never advances is refused");
 
@@ -2105,6 +2126,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2155,6 +2177,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .expect_err("a non-fast-forward publication must be refused");
 
@@ -2246,6 +2269,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .expect_err("a receipt that does not bind the sent pack is not proof of this transfer");
 
@@ -2359,6 +2383,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .expect_err("a lease labelled for another repository is not this repository's lease");
 
@@ -2392,6 +2417,7 @@ mod tests {
             &fixture.repository_id,
             &fixture.main,
             &fixture.main,
+            None,
         )
         .expect_err("a status for another ref does not answer the question this replica asked");
 
@@ -2426,6 +2452,7 @@ mod tests {
             &fixture.repository_id,
             &absent,
             &fixture.main,
+            None,
         )
         .expect_err("a source ref that does not exist cannot be published");
 
