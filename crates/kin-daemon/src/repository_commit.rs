@@ -435,8 +435,8 @@ pub(crate) fn plan_session_workspace_admission(
     source_hashes.extend(shared_policy.sources.iter().map(|source| source.body_hash));
 
     let lease = authority.read_authority();
-    let current_workspace = lease
-        .metadata()
+    let metadata = lease.metadata();
+    let current_workspace = metadata
         .workspaces
         .iter()
         .find(|workspace| workspace.workspace_id == workspace_id)
@@ -454,7 +454,7 @@ pub(crate) fn plan_session_workspace_admission(
         // operation it names: a persisted receipt stopped repeating that record
         // in kin-db 0.7.89 (FIR-3064), and `rejoined_receipt` does the pairing
         // and the validation the `validate` here used to do.
-        let receipt = kin_core::rejoined_receipt(lease.metadata(), base.reconcile_operation_id)
+        let receipt = kin_core::rejoined_receipt(metadata, base.reconcile_operation_id)
             .ok_or_else(|| {
                 invalid(
                     "repository authority moved after session materialization; exact reconcile \
