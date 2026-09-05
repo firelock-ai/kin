@@ -1425,6 +1425,42 @@ impl StatusAdmission {
     }
 }
 
+/// What `kin status` says about a daemon that is up and still opening authority.
+///
+/// Split out from [`admit_before_reading`] so the sentence can be graded without
+/// a daemon on either side of it, exactly as `unreachable_daemon_sentence` is.
+///
+/// It states three things: that a daemon exists, which one, and how long this
+/// command waited before saying so. The pid and port are the pair an operator
+/// reads out of `.kin/daemon.pid` and `.kin/daemon.port`, so a reader who
+/// disbelieves the line can check it by hand.
+///
+/// The two arms are different news. `warming` true is the daemon's own flag off
+/// its readiness answer, so the state is known. `warming` false means it never
+/// answered readiness inside the budget, so all that is known is that its process
+/// is alive, and claiming it is warming would be inventing the part this command
+/// could not read.
+fn opening_authority_admission_sentence(
+    pid: u32,
+    port: u16,
+    detail: &str,
+    waited: std::time::Duration,
+    warming: bool,
+) -> String {
+    let waited_ms = waited.as_millis();
+    let state = if warming {
+        "is warming: it is listening and has not finished opening repository authority"
+    } else {
+        "is alive and did not answer a readiness check"
+    };
+    format!(
+        "this repository's daemon {state} (pid {pid}, port {port}), and it still had not after \
+         {waited_ms} ms, so nothing admitted the working copy and this reports durable authority \
+         alone; it last reported {detail}. Re-run once it is ready, or `kin admit` takes what the \
+         working copy holds"
+    )
+}
+
 /// Admit the complete exact tree, then let the caller read.
 ///
 /// Best effort by construction and never fatal: a status that refuses to print
@@ -1436,14 +1472,29 @@ impl StatusAdmission {
 /// lease keeps a daemon alive indefinitely, which is the defect this would be
 /// trading for.
 pub async fn admit_before_reading(layout: &kin_core::KinLayout) -> StatusAdmission {
-    let Some(base_url) = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await
-    else {
-        return StatusAdmission::Skipped(
-            "no daemon is running for this repository, so nothing admitted the working copy \
-             and this reports durable authority alone; `kin admit` takes what the working \
-             copy holds"
-                .to_string(),
-        );
+    let base_url = match crate::daemon_client::running_daemon_reading(layout).await {
+        crate::daemon_client::RunningDaemonReading::Serving(url) => url,
+        // A daemon that is up and still opening authority is not an absent one,
+        // so it does not get the absent sentence below.
+        crate::daemon_client::RunningDaemonReading::OpeningAuthority {
+            pid,
+            port,
+            detail,
+            waited,
+            warming,
+        } => {
+            return StatusAdmission::Skipped(opening_authority_admission_sentence(
+                pid, port, &detail, waited, warming,
+            ));
+        }
+        crate::daemon_client::RunningDaemonReading::Absent => {
+            return StatusAdmission::Skipped(
+                "no daemon is running for this repository, so nothing admitted the working copy \
+                 and this reports durable authority alone; `kin admit` takes what the working \
+                 copy holds"
+                    .to_string(),
+            );
+        }
     };
     let Ok(client) = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, layout)
     else {
@@ -1799,6 +1850,107 @@ fn build_id(sha: &str, dirty: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon that is up and still opening authority must never be reported as
+    /// absent.
+    ///
+    /// The fixture publishes what a warming daemon publishes: a `/readiness`
+    /// that answers 503 carrying the daemon's own `warming: true`, the shape
+    /// `kin_daemon::api::serve_warming_until` serves while authority loads.
+    /// Nothing here is inferred from the filesystem; the endpoint files say
+    /// where to ask and the answer comes from the server.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_daemon_still_opening_authority_is_not_reported_as_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(root.path()).unwrap().layout;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let warming = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/readiness",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({ "ready": false, "warming": true })),
+                    )
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // The pair an operator reads by hand to prove a daemon is up. This
+        // process is the live pid, so the endpoint is genuinely owned by
+        // something alive and the probe has no excuse to call it stale.
+        std::fs::write(
+            layout.root().join("daemon.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(layout.root().join("daemon.port"), port.to_string()).unwrap();
+
+        let mut env = kin_core::test_env::EnvVarGuard::new();
+        // A one-second budget so the bounded wait is exercised without the test
+        // paying the operator default. The wait itself is what is under test:
+        // it must end, and it must end with a reading rather than a guess.
+        env.apply("KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS", Some("1"));
+        // An inherited override would resolve before the endpoint files are ever
+        // consulted and the arm under test would never run.
+        env.apply("KIN_DAEMON_URL", None::<&str>);
+
+        let pass = admit_before_reading(&layout).await;
+        warming.abort();
+
+        let StatusAdmission::Skipped(why) = pass else {
+            panic!("a daemon that never opened authority admits nothing");
+        };
+        assert!(
+            !why.contains("no daemon is running"),
+            "a live, listening daemon must not be reported as absent: {why}"
+        );
+        assert!(
+            why.contains("warming"),
+            "the reader is told what the daemon is doing: {why}"
+        );
+        assert!(
+            why.contains(&format!("pid {}", std::process::id())),
+            "the reader is told which daemon, so the claim is checkable by hand: {why}"
+        );
+        assert!(
+            why.contains(&format!("port {port}")),
+            "the reader is told where, so the claim is checkable by hand: {why}"
+        );
+        assert!(
+            why.contains("ms"),
+            "the reader is told how long this command waited before saying so: {why}"
+        );
+    }
+
+    /// The control: with nothing recorded and nothing listening, the absent
+    /// sentence is correct and must survive.
+    ///
+    /// Without this, the arm above is satisfied by deleting the absent sentence
+    /// altogether, which would replace a false claim of absence with a false
+    /// claim of presence.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_repository_with_no_daemon_still_says_so() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(root.path()).unwrap().layout;
+
+        let mut env = kin_core::test_env::EnvVarGuard::new();
+        env.apply("KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS", Some("1"));
+        env.apply("KIN_DAEMON_URL", None::<&str>);
+
+        let StatusAdmission::Skipped(why) = admit_before_reading(&layout).await else {
+            panic!("no daemon admits nothing");
+        };
+        assert!(
+            why.contains("no daemon is running"),
+            "an absent daemon is still reported as absent: {why}"
+        );
+    }
 
     /// The coverage a bare authority read publishes. These cases exercise the
     /// durable half of the report, where no live graph was consulted, so this
