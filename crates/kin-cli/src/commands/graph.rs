@@ -433,7 +433,9 @@ pub fn execute_graph_command_for_store(
             census,
             kin_root,
         ),
-        GraphCommandRequest::Validate => build_graph_validate_response(authority, graph, kin_root),
+        GraphCommandRequest::Validate => {
+            build_graph_validate_response_with_census(authority, graph, census, kin_root)
+        }
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
         GraphCommandRequest::Source { entity } => {
             build_graph_source_response(authority, graph, entity)
@@ -1254,9 +1256,34 @@ fn append_health_notes(lines: &mut Vec<String>, notes: &[String]) {
     }
 }
 
+/// The validate renderer as every test in this module asks for it: about a
+/// graph with no store beside it, and so with no census to compare against.
+///
+/// A wrapper rather than a defaulted argument, for the reason the status
+/// wrapper above is one: a test that has no `.kin` directory keeps the spelling
+/// it had, and the store-aware path is the one that has to say which store it
+/// means.
+#[cfg(test)]
 fn build_graph_validate_response(
     authority: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
+    kin_root: Option<&std::path::Path>,
+) -> Result<GraphCommandResponse> {
+    build_graph_validate_response_with_census(
+        authority,
+        graph,
+        &kin_core::relation_census::CensusContext {
+            previous: kin_core::relation_census::RelationCensusRead::Absent,
+            causes: Vec::new(),
+        },
+        kin_root,
+    )
+}
+
+fn build_graph_validate_response_with_census(
+    authority: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    census: &kin_core::relation_census::CensusContext,
     kin_root: Option<&std::path::Path>,
 ) -> Result<GraphCommandResponse> {
     // Validate renders the same parse-coverage section status does, so it reads
@@ -1377,6 +1404,37 @@ fn build_graph_validate_response(
         ));
     }
 
+    // The census this store last recorded, compared against the one this graph
+    // takes now.
+    //
+    // `validate` used to build no comparison at all and hand back
+    // `relation_census: None`, so the command a reader runs to ask "is my graph
+    // sound" was the one surface that never looked at the record kept for
+    // exactly that question. On the rc070 stranger run it printed
+    // "All integrity checks passed" over three separate states another Kin
+    // command refused as inconsistent, and over a merge result `kin doctor`'s
+    // own census row was calling stale in the same session. Both commands read
+    // one store; only one of them was reading this record.
+    //
+    // Measured entity-rooted and de-duplicated by relation id, which is the
+    // measurement `record_relation_census` writes and the one `kin graph status`
+    // prints. The whole-table walk above it counts a different population, and
+    // comparing that against this baseline would report movement no pass
+    // produced.
+    let (current_census, census_entities) = measure_relation_census_with_entities(graph)?;
+    let census_comparison = kin_core::relation_census::RelationCensusComparison::build(
+        &census.previous,
+        &current_census,
+        census.causes.clone(),
+    )
+    .with_current_entities(census_entities);
+    // A lost kind is an issue in its own right, so it withholds the all-clear
+    // and sets the command's non-zero exit rather than printing beneath it. An
+    // integrity pass over a graph missing a third of its edges is still a
+    // passing integrity pass, and saying so and nothing else is what let a
+    // degraded graph read as healthy.
+    issues.extend(census_comparison.loss_lines());
+
     issues.extend(health.critical_issues.clone());
 
     let mut lines = Vec::new();
@@ -1410,12 +1468,20 @@ fn build_graph_validate_response(
     // cannot check whether the edges that should exist do. So it says which
     // question it answered and prints the answer to the other one beside it,
     // rather than leaving a reader to assume the two are the same check.
+    //
+    // The census row is the nearest this command gets to the second question
+    // and is not the same as answering it: it says whether the edges this store
+    // used to hold are still here, never whether the edges the code implies were
+    // ever derived. The sentence names that boundary so a green census is not
+    // read as the completeness claim the line above disclaims.
     lines.push(String::new());
     lines.push(
-        "Integrity only: these checks say the edges present are coherent, not that the edges a \
-         reader expects exist."
+        "Integrity only: these checks say the edges present are coherent, and the census below \
+         says whether the edges this store already held are still here; neither says the edges a \
+         reader expects were ever derived."
             .to_string(),
     );
+    lines.push(census_comparison.summary_line());
     lines.extend(health.reference_edge_coverage.summary_lines());
     let unsupportable = health
         .reference_edge_coverage
@@ -1435,7 +1501,7 @@ fn build_graph_validate_response(
         error: (!issues.is_empty()).then(|| format!("{} issue(s) found", issues.len())),
         source: None,
         reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
-        relation_census: None,
+        relation_census: Some(census_comparison),
         graph_section: None,
     })
 }
@@ -4018,6 +4084,137 @@ mod tests {
             repository_coverage_line(0, 0),
             "Repository coverage: no files admitted yet, so there is no coverage fraction to \
              report"
+        );
+    }
+
+    /// `kin graph validate` is the command a reader runs to ask whether the
+    /// graph is sound, and it was the one surface that never read the record
+    /// kept for exactly that question.
+    ///
+    /// On the rc070 stranger run it printed "All integrity checks passed" over
+    /// three separate states another Kin command refused as inconsistent, and
+    /// over a merge result whose relation census `kin doctor` was calling stale
+    /// in the same session. One store, two commands, and only one of them
+    /// looking at the record.
+    ///
+    /// Both arms share one fixture and differ only in whether `UsesType` still
+    /// has an edge. The control is what makes the second arm mean anything: a
+    /// build that stopped printing the all-clear at all would otherwise read as
+    /// a pass.
+    #[test]
+    fn graph_validate_refuses_the_all_clear_over_a_census_that_lost_ground() {
+        let temp = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(temp.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let binding =
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+
+        let enriched = kin_db::InMemoryGraph::new();
+        let caller = test_entity("run_task");
+        let callee = test_entity("finalize");
+        let typed = test_entity("Payload");
+        for entity in [&caller, &callee, &typed] {
+            enriched.upsert_entity(entity).unwrap();
+        }
+        enriched
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
+            .unwrap();
+        enriched
+            .upsert_relation(&test_relation(RelationKind::UsesType, caller.id, typed.id))
+            .unwrap();
+
+        let recorded = kin_core::relation_census::RelationCensus::new(
+            chrono::Utc::now(),
+            kin_core::relation_census::CensusSource::Sweep,
+            measure_relation_census(&enriched).unwrap(),
+            Vec::new(),
+        );
+        assert_eq!(
+            recorded.kinds.get("UsesType"),
+            Some(&1),
+            "the recorded census holds the kind that is about to be lost: {:?}",
+            recorded.kinds
+        );
+        kin_core::relation_census::write(&layout, &recorded).unwrap();
+
+        // The control. Integrity is sound and the census has lost nothing, so
+        // the all-clear is reachable and validate still says so.
+        let unchanged = build_graph_validate_response_with_census(
+            &pinned(&binding),
+            &enriched,
+            &kin_core::relation_census::CensusContext::for_layout(
+                &layout,
+                Vec::<(String, String)>::new(),
+            ),
+            None,
+        )
+        .unwrap();
+        assert!(unchanged.error.is_none(), "{:?}", unchanged.lines);
+        assert!(
+            unchanged
+                .lines
+                .iter()
+                .any(|line| line == "✓ All integrity checks passed."),
+            "{:?}",
+            unchanged.lines
+        );
+        assert!(
+            unchanged
+                .relation_census
+                .as_ref()
+                .is_some_and(|census| !census.reports_loss()),
+            "the control has to reach the census and find nothing, or the second arm proves \
+             only that some issue exists: {:?}",
+            unchanged.lines
+        );
+
+        // The kind is gone. Every integrity check above still passes: the one
+        // remaining edge points at entities that exist, no entity is duplicated
+        // and none is orphaned. That is exactly the state that used to answer
+        // "All integrity checks passed."
+        let stripped = kin_db::InMemoryGraph::new();
+        for entity in [&caller, &callee, &typed] {
+            stripped.upsert_entity(entity).unwrap();
+        }
+        stripped
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
+            .unwrap();
+
+        let lost = build_graph_validate_response_with_census(
+            &pinned(&binding),
+            &stripped,
+            &kin_core::relation_census::CensusContext::for_layout(
+                &layout,
+                Vec::<(String, String)>::new(),
+            ),
+            None,
+        )
+        .unwrap();
+        let rendered = lost.lines.join("\n");
+        assert!(
+            lost.error.is_some(),
+            "a lost relation kind sets the command's non-zero exit: {rendered}"
+        );
+        assert!(
+            !lost
+                .lines
+                .iter()
+                .any(|line| line == "✓ All integrity checks passed."),
+            "the all-clear is withheld over a graph that lost a whole relation kind: {rendered}"
+        );
+        assert!(
+            lost.lines
+                .iter()
+                .any(|line| line.starts_with("✗ relation kind UsesType lost every edge it held")),
+            "the issue names the kind, because the reader's next action depends on which one \
+             went: {rendered}"
+        );
+        assert!(
+            lost.relation_census
+                .as_ref()
+                .is_some_and(|census| census.reports_loss()),
+            "validate publishes the comparison it judged on rather than only its verdict: \
+             {rendered}"
         );
     }
 
