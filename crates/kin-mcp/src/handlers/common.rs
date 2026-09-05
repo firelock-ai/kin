@@ -1171,37 +1171,82 @@ impl ReferenceLinesAbsent {
 ///
 /// The distinction is the producer's own contract, which is a graph fact rather
 /// than a guess: [`RelationOrigin`](kin_model::RelationOrigin) says which
-/// producer recorded an edge, and only some of them record every site.
+/// producer recorded an edge, and exactly one of the four records every site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceLinesPartial {
-    /// At least one relation kind behind this row was recorded only by
-    /// language-server enrichment, which records at most one site per edge.
+    /// An edge behind this row came from language-server enrichment, which
+    /// records at most one site per edge.
     ///
     /// kin-lsp takes `CallHierarchyOutgoingCall.from_ranges.first()` for a call
     /// edge, keeps the first location per target for a `UsesType` edge, and
-    /// carries no span at all on its `References` edges. Every one of those is a
-    /// single site standing in for however many the file holds, so a row that
-    /// depends on one for a kind knows its lines are a lower bound.
+    /// carries no span at all on its `References` edges. Each is one site
+    /// standing in for however many the file holds.
     LanguageServerEdge,
+    /// An edge behind this row came from a producer with no every-site
+    /// contract: `Manual`, or an origin added after this was written.
+    ///
+    /// A hand-authored edge asserts that the reference exists. A span on it is
+    /// one position somebody recorded, never a statement that the file holds no
+    /// others, so it cannot license a site total. An unrecognized origin lands
+    /// here too, because a producer nobody has checked has made no promise.
+    ProducerWithoutSiteContract,
 }
 
 impl ReferenceLinesPartial {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LanguageServerEdge => "language_server_edge",
+            Self::ProducerWithoutSiteContract => "producer_without_site_contract",
         }
     }
 }
 
-/// Whether the producer that recorded this edge records EVERY site for it.
+/// Why this edge cannot license a site total, and `None` when it can.
 ///
-/// The parser emits one edge per syntax occurrence, each with its own span, and
-/// [`accumulate_relation`](kin_index::linker) merges them into one relation
-/// keyed on the span, so a parsed edge's evidence holds every site the parse
-/// saw. Language-server enrichment reports one site per edge by construction.
-/// A relation carries which of the two produced it, so this needs no heuristic.
-fn edge_records_every_site(relation: &kin_model::relation::Relation) -> bool {
-    relation.origin != kin_model::RelationOrigin::Lsp
+/// The claim is made from positive proof, by naming the origins that carry an
+/// every-site contract, rather than from the absence of one known bad producer.
+/// Reading it the other way round, as `origin != Lsp`, certified `Manual` by
+/// default and would certify any origin added later the same way.
+///
+/// `Parsed` and `Inferred` both carry the contract, and the enum is misleading
+/// about why. Both are the linker's own output over one adapter extraction:
+/// `make_relation` (`kin-index/src/linker.rs`) picks between them purely on
+/// confidence, `origin = if confidence >= 1.0 { Parsed } else { Inferred }`, and
+/// builds the evidence for both from the same `ExtractedRelation::site`. So
+/// `Inferred` here describes how firmly the DESTINATION was resolved, never how
+/// many sites were recorded: an import-pinned cross-file call resolves at 0.9
+/// and is `Inferred` while carrying every call site the parse saw. The linker's
+/// two other `Inferred` producers, the external-import reference and the include
+/// marker, record no `source_span` at all, so they contribute no line to floor.
+///
+/// Treating `Inferred` as contract-less would floor a correct answer: the Python
+/// batch arm of `kin-cli`'s `reference_call_site_lines` reports both of its real
+/// parsed sites on a `type_resolved` row, and it went red under that reading.
+fn edge_site_contract_gap(
+    relation: &kin_model::relation::Relation,
+) -> Option<ReferenceLinesPartial> {
+    match relation.origin {
+        kin_model::RelationOrigin::Parsed | kin_model::RelationOrigin::Inferred => None,
+        kin_model::RelationOrigin::Lsp => Some(ReferenceLinesPartial::LanguageServerEdge),
+        _ => Some(ReferenceLinesPartial::ProducerWithoutSiteContract),
+    }
+}
+
+/// Keep the most specific gap a row has seen.
+///
+/// Both values mean the same thing to a caller, that the lines are a floor, so
+/// the only question is which is more useful to read. `LanguageServerEdge` names
+/// a measured one-site-per-edge producer and points at a specific fix, so it
+/// wins over the general case.
+fn merge_site_contract_gap(
+    current: &mut Option<ReferenceLinesPartial>,
+    incoming: Option<ReferenceLinesPartial>,
+) {
+    match (*current, incoming) {
+        (_, None) => {}
+        (Some(ReferenceLinesPartial::LanguageServerEdge), _) => {}
+        (_, Some(gap)) => *current = Some(gap),
+    }
 }
 
 /// One row per REFERENCING ENTITY that reaches `entity_id` over an allowed
@@ -1227,15 +1272,6 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
     // "the parser recorded nothing" and "what it recorded was unusable here"
     // into one silent empty list.
     let mut spans_outside_caller_file: HashMap<EntityId, usize> = HashMap::new();
-    // Which relation kinds behind each row an exhaustive producer recorded, and
-    // which a one-site-per-edge producer recorded. Kept per kind rather than per
-    // row because a language server routinely re-derives an edge the parser
-    // already enumerated in full: marking that row a floor because a second
-    // producer also saw it would report almost every row on an enriched
-    // repository as incomplete, which is as useless as the over-claim it
-    // replaces. A kind only a language server recorded is the real floor.
-    let mut exhaustive_kinds: HashMap<EntityId, Vec<RelationKind>> = HashMap::new();
-    let mut partial_kinds: HashMap<EntityId, Vec<RelationKind>> = HashMap::new();
 
     // One held authority for the whole reference set. This projects a body per
     // REFERENCING entity, so it is the same multi-entity shape the retrieval
@@ -1326,13 +1362,13 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             .entry(source_entity_id)
             .or_default() += tally.outside_caller_file;
         push_reference_kind(&mut entry.relation_kinds, rel.kind);
-        push_reference_kind(
-            if edge_records_every_site(&rel) {
-                exhaustive_kinds.entry(source_entity_id).or_default()
-            } else {
-                partial_kinds.entry(source_entity_id).or_default()
-            },
-            rel.kind,
+        // Any contribution without an every-site contract keeps the row a floor.
+        // A parsed edge holds every site the PARSE saw, which is not evidence
+        // about the occurrences some other edge stands for, and no coverage
+        // witness in the graph joins the two.
+        merge_site_contract_gap(
+            &mut entry.reference_lines_partial,
+            edge_site_contract_gap(&rel),
         );
         let resolution = RelationResolution::of(&rel);
         entry.resolution = Some(match entry.resolution {
@@ -1425,13 +1461,9 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
                 .entry(source_entity_id)
                 .or_default() += tally.outside_caller_file;
             push_reference_kind(&mut entry.relation_kinds, rel.kind);
-            push_reference_kind(
-                if edge_records_every_site(&rel) {
-                    exhaustive_kinds.entry(source_entity_id).or_default()
-                } else {
-                    partial_kinds.entry(source_entity_id).or_default()
-                },
-                rel.kind,
+            merge_site_contract_gap(
+                &mut entry.reference_lines_partial,
+                edge_site_contract_gap(&rel),
             );
             let resolution = RelationResolution::of(&rel);
             entry.resolution = Some(match entry.resolution {
@@ -1453,17 +1485,12 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
         row.relation_kinds.sort_by_key(relation_kind_rank);
         row.reference_lines.sort_unstable();
         row.reference_lines.dedup();
-        // A kind no exhaustive producer recorded rests on an edge that reports
-        // one site whatever the file holds, so this row's lines are a floor.
-        let exhaustive = exhaustive_kinds
-            .remove(&source_entity_id)
-            .unwrap_or_default();
-        row.reference_lines_partial = partial_kinds
-            .remove(&source_entity_id)
-            .unwrap_or_default()
-            .iter()
-            .any(|kind| !exhaustive.contains(kind))
-            .then_some(ReferenceLinesPartial::LanguageServerEdge);
+        // A row with no lines has nothing to call a floor: `reference_lines_absent`
+        // below is the whole story, and carrying both would state one absence
+        // twice under two names.
+        if row.reference_lines.is_empty() {
+            row.reference_lines_partial = None;
+        }
         row.reference_lines_absent = if !row.reference_lines.is_empty() {
             None
         } else if spans_outside_caller_file

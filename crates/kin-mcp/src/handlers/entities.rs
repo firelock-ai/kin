@@ -1574,10 +1574,12 @@ The `counts` object states the unit outright and adds `files` and `reference_sit
 a count is never read against the wrong unit. `reference_sites` is null when some row's \
 sites could not be located OR are only a floor, with `known_reference_sites` the lower \
 bound and each such row naming why under `reference_lines_absent_reason` (no lines at \
-all) or `reference_lines_partial_reason` (lines came back but there may be more, \
-because a relation kind behind that row was recorded only by language-server \
-enrichment, which reports one site per edge). A row with neither reason set lists every \
-site it has. Rows omit the caller's body by \
+all) or `reference_lines_partial_reason` (lines came back but there may be more). That \
+second reason is `language_server_edge` when an edge came from language-server \
+enrichment, which reports one site per edge, and `producer_without_site_contract` when \
+one was hand-authored, which proves a reference rather than an occurrence count. Only a \
+row built entirely from edges the parse produced lists every site it has, and only that \
+row sets neither reason. Rows omit the caller's body by \
 default to keep the response small; pass include_snippets=true for the signature and a \
 bounded body excerpt, or drill to any row's entity_id with get_entity_source. \
 Use it to answer \"who calls / imports / uses this?\" before you \
@@ -1837,10 +1839,10 @@ fn answer_witnessed_classes<G: GraphStore>(
 /// call sites satisfied it, so express's `setCharset` came back as three sites,
 /// `reference_sites_complete: true`, under a `certified` verdict, while
 /// `test/utils.js` alone holds five. A reader could not tell the undercount from
-/// a small repository. The floor is now stated as a floor: a row whose producer
-/// records one site per edge sets `reference_lines_partial`, and one such row
-/// makes `reference_sites` null with `known_reference_sites` the bound, the same
-/// rule an unlocatable row already followed.
+/// a small repository. The floor is now stated as a floor: a row carrying any
+/// edge without an every-site contract sets `reference_lines_partial`, and one
+/// such row makes `reference_sites` null with `known_reference_sites` the bound,
+/// the same rule an unlocatable row already followed.
 fn reference_counts(rows: &[ReferenceRow], receiver_name_candidates: usize) -> serde_json::Value {
     let known_reference_sites: usize = rows.iter().map(|row| row.reference_lines.len()).sum();
     let reference_sites_complete = rows
@@ -1951,9 +1953,11 @@ fn reference_row_json(row: ReferenceRow, include_snippets: bool) -> serde_json::
             .reference_lines_absent
             .map(ReferenceLinesAbsent::as_str),
         // Why the lines that DID come back are a floor: `language_server_edge`
-        // (a relation kind behind this row was recorded only by language-server
-        // enrichment, which reports one site per edge). Null when every kind
-        // came from a producer that records each site, and then
+        // (an edge behind this row came from language-server enrichment, which
+        // reports one site per edge) or `producer_without_site_contract` (one
+        // was hand-authored, or came from an origin with no checked contract,
+        // so it proves a reference rather than an occurrence count). Null when
+        // every edge behind the row came from the parse, and then
         // `reference_line_count` is the whole count for this caller.
         "reference_lines_partial_reason": row
             .reference_lines_partial
@@ -8080,17 +8084,54 @@ mod tests {
         );
     }
 
-    /// A language server re-deriving an edge the parser already enumerated does
-    /// NOT make the row a floor.
+    /// A manually authored edge does not certify its site set.
     ///
-    /// The rule is per relation kind, not per row, and this is why. On any
-    /// enriched repository the call-hierarchy pass rebuilds edges the adapter
-    /// already recorded site by site, so "any language-server edge makes the row
-    /// partial" would report almost every row as incomplete and the flag would
-    /// carry no information at all. FIR-2357 item 4 in a new place: a fix that
-    /// marks every answer uncertain is not a fix.
+    /// [`RelationOrigin`](kin_model::RelationOrigin) has four values, and the
+    /// two the linker emits over a parse, `Parsed` and `Inferred`, are the ones
+    /// that carry an every-site contract. `Manual` is an edge somebody asserted:
+    /// a single span on it is one position that happened to be recorded, not
+    /// proof that the file holds no others. Certifying by `origin != Lsp`
+    /// certified it by default, and would certify any origin added later.
     #[tokio::test]
-    async fn find_references_still_certifies_a_kind_the_parser_enumerated() {
+    async fn find_references_will_not_certify_sites_from_a_manually_authored_edge() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+
+        let mut relation =
+            make_relation_with_site(caller.id, target.id, RelationKind::Calls, "src/a.rs", 11);
+        relation.origin = RelationOrigin::Manual;
+        store.upsert_relation(&relation).unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        let row = &body["references"].as_array().unwrap()[0];
+
+        assert_eq!(row["reference_lines"], serde_json::json!([12]));
+        assert_eq!(
+            row["reference_lines_partial_reason"], "producer_without_site_contract",
+            "a hand-authored edge proves one site, not every site: {body:#}"
+        );
+        assert_eq!(body["counts"]["reference_sites"], serde_json::Value::Null);
+        assert_eq!(body["counts"]["known_reference_sites"], 1);
+        assert_eq!(body["counts"]["reference_sites_complete"], false);
+    }
+
+    /// A parsed edge beside a language-server edge does not certify the row.
+    ///
+    /// The parsed edge holds every site the PARSE saw. That is not the same
+    /// claim as every site the enrichment edge stands for, and nothing in the
+    /// graph witnesses that the two cover the same occurrences. A rule that let
+    /// one kind's parsed edge vouch for a language-server edge of that kind was
+    /// asserting a coverage fact it had no evidence for, so any contribution
+    /// without an every-site contract now keeps the row a floor.
+    #[tokio::test]
+    async fn find_references_floors_a_row_mixing_a_parsed_and_a_language_server_edge() {
         let store = InMemoryGraph::new();
         let caller_file = FilePathId::new("src/a.rs");
         let caller = make_entity("caller", "src/a.rs");
@@ -8117,8 +8158,6 @@ mod tests {
             .collect();
         store.upsert_relation(&parsed).unwrap();
 
-        // The enrichment edge for the SAME kind, carrying the first of those two
-        // sites. It adds no line the parser did not already have.
         let mut enriched =
             make_relation_with_site(caller.id, target.id, RelationKind::Calls, "src/a.rs", 11);
         enriched.origin = RelationOrigin::Lsp;
@@ -8131,14 +8170,15 @@ mod tests {
         let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
         let row = &body["references"].as_array().unwrap()[0];
 
+        // Both sites are still served; only the claim about them is withheld.
         assert_eq!(row["reference_lines"], serde_json::json!([12, 42]));
         assert_eq!(
-            row["reference_lines_partial_reason"],
-            serde_json::Value::Null,
-            "the parser enumerated this kind, so the sites are whole: {body:#}"
+            row["reference_lines_partial_reason"], "language_server_edge",
+            "the enrichment edge's own site set was never enumerated: {body:#}"
         );
-        assert_eq!(body["counts"]["reference_sites"], 2);
-        assert_eq!(body["counts"]["reference_sites_complete"], true);
+        assert_eq!(body["counts"]["reference_sites"], serde_json::Value::Null);
+        assert_eq!(body["counts"]["known_reference_sites"], 2);
+        assert_eq!(body["counts"]["reference_sites_complete"], false);
     }
 
     /// A kind ONLY the language server recorded makes the row a floor even when
