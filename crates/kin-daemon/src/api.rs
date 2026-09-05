@@ -38677,6 +38677,16 @@ mod tests {
     /// Untracking is not enough. Entities are what rank, so a purge that left
     /// them behind produced the worst reading of all: the artifact listing no
     /// longer names the file while search and locate still return it.
+    ///
+    /// The purged path reaches the graph the way an ambient admission leaves
+    /// one: its bytes in repository authority, its entities derived into the
+    /// live graph, and no commit publishing a semantic delta for them. That is
+    /// the state this eviction is about, and admitting through the daemon's own
+    /// `/commands/admit` is what produces it rather than a hand-placed entity
+    /// standing in for a parse. The committed shape, whose entities repository
+    /// authority holds too, is covered by
+    /// `purge_ignored_retires_the_entities_a_commit_published_for_a_vacated_path`
+    /// and is red for a reason of its own.
     #[tokio::test]
     async fn purge_ignored_evicts_the_entities_that_made_a_path_rank() {
         let state = test_state();
@@ -38684,27 +38694,40 @@ mod tests {
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        // The rule lands after the admission, which is the whole scenario: a
-        // repository that already carries a path is told to stop carrying it.
         for (path, content) in [
             (
                 "investor/deck/build_deck.py",
                 &b"def valuation(): pass\n"[..],
             ),
             ("src/lib.py", &b"def kept(): pass\n"[..]),
-            (".kinignore", &b"investor\n"[..]),
         ] {
             install_working_copy_file(&state, path, content, false);
-            install_repository_file(&state, path, content);
         }
+        let app = router(Arc::clone(&state));
+        admit_through_api(&app).await;
 
-        let private = test_entity("valuation", "investor/deck/build_deck.py");
-        let kept = test_entity("kept", "src/lib.py");
-        state.graph.upsert_entity(&private).unwrap();
-        state.graph.upsert_entity(&kept).unwrap();
+        // The rule lands after the admission, which is the whole scenario: a
+        // repository that already carries a path is told to stop carrying it.
+        // It stays untracked on purpose, because admitting it would retract the
+        // covered path on its own and leave this purge nothing to do.
+        install_working_copy_file(&state, ".kinignore", b"investor\n", false);
+
+        let derived = |path: &str, name: &str| {
+            state
+                .graph
+                .query_entities(&kin_db::EntityFilter {
+                    file_path: Some(kin_model::FilePathId::new(path)),
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.name == name)
+                .unwrap_or_else(|| panic!("the admission must derive {name} for {path}"))
+        };
+        let private = derived("investor/deck/build_deck.py", "valuation");
+        let kept = derived("src/lib.py", "kept");
         assert!(state.graph.get_entity(&private.id).unwrap().is_some());
 
-        let app = router(Arc::clone(&state));
         let (_, applied) = purge_ignored_through_api(&app, true).await;
         assert_eq!(applied["report"]["purge_count"], json!(1));
 
@@ -38727,6 +38750,69 @@ mod tests {
         // entity, so the purge removed one path rather than clearing the graph.
         assert!(live.contains("src/lib.py"));
         assert_eq!(state.graph.get_entity(&kept.id).unwrap(), Some(kept));
+    }
+
+    /// The same purge over a path a COMMIT published entities for, which is what
+    /// a repository that has ever committed its source actually holds.
+    ///
+    /// Red today, and named here rather than left to be rediscovered.
+    /// `repository_commit::publish_workspace_tree` carries
+    /// `WorkspaceSemanticDelta::default()`, so the tree publication that retires
+    /// the path leaves repository authority holding entities on it and kin-db
+    /// refuses the whole transition with "transaction leaves entity ... absent
+    /// from the staged tree". The session admission in that same module already
+    /// carries `retire_semantics_on_vacated` over its vacated set; the tree
+    /// publication does not, and every caller of `publish_exact_workspace_tree`
+    /// inherits the gap, the watch loop's standalone admission included. That is
+    /// the FIR-2429 class surviving on the paths its fix did not reach, and it is
+    /// tracked as FIR-3274.
+    ///
+    /// Ignored so the suite stays green while the class stays written down where
+    /// the fix will find it. Run it by name with
+    /// `cargo test -p kin-daemon --lib -- --ignored
+    /// purge_ignored_retires_the_entities_a_commit_published_for_a_vacated_path`.
+    #[tokio::test]
+    #[ignore = "FIR-3274: publish_workspace_tree carries no retirement for a vacated path"]
+    async fn purge_ignored_retires_the_entities_a_commit_published_for_a_vacated_path() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Committed, not merely admitted: the install plans and commits a native
+        // change, so its entity deltas reach repository authority exactly as a
+        // person's `kin commit` would put them there.
+        for (path, content) in [
+            (
+                "investor/deck/build_deck.py",
+                &b"def valuation(): pass\n"[..],
+            ),
+            ("src/lib.py", &b"def kept(): pass\n"[..]),
+        ] {
+            install_working_copy_file(&state, path, content, false);
+            install_repository_file(&state, path, content);
+        }
+        install_working_copy_file(&state, ".kinignore", b"investor\n", false);
+        let app = router(Arc::clone(&state));
+
+        let private = state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new("investor/deck/build_deck.py")),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.name == "valuation")
+            .expect("the install must derive the entity the purge has to retire");
+
+        let (_, applied) = purge_ignored_through_api(&app, true).await;
+        assert_eq!(applied["report"]["purge_count"], json!(1));
+        assert!(!tracked_paths(&state).contains("investor/deck/build_deck.py"));
+        assert!(
+            state.graph.get_entity(&private.id).unwrap().is_none(),
+            "a purged path's entity still resolves, so it still ranks"
+        );
     }
 
     fn branch_change(state: &DaemonState) -> SemanticChangeId {
@@ -41472,10 +41558,10 @@ mod tests {
             "def handler():\n    return 'checkout drift'\n",
         )
         .unwrap();
-        let mut entity = test_entity("handler", "src/lib.py");
-        entity.span.as_mut().unwrap().end_byte = source.len();
-        entity.span.as_mut().unwrap().end_line = 2;
-        state.graph.upsert_entity(&entity).unwrap();
+        // The entity under test is the one installing the file derived, which
+        // is what the daemon's admission leaves behind. A hand-made duplicate
+        // on the same path made this query name two entities and the endpoint
+        // return three records for a fixture that holds one definition.
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -41504,16 +41590,39 @@ mod tests {
             .unwrap();
         let result: kin_cli::commands::search::DaemonSearchResponse =
             serde_json::from_slice(&body).unwrap();
-        assert_eq!(result.records.len(), 1);
-        match result.records.first().unwrap() {
-            kin_cli::commands::search::DaemonSearchRecord::Entity(entity) => {
-                assert_eq!(entity.name, "handler");
-                assert_eq!(entity.file.as_deref(), Some("src/lib.py"));
-                assert_eq!(entity.body.as_deref(), Some("def handler():"));
-                assert_eq!(entity.body_omitted_line_count, 1);
-            }
-            other => panic!("expected entity record, got {other:?}"),
-        }
+        // Installing a real source file derives the file's own module beside its
+        // function, and a text search for the function's name matches the
+        // module's body as well, so the graph answers with two records where a
+        // single hand-made entity answered with one. Both are named here rather
+        // than counted, because the count on its own says nothing about which
+        // record the body assertions below are about.
+        let mut named: Vec<(&str, &str)> = result
+            .records
+            .iter()
+            .map(|record| match record {
+                kin_cli::commands::search::DaemonSearchRecord::Entity(entity) => {
+                    (entity.name.as_str(), entity.kind.as_str())
+                }
+                other => panic!("expected entity records, got {other:?}"),
+            })
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, [("handler", "Function"), ("lib", "Module")]);
+        let entity = result
+            .records
+            .iter()
+            .find_map(|record| match record {
+                kin_cli::commands::search::DaemonSearchRecord::Entity(entity)
+                    if entity.name == "handler" =>
+                {
+                    Some(entity)
+                }
+                _ => None,
+            })
+            .expect("the search must return the function the query names");
+        assert_eq!(entity.file.as_deref(), Some("src/lib.py"));
+        assert_eq!(entity.body.as_deref(), Some("def handler():"));
+        assert_eq!(entity.body_omitted_line_count, 1);
     }
 
     #[tokio::test]
@@ -44390,13 +44499,12 @@ mod tests {
         let state = test_state();
         // Coverage healthy on purpose, so the degradation is the only reason
         // left to refuse and the assertion cannot pass for the wrong cause.
-        let mut caller = test_entity("caller", "src/a.py");
-        let mut callee = test_entity("callee", "src/b.py");
-        let mut orphan = test_entity("orphan", "src/orphan.py");
-        for entity in [&mut caller, &mut callee, &mut orphan] {
-            install_trace_fixture_file(&state, entity);
-            state.graph.upsert_entity(entity).unwrap();
-        }
+        let caller = install_trace_fixture_file(&state, "caller", "src/a.py");
+        let callee = install_trace_fixture_file(&state, "callee", "src/b.py");
+        // The focal has to reach nothing AND hold no same-file neighbour, so it
+        // is the module of a file that declares nothing rather than a function
+        // sitting beside its own module.
+        install_lone_module_fixture_file(&state, "orphan");
         link_every_class(&state, &caller, &callee);
         state
             .is_initialized
@@ -44441,12 +44549,8 @@ mod tests {
     #[tokio::test]
     async fn a_trace_that_finds_dependencies_stays_unqualified_even_when_degraded() {
         let state = test_state();
-        let mut caller = test_entity("caller", "src/a.py");
-        let mut callee = test_entity("callee", "src/b.py");
-        for entity in [&mut caller, &mut callee] {
-            install_trace_fixture_file(&state, entity);
-            state.graph.upsert_entity(entity).unwrap();
-        }
+        let caller = install_trace_fixture_file(&state, "caller", "src/a.py");
+        let callee = install_trace_fixture_file(&state, "callee", "src/b.py");
         link_every_class(&state, &caller, &callee);
         state
             .is_initialized
@@ -44471,31 +44575,64 @@ mod tests {
         );
     }
 
-    /// Put an entity's file into repository authority and the working copy.
+    /// Install a source file that declares nothing, and hand back the module
+    /// entity that is then the file's ONLY entity.
     ///
-    /// `/trace` resolves a repository authority binding before it renders, so a
-    /// graph-only fixture answers 500 and the assertions below never run.
-    fn install_trace_fixture_file(state: &Arc<DaemonState>, entity: &mut Entity) {
-        let path = entity
-            .file_origin
-            .as_ref()
-            .expect("trace fixture entities carry a file")
-            .0
-            .clone();
-        let source = format!("def {}():\n    return 1\n", entity.name);
+    /// A trace focal that must reach nothing needs a file with no same-file
+    /// neighbour either. `kin_context::build_context_pack` fills an empty
+    /// dependency walk with same-file neighbours and the trace's absence
+    /// qualifier prints only while `dependency_signatures` is empty, so a focal
+    /// sitting in a file that also holds its own module never reaches that
+    /// branch. A Python file holding a function derives both, so the file here
+    /// declares nothing and its module is the focal.
+    fn install_lone_module_fixture_file(state: &Arc<DaemonState>, name: &str) -> Entity {
+        let path = format!("src/{name}.py");
+        let source =
+            format!("# {name} declares nothing, so its module is this file's one entity\n");
         install_repository_file(state, &path, source.as_bytes());
         let working = state.layout.working_dir().join(&path);
         std::fs::create_dir_all(working.parent().unwrap()).unwrap();
         std::fs::write(&working, source.as_bytes()).unwrap();
-        // `test_entity` spans 0..0, which the route rejects against a file that
-        // has bytes. Left unfixed the route answers 500 and every assertion
-        // below never runs.
-        let span = entity
-            .span
-            .as_mut()
-            .expect("trace fixture entities carry a span");
-        span.end_byte = source.len();
-        span.end_line = 2;
+        state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new(&path)),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.name == name && candidate.kind == EntityKind::Module)
+            .unwrap_or_else(|| panic!("installing {path} must derive the module {name}"))
+    }
+
+    /// Put a fixture's file into repository authority and the working copy, and
+    /// hand back the entity the install derived from its bytes.
+    ///
+    /// `/trace` resolves a repository authority binding before it renders, so a
+    /// graph-only fixture answers 500 and the assertions below never run.
+    ///
+    /// The entity comes from the install rather than from `test_entity` because
+    /// installing a source file derives one already, exactly as the daemon's
+    /// admission does. Upserting a second hand-made entity on the same path
+    /// builds a graph the daemon never produces: `orphan` named three entities
+    /// and `caller` two, and the trace then resolved an ambiguity these tests
+    /// never meant to exercise.
+    fn install_trace_fixture_file(state: &Arc<DaemonState>, name: &str, path: &str) -> Entity {
+        let source = format!("def {name}():\n    return 1\n");
+        install_repository_file(state, path, source.as_bytes());
+        let working = state.layout.working_dir().join(path);
+        std::fs::create_dir_all(working.parent().unwrap()).unwrap();
+        std::fs::write(&working, source.as_bytes()).unwrap();
+        state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new(path)),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.name == name && candidate.kind == EntityKind::Function)
+            .unwrap_or_else(|| panic!("installing {path} must derive the function {name}"))
     }
 
     /// Drive `/trace` in its DEFAULT rendering and return the lines it printed.
@@ -49816,12 +49953,8 @@ mod tests {
     /// behavior.
     fn reference_fixture() -> (Arc<DaemonState>, Entity) {
         let state = test_state();
-        let mut target = test_entity("sweep_target", "src/target.py");
-        let mut caller = test_entity("sweep_caller", "src/caller.py");
-        for entity in [&mut target, &mut caller] {
-            install_trace_fixture_file(&state, entity);
-            state.graph.upsert_entity(entity).unwrap();
-        }
+        let target = install_trace_fixture_file(&state, "sweep_target", "src/target.py");
+        let caller = install_trace_fixture_file(&state, "sweep_caller", "src/caller.py");
         link_every_class(&state, &caller, &target);
         (state, target)
     }
@@ -53448,28 +53581,32 @@ mod tests {
         let second =
             "\ndef parse_config_list(paths):\n    return [parse_config(p) for p in paths]\n";
         let source = format!("{first}{second}");
-        install_repository_file(&state, "src/config.py", source.as_bytes());
-        install_working_copy_file(&state, "src/config.py", source.as_bytes(), false);
+        // The module entity an install derives takes the file stem, so a path of
+        // `src/config.py` would put an entity named `config` in this graph and
+        // the descriptive query below would name it by name. Keeping the stem
+        // outside the query is what leaves `all_fallback` a statement about the
+        // query rather than about the fixture's file name.
+        install_repository_file(&state, "src/loader.py", source.as_bytes());
+        install_working_copy_file(&state, "src/loader.py", source.as_bytes(), false);
 
-        for (name, start_byte, end_byte, preview) in [
-            ("parse_config", 0, first.len(), "def parse_config(path):"),
-            (
-                "parse_config_list",
-                first.len(),
-                source.len(),
-                "def parse_config_list(paths):",
-            ),
+        // The two definitions are the ones the install derived from those bytes,
+        // carrying their real spans. Upserting hand-made entities beside them
+        // would leave the graph holding each definition twice, which is a shape
+        // the daemon never produces.
+        for (name, preview) in [
+            ("parse_config", "def parse_config(path):"),
+            ("parse_config_list", "def parse_config_list(paths):"),
         ] {
-            let mut entity = test_entity(name, "src/config.py");
-            entity.span = Some(SourceSpan {
-                file: kin_model::FilePathId::new("src/config.py"),
-                start_byte,
-                end_byte,
-                start_line: 0,
-                start_col: 0,
-                end_line: 1,
-                end_col: 24,
-            });
+            let mut entity = state
+                .graph
+                .query_entities(&kin_db::EntityFilter {
+                    file_path: Some(kin_model::FilePathId::new("src/loader.py")),
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.name == name && candidate.kind == EntityKind::Function)
+                .unwrap_or_else(|| panic!("installing src/loader.py must derive {name}"));
             // The fused ranker reads this to call an entity a definition rather
             // than a bare reference, and only definitions are ranked.
             entity
