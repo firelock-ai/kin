@@ -15,6 +15,12 @@ path = "src/lib.rs"
 [features]
 default = []
 http = ["ureq"]
+# `object_store` is kin-db's own object-store client crate, pulled in here at the
+# same version so `GcsBackend::from_store` accepts a store this crate built. That
+# is what lets a caller point the destination at an emulator without a kin-db
+# change. Not a default feature: the refusals in `first_publication_gcs` compile
+# and are tested without it, and only the client construction needs it.
+gcs = ["kin-db/gcs", "dep:object_store", "object_store/gcp"]
 
 [dependencies]
 serde = { workspace = true }
@@ -29,9 +35,15 @@ kin-db = { workspace = true }
 sha2 = { workspace = true }
 base64 = "0.23"
 ureq = { version = "3", optional = true, features = ["json"] }
+object_store = { version = "0.14", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 sha1 = "0.10"
+# Implementing `object_store::ObjectStore` for the generation-stamping test
+# double. The trait is declared with `async_trait` and its `list` returns a
+# `BoxStream`, so both are needed to write an impl at all.
+async-trait = "0.1"
+futures-util = "0.3"
