@@ -1552,8 +1552,9 @@ fn finalize_daemon_graph_status(
         u64::try_from(report.embeddings_indexed),
         u64::try_from(report.embeddings_pending),
         u64::try_from(report.embeddings_total),
+        u64::try_from(report.relation_count),
     );
-    let (Ok(entity_count), Ok(indexed), Ok(pending), Ok(total)) = counts else {
+    let (Ok(entity_count), Ok(indexed), Ok(pending), Ok(total), Ok(relation_count)) = counts else {
         return envelope::finalize(
             ToolCallResult::error(
                 "daemon kin_graph_status counters do not fit the stdio response envelope",
@@ -1583,11 +1584,15 @@ fn finalize_daemon_graph_status(
     };
     let mut selected_env = base_env
         .with_selected_graph_observation(
-            entity_count,
+            envelope::DurabilityCounts {
+                live_entities: entity_count,
+                durable_entities: report.durable_entity_count,
+                live_relations: Some(relation_count),
+                durable_relations: report.durable_relation_count,
+            },
             indexed,
             pending,
             total,
-            report.durable_entity_count,
         )
         .with_memory_pressure(pressure_refusal.as_ref());
     if let Some(stale) = report.stale.as_ref() {
@@ -2032,7 +2037,17 @@ mod tests {
             embedding_coverage,
         );
         let env = Envelope::daemon()
-            .with_selected_graph_observation(1, 1, 0, 1, Some(1))
+            .with_selected_graph_observation(
+                envelope::DurabilityCounts {
+                    live_entities: 1,
+                    durable_entities: Some(1),
+                    live_relations: Some(0),
+                    durable_relations: Some(0),
+                },
+                1,
+                0,
+                1,
+            )
             .with_memory_pressure(refusal.as_ref());
         let result = envelope::finalize(
             ToolCallResult::text(

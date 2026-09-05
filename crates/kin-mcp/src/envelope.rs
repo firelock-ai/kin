@@ -524,15 +524,34 @@ const DURABILITY_UNKNOWN: &str = "unknown";
 /// work was in the graph and never committed. The entities went with the
 /// daemon; the payloads it read were all true and all silent about it.
 ///
-/// Nothing here is fabricated. `live_only_entities` is a difference between two
-/// counts the daemon observed, and when the two cannot be reconciled the state
-/// is `unknown` with no count rather than a number the reader would act on.
+/// Nothing here is fabricated. Each `live_only_*` field is a difference between
+/// two counts the daemon observed, and when either pair cannot be reconciled the
+/// state is `unknown` with no differences at all rather than numbers the reader
+/// would act on.
+///
+/// It counts relations beside entities because counting entities alone
+/// published a false all-clear over a graph half of which was uncommitted
+/// (FIR-3202). A language-server enrichment sweep writes relations straight into
+/// the live query graph and records nothing durable, exactly as continuous host
+/// admission does for entities, so a store whose entity counts were level
+/// reported `861 entities, 0 uncommitted; durable repository authority records
+/// everything answering here` while 3,438 swept relations answered every query
+/// and belonged to no committed change; an unrelated one-line docstring commit
+/// later folded them in as `entities=0 relations=3438`. Every count in that
+/// block was right. The scope was not: it covered one of the two things a graph
+/// is made of, and its note claimed both.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Durability {
-    /// `recorded` when durable authority carries every entity the selected
-    /// graph holds, `live_uncommitted` when it carries fewer, `unknown` when
-    /// the daemon reported no durable observation or the two counts cannot be
+    /// `recorded` when durable authority carries every entity AND every relation
+    /// the selected graph holds, `live_uncommitted` when it carries fewer of
+    /// either, `unknown` when the daemon reported no durable observation for one
+    /// of them, reported no relation reading at all, or either pair cannot be
     /// reconciled.
+    ///
+    /// One word over two readings, the most pessimistic winning, for the reason
+    /// [`crate::verdict::Verdict`] carries one verdict over its inputs: two
+    /// state words that can disagree is two answers to one question, and which
+    /// one a caller acts on becomes a matter of which key it happened to read.
     pub state: String,
     /// Entities in the live query graph that answered this call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -546,8 +565,159 @@ pub struct Durability {
     /// that this number could not be derived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_only_entities: Option<u64>,
+    /// Relations in the live query graph that answered this call.
+    ///
+    /// Absent when the runtime reported no relation reading, which is not zero.
+    /// A store holding no relations and a runtime that never counted them are
+    /// different answers, and only the first of them can be certified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_relations: Option<u64>,
+    /// Relations durable repository authority carried when this daemon last
+    /// levelled its query graph with authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_relations: Option<u64>,
+    /// How many of `live_relations` no committed change carries. Absent under
+    /// the same rule as `live_only_entities` above, and for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_only_relations: Option<u64>,
     /// One line an agent can act on without reading the counts.
     pub note: String,
+}
+
+/// The four readings [`Durability::observe`] reduces to one state.
+///
+/// A struct rather than four positional arguments. Two of them are
+/// `Option<u64>` and all four are counts of two different things, so a caller
+/// that transposed a pair would publish a durable relation count as a durable
+/// entity count and nothing in the type system would catch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DurabilityCounts {
+    /// Entities in the live query graph that answered this call.
+    pub live_entities: u64,
+    /// Entities durable authority carried at the last levelling, or `None` when
+    /// this daemon has never levelled. `None` is not zero.
+    pub durable_entities: Option<u64>,
+    /// Relations in the live query graph, or `None` when the runtime reported no
+    /// relation reading at all. `None` is not zero.
+    pub live_relations: Option<u64>,
+    /// Relations durable authority carried at the last levelling, or `None` on
+    /// the same rule as `durable_entities`.
+    pub durable_relations: Option<u64>,
+}
+
+/// One count pair's reading, before the two pairs are reduced to one state.
+///
+/// Five readings and not three, because the two that cannot yield a number
+/// arrive for different reasons and send a reader to different levers: a daemon
+/// that never levelled needs `kin status`, and a live graph below durable
+/// authority is a store that lost edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    /// Durable authority carries exactly what the live graph holds.
+    Level,
+    /// Durable authority carries fewer, by this many.
+    Uncommitted(u64),
+    /// This daemon has never levelled this axis with durable authority.
+    Unlevelled,
+    /// Durable authority carries MORE than the live graph holds, so the
+    /// difference is not a count of uncommitted work and `recorded` here would
+    /// be the false all-clear this object exists to prevent.
+    Unreconciled { live: u64, durable: u64 },
+    /// Nothing measured this axis at all.
+    Unobserved,
+}
+
+impl Axis {
+    fn observe(live: Option<u64>, durable: Option<u64>) -> Self {
+        let Some(live) = live else {
+            return Self::Unobserved;
+        };
+        let Some(durable) = durable else {
+            return Self::Unlevelled;
+        };
+        if durable > live {
+            return Self::Unreconciled { live, durable };
+        }
+        match live - durable {
+            0 => Self::Level,
+            live_only => Self::Uncommitted(live_only),
+        }
+    }
+
+    /// The difference, or `None` when this reading cannot yield one.
+    fn live_only(self) -> Option<u64> {
+        match self {
+            Self::Level => Some(0),
+            Self::Uncommitted(live_only) => Some(live_only),
+            Self::Unlevelled | Self::Unreconciled { .. } | Self::Unobserved => None,
+        }
+    }
+
+    /// This axis's clause in an `unknown` note: its count when it has one, and
+    /// otherwise why it does not.
+    ///
+    /// The axis that DID reconcile still states its number. A reader told only
+    /// that the relations could not be read loses the entity reading that was
+    /// fine, and a reader told only that the entity reading is fine has been
+    /// handed the all-clear this object exists to refuse.
+    fn clause(self, subject: &str) -> String {
+        match self {
+            Self::Level => format!("0 of the {subject} are uncommitted"),
+            Self::Uncommitted(live_only) => {
+                format!("{live_only} of the {subject} are uncommitted")
+            }
+            Self::Unlevelled => format!(
+                "how many of the {subject} are uncommitted is unknown, because this daemon has \
+                 not levelled its query graph with durable repository authority"
+            ),
+            Self::Unreconciled { live, durable } => format!(
+                "how many of the {subject} are uncommitted is unknown, because durable authority \
+                 carries {durable} of them and the live graph holds only {live}"
+            ),
+            Self::Unobserved => format!(
+                "how many {subject} are uncommitted is unknown, because nothing measured them"
+            ),
+        }
+    }
+}
+
+/// What answered, as the lead clause of every note this object writes.
+///
+/// Always both counts, because the note has to state the scope it is about to
+/// make a claim over. The block that named only its entity count is the one that
+/// claimed "everything answering here" over a graph whose relations it had never
+/// read.
+fn live_lead(live_entities: Option<u64>, live_relations: Option<u64>) -> String {
+    match (live_entities, live_relations) {
+        (Some(entities), Some(relations)) => {
+            format!("{entities} entities and {relations} relations answered here")
+        }
+        (Some(entities), None) => {
+            format!("{entities} entities answered here and no relation reading reached this answer")
+        }
+        (None, Some(relations)) => {
+            format!("{relations} relations answered here and no entity reading reached this answer")
+        }
+        (None, None) => "this graph answered".to_string(),
+    }
+}
+
+/// Why an observation could not be reduced to numbers, one clause per axis.
+///
+/// The two axes are joined rather than one winning, and the one case that is
+/// written out whole is both axes unlevelled, because there the clauses are the
+/// same sentence twice and a reader skims a note that repeats itself.
+fn unknown_cause(entities: Axis, relations: Axis) -> String {
+    if entities == Axis::Unlevelled && relations == Axis::Unlevelled {
+        return "how many of the entities and relations are uncommitted is unknown, because this \
+                daemon has not levelled its query graph with durable repository authority"
+            .to_string();
+    }
+    format!(
+        "{}, and {}",
+        entities.clause("entities"),
+        relations.clause("relations")
+    )
 }
 
 /// How far graph truth is behind the working copy this daemon watches.
@@ -842,66 +1012,79 @@ impl GraphFreshness {
 }
 
 impl Durability {
-    /// Derive the durability state from the two counts the daemon observed.
+    /// Derive the durability state from the counts the daemon observed.
     ///
-    /// `durable` is `None` when the daemon has never levelled its query graph
-    /// with durable authority and therefore has nothing to report; that is
-    /// `unknown`, not zero. A durable count ABOVE the live count is also
-    /// `unknown`: the live graph has dropped entities authority still carries,
-    /// so the difference is not a count of uncommitted work and reporting
-    /// `recorded` there would be the false all-clear this object exists to
-    /// prevent.
-    pub fn observe(live: u64, durable: Option<u64>) -> Self {
-        let Some(durable) = durable else {
+    /// Two pairs, one state, and the pessimistic reading wins. A `None` durable
+    /// count is a daemon that has never levelled that axis and therefore has
+    /// nothing to report; that is `unknown`, not zero. A durable count ABOVE the
+    /// live one is also `unknown`: the live graph has dropped objects authority
+    /// still carries, so the difference is not a count of uncommitted work and
+    /// reporting `recorded` there would be the false all-clear this object
+    /// exists to prevent. An absent live RELATION count is `unknown` too, and
+    /// that is the FIR-3202 rule stated as code: an answer that never counted
+    /// the relations cannot certify that they are recorded, and reading its
+    /// silence as an all-clear is exactly what the entity-only block did.
+    ///
+    /// Neither `live_only_*` field survives `unknown`. Both go, not just the one
+    /// whose pair failed, because `state` is the field a caller branches on and
+    /// FIR-2820 is the record of what happens when a withdrawn claim leaves a
+    /// number standing beside it. The four raw counts stay on the wire, so a
+    /// reader loses nothing it could not subtract for itself.
+    pub fn observe(counts: DurabilityCounts) -> Self {
+        let entities = Axis::observe(Some(counts.live_entities), counts.durable_entities);
+        let relations = Axis::observe(counts.live_relations, counts.durable_relations);
+        let lead = live_lead(Some(counts.live_entities), counts.live_relations);
+        let (Some(live_only_entities), Some(live_only_relations)) =
+            (entities.live_only(), relations.live_only())
+        else {
             return Self {
                 state: DURABILITY_UNKNOWN.to_string(),
-                live_entities: Some(live),
-                durable_entities: None,
+                live_entities: Some(counts.live_entities),
+                durable_entities: counts.durable_entities,
                 live_only_entities: None,
-                note: "This daemon has not levelled its query graph with durable repository \
-                       authority, so whether these entities are recorded is unknown. Run `kin \
-                       status` to read durable authority directly."
-                    .to_string(),
-            };
-        };
-        if durable > live {
-            return Self {
-                state: DURABILITY_UNKNOWN.to_string(),
-                live_entities: Some(live),
-                durable_entities: Some(durable),
-                live_only_entities: None,
+                live_relations: counts.live_relations,
+                durable_relations: counts.durable_relations,
+                live_only_relations: None,
                 note: format!(
-                    "The live query graph holds {live} entities and durable authority carries \
-                     {durable}, so this answer cannot say how much of it is recorded. Run `kin \
-                     status` to read durable authority directly."
+                    "{lead}; {}. Run `kin status` to read durable authority directly.",
+                    unknown_cause(entities, relations)
                 ),
             };
-        }
-        let live_only = live - durable;
-        if live_only == 0 {
+        };
+        if live_only_entities == 0 && live_only_relations == 0 {
             return Self {
                 state: DURABILITY_RECORDED.to_string(),
-                live_entities: Some(live),
-                durable_entities: Some(durable),
+                live_entities: Some(counts.live_entities),
+                durable_entities: counts.durable_entities,
                 live_only_entities: Some(0),
+                live_relations: counts.live_relations,
+                durable_relations: counts.durable_relations,
+                live_only_relations: Some(0),
+                // Not "everything". The claim names the two things this block
+                // counted, because the sentence it replaces made a whole-graph
+                // promise out of a one-axis reading.
                 note: format!(
-                    "{live} entities, 0 uncommitted; durable repository authority records \
-                     everything answering here."
+                    "{lead}; 0 entities and 0 relations are uncommitted, and durable repository \
+                     authority records every entity and relation answering here."
                 ),
             };
         }
         Self {
             state: DURABILITY_LIVE_UNCOMMITTED.to_string(),
-            live_entities: Some(live),
-            durable_entities: Some(durable),
-            live_only_entities: Some(live_only),
+            live_entities: Some(counts.live_entities),
+            durable_entities: counts.durable_entities,
+            live_only_entities: Some(live_only_entities),
+            live_relations: counts.live_relations,
+            durable_relations: counts.durable_relations,
+            live_only_relations: Some(live_only_relations),
             note: format!(
-                "{live} entities, {live_only} uncommitted; {} is recorded yet, and the \
-                 uncommitted work is lost when this daemon exits. Commit to record it.",
-                if durable == 0 {
-                    "nothing you wrote"
+                "{lead}; {live_only_entities} entities and {live_only_relations} relations are \
+                 uncommitted, and {} recorded yet. The uncommitted work is lost when this daemon \
+                 exits. Commit to record it.",
+                if counts.durable_entities == Some(0) && counts.durable_relations == Some(0) {
+                    "nothing you wrote is"
                 } else {
-                    "not all of what you wrote"
+                    "not all of what you wrote is"
                 }
             ),
         }
@@ -909,9 +1092,10 @@ impl Durability {
 
     /// Restate this reading over a store the working copy has outrun.
     ///
-    /// [`Self::observe`] compares two ENTITY counts, so it answers a question
-    /// about what a commit carries and is structurally unable to see a file no
-    /// admission has taken. A store holding unadmitted host paths therefore
+    /// [`Self::observe`] compares counts the graph already holds, so it answers
+    /// a question about what a commit carries and is structurally unable to see
+    /// a file no admission has taken. A store holding unadmitted host paths
+    /// therefore
     /// reached `recorded` and said "durable repository authority records
     /// everything answering here" over a repository holding a 140-line module
     /// the graph had never met (FIR-2499). The counts are left exactly as
@@ -934,10 +1118,7 @@ impl Durability {
     /// one clause before the note explained that no such number was derivable.
     /// The lead now states the live count, which is a fact, and nothing else.
     pub fn qualified_by(mut self, behind: &GraphBehind) -> Self {
-        let counts = match self.live_entities {
-            Some(live) => format!("{live} entities answered here"),
-            None => "this graph answered".to_string(),
-        };
+        let counts = live_lead(self.live_entities, self.live_relations);
         // Two readings and two sentences, for the same reason the limiting
         // factor carries two: a measured count and no measurement at all send a
         // reader to different levers, and one of them is `kin admit`.
@@ -957,7 +1138,12 @@ impl Durability {
             )
         };
         self.state = DURABILITY_UNKNOWN.to_string();
+        // Both differences, for the reason the state is one word: a withdrawn
+        // claim that leaves a number standing beside it is the FIR-2820 failure,
+        // and there is nothing about a relation count that makes it the
+        // exception.
         self.live_only_entities = None;
+        self.live_only_relations = None;
         self
     }
 
@@ -1825,16 +2011,17 @@ impl Envelope {
     /// its own entity and embedding observations here. Fields that only
     /// `/health` knows stay absent rather than being borrowed from HEAD.
     ///
-    /// `durable_entity_count` is the one durable reading graph status carries
-    /// itself, because the question it answers is about the selected graph and
-    /// not about HEAD. `None` reaches [`Durability::observe`] as `unknown`.
+    /// `counts` carries the durable readings graph status supplies itself,
+    /// because the question they answer is about the selected graph and not
+    /// about HEAD. A `None` in either durable field reaches
+    /// [`Durability::observe`] as `unknown`, and so does an unread relation
+    /// count.
     pub fn with_selected_graph_observation(
         mut self,
-        entity_count: u64,
+        counts: DurabilityCounts,
         embeddings_indexed: u64,
         embeddings_pending: u64,
         embeddings_total: u64,
-        durable_entity_count: Option<u64>,
     ) -> Self {
         let complete = embeddings_pending == 0 && embeddings_indexed == embeddings_total;
         self.runtime = Runtime::RepoDaemon;
@@ -1860,7 +2047,7 @@ impl Envelope {
             graph_body_gap_paths: None,
         });
         self.graph_as_of = None;
-        let durability = Durability::observe(entity_count, durable_entity_count);
+        let durability = Durability::observe(counts);
         // Requalified rather than replaced. This runs on the graph-status path,
         // which may set durability after `with_health` has already read the
         // reconcile block, and a plain assignment there would restore the
@@ -1870,7 +2057,7 @@ impl Envelope {
             None => durability,
         });
         self.graph_state = GraphState {
-            entity_count: Some(entity_count),
+            entity_count: Some(counts.live_entities),
             ..GraphState::default()
         };
         // The selected report replaces HEAD-scoped health observations, but it
@@ -2137,17 +2324,26 @@ impl Envelope {
         if let Some(value) = health.get("initialized").and_then(Value::as_bool) {
             self.graph_state.initialized = Some(value);
         }
-        // Derived from the pair rather than reported by the daemon, because the
+        // Derived from the pairs rather than reported by the daemon, because the
         // live count is the one this envelope already carries and deriving it
-        // here keeps the two numbers from describing different instants. A
-        // daemon that reports no live count has nothing to compare against, so
+        // here keeps the numbers from describing different instants. A daemon
+        // that reports no live entity count has nothing to compare against, so
         // the object stays absent instead of asserting `unknown` about a graph
         // it never measured.
+        //
+        // The relation counts are read straight off the body rather than kept in
+        // `graph_state`, which is a HEAD entity observation and has no relation
+        // field. A body that carries neither leaves both `None`, which
+        // [`Durability::observe`] reads as `unknown` rather than as zero: a
+        // daemon too old to publish a relation count is a daemon this answer
+        // cannot certify (FIR-3202).
         if let Some(live) = self.graph_state.entity_count {
-            self.durability = Some(Durability::observe(
-                live,
-                health.get("durable_entity_count").and_then(Value::as_u64),
-            ));
+            self.durability = Some(Durability::observe(DurabilityCounts {
+                live_entities: live,
+                durable_entities: health.get("durable_entity_count").and_then(Value::as_u64),
+                live_relations: health.get("graph_relation_count").and_then(Value::as_u64),
+                durable_relations: health.get("durable_relation_count").and_then(Value::as_u64),
+            }));
         }
         // Read after the counts, and applied to them. The reconcile block is
         // the only place a response can learn that the host holds content the
@@ -2927,8 +3123,19 @@ mod tests {
         }
     }
 
-    /// The four states a durability observation can be in, including the two
-    /// that must refuse to name a number.
+    /// A level pair on both axes, for the tests below whose subject is
+    /// something other than durability.
+    fn level_counts(entities: u64, relations: u64) -> DurabilityCounts {
+        DurabilityCounts {
+            live_entities: entities,
+            durable_entities: Some(entities),
+            live_relations: Some(relations),
+            durable_relations: Some(relations),
+        }
+    }
+
+    /// The states a durability observation can be in, including the three that
+    /// must refuse to name a number.
     ///
     /// `durable > live` is the one worth writing down. The live graph has
     /// dropped entities authority still carries, so the difference is not a
@@ -2938,42 +3145,175 @@ mod tests {
     /// while authority still holds them.
     #[test]
     fn durability_names_a_count_only_when_the_two_counts_can_be_reconciled() {
-        let uncommitted = Durability::observe(14, Some(0));
+        let uncommitted = Durability::observe(DurabilityCounts {
+            live_entities: 14,
+            durable_entities: Some(0),
+            live_relations: Some(20),
+            durable_relations: Some(0),
+        });
         assert_eq!(uncommitted.state, "live_uncommitted");
         assert_eq!(uncommitted.live_only_entities, Some(14));
+        assert_eq!(uncommitted.live_only_relations, Some(20));
         assert!(
-            uncommitted.note.contains("14 entities, 14 uncommitted")
-                && uncommitted.note.contains("nothing you wrote"),
+            uncommitted
+                .note
+                .contains("14 entities and 20 relations are uncommitted")
+                && uncommitted.note.contains("nothing you wrote is"),
             "an empty durable authority means none of it is recorded: {}",
             uncommitted.note
         );
 
-        let partly = Durability::observe(14, Some(9));
+        let partly = Durability::observe(DurabilityCounts {
+            live_entities: 14,
+            durable_entities: Some(9),
+            live_relations: Some(20),
+            durable_relations: Some(11),
+        });
         assert_eq!(partly.state, "live_uncommitted");
         assert_eq!(partly.live_only_entities, Some(5));
+        assert_eq!(partly.live_only_relations, Some(9));
         assert!(
-            partly.note.contains("not all of what you wrote"),
+            partly.note.contains("not all of what you wrote is"),
             "a nonempty durable authority records some of it: {}",
             partly.note
         );
 
-        let recorded = Durability::observe(14, Some(14));
+        let recorded = Durability::observe(level_counts(14, 20));
         assert_eq!(recorded.state, "recorded");
         assert_eq!(recorded.live_only_entities, Some(0));
+        assert_eq!(recorded.live_only_relations, Some(0));
 
-        let unmeasured = Durability::observe(14, None);
+        let unmeasured = Durability::observe(DurabilityCounts {
+            live_entities: 14,
+            durable_entities: None,
+            live_relations: Some(20),
+            durable_relations: None,
+        });
         assert_eq!(unmeasured.state, "unknown");
         assert_eq!(
             unmeasured.live_only_entities, None,
             "an unlevelled daemon must not report 14 uncommitted entities it cannot see"
         );
+        assert_eq!(unmeasured.live_only_relations, None);
 
-        let shrunk = Durability::observe(9, Some(14));
+        let shrunk = Durability::observe(DurabilityCounts {
+            live_entities: 9,
+            durable_entities: Some(14),
+            live_relations: Some(20),
+            durable_relations: Some(20),
+        });
         assert_eq!(
             shrunk.state, "unknown",
             "a live graph below durable authority cannot be read as recorded"
         );
         assert_eq!(shrunk.live_only_entities, None);
+    }
+
+    /// FIR-3202. The stranger's shape: entities level, relations swept in and
+    /// never committed, and a block that counted only the first of the two.
+    ///
+    /// The counts are the ones the brown arm produced. What shipped over them
+    /// was `state: recorded`, `live_only_entities: 0` and a note reading
+    /// "861 entities, 0 uncommitted; durable repository authority records
+    /// everything answering here", while the 3,438 relations answering every
+    /// query belonged to no committed change.
+    #[test]
+    fn relations_a_commit_does_not_carry_are_never_read_as_recorded() {
+        let swept = Durability::observe(DurabilityCounts {
+            live_entities: 861,
+            durable_entities: Some(861),
+            live_relations: Some(3438),
+            durable_relations: Some(0),
+        });
+
+        assert_eq!(
+            swept.live_only_relations,
+            Some(3438),
+            "the count is the whole disclosure: {}",
+            swept.note
+        );
+        assert_eq!(swept.live_only_entities, Some(0));
+        assert_eq!(
+            swept.state, "live_uncommitted",
+            "a level entity count cannot certify a relation set no commit carries: {}",
+            swept.note
+        );
+        assert!(
+            swept
+                .note
+                .contains("0 entities and 3438 relations are uncommitted"),
+            "the note has to state the uncommitted count of each: {}",
+            swept.note
+        );
+        assert!(
+            !swept.note.contains("everything"),
+            "no sentence here may claim a scope this block does not cover: {}",
+            swept.note
+        );
+    }
+
+    /// The relation axis refuses on its own terms, and each refusal names what
+    /// it could not read.
+    ///
+    /// Three inputs, one per refusal, because two refusals that can both catch
+    /// one input hide each other's absence.
+    #[test]
+    fn an_unreadable_relation_axis_withdraws_the_whole_reading() {
+        let unlevelled = Durability::observe(DurabilityCounts {
+            live_entities: 12,
+            durable_entities: Some(12),
+            live_relations: Some(30),
+            durable_relations: None,
+        });
+        assert_eq!(unlevelled.state, "unknown");
+        assert_eq!(
+            unlevelled.live_only_entities, None,
+            "the state a caller branches on moved, so the number beside it goes with it"
+        );
+        assert!(
+            unlevelled
+                .note
+                .contains("has not levelled its query graph with durable repository authority"),
+            "{}",
+            unlevelled.note
+        );
+
+        // The rc0547b shape: edges gone while the entity count held. A
+        // difference is not derivable from it, and `recorded` over it is the
+        // all-clear this object exists to refuse.
+        let lost = Durability::observe(DurabilityCounts {
+            live_entities: 783,
+            durable_entities: Some(783),
+            live_relations: Some(1268),
+            durable_relations: Some(1279),
+        });
+        assert_eq!(lost.state, "unknown");
+        assert_eq!(lost.live_only_relations, None);
+        assert!(
+            lost.note
+                .contains("durable authority carries 1279 of them and the live graph holds only")
+                && lost.note.contains("0 of the entities are uncommitted"),
+            "the axis that did reconcile still states its number: {}",
+            lost.note
+        );
+
+        // A runtime that published no relation count at all. Silence is not
+        // zero, and reading it as one is the defect with the counts removed.
+        let unobserved = Durability::observe(DurabilityCounts {
+            live_entities: 12,
+            durable_entities: Some(12),
+            live_relations: None,
+            durable_relations: None,
+        });
+        assert_eq!(unobserved.state, "unknown");
+        assert_eq!(unobserved.live_relations, None);
+        assert!(
+            unobserved
+                .note
+                .contains("no relation reading reached this answer"),
+            "{}",
+            unobserved.note
+        );
     }
 
     /// The generic tool path takes its envelope from `/health`, so the fold
@@ -2983,12 +3323,15 @@ mod tests {
         let env = Envelope::daemon().with_health(&serde_json::json!({
             "graph_entity_count": 22,
             "durable_entity_count": 0,
+            "graph_relation_count": 31,
+            "durable_relation_count": 0,
         }));
         let durability = env
             .durability
             .expect("a measured live count carries durability");
         assert_eq!(durability.state, "live_uncommitted");
         assert_eq!(durability.live_only_entities, Some(22));
+        assert_eq!(durability.live_only_relations, Some(31));
 
         // A daemon that reports no durable reading is unknown, not recorded.
         let unlevelled = Envelope::daemon()
@@ -2996,6 +3339,24 @@ mod tests {
             .durability
             .expect("a measured live count carries durability");
         assert_eq!(unlevelled.state, "unknown");
+
+        // FIR-3202. A body that carries the entity pair and no relation reading
+        // is a daemon this answer cannot certify, because the relations
+        // answering beside those entities were never counted. Reading that
+        // silence as zero is the defect with the numbers taken out.
+        let entities_only = Envelope::daemon()
+            .with_health(&serde_json::json!({
+                "graph_entity_count": 22,
+                "durable_entity_count": 22,
+            }))
+            .durability
+            .expect("a measured live count carries durability");
+        assert_eq!(
+            entities_only.state, "unknown",
+            "a level entity pair is not an all-clear over unread relations: {}",
+            entities_only.note
+        );
+        assert_eq!(entities_only.live_only_entities, None);
 
         // And a runtime that measured no live count has nothing to compare, so
         // the object stays absent rather than asserting anything.
@@ -3013,6 +3374,8 @@ mod tests {
         let env = Envelope::daemon().with_health(&serde_json::json!({
             "graph_entity_count": 51,
             "durable_entity_count": 51,
+            "graph_relation_count": 51,
+            "durable_relation_count": 51,
             "reconcile": {
                 "untracked_path_count": 1,
                 "untracked_paths_sample": ["notekeeper/search.py"],
@@ -3038,7 +3401,7 @@ mod tests {
         assert!(
             !durability
                 .note
-                .contains("records everything answering here"),
+                .contains("records every entity and relation answering here"),
             "the all-clear this reading cannot make: {}",
             durability.note
         );
@@ -3078,19 +3441,21 @@ mod tests {
             .with_health(&serde_json::json!({
                 "graph_entity_count": 51,
                 "durable_entity_count": 51,
+                "graph_relation_count": 51,
+                "durable_relation_count": 51,
                 "reconcile": {
                     "untracked_path_count": 2,
                     "untracked_paths_sample": ["notekeeper/search.py"],
                     "last_admission_success_at": "2026-08-20T13:00:00Z",
                 },
             }))
-            .with_selected_graph_observation(51, 51, 0, 51, Some(51));
+            .with_selected_graph_observation(level_counts(51, 51), 51, 0, 51);
 
         let durability = env.durability.expect("graph status reports the counts");
         assert!(
             !durability
                 .note
-                .contains("records everything answering here"),
+                .contains("records every entity and relation answering here"),
             "the graph-status reading restored an all-clear over a behind store: {}",
             durability.note
         );
@@ -3132,7 +3497,7 @@ mod tests {
         });
         let env = Envelope::daemon()
             .with_working_copy_health(&health)
-            .with_selected_graph_observation(6, 6, 0, 6, Some(6));
+            .with_selected_graph_observation(level_counts(6, 6), 6, 0, 6);
 
         assert_eq!(
             env.graph_state.entity_count,
@@ -3160,7 +3525,7 @@ mod tests {
         // has to reach the same reading or the fix depends on a call sequence
         // nobody is holding still.
         let reversed = Envelope::daemon()
-            .with_selected_graph_observation(6, 6, 0, 6, Some(6))
+            .with_selected_graph_observation(level_counts(6, 6), 6, 0, 6)
             .with_working_copy_health(&health)
             .durability
             .expect("graph status reports the counts");
@@ -3181,7 +3546,7 @@ mod tests {
                     "untracked_observed_age_seconds": 0,
                 },
             }))
-            .with_selected_graph_observation(6, 6, 0, 6, Some(6));
+            .with_selected_graph_observation(level_counts(6, 6), 6, 0, 6);
 
         assert!(env.behind.is_none(), "nothing unadmitted is nothing to say");
         let durability = env.durability.expect("graph status reports the counts");
@@ -3205,6 +3570,8 @@ mod tests {
         let env = Envelope::daemon().with_health(&serde_json::json!({
             "graph_entity_count": 51,
             "durable_entity_count": 51,
+            "graph_relation_count": 51,
+            "durable_relation_count": 51,
             "reconcile": { "untracked_path_count": 0 },
         }));
 
@@ -3345,6 +3712,8 @@ mod tests {
         let env = Envelope::daemon().with_health(&serde_json::json!({
             "graph_entity_count": 51,
             "durable_entity_count": 51,
+            "graph_relation_count": 51,
+            "durable_relation_count": 51,
             "reconcile": {
                 "untracked_path_count": 0,
                 "untracked_observation_not_applicable": true,
@@ -3373,6 +3742,8 @@ mod tests {
         let env = Envelope::daemon().with_health(&serde_json::json!({
             "graph_entity_count": 6,
             "durable_entity_count": 6,
+            "graph_relation_count": 6,
+            "durable_relation_count": 6,
             "reconcile": {
                 "untracked_path_count": 1,
                 "untracked_paths_sample": ["linkgraph/predicates.py"],
@@ -3386,8 +3757,10 @@ mod tests {
             durability.note
         );
         assert!(
-            durability.note.contains("6 entities answered here"),
-            "the live count is a fact and stays: {}",
+            durability
+                .note
+                .contains("6 entities and 6 relations answered here"),
+            "the live counts are facts and stay: {}",
             durability.note
         );
     }
@@ -3400,6 +3773,8 @@ mod tests {
         let env = Envelope::daemon().with_health(&serde_json::json!({
             "graph_entity_count": 51,
             "durable_entity_count": 51,
+            "graph_relation_count": 51,
+            "durable_relation_count": 51,
             // Stamped: a measured zero is the all-clear, an unstamped one is the
             // disclosure the test below this asserts.
             "reconcile": {
@@ -3414,7 +3789,7 @@ mod tests {
         assert!(
             durability
                 .note
-                .contains("records everything answering here"),
+                .contains("records every entity and relation answering here"),
             "{}",
             durability.note
         );
@@ -5067,7 +5442,7 @@ mod tests {
             assert!(!trusted);
             assert!(reason.contains("degraded"), "{reason}");
 
-            let selected = flagged.with_selected_graph_observation(4, 4, 0, 4, Some(4));
+            let selected = flagged.with_selected_graph_observation(level_counts(4, 4), 4, 0, 4);
             assert_eq!(
                 selected.degraded.hydration_semantics_stale,
                 Some(true),
@@ -5189,7 +5564,7 @@ mod tests {
         };
         let selected = Envelope::daemon()
             .with_hydration_semantics_observation(Some(&standing))
-            .with_selected_graph_observation(4, 4, 0, 4, Some(4));
+            .with_selected_graph_observation(level_counts(4, 4), 4, 0, 4);
 
         let observation = selected
             .hydration_semantics

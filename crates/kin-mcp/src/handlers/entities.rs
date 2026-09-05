@@ -5488,6 +5488,18 @@ pub struct GraphStatusReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durable_entity_count: Option<u64>,
     pub relation_count: usize,
+    /// Relations durable repository authority carried when the daemon last
+    /// levelled this graph with authority (FIR-3202).
+    ///
+    /// Beside `relation_count` for the reason `durable_entity_count` is beside
+    /// `entity_count`, and added because that pair on its own was the whole
+    /// disclosure. A language-server enrichment sweep writes relations into the
+    /// live query graph and records nothing durable, so a store whose entity
+    /// counts were level published an all-clear over 3,438 relations that
+    /// belonged to no committed change. Absent, not zero, when the daemon has
+    /// never levelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_relation_count: Option<u64>,
     pub embedding_source: GraphStatusEmbeddingSource,
     pub embeddings_indexed: usize,
     pub embeddings_pending: usize,
@@ -5535,6 +5547,8 @@ struct GraphStatusReportWire {
     #[serde(default)]
     durable_entity_count: Option<u64>,
     relation_count: usize,
+    #[serde(default)]
+    durable_relation_count: Option<u64>,
     embedding_source: GraphStatusEmbeddingSource,
     embeddings_indexed: usize,
     embeddings_pending: usize,
@@ -5567,6 +5581,7 @@ impl<'de> Deserialize<'de> for GraphStatusReport {
             entity_count: wire.entity_count,
             durable_entity_count: wire.durable_entity_count,
             relation_count: wire.relation_count,
+            durable_relation_count: wire.durable_relation_count,
             embedding_source: wire.embedding_source,
             embeddings_indexed: wire.embeddings_indexed,
             embeddings_pending: wire.embeddings_pending,
@@ -5796,6 +5811,11 @@ pub struct GraphStatusObservation {
     /// levelled this graph with authority (FIR-2421). `None` when it never has,
     /// which is not zero.
     pub durable_entity_count: Option<u64>,
+    /// Relations durable repository authority carried at that same levelling
+    /// (FIR-3202). `None` on the same rule as the entity count above, and read
+    /// under the same fence, so the pair a caller subtracts describes one
+    /// instant.
+    pub durable_relation_count: Option<u64>,
 }
 
 pub fn handle_daemon_graph_status_observation(
@@ -5812,6 +5832,7 @@ pub fn handle_daemon_graph_status_observation(
         entity_count: observation.entity_count,
         durable_entity_count: observation.durable_entity_count,
         relation_count: observation.relation_count,
+        durable_relation_count: observation.durable_relation_count,
         embedding_source: GraphStatusEmbeddingSource::SelectedGraph,
         embeddings_indexed: observation.embeddings_indexed,
         embeddings_pending: observation.embeddings_pending,
@@ -5851,6 +5872,7 @@ pub fn handle_daemon_graph_status_stale_observation(
         entity_count: observation.entity_count,
         durable_entity_count: observation.durable_entity_count,
         relation_count: observation.relation_count,
+        durable_relation_count: observation.durable_relation_count,
         embedding_source: GraphStatusEmbeddingSource::SelectedGraph,
         embeddings_indexed: observation.embeddings_indexed,
         embeddings_pending: observation.embeddings_pending,
@@ -11271,6 +11293,7 @@ mod tests {
             embeddings_total: embeddings.total,
             embedding_index_keys: None,
             durable_entity_count: None,
+            durable_relation_count: None,
         };
         let result =
             handle_daemon_graph_status_observation(GraphStatusScope::TemporalSession, observation)
@@ -11312,6 +11335,7 @@ mod tests {
                 embeddings_total: 2,
                 embedding_index_keys: None,
                 durable_entity_count: None,
+                durable_relation_count: None,
             },
         )
         .expect_err("the direct daemon boundary must reject impossible coverage");
@@ -11343,6 +11367,7 @@ mod tests {
                 embeddings_total: 49,
                 embedding_index_keys: Some(89),
                 durable_entity_count: None,
+                durable_relation_count: None,
             },
         )
         .expect("a stale-but-covered graph is a reportable observation");
@@ -11364,6 +11389,7 @@ mod tests {
                 embeddings_total: 49,
                 embedding_index_keys: Some(49),
                 durable_entity_count: None,
+                durable_relation_count: None,
             },
         )
         .unwrap();
@@ -11383,6 +11409,7 @@ mod tests {
                 embeddings_total: 12,
                 embedding_index_keys: None,
                 durable_entity_count: None,
+                durable_relation_count: None,
             },
         )
         .unwrap();
@@ -11410,6 +11437,7 @@ mod tests {
                 embeddings_total: 10,
                 embedding_index_keys: Some(9),
                 durable_entity_count: None,
+                durable_relation_count: None,
             },
         )
         .expect_err("an index below its own covered keys is not a reportable observation");

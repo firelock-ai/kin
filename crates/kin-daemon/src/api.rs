@@ -841,6 +841,19 @@ pub struct HealthResponse {
     /// means the live graph is entirely uncommitted.
     #[serde(default)]
     pub durable_entity_count: Option<u64>,
+    /// Relations in the live query graph.
+    ///
+    /// The half the entity pair above could not answer. A store whose entity
+    /// counts were level published an all-clear over 3,438 relations a
+    /// language-server sweep had written into the live graph and no commit
+    /// carried, because nothing on this endpoint counted them (FIR-3202).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_relation_count: Option<usize>,
+    /// Relations durable repository authority carried at the same levelling as
+    /// `durable_entity_count`. Absent, never zero, when this daemon has never
+    /// levelled.
+    #[serde(default)]
+    pub durable_relation_count: Option<u64>,
     pub graph_loaded: bool,
     pub reconciliation_status: String,
     pub repo_id: String,
@@ -2882,6 +2895,11 @@ async fn mcp_graph_status_with_stable_authority(
                     // open and at commit, and neither can run while this fence
                     // is held.
                     durable_entity_count: state.durable_entity_count(),
+                    // The relation half, under that same fence and levelled at
+                    // those same two moments. Without it the block built from
+                    // this observation certifies an entity layer and says
+                    // nothing about the edges answering beside it (FIR-3202).
+                    durable_relation_count: state.durable_relation_count(),
                 }
             }),
             Err(std::sync::TryLockError::WouldBlock) => None,
@@ -3793,6 +3811,10 @@ async fn health(
     let uptime_seconds = state.started_at.elapsed().as_secs();
     let graph = Arc::clone(&state.graph);
     let entity_count = graph.entity_count();
+    // Read off the same graph handle at the same instant as the entity count,
+    // so the pair a caller subtracts against the durable readings below
+    // describes one graph rather than two.
+    let relation_count = graph.relation_count();
     let graph_loaded = entity_count > 0;
     let external_session_count = state
         .coordinator
@@ -3892,6 +3914,8 @@ async fn health(
         uptime_seconds,
         graph_entity_count: Some(entity_count),
         durable_entity_count: state.durable_entity_count(),
+        graph_relation_count: Some(relation_count),
+        durable_relation_count: state.durable_relation_count(),
         graph_loaded,
         reconciliation_status: state.reconciliation_status_str().to_string(),
         repo_id: primary_repo_id(&state),
@@ -6633,6 +6657,10 @@ fn command_commit_after_admission(
     // live graph rather than from the plan, because a plan's `entity_count` is
     // the size of its delta and this is the size of the whole.
     state.record_durable_entity_count(graph.entity_count() as u64);
+    // The relation half of the same levelling, from the same live graph at the
+    // same instant. Recording one counter and not the other would publish a
+    // difference no observation produced (FIR-3202).
+    state.record_durable_relation_count(graph.relation_count() as u64);
     // The relation set just moved and the change is installed, so this is the
     // baseline the next `kin graph status` compares against. Recorded after the
     // install rather than from the plan, for the reason the entity count above
@@ -8537,6 +8565,11 @@ async fn measure_untracked_host_content(state: &Arc<DaemonState>) {
 async fn daemon_health_snapshot(state: &Arc<DaemonState>) -> serde_json::Value {
     measure_untracked_host_content(state).await;
     let entity_count = state.graph.entity_count();
+    // Both live counts off one graph handle before anything else runs, so the
+    // envelope's durability block subtracts a pair from one instant. The
+    // relation half is what makes that block cover the whole graph rather than
+    // the entity layer alone (FIR-3202).
+    let relation_count = state.graph.relation_count();
     serde_json::json!({
         "initialized": state
             .is_initialized
@@ -8544,6 +8577,8 @@ async fn daemon_health_snapshot(state: &Arc<DaemonState>) -> serde_json::Value {
         "graph_loaded": entity_count > 0,
         "graph_entity_count": entity_count as u64,
         "durable_entity_count": state.durable_entity_count(),
+        "graph_relation_count": relation_count as u64,
+        "durable_relation_count": state.durable_relation_count(),
         "graph_generation": state
             .snapshot_generation
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -39573,6 +39608,203 @@ mod tests {
         assert_eq!(
             authority.graph.relation_count(),
             state.graph.relation_count()
+        );
+    }
+
+    /// One committed relation over two committed entities, so both durability
+    /// axes are level with authority through the real MCP transaction path,
+    /// which is the levelling `finalize_committed_transaction` records.
+    async fn state_levelled_by_a_relation_commit() -> (Arc<DaemonState>, Entity, Entity) {
+        let state = test_state();
+        let mut caller = test_entity("caller", "src/lib.rs");
+        caller.file_origin = None;
+        caller.span = None;
+        let mut callee = test_entity("callee", "src/lib.rs");
+        callee.file_origin = None;
+        callee.span = None;
+        install_repository_entities(&state, vec![caller.clone(), callee.clone()]);
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session_id = mcp_test_session(&state);
+
+        let begin = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            serde_json::json!({ "session_id": session_id, "scope": "file:src/lib.rs" }),
+        )
+        .await;
+        let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+        let _stage = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": tx_id,
+                "operations": [{
+                    "verb": "add",
+                    "target": "",
+                    "payload": { "Relation": {
+                        "from": caller.id, "to": callee.id, "kind": RelationKind::Calls }},
+                    "description": ""
+                }]
+            }),
+        )
+        .await;
+        let commit = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            serde_json::json!({ "transaction_id": tx_id }),
+        )
+        .await;
+        assert_ne!(
+            commit.is_error,
+            Some(true),
+            "commit failed: {}",
+            mcp_result_text(&commit)
+        );
+        (state, caller, callee)
+    }
+
+    /// The durability block every daemon-built envelope is decorated from,
+    /// read off the production health snapshot rather than a hand-built body.
+    async fn durability_block(state: &Arc<DaemonState>) -> kin_mcp::envelope::Durability {
+        kin_mcp::Envelope::daemon()
+            .with_health(&daemon_health_snapshot(state).await)
+            .durability
+            .expect("a daemon that counted its graph carries a durability block")
+    }
+
+    /// FIR-3202. The stranger's shape, driven through the sweep's own write
+    /// path: entities level with authority, then a language-server enrichment
+    /// pass installs a relation into the live graph and commits nothing.
+    ///
+    /// Before the fix this block read `recorded`, `live_only_entities: 0` and
+    /// "2 entities, 0 uncommitted; durable repository authority records
+    /// everything answering here" both before and after the sweep, byte for
+    /// byte, while the live relation count went from 1 to 2. On the brown arm
+    /// the same block said the same sentence over 3,438 swept relations.
+    #[tokio::test]
+    async fn a_relation_the_sweep_wrote_and_no_commit_carries_is_reported_uncommitted() {
+        let (state, caller, callee) = state_levelled_by_a_relation_commit().await;
+        let relations_before = state.graph.relation_count();
+
+        let published = crate::daemon::install_lsp_relations(
+            &state,
+            &[kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: RelationKind::References,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            state.graph.relation_count(),
+            relations_before + 1,
+            "the fixture has to put a relation in the live graph, or it measures nothing: {published:?}"
+        );
+
+        let block = durability_block(&state).await;
+        assert_eq!(
+            block.live_only_relations,
+            Some(1),
+            "the swept relation belongs to no committed change and the count has to say so: {}",
+            block.note
+        );
+        assert_eq!(
+            block.live_only_entities,
+            Some(0),
+            "no entity moved, and the entity axis must not borrow the relation reading: {}",
+            block.note
+        );
+        assert_eq!(block.state, "live_uncommitted", "{}", block.note);
+        assert!(
+            block
+                .note
+                .contains("0 entities and 1 relations are uncommitted"),
+            "the note states the uncommitted count of each: {}",
+            block.note
+        );
+        assert!(
+            !block.note.contains("everything"),
+            "no sentence over one axis may claim the whole graph: {}",
+            block.note
+        );
+    }
+
+    /// The control. Right after a commit that captured every live relation, the
+    /// same block reads level on both axes, so the disclosure above is a
+    /// reading and not a fixture that always fires.
+    #[tokio::test]
+    async fn a_commit_that_carries_every_live_relation_reads_recorded_on_both_axes() {
+        let (state, _caller, _callee) = state_levelled_by_a_relation_commit().await;
+        assert!(
+            state.graph.relation_count() > 0,
+            "the control has to hold a relation, or a zero here proves nothing"
+        );
+
+        let block = durability_block(&state).await;
+        assert_eq!(block.state, "recorded", "{}", block.note);
+        assert_eq!(block.live_only_entities, Some(0), "{}", block.note);
+        assert_eq!(block.live_only_relations, Some(0), "{}", block.note);
+        assert_eq!(
+            block.live_relations,
+            Some(state.graph.relation_count() as u64)
+        );
+        assert_eq!(block.durable_relations, block.live_relations);
+    }
+
+    /// The same two readings on the graph-status path, which samples its own
+    /// counters under the embedding fence rather than reading `/health`.
+    #[tokio::test]
+    async fn graph_status_carries_the_durable_relation_count_beside_the_live_one() {
+        let (state, caller, callee) = state_levelled_by_a_relation_commit().await;
+        let level = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_graph_status",
+            serde_json::json!({}),
+        )
+        .await;
+        let level: serde_json::Value = serde_json::from_str(&mcp_result_text(&level)).unwrap();
+        assert_eq!(
+            level["durable_relation_count"], level["relation_count"],
+            "level after the commit: {level}"
+        );
+
+        crate::daemon::install_lsp_relations(
+            &state,
+            &[kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: RelationKind::UsesType,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            }],
+        );
+        let swept = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_graph_status",
+            serde_json::json!({}),
+        )
+        .await;
+        let swept: serde_json::Value = serde_json::from_str(&mcp_result_text(&swept)).unwrap();
+        assert_eq!(
+            swept["relation_count"].as_u64(),
+            level["relation_count"].as_u64().map(|count| count + 1),
+            "the sweep moved the live count: {swept}"
+        );
+        assert_eq!(
+            swept["durable_relation_count"], level["durable_relation_count"],
+            "nothing levelled, so the durable count must not move: {swept}"
         );
     }
 

@@ -1136,12 +1136,17 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
         "the disclosure has to say what it means for an answer: {behind}"
     );
     let durability = durability(&locate);
-    assert!(
-        !durability["note"]
-            .as_str()
-            .is_some_and(|note| note.contains("records everything answering here")),
+    assert_ne!(
+        durability["state"],
+        serde_json::json!("recorded"),
         "durability may not report an all-clear over a repository holding an unadmitted \
          module: {durability}"
+    );
+    assert!(
+        durability["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("covers admitted content only")),
+        "the durability note has to say the reading is qualified: {durability}"
     );
 
     second.stop();
