@@ -1791,6 +1791,13 @@ fn is_process_liveness_route(path: &str) -> bool {
     path == "/health"
 }
 
+/// The routes a kubelet readiness probe is pointed at. Both are served by
+/// `readiness`; `/ready` is the older spelling clients still poll.
+fn is_readiness_route(path: &str) -> bool {
+    let path = path.strip_prefix("/v2").unwrap_or(path);
+    path == "/readiness" || path == "/ready"
+}
+
 /// A hosted daemon may expose the authenticated rollout surface while its
 /// reader admission is absent or moving, but it must not serve graph authority
 /// under an unadmitted image. This keeps first bootstrap and recovery possible
@@ -1809,6 +1816,20 @@ async fn hosted_reader_admission(
     if let Some(control) = state.publication_control.as_ref() {
         if let Err(error) = control.assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
         {
+            // This answers the kubelet's readiness probe before the readiness
+            // handler ever runs, and the kubelet keeps only the status code.
+            // A hosted daemon whose reader is not yet admitted therefore fails
+            // its rollout with nothing in its log saying so, unless it is said
+            // here. Only the probe route logs, so a busy unadmitted daemon does
+            // not write a line per refused request; the probe arrives every
+            // few seconds and stops the moment the reader is admitted.
+            if is_readiness_route(request.uri().path()) {
+                tracing::warn!(
+                    refused_on = "reader admission",
+                    %error,
+                    "readiness refused"
+                );
+            }
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
@@ -3927,13 +3948,20 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let initialized = state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed);
-    let authority_started = Instant::now();
-    let hosted_spine_ready = if initialized && state.hosted_spine_readiness_required() {
-        state.acquire_spine_read_authority().await.is_some()
+    let hosted = state.hosted_spine_readiness_required();
+    // `None` means the authority check did not run, which is the case on the
+    // initialization half and on every local daemon. Carrying the timing as an
+    // Option keeps a branch that never consulted the gate from ever printing a
+    // measured-looking zero for it.
+    let mut authority_wait: Option<Duration> = None;
+    let hosted_spine_ready = if initialized && hosted {
+        let started = Instant::now();
+        let ready = state.acquire_spine_read_authority().await.is_some();
+        authority_wait = Some(started.elapsed());
+        ready
     } else {
         true
     };
-    let authority_wait = authority_started.elapsed();
     let warming = state.spine_warming() || (initialized && !hosted_spine_ready);
 
     if initialized && hosted_spine_ready {
@@ -3945,8 +3973,8 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
             }),
         )
     } else {
-        // Say which half refused, and how long the authority check spent
-        // waiting, because a refusal that says nothing is how a rollout gets
+        // Say which half refused, and when the authority check ran, how long
+        // it waited, because a refusal that says nothing is how a rollout gets
         // read as a broken daemon.
         //
         // On 2026-09-04 a hosted daemon bound port 4219 at 464 s into its
@@ -3954,25 +3982,41 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
         // ready. Nothing in that pod's log said whether it was still
         // uninitialized or whether the spine authority was refusing, and
         // Kubernetes records only the status code, so the post-mortem could
-        // name a mechanism and not confirm it. This is the line that would
+        // name a mechanism and not confirm it. These are the lines that would
         // have answered it.
         //
-        // WARN rather than DEBUG on purpose: a hosted daemon that cannot
-        // serve is the operator's problem whether or not anyone raised the
-        // log level first, and this stops as soon as the daemon is ready.
-        tracing::warn!(
-            initialized,
-            hosted_spine_ready,
-            warming,
-            refused_on = if !initialized {
-                "initialization"
-            } else {
-                "hosted spine authority"
-            },
-            authority_wait_ms = authority_wait.as_millis() as u64,
-            spine_gate_wait_ms = state.last_spine_gate_read_wait().as_millis() as u64,
-            "readiness refused"
-        );
+        // Hosted only. A local daemon answers 503 for the whole of its first
+        // reconcile, the CLI polls it every 200 ms while it does, and there is
+        // nothing an operator can act on in that window, so a line here would
+        // be a wall of warnings on every first `kin daemon`. A hosted daemon
+        // that cannot serve is the operator's problem whether or not anyone
+        // raised the log level first, which is why this is WARN and not DEBUG,
+        // and it stops as soon as the daemon is ready.
+        //
+        // Two lines rather than one with optional fields, so the
+        // initialization half carries no durations at all: on that half the
+        // authority check never ran, and a printed zero reads as "the gate was
+        // fine" when the truth is "the gate was never asked".
+        if hosted {
+            match authority_wait {
+                None => tracing::warn!(
+                    initialized,
+                    hosted_spine_ready,
+                    warming,
+                    refused_on = "initialization",
+                    "readiness refused"
+                ),
+                Some(waited) => tracing::warn!(
+                    initialized,
+                    hosted_spine_ready,
+                    warming,
+                    refused_on = "hosted spine authority",
+                    authority_wait_ms = waited.as_millis() as u64,
+                    spine_gate_wait_ms = state.last_spine_gate_read_wait().as_millis() as u64,
+                    "readiness refused"
+                ),
+            }
+        }
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ReadinessResponse {
@@ -43768,8 +43812,86 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_refused_readiness_says_which_half_refused() {
+    /// A hosted daemon as production composes it: a GCS-shaped storage backend
+    /// over a local file root, the exact five-repo fleet, publication control
+    /// over an in-memory store, and a durable spine over a cold fake store.
+    /// `hosted_spine_readiness_required()` is true on it, which is the whole
+    /// point: the readiness tests below run the half that FIR-3179 is about,
+    /// not the local half that `test_state()` gives.
+    ///
+    /// The environment guard is returned so it lives as long as the state;
+    /// dropping it restores the variables.
+    fn hosted_test_state() -> (Arc<DaemonState>, kin_core::test_env::EnvVarGuard) {
+        const READER: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let fleet = vec![
+            "kin".to_string(),
+            "kin-db".to_string(),
+            "kin-editor".to_string(),
+            "kin-vfs".to_string(),
+            "kinlab".to_string(),
+        ];
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        environment.apply("GOOGLE_CLOUD_PROJECT", Some("fixture-project"));
+        environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
+        environment.apply("KIN_GCS_PREFIX", Some("fixture-prefix"));
+        environment.apply("KIN_REPO_IDS", Some(&fleet.join(",")));
+        environment.apply::<_, &str>("KIN_DISABLE_SPINE", None);
+        let scope = "gcs://fixture-bucket/fixture-prefix";
+
+        let backend_root = tempfile::tempdir().unwrap();
+        for repo_id in &fleet {
+            let graph = kin_db::InMemoryGraph::new();
+            graph
+                .upsert_entity(&test_entity(
+                    &format!("{}_entity", repo_id.replace('-', "_")),
+                    "src/lib.rs",
+                ))
+                .unwrap();
+            kin_db::StorageBackend::save_snapshot(
+                &kin_db::LocalFileBackend::new(backend_root.path()),
+                repo_id,
+                &graph.to_snapshot().to_bytes().unwrap(),
+                kin_db::GENERATION_INIT,
+            )
+            .unwrap();
+        }
+        // The root outlives the state through the leak below; a test fixture
+        // that lives for one test does not need to reclaim it.
+        let backend_root = Box::leak(Box::new(backend_root));
+
+        let repo = tempfile::tempdir().unwrap();
+        let repo = Box::leak(Box::new(repo));
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let store = Arc::new(crate::publication_lease::InMemoryPublicationControlStore::default());
+        let control = Arc::new(
+            crate::publication_lease::PublicationControl::new(scope, READER, fleet.clone(), store)
+                .unwrap(),
+        );
+        let state = Arc::new(
+            DaemonState::open_with_backend_and_publication_control(
+                initialized.layout,
+                Box::new(kin_db::LocalFileBackend::new(backend_root.path())),
+                "kin",
+                Some(fleet.iter().cloned().collect()),
+                control,
+            )
+            .unwrap(),
+        );
+        state.install_hosted_durable_spine_for_test(Arc::new(
+            kin_spine::FirestoreSpineBackend::with_store(Arc::new(
+                kin_spine::test_support::FakeSpineStore::cold(),
+            )),
+        ));
+        assert!(
+            state.hosted_spine_readiness_required(),
+            "the fixture must put readiness on the hosted half, or these tests \
+             exercise nothing FIR-3179 is about"
+        );
+        (state, environment)
+    }
+
+    fn capturing_warnings() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
         let captured = CapturedLog::new();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(captured.clone())
@@ -43777,42 +43899,166 @@ mod tests {
             .with_ansi(false)
             .finish();
         // `set_default` is thread-local and `#[tokio::test]` runs the future on
-        // this thread, so the handler below writes into `captured`.
-        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        // this thread, so the handler writes into `captured`.
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
 
+    async fn probe_readiness(state: Arc<DaemonState>) -> StatusCode {
+        probe_readiness_on(router(state)).await
+    }
+
+    /// The composed fixture carries publication control, and `router()` refuses
+    /// to serve such a state without the authenticated router. `/readiness`
+    /// itself is exempt from the bearer (see `is_publication_control_route`),
+    /// so the probe below sends none, exactly as a kubelet would.
+    /// Through the full hosted router, admission middleware included, with no
+    /// bearer, exactly as a kubelet sends it.
+    async fn probe_hosted_readiness(state: Arc<DaemonState>) -> StatusCode {
+        probe_readiness_on(router_with_publication_control_auth(
+            state,
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        ))
+        .await
+    }
+
+    /// The handler on its own. On a hosted daemon whose reader is not admitted,
+    /// `hosted_reader_admission` answers the probe route before the handler
+    /// runs, so the handler's two halves can only be exercised by calling it
+    /// directly; the middleware path has its own test.
+    async fn call_readiness_handler(state: Arc<DaemonState>) -> StatusCode {
+        readiness(State(state)).await.into_response().status()
+    }
+
+    async fn probe_readiness_on(app: Router) -> StatusCode {
+        app.oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_local_daemon_still_initializing_logs_no_readiness_refusal() {
+        let (captured, _guard) = capturing_warnings();
         // `test_state()` opens a real repo, and `DaemonState::open` sets
         // `is_initialized` from whether a snapshot loaded, so the fixture
-        // arrives ready. Put it back to the state a starting daemon is in, so
-        // the first half is what refuses.
+        // arrives ready. Put it back to the state a starting daemon is in.
         let state = test_state();
         state
             .is_initialized
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        let response = router(state)
-            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !state.hosted_spine_readiness_required(),
+            "test_state() is the local half by construction"
+        );
+        assert_eq!(
+            probe_readiness(state).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let logged = captured.text();
+        assert!(
+            !logged.contains("readiness refused"),
+            "a local daemon answers 503 for its whole first reconcile while the CLI \
+             polls it every 200 ms; a WARN there is a wall of noise on every first \
+             `kin daemon`, not a signal. Captured output was: {logged:?}"
+        );
+    }
 
+    #[tokio::test]
+    async fn a_hosted_daemon_refused_on_initialization_says_so_with_no_durations() {
+        // Build the fixture first: a hosted open installs its own tracing
+        // default on this thread, and a capture installed before it would be
+        // shadowed for the rest of the test and read back empty.
+        let (state, _environment) = hosted_test_state();
+        let (captured, _guard) = capturing_warnings();
+        state
+            .is_initialized
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            call_readiness_handler(state).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         let logged = captured.text();
         assert!(
             logged.contains("readiness refused"),
-            "a 503 from /readiness must say so in the log; Kubernetes keeps only \
-             the status code, so an unlogged refusal is an unanswerable rollout \
-             failure. Captured output was: {logged:?}"
+            "a hosted 503 must say so in the log; Kubernetes keeps only the status \
+             code. Captured output was: {logged:?}"
         );
         assert!(
             logged.contains("refused_on=\"initialization\""),
-            "the refusal must name which half refused, so a reader does not have \
-             to guess between initialization and the spine authority. Captured \
+            "the refusal must name the initialization half. Captured output was: \
+             {logged:?}"
+        );
+        assert!(
+            !logged.contains("authority_wait_ms") && !logged.contains("spine_gate_wait_ms"),
+            "on the initialization half the authority check never ran, so no duration \
+             may be printed: a zero there reads as \"the gate was fine\" when the gate \
+             was never asked. Captured output was: {logged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hosted_daemon_refused_by_the_spine_authority_reports_both_waits() {
+        // Build the fixture first: a hosted open installs its own tracing
+        // default on this thread, and a capture installed before it would be
+        // shadowed for the rest of the test and read back empty.
+        let (state, _environment) = hosted_test_state();
+        let (captured, _guard) = capturing_warnings();
+        assert!(
+            state
+                .is_initialized
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the fixture loads a snapshot for kin, so it is initialized and the \
+             refusal, if any, comes from the spine authority half"
+        );
+        // A cold durable spine with no admitted reader refuses authority, so
+        // this is the branch where the two durations are real measurements.
+        let status = call_readiness_handler(state).await;
+        let logged = captured.text();
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a hosted daemon whose spine authority has not admitted its reader must \
+             not report ready. Captured output was: {logged:?}"
+        );
+        assert!(
+            logged.contains("refused_on=\"hosted spine authority\""),
+            "the refusal must name the spine authority half. Captured output was: \
+             {logged:?}"
+        );
+        assert!(
+            logged.contains("authority_wait_ms=") && logged.contains("spine_gate_wait_ms="),
+            "on the authority half both waits were measured and must be reported; \
+             the gate wait is what separates a slow open from starvation behind the \
+             refresh passes. Captured output was: {logged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unadmitted_hosted_reader_refuses_the_probe_and_says_so() {
+        let (state, _environment) = hosted_test_state();
+        let (captured, _guard) = capturing_warnings();
+        // Through the whole hosted router. The reader in this fixture was never
+        // admitted, so `hosted_reader_admission` answers the probe itself and
+        // the readiness handler never runs.
+        assert_eq!(
+            probe_hosted_readiness(state).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let logged = captured.text();
+        assert!(
+            logged.contains("readiness refused")
+                && logged.contains("refused_on=\"reader admission\""),
+            "a probe refused by reader admission is a 503 the kubelet cannot explain; the \
+             middleware must say so, because the handler behind it never runs. Captured \
              output was: {logged:?}"
         );
         assert!(
-            logged.contains("spine_gate_wait_ms="),
-            "the refusal must report how long the authority check waited for the \
-             publication gate, which is the measurement that separates a slow \
-             open from starvation behind the refresh passes. Captured output \
-             was: {logged:?}"
+            !logged.contains("refused_on=\"hosted spine authority\"")
+                && !logged.contains("refused_on=\"initialization\""),
+            "the handler must not also have logged, or the same refusal is reported twice \
+             with two different reasons. Captured output was: {logged:?}"
         );
     }
 
