@@ -774,7 +774,7 @@ export interface HostedRepositoryTransferRefusal {
  */
 export interface HostedRepositoryTransferSeam {
   protocol: "kin-repository-v6-fast-forward";
-  schemaVersion: 4;
+  schemaVersion: 5;
   routeTemplate: string;
   authorizationScheme: "Bearer";
   orgScoped: true;
