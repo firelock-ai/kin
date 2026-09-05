@@ -30,6 +30,14 @@ pub struct DiffRequest {
     pub head: Option<String>,
     #[serde(default)]
     pub json: bool,
+    /// Whether the caller wants whole bodies rather than the trimmed content
+    /// rows, so the server can read CAS on the caller's behalf.
+    ///
+    /// `#[serde(default)]` because this crosses the daemon wire and an older
+    /// peer neither sends nor understands it; a daemon that ignores it answers
+    /// exactly as it did, and the caller's own fallback fills the content in.
+    #[serde(default)]
+    pub full_bodies: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +46,15 @@ pub struct DiffResponse {
     pub lines: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<DiffReport>,
+    /// Whether this responder read artifact content into `report`.
+    ///
+    /// A flag rather than an empty-vector test, because "this build did not
+    /// read content" and "the content rows are genuinely empty" are different
+    /// facts and only the first is a reason for the caller to open the whole
+    /// store and read CAS itself. `#[serde(default)]` makes an older peer's
+    /// silence read as the first, which is what it means.
+    #[serde(default)]
+    pub artifact_content_rendered: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -255,6 +272,21 @@ pub fn inspect_with_endpoint_entities(
     live: Option<&kin_db::InMemoryGraph>,
 ) -> Result<(DiffReport, DiffEndpointEntities)> {
     let authority = ActiveRepositoryAuthority::open(binding)?;
+    inspect_with_endpoint_entities_at(&authority, base, head, live)
+}
+
+/// The same pair, from an authority the caller already opened.
+///
+/// An open re-verifies every persisted body, so a caller that wants the report
+/// AND the artifact content behind it takes one open and asks it for both.
+/// Reaching for the binding-taking wrapper twice is what made a local `kin diff`
+/// on a converted 470 MiB store pay for two whole-store opens.
+pub fn inspect_with_endpoint_entities_at(
+    authority: &ActiveRepositoryAuthority,
+    base: Option<&str>,
+    head: Option<&str>,
+    live: Option<&kin_db::InMemoryGraph>,
+) -> Result<(DiffReport, DiffEndpointEntities)> {
     let lease = authority.manager().read_authority();
     let metadata = lease.metadata();
     let workspace = metadata
@@ -771,7 +803,8 @@ pub async fn run(
     // local answer, which names its own gap rather than printing a zero that
     // reads like an answer.
     if !json && workspace_endpoint {
-        if let Some(response) = daemon_diff(&layout, &base, &head).await {
+        if let Some(response) = daemon_diff(&layout, &base, &head, full_bodies).await {
+            let content_rendered = response.artifact_content_rendered;
             for line in response.lines {
                 println!("{line}");
             }
@@ -780,12 +813,25 @@ pub async fn run(
                 //
                 // The daemon renders its own header lines and this appends after
                 // them, so its output stays byte-identical and the wire payload
-                // is unchanged. The report it already returns carries both blob
-                // hashes, so the CLI opens its own binding and reads CAS here.
-                // Two renderings of a content diff would drift, and the one
-                // nobody runs would be the one that drifts.
-                for line in content_lines_for(&layout, report, full_bodies) {
-                    println!("{line}");
+                // is unchanged. Two renderings of a content diff would drift,
+                // and the one nobody runs would be the one that drifts.
+                //
+                // The bodies come from the responder's own authority when it
+                // read them, and only from a local open when it did not. That
+                // second arm is a peer too old to carry the rows, and it is the
+                // whole of what used to happen every time: the answer arrived
+                // from a warm daemon and the command then re-verified the entire
+                // store to print the bodies beneath it.
+                if content_rendered {
+                    for row in &report.artifact_content {
+                        for line in render_content_lines(row) {
+                            println!("{line}");
+                        }
+                    }
+                } else {
+                    for line in content_lines_for(&layout, report, full_bodies) {
+                        println!("{line}");
+                    }
                 }
                 if let Some(line) = semantic_scope_line(report.semantic_basis.as_ref()) {
                     println!("{line}");
@@ -797,22 +843,33 @@ pub async fn run(
                 );
             }
             println!("{}", admitted_scope_line(&layout));
+            println!(
+                "{}",
+                crate::commands::repository_authority::answered_by_line(if content_rendered {
+                    crate::commands::repository_authority::AuthoritySource::RunningDaemon
+                } else {
+                    crate::commands::repository_authority::AuthoritySource::RunningDaemonAndOwnOpen
+                })
+            );
             return Ok(());
         }
     }
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
+    // ONE open for both readings. The report and the artifact bodies beneath it
+    // come from the same authority, where this used to open the whole store,
+    // build the report, and then open it a second time to read CAS.
+    //
     // No live graph on this path: the CLI opens durable authority in-process and
     // the entities a workspace endpoint needs live in the daemon's graph. So this
     // derives nothing and the basis says so by name, which is the zero
     // file-search rule applied to a read: when the graph cannot answer, report
     // the gap rather than a zero that reads like an answer.
-    let mut report = inspect(&binding, base.as_deref(), head.as_deref(), None)?;
-    if let Ok(authority) =
-        crate::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)
-    {
-        report.artifact_content =
-            collect_artifact_content(&authority, &report.artifact_deltas, full_bodies);
-    }
+    let authority =
+        crate::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)?;
+    let (mut report, _) =
+        inspect_with_endpoint_entities_at(&authority, base.as_deref(), head.as_deref(), None)?;
+    report.artifact_content =
+        collect_artifact_content(&authority, &report.artifact_deltas, full_bodies);
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -831,6 +888,12 @@ pub async fn run(
             println!("Admission scope: this diff was not measured against the working copy: {why}");
         }
         println!("{}", admitted_scope_line(&layout));
+        println!(
+            "{}",
+            crate::commands::repository_authority::answered_by_line(
+                crate::commands::repository_authority::AuthoritySource::OwnAuthorityOpen
+            )
+        );
     }
     Ok(())
 }
@@ -869,6 +932,7 @@ async fn daemon_diff(
     layout: &kin_core::KinLayout,
     base: &Option<String>,
     head: &Option<String>,
+    full_bodies: bool,
 ) -> Option<DiffResponse> {
     let base_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await?;
     let client =
@@ -879,6 +943,10 @@ async fn daemon_diff(
         // The daemon renders its own lines and this path only takes the text
         // path, so it never asks for the JSON shape.
         json: false,
+        // Said out loud so the responder can read the bodies from the authority
+        // it already holds. A peer that does not know the field ignores it and
+        // answers as it always did, and the caller fills the content in.
+        full_bodies,
     };
     client.diff(&request).await.ok()
 }
@@ -993,15 +1061,36 @@ pub fn build_diff_response(
     request: &DiffRequest,
     live: Option<&kin_db::InMemoryGraph>,
 ) -> Result<DiffResponse> {
-    let report = inspect(
-        binding,
+    let authority = ActiveRepositoryAuthority::open(binding)?;
+    build_diff_response_at(&authority, request, live)
+}
+
+/// The same response, from an authority the caller already opened, with the
+/// artifact content read on the caller's behalf.
+///
+/// Reading content here is what lets a `kin diff` served by this response skip
+/// an authority open of its own. It used to open its own binding and read CAS
+/// after printing the daemon's lines, which meant the answer arrived from a
+/// warm daemon and the command then spent seconds re-verifying the whole store
+/// to render the bodies under it.
+pub fn build_diff_response_at(
+    authority: &ActiveRepositoryAuthority,
+    request: &DiffRequest,
+    live: Option<&kin_db::InMemoryGraph>,
+) -> Result<DiffResponse> {
+    let (mut report, _) = inspect_with_endpoint_entities_at(
+        authority,
         request.base.as_deref(),
         request.head.as_deref(),
         live,
     )?;
+    let lines = render_lines(&report);
+    report.artifact_content =
+        collect_artifact_content(authority, &report.artifact_deltas, request.full_bodies);
     Ok(DiffResponse {
-        lines: render_lines(&report),
+        lines,
         report: Some(report),
+        artifact_content_rendered: true,
     })
 }
 
@@ -1335,6 +1424,86 @@ mod tests {
         FingerprintAlgorithm, LanguageId, RelationKind, RelationOrigin, RepoPath, ResolvedArtifact,
         SemanticFingerprint, Visibility,
     };
+
+    /// One diff answer must open repository authority exactly once, report and
+    /// artifact bodies together.
+    ///
+    /// GAP-6, in the form that scales. An authority open is a full recovery that
+    /// re-verifies every persisted body against its content address, so it costs
+    /// whatever the whole store is worth: measured on a converted 470 MiB
+    /// express store, one open is seconds. The COUNT is the honest bound and the
+    /// wall clock is not, because a fixture small enough to run in CI answers in
+    /// milliseconds whether it opens once or twice.
+    ///
+    /// Counted on this thread only: this binary runs tests in parallel and
+    /// siblings open authority of their own.
+    ///
+    /// Breaking it: read the artifact content through a second
+    /// `ActiveRepositoryAuthority::open` on the binding, which is what both the
+    /// local arm and the daemon arm of `kin diff` used to do. Either takes this
+    /// to 2. Note the second open was UNCONDITIONAL in the shipped code, so this
+    /// bound goes red on a fixture with no artifact deltas too.
+    #[test]
+    fn one_diff_answer_opens_repository_authority_once() {
+        let root = tempfile::tempdir().expect("a temporary directory for the fixture store");
+        let init = kin_core::init(root.path()).expect("kin_core::init builds a real store");
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout)
+            .expect("the fixture store binds");
+        let request = DiffRequest {
+            base: None,
+            head: None,
+            json: false,
+            full_bodies: false,
+        };
+
+        let before = kin_core::authority_opens();
+        let response =
+            build_diff_response(&binding, &request, None).expect("a fresh store answers a diff");
+        let opens = kin_core::authority_opens() - before;
+
+        // Non-vacuity first. A response with no report, or one that did not
+        // claim to have read content, cannot tell "one open for both" apart from
+        // "one open and the second reading skipped".
+        let report = response
+            .report
+            .as_ref()
+            .expect("the diff report must be real");
+        assert_eq!(report.schema, DIFF_SCHEMA);
+        assert!(
+            response.artifact_content_rendered,
+            "the responder must say it read artifact content, or its caller opens the store itself"
+        );
+        assert_eq!(
+            opens, 1,
+            "one diff answer must open repository authority once and ask that open for both the \
+             report and the artifact bodies; opening per reading is GAP-6"
+        );
+    }
+
+    /// An older daemon's silence about artifact content must read as "did not
+    /// read it", so the caller still renders the bodies.
+    ///
+    /// The wire half of the mixed-build case. A `false` here is what sends the
+    /// caller down its own local open, and a payload that decoded as `true`
+    /// would print a diff with every content row missing and nothing saying so.
+    ///
+    /// Breaking it: give the field a `#[serde(default = ...)]` that yields true,
+    /// or drop `#[serde(default)]` so an older payload fails to parse at all.
+    #[test]
+    fn an_older_daemons_diff_payload_says_it_rendered_no_artifact_content() {
+        let decoded: DiffResponse = serde_json::from_value(serde_json::json!({
+            "lines": ["Kin repository-v6 diff"],
+        }))
+        .expect("an older daemon's payload must still decode");
+
+        // Non-vacuity: the payload really is the older shape.
+        assert!(decoded.report.is_none());
+        assert_eq!(decoded.lines.len(), 1);
+        assert!(
+            !decoded.artifact_content_rendered,
+            "an absent flag must mean the content was not read, so the caller reads it itself"
+        );
+    }
 
     fn entity(id: EntityId, name: &str) -> Entity {
         Entity {
