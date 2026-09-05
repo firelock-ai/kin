@@ -2649,6 +2649,24 @@ mod tests {
             folded.entities.len() + 1,
             "the section arm must have answered; a fallback would have dropped its marker"
         );
+        // Equality is not enough here, and this is the assertion that matters.
+        // A section arm that went back to handing out `section.state.clone()`
+        // would return a value equal to this one in every field, so every
+        // assertion above would still pass while the copy this change exists to
+        // remove was back. Only the borrow itself distinguishes them.
+        assert!(
+            matches!(resolved, Cow::Borrowed(_)),
+            "the section arm must borrow its answer; an owned value means the clone came back"
+        );
+        let section_state: *const ResolvedGraphState = &snapshot
+            .materialized_graph
+            .as_ref()
+            .expect("the fixture installed a section")
+            .state;
+        assert!(
+            std::ptr::eq(&*resolved, section_state),
+            "the borrow must point at the section's own state, not at a copy of it"
+        );
     }
 
     #[test]
