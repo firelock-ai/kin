@@ -4747,11 +4747,16 @@ async fn command_status(
         ));
     }
 
-    let repository_authority = state
-        .local_repository_authority_binding()
-        .map_err(repository_authority_error)?;
+    // One open per publication, not three per request. This route used to take
+    // the raw binding and hand it to two kin-cli helpers that each opened the
+    // whole store for themselves, and the CLI then opened a third time on its
+    // own side for the same merge reading. On a converted 470 MiB store one
+    // open costs seconds because it re-verifies every persisted body, so the
+    // request paid that price three times over for two readings that cannot
+    // vary inside one publication.
+    let repository_authority = command_repository_authority(&state)?;
     let embedding_coverage = live_embedding_coverage(&state).await;
-    let report = kin_cli::commands::status::inspect(
+    let report = kin_cli::commands::status::inspect_at(
         &state.layout,
         &repository_authority,
         embedding_coverage,
@@ -4771,10 +4776,10 @@ async fn command_status(
         daemon_source_known: daemon_build.source_known,
         daemon_dependency_provenance: daemon_build.dependency_provenance.to_string(),
     };
-    let merge = kin_core::LocalRepositoryAuthorityBinding::from_layout(&state.layout)
-        .ok()
-        .and_then(|binding| kin_cli::commands::status::merge_in_progress(&binding).ok())
-        .flatten();
+    // Both readings come off the authority this request already holds, not from
+    // a binding that would open the whole store again for each of them.
+    let merge = kin_cli::commands::status::merge_in_progress_at(&repository_authority);
+    let workspace_tip = kin_cli::commands::status::workspace_tip_at(&repository_authority);
     let response = kin_cli::commands::status::build_command_status_response(
         report,
         request.json,
@@ -4802,6 +4807,7 @@ async fn command_status(
         // Never fatal: a status route that 500s because it could not check for a
         // merge is worse than one that answers and does not mention it.
         merge.as_ref(),
+        Some(&workspace_tip),
     )
     .map_err(internal_error)?;
     Ok(Json(response))
@@ -5445,13 +5451,15 @@ async fn command_diff(
         ));
     }
 
-    let repository_authority = state
-        .local_repository_authority_binding()
-        .map_err(repository_authority_error)?;
+    // One open per publication rather than one per request, for the same reason
+    // `/commands/status` and `/commands/log` take it: an open re-verifies every
+    // persisted body, and neither the diff nor the artifact bodies under it can
+    // vary inside one publication.
+    let repository_authority = command_repository_authority(&state)?;
     // The live graph, which is the whole point of routing a workspace diff here:
     // a workspace endpoint's entities are DERIVED, and this process is the only
     // one that holds them. Read per moved path rather than snapshot-cloned.
-    let response = kin_cli::commands::diff::build_diff_response(
+    let response = kin_cli::commands::diff::build_diff_response_at(
         &repository_authority,
         &request,
         Some(state.graph.as_ref()),
@@ -5476,14 +5484,18 @@ async fn command_log(
         ));
     }
 
+    // The session gate is unchanged: this route still resolves the caller's
+    // session graph, which `build_log_response` has always taken and never read,
+    // so that a session's bookkeeping behaves exactly as it did.
     let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let repository_authority = state
-        .local_repository_authority_binding()
-        .map_err(repository_authority_error)?;
-    let response =
-        kin_cli::commands::log::build_log_response(&repository_authority, graph.as_ref(), &request)
-            .map_err(internal_error)?;
+    let _graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    // One open per publication rather than one per request. This handler used to
+    // hand the raw binding to a helper that opened the whole store for itself,
+    // which on a converted 470 MiB store is seconds of re-verifying every
+    // persisted body for a history read that cannot vary inside one publication.
+    let repository_authority = command_repository_authority(&state)?;
+    let response = kin_cli::commands::log::build_log_response_at(&repository_authority, &request)
+        .map_err(internal_error)?;
     Ok(Json(response))
 }
 

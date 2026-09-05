@@ -31,6 +31,14 @@ pub struct LogResponse {
     pub lines: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<LogReport>,
+    /// Where this workspace sits relative to the branch its head names.
+    ///
+    /// On the ENVELOPE rather than in `report`, so `kin.log.v1` does not move
+    /// and a peer on either side of the wire that does not know this field
+    /// keeps working. Log is the one verb that can afford the distance in
+    /// changes, because it has already decoded the change DAG to answer at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_tip: Option<crate::commands::workspace_tip::WorkspaceTip>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -82,11 +90,28 @@ pub struct LogReport {
     pub entries: Vec<LogEntry>,
 }
 
+/// How far back a lag walk will look before it gives up and claims no count.
+///
+/// Bounded because the walk is over a converted repository's whole history and
+/// a workspace that is behind is normally behind by one change. A walk that
+/// exhausts this budget reports no distance rather than a short one; see
+/// [`crate::commands::workspace_tip::distance`].
+const ANCESTRY_WALK_CAP: usize = 4096;
+
 pub fn inspect(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     count: usize,
 ) -> Result<LogReport> {
     let authority = ActiveRepositoryAuthority::open(binding)?;
+    inspect_at(&authority, count)
+}
+
+/// The same report, from an authority the caller already opened.
+///
+/// An open re-verifies every persisted body, so a caller wanting both the log
+/// and the workspace-tip reading takes ONE open and asks it for both, rather
+/// than reaching for the binding-taking wrapper twice.
+pub fn inspect_at(authority: &ActiveRepositoryAuthority, count: usize) -> Result<LogReport> {
     let lease = authority.manager().read_authority();
     let metadata = lease.metadata();
     let snapshot = lease.snapshot();
@@ -183,16 +208,135 @@ pub fn inspect(
     })
 }
 
-pub fn run(count: usize, json: bool) -> Result<()> {
+/// Where this workspace sits relative to its branch, with the distance in
+/// changes filled in from the DAG this command has already decoded.
+///
+/// Log is the only one of these verbs that can honestly claim a count. Status
+/// reads authority metadata and stops, deliberately, because on a converted
+/// repository the change map is most of the snapshot body and no status should
+/// pay to decode it. Here the walk was already paid for.
+pub fn workspace_tip_at(
+    authority: &ActiveRepositoryAuthority,
+) -> crate::commands::workspace_tip::WorkspaceTip {
+    use crate::commands::workspace_tip::WorkspaceTip;
+    let reading = crate::commands::status::workspace_tip_at(authority);
+    let WorkspaceTip::Behind {
+        tip,
+        projected: Some(projected),
+        ..
+    } = &reading
+    else {
+        return reading;
+    };
+    let (tip, projected) = (*tip, *projected);
+    let lease = authority.manager().read_authority();
+    let snapshot = lease.snapshot();
+    let walked = crate::commands::workspace_tip::distance(
+        &tip,
+        &projected,
+        |change_id| {
+            snapshot
+                .changes
+                .get(change_id)
+                .map(|change| change.parents.clone())
+        },
+        ANCESTRY_WALK_CAP,
+    );
+    drop(lease);
+    match walked {
+        Some(changes) => reading.with_distance(changes),
+        None => reading,
+    }
+}
+
+/// Ask the daemon for a log, or `None` when it cannot answer.
+///
+/// Deliberately swallows every failure into `None`, exactly as `kin diff`'s own
+/// daemon route does. A `kin log` that refused because no daemon was running
+/// would be a regression against the command as it shipped, and the local path
+/// it falls back to is the same code the daemon runs.
+///
+/// The reason this route exists at all is cost, not capability: both sides
+/// answer from the same durable authority, and only the daemon can answer from
+/// an authority it already has open. On a converted 470 MiB store an
+/// in-process open re-verifies every persisted body and takes seconds; the
+/// daemon holds one open per publication and answers from it.
+async fn daemon_log(layout: &kin_core::KinLayout, count: usize) -> Option<LogResponse> {
+    let base_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await?;
+    let client =
+        crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, layout).ok()?;
+    client.log(&LogRequest { count }).await.ok()
+}
+
+/// Everything `kin log` prints when no daemon answers, from ONE authority open.
+///
+/// Extracted from `run` so the open count is assertable. The count, not the
+/// wall clock, is the honest thing to bound: an open re-verifies every persisted
+/// body, so it costs whatever the store is worth, and a timing assertion on a
+/// fixture small enough to run in CI passes just as readily with a second open
+/// present.
+fn local_log(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    count: usize,
+) -> Result<(LogReport, crate::commands::workspace_tip::WorkspaceTip)> {
+    let authority = ActiveRepositoryAuthority::open(binding)?;
+    let report = inspect_at(&authority, count)?;
+    let tip = workspace_tip_at(&authority);
+    Ok((report, tip))
+}
+
+pub async fn run(count: usize, json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
+    // The daemon first, and only for the text path. `--json` is a contract with
+    // a machine reader and must publish the exact report this build serializes,
+    // so it stays on the local read rather than re-serializing a peer's payload.
+    //
+    // A daemon too old to carry the tip reading costs this command a named gap
+    // and nothing else, so it does not fall back the way `kin status` does. The
+    // difference is what silence would mean: a status with no merge reading
+    // prints a clean tree over a workspace holding a merge open, and this prints
+    // a line saying the reading was not taken.
+    if !json {
+        if let Some(response) = daemon_log(&layout, count).await {
+            for line in response.lines {
+                println!("{line}");
+            }
+            println!(
+                "{}",
+                crate::commands::workspace_tip::line(
+                    &response.workspace_tip.unwrap_or(
+                        crate::commands::workspace_tip::WorkspaceTip::Unknown {
+                            reason: "the daemon that answered this log does not report it; \
+                                 `kin daemon stop` and re-run picks it up on this build"
+                                .to_string(),
+                        }
+                    )
+                )
+            );
+            println!(
+                "{}",
+                crate::commands::repository_authority::answered_by_line(
+                    crate::commands::repository_authority::AuthoritySource::RunningDaemon
+                )
+            );
+            return Ok(());
+        }
+    }
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
-    let report = inspect(&binding, count)?;
+    let (report, tip) = local_log(&binding, count)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         for line in render_lines(&report) {
             println!("{line}");
         }
+        println!("{}", crate::commands::workspace_tip::line(&tip));
+        println!(
+            "{}",
+            crate::commands::repository_authority::answered_by_line(
+                crate::commands::repository_authority::AuthoritySource::OwnAuthorityOpen
+            )
+        );
     }
     Ok(())
 }
@@ -202,10 +346,20 @@ pub fn build_log_response(
     _graph: &kin_db::InMemoryGraph,
     request: &LogRequest,
 ) -> Result<LogResponse> {
-    let report = inspect(binding, request.count)?;
+    let authority = ActiveRepositoryAuthority::open(binding)?;
+    build_log_response_at(&authority, request)
+}
+
+/// The same response, from an authority the caller already opened.
+pub fn build_log_response_at(
+    authority: &ActiveRepositoryAuthority,
+    request: &LogRequest,
+) -> Result<LogResponse> {
+    let report = inspect_at(authority, request.count)?;
     Ok(LogResponse {
         lines: render_lines(&report),
         report: Some(report),
+        workspace_tip: Some(workspace_tip_at(authority)),
     })
 }
 
@@ -293,6 +447,54 @@ mod tests {
         FingerprintAlgorithm, Hash256, LanguageId, SemanticChange, SemanticFingerprint, SourceSpan,
         Visibility,
     };
+
+    /// One `kin log` with no daemon must open repository authority exactly once.
+    ///
+    /// GAP-6, in the form that scales. An authority open is a full recovery that
+    /// re-verifies every persisted body against its content address, so it costs
+    /// whatever the whole store is worth: measured on a converted 470 MiB
+    /// express store, one open is seconds and `kin status` was paying for three
+    /// of them per invocation. The COUNT is therefore the honest bound and the
+    /// wall clock is not, because a fixture small enough to run in CI answers in
+    /// milliseconds whether it opens once or twice.
+    ///
+    /// Counted on this thread only: this binary runs tests in parallel and
+    /// siblings open authority of their own, so the process-wide delta is not
+    /// this test's number.
+    ///
+    /// Breaking it: give `local_log` a second open, which is exactly what the
+    /// shipped code did before this change and what reverting `workspace_tip_at`
+    /// to a binding-taking helper would restore. Either takes this to 2.
+    #[test]
+    fn one_local_log_opens_repository_authority_once() {
+        let _daemon = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
+        let root = tempfile::tempdir().expect("a temporary directory for the fixture store");
+        let init = kin_core::init(root.path()).expect("kin_core::init builds a real store");
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout)
+            .expect("the fixture store binds");
+
+        let before = kin_core::authority_opens();
+        let (report, tip) = local_log(&binding, 5).expect("a fresh store answers a log");
+        let opens = kin_core::authority_opens() - before;
+
+        // Non-vacuity first, both halves. A call that produced no report, or a
+        // tip reading that says it could not be taken, cannot tell "one open for
+        // both readings" apart from "one open and one reading missing", and the
+        // bound below would pass without meaning anything.
+        assert_eq!(report.schema, LOG_SCHEMA, "the log report must be real");
+        assert!(
+            !matches!(
+                tip,
+                crate::commands::workspace_tip::WorkspaceTip::Unknown { .. }
+            ),
+            "the workspace-tip reading must have come off that same open: {tip:?}"
+        );
+        assert_eq!(
+            opens, 1,
+            "one `kin log` must open repository authority once and ask that open for both the \
+             history and the workspace-tip reading; opening per reading is GAP-6"
+        );
+    }
 
     /// One version of one entity, plus the file-level noise a real reconcile
     /// stamps on every entity in a touched file whether or not it moved: the

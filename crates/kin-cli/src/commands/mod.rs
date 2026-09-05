@@ -106,6 +106,7 @@ pub mod transfer;
 pub mod update;
 pub mod verify;
 pub mod work;
+pub mod workspace_tip;
 pub mod xref;
 
 /// Discover the Kin repository a command is bound to, or refuse by naming the

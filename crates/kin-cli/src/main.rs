@@ -2865,7 +2865,7 @@ fn run() -> Result<()> {
                     commands::capabilities::require_ready("commit")?;
                     commands::commit::run(message, quiet, amend).await
                 }
-                Command::Log { count, json } => commands::log::run(count, json),
+                Command::Log { count, json } => commands::log::run(count, json).await,
                 Command::Branch { action } => match action {
                     BranchAction::List { json } => commands::branch::list(json).await,
                     BranchAction::Create { name, ref_hex } => {
