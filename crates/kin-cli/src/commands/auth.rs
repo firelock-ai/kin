@@ -413,18 +413,78 @@ pub fn hosted_credential_state(
     Ok(absent_state(keyring_read))
 }
 
-fn delete_credential(base_url: &str) -> Result<()> {
+/// Every persisted form one account's credential can take.
+///
+/// The plaintext tier writes to the encrypted path's `.json` sibling and
+/// `load_credential` reads it back from exactly that expression, so a deletion
+/// naming only one of the two leaves the other for the next load. Derived from
+/// the same call and the same `with_extension` here, so the set can never drift
+/// from what the writer and the reader use.
+///
+/// Both names are `account_key(base_url)`, so another account's credential is a
+/// different file and is not in this list at all.
+fn persisted_credential_paths(base_url: &str) -> Result<[PathBuf; 2]> {
+    let encrypted = fallback_credential_path(base_url)?;
+    let plaintext = encrypted.with_extension("json");
+    Ok([encrypted, plaintext])
+}
+
+/// What removing one account's local credential actually managed to do.
+///
+/// A list rather than a bool, because "the keyring entry was not there" and
+/// "the keyring refused to delete it" are different facts and only the second
+/// means a credential may still be readable. Reporting them as one would let a
+/// logout that removed nothing print the same line as one that removed
+/// everything, which is the shape this whole change exists to end.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LocalRemoval {
+    /// Forms that were present and are now gone.
+    removed: Vec<String>,
+    /// Forms that were present and could not be removed, and why.
+    failures: Vec<String>,
+}
+
+impl LocalRemoval {
+    fn is_clean(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+fn delete_credential(base_url: &str) -> Result<LocalRemoval> {
     let key = account_key(base_url);
+    let mut outcome = LocalRemoval::default();
+
     if keyring_enabled() {
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
-            let _ = entry.delete_credential();
+        match keyring::Entry::new(KEYRING_SERVICE, &key) {
+            Ok(entry) => match entry.delete_credential() {
+                Ok(()) => outcome.removed.push("the OS keyring entry".to_string()),
+                // Absent is not a failure: a credential stored in a file has no
+                // keyring entry to remove, and saying so would report every
+                // file-tier logout as half broken.
+                Err(keyring::Error::NoEntry) => {}
+                Err(error) => outcome.failures.push(format!(
+                    "the OS keyring entry could not be removed: {error}"
+                )),
+            },
+            Err(error) => outcome
+                .failures
+                .push(format!("the OS keyring could not be opened: {error}")),
         }
     }
-    let path = fallback_credential_path(base_url)?;
-    if path.exists() {
-        fs::remove_file(path)?;
+
+    for path in persisted_credential_paths(base_url)? {
+        if !path.exists() {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => outcome.removed.push(path.display().to_string()),
+            Err(error) => outcome
+                .failures
+                .push(format!("{} could not be removed: {error}", path.display())),
+        }
     }
-    Ok(())
+
+    Ok(outcome)
 }
 
 fn pkce_challenge(verifier: &str) -> String {
@@ -798,17 +858,104 @@ pub async fn whoami(base_url: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// What a logout learned about the session it tried to end, server side.
+///
+/// Separate from the local removal on purpose. Deleting a file on this machine
+/// revokes nothing: the bearer token stays valid until the server says
+/// otherwise or it expires, so a logout that only deleted locally must not
+/// print a sentence a reader would take as revocation.
+#[derive(Debug, PartialEq, Eq)]
+enum RevocationOutcome {
+    /// Nothing was stored for this base URL, so there was no session to end.
+    NothingStored,
+    /// The server accepted the revocation.
+    Revoked,
+    /// The server did not confirm it, and the reason.
+    NotRevoked(String),
+}
+
+/// Read the revocation attempt, with `None` meaning nothing was stored.
+///
+/// Pure so every row is exercised without a network, which is what the rows
+/// need most: the failing ones are the reason this exists, and a test that had
+/// to reach a server to see them would not run at all.
+fn revocation_outcome(response: Option<std::result::Result<u16, String>>) -> RevocationOutcome {
+    match response {
+        None => RevocationOutcome::NothingStored,
+        Some(Ok(status)) if (200..300).contains(&status) => RevocationOutcome::Revoked,
+        Some(Ok(status)) => {
+            RevocationOutcome::NotRevoked(format!("the server answered HTTP {status}"))
+        }
+        Some(Err(error)) => RevocationOutcome::NotRevoked(error),
+    }
+}
+
+/// What logout tells the reader, given what actually happened.
+///
+/// The claim is bounded by the weaker of the two halves. Local files gone plus
+/// a server that never confirmed is "this machine is clear, the session may
+/// not be", and it names what is left to do rather than implying it is done.
+fn logout_lines(
+    base_url: &str,
+    outcome: &RevocationOutcome,
+    removal: &LocalRemoval,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    match outcome {
+        RevocationOutcome::NothingStored => {
+            lines.push(format!(
+                "No KinLab auth credential was stored for {base_url}."
+            ));
+        }
+        RevocationOutcome::Revoked => {
+            lines.push(format!(
+                "Revoked the KinLab session for {base_url} and removed the local credential."
+            ));
+        }
+        RevocationOutcome::NotRevoked(reason) => {
+            lines.push(format!(
+                "Removed the local KinLab credential for {base_url}, but the session was NOT \
+                 revoked ({reason}). The token stays valid until it expires; revoke it in the \
+                 KinLab dashboard if that matters."
+            ));
+        }
+    }
+    for failure in &removal.failures {
+        lines.push(format!(
+            "This machine may still hold a usable credential: {failure}"
+        ));
+    }
+    lines
+}
+
 pub async fn logout(base_url: Option<String>) -> Result<()> {
     let base_url = normalized_base_url(base_url);
-    if let Some(credential) = load_credential(&base_url, true)? {
-        let _ = reqwest::Client::new()
-            .post(format!("{}/api/cli/auth/logout", base_url))
-            .bearer_auth(&credential.token)
-            .send()
-            .await;
+    let revocation = match load_credential(&base_url, true)? {
+        None => None,
+        Some(credential) => Some(
+            match reqwest::Client::new()
+                .post(format!("{}/api/cli/auth/logout", base_url))
+                .bearer_auth(&credential.token)
+                .send()
+                .await
+            {
+                Ok(response) => Ok(response.status().as_u16()),
+                Err(error) => Err(error.to_string()),
+            },
+        ),
+    };
+    let outcome = revocation_outcome(revocation);
+
+    // Local removal runs whatever the server said. A session this machine
+    // cannot revoke is still a session this machine should not keep the key to.
+    let removal = delete_credential(&base_url)?;
+
+    for line in logout_lines(&base_url, &outcome, &removal) {
+        println!("{line}");
     }
-    delete_credential(&base_url)?;
-    println!("Removed KinLab auth credential for {}.", base_url);
+    if !removal.is_clean() {
+        anyhow::bail!("the local KinLab credential for {base_url} was not fully removed");
+    }
     Ok(())
 }
 
@@ -816,6 +963,235 @@ pub async fn logout(base_url: Option<String>) -> Result<()> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// FIR-3257. A logout removes every persisted form of the credential it
+    /// just logged out of.
+    ///
+    /// `store_credential` writes the no-keyring, no-passphrase tier to
+    /// `fallback_credential_path(..).with_extension("json")`, and
+    /// `load_credential` reads that exact path back. `delete_credential`
+    /// removed only `fallback_credential_path(..)`, so on the tier the product
+    /// itself calls PLAINTEXT the credential survived `kin auth logout` and the
+    /// next load picked it straight back up, while the command printed that it
+    /// had removed it.
+    #[test]
+    #[serial]
+    fn a_logout_removes_the_plaintext_credential_a_later_load_would_read() {
+        let store = tempfile::tempdir().expect("a private credential store");
+        let _root = TestCredentialRoot::set(&store.path().join("auth"));
+        let base_url = "https://kinlab.example.com";
+        std::env::remove_var("KINLAB_AUTH_PASSPHRASE");
+
+        store_credential(base_url, &test_credential(base_url)).expect("store the plaintext tier");
+        let plaintext = fallback_credential_path(base_url)
+            .expect("resolve the credential path")
+            .with_extension("json");
+        assert!(
+            plaintext.exists(),
+            "the fixture has to write the plaintext tier, or the assertion below proves nothing"
+        );
+        assert!(
+            load_credential(base_url, false)
+                .expect("read back what was stored")
+                .is_some(),
+            "and the product has to be able to read it, or this is not the tier under test"
+        );
+
+        delete_credential(base_url).expect("logout removes the local credential");
+
+        assert!(
+            load_credential(base_url, false)
+                .expect("read after the logout")
+                .is_none(),
+            "a logout that leaves a credential a later load reads has not logged anybody out"
+        );
+        assert!(
+            !plaintext.exists(),
+            "and the file itself has to be gone: {}",
+            plaintext.display()
+        );
+    }
+
+    /// The control that keeps the removal from becoming a blunt instrument:
+    /// logging out of one base URL leaves every other account alone.
+    #[test]
+    #[serial]
+    fn a_logout_leaves_another_accounts_credential_alone() {
+        let store = tempfile::tempdir().expect("a private credential store");
+        let _root = TestCredentialRoot::set(&store.path().join("auth"));
+        let mine = "https://kinlab.example.com";
+        let theirs = "https://other.example.com";
+        std::env::remove_var("KINLAB_AUTH_PASSPHRASE");
+
+        store_credential(mine, &test_credential(mine)).expect("store mine");
+        store_credential(theirs, &test_credential(theirs)).expect("store theirs");
+
+        delete_credential(mine).expect("log out of mine only");
+
+        assert!(
+            load_credential(theirs, false)
+                .expect("read the other account")
+                .is_some(),
+            "logging out of one account must not remove another account's credential"
+        );
+    }
+
+    /// The encrypted tier is removed too, and it is a separate file from the
+    /// plaintext one, so covering one says nothing about the other.
+    #[test]
+    #[serial]
+    fn a_logout_removes_the_encrypted_credential() {
+        let store = tempfile::tempdir().expect("a private credential store");
+        let _root = TestCredentialRoot::set(&store.path().join("auth"));
+        let base_url = "https://kinlab.example.com";
+        std::env::set_var("KINLAB_AUTH_PASSPHRASE", "not-a-real-passphrase");
+
+        store_credential(base_url, &test_credential(base_url)).expect("store the encrypted tier");
+        let encrypted = fallback_credential_path(base_url).expect("resolve the credential path");
+        assert!(
+            encrypted.exists(),
+            "the fixture has to write the encrypted tier, or this proves nothing"
+        );
+
+        let removal = delete_credential(base_url).expect("logout removes the local credential");
+
+        std::env::remove_var("KINLAB_AUTH_PASSPHRASE");
+        assert!(!encrypted.exists(), "the encrypted form has to be gone too");
+        assert!(
+            removal.is_clean(),
+            "and nothing should have failed: {:?}",
+            removal.failures
+        );
+        assert_eq!(
+            removal.removed.len(),
+            1,
+            "exactly the one form that was present: {:?}",
+            removal.removed
+        );
+    }
+
+    /// Both forms at once, which is what a machine that logged in twice under
+    /// different passphrase settings actually holds.
+    #[test]
+    #[serial]
+    fn a_logout_removes_both_persisted_forms_when_both_exist() {
+        let store = tempfile::tempdir().expect("a private credential store");
+        let _root = TestCredentialRoot::set(&store.path().join("auth"));
+        let base_url = "https://kinlab.example.com";
+
+        std::env::set_var("KINLAB_AUTH_PASSPHRASE", "not-a-real-passphrase");
+        store_credential(base_url, &test_credential(base_url)).expect("store encrypted");
+        std::env::remove_var("KINLAB_AUTH_PASSPHRASE");
+        store_credential(base_url, &test_credential(base_url)).expect("store plaintext");
+
+        let paths = persisted_credential_paths(base_url).expect("both forms");
+        assert!(
+            paths.iter().all(|path| path.exists()),
+            "the fixture has to leave both forms on disk: {paths:?}"
+        );
+
+        let removal = delete_credential(base_url).expect("logout removes the local credential");
+
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "a logout has to remove every form it could later read: {paths:?}"
+        );
+        assert_eq!(removal.removed.len(), 2, "{:?}", removal.removed);
+        assert!(removal.is_clean(), "{:?}", removal.failures);
+    }
+
+    /// A store with nothing in it removes nothing and reports no failure. This
+    /// is what keeps `is_clean` from being satisfied by a removal that simply
+    /// never looks.
+    #[test]
+    #[serial]
+    fn a_logout_with_nothing_stored_removes_nothing_and_fails_nothing() {
+        let store = tempfile::tempdir().expect("a private credential store");
+        let _root = TestCredentialRoot::set(&store.path().join("auth"));
+
+        let removal = delete_credential("https://kinlab.example.com").expect("nothing to remove");
+
+        assert_eq!(removal, LocalRemoval::default());
+    }
+
+    /// The rows a logout can truthfully print. Under `cfg(test)` the keyring is
+    /// never reached, so these are the rows that decide what the user is told,
+    /// and the failing ones are the reason this is a decision rather than a
+    /// hardcoded sentence.
+    #[test]
+    fn a_logout_never_claims_a_revocation_the_server_did_not_confirm() {
+        assert_eq!(revocation_outcome(None), RevocationOutcome::NothingStored);
+        assert_eq!(
+            revocation_outcome(Some(Ok(200))),
+            RevocationOutcome::Revoked
+        );
+        assert_eq!(
+            revocation_outcome(Some(Ok(204))),
+            RevocationOutcome::Revoked
+        );
+
+        let RevocationOutcome::NotRevoked(reason) = revocation_outcome(Some(Ok(500))) else {
+            panic!("a server that answered 500 has not revoked anything");
+        };
+        assert!(
+            reason.contains("500"),
+            "the row names what happened: {reason}"
+        );
+
+        let RevocationOutcome::NotRevoked(reason) =
+            revocation_outcome(Some(Err("connection refused".to_string())))
+        else {
+            panic!("a request that never arrived has not revoked anything");
+        };
+        assert_eq!(reason, "connection refused");
+    }
+
+    /// And the sentence itself, because the defect was what the command PRINTED
+    /// over a revocation that never happened.
+    #[test]
+    fn the_logout_line_states_only_what_actually_happened() {
+        let base_url = "https://kinlab.example.com";
+        let clean = LocalRemoval::default();
+
+        let revoked = logout_lines(base_url, &RevocationOutcome::Revoked, &clean).join(" ");
+        assert!(revoked.contains("Revoked"), "{revoked}");
+
+        let not_revoked = logout_lines(
+            base_url,
+            &RevocationOutcome::NotRevoked("the server answered HTTP 500".to_string()),
+            &clean,
+        )
+        .join(" ");
+        assert!(
+            not_revoked.contains("NOT") && not_revoked.contains("500"),
+            "a failed revocation has to say so and say why: {not_revoked}"
+        );
+        assert!(
+            !not_revoked.contains("Revoked the KinLab session"),
+            "and it must not carry the sentence a reader would take as revocation: {not_revoked}"
+        );
+
+        let stuck = LocalRemoval {
+            removed: Vec::new(),
+            failures: vec!["the OS keyring entry could not be removed: denied".to_string()],
+        };
+        let warned = logout_lines(base_url, &RevocationOutcome::Revoked, &stuck).join(" ");
+        assert!(
+            warned.contains("may still hold a usable credential"),
+            "a local removal that failed has to reach the reader: {warned}"
+        );
+    }
+
+    fn test_credential(base_url: &str) -> StoredCredential {
+        StoredCredential {
+            base_url: base_url.to_string(),
+            token: "not-a-real-token".to_string(),
+            expires_at: "2026-03-21T00:00:00Z".to_string(),
+            user_email: "nobody@example.com".to_string(),
+            user_display_name: "Nobody".to_string(),
+            provider: None,
+        }
+    }
 
     #[test]
     #[serial]
