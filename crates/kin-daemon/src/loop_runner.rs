@@ -3852,6 +3852,7 @@ mod tests {
     ///
     /// This is the settled state a healthy edit reaches: tree, entities and
     /// layout all describe the same bytes.
+    #[cfg(unix)]
     fn admit_and_derive(state: &Arc<DaemonState>, rel_path: &str, content: &str) -> Hash256 {
         let host_path = state.layout.working_dir().join(rel_path);
         std::fs::create_dir_all(host_path.parent().unwrap()).unwrap();
@@ -3871,6 +3872,7 @@ mod tests {
 
     /// The enrichment half of one reconcile round for one path: what the loop
     /// runs after `exact_tree_admission`, without the loop.
+    #[cfg(unix)]
     fn derive_semantics(state: &Arc<DaemonState>, rel_path: &str) {
         let host_path = state.layout.working_dir().join(rel_path);
         let mut reconciler =
@@ -3893,6 +3895,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     fn file_coverage(state: &Arc<DaemonState>, rel_path: &str) -> serde_json::Value {
         let args = HashMap::from([("path".to_string(), serde_json::json!(rel_path))]);
         let result = kin_mcp::handlers::file_entities::handle_list_file_entities(
@@ -3908,6 +3911,7 @@ mod tests {
     /// Whether `kin graph status`'s parse census counts `rel_path` as a file that
     /// produced an entity, read through the same kin-core function the census
     /// renders from.
+    #[cfg(unix)]
     fn census_counts_file(state: &Arc<DaemonState>, rel_path: &str) -> bool {
         let entities = state.graph.list_all_entities().unwrap();
         let retained = kin_core::retained_parse::read(&state.layout);
@@ -3928,12 +3932,15 @@ mod tests {
                 .any(|entity| entity.file_origin.as_ref().map(|id| id.0.as_str()) == Some(rel_path))
     }
 
+    #[cfg(unix)]
     const TWO_FUNCTIONS: &str = "def alpha():\n    return 1\n\n\ndef beta():\n    return 2\n";
     /// Different bytes from [`TWO_FUNCTIONS`] on purpose: the observation planner
     /// refuses a transition in which one exact blob appears at two paths, because
     /// a copy and a move-plus-replace cannot be told apart from the tree alone.
+    #[cfg(unix)]
     const TWO_OTHER_FUNCTIONS: &str =
         "def gamma():\n    return 3\n\n\ndef delta():\n    return 4\n";
+    #[cfg(unix)]
     const SEVENTEEN_LINES: &str = "# 1\n# 2\n# 3\n# 4\n# 5\n# 6\n# 7\n# 8\n# 9\n# 10\n# 11\n# 12\n# 13\n# 14\n# 15\n# 16\n# 17\n";
 
     /// FIR-3201, the window. A file is admitted and derived, so its enumeration
@@ -3946,6 +3953,7 @@ mod tests {
     /// re-derives the file, after which it and the parse census agree again.
     /// Pinned here, in kin's own pipeline, so a dependency that stopped
     /// retiring would fail this rather than certify a stale span.
+    #[cfg(unix)]
     #[test]
     fn a_replaced_blob_retires_its_layout_until_the_spans_are_re_derived() {
         let repo = tempfile::tempdir().unwrap();
@@ -4041,6 +4049,7 @@ mod tests {
     ///
     /// The control is a file whose entities a fresh parse reproduces exactly,
     /// which must still get `Full`, or a backfill that floors everything passes.
+    #[cfg(unix)]
     #[test]
     fn the_backfill_refuses_full_over_entities_a_fresh_parse_does_not_reproduce() {
         let repo = tempfile::tempdir().unwrap();
