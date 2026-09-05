@@ -5068,22 +5068,36 @@ mod bearer_token_next_step_tests {
     const CREDENTIAL_BEARING: &str =
         "https://alice:s3cr3tpassw0rd@kinlab.example/base?access_token=t0kenvalue#frag";
 
+    /// Every credential that URL carries, each paired with the name the failure
+    /// text uses for it.
+    ///
+    /// The failure text names the credential and never interpolates its value,
+    /// and that is the point rather than a style choice: a test proving the
+    /// product does not echo a credential must not echo one itself, and a
+    /// format string carrying this value is a logging sink to any reader and to
+    /// CodeQL's `rust/cleartext-logging` alike, panic message or not. Which
+    /// credential leaked plus the function's name is the whole diagnosis; the
+    /// value adds nothing a maintainer does not already have in this table.
+    const CARRIED_CREDENTIALS: [(&str, &str); 4] = [
+        ("the password", "s3cr3tpassw0rd"),
+        ("the query token", "t0kenvalue"),
+        ("the username", "alice:"),
+        ("the query that carried a token", "access_token"),
+    ];
+
     /// The refusal is the one place a stranger reads a whole URL back, so it is
     /// the one place a credential typed into a remote config gets copied into a
     /// terminal, a bug report and a shell history.
     #[test]
     fn the_next_step_never_echoes_a_credential_from_the_url_it_names() {
         let message = bearer_token_next_step(CREDENTIAL_BEARING);
-        for secret in ["s3cr3tpassw0rd", "t0kenvalue", "alice:"] {
+        for (named, carried) in CARRIED_CREDENTIALS {
             assert!(
-                !message.contains(secret),
-                "the remedy echoed {secret} out of the remote URL: {message}"
+                !message.contains(carried),
+                "bearer_token_next_step echoed {named} out of the remote URL it named; it must \
+                 strip userinfo, query and fragment"
             );
         }
-        assert!(
-            !message.contains("access_token"),
-            "and must not echo the query that carried one: {message}"
-        );
     }
 
     /// The positive control for the assertions above: a message that redacted
@@ -5167,23 +5181,32 @@ mod redacted_remote_address_tests {
     /// have put a secret in survives.
     #[test]
     fn no_userinfo_query_or_fragment_survives_redaction() {
-        for input in [
-            "https://alice:s3cr3t@kinlab.ai/org?access_token=t0ken#frag",
-            "http://s3cr3t@127.0.0.1:53848?t0ken=1",
-            "alice:s3cr3t@kinlab.ai#t0ken",
+        for (case, input) in [
+            (
+                "userinfo, query and fragment together",
+                "https://alice:s3cr3t@kinlab.ai/org?access_token=t0ken#frag",
+            ),
+            (
+                "userinfo and a query on a loopback peer",
+                "http://s3cr3t@127.0.0.1:53848?t0ken=1",
+            ),
+            (
+                "userinfo and a fragment with no scheme",
+                "alice:s3cr3t@kinlab.ai#t0ken",
+            ),
         ] {
             let redacted = redacted_remote_address(input);
             assert!(
                 !redacted.contains("s3cr3t") && !redacted.contains("t0ken"),
-                "{input} redacted to {redacted}"
+                "{case}: a credential survived redaction"
             );
             assert!(
                 !redacted.contains('?') && !redacted.contains('#'),
-                "{input} redacted to {redacted}"
+                "{case}: a query or fragment survived redaction"
             );
             assert!(
                 redacted.contains("kinlab.ai") || redacted.contains("127.0.0.1"),
-                "the host a reader acts on must survive: {input} redacted to {redacted}"
+                "{case}: the host a reader acts on must survive redaction"
             );
         }
     }
