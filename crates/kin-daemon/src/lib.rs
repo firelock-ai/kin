@@ -137,6 +137,7 @@ mod mcp_commit;
 mod pending_commits;
 pub mod publication_lease;
 pub mod replica_adoption;
+pub mod repo_blob;
 mod repository_admit;
 mod repository_branch;
 mod repository_checkout;

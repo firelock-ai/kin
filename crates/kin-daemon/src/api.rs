@@ -105,7 +105,7 @@ impl ActiveApiRepositoryAuthority {
     }
 }
 
-fn repository_authority_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+pub(crate) fn repository_authority_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (
         StatusCode::FAILED_DEPENDENCY,
         format!("this repository's authority could not be opened: {error}"),
@@ -1203,6 +1203,15 @@ struct RepoScopedMcpToolCallRequest {
 }
 
 const REPO_SCOPED_SEMANTIC_CAPABILITY: &str = "repo_scoped_semantic_tools_v1";
+/// This daemon serves one file's bytes for a repository and ref.
+///
+/// A capability rather than a probe, because the caller that needs it is a
+/// hosted control plane talking to whatever image production currently runs,
+/// and the alternative is guessing from a 404: an unmatched axum route and a
+/// path the ref genuinely does not carry both answer 404, and only one of
+/// them means "ask an older daemon a different question". Advertising it is
+/// what lets that caller keep a truthful fallback instead of a heuristic.
+const REPO_SCOPED_BLOB_CAPABILITY: &str = "repo_scoped_blob_v1";
 /// Retained continuations per repository, not per daemon.
 ///
 /// A per-daemon cap is a shared resource across tenants, and the eviction that
@@ -2212,6 +2221,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/repos/{repo_id}/health", get(repo_health))
         .route("/repos/{repo_id}/entities", get(repo_entities))
         .route("/repos/{repo_id}/files", get(repo_files))
+        .route("/repos/{repo_id}/blob", get(crate::repo_blob::repo_blob))
         .route("/repos/{repo_id}/refs", get(repo_refs))
         .route("/repos/{repo_id}/history", get(repo_history))
         .route(
@@ -15094,7 +15104,7 @@ async fn repository_ref_metadata(
     Ok(Arc::new(repository_metadata(&snapshot)?.clone()))
 }
 
-fn default_repository_ref(
+pub(crate) fn default_repository_ref(
     metadata: &kin_db::PersistedRepositoryAuthority,
 ) -> Result<Option<&kin_model::RepositoryRef>, (StatusCode, String)> {
     crate::state::select_repository_default_ref(metadata).map_err(repository_authority_error)
@@ -15126,7 +15136,7 @@ fn default_repository_ref(
 /// A local daemon keeps opening its own authority. Its startup cache entry
 /// carries no envelope, so there is nothing cached for the local arm to read,
 /// and a local repository has no publication cursor to bind reuse to.
-enum RepositoryReadView {
+pub(crate) enum RepositoryReadView {
     Hosted {
         generation: Arc<crate::state::HostedRepoCacheEntry>,
         metadata: Arc<kin_db::PersistedRepositoryAuthority>,
@@ -15146,7 +15156,9 @@ impl RepositoryReadView {
     /// wearing that name spends the guard's allowlist on a call that touches no
     /// filesystem, and the guard runs only in the `check` job, which pull
     /// requests skip, so the cost lands on main rather than on the PR.
-    fn authority(&self) -> Result<&kin_db::PersistedRepositoryAuthority, (StatusCode, String)> {
+    pub(crate) fn authority(
+        &self,
+    ) -> Result<&kin_db::PersistedRepositoryAuthority, (StatusCode, String)> {
         match self {
             Self::Hosted { metadata, .. } => Ok(metadata.as_ref()),
             Self::Local { snapshot } => repository_metadata(snapshot),
@@ -15154,7 +15166,7 @@ impl RepositoryReadView {
     }
 
     /// Resolve one ref target to the change it names.
-    fn resolve_target(
+    pub(crate) fn resolve_target(
         &self,
         target: &kin_model::RefTarget,
     ) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
@@ -15182,7 +15194,7 @@ impl RepositoryReadView {
     /// its own snapshot, and a caller still holding the view would keep two
     /// copies of one repository resident for the length of the response, which
     /// is the memory shape this change exists to remove.
-    fn resolve_tree_at(
+    pub(crate) fn resolve_tree_at(
         self,
         state: &DaemonState,
         change_id: &kin_model::SemanticChangeId,
@@ -15205,7 +15217,7 @@ impl RepositoryReadView {
 /// Addressability is decided first and by the same rule
 /// [`repo_scoped_graph`] uses, so an id this daemon does not serve keeps
 /// answering the refusal that already names both identities.
-async fn repository_read_view(
+pub(crate) async fn repository_read_view(
     state: &DaemonState,
     repo_id: &str,
 ) -> Result<RepositoryReadView, (StatusCode, String)> {
@@ -15267,7 +15279,7 @@ fn repository_tree_at(
         .map_err(repository_authority_error)
 }
 
-fn short_ref_name(name: &kin_model::RefName) -> String {
+pub(crate) fn short_ref_name(name: &kin_model::RefName) -> String {
     let bytes = name.as_bytes();
     for prefix in [b"refs/heads/".as_slice(), b"refs/tags/".as_slice()] {
         if let Some(short) = bytes.strip_prefix(prefix) {
@@ -16196,7 +16208,12 @@ async fn repo_health(
         semantic_capabilities: state
             .storage_backend
             .as_ref()
-            .map(|_| vec![REPO_SCOPED_SEMANTIC_CAPABILITY.to_string()])
+            .map(|_| {
+                vec![
+                    REPO_SCOPED_SEMANTIC_CAPABILITY.to_string(),
+                    REPO_SCOPED_BLOB_CAPABILITY.to_string(),
+                ]
+            })
             .unwrap_or_default(),
         repository_read_cache: RepositoryReadCacheHealth {
             hits: state
@@ -18091,30 +18108,27 @@ impl ExactSourceEntry {
     }
 }
 
-fn parse_exact_source_change_id(
-    source_change_id: &str,
+/// Parse a canonical semantic change id out of one named request field.
+///
+/// The field name is a parameter because the refusal is the whole value here:
+/// two routes accept a change id under two different names, and a message that
+/// names the wrong one sends a caller looking at the wrong parameter.
+pub(crate) fn parse_semantic_change_id(
+    field: &str,
+    value: &str,
 ) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
-    if source_change_id.len() != 64
-        || !source_change_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "source_change_id must be a canonical 64-character hexadecimal semantic change ID"
-                .to_string(),
+            format!("{field} must be a canonical 64-character hexadecimal semantic change ID"),
         ));
     }
-    let decoded = hex::decode(source_change_id).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("invalid source_change_id: {error}"),
-        )
-    })?;
+    let decoded = hex::decode(value)
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid {field}: {error}")))?;
     let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            "source_change_id must decode to 32 bytes".to_string(),
+            format!("{field} must decode to 32 bytes"),
         )
     })?;
     Ok(kin_model::SemanticChangeId::from_hash(
@@ -18333,49 +18347,86 @@ fn build_exact_source_tar_gz(
     Ok((bytes, manifest_hash))
 }
 
+/// One repository's source-CAS reader, its arm chosen once for a whole read.
+///
+/// Two callers need the same choice and neither should re-derive it: the exact
+/// source archive, which loads every artifact in a tree, and
+/// [`crate::repo_blob`], which loads one. Handing back a loader rather than a
+/// per-call function is what keeps the local arm's authority opened once. That
+/// open re-reads the whole authority out of storage and revalidates its
+/// history, so paying it per artifact is the shape [`RepositoryReadView`]
+/// exists to remove.
+pub(crate) type RepositorySourceBlobLoader = Box<
+    dyn FnMut(&RepoPath, kin_model::Hash256, u64) -> Result<Option<Vec<u8>>, (StatusCode, String)>
+        + Send,
+>;
+
+/// Open the reader for `repo_id`'s exact source bytes.
+///
+/// Capability decides which authority answers, by the same rule
+/// [`repository_read_view`] uses and for the same reason: a daemon with a
+/// storage backend reaches every repository it serves through that backend, and
+/// a daemon without one has only the local binding it opened at startup. Reading
+/// the tree from one authority and the bytes from the other is what this rule
+/// exists to stop, and it is reachable: `cached_repo_id` is the id this daemon
+/// resolved from its own manifest, so a hosted daemon serving a repository of
+/// that name would otherwise resolve the tree from its generation and then look
+/// for the bytes in a local CAS it does not have.
+///
+/// Neither arm has a filesystem fallback, and `Ok(None)` from either means the
+/// bytes were never persisted rather than that they might be found somewhere
+/// else.
+pub(crate) fn repository_source_blob_loader(
+    state: &DaemonState,
+    repo_id: &str,
+) -> Result<RepositorySourceBlobLoader, (StatusCode, String)> {
+    let Some(backend) = state.storage_backend.as_ref().map(Arc::clone) else {
+        let authority = ActiveApiRepositoryAuthority::open(state)?;
+        return Ok(Box::new(
+            move |path: &RepoPath, digest: kin_model::Hash256, _remaining_bytes: u64| {
+                authority.manager.load_source_blob(digest).map_err(|error| {
+                    (
+                        StatusCode::FAILED_DEPENDENCY,
+                        format!("repository CAS blob load failed for {path} at {digest}: {error}"),
+                    )
+                })
+            },
+        ));
+    };
+    let repo_id = repo_id.to_string();
+    Ok(Box::new(
+        move |path: &RepoPath, digest: kin_model::Hash256, remaining_bytes: u64| {
+            backend
+                .load_source_blob_bounded(&repo_id, *digest.as_bytes(), remaining_bytes)
+                .map_err(|error| {
+                    let status = if matches!(
+                        &error,
+                        kin_db::KinDbError::SourceBlobReadLimitExceeded { .. }
+                    ) {
+                        StatusCode::PAYLOAD_TOO_LARGE
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    };
+                    (
+                        status,
+                        format!(
+                            "immutable source blob load failed for {} at {}: {error}",
+                            path, digest
+                        ),
+                    )
+                })
+        },
+    ))
+}
+
 fn load_exact_source_entries(
     state: &DaemonState,
     repo_id: &str,
     tree: &kin_model::ResolvedTree,
 ) -> Result<Vec<ExactSourceEntry>, (StatusCode, String)> {
-    if repo_id == state.cached_repo_id {
-        let authority = ActiveApiRepositoryAuthority::open(state)?;
-        return load_exact_source_entries_with(tree, |path, digest, _remaining_bytes| {
-            authority.manager.load_source_blob(digest).map_err(|error| {
-                (
-                    StatusCode::FAILED_DEPENDENCY,
-                    format!("repository CAS blob load failed for {path} at {digest}: {error}"),
-                )
-            })
-        });
-    }
-
-    let backend = state.storage_backend.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "exact source export requires immutable backend source storage".to_string(),
-        )
-    })?;
+    let mut load_blob = repository_source_blob_loader(state, repo_id)?;
     load_exact_source_entries_with(tree, |path, digest, remaining_bytes| {
-        backend
-            .load_source_blob_bounded(repo_id, *digest.as_bytes(), remaining_bytes)
-            .map_err(|error| {
-                let status = if matches!(
-                    &error,
-                    kin_db::KinDbError::SourceBlobReadLimitExceeded { .. }
-                ) {
-                    StatusCode::PAYLOAD_TOO_LARGE
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                };
-                (
-                    status,
-                    format!(
-                        "immutable source blob load failed for {} at {}: {error}",
-                        path, digest
-                    ),
-                )
-            })
+        load_blob(path, digest, remaining_bytes)
     })
 }
 
@@ -18538,7 +18589,7 @@ async fn repo_exact_source_tar_gz(
     // complete in-memory archive. Serialize this bounded path until backend
     // streaming lands so concurrent requests cannot multiply peak RSS.
     let archive_permit = try_acquire_exact_source_archive_slot(exact_source_archive_exports())?;
-    let requested_change = parse_exact_source_change_id(&source_change_id)?;
+    let requested_change = parse_semantic_change_id("source_change_id", &source_change_id)?;
     let view = repository_read_view(&state, &repo_id).await?;
     if view.change(&requested_change)?.is_none() {
         return Err((
@@ -23365,6 +23416,597 @@ mod tests {
         );
     }
 
+    /// Read one file's bytes and the digest the route verified them against.
+    ///
+    /// The paths these tests use carry no character a query string would need
+    /// escaped, and the assertion below keeps it that way rather than leaving a
+    /// silently mis-encoded path to look like an absent file.
+    async fn repo_blob_read(
+        state: Arc<DaemonState>,
+        repo_id: &str,
+        path: &str,
+    ) -> (StatusCode, Vec<u8>) {
+        assert!(
+            path.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte)),
+            "this helper does not escape {path}"
+        );
+        repo_route(state, &format!("/repos/{repo_id}/blob?path={path}")).await
+    }
+
+    /// The blob route answers a published file with its exact bytes (FIR-3277).
+    ///
+    /// This is the whole point of the route, so it is graded end to end through
+    /// the router rather than only at the verification helper: the bytes the
+    /// publication persisted come back, and `content_sha256` is the digest they
+    /// were checked against rather than a digest recomputed for the response.
+    #[tokio::test]
+    async fn the_blob_route_serves_published_bytes_under_the_digest_it_verified() {
+        let repo_id = format!("hostedblob-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        let source = "fn first_symbol() {}\n";
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0001,
+            "publish a file to read",
+            &[("first_symbol", "src/first.rs", source)],
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let (status, body) = repo_blob_read(Arc::clone(&state), &repo_id, "src/first.rs").await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the blob route must answer: {message}"
+        );
+        let blob: crate::repo_blob::RepoBlobResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(blob.display_path, "src/first.rs");
+        assert_eq!(blob.content.as_deref(), Some(source));
+        assert!(blob.is_utf8);
+        assert_eq!(blob.byte_len, source.len() as u64);
+        let expected: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+        assert_eq!(
+            blob.content_sha256,
+            hex::encode(expected),
+            "the response must name the digest the bytes were verified against"
+        );
+        assert_eq!(blob.resolved_ref.as_deref(), Some("main"));
+    }
+
+    /// A path the ref's tree does not carry is a refusal, never a filesystem
+    /// read that might find one (FIR-3277).
+    #[tokio::test]
+    async fn the_blob_route_refuses_a_path_the_ref_does_not_carry() {
+        let repo_id = format!("hostedblob-absent-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0002,
+            "publish a file to read",
+            &[("first_symbol", "src/first.rs", "fn first_symbol() {}\n")],
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let (status, body) =
+            repo_blob_read(Arc::clone(&state), &repo_id, "src/never_published.rs").await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::NOT_FOUND, "{message}");
+        assert!(
+            message.contains("src/never_published.rs"),
+            "the refusal must name the path asked for: {message}"
+        );
+    }
+
+    /// The blob route is addressed the way every other repo route is, so an
+    /// unpublished repository refuses here for the same named reason (FIR-3277).
+    ///
+    /// It also proves the route is registered at all: an unmatched axum route
+    /// answers 404 with an empty body, and this answers 424 with a sentence.
+    #[tokio::test]
+    async fn the_blob_route_shares_the_repo_addressing_refusal() {
+        let repo_id = format!("hostedblob-unpublished-{}", Uuid::new_v4());
+        let (state, _working, _storage) = replica_state(&repo_id);
+
+        let (status, body) = repo_blob_read(Arc::clone(&state), &repo_id, "src/first.rs").await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::FAILED_DEPENDENCY, "{message}");
+        assert!(
+            message.contains("authority envelope"),
+            "the refusal must name the missing envelope: {message}"
+        );
+    }
+
+    /// Drive one blob request and keep its response headers.
+    ///
+    /// `repo_route` drops them, and the refusal kind this route publishes lives
+    /// in a header precisely so a caller does not have to read English. A test
+    /// that could not see the header could not grade the contract.
+    async fn repo_blob_route(
+        state: Arc<DaemonState>,
+        path: &str,
+    ) -> (StatusCode, Option<String>, Vec<u8>) {
+        let response = router(state)
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let refusal = response
+            .headers()
+            .get(crate::repo_blob::REPO_BLOB_REFUSAL_HEADER)
+            .map(|value| value.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, refusal, body.to_vec())
+    }
+
+    /// Point a second, non-default ref at an earlier change (FIR-3277).
+    ///
+    /// `publish_hosted_semantic_change` only ever moves `main`, so a test that
+    /// wants to prove a read honours the ref it was given needs a ref that is
+    /// not `main` and does not point where `main` points. This writes one, and
+    /// nothing else: no change, no workspace mutation, no default-ref move.
+    fn add_hosted_ref(
+        storage: &FsPath,
+        repository_id: &RepositoryId,
+        operation: u128,
+        ref_name: kin_model::RefName,
+        target: SemanticChangeId,
+    ) {
+        use kin_model::{
+            RefExpectation, RefMutation, RefTarget, RefUpdatePolicy, RepositoryTransaction,
+            REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        };
+
+        let manager = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(kin_db::LocalFileBackend::new(storage.to_path_buf())),
+        )
+        .unwrap();
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::from_uuid(Uuid::from_u128(operation)),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("repo-scoped-blob-test"),
+            reason: format!("point {ref_name} at a change"),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: vec![RefMutation {
+                name: ref_name,
+                expected: RefExpectation::MustNotExist,
+                new_target: Some(RefTarget::change(target)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: None,
+        };
+        drop(lease);
+        manager.commit_repository_transaction(transaction).unwrap();
+    }
+
+    /// The blob route reads the ref it was given, not the default one (FIR-3277).
+    ///
+    /// Every other test here reads the default ref, so none of them can tell a
+    /// route that honours `ref` from one that ignores it: both answer the same
+    /// bytes. This publishes two generations, points `legacy` at the first, and
+    /// reads across the gap in three ways that only a ref-honouring route gets
+    /// right. Make `resolve_read_point` ignore its `reference` argument and all
+    /// three go red: the second generation's file becomes readable at a ref
+    /// whose tree never carried it, and the first generation's read comes back
+    /// labelled with `main` and the second change's id.
+    #[tokio::test]
+    async fn the_blob_route_serves_the_requested_ref_rather_than_the_default() {
+        let repo_id = format!("hostedblob-ref-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        let first_source = "fn only_in_first() {}\n";
+        let second_source = "fn only_in_second() {}\n";
+
+        let (first_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0011,
+            "publish the first generation",
+            &[("only_in_first", "src/only_in_first.rs", first_source)],
+        );
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first_change),
+            0x3277_0012,
+            "publish the second generation",
+            &[("only_in_second", "src/only_in_second.rs", second_source)],
+        );
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3277_0013,
+            kin_model::RefName::branch(b"legacy").unwrap(),
+            first_change,
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        // The default ref carries both generations' files, so this is the arm
+        // that would still pass under a route that ignores `ref`. It is here to
+        // establish that the second file is readable at all, which is what makes
+        // the refusal below evidence rather than an absent fixture.
+        let (status, body) =
+            repo_blob_read(Arc::clone(&state), &repo_id, "src/only_in_second.rs").await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let at_default: crate::repo_blob::RepoBlobResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(at_default.content.as_deref(), Some(second_source));
+        assert_eq!(at_default.resolved_ref.as_deref(), Some("main"));
+
+        // The same path at a ref whose tree never carried it. A route that fell
+        // back to the default would answer 200 here.
+        let (status, refusal, body) = repo_blob_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/blob?path=src/only_in_second.rs&ref=legacy"),
+        )
+        .await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a ref whose tree lacks the path must refuse, not serve the default ref: {message}"
+        );
+        assert_eq!(
+            refusal.as_deref(),
+            Some("path-not-found"),
+            "a ref that exists and lacks the path is the absent-side case: {message}"
+        );
+        assert!(
+            message.contains("legacy"),
+            "the refusal must name the ref it read: {message}"
+        );
+
+        // And the ref's own bytes, labelled with the ref and the change it
+        // resolved to rather than with the default's.
+        let (status, body) = repo_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/blob?path=src/only_in_first.rs&ref=legacy"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let at_legacy: crate::repo_blob::RepoBlobResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(at_legacy.content.as_deref(), Some(first_source));
+        assert_eq!(at_legacy.requested_ref.as_deref(), Some("legacy"));
+        assert_eq!(at_legacy.resolved_ref.as_deref(), Some("legacy"));
+        assert_eq!(at_legacy.change_id, first_change.to_string());
+
+        // A canonical change id is the other read point the route accepts, and
+        // it names no ref because none was involved.
+        let (status, body) = repo_route(
+            Arc::clone(&state),
+            &format!(
+                "/repos/{repo_id}/blob?path=src/only_in_first.rs&ref={}",
+                first_change
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let at_change: crate::repo_blob::RepoBlobResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(at_change.content.as_deref(), Some(first_source));
+        assert_eq!(at_change.resolved_ref, None);
+        assert_eq!(at_change.change_id, first_change.to_string());
+
+        // And a ref this repository does not carry at all. It shares its status
+        // with the case above and means the opposite: nothing was resolved, no
+        // tree was read, and no path was looked up in one. A caller that read
+        // this as an absent side would assemble a comparison out of a file that
+        // was never missing.
+        let (status, refusal, body) = repo_blob_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/blob?path=src/only_in_first.rs&ref=no-such-ref"),
+        )
+        .await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::NOT_FOUND, "{message}");
+        assert_eq!(
+            refusal.as_deref(),
+            Some("unknown-ref"),
+            "an unresolvable ref must not wear the absent-path kind: {message}"
+        );
+        assert!(
+            message.contains("no-such-ref"),
+            "the refusal must name the ref that could not be resolved: {message}"
+        );
+    }
+
+    /// A ref's full name outranks another ref's short alias (FIR-3277).
+    ///
+    /// A branch may be named so that its own short alias is another ref's full
+    /// name: `refs/heads/refs/tags/v1` shortens to `refs/tags/v1`, which is the
+    /// tag `refs/tags/v1`'s full name. A lookup that accepts either spelling in
+    /// one pass answers with whichever the ref list holds first, so an explicit
+    /// full name can serve a different ref's bytes, and nothing about the
+    /// response says so. Both refs here resolve, they point at different
+    /// changes, and only one of them is the one that was asked for.
+    #[tokio::test]
+    async fn a_full_ref_name_outranks_another_refs_short_alias() {
+        let repo_id = format!("hostedblob-alias-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        let first_source = "fn only_in_first() {}\n";
+        let second_source = "fn only_in_second() {}\n";
+
+        let (first_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0031,
+            "publish the first generation",
+            &[("only_in_first", "src/only_in_first.rs", first_source)],
+        );
+        let (second_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first_change),
+            0x3277_0032,
+            "publish the second generation",
+            &[("only_in_second", "src/only_in_second.rs", second_source)],
+        );
+        // The branch whose SHORT name is the tag's FULL name, pointed at the
+        // first generation, and the tag itself pointed at the second.
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3277_0033,
+            kin_model::RefName::branch(b"refs/tags/v1").unwrap(),
+            first_change,
+        );
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3277_0034,
+            kin_model::RefName::tag(b"v1").unwrap(),
+            second_change,
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let (status, refusal, body) = repo_blob_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/blob?path=src/only_in_second.rs&ref=refs/tags/v1"),
+        )
+        .await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the tag named in full must answer, refusal={refusal:?}: {message}"
+        );
+        let blob: crate::repo_blob::RepoBlobResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            blob.change_id,
+            second_change.to_string(),
+            "the full name names the tag, not the branch that shortens to it"
+        );
+        assert_eq!(blob.resolved_ref.as_deref(), Some("v1"));
+        assert_eq!(blob.content.as_deref(), Some(second_source));
+    }
+
+    /// A short alias two refs answer to is refused, not guessed (FIR-3277).
+    #[tokio::test]
+    async fn a_short_alias_two_refs_answer_to_is_refused() {
+        let repo_id = format!("hostedblob-ambiguous-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+
+        let (first_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0041,
+            "publish the first generation",
+            &[(
+                "only_in_first",
+                "src/only_in_first.rs",
+                "fn only_in_first() {}\n",
+            )],
+        );
+        let (second_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first_change),
+            0x3277_0042,
+            "publish the second generation",
+            &[(
+                "only_in_second",
+                "src/only_in_second.rs",
+                "fn only_in_second() {}\n",
+            )],
+        );
+        // A branch and a tag that share the short alias `v2` and point at
+        // different changes, so picking either one serves the wrong bytes.
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3277_0043,
+            kin_model::RefName::branch(b"v2").unwrap(),
+            first_change,
+        );
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3277_0044,
+            kin_model::RefName::tag(b"v2").unwrap(),
+            second_change,
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let (status, refusal, body) = repo_blob_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/blob?path=src/only_in_first.rs&ref=v2"),
+        )
+        .await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::CONFLICT, "{message}");
+        assert_eq!(refusal.as_deref(), Some("ambiguous-ref"), "{message}");
+        assert!(
+            message.contains("refs/heads/v2") && message.contains("refs/tags/v2"),
+            "the refusal must name both refs so a caller can pick one: {message}"
+        );
+    }
+
+    /// The blob route publishes its refusal kind on every refusal (FIR-3277).
+    ///
+    /// The header is the contract a hosted caller branches on, so an arm that
+    /// forgot to set it would look like a missing header rather than a wrong
+    /// one, and a caller reading `undefined` would fall back to whatever its
+    /// default is. Three different refusals, three different kinds, one shape.
+    #[tokio::test]
+    async fn every_blob_refusal_carries_its_kind() {
+        let repo_id = format!("hostedblob-kinds-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0021,
+            "publish a file to read",
+            &[("first_symbol", "src/first.rs", "fn first_symbol() {}\n")],
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let cases = [
+            (
+                "path=src/absent.rs",
+                StatusCode::NOT_FOUND,
+                "path-not-found",
+            ),
+            (
+                "path=src/first.rs&ref=no-such-ref",
+                StatusCode::NOT_FOUND,
+                "unknown-ref",
+            ),
+        ];
+        for (query, expected_status, expected_kind) in cases {
+            let (status, refusal, body) = repo_blob_route(
+                Arc::clone(&state),
+                &format!("/repos/{repo_id}/blob?{query}"),
+            )
+            .await;
+            let message = String::from_utf8_lossy(&body);
+            assert_eq!(status, expected_status, "{query}: {message}");
+            assert_eq!(
+                refusal.as_deref(),
+                Some(expected_kind),
+                "{query}: {message}"
+            );
+        }
+
+        // A repository this daemon does not serve, which shares its status with
+        // the two above and is neither of them.
+        let (status, refusal, body) = repo_blob_route(
+            Arc::clone(&state),
+            "/repos/not-served-here/blob?path=src/first.rs",
+        )
+        .await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::NOT_FOUND, "{message}");
+        assert_eq!(refusal.as_deref(), Some("unknown-repository"), "{message}");
+    }
+
+    /// A malformed query is named too, not left to the extractor (FIR-3277).
+    ///
+    /// `Query<T>` refuses a missing or repeated parameter before a handler body
+    /// runs, and that refusal carries no `x-kin-blob-refusal`. To a caller
+    /// branching on the header, an absent header and a wrong one are the same
+    /// reading, so a malformed request would look like a route that forgot to
+    /// name its refusal. These are the requests the handler never gets to think
+    /// about, and they are the ones most likely to be read wrong.
+    #[tokio::test]
+    async fn a_malformed_blob_query_is_refused_by_name() {
+        let repo_id = format!("hostedblob-query-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0051,
+            "publish a file to read",
+            &[("first_symbol", "src/first.rs", "fn first_symbol() {}\n")],
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        // No `path` at all, and the same parameter given twice. Both are refused
+        // before the handler resolves anything, and both must still say so.
+        for query in [
+            "",
+            "?ref=main",
+            "?path=src/first.rs&path=src/other.rs",
+            "?path=a&ref=b&ref=c",
+        ] {
+            let (status, refusal, body) =
+                repo_blob_route(Arc::clone(&state), &format!("/repos/{repo_id}/blob{query}")).await;
+            let message = String::from_utf8_lossy(&body);
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "query {query:?} must be refused: {message}"
+            );
+            assert_eq!(
+                refusal.as_deref(),
+                Some("bad-request"),
+                "query {query:?} must be refused BY NAME: {message}"
+            );
+        }
+
+        // The control: a well-formed query on the same repository answers, so
+        // the four above are refused for their own shape and not because this
+        // fixture refuses everything.
+        let (status, refusal, body) = repo_blob_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/blob?path=src/first.rs"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(refusal, None, "a successful read carries no refusal header");
+    }
+
+    /// A hosted daemon says it can serve one file's bytes (FIR-3277).
+    ///
+    /// The hosted control plane keys its fallback on this string, so an image
+    /// that carries the route and does not advertise it is the same outage as
+    /// one that carries neither. Graded here rather than left implicit.
+    #[tokio::test]
+    async fn a_hosted_daemon_advertises_the_repo_scoped_blob_capability() {
+        let repo_id = format!("hostedblob-capability-{}", Uuid::new_v4());
+        let (state, _working, _storage) = replica_state(&repo_id);
+
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/health")).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let health: RepoHealthResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            health
+                .semantic_capabilities
+                .iter()
+                .any(|capability| capability == REPO_SCOPED_BLOB_CAPABILITY),
+            "a daemon carrying the blob route must advertise it: {:?}",
+            health.semantic_capabilities
+        );
+    }
+
     /// A publication that moves the generation is not answered from the tree
     /// resolved before it (FIR-2924).
     ///
@@ -23948,7 +24590,10 @@ mod tests {
         let health: RepoHealthResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             health.semantic_capabilities,
-            vec![REPO_SCOPED_SEMANTIC_CAPABILITY.to_string()]
+            vec![
+                REPO_SCOPED_SEMANTIC_CAPABILITY.to_string(),
+                REPO_SCOPED_BLOB_CAPABILITY.to_string(),
+            ]
         );
 
         // Authentication must run before even the cheap repository-address
