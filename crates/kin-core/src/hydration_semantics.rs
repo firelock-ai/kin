@@ -857,6 +857,74 @@ mod tests {
         assert!(!unstamped.contains("was authored"), "{unstamped}");
     }
 
+    /// Every remedy this build emits is the one the acceptance suite grades.
+    ///
+    /// That suite compares advice by exact equality rather than by prefix,
+    /// deliberately, because a prefix match accepts correct advice followed by
+    /// advice that destroys the store. It runs inside `Product Acceptance`,
+    /// which is skipped on a pull request, so nothing before a landing was
+    /// checking that the two copies still say the same thing, and its own
+    /// `--self-test` cannot: every fixture there is built from the constant, so
+    /// changing the constant changes both sides and it still reports 83 of 83.
+    ///
+    /// Reading the script rather than restating its strings is the point. A
+    /// second hand-typed copy here would agree with nothing and drift with the
+    /// first. The same shape guards the transfer seam contract from
+    /// `crates/kin-remote/src/repository_transfer_http.rs`.
+    #[test]
+    fn the_acceptance_suite_grades_the_advice_this_build_emits() {
+        const ACCEPTANCE: &str =
+            include_str!("../../../scripts/acceptance/hydration_semantics_repro.py");
+        // The scan reads the file it means to read. Without this, every
+        // assertion below is satisfied by an empty string.
+        assert!(
+            ACCEPTANCE.contains("REMEDY_UNKNOWN = ("),
+            "the acceptance suite no longer declares REMEDY_UNKNOWN, so this guard is reading the \
+             wrong file or a file that has moved"
+        );
+        // Python wraps a long constant across adjacent string literals, so the
+        // sentence exists in the file only once the wrapping is removed.
+        let joined = ACCEPTANCE.replace("\"\n    \"", "");
+        for (label, standing) in [
+            (
+                "behind",
+                HydrationStanding::Behind {
+                    created_under: 9,
+                    derives: 10,
+                },
+            ),
+            (
+                "ahead",
+                HydrationStanding::Ahead {
+                    created_under: 11,
+                    derives: 10,
+                },
+            ),
+            ("unstamped", HydrationStanding::Unstamped { derives: 10 }),
+            (
+                "unreadable",
+                HydrationStanding::Unreadable {
+                    reason: "truncated".to_string(),
+                    derives: 10,
+                },
+            ),
+        ] {
+            let remedy = standing
+                .remedy()
+                .expect("every gap standing carries advice");
+            assert!(
+                joined.contains(&remedy),
+                "the acceptance suite's {label} remedy is not the one this build emits, so a \
+                 landing would turn main's acceptance red. This build says:\n{remedy}"
+            );
+        }
+        // The must-miss control, so a hit above means something.
+        assert!(
+            !joined.contains("a sentence no build of Kin has ever emitted"),
+            "the control matched, so the containment checks above prove nothing"
+        );
+    }
+
     /// The one comparison a receiver makes over a declared authoring version,
     /// in every pairing. Five of the six must discard, and the sixth is the
     /// whole point of the change.

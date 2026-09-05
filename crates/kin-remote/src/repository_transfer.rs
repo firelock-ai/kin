@@ -3261,6 +3261,9 @@ mod tests {
             external_objects,
             aliases,
             bodies,
+            // A Git-admitted bootstrap fixture speaks for no local store, so it
+            // declares nothing, which is the same thing a hosted sender does.
+            source_hydration_semantics: None,
         };
         pack.transfer_id = compute_transfer_id(&pack).unwrap();
         pack
