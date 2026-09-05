@@ -231,11 +231,12 @@ pub struct SessionWorkspaceAdmissionPlan {
     pub previous_tree: kin_model::ResolvedTree,
     pub target_tree: kin_model::ResolvedTree,
     pub deltas: Vec<kin_model::TreeDelta>,
-    /// The entities and relations this admission retires because the paths
-    /// that owned them left the tree, carried in the same transaction as the
-    /// tree transition so the derived graph can follow authority exactly.
-    pub retired_entity_deltas: Vec<kin_model::EntityDelta>,
-    pub retired_relation_deltas: Vec<kin_model::RelationDelta>,
+    /// The paths this transition leaves with nothing at them, and the artifact
+    /// identities that held them. The transaction retires their semantics
+    /// against authority's own graph; the handler derives the live graph's
+    /// retirement from the live graph with the same set, because the two can
+    /// hold different payloads for the same entity and each must drop its own.
+    pub vacated: VacatedPaths,
     pub workspace_id: WorkspaceId,
     source_hashes: Vec<Hash256>,
     recovered_receipt: Option<RepositoryCommitReceipt>,
@@ -300,7 +301,7 @@ pub(crate) fn plan_session_workspace_admission(
     // session that deleted a source file could not reconcile at all, the
     // refusal surfaced as a 500, and the file's entities kept answering
     // queries with nothing on disk behind them.
-    let vacated = vacated_paths(&deltas);
+    let vacated = VacatedPaths::from_deltas(&deltas);
     let semantic_delta = if vacated.is_empty() {
         WorkspaceSemanticDelta::default()
     } else {
@@ -309,12 +310,10 @@ pub(crate) fn plan_session_workspace_admission(
             lease.workspace_graph_snapshot(&workspace_id)?
         };
         match snapshot {
-            Some(snapshot) => retire_entities_on_vacated_paths(&snapshot, &vacated)?,
+            Some(snapshot) => retire_semantics_on_vacated(&snapshot, &vacated)?,
             None => WorkspaceSemanticDelta::default(),
         }
     };
-    let retired_entity_deltas = semantic_delta.entity_deltas().to_vec();
-    let retired_relation_deltas = semantic_delta.relation_deltas().to_vec();
     let mut source_lengths = std::collections::BTreeMap::new();
     let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
         Some(&base.source_workspace.shared_admission_policy),
@@ -450,45 +449,82 @@ pub(crate) fn plan_session_workspace_admission(
         previous_tree: base.source_workspace.tree.clone(),
         target_tree: desired_tree.clone(),
         deltas,
-        retired_entity_deltas,
-        retired_relation_deltas,
+        vacated,
         workspace_id,
         source_hashes: source_hashes.into_iter().collect(),
         recovered_receipt,
     })
 }
 
-/// The repository paths a tree transition leaves with nothing at them.
+/// The paths a tree transition leaves with nothing at them, and the artifact
+/// identities that held them.
 ///
 /// A path some delta's old state held and no delta's new state holds. A
 /// modification keeps its path and a rename vacates only its old one, so a
-/// moved file retires its entities here and the enrichment that follows the
-/// publication re-derives them at the new path. Only UTF-8 paths are returned,
-/// because only those can own entities.
-fn vacated_paths(deltas: &[kin_model::TreeDelta]) -> BTreeSet<String> {
-    let kept = deltas
-        .iter()
-        .filter_map(|delta| delta.new_state().map(|new| new.path.clone()))
-        .collect::<BTreeSet<_>>();
-    deltas
-        .iter()
-        .filter_map(|delta| delta.old_state())
-        .filter(|old| !kept.contains(&old.path))
-        .filter_map(|old| old.path.as_utf8().map(str::to_string))
-        .collect()
+/// moved file retires its semantics here and the enrichment that follows the
+/// publication re-derives them at the new path. Paths are kept only in their
+/// UTF-8 rendering, because only those can own entities; artifact identities
+/// are kept for every vacated entry, because the cross-file linker binds
+/// relations to artifact nodes whatever the path is made of.
+#[derive(Debug, Clone, Default)]
+pub struct VacatedPaths {
+    pub paths: BTreeSet<String>,
+    pub artifacts: Vec<kin_model::ArtifactId>,
 }
 
-/// The canonical semantic transition that retires every entity authority holds
-/// on a vacated path, and every relation with such an entity at either end.
+impl VacatedPaths {
+    pub(crate) fn from_deltas(deltas: &[kin_model::TreeDelta]) -> Self {
+        let kept = deltas
+            .iter()
+            .filter_map(|delta| delta.new_state().map(|new| new.path.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut vacated = Self::default();
+        for delta in deltas {
+            let Some(old) = delta.old_state() else {
+                continue;
+            };
+            if kept.contains(&old.path) {
+                continue;
+            }
+            vacated.artifacts.push(delta.artifact_id());
+            if let Some(path) = old.path.as_utf8() {
+                vacated.paths.insert(path.to_string());
+            }
+        }
+        vacated
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.artifacts.is_empty()
+    }
+}
+
+/// The canonical semantic transition that retires everything one graph holds
+/// on a vacated path: every entity the path owns, every relation with such an
+/// entity at either end, and every relation bound to the vacated artifact node
+/// itself.
 ///
-/// Derived by difference against the workspace's own authority graph rather
-/// than the daemon's live one, for the reason every other repository command
-/// plans its authority delta that way: the live graph carries enrichment that
-/// has not crossed the compare-and-swap, and a delta planned from it would ask
-/// authority to retract semantics it never held.
-fn retire_entities_on_vacated_paths(
+/// The last of those is the half a per-entity retirement misses. The
+/// cross-file linker mints file-level `Imports` and `Includes` edges between
+/// artifact nodes, which no entity reaches, and kin-db validates every relation
+/// endpoint against the staged artifact set on each transaction. One surviving
+/// edge fails the whole transaction with "unadmitted destination endpoint", so
+/// deleting a file another file imports could not reconcile at all until these
+/// were retired beside the entities. `retire_artifact_node_relations` in
+/// `loop_runner` is the same rule applied to the live graph by the watcher.
+///
+/// Called once per graph rather than once per transition, on purpose. The
+/// planner runs it on authority's workspace snapshot and the reconcile handler
+/// runs it on the live graph's, with the same vacated set, because the two can
+/// hold different payloads for the same entity: a readmission after an earlier
+/// session moves the live graph's spans and leaves authority's where the last
+/// commit put them. kin-db requires a removal's old payload to match the graph
+/// it is applied to exactly, so a delta derived against one graph and applied
+/// to the other is refused after authority has already moved, which splits the
+/// two. Each graph diffing itself is what keeps them level.
+pub(crate) fn retire_semantics_on_vacated(
     snapshot: &kin_db::GraphSnapshot,
-    vacated: &BTreeSet<String>,
+    vacated: &VacatedPaths,
 ) -> Result<WorkspaceSemanticDelta> {
     let mut desired_entities = snapshot.entities.clone();
     let mut retired = std::collections::HashSet::new();
@@ -496,16 +532,19 @@ fn retire_entities_on_vacated_paths(
         let owned_by_vacated = entity
             .file_origin
             .as_ref()
-            .is_some_and(|origin| vacated.contains(&origin.0));
+            .is_some_and(|origin| vacated.paths.contains(&origin.0));
         if owned_by_vacated {
             desired_entities.remove(entity_id);
             retired.insert(*entity_id);
         }
     }
-    let touches_retired = |node: &kin_model::GraphNodeId| matches!(node, kin_model::GraphNodeId::Entity(entity_id) if retired.contains(entity_id));
+    let departs = |node: &kin_model::GraphNodeId| match node {
+        kin_model::GraphNodeId::Entity(entity_id) => retired.contains(entity_id),
+        kin_model::GraphNodeId::Artifact(artifact_id) => vacated.artifacts.contains(artifact_id),
+        _ => false,
+    };
     let mut desired_relations = snapshot.relations.clone();
-    desired_relations
-        .retain(|_, relation| !touches_retired(&relation.src) && !touches_retired(&relation.dst));
+    desired_relations.retain(|_, relation| !departs(&relation.src) && !departs(&relation.dst));
     kin_core::diff_workspace_semantics(
         &snapshot.entities,
         &snapshot.relations,

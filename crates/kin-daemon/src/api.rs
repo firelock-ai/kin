@@ -6066,8 +6066,7 @@ async fn reconcile_session_workspace(
             &observation,
         )
         .map_err(repository_commit_error)?;
-        let retired_entity_deltas = plan.retired_entity_deltas.clone();
-        let retired_relation_deltas = plan.retired_relation_deltas.clone();
+        let vacated = plan.vacated.clone();
         let committed = crate::repository_commit::commit_session_workspace_admission(
             &state.layout,
             state.blobs.as_ref(),
@@ -6098,13 +6097,26 @@ async fn reconcile_session_workspace(
         if graph_tree == observation.base().source_workspace.tree {
             // Entities retire with the paths that owned them, in the same
             // step as the tree moves, so the live graph never holds an entity
-            // authority just refused to carry.
+            // authority just refused to carry. Derived here from the LIVE
+            // graph with the plan's vacated set, never copied from the plan:
+            // the plan's delta was diffed against authority, and the live graph
+            // can already hold newer payloads for these entities from an
+            // earlier session's readmission. kin-db checks a removal's old
+            // payload against the graph it lands on, so authority's payload
+            // applied here was refused after authority had already moved,
+            // leaving the two graphs holding different trees.
+            let live = crate::repository_commit::retire_semantics_on_vacated(
+                &state.graph.to_snapshot(),
+                &vacated,
+            )
+            .map_err(repository_commit_error)?;
+            let retired_entity_deltas = live.entity_deltas().to_vec();
             state
                 .graph
                 .apply_transaction_delta(&TransactionDelta {
                     tree_deltas: observation.deltas().to_vec(),
                     entity_deltas: retired_entity_deltas.clone(),
-                    relation_deltas: retired_relation_deltas,
+                    relation_deltas: live.relation_deltas().to_vec(),
                     ..TransactionDelta::default()
                 })
                 .map_err(internal_error)?;
@@ -35781,6 +35793,168 @@ mod tests {
                 .iter()
                 .any(|delta| matches!(delta, kin_model::TreeDelta::Removed { .. })),
             "and the file's removal beside it"
+        );
+    }
+
+    /// FIR-3209, the artifact half. A session that deletes a file another file
+    /// imports.
+    ///
+    /// The cross-file linker mints an artifact-to-artifact `Imports` edge that
+    /// no entity reaches, and kin-db validates every relation endpoint against
+    /// the staged artifact set, so retiring the file's entities alone left one
+    /// edge standing and the whole transaction was refused with "unadmitted
+    /// destination endpoint". Measured red by review1503's probe C at 03476033c.
+    ///
+    /// Falsify by dropping the `GraphNodeId::Artifact` arm from `departs` in
+    /// `retire_semantics_on_vacated`: the 500 returns with that message.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_session_that_deletes_an_imported_file_retires_its_artifact_edges() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("gone.ts"),
+            b"export function gone(): number { return 7; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("keep.ts"),
+            b"import { gone } from \"./gone\";\nexport function keep(): number { return gone(); }\n",
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixtures").await;
+        let gone_path = RepoPath::from_utf8("gone.ts".to_string()).unwrap();
+        let gone_artifact = state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&gone_path)
+            .map(|artifact| artifact.artifact_id)
+            .expect("the fixture is in the tree");
+        let gone_node = kin_model::GraphNodeId::Artifact(gone_artifact);
+        assert!(
+            !state
+                .graph
+                .get_all_relations_for_node(&gone_node)
+                .unwrap()
+                .is_empty(),
+            "the fixture only means something if the linker bound an edge to the artifact node"
+        );
+
+        let session_dir = state.layout.root().join("runs/session-fir3209-imported");
+        materialize_session_through_api(&app, &session_dir).await;
+        std::fs::remove_file(session_dir.join("gone.ts")).unwrap();
+        let summary = reconcile_session_through_api(&app, &session_dir).await;
+        assert_eq!(summary.removed, 1);
+
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&gone_path)
+            .is_none());
+        assert!(
+            state
+                .graph
+                .get_all_relations_for_node(&gone_node)
+                .unwrap()
+                .is_empty(),
+            "no relation may outlive the artifact node it is bound to"
+        );
+        assert!(state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new("gone.ts")),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+        assert!(!state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new("keep.ts")),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+        commit_through_api(&app, kin_model::OperationId::new(), "commit the deletion").await;
+    }
+
+    /// FIR-3209, the split-brain half. Modify an entity-owning file in one
+    /// session, then delete it in the next.
+    ///
+    /// The first reconcile's readmission re-derives the path's entities into
+    /// the live graph only, so authority and the live graph now hold different
+    /// payloads for the same entity. A removal delta diffed against authority
+    /// and then applied to the live graph is refused there, "stale old payload
+    /// for removed entity", after authority has already committed, which left
+    /// the two graphs on different trees. Measured red by review1503's probe E
+    /// at 03476033c. Each graph now diffs itself with the same vacated set.
+    ///
+    /// Falsify by applying the plan's authority-derived deltas to the live
+    /// graph instead of the live-derived ones: the delete reconcile 500s with
+    /// that message after the authority commit is durable.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_session_that_deletes_a_file_an_earlier_session_modified_reconciles() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(repo.path().join("keep.rs"), b"pub fn keep() -> u32 { 1 }\n").unwrap();
+        std::fs::write(repo.path().join("gone.rs"), b"pub fn gone() -> u32 { 7 }\n").unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixtures").await;
+        let entities_at = |path: &str| {
+            state
+                .graph
+                .query_entities(&kin_db::EntityFilter {
+                    file_path: Some(kin_model::FilePathId::new(path)),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        assert_eq!(entities_at("gone.rs").len(), 1);
+
+        let first = state.layout.root().join("runs/session-fir3209-modify");
+        materialize_session_through_api(&app, &first).await;
+        prepend_session_lines(&first.join("gone.rs"), 17);
+        let modified = reconcile_session_through_api(&app, &first).await;
+        assert_eq!(modified.semantic_files_enriched, 1);
+        assert_eq!(
+            entities_at("gone.rs")[0].span.as_ref().unwrap().start_line,
+            17,
+            "the live graph moved on; authority did not"
+        );
+
+        let second = state.layout.root().join("runs/session-fir3209-then-delete");
+        materialize_session_through_api(&app, &second).await;
+        std::fs::remove_file(second.join("gone.rs")).unwrap();
+        let deleted = reconcile_session_through_api(&app, &second).await;
+        assert_eq!(deleted.removed, 1);
+        assert!(entities_at("gone.rs").is_empty());
+        assert_eq!(entities_at("keep.rs").len(), 1);
+
+        // The two graphs must still be level: a third session materializes and
+        // the next commit carries the removal into history.
+        let change_id =
+            commit_through_api(&app, kin_model::OperationId::new(), "commit the deletion").await;
+        let change = state.graph.get_change(&change_id).unwrap().unwrap();
+        assert!(
+            change.entity_deltas.iter().any(|delta| matches!(
+                delta,
+                kin_model::EntityDelta::Removed { old }
+                    if old.file_origin.as_ref().is_some_and(|f| f.0 == "gone.rs")
+            )),
+            "history must record the removal: {:?}",
+            change.entity_deltas
         );
     }
 
