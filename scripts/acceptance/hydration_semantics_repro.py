@@ -30,10 +30,12 @@ about the others, and a future creation path can leave the one staging boundary
 while a suite that only ever built one store stays green.
 
 ``native_transfer`` moves real history between two replicas and reads the
-receiver afterwards. The transfer protocol carries no authoring version, so a
-receiver that kept its own creation stamp would certify replay semantics for
-deltas authored on another host by another build. Its control is a pull that
-admits nothing, which must leave the record alone.
+receiver afterwards. The pack declares the SENDING store's creation record and
+the receiver keeps its own only when the two agree, so this fixture stamps its
+source one version back: a receiver that kept its record over a declaration it
+cannot match would certify replay semantics for deltas authored on another host
+by another build. Its control is a pull that admits nothing, which must leave
+the record alone.
 
 Advice is compared against the canonical remedy exactly, not by prefix or
 substring. A prefix check accepts correct advice followed by advice that
@@ -89,8 +91,11 @@ REMEDY_AHEAD = (
     "with the older replay version"
 )
 REMEDY_UNKNOWN = (
-    "upgrade Kin before changing this store; if the newest build still cannot read the record, "
-    "re-ingest the repository into a separate fresh store rather than replacing this one"
+    "upgrade Kin to the newest build first, because a record this build cannot read can belong "
+    "to a store a newer build created. If the newest build still reads no record, nothing "
+    "recovers one in place: this store keeps serving its history with its creation-time version "
+    "unknown, and re-ingesting builds a fresh store from source files rather than carrying this "
+    "store's own history over"
 )
 CANONICAL_REMEDY = {
     "current": None,
@@ -843,9 +848,11 @@ class Suite(object):
         Both doors are shipped CLI: the receiver is created by
         `kin init --adopt-repository-id`, which is how a store comes to share
         another repository's identity, and the history moves by `kin pull --url`.
-        The source's own stamp is rewritten one version back purely as provenance
-        setup; the transfer protocol carries no such field, which is the whole
-        reason the receiver cannot keep claiming one.
+        The source's own stamp is rewritten one version back so the pack it
+        publishes declares a version this receiver cannot match, which is the
+        whole reason the receiver cannot keep claiming one. A source left at this
+        build's own version would declare a matching one and the receiver would
+        keep its record, which is the agreeing case and a different arm.
         """
         if self._transfer is not None:
             return self._transfer

@@ -151,6 +151,7 @@ async fn clone_native(source: NativeCloneSource, target: &Path) -> Result<()> {
                 Ok(Some(kin_core::init::replica::ReplicaBootstrapInput {
                     transaction: bootstrap.transaction,
                     bodies: bootstrap.bodies,
+                    source_hydration_semantics: bootstrap.source_hydration_semantics,
                 }))
             };
             fetch()

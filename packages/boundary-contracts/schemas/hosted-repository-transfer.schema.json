@@ -7,7 +7,7 @@
       "description": "Route, leaves and envelope keys. Held as a const so a reader gets the literal rather than a shape that would admit a renamed field.",
       "const": {
         "protocol": "kin-repository-v6-fast-forward",
-        "schemaVersion": 4,
+        "schemaVersion": 5,
         "routeTemplate": "/api/v1/orgs/{orgId}/repos/{repoId}/transfer/{leaf}",
         "authorizationScheme": "Bearer",
         "orgScoped": true,
@@ -77,7 +77,8 @@
               "trees",
               "external_objects",
               "aliases",
-              "bodies"
+              "bodies",
+              "source_hydration_semantics"
             ]
           },
           {

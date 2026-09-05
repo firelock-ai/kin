@@ -15010,13 +15010,22 @@ fn configured_transfer_limits() -> kin_remote::repository_transfer::RepositoryTr
 /// because the failure this repairs was a receiver that admitted history and
 /// left the store describing itself by a record that predates it.
 ///
-/// The policy is to discard the hydration creation stamp. The transfer protocol
-/// carries no authoring version beside the history it moves, so a receiver that
-/// kept its own creation number would certify replay semantics for deltas
-/// authored on another host by another build. Deleting the record is the
-/// conservative half of that trade: the store reads unstamped and every surface
-/// discloses it, instead of reading current and certifying an absence over
-/// history whose provenance nothing recorded.
+/// The policy is to reconcile the hydration creation stamp against what the pack
+/// declared. `RepositoryTransferPack::source_hydration_semantics` carries the
+/// sending store's own creation record, so a receiver whose record says the same
+/// number keeps it: the arriving deltas were replayed under the same semantics
+/// this store's own history was. Anything else discards the record, which is
+/// what every receiver did unconditionally before the wire carried a version,
+/// and which is still what a hosted or older sender gets, because both declare
+/// nothing. The store then reads unstamped and every surface discloses it,
+/// instead of reading current and certifying an absence over history whose
+/// provenance nothing recorded.
+///
+/// Keeping is not the same as claiming the pack's contents. The declaration says
+/// which version was in force when the SENDING store was created, exactly as the
+/// receiver's own record says it for this one, and the comparison in
+/// `kin_core::hydration_semantics::transfer_preserves_creation_record` is the
+/// only place that reads it.
 ///
 /// A hosted daemon runs no policy. Its storage backend is not a local `.kin`
 /// layout, and the scaffolding directory beside it belongs to no repository
@@ -15085,7 +15094,7 @@ fn apply_received_repository_transfer_pack(
         &configured_transfer_limits(),
         receiver_case,
         || match local_kindb {
-            Some(kindb) => kindb.invalidate_for_unversioned_transfer(),
+            Some(kindb) => kindb.reconcile_after_transfer(pack.source_hydration_semantics),
             None => Ok(()),
         },
     )
@@ -15202,6 +15211,10 @@ async fn repo_transfer_export(
         &authority,
         &request.source_ref,
         &request.expectation,
+        // This daemon's own store speaks for the history it is exporting. A
+        // hosted daemon reads `None` here by construction and the puller then
+        // discards its record, exactly as before.
+        state.local_hydration_creation_version(),
     )
     .map_err(repository_transfer_error)?;
     Ok(Json(segment.pack))
@@ -15437,6 +15450,9 @@ async fn command_push(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let context = transfer_command_context(&state, &request)?;
     let (source_ref, destination_ref) = context.publication_refs()?;
+    // Read before the blocking hop, because `context` moves into it and the
+    // record belongs to this daemon's store rather than to the context.
+    let source_hydration_semantics = state.local_hydration_creation_version();
     // Negotiation blocks on peer HTTP and on authority reads, so it must not run
     // on the async executor that also serves this daemon's own transfer seam.
     let outcome = tokio::task::spawn_blocking(move || {
@@ -15446,6 +15462,7 @@ async fn command_push(
             &context.repository_id,
             &source_ref,
             &destination_ref,
+            source_hydration_semantics,
         )
     })
     .await
@@ -21973,6 +21990,7 @@ mod tests {
             &source,
             &destination_ref,
             &expectation,
+            None,
         )
         .unwrap();
         assert!(segment.is_final());
@@ -26005,6 +26023,7 @@ mod tests {
             &source_authority,
             &destination_ref,
             &expectation,
+            None,
         )
         .unwrap();
         assert!(
@@ -26015,14 +26034,14 @@ mod tests {
             segment.pack.schema_version,
             kin_remote::repository_transfer::REPOSITORY_TRANSFER_SCHEMA_VERSION
         );
-        assert_eq!(segment.pack.schema_version, 4);
+        assert_eq!(segment.pack.schema_version, 5);
         assert!(
             segment
                 .pack
                 .changes
                 .iter()
                 .any(|change| !change.entity_deltas.is_empty()),
-            "schema 4 must carry the imported semantic entity deltas"
+            "schema 5 must carry the imported semantic entity deltas"
         );
 
         let response = router(Arc::clone(&destination_state))
@@ -27085,6 +27104,7 @@ mod tests {
                 &authority.manager,
                 &main,
                 &expectation,
+                None,
             );
 
             if fits {
@@ -27722,6 +27742,7 @@ mod tests {
             repository_id: &RepositoryId,
             destination_kindb: &FsPath,
             operation: u128,
+            declared: Option<u32>,
         ) -> kin_remote::repository_transfer::RepositoryTransferPack {
             let source_storage = tempfile::tempdir().unwrap();
             let source_head = seed_replica_change(
@@ -27757,6 +27778,7 @@ mod tests {
                 &source,
                 &destination_ref,
                 &expectation,
+                declared,
             )
             .unwrap();
             assert!(
@@ -27764,6 +27786,10 @@ mod tests {
                 "the one-change fixture fits one segment"
             );
             assert_eq!(segment.pack.source_head, source_head);
+            assert_eq!(
+                segment.pack.source_hydration_semantics, declared,
+                "the fixture must publish the declaration the arm is about"
+            );
             segment.pack
         }
 
@@ -27803,14 +27829,21 @@ mod tests {
             (state, layout, working)
         }
 
-        /// Inbound receive, which is also where a `kin push` lands.
+        /// Inbound receive, which is also where a `kin push` lands, from a
+        /// sender that declares no creation version of its own.
+        ///
+        /// That is a hosted daemon, or any build older than the wire field, and
+        /// it must still cost the receiver its record: nothing said which replay
+        /// semantics authored the arriving deltas, so the receiver's own number
+        /// cannot speak for them.
         #[tokio::test]
-        async fn an_http_receive_discards_the_receivers_creation_record() {
+        async fn an_http_receive_from_an_undeclared_sender_discards_the_creation_record() {
             let (state, layout, _working) = local_replica();
             let repo_id = state.cached_repo_id.clone();
             let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
             let destination_ref = kin_model::RefName::branch(b"main").unwrap();
-            let pack = pack_for_local_destination(&repository_id, &layout.kindb_dir(), 0x2829);
+            let pack =
+                pack_for_local_destination(&repository_id, &layout.kindb_dir(), 0x2829, None);
             let admitted_head = pack.source_head;
             restamp_current(&layout);
 
@@ -27824,7 +27857,84 @@ mod tests {
                 receipt.destination_head, admitted_head,
                 "the fixture must prove history actually moved"
             );
-            assert_unstamped(&layout, "an inbound receive");
+            assert_unstamped(&layout, "an inbound receive from an undeclared sender");
+        }
+
+        /// The defect this whole change ends, at the boundary that produced it.
+        ///
+        /// Measured on 2026-09-05 on two scratch native stores minutes old, on
+        /// the build this lane branched from: the receiver's `kin doctor` went
+        /// from `version 10 at creation` to `STALE ... records no hydration
+        /// semantics version` the instant a push landed, and every agent answer
+        /// over that store read `inconclusive` from then on, with a remedy
+        /// telling it to upgrade a build minutes old.
+        #[tokio::test]
+        async fn an_http_receive_declaring_this_stores_version_keeps_the_creation_record() {
+            let (state, layout, _working) = local_replica();
+            let repo_id = state.cached_repo_id.clone();
+            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+            let pack = pack_for_local_destination(
+                &repository_id,
+                &layout.kindb_dir(),
+                0x2831,
+                Some(hydration_semantics::binary_version()),
+            );
+            let admitted_head = pack.source_head;
+            restamp_current(&layout);
+            let before = hydration_semantics::read(&layout);
+
+            let (status, body) =
+                post_receive(Arc::clone(&state), &repo_id, &destination_ref, &pack).await;
+            assert_eq!(status, StatusCode::OK, "the receive must commit: {body}");
+            let receipt: kin_remote::repository_transfer::RepositoryTransferReceipt =
+                serde_json::from_str(&body).expect("the route answers a receipt");
+            assert_eq!(
+                receipt.destination_head, admitted_head,
+                "the fixture must prove history actually moved"
+            );
+
+            assert_eq!(
+                hydration_semantics::read(&layout),
+                before,
+                "an agreeing declaration must leave the record byte-identical"
+            );
+            assert!(
+                !hydration_semantics::standing(&layout).is_gap(),
+                "a receiver lost certification to a sender recording its own version"
+            );
+        }
+
+        /// The arm that keeps the one above from becoming "keep it always".
+        ///
+        /// A sender one version behind is exactly the case the discard was
+        /// written for: keeping the record here would certify this store's
+        /// creation number over deltas replayed under another one.
+        #[tokio::test]
+        async fn an_http_receive_declaring_another_version_discards_the_creation_record() {
+            let (state, layout, _working) = local_replica();
+            let repo_id = state.cached_repo_id.clone();
+            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+            let pack = pack_for_local_destination(
+                &repository_id,
+                &layout.kindb_dir(),
+                0x2832,
+                Some(hydration_semantics::binary_version() - 1),
+            );
+            let admitted_head = pack.source_head;
+            restamp_current(&layout);
+
+            let (status, body) =
+                post_receive(Arc::clone(&state), &repo_id, &destination_ref, &pack).await;
+            assert_eq!(status, StatusCode::OK, "the receive must commit: {body}");
+            let receipt: kin_remote::repository_transfer::RepositoryTransferReceipt =
+                serde_json::from_str(&body).expect("the route answers a receipt");
+            assert_eq!(
+                receipt.destination_head, admitted_head,
+                "the fixture must prove history actually moved"
+            );
+            assert_unstamped(&layout, "an inbound receive declaring another version");
         }
 
         /// The control that makes the arm above mean something: a receiver that
@@ -27836,7 +27946,12 @@ mod tests {
             let repo_id = state.cached_repo_id.clone();
             let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
             let destination_ref = kin_model::RefName::branch(b"main").unwrap();
-            let mut pack = pack_for_local_destination(&repository_id, &layout.kindb_dir(), 0x2830);
+            let mut pack = pack_for_local_destination(
+                &repository_id,
+                &layout.kindb_dir(),
+                0x2830,
+                Some(hydration_semantics::binary_version()),
+            );
             // A destination ref the route did not ask for. Refused by identity,
             // well before anything durable moves.
             pack.destination_ref = kin_model::RefName::branch(b"not-the-route").unwrap();
@@ -27926,6 +28041,53 @@ mod tests {
             assert!(
                 !hydration_semantics::standing(&layout).is_gap(),
                 "a pull that admitted nothing discarded the creation record"
+            );
+        }
+
+        /// Native clone between two stores this build created, over real HTTP.
+        ///
+        /// This is the journey run's step 7 in a test: the peer serves its own
+        /// creation record on the export, the replica is stamped by the same
+        /// build, and the finished replica must still certify. Before the wire
+        /// carried the declaration this arm was impossible to satisfy, because
+        /// the receiver discarded on every admission.
+        #[tokio::test]
+        async fn a_native_clone_of_a_matching_source_keeps_the_replicas_record() {
+            let peer = native_clone_peer().await;
+            assert_eq!(
+                hydration_semantics::standing(&peer.layout),
+                HydrationStanding::Current {
+                    version: hydration_semantics::binary_version()
+                },
+                "the peer must start current, or this arm proves nothing"
+            );
+
+            let destination = tempfile::tempdir().unwrap();
+            let cloned = crate::replica_adoption::clone_native_replica(
+                destination.path(),
+                clone_endpoint(&peer.url),
+                &peer.repository_id,
+            )
+            .await
+            .expect("a native clone of a served peer");
+            assert!(
+                cloned.transfer.outcome.moved_history(),
+                "the clone admitted no history, so it says nothing about the commit boundary"
+            );
+
+            assert_eq!(
+                hydration_semantics::standing(&cloned.state.layout),
+                HydrationStanding::Current {
+                    version: hydration_semantics::binary_version()
+                },
+                "a replica of a peer this build created lost its creation record"
+            );
+            assert_eq!(
+                hydration_semantics::standing(&peer.layout),
+                HydrationStanding::Current {
+                    version: hydration_semantics::binary_version()
+                },
+                "the transfer moved the source's own creation record, which it must never do"
             );
         }
 
@@ -28492,6 +28654,7 @@ mod tests {
                 &pushed_repository_id,
                 &main,
                 &main,
+                None,
             )
         })
         .await

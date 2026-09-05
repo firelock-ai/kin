@@ -12405,10 +12405,18 @@ mod tests {
             assert!(matches!(unknown.status, HealthStatus::Stale));
             let fix = unknown.manual_fix.as_deref().unwrap_or_default();
             assert!(
-                fix.starts_with("upgrade Kin before changing this store"),
+                fix.starts_with("upgrade Kin to the newest build"),
                 "unknown provenance must not trigger destructive advice: {unknown:?}"
             );
-            assert!(fix.contains("separate fresh store"));
+            // The doctor row a native store reads after a sync it could not
+            // match. It may not name re-ingest as a step that keeps this
+            // store's history, because a native store has no source to
+            // re-ingest from.
+            assert!(
+                !fix.contains("re-ingest the repository into a separate fresh store"),
+                "unknown provenance must not presume a source outside the store: {fix}"
+            );
+            assert!(fix.contains("keeps serving its history"));
             assert!(!blocks_readiness(&unknown));
         }
 

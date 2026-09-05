@@ -49,26 +49,40 @@
 //!    its own record.
 //! 4. A store whose stamp a person removed. Reads as unverified, which errs
 //!    toward disclosure and never toward a false all-clear.
+//! 5. A store that admitted a native transfer whose declared authoring version
+//!    was not the one this store records, or that declared none at all. This is
+//!    the only producer that reaches a store a current build created, and what
+//!    it says is exact: this store's own history was replayed under its creation
+//!    version and it has since admitted history that was not.
 //!
 //! ## What the stamp claims, and what it does not
 //!
 //! It claims only the version in force when this store was created. For a local
-//! conversion, creation and historical replay happen in the same operation. It
-//! does not claim anything about history a replica later admits over the native
-//! transport: those deltas were authored on whichever host converted the
-//! repository, and the transport carries no version beside them.
+//! conversion, creation and historical replay happen in the same operation.
 //!
-//! That limit used to be recorded and then contradicted by the runtime. A
-//! version-10 client cloning a repository whose history was authored under
-//! version 9 got a version-10 creation stamp, imported the version-9 deltas
-//! with no provenance beside them, and every surface read `Current` over the
-//! result. [`invalidate_for_unversioned_transfer`] is what ends that: admitting
-//! a native transfer pack durably discards the creation record before the
-//! authority commit that makes the history visible, so the store reads
-//! [`HydrationStanding::Unstamped`] rather than certifying provenance it does
-//! not have. Giving up a creation-time number the store can no longer speak for
-//! is the conservative half of the trade; carrying the authoring version on the
-//! wire is the phase that gets it back.
+//! History a replica admits over the native transport was authored on whichever
+//! host converted that repository, so a receiver can speak for it only when the
+//! sender says which version authored it. That used to be recorded and then
+//! contradicted by the runtime: a version-10 client cloning a repository whose
+//! history was authored under version 9 got a version-10 creation stamp,
+//! imported the version-9 deltas with no provenance beside them, and every
+//! surface read `Current` over the result.
+//!
+//! The pack declares it now. `RepositoryTransferPack::source_hydration_semantics`
+//! carries the sending store's own creation record, and
+//! [`transfer_preserves_creation_record`] is the single comparison a receiver
+//! makes over it: the record survives when the sender declared the exact version
+//! this store records, and [`invalidate_for_unversioned_transfer`] discards it
+//! otherwise, durably, before the authority commit that makes the history
+//! visible. So two replicas of one build keep certifying their history through
+//! every sync, and a receiver that admits history authored under a version it
+//! cannot match reads [`HydrationStanding::Unstamped`] rather than certifying
+//! provenance it does not have.
+//!
+//! Discarding is still what an unversioned sender gets, and that is the whole of
+//! the conservative half: a hosted daemon owns no local creation record, and a
+//! build older than this wire field declares nothing, so both leave the receiver
+//! unstamped exactly as every transfer did before.
 //!
 //! ## What this module deliberately does not do
 //!
@@ -135,6 +149,20 @@ pub enum HydrationSemanticsRead {
     Recorded(HydrationSemanticsStamp),
     Absent,
     Unreadable(String),
+}
+
+impl HydrationSemanticsRead {
+    /// The creation-time version this read establishes, when it establishes one.
+    ///
+    /// `None` for both gap variants. A record that will not parse establishes no
+    /// version, and reporting "we could not tell" as a number is what the three
+    /// variants beside it exist to prevent.
+    pub fn created_under(&self) -> Option<u32> {
+        match self {
+            Self::Recorded(stamp) => Some(stamp.created_under),
+            Self::Absent | Self::Unreadable(_) => None,
+        }
+    }
 }
 
 /// How the store's recorded version stands against the one this binary derives.
@@ -231,6 +259,12 @@ impl HydrationStanding {
     /// absent or unreadable record can belong to a newer store, so those cases
     /// name upgrade-first advice and preserve the original store until the
     /// direction is known.
+    ///
+    /// The unknown-provenance arm also refuses to presume a source. A native
+    /// store is its own only source, so telling one to re-ingest names no
+    /// reachable action; it says what re-ingesting actually does instead, and
+    /// says first that the store keeps working. That is the sentence a store
+    /// minutes old reads after its first sync with a peer it cannot match.
     pub fn remedy(&self) -> Option<String> {
         match self {
             Self::Current { .. } => None,
@@ -245,9 +279,11 @@ impl HydrationStanding {
                     .to_string(),
             ),
             Self::Unstamped { .. } | Self::Unreadable { .. } => Some(
-                "upgrade Kin before changing this store; if the newest build still cannot read \
-                 the record, re-ingest the repository into a separate fresh store rather than \
-                 replacing this one"
+                "upgrade Kin to the newest build first, because a record this build cannot read \
+                 can belong to a store a newer build created. If the newest build still reads no \
+                 record, nothing recovers one in place: this store keeps serving its history with \
+                 its creation-time version unknown, and re-ingesting builds a fresh store from \
+                 source files rather than carrying this store's own history over"
                     .to_string(),
             ),
         }
@@ -287,8 +323,18 @@ pub fn standing_of(read: &HydrationSemanticsRead, derives: u32) -> HydrationStan
 /// the surfaces state honestly. A read error must never be able to present as
 /// agreement.
 pub fn read(layout: &KinLayout) -> HydrationSemanticsRead {
-    let path = layout.kindb_hydration_semantics_path();
-    let raw = match std::fs::read_to_string(&path) {
+    read_from(|| std::fs::read_to_string(layout.kindb_hydration_semantics_path()))
+}
+
+/// [`read`] over any source of the record's bytes.
+///
+/// One parser rather than one per caller. The daemon reads this record through a
+/// directory handle it pinned at startup and every other surface reads it
+/// through the layout's ambient path; two parsers would let one surface certify
+/// a store the other discloses, which is the exact failure the three read
+/// variants exist to prevent.
+fn read_from(load: impl FnOnce() -> std::io::Result<String>) -> HydrationSemanticsRead {
+    let raw = match load() {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return HydrationSemanticsRead::Absent
@@ -365,6 +411,22 @@ pub fn write(layout: &KinLayout, stamp: &HydrationSemanticsStamp) -> std::io::Re
     }
     sync_directory_metadata(parent)?;
     Ok(())
+}
+
+/// Whether a receiver may keep its own creation record after admitting history
+/// a pack declared was authored under `declared`.
+///
+/// True only when both numbers exist and are equal, which is deliberately narrow.
+/// The record claims a creation-time version, so it can survive exactly the case
+/// where the arriving deltas were replayed under the same version this store's
+/// own history was. Every other pairing leaves the store holding history its
+/// number does not speak for, which is what
+/// [`invalidate_for_unversioned_transfer`] is for.
+///
+/// A receiver with no record of its own reads `false`, and that costs nothing:
+/// discarding an absent record is a no-op that still makes the absence durable.
+pub fn transfer_preserves_creation_record(recorded: Option<u32>, declared: Option<u32>) -> bool {
+    recorded.is_some() && recorded == declared
 }
 
 /// Which of the two removal outcomes the invalidation observed.
@@ -460,6 +522,32 @@ impl HydrationStampCapability {
             #[cfg(unix)]
             sync_handle: std::fs::File::open(kindb_dir)?,
         })
+    }
+
+    /// This store's creation record, through the retained handle.
+    pub fn read(&self) -> HydrationSemanticsRead {
+        read_from(|| self.kindb.read_to_string(HYDRATION_SEMANTICS_FILE_NAME))
+    }
+
+    /// Reconcile this store's creation record against the version a received
+    /// pack declared for the history it carries.
+    ///
+    /// Keeps the record when the sender declared the exact version this store
+    /// records at creation, because the arriving deltas were then replayed under
+    /// the same semantics this store's own history was and the number still
+    /// speaks for the whole store. Discards it otherwise, which is what every
+    /// transfer did before the wire carried a version at all.
+    ///
+    /// The error is returned rather than logged, for the reason
+    /// [`invalidate_for_unversioned_transfer`] states: this runs immediately
+    /// before the authority commit that publishes the transported history, and a
+    /// commit that proceeded over a failed discard would leave exactly the false
+    /// `Current` the discard exists to prevent.
+    pub fn reconcile_after_transfer(&self, declared: Option<u32>) -> std::io::Result<()> {
+        if transfer_preserves_creation_record(self.read().created_under(), declared) {
+            return Ok(());
+        }
+        self.invalidate_for_unversioned_transfer()
     }
 
     /// [`invalidate_for_unversioned_transfer`], through the retained handle.
@@ -606,11 +694,11 @@ mod tests {
         );
         let advice = standing.remedy().expect("an unreadable record has advice");
         assert!(
-            advice.starts_with("upgrade Kin before changing this store"),
+            advice.starts_with("upgrade Kin to the newest build"),
             "unknown provenance must preserve a potentially newer store: {advice}"
         );
         assert!(
-            !advice.starts_with("re-ingest the repository"),
+            !advice.starts_with("re-ingest"),
             "unknown provenance must not begin with destructive re-ingest advice: {advice}"
         );
     }
@@ -698,9 +786,25 @@ mod tests {
             },
         ] {
             let advice = standing.remedy().unwrap();
-            assert!(advice.starts_with("upgrade Kin before changing this store"));
-            assert!(advice.contains("separate fresh store"));
+            assert!(advice.starts_with("upgrade Kin to the newest build"));
             assert!(!advice.contains("rewrite the record"));
+            // A native store is its own only source, so the advice may not name
+            // re-ingest as a step that keeps this store's history. The journey
+            // run that produced this change read the old sentence on a native
+            // store minutes old, where "re-ingest the repository into a separate
+            // fresh store" named nothing the reader could do.
+            assert!(
+                !advice.contains("re-ingest the repository into a separate fresh store"),
+                "unknown provenance must not presume a source outside the store: {advice}"
+            );
+            assert!(
+                advice.contains("keeps serving its history"),
+                "the advice must say the store still works: {advice}"
+            );
+            assert!(
+                advice.contains("rather than carrying this store's own history over"),
+                "the advice must say what re-ingesting costs: {advice}"
+            );
         }
     }
 
@@ -751,6 +855,109 @@ mod tests {
         );
         assert!(!unstamped.contains("older than"), "{unstamped}");
         assert!(!unstamped.contains("was authored"), "{unstamped}");
+    }
+
+    /// The one comparison a receiver makes over a declared authoring version,
+    /// in every pairing. Five of the six must discard, and the sixth is the
+    /// whole point of the change.
+    #[test]
+    fn a_creation_record_survives_only_a_declaration_that_matches_it() {
+        assert!(transfer_preserves_creation_record(Some(10), Some(10)));
+        assert!(!transfer_preserves_creation_record(Some(10), Some(9)));
+        assert!(!transfer_preserves_creation_record(Some(9), Some(10)));
+        assert!(!transfer_preserves_creation_record(Some(10), None));
+        assert!(!transfer_preserves_creation_record(None, Some(10)));
+        assert!(!transfer_preserves_creation_record(None, None));
+    }
+
+    /// The capability and the layout read one file through one parser. Asserted
+    /// against what the layout's own writer produced rather than by comparing
+    /// two hardcoded names, which is the shape where a rename leaves both halves
+    /// green over different files.
+    #[test]
+    fn the_capability_reads_the_record_the_layout_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        write(&layout, &HydrationSemanticsStamp::new(7, at(2))).unwrap();
+        let capability = HydrationStampCapability::open(&layout.kindb_dir()).unwrap();
+
+        assert_eq!(capability.read(), read(&layout));
+        assert_eq!(capability.read().created_under(), Some(7));
+
+        std::fs::remove_file(layout.kindb_hydration_semantics_path()).unwrap();
+        assert_eq!(capability.read(), HydrationSemanticsRead::Absent);
+        assert_eq!(capability.read().created_under(), None);
+
+        std::fs::write(layout.kindb_hydration_semantics_path(), b"{ truncated").unwrap();
+        assert!(matches!(
+            capability.read(),
+            HydrationSemanticsRead::Unreadable(_)
+        ));
+        assert_eq!(
+            capability.read().created_under(),
+            None,
+            "a record that will not parse must establish no version"
+        );
+    }
+
+    /// The reconciliation on the real filesystem, through the capability the
+    /// daemon holds. A matching declaration must leave the record BYTE-identical
+    /// rather than rewrite it, because a rewrite would move the recorded
+    /// timestamp and quietly restate a claim the receiver never re-earned.
+    #[test]
+    fn reconciling_after_a_transfer_keeps_only_a_matching_declaration() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        write(&layout, &HydrationSemanticsStamp::new(10, at(1))).unwrap();
+        let path = layout.kindb_hydration_semantics_path();
+        let before = std::fs::read(&path).unwrap();
+        let capability = HydrationStampCapability::open(&layout.kindb_dir()).unwrap();
+
+        capability.reconcile_after_transfer(Some(10)).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a matching declaration rewrote or removed the record"
+        );
+        assert_eq!(
+            standing_of(&read(&layout), 10),
+            HydrationStanding::Current { version: 10 }
+        );
+
+        capability.reconcile_after_transfer(Some(9)).unwrap();
+        assert_eq!(
+            read(&layout),
+            HydrationSemanticsRead::Absent,
+            "a declaration this store cannot match must cost it the record"
+        );
+    }
+
+    /// A sender that declares nothing is a hosted daemon or a build older than
+    /// the wire field, and both must still cost the receiver its record. This is
+    /// the behaviour every transfer had before the declaration existed, and the
+    /// arm that stops the change from becoming "keep the record always".
+    #[test]
+    fn reconciling_after_an_undeclared_transfer_discards_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        stamp_staged(&layout).unwrap();
+        assert!(
+            !standing(&layout).is_gap(),
+            "the fixture did not start current"
+        );
+
+        HydrationStampCapability::open(&layout.kindb_dir())
+            .unwrap()
+            .reconcile_after_transfer(None)
+            .unwrap();
+
+        assert_eq!(read(&layout), HydrationSemanticsRead::Absent);
+        assert_eq!(
+            standing(&layout),
+            HydrationStanding::Unstamped {
+                derives: binary_version()
+            }
+        );
     }
 
     /// The invalidation the native transfer commit boundary depends on. A store
