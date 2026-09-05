@@ -6066,6 +6066,8 @@ async fn reconcile_session_workspace(
             &observation,
         )
         .map_err(repository_commit_error)?;
+        let retired_entity_deltas = plan.retired_entity_deltas.clone();
+        let retired_relation_deltas = plan.retired_relation_deltas.clone();
         let committed = crate::repository_commit::commit_session_workspace_admission(
             &state.layout,
             state.blobs.as_ref(),
@@ -6094,13 +6096,43 @@ async fn reconcile_session_workspace(
 
         let graph_tree = state.graph.resolved_tree();
         if graph_tree == observation.base().source_workspace.tree {
+            // Entities retire with the paths that owned them, in the same
+            // step as the tree moves, so the live graph never holds an entity
+            // authority just refused to carry.
             state
                 .graph
                 .apply_transaction_delta(&TransactionDelta {
                     tree_deltas: observation.deltas().to_vec(),
+                    entity_deltas: retired_entity_deltas.clone(),
+                    relation_deltas: retired_relation_deltas,
                     ..TransactionDelta::default()
                 })
                 .map_err(internal_error)?;
+            for delta in &retired_entity_deltas {
+                let kin_model::EntityDelta::Removed { old } = delta else {
+                    continue;
+                };
+                if let Some(file_id) = &old.file_origin {
+                    if let Err(error) = crate::loop_runner::clear_incompatible_facets_in(
+                        state.graph.as_ref(),
+                        file_id,
+                        crate::loop_runner::EnrichmentFacet::None,
+                    ) {
+                        warn!(
+                            file = %file_id,
+                            error = %error,
+                            "retired a vacated path's entities but could not clear every facet"
+                        );
+                    }
+                }
+                state.emit_event(DaemonEvent::EntityChanged {
+                    entity_id: old.id,
+                    node: None,
+                    change_type: crate::state::ChangeType::Deleted,
+                    file_path: old.file_origin.as_ref().map(|file| file.0.clone()),
+                    session_id: None,
+                });
+            }
         } else if graph_tree != *observation.desired_tree() {
             return Err((
                 StatusCode::CONFLICT,
@@ -35624,6 +35656,132 @@ mod tests {
             .resolved_tree()
             .artifact_at_path(&kin_model::RepoPath::from_utf8("pending.txt").unwrap())
             .is_none());
+    }
+
+    /// FIR-3209. A session that deletes an entity-owning file reconciles, the
+    /// file's entities are absent from every query afterwards, and the next
+    /// commit records the removal.
+    ///
+    /// kin-db refuses a transition that leaves an entity on a path the staged
+    /// tree no longer carries, and it names the remedy in its own message:
+    /// "carry its exact entity removal or relocation in the same delta". The
+    /// invariant is right and the session admission was the caller that owed
+    /// the removal, so an agent's `rm` of a source file could not reconcile at
+    /// all. The existing session-reconcile test deletes `delete.me`, a file with
+    /// no entities, which is why the suite was green over this.
+    ///
+    /// Falsify by restoring `semantic_delta: WorkspaceSemanticDelta::default()`
+    /// in `plan_session_workspace_admission`: the reconcile returns the 500 the
+    /// review's control probe measured, and `gone.rs` keeps its entity with no
+    /// file behind it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_session_that_deletes_an_entity_source_file_retires_its_entities() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(repo.path().join("keep.rs"), b"pub fn keep() -> u32 { 1 }\n").unwrap();
+        std::fs::write(repo.path().join("gone.rs"), b"pub fn gone() -> u32 { 7 }\n").unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixtures").await;
+        let entities_at = |path: &str| {
+            state
+                .graph
+                .query_entities(&kin_db::EntityFilter {
+                    file_path: Some(kin_model::FilePathId::new(path)),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let gone_before = entities_at("gone.rs");
+        eprintln!(
+            "FIR-3209 measurement: before gone.rs entities={} keep.rs entities={}",
+            gone_before.len(),
+            entities_at("keep.rs").len()
+        );
+        assert_eq!(gone_before.len(), 1, "the fixture owns exactly one entity");
+        let gone_id = gone_before[0].id;
+
+        let session_dir = state.layout.root().join("runs/session-fir3209");
+        materialize_session_through_api(&app, &session_dir).await;
+        std::fs::remove_file(session_dir.join("gone.rs")).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"session_dir": session_dir, "confirm_mass_deletion": false})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+        eprintln!(
+            "FIR-3209 measurement: reconcile status={status} after gone.rs entities={} body={body}",
+            entities_at("gone.rs").len()
+        );
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "deleting a source file in a session is an ordinary edit and must reconcile: {body}"
+        );
+        let summary: kin_cli::commands::reconcile::ReconcileSummary =
+            serde_json::from_str(&body).unwrap();
+        assert_eq!(summary.removed, 1);
+
+        // Absent from every query, not only the by-path one the invariant is
+        // phrased in: by id, by name, and from the exact tree.
+        assert!(
+            entities_at("gone.rs").is_empty(),
+            "an entity must not outlive the path that owned it"
+        );
+        assert_eq!(entities_at("keep.rs").len(), 1, "the sibling is untouched");
+        assert!(state.graph.get_entity(&gone_id).unwrap().is_none());
+        assert!(state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                name_pattern: Some("gone".to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&RepoPath::from_utf8("gone.rs".to_string()).unwrap())
+            .is_none());
+
+        // The next commit carries the removal into history.
+        let change_id =
+            commit_through_api(&app, kin_model::OperationId::new(), "commit the deletion").await;
+        let change = state.graph.get_change(&change_id).unwrap().unwrap();
+        assert!(
+            change.entity_deltas.iter().any(|delta| matches!(
+                delta,
+                kin_model::EntityDelta::Removed { old } if old.id == gone_id
+            )),
+            "the commit after the session must record the entity's removal: {:?}",
+            change.entity_deltas
+        );
+        assert!(
+            change
+                .tree_deltas
+                .iter()
+                .any(|delta| matches!(delta, kin_model::TreeDelta::Removed { .. })),
+            "and the file's removal beside it"
+        );
     }
 
     /// Changes in repository authority, read the way `kin log` reads them.
