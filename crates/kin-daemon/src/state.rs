@@ -1770,6 +1770,16 @@ struct HostedSpineAuthorityProof {
     repositories: BTreeMap<String, HostedSpineRepoAuthorityProof>,
 }
 
+/// The durable control-plane authority a cached proof is read under: the
+/// admitted fence evidence, the active Firestore fence with the store revision
+/// that carried it, and the registered fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostedControlAuthority {
+    durable: kin_spine::SpineRolloutFenceEvidence,
+    active_fence: kin_spine::LoadedSpineRolloutFence,
+    registered: std::collections::BTreeSet<String>,
+}
+
 /// Why a cached hosted authority proof cannot answer, and whether re-proving it
 /// now would help.
 #[derive(Debug, Clone)]
@@ -6880,6 +6890,48 @@ impl DaemonState {
         ))
     }
 
+    /// The durable control-plane authority a cached proof is read under: the
+    /// admitted fence evidence, the active Firestore fence with the revision
+    /// that carried it, and the registered fleet.
+    ///
+    /// Read once before the identity bundle and once after, and required to be
+    /// identical, so a rollout or an admission change DURING the bundle reads
+    /// cannot be answered through.
+    fn read_hosted_control_authority(
+        &self,
+        control: &crate::publication_lease::PublicationControl,
+        backend: &dyn kin_spine::SpineBackend,
+    ) -> std::result::Result<HostedControlAuthority, CachedAuthorityRefusal> {
+        control
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .map_err(|error| {
+                CachedAuthorityRefusal::blocked(format!(
+                    "hosted spine reader is not durably admitted: {error}"
+                ))
+            })?;
+        let durable = match control.runtime_spine_authority().map_err(|error| {
+            CachedAuthorityRefusal::blocked(format!("load hosted spine runtime authority: {error}"))
+        })? {
+            crate::publication_lease::RuntimeSpineAuthority::Completed(evidence) => evidence,
+            crate::publication_lease::RuntimeSpineAuthority::RolloutActive(blocking) => {
+                return Err(CachedAuthorityRefusal::blocked(format!(
+                    "hosted spine {blocking}; cached authority is not readable"
+                )))
+            }
+        };
+        let active_fence = without_blocking_runtime_worker(|| backend.active_rollout_fence())
+            .map_err(|error| {
+                CachedAuthorityRefusal::blocked(format!(
+                    "load active Firestore spine fence: {error}"
+                ))
+            })?;
+        Ok(HostedControlAuthority {
+            durable,
+            active_fence,
+            registered: backend.registered_repo_ids().into_iter().collect(),
+        })
+    }
+
     /// Prove the cached hosted authority against durable identity, with no
     /// hydration and no graph load.
     ///
@@ -6894,6 +6946,12 @@ impl DaemonState {
     /// rollout evidence stays exactly where it is, so a check that stops at the
     /// fleet's names certifies a proof built against a generation that has
     /// already been superseded.
+    ///
+    /// The control-plane authority is read on BOTH sides of the identity bundle
+    /// and required to be identical. Reading it only before would answer a probe
+    /// through a rollout that began, or an admission that lapsed, while the
+    /// heads and cursors were being read; the full proof re-reads its fence at
+    /// the end for the same reason.
     ///
     /// What it does NOT re-establish is the graph root, because it does not have
     /// to: the root was fully validated against an immutable source cursor, and
@@ -6912,27 +6970,11 @@ impl DaemonState {
         let Some(control) = self.publication_control.as_ref() else {
             return Ok(());
         };
-        control
-            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
-            .map_err(|error| {
-                CachedAuthorityRefusal::blocked(format!(
-                    "hosted spine reader is not durably admitted: {error}"
-                ))
-            })?;
-        let durable = match control.runtime_spine_authority().map_err(|error| {
-            CachedAuthorityRefusal::blocked(format!("load hosted spine runtime authority: {error}"))
-        })? {
-            crate::publication_lease::RuntimeSpineAuthority::Completed(evidence) => evidence,
-            crate::publication_lease::RuntimeSpineAuthority::RolloutActive(blocking) => {
-                return Err(CachedAuthorityRefusal::blocked(format!(
-                    "hosted spine {blocking}; cached authority is not readable"
-                )))
-            }
-        };
+        let before = self.read_hosted_control_authority(control, backend)?;
         let expected = self
             .expected_hosted_spine_rollout_fence()
             .map_err(CachedAuthorityRefusal::blocked)?;
-        if expected != durable {
+        if expected != before.durable {
             return Err(CachedAuthorityRefusal::blocked(
                 "cached hosted spine evidence differs from the GCS publication-control record"
                     .to_string(),
@@ -6949,24 +6991,18 @@ impl DaemonState {
                     self.spine_unavailable_reason()
                 ))
             })?;
-        let active = without_blocking_runtime_worker(|| backend.active_rollout_fence()).map_err(
-            |error| {
-                CachedAuthorityRefusal::blocked(format!(
-                    "load active Firestore spine fence: {error}"
-                ))
-            },
-        )?;
-        if active != cached.rollout_fence || active.evidence() != durable {
+        if before.active_fence != cached.rollout_fence
+            || before.active_fence.evidence() != before.durable
+        {
             return Err(CachedAuthorityRefusal::blocked(
                 "cached hosted spine proof differs from active Firestore authority".to_string(),
             ));
         }
-        let registered = backend.registered_repo_ids();
-        if cached.repositories.len() != registered.len()
+        if cached.repositories.len() != before.registered.len()
             || cached
                 .repositories
                 .keys()
-                .any(|repo_id| !registered.contains(repo_id))
+                .any(|repo_id| !before.registered.contains(repo_id))
         {
             return Err(CachedAuthorityRefusal::blocked(
                 "cached hosted spine proof does not cover the exact registered fleet".to_string(),
@@ -6993,6 +7029,16 @@ impl DaemonState {
                     proved.identity.source_cursor,
                 )));
             }
+        }
+        // Close the bracket. Everything the answer rests on must still be what
+        // it was when the bundle reads started.
+        let after = self.read_hosted_control_authority(control, backend)?;
+        if after != before {
+            return Err(CachedAuthorityRefusal::superseded(
+                "hosted control-plane authority moved while the durable identity bundle was \
+                 being read"
+                    .to_string(),
+            ));
         }
         Ok(())
     }

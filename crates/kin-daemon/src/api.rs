@@ -45532,6 +45532,9 @@ mod tests {
         hydration_charge_ms: std::sync::atomic::AtomicU64,
         point_charge_ms: std::sync::atomic::AtomicU64,
         fail_next_hydration: std::sync::atomic::AtomicBool,
+        /// Runs on every committed-head read, so a test can move durable state
+        /// while a probe is between its two bundle observations.
+        on_head_read: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl MeasuredSpineStore {
@@ -45543,6 +45546,7 @@ mod tests {
                 hydration_charge_ms: std::sync::atomic::AtomicU64::new(0),
                 point_charge_ms: std::sync::atomic::AtomicU64::new(0),
                 fail_next_hydration: std::sync::atomic::AtomicBool::new(false),
+                on_head_read: std::sync::Mutex::new(None),
             }
         }
 
@@ -45555,6 +45559,10 @@ mod tests {
         /// Reads that pull one document or one small collection.
         fn point_reads(&self) -> usize {
             self.point_reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn on_head_read(&self, hook: Box<dyn Fn() + Send + Sync>) {
+            *self.on_head_read.lock().unwrap() = Some(hook);
         }
 
         /// Fail the next durable cache hydration once, leaving every identity
@@ -45622,6 +45630,13 @@ mod tests {
             kin_spine::SpineError,
         > {
             self.charge_point_read();
+            // Clone the hook out before calling it, so a hook that touches this
+            // store does not deadlock on its own lock.
+            let hook = self.on_head_read.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+                *self.on_head_read.lock().unwrap() = Some(hook);
+            }
             self.inner.load_repo_heads()
         }
 
@@ -45746,6 +45761,10 @@ mod tests {
         inner: crate::publication_lease::InMemoryPublicationControlStore,
         record_reads: std::sync::atomic::AtomicUsize,
         charge_ms: std::sync::atomic::AtomicU64,
+        /// Refuse every record read past this many, counted from the arming.
+        /// Zero means never.
+        refuse_reads_past: std::sync::atomic::AtomicUsize,
+        reads_since_arming: std::sync::atomic::AtomicUsize,
     }
 
     impl MeasuredControlStore {
@@ -45754,11 +45773,23 @@ mod tests {
                 inner: crate::publication_lease::InMemoryPublicationControlStore::default(),
                 record_reads: std::sync::atomic::AtomicUsize::new(0),
                 charge_ms: std::sync::atomic::AtomicU64::new(0),
+                refuse_reads_past: std::sync::atomic::AtomicUsize::new(0),
+                reads_since_arming: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
         fn record_reads(&self) -> usize {
             self.record_reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Serve `allowed` more record reads, then refuse every one after
+        /// them, so a probe's pre-bundle reads succeed and its post-bundle
+        /// reads find the admission gone.
+        fn refuse_record_reads_past(&self, allowed: usize) {
+            self.reads_since_arming
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            self.refuse_reads_past
+                .store(allowed, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn charge_each_record_read(&self, cost: Duration) {
@@ -45781,6 +45812,20 @@ mod tests {
             let charge = self.charge_ms.load(std::sync::atomic::Ordering::SeqCst);
             if charge > 0 {
                 std::thread::sleep(Duration::from_millis(charge));
+            }
+            let allowed = self
+                .refuse_reads_past
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if allowed > 0 {
+                let served = self
+                    .reads_since_arming
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                if served > allowed {
+                    return Err(crate::publication_lease::PublicationControlError::Missing(
+                        "injected publication-control record read failure".to_string(),
+                    ));
+                }
             }
             self.inner.load()
         }
@@ -46152,8 +46197,9 @@ mod tests {
             "the probe made {point_reads} spine point reads, {record_reads} control record \
              reads and {cursor_probes} source cursor probes. Two complete bundle \
              observations of one heads read and one cursor read per repository, plus the \
-             admission and runtime-authority record reads and the active fence, is the \
-             whole budget; anything past it is a read nobody accounted for."
+             admission, runtime-authority and active-fence reads taken on BOTH sides of \
+             that bundle, is the whole budget; anything past it is a read nobody \
+             accounted for."
         );
     }
 
@@ -46310,6 +46356,72 @@ mod tests {
             call_readiness_handler(state).await,
             StatusCode::OK,
             "readiness must return as soon as a pass succeeds"
+        );
+    }
+
+    /// A rollout that begins WHILE the bundle is read must refuse.
+    ///
+    /// The heads and the cursors do not move here, so both bundle observations
+    /// agree and the identity comparison passes. Only re-reading the control
+    /// authority after the bundle can catch it.
+    #[tokio::test]
+    async fn a_hosted_readiness_probe_refuses_a_fence_that_moves_during_the_bundle() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK,
+            "the fixture must be ready first, or the refusal below proves nothing"
+        );
+
+        let fake = Arc::clone(&store.inner);
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let armed = Arc::clone(&fired);
+        store.on_head_read(Box::new(move || {
+            if armed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            // Between the probe's two bundle observations: advance the durable
+            // rollout fence's revision and nothing else.
+            let mut fence = fake.rollout_fence_state.lock().unwrap();
+            if let Some((revision, _)) = fence.as_mut() {
+                *revision += 1;
+            }
+        }));
+
+        assert_eq!(
+            call_readiness_handler(state).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the control authority moved while the identity bundle was being read, and a \
+             probe that reads it only before the bundle answers through exactly that"
+        );
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the hook never ran, so nothing moved and this test proved nothing"
+        );
+    }
+
+    /// An admission that lapses WHILE the bundle is read must refuse.
+    #[tokio::test]
+    async fn a_hosted_readiness_probe_refuses_an_admission_lost_during_the_bundle() {
+        let (state, _store, _backend_root, meters, _environment) =
+            admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK,
+            "the fixture must be ready first, or the refusal below proves nothing"
+        );
+
+        // The probe reads the control record twice before the bundle, for the
+        // admission and the runtime authority. Serve exactly those two and
+        // refuse everything after, which is the post-bundle pair.
+        meters.control.refuse_record_reads_past(2);
+
+        assert_eq!(
+            call_readiness_handler(state).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a probe whose durable admission stopped answering while it read the identity \
+             bundle must not report ready on the strength of the read it made first"
         );
     }
 
