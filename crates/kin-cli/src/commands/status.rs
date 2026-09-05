@@ -1093,6 +1093,13 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
                 Some(&footprint),
                 crate::daemon_death::recorded_for_store(layout.root()).as_ref(),
                 &kin_core::last_admission::read(&layout),
+                // Read from the store rather than asked of the daemon, for the
+                // same reason the freshness line above it is: the record is
+                // durable, so the line appears when the daemon has since gone,
+                // and the status wire contract does not move. `StatusReportWire`
+                // denies unknown fields, so a new key there would make an older
+                // CLI reject a newer daemon's report outright.
+                &kin_core::retained_parse::read(&layout),
                 &pass,
                 reading.merge.as_ref(),
                 Some(&reading.workspace_tip),
@@ -1225,6 +1232,7 @@ pub fn build_command_status_response(
     footprint: Option<&StoreFootprint>,
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
     admission: &LastAdmissionRead,
+    retained: &kin_core::retained_parse::RetainedParseRead,
     pass: &StatusAdmission,
     merge: Option<&MergeInProgress>,
     workspace_tip: Option<&crate::commands::workspace_tip::WorkspaceTip>,
@@ -1235,6 +1243,7 @@ pub fn build_command_status_response(
         footprint,
         death,
         admission,
+        retained,
         pass,
         merge,
         workspace_tip,
@@ -1579,11 +1588,12 @@ fn render_text(
     footprint: Option<&StoreFootprint>,
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
     admission: &LastAdmissionRead,
+    retained: &kin_core::retained_parse::RetainedParseRead,
     pass: &StatusAdmission,
     merge: Option<&MergeInProgress>,
 ) -> String {
     render_text_with_tip(
-        report, build, footprint, death, admission, pass, merge, None,
+        report, build, footprint, death, admission, retained, pass, merge, None,
     )
 }
 
@@ -1593,6 +1603,7 @@ fn render_text_with_tip(
     footprint: Option<&StoreFootprint>,
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
     admission: &LastAdmissionRead,
+    retained: &kin_core::retained_parse::RetainedParseRead,
     pass: &StatusAdmission,
     merge: Option<&MergeInProgress>,
     workspace_tip: Option<&crate::commands::workspace_tip::WorkspaceTip>,
@@ -1674,6 +1685,22 @@ fn render_text_with_tip(
             .position(|line| line.starts_with("Head: "))
             .map_or(lines.len(), |position| position + 1);
         lines.insert(after_head, crate::commands::workspace_tip::line(tip));
+    }
+    // The caveat on the enrichment counts directly above, placed there rather
+    // than appended at the foot of the page. The counts are correct about what
+    // durable authority holds; what they cannot say is that some of it was
+    // derived from bytes the working copy no longer has, and a caveat printed
+    // fifteen lines under the number it qualifies is one a reader reaches after
+    // they have already believed the number. Every placement in this function is
+    // computed by searching the lines it already holds rather than by index, so
+    // the workspace-tip insert above, the merge banner below and this one cannot
+    // shift each other whatever order they run in.
+    if let Some(line) = retained.describe(Utc::now()) {
+        let after_enrichment = lines
+            .iter()
+            .position(|line| line.starts_with("Live graph enrichment:"))
+            .unwrap_or(lines.len());
+        lines.insert(after_enrichment, line);
     }
     if let Some(footprint) = footprint {
         lines.push(format!("Store size: {}", footprint.render()));
@@ -1831,6 +1858,7 @@ mod tests {
                 None,
                 None,
                 &LastAdmissionRead::Absent,
+                &kin_core::retained_parse::RetainedParseRead::Absent,
                 &skipped_pass(),
                 None
             )
@@ -2141,6 +2169,7 @@ mod tests {
             None,
             None,
             &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
             &skipped_pass(),
             None,
         );
@@ -2173,6 +2202,7 @@ mod tests {
                 None,
                 None,
                 &LastAdmissionRead::Absent,
+                &kin_core::retained_parse::RetainedParseRead::Absent,
                 &skipped_pass(),
                 None
             )
@@ -2184,6 +2214,7 @@ mod tests {
                 None,
                 None,
                 &LastAdmissionRead::Absent,
+                &kin_core::retained_parse::RetainedParseRead::Absent,
                 &skipped_pass(),
                 None
             )
@@ -2287,6 +2318,7 @@ mod tests {
             None,
             None,
             &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
             &skipped_pass(),
             Some(&merge),
         );
@@ -2307,6 +2339,7 @@ mod tests {
             None,
             None,
             &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
             &skipped_pass(),
             None,
         );
@@ -2468,6 +2501,7 @@ mod tests {
                 None,
                 None,
                 &LastAdmissionRead::Absent,
+                &kin_core::retained_parse::RetainedParseRead::Absent,
                 pass,
                 None,
             )
@@ -2514,6 +2548,7 @@ mod tests {
             None,
             None,
             &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
             &skipped_pass(),
             None,
         );
@@ -2529,6 +2564,7 @@ mod tests {
             Some(&footprint),
             None,
             &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
             &skipped_pass(),
             None,
         );
@@ -2680,6 +2716,106 @@ mod tests {
 
     /// One real report to drive the settle with, so it is exercised against the
     /// shape production hands it rather than a hand-built stand-in.
+    /// A record naming one path the graph is answering about from an earlier
+    /// parse, so the line is testable without a daemon.
+    fn retained_fixture() -> kin_core::retained_parse::RetainedParseRead {
+        kin_core::retained_parse::RetainedParseRead::Recorded(kin_core::retained_parse::fold(
+            &[],
+            &[kin_core::retained_parse::ObservedParse::retained(
+                "search.py",
+                4,
+            )],
+            Utc::now(),
+        ))
+    }
+
+    /// `kin status` says which paths it is describing from an earlier parse,
+    /// and says it beside the counts it qualifies.
+    ///
+    /// Placement is half of this. The enrichment counts are correct about what
+    /// durable authority holds, and a caveat printed under the store size and
+    /// the daemon memory is one a reader reaches after they have already
+    /// believed the number.
+    #[test]
+    fn the_retained_line_sits_under_the_enrichment_counts_it_qualifies() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
+
+        let rendered = render_text(
+            &report,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &retained_fixture(),
+            &skipped_pass(),
+            None,
+        );
+        let lines: Vec<&str> = rendered.lines().collect();
+        let retained_at = lines
+            .iter()
+            .position(|line| line.starts_with("Retained from last good parse:"))
+            .unwrap_or_else(|| panic!("no retained line in:\n{rendered}"));
+        let enrichment_at = lines
+            .iter()
+            .position(|line| line.starts_with("Durable semantic enrichment:"))
+            .expect("the enrichment line is always rendered");
+        assert_eq!(
+            retained_at,
+            enrichment_at + 1,
+            "the caveat belongs directly under the number it qualifies:\n{rendered}"
+        );
+        assert!(
+            lines[retained_at].contains("search.py (4 parse errors)"),
+            "{rendered}"
+        );
+
+        // The control, and the half a fix that printed unconditionally would
+        // fail: a store with nothing retained says nothing about it.
+        let quiet = render_text(
+            &report,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
+            &skipped_pass(),
+            None,
+        );
+        assert!(
+            !quiet.contains("Retained from last good parse"),
+            "a store answering from its own bytes must not claim otherwise: {quiet}"
+        );
+    }
+
+    /// A record that will not parse is louder than one that is missing. Silence
+    /// here would let a truncated record read as a whole store, which is the
+    /// class this whole change closes, reached by the other door.
+    #[test]
+    fn an_unreadable_retained_record_is_reported_rather_than_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
+
+        let rendered = render_text(
+            &report,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Unreadable("truncated".to_string()),
+            &skipped_pass(),
+            None,
+        );
+        assert!(
+            rendered.contains("could not be read (truncated)"),
+            "{rendered}"
+        );
+    }
+
     fn settle_base_report() -> StatusReport {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();

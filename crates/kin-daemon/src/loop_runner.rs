@@ -145,6 +145,41 @@ pub(crate) enum EnrichmentFacet {
     None,
 }
 
+/// What one reconcile outcome says about the path's current bytes, for the
+/// durable record every reporting surface reads.
+///
+/// `BrokenAst` is the one outcome that means the graph has started answering
+/// about this path from an earlier parse: it derives nothing, retains what the
+/// last good parse left, and the daemon reconciles under
+/// `ReconcilePolicy::FallbackToLkg`, so it is the ordinary case rather than an
+/// edge. `Updated` and `FileRemoved` settle the path, because both re-derived
+/// from the bytes this pass just read.
+///
+/// `Conflict` also retains last-known-good state and is deliberately not
+/// recorded. It is a held merge rather than a file whose syntax is broken, it
+/// has its own surface, and folding the two into one line would tell a reader to
+/// go fix a syntax error in a file whose syntax is fine.
+///
+/// A path the tree admits without a UTF-8 spelling yields nothing, because the
+/// record is keyed by the path string every reporting surface renders.
+fn observed_parse_of(
+    repo_path: &RepoPath,
+    outcome: &kin_reconcile::ReconcileOutcome,
+) -> Option<kin_core::retained_parse::ObservedParse> {
+    use kin_core::retained_parse::ObservedParse;
+    use kin_reconcile::ReconcileOutcome;
+    let path = repo_path.as_utf8()?;
+    match outcome {
+        ReconcileOutcome::BrokenAst { error_ranges, .. } => {
+            Some(ObservedParse::retained(path, error_ranges.len()))
+        }
+        ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. } => {
+            Some(ObservedParse::settled(path))
+        }
+        ReconcileOutcome::Conflict(_) => None,
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct FacetCleanup {
     pub(crate) removed_entities: Vec<EntityId>,
@@ -3075,6 +3110,12 @@ pub async fn run_loop_armed(
         batch.extend(exact_admission.semantic_events.iter().cloned());
         let batch = dedup_file_events(batch);
 
+        // What this pass sees about which paths the graph is answering about
+        // from an earlier parse. Collected here and published once below rather
+        // than written per file, because the record is one document and a pass
+        // that touched forty paths must not rewrite it forty times.
+        let mut observed_parses: Vec<kin_core::retained_parse::ObservedParse> = Vec::new();
+
         for event in &batch {
             let admitted = match admit_file_event_with_exact_tree(
                 &state,
@@ -3305,6 +3346,15 @@ pub async fn run_loop_armed(
                             }
                             graph_changed = true;
                             state.bump_version();
+                            // A removed path settles its retained-parse entry
+                            // here, because it never reaches the reconcile
+                            // below. Without this, deleting a file whose syntax
+                            // was broken would leave every surface naming a path
+                            // the repository no longer has.
+                            if let Some(path) = repo_path.as_utf8() {
+                                observed_parses
+                                    .push(kin_core::retained_parse::ObservedParse::settled(path));
+                            }
                             debug!(file = %repo_path, "removed exact repository-tree entry");
                         }
                         Err(error) => warn!(
@@ -3328,6 +3378,7 @@ pub async fn run_loop_armed(
                 Ok(result) => {
                     let (outcome, delta) = result.into_parts();
                     debug!(?outcome, "reconcile outcome");
+                    observed_parses.extend(observed_parse_of(&semantic_repo_path, &outcome));
 
                     use kin_reconcile::ReconcileOutcome;
                     let should_apply = matches!(
@@ -3550,6 +3601,14 @@ pub async fn run_loop_armed(
             }
         }
         drop(graph_mutation);
+
+        // One publication for the whole pass, after the graph mutation is
+        // released so a marker write never sits under it, and before the
+        // reconciler lock is released below so it cannot interleave with the
+        // complete sync's own publication. `record` folds these observations
+        // into whatever the record already held and leaves every path this pass
+        // did not look at exactly as it was.
+        kin_core::retained_parse::record(&state.layout, &observed_parses);
 
         // Every path this tick looked at without deferring is stable as far as
         // the pass can tell, so its ladder is forgotten and its next deferral
@@ -6924,6 +6983,79 @@ mod tests {
     /// cfg-gated pair collapsed both parsed halves onto whichever half the graph
     /// returned first. Two deltas for one entity is not a transaction, so the
     /// whole reconcile was refused and the edit never became queryable.
+    /// The complete sync records which paths it could not parse, and clears the
+    /// record when they parse again.
+    ///
+    /// This is the seam `/commands/admit` and `/commands/commit` both drive, so
+    /// it is the pass a reader is looking at when they run `kin status`,
+    /// `kin diff` or `kin commit`. Journey GAP-9: the reconciler logged `broken
+    /// AST, retaining LKG state` and every one of those surfaces reported a
+    /// whole store, because the outcome reached nothing but the log.
+    ///
+    /// Three assertions and each is a different failure. The store starts clean,
+    /// so a record written unconditionally fails the first. The broken pass
+    /// names the path with the reconciler's own error count, so a seam that
+    /// dropped the outcome fails the second. The fixed pass clears it, so a
+    /// write that only ever adds fails the third.
+    #[tokio::test]
+    async fn a_complete_sync_records_a_file_it_could_not_parse_and_clears_it_when_fixed() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir().to_path_buf();
+
+        std::fs::write(
+            root.join("search.py"),
+            b"def tokenize(text):\n    return [word.lower() for word in text.split()]\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert_eq!(
+            entity_names_for(&state, "search.py"),
+            vec!["search".to_string(), "tokenize".to_string()],
+            "the fixture needs the module and its function admitted"
+        );
+        assert!(
+            kin_core::retained_parse::read(&state.layout)
+                .paths()
+                .is_empty(),
+            "a store whose every file parses must record no retained path: {:?}",
+            kin_core::retained_parse::read(&state.layout)
+        );
+
+        // The same edit the journey drove: the closing bracket of the list
+        // comprehension removed, which `ast.parse` rejects.
+        std::fs::write(
+            root.join("search.py"),
+            b"def tokenize(text):\n    return [word.lower() for word in text.split(\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let broken = kin_core::retained_parse::read(&state.layout);
+        let errors = broken.errors_for("search.py").unwrap_or_else(|| {
+            panic!("the pass that could not parse search.py recorded nothing: {broken:?}")
+        });
+        assert!(
+            errors > 0,
+            "the record carries the reconciler's own error count, not a placeholder"
+        );
+        assert!(
+            !entity_names_for(&state, "search.py").is_empty(),
+            "the entities are RETAINED, which is why the record has to say so"
+        );
+
+        std::fs::write(
+            root.join("search.py"),
+            b"def tokenize(text):\n    return [word.lower() for word in text.split()]\n\ndef find(h, n):\n    return h\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert_eq!(
+            kin_core::retained_parse::read(&state.layout).errors_for("search.py"),
+            None,
+            "a path that parses again must leave the record, or every surface names it forever"
+        );
+    }
+
     #[tokio::test]
     async fn an_edit_above_a_duplicated_declaration_admits_the_new_entity() {
         let repo = tempfile::tempdir().unwrap();
@@ -8798,6 +8930,12 @@ async fn sync_filesystem_with_graph_publishing_inner(
     let enrichment_pipeline = IndexPipeline::new();
     state.bump_version();
 
+    // The same per-pass collection the ambient tick takes, on the seam
+    // `/commands/admit` and `/commands/commit` both drive. This is the pass a
+    // reader is usually looking at when they run `kin status` or `kin commit`,
+    // because both admit before they read.
+    let mut observed_parses: Vec<kin_core::retained_parse::ObservedParse> = Vec::new();
+
     for event in events {
         let admitted = match admit_file_event_with_exact_tree(
             state,
@@ -8960,6 +9098,13 @@ async fn sync_filesystem_with_graph_publishing_inner(
                             }
                         }
                         graph_changed = true;
+                        // Settled here for the same reason as on the ambient
+                        // tick: a removed path never reaches the reconcile
+                        // below, so nothing else would clear its entry.
+                        if let Some(path) = repo_path.as_utf8() {
+                            observed_parses
+                                .push(kin_core::retained_parse::ObservedParse::settled(path));
+                        }
                         debug!(file = %repo_path, "removed exact tree entry during complete sync");
                     }
                     Err(error) => warn!(
@@ -8977,6 +9122,7 @@ async fn sync_filesystem_with_graph_publishing_inner(
         {
             Ok(result) => {
                 let (outcome, delta) = result.into_parts();
+                observed_parses.extend(observed_parse_of(&semantic_repo_path, &outcome));
                 use kin_reconcile::ReconcileOutcome;
                 let should_apply = matches!(
                     &outcome,
@@ -9063,6 +9209,18 @@ async fn sync_filesystem_with_graph_publishing_inner(
         }
     }
 
+    // One publication for the whole pass, and it happens while this pass still
+    // holds the reconciler lock, which is what serializes it against the
+    // ambient tick's own publication. `record` is a read-modify-write of one
+    // document, so two passes interleaving it would let the later write drop
+    // what the earlier one learned. The tick publishes under the same lock for
+    // the same reason.
+    //
+    // Every `continue` in the loop above falls through to here, so a pass that
+    // skipped one file still publishes what it learned about the rest. A pass
+    // that REFUSES does not reach this, and that is the right direction: the
+    // observations it took describe a transition it then declined to complete.
+    kin_core::retained_parse::record(&state.layout, &observed_parses);
     drop(reconciler);
 
     if graph_changed {

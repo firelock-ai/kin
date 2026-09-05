@@ -1027,7 +1027,9 @@ fn graph_status_publishes_per_language_parse_coverage_without_a_verdict() {
     let lines = response.lines.join("\n");
 
     assert!(
-        lines.contains("Parse coverage (files that produced an entity / files admitted):"),
+        lines.contains(
+            "Parse coverage (files whose current bytes produced an entity / files admitted):"
+        ),
         "the section prints: {lines}"
     );
     // The denominator assertion moves to the rust row, and it has to: every one

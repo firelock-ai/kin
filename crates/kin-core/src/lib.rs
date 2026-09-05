@@ -45,6 +45,7 @@ pub mod registry;
 pub mod relation_census;
 pub mod repository_authority;
 pub mod resolver;
+pub mod retained_parse;
 pub mod shims;
 pub mod sync_state;
 /// Scoped, restoring, serialized environment mutation for test code.

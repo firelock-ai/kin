@@ -183,6 +183,22 @@ impl KinLayout {
         self.kindb_dir().join("relation-census")
     }
 
+    /// `.kin/kindb/retained-parse` — the paths whose current bytes did not parse
+    /// and whose entities the graph is therefore still answering from an earlier
+    /// parse.
+    ///
+    /// Durable rather than in-process for the same reason the last-admission
+    /// marker beside it is: the pass that learns the fact and the command that
+    /// has to report it are usually different processes, and a reconcile pass
+    /// with nothing to admit returns before it reconciles anything, so a surface
+    /// recomputing this per read would report a store whole the moment nothing
+    /// changed. Written only by the daemon's reconcile seams, from what they
+    /// observed, and read by `kin status`, `kin diff`, `kin commit`,
+    /// `kin graph status` and `kin doctor` so the five cannot disagree.
+    pub fn kindb_retained_parse_path(&self) -> PathBuf {
+        self.kindb_dir().join("retained-parse")
+    }
+
     /// `.kin/kindb/graph.kvec` — persisted vector index aligned with the snapshot.
     pub fn kindb_vector_index_path(&self) -> PathBuf {
         self.kindb_snapshot_path().with_extension("kvec")
