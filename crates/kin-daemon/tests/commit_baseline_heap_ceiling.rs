@@ -37,9 +37,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use kin_daemon::commit_deltas::resolve_authority_baseline;
 use kin_db::{GraphSnapshot, InMemoryGraph};
 use kin_model::{
-    ChangeStore, Entity, EntityDelta, EntityKind, EntityMetadata, EntityStore,
-    FingerprintAlgorithm, FilePathId, Hash256, LanguageId, SemanticChangeId, SemanticFingerprint,
-    Timestamp, Visibility,
+    ChangeStore, Entity, EntityDelta, EntityKind, EntityMetadata, EntityStore, FilePathId,
+    FingerprintAlgorithm, Hash256, LanguageId, SemanticChangeId, SemanticFingerprint, Timestamp,
+    Visibility,
 };
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -187,7 +187,9 @@ fn change(
 /// selects the expensive branch in `InMemoryGraph::from_snapshot`.
 fn authority_like_snapshot() -> (GraphSnapshot, SemanticChangeId) {
     let graph = InMemoryGraph::new();
-    let mut live: Vec<Entity> = (0..ENTITIES).map(|i| entity(&format!("seed_{i}"))).collect();
+    let mut live: Vec<Entity> = (0..ENTITIES)
+        .map(|i| entity(&format!("seed_{i}")))
+        .collect();
 
     let seeded = change(
         None,
