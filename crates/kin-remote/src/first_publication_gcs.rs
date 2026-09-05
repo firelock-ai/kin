@@ -13,20 +13,25 @@
 //! ## What is refused, and why each refusal is not cosmetic
 //!
 //! * A **bucket** outside the object-store naming grammar builds a request that
-//!   is nonsense rather than one that fails cleanly. Google's full naming policy
-//!   stays Google's to enforce; refused here is only what would corrupt the
-//!   request or the key.
+//!   is nonsense rather than one that fails cleanly. The provider's full naming
+//!   policy stays the provider's to enforce. Refused here is what would corrupt
+//!   the request or the key, plus one rule that is deliberately stricter than
+//!   the published grammar: 63 bytes over the whole name rather than per dotted
+//!   label. A hosted bucket is fleet configuration with a short name, and the
+//!   stricter bound is worth more than the dotted-name case it gives up.
 //! * A **prefix** that is not already in normal form names a different object
 //!   than it appears to. `object_store` drops empty path segments while
 //!   building a key, so `a//b`, `/a/b/` and `a/b` are one object, while the
 //!   destination scope this module renders keeps whatever was written. The
 //!   receipt would then name a location that is not the key. Refuse rather than
 //!   normalize, so the operator sees which value to fix.
-//! * The **artifact identifier budget** is checked before anything is written.
-//!   The hosted control plane stores that identifier as bounded text, and it is
+//! * The **artifact identifier budget** is spent before a backend exists. The
+//!   hosted control plane stores that identifier as bounded text, and it is
 //!   composed from the destination scope after a publication has already
 //!   committed, so an over-long prefix otherwise produces a publication that
-//!   succeeded and a receipt that cannot be composed. The check here uses the
+//!   succeeded and a receipt that cannot be composed. Opening a destination
+//!   therefore names the repository and refuses on the budget, and there is no
+//!   way to get a backend out of this module that skips it. The check uses the
 //!   widest generation a `u64` can print, because a bucket assigns generations
 //!   itself and the value is not known until after the write.
 //!
@@ -61,8 +66,8 @@
 ///
 /// Restated here rather than imported because the composing code lives above
 /// this crate in the dependency graph. The caller passes its own identifier
-/// prefix into [`GcsDestination::check_artifact_id_budget`], so the two halves
-/// of the format meet at one call site.
+/// prefix in when it opens a destination, so the two halves of the format meet
+/// at one call site and the budget cannot be skipped.
 pub const ARTIFACT_ID_MAX_BYTES: usize = 256;
 
 /// Shortest bucket name the object-store naming grammar accepts.
@@ -301,9 +306,32 @@ impl GcsEndpointOverride {
             return Err(refuse("it has no host"));
         }
 
-        let (host, port) = match authority.rsplit_once(':') {
+        // Credentials in the authority are refused rather than carried. This
+        // value is normalized into the record a caller writes down, so a
+        // password embedded here would be copied into whatever that record is,
+        // and an endpoint override is not where credentials belong.
+        if authority.contains('@') {
+            return Err(refuse(
+                "it carries credentials before the host; an endpoint must be scheme, host and \
+                 port only",
+            ));
+        }
+
+        // A bracketed IPv6 literal has colons inside the host, so the port is
+        // whatever follows the closing bracket and nothing else. Splitting on
+        // the last colon without this refuses `[::1]` for having a port of
+        // "1]", which is a loud refusal wearing the wrong reason.
+        let port_separator = match authority.rfind(']') {
+            Some(bracket) => authority[bracket + 1..]
+                .find(':')
+                .map(|offset| bracket + 1 + offset),
+            None => authority.rfind(':'),
+        };
+
+        let (host, port) = match port_separator {
             None => (authority, if scheme == "https" { 443_u16 } else { 80 }),
-            Some((host, port_text)) => {
+            Some(index) => {
+                let (host, port_text) = (&authority[..index], &authority[index + 1..]);
                 let port = port_text
                     .parse::<u16>()
                     .map_err(|_| refuse(&format!("its port {port_text:?} is not in 1..=65535")))?;
@@ -341,6 +369,14 @@ impl GcsEndpointOverride {
 /// provider enforces and which changes without this crate hearing about it. It
 /// refuses the shapes that would corrupt a URL or an object key while still
 /// looking like a configured destination.
+///
+/// One rule here is stricter than that, and is stated rather than hidden: the
+/// 63-byte bound applies to the whole name, while the published grammar applies
+/// it per dotted label and allows a longer dotted name overall. A dot-separated
+/// bucket over 63 bytes is therefore refused even though the provider would
+/// accept it. A hosted destination is fleet configuration with a short name, so
+/// the trade is worth making, but it is a policy choice and not a corruption
+/// check.
 fn validate_bucket(bucket: &str) -> Result<(), GcsDestinationError> {
     let refuse = |reason: &str| GcsDestinationError::Bucket {
         bucket: bucket.to_owned(),
@@ -439,9 +475,11 @@ mod backend {
 
     /// A destination that has been opened, with the class it was opened against.
     ///
-    /// `#[must_use]` on purpose. Dropping this and keeping only the backend
-    /// would throw away the one fact that distinguishes an emulator run from a
-    /// production one, which is exactly the confusion the class exists to stop.
+    /// `#[must_use]` catches one shape and only one: a destination opened and
+    /// then dropped whole. It does NOT catch a caller that keeps a field and
+    /// discards the rest, because reading a field is a use, and the tests below
+    /// do exactly that. What actually keeps the class from being lost is that
+    /// nothing can build this value without naming an endpoint.
     #[must_use]
     pub struct OpenedGcsDestination {
         /// The backend a publication is handed.
@@ -463,18 +501,66 @@ mod backend {
     }
 
     impl GcsDestination {
-        /// Open this destination against `endpoint`.
+        /// Open this destination against `endpoint`, for one repository.
         ///
-        /// One construction path for both classes: the client is always built
-        /// from the same builder, and an override adds exactly two calls to it.
-        /// An override also skips request signing, because an emulator has no
-        /// credentials to sign with and because an unsigned request that reaches
-        /// the real service is rejected by it rather than quietly authorized by
-        /// whatever credentials the host happens to carry.
+        /// The repository is named here rather than later because the artifact
+        /// identifier budget depends on it, and that budget has to be spent
+        /// before a backend exists rather than after a publication has already
+        /// committed. There is no way to obtain a backend from this module that
+        /// skips it.
+        ///
+        /// This builds the client and hands it to [`GcsDestination::opened`],
+        /// which is the only place either entry point derives the endpoint
+        /// class. That is deliberate: a second derivation site is a second place
+        /// for an emulator to be recorded as production, and a review of this
+        /// module found exactly that mutant surviving when there were two.
         pub fn open(
             &self,
             endpoint: &GcsEndpoint,
+            artifact_id_prefix: &str,
+            repository_id: &str,
         ) -> Result<OpenedGcsDestination, GcsDestinationError> {
+            let store = self.client(endpoint)?;
+            self.opened(store, endpoint, artifact_id_prefix, repository_id)
+        }
+
+        /// Open this destination over a store the caller already holds.
+        ///
+        /// Same contract as [`GcsDestination::open`], including the budget.
+        pub fn open_with_store(
+            &self,
+            store: Box<dyn ObjectStore>,
+            endpoint: &GcsEndpoint,
+            artifact_id_prefix: &str,
+            repository_id: &str,
+        ) -> Result<OpenedGcsDestination, GcsDestinationError> {
+            self.opened(store, endpoint, artifact_id_prefix, repository_id)
+        }
+
+        /// Build the client.
+        ///
+        /// One construction path for both classes: the same builder every time,
+        /// and an override adds exactly two calls to it. An override also skips
+        /// request signing, because an emulator has no credentials to sign with
+        /// and because an unsigned request that reaches the real service is
+        /// rejected by it rather than quietly authorized by whatever credentials
+        /// the host happens to carry.
+        ///
+        /// The production arm is deliberately the same two builder calls
+        /// `kin_db::GcsBackend::new` makes, rather than a call to it, so that one
+        /// path serves both classes. The cost is real and is written down here:
+        /// a client option kin-db adds to its own constructor later will not
+        /// reach this path, and this comment is where the next reader finds that
+        /// out.
+        ///
+        /// No network happens here. The builder does read the ambient credential
+        /// environment, on both arms, because it resolves application default
+        /// credentials while building. That is the caller's ambient
+        /// configuration and not something this module chooses.
+        fn client(
+            &self,
+            endpoint: &GcsEndpoint,
+        ) -> Result<Box<dyn ObjectStore>, GcsDestinationError> {
             let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(&self.bucket);
             if let GcsEndpoint::Emulator(override_) = endpoint {
                 builder = builder
@@ -487,33 +573,23 @@ mod backend {
                     None => format!("bucket {}: {error}", self.bucket),
                 })
             })?;
-            Ok(self.opened(Box::new(store), endpoint.class(), endpoint.url()))
+            Ok(Box::new(store))
         }
 
-        /// Open this destination over a store the caller already holds.
-        ///
-        /// The class is still named rather than guessed, for the same reason it
-        /// is named in [`GcsDestination::open`].
-        pub fn open_with_store(
-            &self,
-            store: Box<dyn ObjectStore>,
-            endpoint_class: GcsEndpointClass,
-            endpoint_url: Option<&str>,
-        ) -> OpenedGcsDestination {
-            self.opened(store, endpoint_class, endpoint_url)
-        }
-
+        /// The one place an opened destination is assembled.
         fn opened(
             &self,
             store: Box<dyn ObjectStore>,
-            endpoint_class: GcsEndpointClass,
-            endpoint_url: Option<&str>,
-        ) -> OpenedGcsDestination {
-            OpenedGcsDestination {
+            endpoint: &GcsEndpoint,
+            artifact_id_prefix: &str,
+            repository_id: &str,
+        ) -> Result<OpenedGcsDestination, GcsDestinationError> {
+            self.check_artifact_id_budget(artifact_id_prefix, repository_id)?;
+            Ok(OpenedGcsDestination {
                 backend: Arc::new(kin_db::GcsBackend::from_store(store, self.prefix.clone())),
-                endpoint_class,
-                endpoint_url: endpoint_url.map(ToOwned::to_owned),
-            }
+                endpoint_class: endpoint.class(),
+                endpoint_url: endpoint.url().map(ToOwned::to_owned),
+            })
         }
     }
 }
@@ -716,6 +792,11 @@ mod tests {
             ),
             ("HTTP://localhost:4443", "http://localhost:4443"),
             ("http://localhost:4443/", "http://localhost:4443"),
+            // A bracketed IPv6 literal has colons inside the host, so the port
+            // is whatever follows the closing bracket and nothing else.
+            ("http://[::1]:4443", "http://[::1]:4443"),
+            ("http://[::1]", "http://[::1]:80"),
+            ("https://[2001:db8::1]", "https://[2001:db8::1]:443"),
         ] {
             let parsed = GcsEndpointOverride::parse(value, "OPERATOR_ENDPOINT")
                 .unwrap_or_else(|error| panic!("{value:?} must parse: {error}"));
@@ -736,6 +817,13 @@ mod tests {
             ("http://localhost:0", "its port is 0"),
             ("http://localhost:70000", "is not in 1..=65535"),
             ("http://:4443", "it has no host"),
+            // Credentials here would be copied verbatim into whatever record
+            // the caller writes the endpoint URL into.
+            (
+                "http://user:pass@storage.example.test:4443",
+                "it carries credentials before the host",
+            ),
+            ("http://user@storage.example.test", "it carries credentials"),
         ] {
             let Err(error) = GcsEndpointOverride::parse(value, "OPERATOR_ENDPOINT") else {
                 panic!("endpoint {value:?} must be refused");
@@ -783,12 +871,15 @@ mod gcs_tests {
         Result as ObjectStoreResult,
     };
 
-    use super::{GcsDestination, GcsEndpointClass};
+    use super::{
+        GcsDestination, GcsEndpoint, GcsEndpointClass, GcsEndpointOverride, OpenedGcsDestination,
+    };
 
     const BUCKET: &str = "kin-hosted-prod";
     const PREFIX: &str = "publications/v1";
     const REPOSITORY: &str = "9f1c2e04-3b7a-4d21-9c55-0ab61d7e8f30";
     const EMULATOR_URL: &str = "http://localhost:4443";
+    const SCHEMA: &str = "kin.first-publication.v1";
 
     /// Where the double starts assigning generations.
     ///
@@ -932,30 +1023,53 @@ mod gcs_tests {
             .expect("the double must accept a seeded object");
     }
 
+    /// Open through the double, naming the two arguments every gated test
+    /// shares. The budget is part of opening now, so a fixture that could not
+    /// compose an identifier would fail here rather than silently later.
+    fn open_double(
+        destination: &GcsDestination,
+        raw: &Arc<GenerationStampedStore>,
+        endpoint: &GcsEndpoint,
+    ) -> OpenedGcsDestination {
+        destination
+            .open_with_store(Box::new(Arc::clone(raw)), endpoint, SCHEMA, REPOSITORY)
+            .expect("a fixture destination fits the artifact identifier budget")
+    }
+
+    fn emulator() -> GcsEndpoint {
+        GcsEndpoint::Emulator(
+            GcsEndpointOverride::parse(EMULATOR_URL, "OPERATOR_ENDPOINT").expect("parses"),
+        )
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_publication_is_found_at_the_key_this_destination_names() {
         // The key this module composes is a mirror of the backend's own. This
         // is what stops the two from drifting: the object is seeded at the
         // mirrored key and the real backend is asked to find it.
+        //
+        // Both branches of the mirror are exercised, because the empty-prefix
+        // branch is a different `format!` and asserting it against another
+        // `format!` would only prove this module agrees with itself.
         let raw = Arc::new(GenerationStampedStore::default());
-        let destination = destination(PREFIX);
-        seed(&raw, &destination.snapshot_object_key(REPOSITORY)).await;
+        for prefix in ["", PREFIX] {
+            let destination = destination(prefix);
+            seed(&raw, &destination.snapshot_object_key(REPOSITORY)).await;
 
-        let opened = destination.open_with_store(
-            Box::new(Arc::clone(&raw)),
-            GcsEndpointClass::Emulator,
-            Some(EMULATOR_URL),
-        );
-        let cursor = opened
-            .backend
-            .load_snapshot_cursor(REPOSITORY)
-            .expect("the destination must answer")
-            .expect("the seeded object is the publication this destination names");
-        assert!(
-            cursor.backend_generation() >= FIRST_GENERATION,
-            "a bucket's generation is large; got {}",
-            cursor.backend_generation()
-        );
+            let opened = open_double(&destination, &raw, &emulator());
+            let cursor = opened
+                .backend
+                .load_snapshot_cursor(REPOSITORY)
+                .expect("the destination must answer")
+                .unwrap_or_else(|| {
+                    panic!("the seeded object is the publication prefix {prefix:?} names")
+                });
+            assert!(
+                cursor.backend_generation() >= FIRST_GENERATION,
+                "a bucket's generation is large; got {}",
+                cursor.backend_generation()
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -967,11 +1081,7 @@ mod gcs_tests {
         seed(&raw, &destination(PREFIX).snapshot_object_key(REPOSITORY)).await;
 
         let elsewhere = destination("publications/v2");
-        let opened = elsewhere.open_with_store(
-            Box::new(Arc::clone(&raw)),
-            GcsEndpointClass::Emulator,
-            Some(EMULATOR_URL),
-        );
+        let opened = open_double(&elsewhere, &raw, &emulator());
         assert!(
             opened
                 .backend
@@ -992,24 +1102,14 @@ mod gcs_tests {
         seed(&raw, &destination(PREFIX).snapshot_object_key(REPOSITORY)).await;
 
         let writer = GcsDestination::new(BUCKET, PREFIX).expect("validates");
-        let written = writer
-            .open_with_store(
-                Box::new(Arc::clone(&raw)),
-                GcsEndpointClass::Emulator,
-                Some(EMULATOR_URL),
-            )
+        let written = open_double(&writer, &raw, &emulator())
             .backend
             .load_snapshot_cursor(REPOSITORY)
             .expect("the destination must answer")
             .expect("present");
 
         let reader = GcsDestination::new(BUCKET, PREFIX).expect("validates");
-        let read = reader
-            .open_with_store(
-                Box::new(Arc::clone(&raw)),
-                GcsEndpointClass::Emulator,
-                Some(EMULATOR_URL),
-            )
+        let read = open_double(&reader, &raw, &emulator())
             .backend
             .load_snapshot_cursor(REPOSITORY)
             .expect("the destination must answer")
@@ -1031,11 +1131,9 @@ mod gcs_tests {
         .await
         .expect("the memory store must accept a seeded object");
 
-        let opened = destination.open_with_store(
-            Box::new(Arc::clone(&raw)),
-            GcsEndpointClass::Emulator,
-            Some(EMULATOR_URL),
-        );
+        let opened = destination
+            .open_with_store(Box::new(Arc::clone(&raw)), &emulator(), SCHEMA, REPOSITORY)
+            .expect("the fixture fits the budget");
         let error = opened
             .backend
             .load_snapshot_cursor(REPOSITORY)
@@ -1048,23 +1146,71 @@ mod gcs_tests {
 
     #[test]
     fn the_endpoint_class_travels_with_the_opened_destination() {
-        // An emulator must never be recorded as production. The class is an
-        // input to opening, so it cannot be lost between building a handle and
-        // writing down what the handle talked to.
-        let emulator = destination(PREFIX).open_with_store(
-            Box::new(InMemory::new()),
-            GcsEndpointClass::Emulator,
-            Some(EMULATOR_URL),
-        );
+        // An emulator must never be recorded as production. The class is
+        // derived in exactly one place from the endpoint that was named, so
+        // there is no second site for it to be dropped at.
+        let emulator = destination(PREFIX)
+            .open_with_store(Box::new(InMemory::new()), &emulator(), SCHEMA, REPOSITORY)
+            .expect("the fixture fits the budget");
         assert_eq!(emulator.endpoint_class, GcsEndpointClass::Emulator);
         assert_eq!(emulator.endpoint_url.as_deref(), Some(EMULATOR_URL));
 
-        let production = destination(PREFIX).open_with_store(
-            Box::new(InMemory::new()),
-            GcsEndpointClass::ProductionAdc,
-            None,
-        );
+        let production = destination(PREFIX)
+            .open_with_store(
+                Box::new(InMemory::new()),
+                &GcsEndpoint::ProductionAdc,
+                SCHEMA,
+                REPOSITORY,
+            )
+            .expect("the fixture fits the budget");
         assert_eq!(production.endpoint_class, GcsEndpointClass::ProductionAdc);
         assert_eq!(production.endpoint_url, None);
+    }
+
+    #[test]
+    fn a_destination_that_cannot_compose_an_identifier_never_yields_a_backend() {
+        // The budget is not advice. A destination that would publish
+        // successfully and then fail to be reported must refuse before a
+        // backend exists, and this is the only way to get one out of here.
+        let destination = destination(&"a".repeat(180));
+        let error = destination
+            .open_with_store(Box::new(InMemory::new()), &emulator(), SCHEMA, REPOSITORY)
+            .expect_err("an over-long destination must refuse rather than open");
+        assert!(
+            error.to_string().contains("over the 256 a hosted record"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn opening_a_real_client_derives_the_class_from_the_endpoint_it_was_given() {
+        // The one path the wiring commit will actually call. It builds a real
+        // client, which performs no network IO, and it is here because a review
+        // found a class-dropping mutant surviving inside it while every test
+        // went through the other entry point.
+        let destination = destination(PREFIX);
+        let emulator = destination
+            .open(&emulator(), SCHEMA, REPOSITORY)
+            .expect("building a client performs no network IO");
+        assert_eq!(emulator.endpoint_class, GcsEndpointClass::Emulator);
+        assert_eq!(emulator.endpoint_url.as_deref(), Some(EMULATOR_URL));
+
+        let production = destination
+            .open(&GcsEndpoint::ProductionAdc, SCHEMA, REPOSITORY)
+            .expect("building a client performs no network IO");
+        assert_eq!(production.endpoint_class, GcsEndpointClass::ProductionAdc);
+        assert_eq!(production.endpoint_url, None);
+    }
+
+    #[test]
+    fn a_real_client_is_never_built_for_a_destination_over_budget() {
+        let destination = destination(&"a".repeat(180));
+        let error = destination
+            .open(&emulator(), SCHEMA, REPOSITORY)
+            .expect_err("an over-long destination must refuse rather than open");
+        assert!(
+            error.to_string().contains("over the 256 a hosted record"),
+            "{error}"
+        );
     }
 }
