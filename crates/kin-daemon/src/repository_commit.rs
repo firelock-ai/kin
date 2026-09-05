@@ -469,7 +469,7 @@ pub(crate) fn plan_session_workspace_admission(
 #[derive(Debug, Clone, Default)]
 pub struct VacatedPaths {
     pub paths: BTreeSet<String>,
-    pub artifacts: Vec<kin_model::ArtifactId>,
+    pub artifacts: std::collections::HashSet<kin_model::ArtifactId>,
 }
 
 impl VacatedPaths {
@@ -486,7 +486,7 @@ impl VacatedPaths {
             if kept.contains(&old.path) {
                 continue;
             }
-            vacated.artifacts.push(delta.artifact_id());
+            vacated.artifacts.insert(delta.artifact_id());
             if let Some(path) = old.path.as_utf8() {
                 vacated.paths.insert(path.to_string());
             }
@@ -513,15 +513,16 @@ impl VacatedPaths {
 /// were retired beside the entities. `retire_artifact_node_relations` in
 /// `loop_runner` is the same rule applied to the live graph by the watcher.
 ///
-/// Called once per graph rather than once per transition, on purpose. The
-/// planner runs it on authority's workspace snapshot and the reconcile handler
-/// runs it on the live graph's, with the same vacated set, because the two can
-/// hold different payloads for the same entity: a readmission after an earlier
-/// session moves the live graph's spans and leaves authority's where the last
-/// commit put them. kin-db requires a removal's old payload to match the graph
-/// it is applied to exactly, so a delta derived against one graph and applied
-/// to the other is refused after authority has already moved, which splits the
-/// two. Each graph diffing itself is what keeps them level.
+/// This is the authority side only. The reconcile handler retires the same
+/// vacated set from the live graph with [`retire_live_semantics_on_vacated`],
+/// which reads that graph's own payloads through targeted queries, because the
+/// two graphs can hold different payloads for the same entity: a readmission
+/// after an earlier session moves the live graph's spans and leaves authority's
+/// where the last commit put them. kin-db requires a removal's old payload to
+/// match the graph it is applied to exactly, so a delta derived against one
+/// graph and applied to the other is refused after authority has already moved,
+/// which splits the two. Each graph deriving its own retirement is what keeps
+/// them level.
 pub(crate) fn retire_semantics_on_vacated(
     snapshot: &kin_db::GraphSnapshot,
     vacated: &VacatedPaths,
@@ -552,6 +553,54 @@ pub(crate) fn retire_semantics_on_vacated(
         &desired_relations,
     )
     .map_err(Into::into)
+}
+
+/// The live graph's own retirement of a vacated set, read through targeted
+/// queries rather than a snapshot of the whole store.
+///
+/// The first cut of this diffed `state.graph.to_snapshot()`, which deep-clones
+/// every sub-store and the change DAG on each vacating reconcile, on the exact
+/// path a one-file commit on a converted `psf/requests` already peaks past the
+/// stranger's memory ceiling. This reads only what leaves: the entities each
+/// vacated path owns, every relation bound to one of those entities, and every
+/// relation bound to a vacated artifact node, the same three reads the watcher's
+/// removal path makes. The payloads are the live graph's own, which is the whole
+/// point of deriving this here rather than carrying authority's delta over.
+pub(crate) fn retire_live_semantics_on_vacated(
+    graph: &kin_db::InMemoryGraph,
+    vacated: &VacatedPaths,
+) -> Result<(Vec<kin_model::EntityDelta>, Vec<kin_model::RelationDelta>)> {
+    use kin_model::EntityStore as _;
+    let mut entity_deltas = Vec::new();
+    let mut departing_relations = std::collections::HashMap::new();
+    for path in &vacated.paths {
+        let owned = graph.query_entities(&kin_model::EntityFilter {
+            file_path: Some(kin_model::FilePathId::new(path)),
+            ..Default::default()
+        })?;
+        for entity in owned {
+            for relation in
+                graph.get_all_relations_for_node(&kin_model::GraphNodeId::Entity(entity.id))?
+            {
+                departing_relations.insert(relation.id, relation);
+            }
+            entity_deltas.push(kin_model::EntityDelta::Removed { old: entity });
+        }
+    }
+    for artifact_id in &vacated.artifacts {
+        for relation in
+            graph.get_all_relations_for_node(&kin_model::GraphNodeId::Artifact(*artifact_id))?
+        {
+            departing_relations.insert(relation.id, relation);
+        }
+    }
+    let mut relation_deltas = departing_relations
+        .into_values()
+        .map(|old| kin_model::RelationDelta::Removed { old })
+        .collect::<Vec<_>>();
+    entity_deltas.sort_by_key(kin_model::EntityDelta::target_id);
+    relation_deltas.sort_by_key(kin_model::RelationDelta::target_id);
+    Ok((entity_deltas, relation_deltas))
 }
 
 /// Persist session-observed immutable bodies and linearize the exact primary

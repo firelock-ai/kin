@@ -6097,26 +6097,27 @@ async fn reconcile_session_workspace(
         if graph_tree == observation.base().source_workspace.tree {
             // Entities retire with the paths that owned them, in the same
             // step as the tree moves, so the live graph never holds an entity
-            // authority just refused to carry. Derived here from the LIVE
-            // graph with the plan's vacated set, never copied from the plan:
-            // the plan's delta was diffed against authority, and the live graph
-            // can already hold newer payloads for these entities from an
-            // earlier session's readmission. kin-db checks a removal's old
-            // payload against the graph it lands on, so authority's payload
-            // applied here was refused after authority had already moved,
-            // leaving the two graphs holding different trees.
-            let live = crate::repository_commit::retire_semantics_on_vacated(
-                &state.graph.to_snapshot(),
-                &vacated,
-            )
-            .map_err(repository_commit_error)?;
-            let retired_entity_deltas = live.entity_deltas().to_vec();
+            // authority just refused to carry. Read from the LIVE graph with
+            // the plan's vacated set, never copied from the plan: the plan's
+            // delta was diffed against authority, and the live graph can
+            // already hold newer payloads for these entities from an earlier
+            // session's readmission. kin-db checks a removal's old payload
+            // against the graph it lands on, so authority's payload applied
+            // here was refused after authority had already moved, leaving the
+            // two graphs holding different trees. Targeted reads rather than a
+            // snapshot of the whole store, which this path cannot afford.
+            let (retired_entity_deltas, retired_relation_deltas) =
+                crate::repository_commit::retire_live_semantics_on_vacated(
+                    state.graph.as_ref(),
+                    &vacated,
+                )
+                .map_err(repository_commit_error)?;
             state
                 .graph
                 .apply_transaction_delta(&TransactionDelta {
                     tree_deltas: observation.deltas().to_vec(),
                     entity_deltas: retired_entity_deltas.clone(),
-                    relation_deltas: live.relation_deltas().to_vec(),
+                    relation_deltas: retired_relation_deltas,
                     ..TransactionDelta::default()
                 })
                 .map_err(internal_error)?;
