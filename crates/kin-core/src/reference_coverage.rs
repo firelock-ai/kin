@@ -1072,6 +1072,17 @@ const PARSE_HOLE_SAMPLE: usize = 5;
 /// nothing, which is what the word says.
 pub const NO_ENTITY_OBSERVATION: &str = "no_entity";
 
+/// The heading the parse-coverage section prints, in one place because two
+/// surfaces and an acceptance grader all key on it.
+///
+/// The numerator says "whose current bytes produced an entity" rather than
+/// "that produced an entity", and the two extra words are the whole point. A
+/// file whose syntax broke keeps the entities its last good parse produced, so
+/// under the old wording it was counted as parsed and a store answering about it
+/// at positions its bytes no longer hold printed 100%.
+pub const PARSE_COVERAGE_HEADING: &str =
+    "Parse coverage (files whose current bytes produced an entity / files admitted):";
+
 /// How many of one language's admitted files reached the entity table.
 ///
 /// The denominator is the repository tree's own admitted file set, not the set
@@ -1097,6 +1108,21 @@ pub struct LanguageParseCoverage {
     pub with_entities: usize,
     /// Of those, how many produced none.
     pub silent: usize,
+    /// Of those, how many did not parse from their CURRENT bytes, so the
+    /// entities the graph holds for them came from an earlier parse.
+    ///
+    /// Its own bucket rather than folded into either counter beside it, because
+    /// it is neither. Counting a retained file under `with_entities` is the
+    /// defect this field closes: a file whose syntax broke kept the entities its
+    /// last good parse produced, so it read exactly like one Kin parses
+    /// correctly, and a store answering about it at positions its bytes no
+    /// longer hold printed 100%. Counting it under `silent` would be the
+    /// opposite lie, because the file is not silent at all; the graph is
+    /// answering about it, from bytes that are gone.
+    ///
+    /// `with_entities + silent + retained == tracked`.
+    #[serde(default)]
+    pub retained: usize,
     /// Silent paths, shallowest first, then alphabetical.
     ///
     /// Shallowest rather than largest, and the ordering is named on the line
@@ -1104,6 +1130,14 @@ pub struct LanguageParseCoverage {
     /// size, so a "biggest files" ranking would be the one part of this report
     /// a reader could not check against the store.
     pub sample: Vec<String>,
+    /// Retained paths with the parse-error count the reconciler reported for
+    /// each, under the same ordering rule as `sample`.
+    ///
+    /// The count is carried rather than recomputed. The same missing bracket
+    /// produced three errors in one measured file and four in another, so no
+    /// surface may assert a number of its own.
+    #[serde(default)]
+    pub retained_sample: Vec<String>,
 }
 
 impl LanguageParseCoverage {
@@ -1125,6 +1159,39 @@ impl LanguageParseCoverage {
         format!(
             "{NO_ENTITY_OBSERVATION}: {} of {} admitted {} files produced no entity{named}",
             self.silent, self.tracked, self.language
+        )
+    }
+
+    /// The one sentence a surface prints naming this language's retained files.
+    ///
+    /// Unlike [`Self::silent_sentence`] this one names a next step, because
+    /// unlike a silent file a retained one is unambiguously a gap: its bytes are
+    /// on disk and they do not parse. A side-effect script that declares nothing
+    /// is correct; a file whose syntax is broken is not a second correct case.
+    ///
+    /// What the graph still holds for such a file is stated as a conditional
+    /// rather than asserted. `FileEvent::Changed` covers "created or modified",
+    /// so a brand-new file with a typo reaches the same fallback arm with no
+    /// earlier parse behind it, and only the seam knows which of the two any one
+    /// path is.
+    pub fn retained_sentence(&self) -> String {
+        let named = if self.retained_sample.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", including {} (shallowest paths first)",
+                self.retained_sample.join(", ")
+            )
+        };
+        format!(
+            "{}: {} of {} admitted {} files did not parse as written, so any entities the graph \
+             still holds for them came from an earlier parse of bytes that are gone, and a file \
+             the graph never parsed is absent from it entirely{named}. Fix the syntax and the \
+             next admission re-derives them.",
+            crate::retained_parse::RETAINED_OBSERVATION,
+            self.retained,
+            self.tracked,
+            self.language
         )
     }
 }
@@ -1152,6 +1219,33 @@ impl ParseCoverageCensus {
             .collect()
     }
 
+    /// One sentence per language holding a file the graph is answering about
+    /// from an earlier parse.
+    ///
+    /// A verdict, unlike the disclosure beside it, and a caller rendering these
+    /// may treat a non-empty result as a gap it has established.
+    pub fn retained_file_lines(&self) -> Vec<String> {
+        self.languages
+            .iter()
+            .filter(|language| language.retained > 0)
+            .map(LanguageParseCoverage::retained_sentence)
+            .collect()
+    }
+
+    /// Every retained path across every language, for a caller that needs the
+    /// set rather than the prose.
+    pub fn retained_paths(&self) -> Vec<&str> {
+        self.languages
+            .iter()
+            .flat_map(|language| language.retained_sample.iter().map(String::as_str))
+            .collect()
+    }
+
+    /// Whether any language holds a file retained from an earlier parse.
+    pub fn any_retained(&self) -> bool {
+        self.languages.iter().any(|language| language.retained > 0)
+    }
+
     /// Terminal rendering, one line per language that admits a file.
     ///
     /// Rendered in every state, including the whole-clean one. A section that
@@ -1164,8 +1258,7 @@ impl ParseCoverageCensus {
                     .to_string(),
             ];
         }
-        let mut lines =
-            vec!["Parse coverage (files that produced an entity / files admitted):".to_string()];
+        let mut lines = vec![PARSE_COVERAGE_HEADING.to_string()];
         for language in &self.languages {
             let percent = language
                 .entity_percent()
@@ -1179,12 +1272,21 @@ impl ParseCoverageCensus {
         for line in self.silent_file_lines() {
             lines.push(format!("  {line}"));
         }
+        // Printed after the silent lines and before the disclaimer, because it
+        // is the one row on this section a reader should act on rather than
+        // investigate. The disclaimer below is about silent files and says so.
+        for line in self.retained_file_lines() {
+            lines.push(format!("  {line}"));
+        }
         lines.push(
             "  A file that produced no entity is absent from every enumeration, caller count and \
              dead-code answer over it rather than reported as a gap in one. It is NOT on its own \
              evidence that anything failed: a side-effect script, a re-export and a comment-only \
              file each correctly produce nothing, and no graph-owned signal separates those from \
-             a file an adapter could not read. Open the named paths to tell them apart."
+             a file an adapter could not read. Open the named paths to tell them apart. A file \
+             named on a retained line above is the one case that IS established: its bytes are on \
+             disk and they do not parse. The numerator excludes it because whatever this graph \
+             answers about it was not derived from those bytes."
                 .to_string(),
         );
         lines
@@ -1210,10 +1312,15 @@ impl ParseCoverageCensus {
 /// query actually answers from.
 pub fn collect_parse_coverage(
     graph: &kin_db::InMemoryGraph,
+    retained: &crate::retained_parse::RetainedParseRead,
 ) -> Result<ParseCoverageCensus, kin_db::KinDbError> {
     let resolved_tree = graph.resolved_tree();
     let entities = graph.list_all_entities()?;
-    Ok(collect_parse_coverage_from(&resolved_tree, &entities))
+    Ok(collect_parse_coverage_from(
+        &resolved_tree,
+        &entities,
+        retained,
+    ))
 }
 
 /// The census rule with both graph readings as inputs, so every branch is
@@ -1233,9 +1340,21 @@ pub fn collect_parse_coverage(
 /// module carried a verdict. Fixing it properly means fencing both reads behind
 /// one epoch the way `mcp_graph_status_with_stable_authority` does, which is a
 /// change to the report's whole read discipline rather than to this function.
+///
+/// `retained` is the daemon's durable record of the paths whose CURRENT bytes did
+/// not parse. It is a third input rather than something this function could
+/// derive, and that is structural: the reconciler is the only thing that ever
+/// attempts the parse, the graph deliberately keeps the last good reading, and
+/// nothing left in graph-owned state afterwards distinguishes a file Kin read
+/// correctly from one it read a week ago. `Absent` and `Unreadable` both count
+/// nothing as retained, which is exactly the behaviour this section had before
+/// the record existed; the unreadable case is not thereby silent, because the
+/// surfaces render it as its own line from
+/// [`crate::retained_parse::RetainedParseRead::describe`].
 pub fn collect_parse_coverage_from(
     resolved_tree: &kin_model::ResolvedTree,
     entities: &[Entity],
+    retained: &crate::retained_parse::RetainedParseRead,
 ) -> ParseCoverageCensus {
     let registry = kin_parser::AdapterRegistry::new();
     let producing: HashSet<&str> = entities
@@ -1285,7 +1404,17 @@ pub fn collect_parse_coverage_from(
             .entry(adapter.language_id().to_string())
             .or_default();
         tally.tracked += 1;
-        if producing.contains(path) {
+        // Retained is tested FIRST, and the order is the fix rather than a
+        // preference. A retained file is in `producing` by construction, because
+        // the entities its last good parse produced are still in the table, so
+        // testing `producing` first would count it as parsed and this whole
+        // third bucket would never receive anything.
+        if let Some(errors) = retained.errors_for(path) {
+            tally.retained += 1;
+            tally
+                .retained_paths
+                .push(format!("{path} ({errors} parse errors)"));
+        } else if producing.contains(path) {
             tally.with_entities += 1;
         } else {
             tally.silent += 1;
@@ -1306,7 +1435,9 @@ struct ParseTally {
     tracked: usize,
     with_entities: usize,
     silent: usize,
+    retained: usize,
     silent_paths: Vec<String>,
+    retained_paths: Vec<String>,
 }
 
 impl ParseTally {
@@ -1315,17 +1446,22 @@ impl ParseTally {
         // same store always names the same files. `lib/express.js` sorts above
         // `test/fixtures/blog/index.js` because a library root is what a reader
         // asking "what did Kin miss" means by the biggest one.
-        self.silent_paths.sort_by(|left, right| {
+        let shallowest_first = |left: &String, right: &String| {
             let depth = |path: &String| path.matches('/').count();
             depth(left).cmp(&depth(right)).then_with(|| left.cmp(right))
-        });
+        };
+        self.silent_paths.sort_by(shallowest_first);
         self.silent_paths.truncate(PARSE_HOLE_SAMPLE);
+        self.retained_paths.sort_by(shallowest_first);
+        self.retained_paths.truncate(PARSE_HOLE_SAMPLE);
         LanguageParseCoverage {
             language,
             tracked: self.tracked,
             with_entities: self.with_entities,
             silent: self.silent,
+            retained: self.retained,
             sample: self.silent_paths,
+            retained_sample: self.retained_paths,
         }
     }
 }
@@ -1337,6 +1473,8 @@ pub const PARSE_HOLE_LIMITING_FACTOR: &str = "parse_hole";
 
 #[cfg(test)]
 mod tests {
+    use crate::retained_parse::{ObservedParse, RetainedParseRead};
+
     /// A host where exactly these languages have a usable server.
     fn usable(languages: &[LanguageId]) -> LanguageServerReadinessMap {
         languages
@@ -2267,8 +2405,26 @@ mod tests {
             tracked,
             with_entities: tracked.saturating_sub(silent),
             silent,
+            retained: 0,
             sample: (0..silent.min(PARSE_HOLE_SAMPLE))
                 .map(|index| format!("lib/file{index}.js"))
+                .collect(),
+            retained_sample: Vec::new(),
+        }
+    }
+
+    /// A row for a language holding files the graph answers about from an
+    /// earlier parse, so the numerator drops rather than the denominator.
+    fn retained_row(language: &str, tracked: usize, retained: usize) -> LanguageParseCoverage {
+        LanguageParseCoverage {
+            language: language.to_string(),
+            tracked,
+            with_entities: tracked.saturating_sub(retained),
+            silent: 0,
+            retained,
+            sample: Vec::new(),
+            retained_sample: (0..retained.min(PARSE_HOLE_SAMPLE))
+                .map(|index| format!("lib/broken{index}.py (4 parse errors)"))
                 .collect(),
         }
     }
@@ -2366,7 +2522,7 @@ mod tests {
             entity("handle", "lib/router/index.js", None, None),
         ];
 
-        let census = collect_parse_coverage_from(&tree, &produced);
+        let census = collect_parse_coverage_from(&tree, &produced, &RetainedParseRead::Absent);
         assert_eq!(census.languages.len(), 1, "{census:?}");
         let row = &census.languages[0];
         assert_eq!(row.language, "javascript");
@@ -2384,6 +2540,104 @@ mod tests {
         assert_eq!(row.entity_percent(), Some(50));
     }
 
+    /// The census stops counting a file whose CURRENT bytes did not parse.
+    ///
+    /// This is the arithmetic behind journey GAP-9. The daemon reconciles under
+    /// fallback-to-last-known-good, so a file with a syntax error keeps the
+    /// entities its previous parse produced and is therefore in `producing` by
+    /// construction. Counting it there is what made a store answering about
+    /// `search.py` at retired positions print `python: 2/2 (100%)` while its own
+    /// daemon log carried `broken AST, retaining LKG state`.
+    ///
+    /// The second half is the control that makes the first mean something: the
+    /// SAME tree and the SAME entities with an absent record read 2/2 again, so
+    /// a census that had simply stopped counting python files would fail here.
+    #[test]
+    fn a_file_retained_from_an_earlier_parse_leaves_the_numerator() {
+        let tree = tree_of(&["search.py", "store.py"]);
+        let produced = [
+            entity("tokenize", "search.py", None, None),
+            entity("put", "store.py", None, None),
+        ];
+        let record = crate::retained_parse::fold(
+            &[],
+            &[ObservedParse::retained("search.py", 4)],
+            chrono::Utc::now(),
+        );
+        let retained = RetainedParseRead::Recorded(record);
+
+        let census = collect_parse_coverage_from(&tree, &produced, &retained);
+        let row = &census.languages[0];
+        assert_eq!(row.language, "python");
+        assert_eq!(row.tracked, 2, "the denominator is every admitted file");
+        assert_eq!(
+            row.with_entities, 1,
+            "search.py answers from bytes it no longer has"
+        );
+        assert_eq!(row.retained, 1);
+        assert_eq!(
+            row.silent, 0,
+            "a retained file is not silent; the graph answers about it"
+        );
+        assert_eq!(
+            row.with_entities + row.silent + row.retained,
+            row.tracked,
+            "the three buckets partition the admitted set: {row:?}"
+        );
+        assert_eq!(row.entity_percent(), Some(50));
+
+        let control = collect_parse_coverage_from(&tree, &produced, &RetainedParseRead::Absent);
+        assert_eq!(
+            control.languages[0].with_entities, 2,
+            "with no record the same tree and entities read exactly as before"
+        );
+        assert_eq!(control.languages[0].retained, 0);
+    }
+
+    /// The section names the file and says what a reader is being served,
+    /// because a count nobody can act on is the state this row was already in.
+    #[test]
+    fn the_section_names_a_retained_file_and_reaches_a_verdict_about_it() {
+        let census = ParseCoverageCensus {
+            languages: vec![retained_row("python", 2, 1)],
+        };
+        assert!(census.any_retained());
+        let lines = census.summary_lines().join("\n");
+        assert!(
+            lines.contains(PARSE_COVERAGE_HEADING),
+            "the heading says whose bytes the numerator counts: {lines}"
+        );
+        assert!(lines.contains("  python: 1/2 (50%)"), "{lines}");
+        assert!(
+            lines.contains(crate::retained_parse::RETAINED_OBSERVATION),
+            "the class is taggable rather than only readable: {lines}"
+        );
+        assert!(lines.contains("lib/broken0.py (4 parse errors)"), "{lines}");
+        assert!(lines.contains("did not parse as written"), "{lines}");
+        // True of both populations. A file created with a typo has no earlier
+        // parse, so the clause about what the graph holds has to be conditional.
+        assert!(
+            lines.contains("any entities the graph still holds"),
+            "the sentence may not diagnose one member of the set: {lines}"
+        );
+
+        // The control. A census with nothing retained says nothing about it, or
+        // every clean store reads as one holding a broken file.
+        let clean = ParseCoverageCensus {
+            languages: vec![parse_row("python", 2, 0)],
+        };
+        assert!(!clean.any_retained());
+        let clean_lines = clean.summary_lines().join("\n");
+        assert!(
+            !clean_lines.contains(crate::retained_parse::RETAINED_OBSERVATION),
+            "a store with nothing retained must not claim one: {clean_lines}"
+        );
+        assert!(
+            clean_lines.contains("  python: 2/2 (100%)"),
+            "{clean_lines}"
+        );
+    }
+
     /// A file the tree does not admit cannot be a hole in it, and a file the
     /// tree admits that no adapter is registered for is not one either. Both
     /// halves keep the denominator honest: without the first a stale entity
@@ -2394,7 +2648,7 @@ mod tests {
         let tree = tree_of(&["lib/express.js", "README.md", "Makefile"]);
         // An entity whose file the tree no longer admits.
         let stale = [entity("gone", "lib/removed.js", None, None)];
-        let census = collect_parse_coverage_from(&tree, &stale);
+        let census = collect_parse_coverage_from(&tree, &stale, &RetainedParseRead::Absent);
         let row = &census.languages[0];
         assert_eq!(
             row.tracked, 1,
@@ -2413,7 +2667,7 @@ mod tests {
     #[test]
     fn a_header_is_left_out_rather_than_attributed_to_the_wrong_language() {
         let tree = tree_of(&["src/widget.h", "src/widget.cpp", "src/other.cpp"]);
-        let census = collect_parse_coverage_from(&tree, &[]);
+        let census = collect_parse_coverage_from(&tree, &[], &RetainedParseRead::Absent);
         assert_eq!(census.languages.len(), 1, "{census:?}");
         let row = &census.languages[0];
         assert_eq!(row.language, "cpp", "the .cpp files are attributable");
@@ -2442,7 +2696,7 @@ mod tests {
             "test/exports.js",
             "lib/application.js",
         ]);
-        let census = collect_parse_coverage_from(&tree, &[]);
+        let census = collect_parse_coverage_from(&tree, &[], &RetainedParseRead::Absent);
         let row = &census.languages[0];
         assert_eq!(
             row.sample,

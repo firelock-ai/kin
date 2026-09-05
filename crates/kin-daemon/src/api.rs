@@ -4793,6 +4793,11 @@ async fn command_status(
         // durable marker rather than from this daemon's own probes, which reset
         // on restart and then report every store as never admitted (FIR-2961).
         &kin_core::last_admission::read(&state.layout),
+        // Which paths the graph is answering about from an earlier parse, read
+        // from the record this daemon's own reconcile seams write. The CLI takes
+        // its own read of the same record, so the two renderings of one store
+        // agree without this response carrying a new field.
+        &kin_core::retained_parse::read(&state.layout),
         // This endpoint stays a pure read. The CLI admits before it reads, which
         // is where the founder's 2026-08-30 decision applies, and a caller of
         // this route drives its own admission through `/commands/admit`. Saying
@@ -9364,9 +9369,12 @@ async fn support(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    let result =
-        kin_cli::commands::support::inspect_support_graph(&repository_authority, graph.as_ref())
-            .map_err(internal_error)?;
+    let result = kin_cli::commands::support::inspect_support_graph(
+        &repository_authority,
+        graph.as_ref(),
+        Some(state.layout.root()),
+    )
+    .map_err(internal_error)?;
     Ok(Json(result))
 }
 

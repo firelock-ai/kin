@@ -433,7 +433,7 @@ pub fn execute_graph_command_for_store(
             census,
             kin_root,
         ),
-        GraphCommandRequest::Validate => build_graph_validate_response(authority, graph),
+        GraphCommandRequest::Validate => build_graph_validate_response(authority, graph, kin_root),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
         GraphCommandRequest::Source { entity } => {
             build_graph_source_response(authority, graph, entity)
@@ -631,8 +631,19 @@ fn build_graph_status_response_for_store(
             std::sync::Arc::new(move || Ok(std::sync::Arc::clone(&opened))),
         )
     };
-    let mut health =
-        inspect_graph_with_entities(&coherent, graph, &entities, Some(embed_status.pending))?;
+    // One read of the durable retained-parse record for this whole response. The
+    // parse-coverage census below counts against it, and the disclosure line
+    // under the repository-coverage block renders from it, so the two cannot
+    // come to disagree about which paths the graph is answering about from an
+    // earlier parse.
+    let retained = kin_core::retained_parse::read_at_root(kin_root);
+    let mut health = inspect_graph_with_entities(
+        &coherent,
+        graph,
+        &entities,
+        Some(embed_status.pending),
+        &retained,
+    )?;
 
     // An external reference target is a node this repository references without
     // owning: no file, no span, no signature, and a uniform kind. Counting it
@@ -778,6 +789,17 @@ fn build_graph_status_response_for_store(
              those produced no entity",
             supported - unique_files.len()
         ));
+    }
+    // The disclosure the two counters above cannot carry. Both are literally
+    // true about the graph: a file whose syntax broke DID produce the entities
+    // the graph holds, so it is counted here and in `Files:` above. What neither
+    // can say is that those entities came from bytes the file no longer has,
+    // which is the difference between a store a reader can trust and one that
+    // reads clean while answering at retired positions. Rendered right under the
+    // coverage claim it qualifies rather than at the foot of the page, because a
+    // 100% two lines above an unread caveat is the shape this defect had.
+    if let Some(line) = retained.describe(chrono::Utc::now()) {
+        lines.push(format!("  {line}"));
     }
     lines.push(format!(
         "Entity-to-entity rels/entity: {:.2}",
@@ -1235,8 +1257,14 @@ fn append_health_notes(lines: &mut Vec<String>, notes: &[String]) {
 fn build_graph_validate_response(
     authority: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
+    kin_root: Option<&std::path::Path>,
 ) -> Result<GraphCommandResponse> {
-    let health = inspect_graph(authority, graph)?;
+    // Validate renders the same parse-coverage section status does, so it reads
+    // the same record. A store root it was not given yields an absent record,
+    // which counts nothing as retained and leaves the section exactly as it read
+    // before the record existed.
+    let retained = kin_core::retained_parse::read_at_root(kin_root);
+    let health = inspect_graph(authority, graph, &retained)?;
 
     // Validation needs the complete relation table, including corrupt edges
     // whose source and destination are both absent. Entity-rooted traversal
@@ -4000,7 +4028,7 @@ mod tests {
         graph.upsert_entity(&caller).unwrap();
         graph.upsert_relation(&relation).unwrap();
 
-        let response = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
+        let response = build_graph_validate_response(&pinned(&binding), &graph, None).unwrap();
 
         assert!(response.error.is_none(), "{:?}", response.lines);
         assert!(response
@@ -4039,7 +4067,7 @@ mod tests {
             ))
             .unwrap();
 
-        let response = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
+        let response = build_graph_validate_response(&pinned(&binding), &graph, None).unwrap();
 
         assert!(response.error.is_some(), "{:?}", response.lines);
         assert!(response
@@ -4059,7 +4087,7 @@ mod tests {
             ))
             .unwrap();
 
-        let response = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
+        let response = build_graph_validate_response(&pinned(&binding), &graph, None).unwrap();
 
         assert!(response.error.is_some(), "{:?}", response.lines);
         assert!(response
@@ -4078,7 +4106,7 @@ mod tests {
         let (_caller, relation) = external_placeholder_relation(RelationKind::References);
         graph.upsert_relation(&relation).unwrap();
 
-        let response = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
+        let response = build_graph_validate_response(&pinned(&binding), &graph, None).unwrap();
 
         assert!(response.error.is_some(), "{:?}", response.lines);
         assert!(response
@@ -4839,7 +4867,7 @@ mod tests {
         entity.file_origin = Some(FilePathId::new("src/present.rs"));
         graph.upsert_entity(&entity).unwrap();
 
-        let response = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
+        let response = build_graph_validate_response(&pinned(&binding), &graph, None).unwrap();
 
         let line = orphan_line(&response).expect("graph tree lacks the file, so it is orphaned");
         assert!(line.contains('1'), "{line}");
@@ -4889,7 +4917,7 @@ mod tests {
             .upsert_entity(&external_target_entity("info", 0x22))
             .unwrap();
 
-        let distinct = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
+        let distinct = build_graph_validate_response(&pinned(&binding), &graph, None).unwrap();
         assert!(
             duplicate_line(&distinct).is_none(),
             "distinct import sources are distinct entities: {}",
@@ -4902,7 +4930,7 @@ mod tests {
             .upsert_entity(&external_target_entity("info", 0x22))
             .unwrap();
 
-        let duplicated = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
+        let duplicated = build_graph_validate_response(&pinned(&binding), &graph, None).unwrap();
         let line = duplicate_line(&duplicated)
             .expect("two entities claiming one external target is a duplicate");
         assert!(line.contains('1'), "{line}");
@@ -4921,7 +4949,7 @@ mod tests {
         entity.file_origin = Some(FilePathId::new("src/tracked.rs"));
         graph.upsert_entity(&entity).unwrap();
 
-        let validate = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
+        let validate = build_graph_validate_response(&pinned(&binding), &graph, None).unwrap();
         let status = build_graph_status_response(
             &pinned(&binding),
             &graph,
@@ -4965,7 +4993,7 @@ mod tests {
         entity.file_origin = Some(FilePathId::new("src/tracked.rs"));
         graph.upsert_entity(&entity).unwrap();
 
-        let response = build_graph_validate_response(&pinned(&binding), &graph).unwrap();
+        let response = build_graph_validate_response(&pinned(&binding), &graph, None).unwrap();
 
         assert!(
             orphan_line(&response).is_none(),

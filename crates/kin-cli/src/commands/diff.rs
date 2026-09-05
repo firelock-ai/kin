@@ -842,6 +842,9 @@ pub async fn run(
                     "Admission scope: this diff was not measured against the working copy: {why}"
                 );
             }
+            if let Some(line) = retained_parse_line(&layout) {
+                println!("{line}");
+            }
             println!("{}", admitted_scope_line(&layout));
             println!(
                 "{}",
@@ -887,6 +890,9 @@ pub async fn run(
         if let Some(crate::commands::status::StatusAdmission::Skipped(why)) = pass.as_ref() {
             println!("Admission scope: this diff was not measured against the working copy: {why}");
         }
+        if let Some(line) = retained_parse_line(&layout) {
+            println!("{line}");
+        }
         println!("{}", admitted_scope_line(&layout));
         println!(
             "{}",
@@ -896,6 +902,19 @@ pub async fn run(
         );
     }
     Ok(())
+}
+
+/// The paths this diff's entity counts were derived from an earlier parse for.
+///
+/// Printed by both routes and read from the store rather than carried on the
+/// wire, so the daemon's rendered lines stay byte-identical and one record
+/// answers for `kin diff`, `kin status`, `kin commit`, `kin graph status` and
+/// `kin doctor` alike. Without it a broken edit prints `Entities: +0 ~0 -0`
+/// beside a hunk that plainly changed a function, and the zero is correct: the
+/// bytes did not parse, so nothing was derived from them. The zero is the
+/// answer; this line is what the zero means.
+fn retained_parse_line(layout: &kin_core::KinLayout) -> Option<String> {
+    kin_core::retained_parse::read(layout).describe(chrono::Utc::now())
 }
 
 /// Content lines for a report the daemon rendered, read from this CLI's own CAS.
@@ -1604,8 +1623,39 @@ mod tests {
         assert!(line.contains("11"), "{line}");
     }
 
-    /// The control for the test above. A diff that elides nothing must say
-    /// nothing about eliding, or every diff reads as trimmed.
+    /// `kin diff` says what its zero means.
+    ///
+    /// `Entities: +0 ~0 -0` beside a hunk that plainly changed a function is
+    /// correct and unreadable: the bytes did not parse, so nothing was derived
+    /// from them. Journey GAP-9 is that the zero stood alone. Both routes print
+    /// this from the same store record, so the daemon-rendered lines and the
+    /// local ones cannot come to disagree.
+    #[test]
+    fn the_diff_line_names_a_file_the_graph_answers_about_from_an_earlier_parse() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+
+        // The control first, and it is the half a line printed unconditionally
+        // would fail.
+        assert!(
+            retained_parse_line(&init.layout).is_none(),
+            "a store with no record says nothing about retained parses"
+        );
+
+        kin_core::retained_parse::record(
+            &init.layout,
+            &[kin_core::retained_parse::ObservedParse::retained(
+                "search.py",
+                4,
+            )],
+        );
+        let line = retained_parse_line(&init.layout).expect("a recorded path speaks");
+        assert!(line.contains("search.py (4 parse errors)"), "{line}");
+        assert!(line.contains("The bytes on disk do not parse"), "{line}");
+    }
+
+    /// The control for the withheld-count test above. A diff that elides
+    /// nothing must say nothing about eliding, or every diff reads as trimmed.
     #[test]
     fn a_diff_that_withholds_nothing_says_nothing_about_withholding() {
         let id = EntityId::new();

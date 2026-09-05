@@ -136,7 +136,7 @@ def status_publishes_the_census(text):
     the repository-grain count already exists on the page above it; the delta is
     the per-language row and the named paths.
     """
-    return ("Parse coverage (files that produced an entity / files admitted):" in text
+    return ("Parse coverage (files whose current bytes produced an entity / files admitted):" in text
             and "no_entity:" in text)
 
 
@@ -330,14 +330,14 @@ def self_test():
     """
     cases = [
         ("status_publishes_the_census", True,
-         "Parse coverage (files that produced an entity / files admitted):\n"
+         "Parse coverage (files whose current bytes produced an entity / files admitted):\n"
          "  javascript: 4/7 (57%)\n  no_entity: 3 of 7 admitted rust files produced "
          "no entity, including lib/silent0.rs"),
         # The header alone is not the delta: a repository-grain count already
         # existed on that page, and the per-language row plus the named paths
         # are what this suite is about.
         ("status_publishes_the_census", False,
-         "Parse coverage (files that produced an entity / files admitted):\n"
+         "Parse coverage (files whose current bytes produced an entity / files admitted):\n"
          "  rust: 3/3 (100%)"),
         ("status_publishes_the_census", False, "no_entity: 3 of 3 admitted rust files"),
         ("status_publishes_the_census", False, "Entities: 4  |  Files: 4"),
