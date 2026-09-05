@@ -4907,9 +4907,9 @@ mod tests {
             "a ranking that named the query's symbol needs no relevance caveat: {named}"
         );
     }
-    /// GAP-F, on the surface an agent reads: the compact page the same tool
-    /// returns when the whole-ranking flag is ABSENT because one row the caller
-    /// never saw carried the query's word.
+    /// The surface an agent reads: the compact page this tool returns when the
+    /// whole-ranking flag is ABSENT because one row the caller never saw carried
+    /// the query's word.
     ///
     /// Measured on express at 798 of 798 embedded. "attach an encoding label to
     /// a media type string" returned eight rows all `matched: text_fallback` at

@@ -1273,6 +1273,19 @@ fn locate_empty_window_over_nonempty_ranking(payload: &Value) -> bool {
 /// to drift into retrieval by being shared with it. Hyphens are excluded because
 /// ordinary prose hyphenates, and a rule that reads `graph-native` as a symbol
 /// name would qualify half of all English queries.
+///
+/// Capitals alone are excluded for the same reason, and that exclusion is the
+/// difference between this gate covering real questions and exempting most of
+/// them. Counting capitals alone made `JSON` a named symbol, so "send a JSON
+/// response body to the client" was routed to the symbol gate beside this one,
+/// which asks a different question and fires only on the whole-ranking
+/// `all_fallback` flag that a paged answer often does not carry. The measured
+/// consequence was that the identical page of fallback neighbours certified
+/// under that phrasing, and HTTP, API, URL, SQL, HTML, XML, UUID, DNS and TLS
+/// did it too. Mixed case is what separates a name from an abbreviation, and a
+/// token carrying an underscore, a dot or a path separator stays a symbol
+/// whatever its case, so `MAX_RETRIES`, `README.md`, `IOError` and
+/// `HTTPServer` are all still symbol lookups.
 fn query_names_a_symbol(query: &str) -> bool {
     query.split_whitespace().any(|token| {
         let core = token.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'));
@@ -1280,7 +1293,8 @@ fn query_names_a_symbol(query: &str) -> bool {
             && (core.contains('_')
                 || core.contains("::")
                 || core.contains('.')
-                || core.chars().filter(|ch| ch.is_ascii_uppercase()).count() >= 2)
+                || (core.chars().filter(|ch| ch.is_ascii_uppercase()).count() >= 2
+                    && core.chars().any(|ch| ch.is_ascii_lowercase())))
     })
 }
 
@@ -1415,11 +1429,11 @@ fn locate_relevance_unverified(payload: &Value) -> bool {
 /// today stops firing.
 ///
 /// A name match is NOT discounted for resting on an ordinary English word, even
-/// though the row that silenced this gate on express was one. The tool's three
-/// best answers are that shape too: `app.render` for "render a view template
-/// with a layout" and `res.json` for "send a JSON response body to the client"
-/// are both name matches on a plain lowercase token, both first row, both right.
-/// A returned name row IS the calibrated floor a locate response publishes, and
+/// though the row that silenced this gate on express was one. Two of the tool's
+/// best answers are that shape: `app.render` for "render a view template with a
+/// layout" and `res.json` for "send a JSON response body to the client" are both
+/// name matches on a plain lowercase token, both first row, both right. A
+/// returned name row IS the calibrated floor a locate response publishes, and
 /// the defect is that a name row the caller cannot see was allowed to stand in
 /// for one. Telling `app.render` from a question's stray word is a ranking
 /// judgment and belongs where ranking is decided.
@@ -7164,8 +7178,8 @@ mod tests {
         row
     }
 
-    /// The eight rows express returned for the concept query in GAP-F, kinds and
-    /// scores as measured.
+    /// The eight rows express returned for the concept query, kinds and scores
+    /// as measured.
     fn gap_f_fallback_rows() -> Value {
         json!([
             compact_locate_row(
@@ -7206,7 +7220,7 @@ mod tests {
 
     #[test]
     fn a_prose_page_of_lexical_neighbours_is_qualified_when_the_named_row_is_off_the_page() {
-        // journey072 GAP-F, on express with the vector index complete at 798 of
+        // Measured on express with the vector index complete at 798 of
         // 798. The caller asked "attach an encoding label to a media type
         // string" and received eight lexical neighbours at scores 52.05 down to
         // 52.02, none of them `setCharset`, which was not in the ranking at any
@@ -7246,11 +7260,14 @@ mod tests {
     #[test]
     fn a_prose_page_whose_returned_rows_name_the_query_stays_unqualified() {
         // The control that pins the repair's scope, and the reason this gate
-        // must not discount a plain-word name match. All three are prose queries
-        // measured on the same express store, all three answered first row, and
-        // all three name matches rest on an ordinary English token, so a rule
-        // that demanded a symbol-shaped one would refuse to certify the tool's
-        // three best answers.
+        // must not discount a plain-word name match. All three questions are
+        // prose by this module's own rule, all three answered first row on the
+        // same store, and the first two are named by an ordinary English token,
+        // so a rule that demanded a symbol-shaped one would refuse to certify
+        // the tool's best answers. The second reaches this gate at all only
+        // because an acronym is not a symbol the caller named: while `JSON`
+        // counted as one, `query_names_a_symbol` returned true and the row
+        // classifier below was never consulted for that question.
         for (query, name, file, score) in [
             (
                 "render a view template with a layout",
@@ -7289,7 +7306,7 @@ mod tests {
 
     #[test]
     fn a_prose_page_of_vector_neighbours_stays_qualified() {
-        // The other half of GAP-F, measured in the same session: "decide which
+        // The other half of the same measurement: "decide which
         // proxy addresses may be believed" returned eight rows all
         // `matched: semantic` at 96.28 down to 94.41, with `all_fallback` set,
         // and was correctly inconclusive. Widening the gate to read the returned
@@ -7369,6 +7386,188 @@ mod tests {
             "a file answer carries no entity match kinds and must not be read as fallback: \
              {payload}"
         );
+    }
+
+    /// One page on the FULL fused surface, which serializes `LocateEntity`
+    /// verbatim: `match_kind` per row and no compact `matched` key.
+    fn full_fused_page(query: &str, entities: Value, total_ranked: u64) -> Value {
+        json!({
+            "query": query,
+            "granularity": "entity",
+            "routing": "fused-v1",
+            "page": 0,
+            "entities": entities,
+            "files": [{"path": "lib/response.js", "score": 52.05}],
+            "total_ranked": total_ranked,
+        })
+    }
+
+    fn full_fused_row(name: &str, match_kind: &str) -> Value {
+        json!({
+            "entity_id": "00000000-0000-0000-0000-0000000000ba",
+            "kind": "function",
+            "name": name,
+            "score": 52.05,
+            "definition": true,
+            "match_kind": match_kind,
+            "provenance": { "file": "lib/response.js" },
+        })
+    }
+
+    #[test]
+    fn a_prose_page_of_fallback_rows_is_qualified_on_the_full_fused_surface() {
+        // The compact projection is not the only surface this gate has to read.
+        // `fused_semantic_locate_payload` serializes the reused `LocateResult`
+        // types when the caller asks for the full shape, and there a row's kind
+        // is `match_kind` rather than `matched`. A classifier reading only the
+        // compact spelling would let every full-surface page certify, and no
+        // fixture would notice: swapping the `match_kind` read for a second
+        // `matched` read leaves the rest of this suite green.
+        let payload = full_fused_page(
+            "attach an encoding label to a media type string",
+            json!([
+                full_fused_row("res.send", "text_fallback"),
+                full_fused_row("res.sendFile", "text_fallback"),
+            ]),
+            31,
+        );
+        // A real full-fused row carries a `match_evidence` object beside its
+        // `match_kind` (`crates/kin-daemon/src/api.rs:11642`). This one omits it
+        // for the same reason the cosine fixture below omits `match_kind`: with
+        // one spelling present, the arm under test is the only thing that can
+        // classify the row, and a mutation to it cannot hide behind a sibling.
+        assert!(
+            payload["entities"][0].get("matched").is_none(),
+            "this fixture omits the compact spelling so match_kind is the only classifier: \
+             {payload}"
+        );
+        let negative = negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("a full-surface page of fallback rows may not certify a concept answer");
+        assert_eq!(negative["kind"], json!("relevance_unverified"));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("relevance_floor_unmeasured"), "{reason}");
+
+        // The control on the same surface: one returned row carrying the name
+        // the query used is the calibrated floor, and it is read through the
+        // same spelling.
+        let named = full_fused_page(
+            "attach an encoding label to a media type string",
+            json!([
+                full_fused_row("type", "name"),
+                full_fused_row("res.sendFile", "text_fallback"),
+            ]),
+            31,
+        );
+        assert!(
+            negative_for(
+                "semantic_locate",
+                &named,
+                &semantic_authoritative_envelope()
+            )
+            .is_none(),
+            "a full-surface page whose row names the query needs no caveat: {named}"
+        );
+    }
+
+    #[test]
+    fn a_prose_page_of_fallback_rows_is_qualified_on_the_cosine_surface() {
+        // The third spelling: `match_evidence.name_match`, the cosine arm's own
+        // word for the fact the other two surfaces spell `name`.
+        //
+        // A stock daemon's cosine entity row carries BOTH keys. It has emitted
+        // `match_kind` on every entity-granularity hit since `917bf1d3b`
+        // (2026-08-12), at `crates/kin-daemon/src/api.rs:11248`, derived from
+        // the same predicate the evidence object reports so the two cannot
+        // disagree. This fixture is therefore not a sample of what that arm
+        // sends today. It is the compatibility read, for a producer that
+        // publishes the evidence object and no `match_kind`, and it omits the
+        // sibling key on purpose so that the arm under test is the only thing
+        // that can classify the row. Without that arm every row here reports an
+        // unknown kind, the gate never fires, and a prose page of neighbours
+        // certifies.
+        let payload = json!({
+            "query": "attach an encoding label to a media type string",
+            "routing": "cosine-v0",
+            "page": 0,
+            "total_ranked": 31,
+            "results": [
+                cosine_locate_hit("res_send", "none"),
+                cosine_locate_hit("res_send_file", "partial"),
+            ],
+        });
+        assert!(
+            payload["results"][0].get("match_kind").is_none(),
+            "this fixture omits match_kind so the evidence arm is the only classifier: {payload}"
+        );
+        let negative = negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("a cosine page of neighbours may not certify a concept answer");
+        assert_eq!(negative["kind"], json!("relevance_unverified"));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("relevance_floor_unmeasured"), "{reason}");
+
+        // The control: `exact` is the cosine arm's own word for the fact the
+        // other two surfaces spell `name`.
+        let named = json!({
+            "query": "attach an encoding label to a media type string",
+            "routing": "cosine-v0",
+            "page": 0,
+            "total_ranked": 31,
+            "results": [
+                cosine_locate_hit("type", "exact"),
+                cosine_locate_hit("res_send_file", "partial"),
+            ],
+        });
+        assert!(
+            negative_for(
+                "semantic_locate",
+                &named,
+                &semantic_authoritative_envelope()
+            )
+            .is_none(),
+            "an exact name match is the floor on this surface too: {named}"
+        );
+    }
+
+    #[test]
+    fn an_acronym_in_a_question_does_not_exempt_it_from_the_relevance_gate() {
+        // The same eight-row all-fallback page, asked with an acronym in the
+        // sentence. `query_names_a_symbol` used to read any three-character
+        // token with two capitals as a named symbol, so `JSON` alone sent the
+        // question to the symbol gate, which needs the whole-ranking
+        // `all_fallback` flag this page does not carry, and the page certified.
+        // That exempted the most common shape of real question there is: HTTP,
+        // API, URL, SQL, HTML, XML, UUID, DNS and TLS all did it too.
+        let payload = compact_fused_page(
+            "send a JSON response body to the client",
+            gap_f_fallback_rows(),
+            31,
+        );
+        let negative = negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("an acronym in the sentence is not a symbol the caller named");
+        assert_eq!(negative["kind"], json!("relevance_unverified"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("relevance_floor_unmeasured"), "{reason}");
+
+        // The control that keeps the symbol gate's own territory: a token that
+        // mixes case IS a symbol name, and a query naming one is answered by
+        // the gate beside this one rather than by this one.
+        assert!(query_names_a_symbol("how does HTTPServer parse a header"));
+        assert!(query_names_a_symbol("IOError"));
+        assert!(query_names_a_symbol("MAX_RETRIES"));
     }
 
     #[test]
@@ -7724,6 +7923,21 @@ mod tests {
         assert!(!query_names_a_symbol("Checks That Cannot Fail"));
         assert!(!query_names_a_symbol("graph-native repo substrate"));
         assert!(!query_names_a_symbol(""));
+        // An all-capital token is an acronym English prose is full of, not a
+        // symbol the caller named. Mixed case is what separates the two, and a
+        // token carrying an underscore, a dot or a path separator stays a
+        // symbol whatever its case.
+        assert!(!query_names_a_symbol(
+            "send a JSON response body to the client"
+        ));
+        assert!(!query_names_a_symbol(
+            "which HTTP status does a redirect use"
+        ));
+        assert!(!query_names_a_symbol("parse the URL and the DNS name"));
+        assert!(query_names_a_symbol("how does HTTPServer parse a header"));
+        assert!(query_names_a_symbol("IOError"));
+        assert!(query_names_a_symbol("MAX_RETRIES"));
+        assert!(query_names_a_symbol("README.md"));
     }
 
     /// FIR-2542's second half. `edge_coverage_unreported` reached every
