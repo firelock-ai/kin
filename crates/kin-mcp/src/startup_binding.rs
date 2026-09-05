@@ -164,8 +164,13 @@ impl StartupDaemonBinding {
     /// `send_replace` rather than `send` for the same reason the state channel
     /// uses it: there is usually no subscriber, because the launcher's binding
     /// task subscribes only while it is actually waiting.
-    pub fn admit_daemon_spawn(&self) {
-        self.spawn_admitted.send_replace(true);
+    ///
+    /// Returns whether this call was the FIRST admission. That call is the one
+    /// that starts the daemon, so it is the only one that can be waiting on a
+    /// cold open rather than on a daemon somebody else already paid for, and
+    /// the caller sizes its wait against the answer.
+    pub fn admit_daemon_spawn(&self) -> bool {
+        !self.spawn_admitted.send_replace(true)
     }
 
     /// Whether a `tools/call` has admitted starting a daemon.
@@ -238,17 +243,26 @@ impl StartupDaemonBinding {
     }
 
     /// The honest account of a `tools/call` that arrived while the binding is
-    /// still pending: what is happening, how long it has been happening, and
-    /// what the caller should do (retry, not remediate).
-    pub fn starting_report(&self, tool: &str) -> String {
+    /// still pending: what is happening, how long it has been happening, how
+    /// long this call actually waited before saying so, and what the caller
+    /// should do (retry, not remediate).
+    ///
+    /// `waited` is stated rather than left to be inferred. Two calls in one
+    /// session now get different bounds, so a reader comparing two of these
+    /// reports would otherwise see the same sentence over waits that differ by
+    /// half a minute, and could not tell a call that gave up early from one
+    /// that gave the daemon its full patience.
+    pub fn starting_report(&self, tool: &str, waited: Duration) -> String {
         let phase = self.startup_phase();
         let elapsed = self.began.elapsed().as_secs();
+        let waited = waited.as_secs();
         format!(
             "kin-mcp cannot answer '{tool}' yet: the repo daemon is still starting \
-             ({phase}; {elapsed}s so far). The MCP transport is up and `initialize` and \
-             `tools/list` are served; retry this call once the daemon is ready. Large \
-             repositories can take minutes on a fully cold start. This is startup latency, \
-             not a failure: do not restart the MCP server or re-run `kin init`."
+             ({phase}; {elapsed}s so far, and this call waited {waited}s for it). The MCP \
+             transport is up and `initialize` and `tools/list` are served; retry this call \
+             once the daemon is ready. Large repositories can take minutes on a fully cold \
+             start. This is startup latency, not a failure: do not restart the MCP server or \
+             re-run `kin init`."
         )
     }
 
@@ -363,9 +377,15 @@ mod tests {
             !binding.daemon_spawn_admitted(),
             "attaching to a daemon that was already serving is not a caller asking for one"
         );
-        binding.admit_daemon_spawn();
+        assert!(
+            binding.admit_daemon_spawn(),
+            "the first tool call to ask for a graph answer is the one that starts the daemon"
+        );
         assert!(binding.daemon_spawn_admitted());
-        binding.admit_daemon_spawn();
+        assert!(
+            !binding.admit_daemon_spawn(),
+            "a second tool call is not paying for a cold start and must not claim it is"
+        );
         assert!(
             binding.daemon_spawn_admitted(),
             "admission is idempotent: a second tool call must not unset it"
@@ -402,7 +422,7 @@ mod tests {
     fn the_starting_report_carries_the_injected_phase() {
         let binding = StartupDaemonBinding::new();
         // Before a probe is installed, the report still explains itself.
-        let report = binding.starting_report("kin_graph_status");
+        let report = binding.starting_report("kin_graph_status", Duration::from_secs(10));
         assert!(
             report.contains("resolving which repository"),
             "with no probe the report carries the resolve phase: {report}"
@@ -424,12 +444,32 @@ mod tests {
         let probe_phase = std::sync::Arc::clone(&phase);
         binding.set_phase_probe(Box::new(move || *probe_phase.lock().unwrap()));
         assert!(binding
-            .starting_report("kin_graph_status")
+            .starting_report("kin_graph_status", Duration::from_secs(10))
             .contains("loading the repository graph"));
 
         *phase.lock().unwrap() = "phase: the daemon is listening and finishing readiness checks";
         assert!(binding
-            .starting_report("kin_graph_status")
+            .starting_report("kin_graph_status", Duration::from_secs(10))
             .contains("finishing readiness checks"));
+    }
+
+    /// The bound the call actually waited reaches the reader.
+    ///
+    /// Two calls in one session wait different amounts now, and a report that
+    /// named only the daemon's own elapsed time would read identically over a
+    /// ten-second give-up and a forty-five-second one.
+    #[test]
+    fn the_starting_report_states_the_bound_this_call_waited() {
+        let binding = StartupDaemonBinding::new();
+        let patient = binding.starting_report("kin_graph_status", Duration::from_secs(45));
+        assert!(
+            patient.contains("this call waited 45s"),
+            "the long wait has to be visible in the report: {patient}"
+        );
+        let brief = binding.starting_report("kin_graph_status", Duration::from_secs(10));
+        assert!(
+            brief.contains("this call waited 10s"),
+            "and so has the short one, or the two are indistinguishable: {brief}"
+        );
     }
 }

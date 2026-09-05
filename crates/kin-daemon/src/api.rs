@@ -35479,6 +35479,79 @@ mod tests {
         assert!(change.admission_policy_delta.is_none());
     }
 
+    /// Read this store's graph-section standing the way every reporting surface
+    /// does, off a fresh authority open.
+    fn graph_section_standing(
+        state: &Arc<DaemonState>,
+    ) -> kin_core::graph_section::GraphSectionStanding {
+        let authority =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(state)
+                .expect("open the pinned local repository authority");
+        let lease = authority.manager.read_authority();
+        kin_core::graph_section::read(&lease, &authority.workspace_id).standing
+    }
+
+    /// A commit leaves this workspace's base graph section written, so the
+    /// store it hands back does not fold its history at every open.
+    ///
+    /// This is journey GAP-4. `kin init` materializes a section and nothing
+    /// else did, so the FIRST commit in a repository built with Kin left
+    /// `kin doctor` printing `✗ Graph section DEGRADED ... kin graph
+    /// materialize writes one`, on a store holding one change, with the setup
+    /// footer calling it a host limit. The same absence costs an admitted
+    /// repository far more: an express store of 470 MiB opened in 37.9 seconds
+    /// with `folded_changes=3834` because one commit had refused its section,
+    /// and every later open paid it again.
+    ///
+    /// Three assertions rather than one, because the interesting states are
+    /// before, at the boundary and after. An unborn workspace has no base to
+    /// memoize and must not be reported as folding; the first commit is where
+    /// the old behaviour broke; and the second commit is where a section
+    /// written once and never refreshed would come back as `present but
+    /// refused`, which reads differently and is just as slow.
+    ///
+    /// Falsified by deleting the `refresh_workspace_base_graph_section` call at
+    /// the end of `commit_native_plan_with_working_copy_proof`: both commit
+    /// assertions then report `Folding`.
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_leaves_the_workspace_base_graph_section_written() {
+        let repo = tempfile::tempdir().unwrap();
+        let state =
+            Arc::new(DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap());
+        let app = router(Arc::clone(&state));
+
+        assert_eq!(
+            graph_section_standing(&state),
+            kin_core::graph_section::GraphSectionStanding::Unborn,
+            "a workspace with no base target has nothing to fold and nothing to memoize"
+        );
+
+        std::fs::write(
+            repo.path().join("notes.py"),
+            b"def add(a, b):\n    return a + b\n",
+        )
+        .unwrap();
+        commit_through_api(&app, kin_model::OperationId::new(), "first").await;
+        assert_eq!(
+            graph_section_standing(&state),
+            kin_core::graph_section::GraphSectionStanding::Serving,
+            "the first commit must leave a section that answers for the base it just published"
+        );
+
+        std::fs::write(
+            repo.path().join("notes.py"),
+            b"def add(a, b):\n    return b + a\n",
+        )
+        .unwrap();
+        commit_through_api(&app, kin_model::OperationId::new(), "second").await;
+        assert_eq!(
+            graph_section_standing(&state),
+            kin_core::graph_section::GraphSectionStanding::Serving,
+            "a second commit must refresh the section it moved the base past, not leave it refused"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial(commit_phase_capture)]
     async fn commit_amend_rejects_stale_head_before_admitting_pending_files() {

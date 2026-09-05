@@ -61,18 +61,28 @@ pub(crate) const ROUND_TRIP_TOOL: &str = "kin_graph_status";
 /// How long one client's launch may take before it is killed.
 ///
 /// The server answers `initialize` and `tools/list` immediately by design, and
-/// bounds a `tools/call` that races its startup daemon binding to a ten-second
-/// grace before answering that the daemon is still starting. This leaves room
-/// for that grace plus process start and exit, and nothing more.
-pub(crate) const PER_CLIENT_BUDGET: Duration = Duration::from_secs(20);
+/// bounds a `tools/call` that races its startup daemon binding before answering
+/// that the daemon is still starting. This leaves room for that grace plus
+/// process start and exit, and nothing more.
+///
+/// Derived from the server's own constant rather than restated, because the two
+/// cannot be allowed to drift: a budget shorter than the grace kills the client
+/// mid-wait, and the run then reports a deadline where the server was about to
+/// hand back an accurate account of a daemon that was still coming up.
+pub(crate) const PER_CLIENT_BUDGET: Duration =
+    kin_mcp::FIRST_TOOLS_CALL_STARTUP_BIND_GRACE.saturating_add(Duration::from_secs(10));
 
 /// How long the whole verification step may take across every client.
 ///
-/// Six configured clients under the per-client bound alone would be two
-/// minutes. Clients are checked in order and whatever the budget does not reach
-/// is reported skipped by name, which is slower to read than a green tick and
-/// far better than a setup run that stalls.
-pub(crate) const TOTAL_BUDGET: Duration = Duration::from_secs(45);
+/// One client can pay a cold daemon start and the rest cannot: the first
+/// client's tool call is what starts the daemon, so every client after it binds
+/// a daemon that is already serving and answers in well under a second. So the
+/// budget covers one cold client plus the warm ones behind it, rather than the
+/// per-client bound multiplied by however many clients are configured. Clients
+/// are checked in order and whatever the budget does not reach is reported
+/// skipped by name, which is slower to read than a green tick and far better
+/// than a setup run that stalls.
+pub(crate) const TOTAL_BUDGET: Duration = PER_CLIENT_BUDGET.saturating_add(Duration::from_secs(35));
 
 /// How long to wait for a drained pipe after the child is gone.
 ///
@@ -864,6 +874,28 @@ pub(crate) fn print_proofs(proofs: &[ClientProof]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The client budget has to outlast the wait the server it launches is
+    /// entitled to take.
+    ///
+    /// This is the whole reason the constant is derived rather than written
+    /// down twice. A budget at or under the grace kills the client while the
+    /// server is still waiting, and the run reports a deadline instead of the
+    /// accurate still-starting account the server was about to hand back. The
+    /// same reading applies to the whole-step budget: it has to fit at least one
+    /// client that pays a cold daemon start, because the first client's tool
+    /// call is what starts the daemon.
+    #[test]
+    fn the_client_budget_outlasts_the_wait_the_mcp_server_is_allowed_to_take() {
+        assert!(
+            PER_CLIENT_BUDGET > kin_mcp::FIRST_TOOLS_CALL_STARTUP_BIND_GRACE,
+            "a per-client budget inside the server's own grace kills the client mid-wait"
+        );
+        assert!(
+            TOTAL_BUDGET >= PER_CLIENT_BUDGET,
+            "a total budget under one client's budget can never let a cold client finish"
+        );
+    }
 
     /// Build a session out of raw JSON-RPC responses, as the reader would have
     /// parsed them off the server's stdout.

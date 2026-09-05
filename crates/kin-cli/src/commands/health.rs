@@ -5234,13 +5234,24 @@ fn graph_section_row_for_unread_graph(
 /// Turn the section state into a row, split from its fetch so every branch is
 /// testable without a daemon.
 ///
-/// `Degraded` for a folding store, and the severity is chosen rather than
+/// `Stale` for a folding store, and the severity is chosen rather than
 /// inherited. A store that folds is completely correct; it is only paying a full
 /// history replay at every open, which on the kin store was 47 seconds of a 95
 /// second one. `Missing` and `Misconfigured` fail the whole report, and a store
-/// that answers every question correctly must not do that. `Degraded` costs it
-/// the all-clear and nothing else, which is exactly the claim the evidence
-/// supports, and it names the one command that changes it.
+/// that answers every question correctly must not do that. What is wanted is a
+/// status that costs the all-clear and nothing else.
+///
+/// Two statuses do exactly that, and the row carried the wrong one. `Degraded`
+/// is documented on the enum as "a real shortfall in the machine or container
+/// Kin was asked to run on", and `setup.rs` reads it at its word: its closing
+/// line prints "Degraded rows are host limits: Graph section." So a first
+/// `kin commit` in a fresh repository told its owner that a memoization nobody
+/// had written yet was a property of their machine, over a store holding one
+/// change, with an internal repair command beside it (journey GAP-4). `Stale`
+/// carries the same roll-up behaviour for this row, keeping it out of `Ready`
+/// through `needs_attention` and out of `Failing` through `blocks_readiness`,
+/// and it says the true thing: this store's acceleration is not current. The
+/// row still names the one command that changes it.
 ///
 /// A refused section is reported with kin-db's own refusal word because that is
 /// the word its own log carries, so an operator comparing this row against
@@ -5254,9 +5265,14 @@ pub(crate) fn graph_section_health(
     let status = match state.standing {
         kin_core::graph_section::GraphSectionStanding::Serving
         | kin_core::graph_section::GraphSectionStanding::Unborn => HealthStatus::Healthy,
-        kin_core::graph_section::GraphSectionStanding::Folding => HealthStatus::Degraded,
+        kin_core::graph_section::GraphSectionStanding::Folding => HealthStatus::Stale,
         // Never healthy. A state that could not be read is not a state that is
         // fine, and rendering it as one is the invisibility this row replaces.
+        // It shares `Stale` with a folding store, and the two stay separate
+        // where `kin_core::graph_section` keeps them separate, in the sentence:
+        // one says the store folds and how big the fold is, the other says the
+        // state could not be read and why. What the module refuses is rendering
+        // either as a clean bill, and neither is one.
         kin_core::graph_section::GraphSectionStanding::Unknown => HealthStatus::Stale,
     };
     let check = HealthCheck::new(ID, LABEL, status, state.doctor_detail());
@@ -7188,9 +7204,15 @@ mod tests {
     fn a_folding_store_loses_the_all_clear_without_failing_the_report() {
         let row = graph_section_health(&folding_section_state());
         assert!(
-            matches!(row.status, HealthStatus::Degraded),
-            "a folding store is degraded, not broken: {:?}",
+            matches!(row.status, HealthStatus::Stale),
+            "a folding store's acceleration is out of date, not broken, and not a host limit: \
+             {:?}",
             row.status
+        );
+        assert!(
+            !matches!(row.status, HealthStatus::Degraded),
+            "`Degraded` is the host-shortfall status, and `setup.rs` prints `Degraded rows are \
+             host limits`; a store that one `kin graph materialize` fixes is not a host limit"
         );
         assert!(
             !blocks_readiness(&row),

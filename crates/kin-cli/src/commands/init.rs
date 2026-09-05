@@ -443,6 +443,294 @@ async fn stop_conversion_daemon(borrowed_existing: bool, kin_root: &Path) {
     }
 }
 
+/// How long the conversion phase waits for the first embedding pass to settle
+/// before it stops the daemon it started.
+///
+/// [`stop_conversion_daemon`] already waits for the sweep, and its own doc says
+/// why: "a sweep killed halfway is the failure this whole area exists to
+/// prevent". The first embedding pass was given no such wait, so a conversion
+/// that queued a backlog stopped the only process that could drain it, and the
+/// daemon a user's next command started began that pass from zero. On the
+/// journey run of 2026-09-04 the store handed over reported `Embeddings: 0/804
+/// indexed (804 pending)` and the session's first semantic query ranked on
+/// lexical fallback.
+///
+/// Bounded for the reason `ENRICH_BUDGET` is bounded, and much more tightly: the
+/// pass is resumable, so what this cuts short the next daemon continues from a
+/// persisted checkpoint rather than from zero, and a conversion that waits
+/// without end on a very large first fill is worse than one that hands over a
+/// store still filling and says so.
+///
+/// Sized from the pass, not from a feeling. Measured on 2026-09-05 on a
+/// 180-file Python repository admitted through `kin init`, whose store queues
+/// 1,800 embeddings: a daemon drained 880 of them in 21 seconds on the CPU
+/// backend with the host carrying six concurrent Rust builders, so the whole
+/// queue from zero is around 45 seconds on that shape, and the 804 the journey
+/// run left on express would be under 20. Two minutes is that with well over
+/// double the margin, and it stays under half of what an import of this size
+/// already costs: this one took 134 seconds and express took 296.
+const FIRST_EMBED_PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How often the wait asks the daemon where the pass has reached.
+const FIRST_EMBED_PASS_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a pass may report no progress before this wait stops calling it a
+/// pass.
+///
+/// The daemon stands its embedding worker down for reasons this reading cannot
+/// see. `KIN_DAEMON_AUTO_EMBED=0` pauses it outright, and
+/// `background_embed_worker_can_drain` gates on that pause, on a permanently
+/// failed worker and on whether embed progress can be persisted at all, while
+/// `EmbedRuntimeState` carries only the last two of those three. So a queue on
+/// an opt-out host is `Filling` by every field this wait can read, and without
+/// this the conversion would sit here for the whole budget on a store where
+/// nothing was ever going to be embedded.
+///
+/// Answered by progress rather than by a flag, which is what makes it cover the
+/// case nobody has thought of yet: a pass that is neither indexing, nor
+/// downloading its model, nor holding the embed mutex is not a pass. The window
+/// is not a race against how long a drain takes, because a running drain moves
+/// the indexed count on every batch and resets it: the 880 embeddings measured
+/// on 2026-09-05 took 21 seconds in total and would have reset this many times
+/// over. It only has to be longer than the gap between two batches.
+const FIRST_EMBED_PASS_STALL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How often the wait says where the pass has reached.
+///
+/// A conversion that has already taken minutes must not then go silent for two
+/// more, and a line every poll is a wall nobody reads. Fifteen seconds puts at
+/// most eight lines under a wait that runs to its budget, and one under a wait
+/// that ends in a few seconds.
+const FIRST_EMBED_PASS_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What the conversion phase should do about the embedding pass it started,
+/// read from one daemon reading.
+///
+/// Split from the poll for the reason every other reader in this file is split
+/// from its fetch: each branch has to be provable without a daemon, an
+/// embedding model or a network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstEmbedPassStanding {
+    /// Nothing is queued. Stopping the daemon now costs nothing.
+    Settled,
+    /// Work is outstanding and something in this daemon will drain it. This is
+    /// the state the stop must not cut short.
+    Filling,
+    /// Work is outstanding and nothing in this daemon will drain it, so waiting
+    /// buys the store nothing.
+    Stalled(&'static str),
+}
+
+/// Read one daemon reading into a decision.
+///
+/// The stalled arms mirror the daemon's own `background_embed_worker_can_drain`
+/// predicate rather than a second copy of its rule: a backlog nobody will
+/// consume is not work in flight, and treating it as such would make every
+/// conversion on such a store sit here for the whole budget.
+fn first_embed_pass_standing(
+    embed: &crate::commands::resources::EmbedRuntimeState,
+) -> FirstEmbedPassStanding {
+    if embed.embed_worker_failed {
+        return FirstEmbedPassStanding::Stalled(
+            "the daemon's background embedding worker has stopped",
+        );
+    }
+    if embed.embed_persistence_unavailable {
+        return FirstEmbedPassStanding::Stalled(
+            "this store's graph authority carries no durable local vector sidecar, so nothing \
+             embeds here",
+        );
+    }
+    if embed.embeddings_pending == 0 {
+        return FirstEmbedPassStanding::Settled;
+    }
+    FirstEmbedPassStanding::Filling
+}
+
+/// What one wait for the first embedding pass ended in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FirstEmbedPassOutcome {
+    /// The daemon could not be read, so nothing was waited for. Never an error:
+    /// a conversion that already succeeded must not be turned into a failure,
+    /// or a hang, by a probe.
+    Unread,
+    /// The queue drained.
+    Drained { indexed: usize },
+    /// Nothing in this daemon would drain the queue.
+    Stalled {
+        pending: usize,
+        reason: &'static str,
+    },
+    /// The budget ran out with the queue still filling. The budget is carried
+    /// rather than read back off the constant, so the line a reader sees names
+    /// the wait that actually happened.
+    BudgetSpent {
+        indexed: usize,
+        total: usize,
+        waited_secs: u64,
+    },
+}
+
+impl FirstEmbedPassOutcome {
+    /// The line the conversion prints, or nothing when there is nothing a
+    /// reader could act on.
+    ///
+    /// Silent on `Unread` and on a queue that was already empty, because a
+    /// conversion of a repository with nothing to embed must not grow a line
+    /// about embedding.
+    fn note(&self) -> Option<String> {
+        match self {
+            Self::Unread => None,
+            Self::Drained { indexed: 0 } => None,
+            Self::Drained { indexed } => Some(format!(
+                "First embedding pass: complete, {indexed} indexed before this command handed the \
+                 repository over."
+            )),
+            Self::Stalled { pending, reason } => Some(format!(
+                "First embedding pass: {pending} still queued and {reason}, so this command did \
+                 not wait for them."
+            )),
+            Self::BudgetSpent {
+                indexed,
+                total,
+                waited_secs,
+            } => Some(format!(
+                "First embedding pass: {indexed} of {total} indexed in the {waited_secs}s this \
+                 command was willing to wait. The rest is persisted work in progress: the daemon \
+                 your next command starts resumes it from here, and semantic queries answer from \
+                 lexical retrieval until it finishes."
+            )),
+        }
+    }
+}
+
+/// Wait for the first embedding pass to settle, under a budget, reporting where
+/// it has reached.
+///
+/// `read` is injected so the loop's behaviour is provable without a daemon, an
+/// embedding model or a network: the property under test is that this waits
+/// while work is filling and stops when it is not, and no fixture can produce
+/// that against a real first fill inside a test.
+async fn settle_first_embed_pass_within<F, Fut>(
+    budget: std::time::Duration,
+    poll: std::time::Duration,
+    stall: std::time::Duration,
+    mut read: F,
+) -> FirstEmbedPassOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<crate::commands::resources::EmbedRuntimeState>>,
+{
+    // A watch loop that ends on its first failed read reports a settled pass
+    // over a daemon that was merely busy for one poll. A watch loop that never
+    // ends on a failed read waits out its whole budget against a daemon that is
+    // gone. So consecutive failures are counted, and the count is what decides.
+    const UNREADABLE_POLLS_BEFORE_GIVING_UP: usize = 3;
+
+    // `tokio::time::Instant`, not `std::time::Instant`, and this is load
+    // bearing rather than tidiness. The budget is what a paused-clock test
+    // drives the loop to, and `std::time::Instant::elapsed` does not move under
+    // `#[tokio::test(start_paused = true)]`, so a budget read from the wall
+    // clock would never be reached and the test that proves this wait STOPS
+    // would hang instead of failing. Outside a test the two are the same clock.
+    let began = tokio::time::Instant::now();
+    let mut last_report: Option<tokio::time::Instant> = None;
+    let mut unreadable = 0usize;
+    let mut last_progress = tokio::time::Instant::now();
+    let mut last_indexed: Option<usize> = None;
+    loop {
+        let Some(embed) = read().await else {
+            unreadable += 1;
+            if unreadable >= UNREADABLE_POLLS_BEFORE_GIVING_UP || began.elapsed() >= budget {
+                return FirstEmbedPassOutcome::Unread;
+            }
+            tokio::time::sleep(poll).await;
+            continue;
+        };
+        unreadable = 0;
+        match first_embed_pass_standing(&embed) {
+            FirstEmbedPassStanding::Settled => {
+                return FirstEmbedPassOutcome::Drained {
+                    indexed: embed.embeddings_indexed,
+                }
+            }
+            FirstEmbedPassStanding::Stalled(reason) => {
+                return FirstEmbedPassOutcome::Stalled {
+                    pending: embed.embeddings_pending,
+                    reason,
+                }
+            }
+            FirstEmbedPassStanding::Filling => {}
+        }
+        // Whether this reading is evidence the pass is alive. Any one of the
+        // three is enough: the model arriving is progress on a pass that cannot
+        // index yet, and the embed mutex being held is progress on a batch
+        // whose count has not landed.
+        let moved = last_indexed != Some(embed.embeddings_indexed);
+        if moved || embed.embedding_work_busy || embed.model_fetch.fetching {
+            last_progress = tokio::time::Instant::now();
+            last_indexed = Some(embed.embeddings_indexed);
+        } else if last_progress.elapsed() >= stall {
+            return FirstEmbedPassOutcome::Stalled {
+                pending: embed.embeddings_pending,
+                reason: "no embed pass is running and the indexed count has not moved, so this \
+                         daemon is not draining the queue",
+            };
+        }
+        if began.elapsed() >= budget {
+            return FirstEmbedPassOutcome::BudgetSpent {
+                indexed: embed.embeddings_indexed,
+                total: embed.embeddings_total,
+                waited_secs: budget.as_secs(),
+            };
+        }
+        let due = last_report
+            .map(|at| at.elapsed() >= FIRST_EMBED_PASS_REPORT_EVERY)
+            .unwrap_or(true);
+        if due {
+            last_report = Some(tokio::time::Instant::now());
+            match embed.model_fetch.download_phase() {
+                Some(phase) => note!(
+                    "  → first embedding pass: {} of {} indexed; {phase}",
+                    embed.embeddings_indexed,
+                    embed.embeddings_total
+                ),
+                None => note!(
+                    "  → first embedding pass: {} of {} indexed",
+                    embed.embeddings_indexed,
+                    embed.embeddings_total
+                ),
+            }
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Ask the daemon this conversion started where its first embedding pass has
+/// reached, and wait for it under [`FIRST_EMBED_PASS_BUDGET`].
+async fn settle_first_embed_pass(layout: &kin_core::KinLayout) -> FirstEmbedPassOutcome {
+    let Some(url) = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await else {
+        return FirstEmbedPassOutcome::Unread;
+    };
+    let Ok(client) = crate::daemon_client::DaemonClient::from_base_url_for_layout(url, layout)
+    else {
+        return FirstEmbedPassOutcome::Unread;
+    };
+    settle_first_embed_pass_within(
+        FIRST_EMBED_PASS_BUDGET,
+        FIRST_EMBED_PASS_POLL,
+        FIRST_EMBED_PASS_STALL,
+        || async {
+            client
+                .command_resources(&crate::commands::resources::CommandResourcesRequest::default())
+                .await
+                .ok()
+                .map(|response| response.embed_runtime)
+        },
+    )
+    .await
+}
+
 /// Run the language-server sweep as a phase of conversion, with progress.
 ///
 /// Every line this prints goes to STDERR, including the progress. `kin init
@@ -752,6 +1040,20 @@ async fn enrich_after_init(kin_root: &Path) -> CrossFileEnrichment {
         }
     };
 
+    // Before the stop, never after it. The daemon this phase started is the
+    // only process that can drain the embedding queue its own ingest filled,
+    // and stopping it mid-pass lands wherever the pass happens to be. The same
+    // 180-file import measured twice on 2026-09-05 handed over `0/1800
+    // indexed` on one run and a salvaged `920/1800` on the next, because the
+    // stop is unrelated to where the pass is. `stop_conversion_daemon` already
+    // waits for the sweep for exactly this reason, and gave the embedding pass
+    // no such wait. Skipped when this phase borrowed a daemon somebody else
+    // started, because then there is no stop to protect against.
+    if !borrowed_existing {
+        if let Some(line) = settle_first_embed_pass(&layout).await.note() {
+            note!("{line}");
+        }
+    }
     stop_conversion_daemon(borrowed_existing, kin_root).await;
     outcome
 }
@@ -1739,6 +2041,236 @@ fn initialized_raw_git_head(result: &kin_core::InitResult) -> Option<&kin_model:
 mod tests {
     use super::*;
     use crate::commands::status::SemanticEnrichmentView;
+
+    /// A queue nobody is draining is not work in flight.
+    ///
+    /// Both stalled arms mirror the daemon's own reasons for standing its
+    /// worker down. Without them a conversion on such a store would sit here
+    /// for the whole budget and then hand over exactly the store it would have
+    /// handed over immediately.
+    #[test]
+    fn a_backlog_nothing_will_drain_is_not_a_pass_worth_waiting_for() {
+        let filling = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 12,
+            embeddings_pending: 80,
+            embeddings_total: 92,
+            ..Default::default()
+        };
+        assert_eq!(
+            first_embed_pass_standing(&filling),
+            FirstEmbedPassStanding::Filling,
+            "a queue with a healthy worker behind it is the state the stop must not cut short"
+        );
+
+        let failed = crate::commands::resources::EmbedRuntimeState {
+            embed_worker_failed: true,
+            ..filling.clone()
+        };
+        assert!(matches!(
+            first_embed_pass_standing(&failed),
+            FirstEmbedPassStanding::Stalled(_)
+        ));
+
+        let unpersistable = crate::commands::resources::EmbedRuntimeState {
+            embed_persistence_unavailable: true,
+            ..filling.clone()
+        };
+        assert!(matches!(
+            first_embed_pass_standing(&unpersistable),
+            FirstEmbedPassStanding::Stalled(_)
+        ));
+
+        let drained = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 92,
+            embeddings_pending: 0,
+            embeddings_total: 92,
+            ..Default::default()
+        };
+        assert_eq!(
+            first_embed_pass_standing(&drained),
+            FirstEmbedPassStanding::Settled
+        );
+    }
+
+    /// The wait actually waits.
+    ///
+    /// This is the property the whole change exists for: before it, the
+    /// conversion stopped the daemon the moment the sweep phase ended, and the
+    /// embedding pass that daemon had queued died with it. A reader that
+    /// reports work filling has to hold this function until the work is not.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_holds_while_the_pass_is_filling_and_returns_when_it_drains() {
+        let readings = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let counter = std::sync::Arc::clone(&readings);
+        let outcome = settle_first_embed_pass_within(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(20),
+            move || {
+                let counter = std::sync::Arc::clone(&counter);
+                async move {
+                    let mut seen = counter.lock().unwrap();
+                    *seen += 1;
+                    Some(if *seen < 4 {
+                        crate::commands::resources::EmbedRuntimeState {
+                            embeddings_indexed: *seen * 10,
+                            embeddings_pending: 40 - *seen * 10,
+                            embeddings_total: 40,
+                            ..Default::default()
+                        }
+                    } else {
+                        crate::commands::resources::EmbedRuntimeState {
+                            embeddings_indexed: 40,
+                            embeddings_pending: 0,
+                            embeddings_total: 40,
+                            ..Default::default()
+                        }
+                    })
+                }
+            },
+        )
+        .await;
+        assert_eq!(outcome, FirstEmbedPassOutcome::Drained { indexed: 40 });
+        assert!(
+            *readings.lock().unwrap() >= 4,
+            "a wait that returned on its first reading did not wait for anything"
+        );
+    }
+
+    /// And it stops waiting.
+    ///
+    /// The other half of the same contract. A conversion that never returns is
+    /// worse than one that hands over a store still filling, so a pass that
+    /// never drains has to end this wait at the budget and say where it got to.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_that_never_drains_ends_at_the_budget_and_says_where_it_reached() {
+        // The elapsed clock is read as well as the outcome, and it is the half
+        // that matters. A `BudgetSpent` carrying the right counts proves
+        // nothing on its own: a loop that returned on its first reading would
+        // report exactly the same value while having waited for nothing at all.
+        let began = tokio::time::Instant::now();
+        let outcome = settle_first_embed_pass_within(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(2),
+            // A stall window longer than the budget, so the budget is what this
+            // arm actually proves. Without that this test would pass on the
+            // stall guard and say nothing about the budget at all.
+            std::time::Duration::from_secs(3_600),
+            || async {
+                Some(crate::commands::resources::EmbedRuntimeState {
+                    embeddings_indexed: 7,
+                    embeddings_pending: 33,
+                    embeddings_total: 40,
+                    embedding_work_busy: true,
+                    ..Default::default()
+                })
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            FirstEmbedPassOutcome::BudgetSpent {
+                indexed: 7,
+                total: 40,
+                waited_secs: 300,
+            }
+        );
+        assert!(
+            began.elapsed() >= std::time::Duration::from_secs(300),
+            "the wait has to actually reach its budget, not merely name it: {:?}",
+            began.elapsed()
+        );
+        let note = outcome.note().expect("a partial pass is worth a line");
+        assert!(
+            note.contains("7 of 40") && note.contains("resumes it from here"),
+            "the reader has to learn where it reached and that nothing is lost: {note}"
+        );
+    }
+
+    /// A queue that nothing is draining stops being waited on, even when every
+    /// field this wait can read says it is filling.
+    ///
+    /// `KIN_DAEMON_AUTO_EMBED=0` pauses the daemon's worker and
+    /// `EmbedRuntimeState` carries no flag for that pause, so an opt-out host
+    /// reports a non-empty queue, a healthy worker and persistable progress
+    /// forever. Answering that with the budget would put two minutes into every
+    /// `kin init` on such a host. Progress, not a flag, is what separates them.
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_that_never_moves_stops_being_waited_on_before_the_budget() {
+        let outcome = settle_first_embed_pass_within(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(20),
+            || async {
+                Some(crate::commands::resources::EmbedRuntimeState {
+                    embeddings_indexed: 0,
+                    embeddings_pending: 40,
+                    embeddings_total: 40,
+                    embedding_work_busy: false,
+                    ..Default::default()
+                })
+            },
+        )
+        .await;
+        match outcome {
+            FirstEmbedPassOutcome::Stalled { pending, .. } => assert_eq!(pending, 40),
+            other => panic!("a queue nothing moves is not a pass worth waiting for: {other:?}"),
+        }
+    }
+
+    /// The control for the arm above: the same shape with the model still
+    /// arriving is a pass, and must NOT be cut off.
+    ///
+    /// Without this, a stall guard that fired on any zero-progress reading
+    /// would look correct and would abandon every first `kin init` on a machine
+    /// that has to download the 522 MiB model before it can index anything.
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_waiting_on_the_model_download_is_still_a_pass() {
+        let outcome = settle_first_embed_pass_within(
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(20),
+            || async {
+                Some(crate::commands::resources::EmbedRuntimeState {
+                    embeddings_indexed: 0,
+                    embeddings_pending: 40,
+                    embeddings_total: 40,
+                    embedding_work_busy: false,
+                    model_fetch: crate::embed_model::EmbedModelFetch {
+                        fetching: true,
+                        fetched_bytes: 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, FirstEmbedPassOutcome::BudgetSpent { .. }),
+            "a download in progress is progress; this wait must run to its budget, not stall: \
+             {outcome:?}"
+        );
+    }
+
+    /// No daemon, no wait, and no failure.
+    ///
+    /// The real wiring, against a real layout with nothing serving it. A probe
+    /// must never be able to turn a conversion that already succeeded into a
+    /// hang or an error.
+    #[tokio::test]
+    async fn the_wait_returns_at_once_when_no_daemon_is_serving_the_store() {
+        let repo = tempfile::tempdir().expect("temp repo");
+        let layout = kin_core::init(repo.path()).expect("init").layout;
+        let began = std::time::Instant::now();
+        let outcome = settle_first_embed_pass(&layout).await;
+        assert_eq!(outcome, FirstEmbedPassOutcome::Unread);
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(30),
+            "a store with no daemon must not be waited on at all"
+        );
+        assert!(outcome.note().is_none());
+    }
 
     /// Pin the LSP-first output contract so an embedding notice cannot drift
     /// ahead of the materially stronger cross-file guidance.

@@ -357,12 +357,12 @@ where
                     // tool never opens the store and never runs an embedding
                     // pass. Set before the wait, because the wait is what the
                     // launcher's binding task is sitting on.
-                    startup.admit_daemon_spawn();
-                    if !startup
-                        .wait_until_settled(TOOLS_CALL_STARTUP_BIND_GRACE)
-                        .await
-                    {
-                        if let Some(response) = startup_pending_response(&value, startup) {
+                    // The bound this call gets, decided by whether it is the
+                    // call that started the daemon. See
+                    // `startup_bind_grace`.
+                    let grace = startup_bind_grace(startup.admit_daemon_spawn());
+                    if !startup.wait_until_settled(grace).await {
+                        if let Some(response) = startup_pending_response(&value, startup, grace) {
                             let response_json =
                                 serde_json::to_string(&response).map_err(McpError::Json)?;
                             write_stdio_message(&mut *writer, &response_json, framed).await?;
@@ -752,14 +752,49 @@ impl WorkspaceMismatch {
 }
 
 /// How long a `tools/call` waits for the launcher's startup daemon binding to
-/// settle before answering that the daemon is still starting.
+/// settle before answering that the daemon is still starting, once some earlier
+/// call has already admitted the spawn.
 ///
 /// A warm daemon binds in well under a second, so a call racing the bind gets
-/// its real answer inside this window; a cold flagship-scale start takes
-/// minutes and no defensible grace covers it, which is exactly when the honest
-/// still-starting answer is owed. Kept well under common MCP client per-call
-/// timeouts (60 s) and under the update watchdog's 30 s whole-probe budget.
+/// its real answer inside this window. A caller that reaches this bound has
+/// already been told once, by the call that started the daemon, so repeating
+/// the wait buys it nothing.
 const TOOLS_CALL_STARTUP_BIND_GRACE: Duration = Duration::from_secs(10);
+
+/// How long the FIRST graph-reading `tools/call` of a session waits.
+///
+/// That call is the one that admits the daemon spawn, so it is the only one
+/// that can be waiting on a cold open rather than on a daemon somebody else
+/// already paid for, and ten seconds is measurably short for it. Measured on
+/// 2026-09-05 against kin `f6a29e329` on a 470 MiB store of 218 files: the
+/// first call gave up at 10 s and the next one bound after 15.3 s, so the bind
+/// wanted about 25 s and the session's first question failed anyway. The same
+/// bound is what a call racing an in-flight admission needs: a five-line edit
+/// on that store took the daemon 20 s to admit, and every `tools/call` during
+/// that window read as still starting.
+///
+/// 45 s is that measurement with margin, and it stays under the 60 s per-call
+/// timeout common MCP clients use, so a client times out on nothing this
+/// process chose. It is a ceiling and not a delay: `wait_until_settled` returns
+/// the instant the binding settles, so a warm session is exactly as fast as it
+/// was. A cold flagship-scale start still takes minutes, no defensible grace
+/// covers that, and the honest still-starting answer is still what it gets.
+///
+/// `kin setup`'s own MCP round trip is sized against this constant
+/// (`kin_cli::commands::setup_verify`), because a client budget shorter than
+/// this grace turns a still-starting answer into a killed process.
+pub const FIRST_TOOLS_CALL_STARTUP_BIND_GRACE: Duration = Duration::from_secs(45);
+
+/// The bound one `tools/call` gets to wait for the startup binding.
+///
+/// Pure, so the policy is provable without a daemon, a process or a clock.
+const fn startup_bind_grace(first_graph_call: bool) -> Duration {
+    if first_graph_call {
+        FIRST_TOOLS_CALL_STARTUP_BIND_GRACE
+    } else {
+        TOOLS_CALL_STARTUP_BIND_GRACE
+    }
+}
 
 /// Structured answer for a `tools/call` that arrived while the launcher's
 /// startup binding is still pending. `None` for a malformed call with no id,
@@ -768,13 +803,14 @@ const TOOLS_CALL_STARTUP_BIND_GRACE: Duration = Duration::from_secs(10);
 fn startup_pending_response(
     request: &serde_json::Value,
     startup: &StartupDaemonBinding,
+    waited: Duration,
 ) -> Option<JsonRpcResponse> {
     let id = request.get("id").filter(|id| !id.is_null())?.clone();
     let tool = request
         .pointer("/params/name")
         .and_then(|name| name.as_str())
         .unwrap_or("this tool");
-    let result = ToolCallResult::error(startup.starting_report(tool));
+    let result = ToolCallResult::error(startup.starting_report(tool, waited));
     let enveloped = envelope::finalize(result, Envelope::daemon_unreachable(), tool);
     Some(JsonRpcResponse::success(
         Some(id),
@@ -3930,6 +3966,75 @@ mod tests {
             serde_json::to_value(&ordinary.degraded).unwrap(),
             serde_json::json!({}),
             "an ordinary tool error carries the same empty degraded object it always did"
+        );
+    }
+    /// The bound one `tools/call` waits is decided by whether it is the call
+    /// that started the daemon.
+    ///
+    /// The whole point of the fix is that the first ask is patient and the ones
+    /// behind it are not, so both arms are asserted. Asserting only the long one
+    /// would keep passing on the day every call got 45 s, which would put a
+    /// three-quarter-minute stall in front of every repeat question about a
+    /// daemon that is never coming up.
+    #[test]
+    fn only_the_call_that_starts_the_daemon_gets_the_long_wait() {
+        assert_eq!(
+            startup_bind_grace(true),
+            FIRST_TOOLS_CALL_STARTUP_BIND_GRACE
+        );
+        assert_eq!(startup_bind_grace(false), TOOLS_CALL_STARTUP_BIND_GRACE);
+        assert!(
+            FIRST_TOOLS_CALL_STARTUP_BIND_GRACE > TOOLS_CALL_STARTUP_BIND_GRACE,
+            "a first call that waited no longer than a repeat call is the defect this fixes"
+        );
+    }
+
+    /// The first-call bound has to clear what a cold bind actually costs and
+    /// stay under what an MCP client will wait.
+    ///
+    /// The lower bound is the measurement in the constant's own doc: a first
+    /// call gave up at 10 s and the next one bound after 15.3 s, so anything at
+    /// or under 25 s reproduces the gap. The upper bound is the 60 s per-call
+    /// timeout common clients use, which this must never reach or the client
+    /// times out instead of reading the report.
+    #[test]
+    fn the_first_call_bound_clears_the_measured_cold_bind_and_stays_under_a_client_timeout() {
+        assert!(
+            FIRST_TOOLS_CALL_STARTUP_BIND_GRACE > Duration::from_secs(25),
+            "a bound at or under the measured 25 s cold bind fixes nothing"
+        );
+        assert!(
+            FIRST_TOOLS_CALL_STARTUP_BIND_GRACE < Duration::from_secs(60),
+            "a bound at a client's own per-call timeout hands the reader a timeout, not a report"
+        );
+    }
+
+    /// A pending binding answers with the bound it waited, and the answer is
+    /// still the structured still-starting result the callers key on.
+    #[tokio::test]
+    async fn a_first_call_that_outlasts_its_bound_reports_the_bound_it_waited() {
+        let startup = StartupDaemonBinding::new();
+        assert!(startup.admit_daemon_spawn());
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": { "name": "kin_graph_status", "arguments": {} },
+        });
+        let response =
+            startup_pending_response(&request, &startup, FIRST_TOOLS_CALL_STARTUP_BIND_GRACE)
+                .expect("a call carrying an id has a response channel");
+        let rendered = serde_json::to_string(&response).expect("serialize");
+        assert!(
+            rendered.contains(&format!(
+                "this call waited {}s",
+                FIRST_TOOLS_CALL_STARTUP_BIND_GRACE.as_secs()
+            )),
+            "the report must name the bound this call actually waited: {rendered}"
+        );
+        assert!(
+            rendered.contains("still starting") && rendered.contains("retry"),
+            "the answer is still the honest still-starting report: {rendered}"
         );
     }
 }

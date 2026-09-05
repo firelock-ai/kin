@@ -1334,6 +1334,78 @@ pub(crate) fn commit_native_plan(
     })
 }
 
+/// Persist this workspace's base graph section after the commit that moved its
+/// base past the last one.
+///
+/// `kin init` writes a section (`kin-cli/src/commands/init.rs`, through
+/// `materialize_workspace_base_offline`) and nothing else did, so the first
+/// commit in a repository built with Kin left `kin doctor` reporting
+/// `✗ Graph section DEGRADED ... kin graph materialize writes one`, with the
+/// setup footer calling it a host limit, on a store holding one change. Journey
+/// GAP-4.
+///
+/// Through the authority this commit already holds, so it costs no second
+/// O(store) open: opening one decodes the whole persisted authority and
+/// re-verifies every body in repository CAS, which is the cost
+/// `commit_native_plan_with_working_copy_proof` carries the planned authority
+/// forward to avoid paying twice.
+///
+/// Unconditional, and that is the deliberate part. kin-db's writer recomputes
+/// the fold it memoizes from history rather than from the section it replaces,
+/// and its own doc says "ordinary publish deliberately does not pay this
+/// capture's memory cost", so the obvious shape here is a size bound that leaves
+/// large stores alone. That shape is wrong, because the fold is paid once either
+/// way: a store whose section a commit invalidated pays it at EVERY open until
+/// somebody runs `kin graph materialize`, and a store whose commit refreshed it
+/// pays it once and opens clean until the next commit. Measured on 2026-09-05 on
+/// an admitted express store of 470 MiB, an open with a refused section reported
+/// `authority_open=37922ms` with `folded_changes=3834`, and that reading repeats
+/// on every open of that store. A daemon restarts more often than a person
+/// commits, the idle window guarantees it, and an open blocks the first question
+/// a session asks while a commit is a heavy operation the caller already chose
+/// to wait for. So the fold moves to the commit, on every store, and the elapsed
+/// time is logged on every commit that pays it.
+///
+/// Never fatal, and deliberately not part of the receipt. The repository
+/// transaction above is durable and the change is committed; a memoization that
+/// did not persist is a slower next open, not a failed commit, and turning one
+/// into the other would be a strictly worse product than the row this fixes.
+fn refresh_workspace_base_graph_section(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    repository_id: &kin_model::RepositoryId,
+    workspace_id: WorkspaceId,
+) {
+    let changes_in_store = authority.read_authority().snapshot().changes.len();
+    let started = std::time::Instant::now();
+    let outcome = crate::mcp_commit::timed_commit_phase("materialize_graph_section", || {
+        authority.materialize_workspace_base_graph_section(repository_id, &workspace_id)
+    });
+    let elapsed_ms = started.elapsed().as_millis();
+    match outcome {
+        Ok(Some(outcome)) => tracing::info!(
+            repository = %repository_id,
+            workspace = %workspace_id,
+            changes_in_store,
+            elapsed_ms,
+            outcome = ?outcome,
+            "refreshed the workspace base graph section after a native commit"
+        ),
+        Ok(None) => tracing::info!(
+            repository = %repository_id,
+            workspace = %workspace_id,
+            "no workspace to refresh a graph section for"
+        ),
+        Err(error) => tracing::warn!(
+            repository = %repository_id,
+            workspace = %workspace_id,
+            elapsed_ms,
+            %error,
+            "the workspace base graph section did not persist after this commit, so the next \
+             open folds this base out of history; `kin graph materialize` writes one"
+        ),
+    }
+}
+
 /// Atomically project and publish one native repository transaction.
 ///
 /// Source bodies are copied into repository CAS first, then the exact prior
@@ -1530,6 +1602,11 @@ fn commit_native_plan_with_working_copy_proof(
         )));
     }
     receipt.validate()?;
+    refresh_workspace_base_graph_section(
+        &authority,
+        &repository_id,
+        authority_context.workspace_id(),
+    );
     Ok(NativeCommitResult {
         change: plan.change,
         receipt,
