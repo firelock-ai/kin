@@ -33581,6 +33581,14 @@ mod tests {
         /// readiness probe's per-repository reads are measured rather than
         /// assumed free.
         cursor_probe_delay: Option<Duration>,
+        /// Cursor probes inside the backend right now, and the most that were
+        /// ever there together. Concurrency is a structural property, so it is
+        /// counted rather than inferred from how long a probe took: a shared
+        /// CI runner can add a second of scheduling to any wall-clock reading,
+        /// and a bound tight enough to separate concurrent from serial is
+        /// tight enough to fail on that noise. This one cannot.
+        cursor_probes_in_flight: usize,
+        peak_cursor_probes_in_flight: usize,
     }
 
     #[derive(Clone)]
@@ -33697,6 +33705,23 @@ mod tests {
 
         fn charge_each_cursor_probe(&self, cost: Duration) {
             self.0.lock().unwrap().cursor_probe_delay = Some(cost);
+        }
+
+        fn enter_cursor_probe(&self) {
+            let mut state = self.0.lock().unwrap();
+            state.cursor_probes_in_flight += 1;
+            state.peak_cursor_probes_in_flight = state
+                .peak_cursor_probes_in_flight
+                .max(state.cursor_probes_in_flight);
+        }
+
+        fn leave_cursor_probe(&self) {
+            self.0.lock().unwrap().cursor_probes_in_flight -= 1;
+        }
+
+        /// The most source cursor probes this backend ever served at one time.
+        fn peak_concurrent_cursor_probes(&self) -> usize {
+            self.0.lock().unwrap().peak_cursor_probes_in_flight
         }
 
         fn cursor_probe_delay(&self) -> Option<Duration> {
@@ -33913,9 +33938,11 @@ mod tests {
             // Count the probe before parking on any rendezvous, so a blocked
             // probe still shows up in `cursor_probes`.
             self.faulting.record_cursor_probe(repo_id);
+            self.faulting.enter_cursor_probe();
             if let Some(cost) = self.faulting.cursor_probe_delay() {
                 std::thread::sleep(cost);
             }
+            self.faulting.leave_cursor_probe();
             if let Some(block) = self.faulting.cursor_probe_block_for(repo_id) {
                 block.arrive_and_wait();
             }
@@ -45401,6 +45428,10 @@ mod tests {
     /// measure or charge what the store is asked for. The storage root comes
     /// back too, so a test can advance a repository's source publication the
     /// way a sibling writer does.
+    /// The hosted fixture publishes this many repositories, which is also how
+    /// many source cursor probes one bundle observation issues at once.
+    const HOSTED_FIXTURE_FLEET_SIZE: usize = 5;
+
     fn hosted_test_state_over(
         spine_store: Arc<dyn kin_spine::SpineStore>,
     ) -> (
@@ -45418,6 +45449,11 @@ mod tests {
             "kin-vfs".to_string(),
             "kinlab".to_string(),
         ];
+        assert_eq!(
+            fleet.len(),
+            HOSTED_FIXTURE_FLEET_SIZE,
+            "the fleet size the concurrency assertion reads must be this fleet's size"
+        );
         let mut environment = kin_core::test_env::EnvVarGuard::new();
         environment.apply("GOOGLE_CLOUD_PROJECT", Some("fixture-project"));
         environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
@@ -46137,13 +46173,21 @@ mod tests {
     /// The probe must answer from the proof this process already holds, at a
     /// cost that is counted rather than assumed.
     ///
-    /// Every read the probe makes is charged here, not just the hydration: the
-    /// publication-control record, the active Firestore fence, the committed
-    /// heads, and every repository's source publication cursor. The per-repo
-    /// cursor charge is deliberately the largest, because it is the one the
-    /// probe issues five at a time: served in series those ten reads alone
-    /// would cost two seconds, so a bound of 1.5 s fails a serial
-    /// implementation and passes a concurrent one.
+    /// Every read the probe makes is charged and counted: the publication
+    /// control record, the active Firestore fence, the committed heads, and
+    /// every repository's source publication cursor. What must NOT appear is a
+    /// durable cache hydration, and what must appear is the whole fleet's
+    /// cursor probes in flight together.
+    ///
+    /// The concurrency claim is asserted structurally rather than by wall
+    /// clock. An earlier version of this test proved it with a 1.5 s bound,
+    /// reasoning that ten cursor probes served in series would cost 2 s of
+    /// charges on their own. That bound failed on a shared CI runner at
+    /// 1.538 s with exactly the right reads and no hydration: the runner had
+    /// added about 900 ms of scheduling to 560 ms of charges. A bound tight
+    /// enough to separate concurrent from serial is tight enough to fail on
+    /// that noise, so the peak in-flight count carries the claim now and the
+    /// wall clock only guards against a hydration coming back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_hosted_readiness_probe_answers_without_a_durable_spine_refresh() {
         let (state, store, _backend_root, meters, _environment) =
@@ -46155,7 +46199,7 @@ mod tests {
             .charge_each_record_read(Duration::from_millis(20));
         meters
             .cursor_probes
-            .charge_each_cursor_probe(Duration::from_millis(200));
+            .charge_each_cursor_probe(Duration::from_millis(100));
         let hydrations_before = store.hydration_reads();
         let point_reads_before = store.point_reads();
         let record_reads_before = meters.control.record_reads();
@@ -46169,10 +46213,11 @@ mod tests {
         let point_reads = store.point_reads() - point_reads_before;
         let record_reads = meters.control.record_reads() - record_reads_before;
         let cursor_probes = meters.cursor_probes.total_cursor_probes() - cursor_probes_before;
+        let peak_concurrent = meters.cursor_probes.peak_concurrent_cursor_probes();
         println!(
             "readiness probe cost: {elapsed:?}, {hydrations} hydration(s), \
              {point_reads} spine point read(s), {record_reads} control record read(s), \
-             {cursor_probes} source cursor probe(s)"
+             {cursor_probes} source cursor probe(s), {peak_concurrent} of them at once"
         );
 
         assert_eq!(
@@ -46185,21 +46230,37 @@ mod tests {
             "the probe hydrated the durable spine cache. Establishing authority is what \
              the publication and rollout paths do; a probe reports it."
         );
-        assert!(
-            elapsed < Duration::from_millis(1500),
-            "readiness took {elapsed:?} for {point_reads} spine point reads, {record_reads} \
-             control record reads and {cursor_probes} source cursor probes. The kubelet \
-             allows 3 s on the startup probe and 1 s on the readiness probe, and ten \
-             cursor probes served in series would cost 2 s of that on their own."
+        // This one number carries both halves of the contract. The probe takes
+        // TWO sequential identity observations, and each issues the fleet's
+        // cursor probes together, so the peak in flight is the fleet size: a
+        // serial implementation drives it to one, and two waves that overlapped
+        // would drive it to twice the fleet, which would mean the second
+        // observation was not observing anything the first had not already
+        // settled.
+        assert_eq!(
+            peak_concurrent, HOSTED_FIXTURE_FLEET_SIZE,
+            "{peak_concurrent} source cursor probes were in flight at the peak, not the \
+             fleet's {HOSTED_FIXTURE_FLEET_SIZE}. One means they are issued in series, and \
+             the probe then pays a round trip per repository instead of one for the fleet; \
+             twice the fleet would mean the two identity observations overlapped, and the \
+             second one proves nothing unless it starts after the first has finished."
         );
         assert!(
-            point_reads <= 4 && record_reads <= 4 && cursor_probes <= 12,
+            elapsed < Duration::from_secs(3),
+            "readiness took {elapsed:?} for {point_reads} spine point reads, {record_reads} \
+             control record reads and {cursor_probes} source cursor probes, which are \
+             charged at 20, 20 and 100 ms. A durable cache hydration is charged 10 s here, \
+             so this bound is what catches one coming back onto the probe path; the \
+             concurrency claim is the peak count above, not this."
+        );
+        assert_eq!(
+            (point_reads, record_reads, cursor_probes),
+            (4, 4, 2 * HOSTED_FIXTURE_FLEET_SIZE),
             "the probe made {point_reads} spine point reads, {record_reads} control record \
-             reads and {cursor_probes} source cursor probes. Two complete bundle \
-             observations of one heads read and one cursor read per repository, plus the \
-             admission, runtime-authority and active-fence reads taken on BOTH sides of \
-             that bundle, is the whole budget; anything past it is a read nobody \
-             accounted for."
+             reads and {cursor_probes} source cursor probes. The budget is exactly two \
+             identity observations, each one committed-head listing plus one cursor read \
+             per repository, bracketed by the admission, runtime-authority and active-fence \
+             reads taken on both sides; anything else is a read nobody accounted for."
         );
     }
 
