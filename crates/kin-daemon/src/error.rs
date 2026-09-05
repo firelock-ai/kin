@@ -20,6 +20,38 @@ pub fn workspace_generation_exhausted(
     )
 }
 
+/// Add the recovery to a refusal whose message names a graph node no query
+/// returns, and leave every other refusal alone.
+///
+/// kin-db refuses any transaction, and any snapshot, holding a relation whose
+/// endpoint the graph does not have. Its message names two uuids and nothing
+/// else, and the entity uuid it names is one `kin graph inspect` reports as not
+/// found, because it genuinely is not there. A caller meeting that has no way to
+/// know the state is recoverable at all. A first-time user hit exactly this on
+/// the v0.7.0 release: commit, `kin stash push` and `kin branch switch` refused
+/// at once, each naming an entity no query returned, and finding the sequence
+/// below by hand cost twenty minutes.
+///
+/// The clause is attached innermost, so `cause_first` renders it directly after
+/// the storage message it explains rather than behind the step description.
+pub fn name_stranded_endpoint_recovery(error: anyhow::Error) -> anyhow::Error {
+    const MARKERS: [&str; 3] = [
+        "unadmitted source endpoint",
+        "unadmitted destination endpoint",
+        "relation removal must be explicit",
+    ];
+    let message = format!("{error:#}");
+    if !MARKERS.iter().any(|marker| message.contains(marker)) {
+        return error;
+    }
+    error.context(
+        "recovery: the graph holds an edge into a node it no longer has, which is why the id in \
+         this message resolves to nothing. Run `kin daemon stop`, then `kin commit` until `kin \
+         diff HEAD WORKSPACE` reports no pending relations. Every file body on disk is intact \
+         throughout, and this is worth reporting: no command should leave that edge behind",
+    )
+}
+
 /// Render an error chain with its root cause as the headline.
 ///
 /// `{error:#}` prints the outermost context first, which on the repository
@@ -175,7 +207,54 @@ pub type Result<T> = std::result::Result<T, DaemonError>;
 
 #[cfg(test)]
 mod tests {
-    use super::cause_first;
+    use super::{cause_first, name_stranded_endpoint_recovery};
+
+    /// The wedge a stranger hit on the v0.7.0 release: a storage refusal naming
+    /// a relation and an entity, where the entity is one `kin graph inspect`
+    /// reports as not found. The refusal now carries the sequence that clears
+    /// it, and it lands directly after the storage message rather than behind
+    /// the internal step description.
+    #[test]
+    fn a_refusal_naming_a_node_no_query_returns_carries_its_recovery() {
+        let raw = anyhow::anyhow!(
+            "storage error: transaction relation faf90068 has unadmitted source endpoint \
+             entity:d1f10112"
+        );
+        let named =
+            name_stranded_endpoint_recovery(raw).context("apply branch-switch daemon preflight");
+        let rendered = cause_first(&named);
+
+        assert!(
+            rendered.contains("kin daemon stop"),
+            "the refusal must name the recovery: {rendered}"
+        );
+        assert!(
+            rendered.contains("kin commit"),
+            "the refusal must name what drains the pending relations: {rendered}"
+        );
+        let recovery_at = rendered
+            .find("recovery:")
+            .expect("the recovery clause is present");
+        let step_at = rendered
+            .find("apply branch-switch")
+            .expect("the step description is present");
+        assert!(
+            recovery_at < step_at,
+            "the recovery belongs beside the message it explains, not behind the step: {rendered}"
+        );
+    }
+
+    /// The clause is attached only to the refusal it explains. A guard that
+    /// fires on everything would append a graph recovery to a bad path, an
+    /// unreadable file, and every other refusal in the crate.
+    #[test]
+    fn an_unrelated_refusal_is_left_exactly_as_it_was() {
+        let raw = anyhow::anyhow!("provide a UTF-8 path or --path-hex");
+        assert_eq!(
+            cause_first(&name_stranded_endpoint_recovery(raw)),
+            "provide a UTF-8 path or --path-hex"
+        );
+    }
 
     #[test]
     fn the_root_cause_leads_and_the_steps_that_reached_it_follow() {

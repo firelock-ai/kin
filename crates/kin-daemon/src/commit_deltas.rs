@@ -1037,6 +1037,121 @@ mod tests {
         assert!(graph.to_snapshot().relations.is_empty());
     }
 
+    /// A per-path checkout retires the edges into every entity it discards, in
+    /// the same delta that discards them.
+    ///
+    /// The class this locks: an edit adds an entity, background enrichment mints
+    /// an edge into it from a file outside the selection, and the checkout drops
+    /// the entity. An edge left pointing at it is an orphan, and kin-db then
+    /// refuses every later transaction and every later snapshot naming an entity
+    /// `kin graph inspect` reports as not found. A stranger driving the v0.7.0
+    /// release reached that state and had commit, `kin stash push` and
+    /// `kin branch switch` all refuse at once.
+    ///
+    /// The `apply_transaction_delta` at the end is the positive control: it is
+    /// the same admission check the daemon runs, so a delta that stranded the
+    /// edge fails here rather than passing quietly.
+    #[test]
+    fn selected_checkout_retires_the_edges_into_every_entity_it_discards() {
+        let selected = RepoPath::from_utf8("src").unwrap();
+        let discarded_id = EntityId::new();
+        let outside_id = EntityId::new();
+        let selected_artifact = ArtifactId::new();
+        let outside_artifact = ArtifactId::new();
+        let entry = TreeEntry::blob(Hash256::from_bytes([0x41; 32]), false);
+        let tree = resolved_tree(vec![
+            (
+                selected_artifact,
+                RepoPath::from_utf8("src/lib.rs").unwrap(),
+                entry.clone(),
+            ),
+            (
+                outside_artifact,
+                RepoPath::from_utf8("other/mod.rs").unwrap(),
+                entry,
+            ),
+        ]);
+        let discarded = make_entity_with_id(
+            discarded_id,
+            "grand_total",
+            "src/lib.rs",
+            LanguageId::Rust,
+            [0x42; 32],
+        );
+        let outside = make_entity_with_id(
+            outside_id,
+            "format_report",
+            "other/mod.rs",
+            LanguageId::Rust,
+            [0x43; 32],
+        );
+        // Enrichment derived this after the edit, from a file the checkout does
+        // not touch into one it does.
+        let inbound = relation(
+            RelationId::new(),
+            GraphNodeId::Entity(outside_id),
+            GraphNodeId::Entity(discarded_id),
+            RelationKind::UsesType,
+        );
+
+        let graph = InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: kin_core::exact_tree_correction(&ResolvedTree::default(), &tree)
+                    .unwrap(),
+                entity_deltas: vec![
+                    kin_model::EntityDelta::Added {
+                        new: discarded.clone(),
+                    },
+                    kin_model::EntityDelta::Added {
+                        new: outside.clone(),
+                    },
+                ],
+                relation_deltas: vec![kin_model::RelationDelta::Added {
+                    new: inbound.clone(),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+
+        // The change being restored predates the edit, so it never held the
+        // entity or the edge into it.
+        let target = ResolvedGraphState {
+            entities: HashMap::from([(outside_id, outside.clone())]),
+            relations: HashMap::new(),
+            entity_revisions: Default::default(),
+            tree: tree.clone(),
+            entity_tombstones: Default::default(),
+            relation_tombstones: Default::default(),
+            external_references: HashMap::new(),
+        };
+
+        let delta =
+            compute_selected_checkout_delta(&graph, &selected, &target, &tree, &tree).unwrap();
+        assert!(delta.tree_deltas.is_empty());
+        assert_eq!(
+            delta.entity_deltas,
+            vec![kin_model::EntityDelta::Removed { old: discarded }],
+            "the checkout discards the entity the edit introduced"
+        );
+        assert_eq!(
+            delta.relation_deltas,
+            vec![kin_model::RelationDelta::Removed {
+                old: inbound.clone()
+            }],
+            "and retires the edge into it in the same delta"
+        );
+
+        graph.apply_transaction_delta(&delta).unwrap();
+        let after = graph.to_snapshot();
+        assert!(!after.entities.contains_key(&discarded_id));
+        assert!(after.relations.is_empty());
+        assert!(
+            after.entities.contains_key(&outside_id),
+            "the entity outside the selection is untouched"
+        );
+    }
+
     /// A path selection does not scope the external-reference domain, so a
     /// spliced edge to an external endpoint survives exactly when the graph
     /// already holds that reference. The absent case must drop the edge rather
