@@ -5171,32 +5171,26 @@ pub(crate) fn parse_coverage_health(
     // it gives about every other file is still true, so this needs attention
     // without failing readiness, exactly as the reference-edge row beside it
     // does for a gap a person can close.
-    if census.any_retained() {
-        let retained = census.retained_file_lines();
-        return HealthCheck::new(
-            ID,
-            LABEL,
-            HealthStatus::Pending,
-            format!("{summary}; {}", retained.join("; ")),
-        )
-        .with_manual_fix(format!(
-            "fix the syntax in {} and run `kin admit`, which re-derives them; until then every \
-             span, reference and enumeration Kin answers over those paths describes an earlier \
-             version of them",
-            census.retained_paths().join(", ")
-        ));
-    }
+    // Both populations reach the detail, and only one reaches the verdict. An
+    // early return on the retained arm dropped the silent sample from any store
+    // holding both, which is the store most worth reading: a reader told about
+    // one broken file would never learn that seventy-five others declare
+    // nothing. The severity and the fix stay gated on the retained set alone,
+    // because a silent file is not evidence that anything failed.
+    let mut detail = vec![summary];
+    detail.extend(census.retained_file_lines());
+    detail.extend(census.silent_file_lines());
+    let detail = detail.join("; ");
 
-    let silent = census.silent_file_lines();
-    if silent.is_empty() {
-        return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, summary);
+    if !census.any_retained() {
+        return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, detail);
     }
-    HealthCheck::new(
-        ID,
-        LABEL,
-        HealthStatus::Healthy,
-        format!("{summary}; {}", silent.join("; ")),
-    )
+    HealthCheck::new(ID, LABEL, HealthStatus::Pending, detail).with_manual_fix(format!(
+        "fix the syntax in {} and run `kin admit`, which re-derives them; until then Kin answers \
+         about those paths from an earlier parse where it has one, and not at all where it does \
+         not",
+        census.retained_paths().join(", ")
+    ))
 }
 
 /// Whether this store serves its graph from the persisted section or folds its
@@ -12709,6 +12703,42 @@ mod tests {
             silent.status
         );
         assert!(silent.manual_fix.is_none());
+    }
+
+    /// A store holding both populations reports both.
+    ///
+    /// The retained arm used to return before the silent one ran, so exactly the
+    /// store worth reading, one broken file among seventy-five that declare
+    /// nothing, lost the larger half of its own row. The verdict still comes
+    /// from the retained set alone.
+    #[test]
+    fn a_store_holding_both_a_retained_file_and_silent_ones_reports_both() {
+        let row = parse_coverage_health(&kin_core::reference_coverage::ParseCoverageCensus {
+            languages: vec![
+                retained_census_row("python", 2, 1),
+                parse_census_row("javascript", 141, 75),
+            ],
+        });
+        assert!(needs_attention(&row), "{:?}", row.status);
+        for expected in [
+            "search.py (4 parse errors)",
+            "lib/express.js",
+            "python 1/2",
+            "javascript 66/141",
+        ] {
+            assert!(
+                row.detail.contains(expected),
+                "the row must carry {expected}: {}",
+                row.detail
+            );
+        }
+        assert!(
+            row.manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("search.py") && !fix.contains("express.js")),
+            "the fix names only what a person can fix: {:?}",
+            row.manual_fix
+        );
     }
 
     /// A daemon that never measured parse coverage and a store whose files are

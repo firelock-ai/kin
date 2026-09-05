@@ -4,8 +4,9 @@
 //! Durable record of the paths whose current bytes did not parse.
 //!
 //! The daemon reconciles under `ReconcilePolicy::FallbackToLkg`, so a file whose
-//! syntax is broken keeps the entities its previous parse produced and derives
-//! nothing new. That is the right answer: an agent mid-edit produces
+//! syntax is broken keeps whatever entities a previous parse produced and derives
+//! nothing new. A file created with a typo reaches the same arm and has nothing
+//! to keep, which is why nothing here diagnoses one path. That is the right answer: an agent mid-edit produces
 //! half-written source constantly, and refusing to record anything until the
 //! syntax is fixed would be worse than serving spans one edit old. What was
 //! missing is that nobody was told. The reconciler logs `broken AST, retaining
@@ -37,9 +38,13 @@ pub const RETAINED_PARSE_SCHEMA: &str = "kin.retained-parse.v1";
 /// The tag every sentence about a retained path opens with, for a caller keying
 /// on the class rather than reading the prose.
 ///
-/// `retained_last_good_parse` rather than `parse_failure`, because the file is
-/// not missing from the graph and nothing failed to be recorded. What happened
-/// is that the graph kept an earlier reading of it.
+/// `retained_last_good_parse` rather than `parse_failure`, because nothing
+/// failed to be recorded: the bytes are durable, the history is right, and where
+/// the graph already held a parse of this path it kept it. What the tag names is
+/// the population, not a diagnosis of any one member. `FileEvent::Changed`
+/// covers "created or modified", so a brand-new file with a typo reaches the
+/// same fallback arm with no earlier parse to keep, and no sentence over this
+/// set may claim one for it.
 pub const RETAINED_OBSERVATION: &str = "retained_last_good_parse";
 
 /// Paths named on a surface line before it stops being readable.
@@ -153,19 +158,27 @@ impl RetainedParseRead {
                     String::new()
                 };
                 let age = crate::last_admission::humanize_age(age_seconds(recorded.at, now));
+                // Established half first, conditional half second, and the split
+                // is the point. The seam knows which of the two populations a
+                // path is in; this record does not, and widening it to carry
+                // that is a change to the on-disk shape rather than to a
+                // sentence. So the line asserts only what is true of both: the
+                // bytes on disk do not parse. What the graph still holds for
+                // them is stated as a conditional, because a file created with
+                // a typo has no earlier parse to hold.
                 Some(format!(
-                    "Retained from last good parse: {named}{and_more}. Their current bytes did not \
-                     parse, so the graph answers about them at the positions an earlier parse \
-                     recorded, and every span, reference and enumeration over them describes those \
-                     bytes rather than the ones on disk. Fix the syntax and the next admission \
-                     re-derives them. Observed {age} ago."
+                    "Did not parse as written: {named}{and_more}. The bytes on disk do not parse, \
+                     so any entities the graph still holds for these paths came from an earlier \
+                     parse of bytes that are gone, and a path the graph never parsed is absent \
+                     from it entirely. Fix the syntax and the next admission re-derives them. \
+                     Observed {age} ago."
                 ))
             }
             Self::Absent => None,
             Self::Unreadable(reason) => Some(format!(
-                "Retained from last good parse: unknown. The record of which paths the graph is \
-                 answering about from an earlier parse could not be read ({reason}), so this \
-                 report cannot say there are none; run `kin admit` to rewrite it."
+                "Did not parse as written: unknown. The record of which paths failed to parse \
+                 could not be read ({reason}), so this report cannot say there are none; run \
+                 `kin admit` to rewrite it."
             )),
         }
     }
@@ -394,8 +407,20 @@ mod tests {
         let line = read_back.describe(at()).expect("a retained path speaks");
         assert!(line.contains("search.py (4 parse errors)"), "{line}");
         assert!(
-            line.contains("an earlier parse recorded"),
-            "the line has to say what the reader is being served: {line}"
+            line.contains("The bytes on disk do not parse"),
+            "the established half leads: {line}"
+        );
+        // The half a brand-new file with a typo makes load-bearing. `FileEvent`
+        // has only `Changed` and `Removed`, and `Changed` covers "created", so
+        // this set holds paths with no earlier parse at all. A sentence that
+        // asserted one would be a false diagnosis on five surfaces.
+        assert!(
+            line.contains("any entities the graph still holds"),
+            "what the graph holds is a conditional, not an assertion: {line}"
+        );
+        assert!(
+            !line.contains("the graph answers about them at the positions"),
+            "no sentence over this set may claim an earlier parse for every member: {line}"
         );
     }
 

@@ -1193,8 +1193,8 @@ mod tests {
             relation_count: 0,
             file_count: 1,
         };
-        let retained = "Retained from last good parse: search.py (4 parse errors). \
-                        Their current bytes did not parse.";
+        let retained = "Did not parse as written: search.py (4 parse errors). The bytes on disk \
+                        do not parse.";
 
         let quiet = render_commit_summary(&result, None, None);
         let named = render_commit_summary(&result, None, Some(retained));

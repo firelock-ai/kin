@@ -1651,7 +1651,7 @@ mod tests {
         );
         let line = retained_parse_line(&init.layout).expect("a recorded path speaks");
         assert!(line.contains("search.py (4 parse errors)"), "{line}");
-        assert!(line.contains("an earlier parse recorded"), "{line}");
+        assert!(line.contains("The bytes on disk do not parse"), "{line}");
     }
 
     /// The control for the withheld-count test above. A diff that elides

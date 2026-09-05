@@ -2756,7 +2756,7 @@ mod tests {
         let lines: Vec<&str> = rendered.lines().collect();
         let retained_at = lines
             .iter()
-            .position(|line| line.starts_with("Retained from last good parse:"))
+            .position(|line| line.starts_with("Did not parse as written:"))
             .unwrap_or_else(|| panic!("no retained line in:\n{rendered}"));
         let enrichment_at = lines
             .iter()
@@ -2785,7 +2785,7 @@ mod tests {
             None,
         );
         assert!(
-            !quiet.contains("Retained from last good parse"),
+            !quiet.contains("Did not parse as written"),
             "a store answering from its own bytes must not claim otherwise: {quiet}"
         );
     }

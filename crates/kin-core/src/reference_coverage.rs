@@ -1166,9 +1166,14 @@ impl LanguageParseCoverage {
     ///
     /// Unlike [`Self::silent_sentence`] this one names a next step, because
     /// unlike a silent file a retained one is unambiguously a gap: its bytes are
-    /// on disk, they do not parse, and every answer over it describes bytes that
-    /// are gone. A side-effect script that declares nothing is correct; a file
-    /// whose syntax is broken is not a second correct case.
+    /// on disk and they do not parse. A side-effect script that declares nothing
+    /// is correct; a file whose syntax is broken is not a second correct case.
+    ///
+    /// What the graph still holds for such a file is stated as a conditional
+    /// rather than asserted. `FileEvent::Changed` covers "created or modified",
+    /// so a brand-new file with a typo reaches the same fallback arm with no
+    /// earlier parse behind it, and only the seam knows which of the two any one
+    /// path is.
     pub fn retained_sentence(&self) -> String {
         let named = if self.retained_sample.is_empty() {
             String::new()
@@ -1179,10 +1184,10 @@ impl LanguageParseCoverage {
             )
         };
         format!(
-            "{}: {} of {} admitted {} files did not parse from their current bytes, so the \
-             entities the graph holds for them came from an earlier parse and every span, \
-             reference and enumeration over them describes bytes that are gone{named}. Fix the \
-             syntax and the next admission re-derives them.",
+            "{}: {} of {} admitted {} files did not parse as written, so any entities the graph \
+             still holds for them came from an earlier parse of bytes that are gone, and a file \
+             the graph never parsed is absent from it entirely{named}. Fix the syntax and the \
+             next admission re-derives them.",
             crate::retained_parse::RETAINED_OBSERVATION,
             self.retained,
             self.tracked,
@@ -1280,8 +1285,8 @@ impl ParseCoverageCensus {
              file each correctly produce nothing, and no graph-owned signal separates those from \
              a file an adapter could not read. Open the named paths to tell them apart. A file \
              named on a retained line above is the one case that IS established: its bytes are on \
-             disk, they do not parse, and the numerator excludes it because the entities the graph \
-             still holds for it came from bytes it no longer has."
+             disk and they do not parse. The numerator excludes it because whatever this graph \
+             answers about it was not derived from those bytes."
                 .to_string(),
         );
         lines
@@ -2608,9 +2613,12 @@ mod tests {
             "the class is taggable rather than only readable: {lines}"
         );
         assert!(lines.contains("lib/broken0.py (4 parse errors)"), "{lines}");
+        assert!(lines.contains("did not parse as written"), "{lines}");
+        // True of both populations. A file created with a typo has no earlier
+        // parse, so the clause about what the graph holds has to be conditional.
         assert!(
-            lines.contains("did not parse from their current bytes"),
-            "{lines}"
+            lines.contains("any entities the graph still holds"),
+            "the sentence may not diagnose one member of the set: {lines}"
         );
 
         // The control. A census with nothing retained says nothing about it, or
