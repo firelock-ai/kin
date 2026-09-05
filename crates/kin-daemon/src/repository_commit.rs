@@ -1612,7 +1612,20 @@ fn plan_native_commit_inner(
 ) -> Result<NativeCommitPlan> {
     let repository_id = authority_context.repository_id().clone();
     let workspace_id = authority_context.workspace_id();
-    let authority = authority_context.open().map_err(DaemonError::Graph)?;
+    // Named, because the phase around it is the largest of the commit and almost
+    // none of it is measured. On the converted psf/requests store of 2026-09-05
+    // `plan_transaction` took 29,081 ms while every sub-phase this function
+    // already times stayed under the 500 ms `timed_commit_phase` reports at, so
+    // not one of them appears in the daemon log and at least 26.5 seconds of a
+    // 77 second commit carries no name at all. This open and the workspace-graph
+    // materialization below are the two O(store) operations inside that gap: an
+    // open decodes the whole persisted authority and then re-verifies every body
+    // in repository CAS against its content address. Naming them costs nothing
+    // and is what makes the next measurement an attribution rather than another
+    // hypothesis.
+    let authority = crate::mcp_commit::timed_commit_phase("plan_open_authority", || {
+        authority_context.open().map_err(DaemonError::Graph)
+    })?;
     let lease = authority.read_authority();
     if expected_roots.is_some_and(|expected| expected != lease.roots()) {
         return Err(invalid(
@@ -1638,7 +1651,9 @@ fn plan_native_commit_inner(
     }
 
     let (commit_target, current_ref_target, head) =
-        resolve_commit_base(metadata, &workspace.head, workspace.base_target.as_ref())?;
+        crate::mcp_commit::timed_commit_phase("plan_resolve_base", || {
+            resolve_commit_base(metadata, &workspace.head, workspace.base_target.as_ref())
+        })?;
     let previous_change = if let Some(amend) = amend {
         require_amend_head(head, amend.expected_head)?;
         Some(
@@ -1683,14 +1698,21 @@ fn plan_native_commit_inner(
     // whole authority publication after it. It has nothing to contribute to
     // either.
     let workspace_semantic_delta = {
+        // The authority half of the diff, and the other O(store) operation in
+        // this function. It reads the workspace's graph out of authority, and on
+        // a store whose materialized base section does not resolve at the change
+        // being asked about, kin-db folds that base out of history instead. It
+        // sat untimed between two timed phases, so whatever it costs was
+        // invisible in every commit profile taken so far.
         let authority_workspace_graph =
-            lease
-                .workspace_graph_snapshot(&workspace_id)?
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "repository authority has no graph snapshot for workspace {workspace_id}"
-                    ))
-                })?;
+            crate::mcp_commit::timed_commit_phase("plan_authority_workspace_graph", || {
+                lease.workspace_graph_snapshot(&workspace_id)
+            })?
+            .ok_or_else(|| {
+                invalid(format!(
+                    "repository authority has no graph snapshot for workspace {workspace_id}"
+                ))
+            })?;
         let desired_workspace_graph =
             crate::mcp_commit::timed_commit_phase("plan_snapshot_clone", || graph.to_snapshot());
         crate::mcp_commit::timed_commit_phase("plan_diff_semantics", || {
