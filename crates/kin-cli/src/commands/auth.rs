@@ -980,7 +980,7 @@ mod tests {
         let store = tempfile::tempdir().expect("a private credential store");
         let _root = TestCredentialRoot::set(&store.path().join("auth"));
         let base_url = "https://kinlab.example.com";
-        std::env::remove_var("KINLAB_AUTH_PASSPHRASE");
+        let _passphrase = kin_core::test_env::EnvVarGuard::unset("KINLAB_AUTH_PASSPHRASE");
 
         store_credential(base_url, &test_credential(base_url)).expect("store the plaintext tier");
         let plaintext = fallback_credential_path(base_url)
@@ -1021,7 +1021,7 @@ mod tests {
         let _root = TestCredentialRoot::set(&store.path().join("auth"));
         let mine = "https://kinlab.example.com";
         let theirs = "https://other.example.com";
-        std::env::remove_var("KINLAB_AUTH_PASSPHRASE");
+        let _passphrase = kin_core::test_env::EnvVarGuard::unset("KINLAB_AUTH_PASSPHRASE");
 
         store_credential(mine, &test_credential(mine)).expect("store mine");
         store_credential(theirs, &test_credential(theirs)).expect("store theirs");
@@ -1044,7 +1044,8 @@ mod tests {
         let store = tempfile::tempdir().expect("a private credential store");
         let _root = TestCredentialRoot::set(&store.path().join("auth"));
         let base_url = "https://kinlab.example.com";
-        std::env::set_var("KINLAB_AUTH_PASSPHRASE", "not-a-real-passphrase");
+        let _passphrase =
+            kin_core::test_env::EnvVarGuard::set("KINLAB_AUTH_PASSPHRASE", "not-a-real-passphrase");
 
         store_credential(base_url, &test_credential(base_url)).expect("store the encrypted tier");
         let encrypted = fallback_credential_path(base_url).expect("resolve the credential path");
@@ -1055,7 +1056,6 @@ mod tests {
 
         let removal = delete_credential(base_url).expect("logout removes the local credential");
 
-        std::env::remove_var("KINLAB_AUTH_PASSPHRASE");
         assert!(!encrypted.exists(), "the encrypted form has to be gone too");
         assert!(
             removal.is_clean(),
@@ -1079,9 +1079,10 @@ mod tests {
         let _root = TestCredentialRoot::set(&store.path().join("auth"));
         let base_url = "https://kinlab.example.com";
 
-        std::env::set_var("KINLAB_AUTH_PASSPHRASE", "not-a-real-passphrase");
+        let mut passphrase = kin_core::test_env::EnvVarGuard::new();
+        passphrase.apply("KINLAB_AUTH_PASSPHRASE", Some("not-a-real-passphrase"));
         store_credential(base_url, &test_credential(base_url)).expect("store encrypted");
-        std::env::remove_var("KINLAB_AUTH_PASSPHRASE");
+        passphrase.apply("KINLAB_AUTH_PASSPHRASE", None::<&str>);
         store_credential(base_url, &test_credential(base_url)).expect("store plaintext");
 
         let paths = persisted_credential_paths(base_url).expect("both forms");
