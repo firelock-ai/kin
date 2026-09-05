@@ -343,7 +343,7 @@ pub const REPO_IDS: HostedStartRequirement = HostedStartRequirement {
     required: true,
     introduced_in: "0.6.2",
     consequence: "publication fencing has no fleet to fence: the daemon exits during startup. The \
-                  durable spine additionally requires exactly five canonical entries, and one \
+                  durable spine additionally requires 1 through 64 canonical entries, and one \
                   that omits the served repo id is refused by name",
     refusals: &[
         (

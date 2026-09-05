@@ -450,3 +450,6 @@ fn first_publication_preserves_indeterminate_outcome_and_durable_recovery_eviden
     assert_eq!(reopened.read_authority().roots(), &roots);
     assert!(publish_first_repository(source, &id, FirstPublicationMode::Native, durable).is_err());
 }
+
+#[cfg(feature = "gcs")]
+mod hosted_fleet;
