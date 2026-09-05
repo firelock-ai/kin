@@ -6173,6 +6173,16 @@ async fn reconcile_session_workspace(
         // previous parse recorded. On a converted `psf/requests` an edit that
         // prepended seventeen lines left the whole file answering seventeen
         // lines short, under an envelope with nothing to report.
+        // Record what this publication owes a parser before parsing any of it,
+        // and leave the record standing after. Re-deriving here fixes the live
+        // daemon and nothing more: entities reach durable authority only inside
+        // a semantic change, this publication deliberately writes no history,
+        // and a derived-graph mutation no change carries is gone when the next
+        // daemon replays that history. Measured, not assumed. A daemon reopened
+        // between this publication and its commit read the pre-edit span back,
+        // and a synchronous snapshot immediately after the re-derivation did not
+        // change that. The commit that publishes is what settles the record.
+        crate::semantic_debt::record(&state, &crate::semantic_debt::owed_by(observation.deltas()));
         let readmitted =
             crate::loop_runner::readmit_semantics_for_paths(&state, &published_paths(&observation))
                 .await;
@@ -6211,7 +6221,11 @@ async fn reconcile_session_workspace(
         changes,
     };
     if !semantic_failures.is_empty() {
-        return Err(semantic_readmission_refused(&summary, &semantic_failures));
+        let named = semantic_failures
+            .iter()
+            .map(|failure| failure.path.clone())
+            .collect::<Vec<_>>();
+        return Err(semantic_readmission_refused(&summary, &named));
     }
     Ok(Json(summary))
 }
@@ -6457,6 +6471,13 @@ async fn command_commit(
                 &state.layout,
                 state.graph.resolved_tree().len() as u64,
             );
+            // This transaction reached authority, and a commit derives its
+            // change from the live graph, so every parse the admission above put
+            // back into that graph is in history now. Nothing the record named
+            // is still owed. Settled here rather than at the drain because a
+            // crash between the two would otherwise clear the record for work no
+            // change carried, which is the loss the record exists to prevent.
+            crate::semantic_debt::settle_all(&state);
             Ok(response)
         }
         Err(error) => {
@@ -6689,10 +6710,22 @@ fn refuse_a_successor_that_records_nothing(
 /// they can see. On 0.5.52 it reached them as `HTTP 500 Internal Server Error:
 /// Core error: ...` (FIR-2664). Everything else stays an internal error.
 fn commit_admission_error(error: crate::error::DaemonError) -> (StatusCode, String) {
-    match projection_blocked_refusal(&error) {
-        Some(refusal) => refusal,
-        None => internal_error(error),
+    if let Some(refusal) = projection_blocked_refusal(&error) {
+        return refusal;
     }
+    // A parse this daemon could not perform over bytes that are already durable
+    // authority. The store is intact and nothing needs repairing, so answering
+    // it as an internal error would send a reader to the daemon for a file they
+    // can see. It is a refusal in words, naming the files, exactly as the
+    // reconcile that first owed the parse refuses.
+    if let crate::error::DaemonError::SemanticReadmissionFailed(message) = &error {
+        let body = serde_json::json!({
+            "error": "semantic_readmission_failed",
+            "message": message,
+        });
+        return (StatusCode::CONFLICT, body.to_string());
+    }
+    internal_error(error)
 }
 
 /// The worded refusal for a blocked projection, when `error` is one.
@@ -35133,6 +35166,417 @@ mod tests {
             after,
             before + PREPENDED_LINES,
             "the published span must move with the bytes the session changed"
+        );
+    }
+
+    /// FIR-3200, the reopen arm. The session that makes the edit and the commit
+    /// that publishes it are routinely separated by a daemon restart, which is
+    /// what makes where the parse happens matter rather than merely when. A
+    /// daemon that comes up after the session reconcile must load a graph whose
+    /// spans already match its own tree, with nothing left owed to it.
+    ///
+    /// Falsify it the way its sibling falsifies: replace the
+    /// `readmit_semantics_for_paths` call in `reconcile_session_workspace` with
+    /// `SemanticReadmission::default()`, the pair of zeros that stood there
+    /// before, and this reopens onto a graph seventeen lines behind its bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_daemon_reopened_after_a_session_reconcile_answers_at_the_moved_span() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = layout.root().join("runs/session-fir3200-reopen");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        let summary = reconcile_session_through_api(&app, &session_dir).await;
+        assert_eq!(summary.semantic_files_enriched, 1);
+        assert_eq!(summary.semantic_enrichment_failures, 0);
+
+        // The daemon dies here, between the session's edit and the commit that
+        // publishes it. Whatever the readmission derived has to be on disk
+        // already for the next one to load it.
+        drop(app);
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // The seam the reconcile loop drives once per daemon life, before it
+        // answers anything. Called directly here because this test drives the
+        // daemon's HTTP surface rather than its loop, and what is being asserted
+        // is that the record carries the parse across the restart, not that a
+        // background task eventually fires.
+        crate::loop_runner::drain_semantic_debt(&reopened)
+            .await
+            .unwrap();
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "a reopened daemon must load the spans the session's bytes hold"
+        );
+
+        let reopened_app = router(Arc::clone(&reopened));
+        commit_through_api(
+            &reopened_app,
+            kin_model::OperationId::new(),
+            "commit the session's edit after a restart",
+        )
+        .await;
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the commit after a restart must not move the span back"
+        );
+    }
+
+    /// FIR-3208. A drain that is not a commit settles nothing.
+    ///
+    /// The record exists because a re-derivation lives in the derived graph and
+    /// dies with the daemon that performed it; only a commit puts it in
+    /// history. So a drain at startup pays the parse and must leave the record
+    /// standing, or the next restart before a commit reads the pre-edit span
+    /// with nothing left to say otherwise.
+    ///
+    /// Falsify by moving `settle_all` into `drain_semantic_debt`: the first
+    /// assertion on the record goes red, and the second reopen reads the
+    /// pre-edit span with no record to pay it from.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_drain_without_a_commit_leaves_the_record_standing() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+        let session_dir = layout.root().join("runs/session-fir3208-standing");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        reconcile_session_through_api(&app, &session_dir).await;
+        drop(app);
+        drop(state);
+
+        // First restart: the drain pays the parse, and the record stands.
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        crate::loop_runner::drain_semantic_debt(&reopened)
+            .await
+            .unwrap();
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES
+        );
+        assert!(
+            !crate::semantic_debt::outstanding(&reopened).is_empty(),
+            "a drain pays the parse in the derived graph; only a commit may settle the record"
+        );
+        drop(reopened);
+
+        // Second restart, still no commit: the derived graph is stale again
+        // and the record is what makes that recoverable.
+        let again = Arc::new(DaemonState::open(layout).unwrap());
+        again
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            published_start_line(&again, "shifted.rs"),
+            before,
+            "nothing durable carried the parse across the restart"
+        );
+        crate::loop_runner::drain_semantic_debt(&again)
+            .await
+            .unwrap();
+        assert_eq!(
+            published_start_line(&again, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the standing record pays it again"
+        );
+
+        // The commit is what settles it.
+        let again_app = router(Arc::clone(&again));
+        commit_through_api(
+            &again_app,
+            kin_model::OperationId::new(),
+            "commit the session's edit",
+        )
+        .await;
+        assert!(
+            crate::semantic_debt::outstanding(&again).is_empty(),
+            "a commit that reached authority settles the whole record"
+        );
+    }
+
+    /// FIR-3208. One unrelated edit must not settle a debt nothing has paid.
+    ///
+    /// The commit that carries an admission clears the whole record once its
+    /// transaction reaches authority. An admission that drained only when its
+    /// own transition was empty would therefore let a one-line edit somewhere
+    /// else discard a parse another file was still owed, and the file would stay
+    /// stale with the record saying it was settled.
+    ///
+    /// Found by reading the settle point rather than from a failure, and it is
+    /// the same mistake the empty-delta return made in the first place: a
+    /// conclusion drawn from the wrong question. The admission's own transition
+    /// says what THIS pass moved, never what an earlier one left owing.
+    ///
+    /// Falsify by moving the `drain_semantic_debt` call back inside the
+    /// `exact_admission.deltas.is_empty()` arm: this commit then has a non-empty
+    /// transition of its own, never drains, settles the record anyway, and the
+    /// span stays where the pre-edit parse left it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn an_unrelated_edit_does_not_settle_a_debt_nothing_paid() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = layout.root().join("runs/session-fir3208-unrelated");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        reconcile_session_through_api(&app, &session_dir).await;
+
+        // The restart is what makes the debt matter: the publication's own
+        // re-derivation lives in the derived graph, and the next daemon rebuilds
+        // that from a history this publication deliberately did not write.
+        drop(app);
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // A commit whose own transition is non-empty and has nothing to do with
+        // the file that is owed a parse.
+        std::fs::write(
+            repo.path().join("unrelated.rs"),
+            b"pub fn unrelated() -> u32 { 9 }\n",
+        )
+        .unwrap();
+        let reopened_app = router(Arc::clone(&reopened));
+        commit_through_api(
+            &reopened_app,
+            kin_model::OperationId::new(),
+            "commit an unrelated file",
+        )
+        .await;
+
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "a commit that settles the record must first pay what it settles"
+        );
+    }
+
+    /// FIR-3208. An unparseable file does not block the commit.
+    ///
+    /// Source the parser cannot read is the file's own state, and retaining
+    /// last-known-good is the designed answer to it rather than a fault. An
+    /// agent mid-edit produces exactly this, so refusing every commit until the
+    /// syntax is fixed would leave a caller unable to record anything at all,
+    /// which is worse than the stale spans this record exists to prevent. The
+    /// commit records the bytes and the file keeps the spans its last readable
+    /// version produced, which is what this seam did for such a file before any
+    /// of this existed.
+    ///
+    /// Falsify by dropping the `unparseable` partition in `drain_semantic_debt`
+    /// and refusing on every failure: this commit then 409s and a caller with one
+    /// half-written file can record nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn an_unparseable_file_keeps_its_spans_and_does_not_block_the_commit() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = layout.root().join("runs/session-fir3208-broken");
+        materialize_session_through_api(&app, &session_dir).await;
+        let session_file = session_dir.join("shifted.rs");
+        prepend_session_lines(&session_file, 17);
+        let mut broken = std::fs::read(&session_file).unwrap();
+        broken.extend_from_slice(b"pub fn half_written(\n");
+        std::fs::write(&session_file, &broken).unwrap();
+        // The reconcile refuses, because the caller who just published these
+        // bytes is the one who needs to know their semantics did not follow.
+        let refusal = app
+            .clone()
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"session_dir": session_dir, "confirm_mass_deletion": false})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refusal.status(), StatusCode::CONFLICT);
+
+        // The commit after it does not refuse. The caller has been told once,
+        // the bytes are durable, and blocking them buys nothing.
+        drop(app);
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let reopened_app = router(Arc::clone(&reopened));
+        commit_through_api(
+            &reopened_app,
+            kin_model::OperationId::new(),
+            "commit a half-written file",
+        )
+        .await;
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before,
+            "an unparseable file keeps its last readable version's spans"
+        );
+    }
+
+    /// FIR-3208. A drain failure that is NOT the file's own fault refuses the
+    /// commit.
+    ///
+    /// The two halves have to be told apart or the split is meaningless. This
+    /// failure is transient and the caller can retry it; letting it through would
+    /// settle the record unpaid and reproduce the stale spans silently, which is
+    /// the whole class the record exists to close.
+    ///
+    /// The trigger is graph-owned rather than contrived: the record names a body
+    /// the exact tree still carries, and the CAS cannot produce it. That is the
+    /// shape of a store whose ingestion CAS was pruned under it.
+    ///
+    /// Falsify by treating every drain failure as unparseable: this commit then
+    /// succeeds and settles a record nothing paid.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_drain_failure_that_is_not_the_file_refuses_the_commit() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+
+        let repo_path = RepoPath::from_utf8("shifted.rs".to_string()).unwrap();
+        let tree = state.graph.resolved_tree();
+        let kin_model::TreeEntry::Blob { hash, .. } =
+            tree.artifact_at_path(&repo_path).unwrap().entry
+        else {
+            panic!("the fixture is a regular file");
+        };
+        drop(tree);
+        crate::semantic_debt::record(
+            &state,
+            &[crate::semantic_debt::SemanticDebt {
+                path: "shifted.rs".to_string(),
+                body: hash.to_string(),
+            }],
+        );
+        let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        state.blobs.delete(&body_hash).unwrap();
+
+        std::fs::write(
+            repo.path().join("other.rs"),
+            b"pub fn other() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
+                            "message": "commit while a debt cannot be paid"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a drain failure the caller can retry must refuse rather than settle unpaid: {body}"
+        );
+        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(refusal["error"], "semantic_readmission_failed");
+        assert!(
+            refusal["message"].as_str().unwrap().contains("shifted.rs"),
+            "the refusal names the path it could not pay: {body}"
         );
     }
 

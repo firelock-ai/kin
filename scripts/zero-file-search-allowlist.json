@@ -573,6 +573,17 @@
       ]
     },
     {
+      "file": "crates/kin-daemon/src/semantic_debt.rs",
+      "reason": "Semantic-debt record boundary. Three primitives on one bookkeeping file at <kin_root>/semantic-debt.json: one read of what is owed, one rewrite when an entry is recorded or settled, and one removal when a commit settles the whole record. It names repository paths whose exact bytes reached authority without a parse, and nothing else. No repository content is read here and no query answer derives from it: what the record names is decided against graph truth by partition_against_tree before anything acts on it, and the parse it triggers reads the body the exact tree names from graph-owned CAS rather than from the filesystem. An absent or unparseable record degrades to the behaviour that existed before it, a path answering at the positions its previous parse recorded, rather than to a wrong answer this daemon believes. It is a file rather than in-memory state for the same reason the unpublished-enrichment marker beside it is: the fact it carries is only ever read by a LATER process. A session reconcile publishes the workspace tree with no history and no ref move, entities reach durable authority only inside a semantic change, so the re-derivation it triggers has nothing to ride and dies with the daemon that performed it. Measured, not assumed: a daemon reopened between a session's edit and its commit read the pre-edit span back, and a synchronous snapshot immediately after the re-derivation did not change that. Function-scoped so the rest of the module stays scanned, and the module holds no other filesystem call.",
+      "owner": "kin-daemon",
+      "expiration": "2027-09-24",
+      "allow_fn": [
+        "outstanding",
+        "write",
+        "settle_all"
+      ]
+    },
+    {
       "file": "crates/kin-daemon/src/loop_runner.rs",
       "reason": "Host event ingestion boundary. The excused bodies are the file watcher's admission path: reading a host file or symlink target and its mode so the change can be admitted into the graph as exact tree state, and comparing a host entry against what the graph already holds so an unchanged file is not re-admitted. Reading the working tree is the entire job of an ingestion boundary, and the result is written into graph truth rather than returned as an answer. The remaining two are repository binding, which precedes any graph consult: recognizing a bare git layout, and resolving a path relative to the bound root. The helper that canonicalized a host parent while preserving its leaf moved to kin-index, which is a declared ingestion boundary, so the watcher and this runner decide repository containment by one rule instead of two. The cfg-gated executable-bit helper is the pair that carries a count of two. Function-scoped so the rest of the runner stays scanned. Two further bodies are operational state beside the pid and port files, the same class as the sweep's own enrichment marker in daemon.rs: one records the repository paths this daemon derived entities for and could not have published, the other reads that record back on the next open. Neither reads repository content and neither answers a query. What the record names is decided against graph truth before anything acts on it, which is the point: without it a file whose entities died with the daemon that derived them stays admitted and unqueryable forever (FIR-2606).",
       "owner": "kin-daemon",

@@ -2479,6 +2479,12 @@ pub async fn run_loop_armed(
     // Owed once per daemon life, and independent of the catch-up window: the
     // paths it recovers are exactly the ones whose host modification time puts
     // them outside that window, which is why the window cannot see them.
+    // The semantic debt one previous daemon left, owed once per daemon life and
+    // before this loop answers anything. A path whose bytes reached authority
+    // without a parse is a wrong answer this daemon is able to know about, and
+    // waiting for the next commit to drain it would serve the previous parse to
+    // every query in between.
+    let mut semantic_debt_drain_owed = true;
     let mut enrichment_repair_owed = true;
     // Owed once per daemon life for the same reason and on the same schedule:
     // a store converted from Git carries entities whose parse observation was
@@ -2645,6 +2651,23 @@ pub async fn run_loop_armed(
         // answered every query as an absence, and a store that has been in that
         // state deserves the count said out loud rather than repaired in
         // silence.
+        if semantic_debt_drain_owed {
+            semantic_debt_drain_owed = false;
+            // Under the gate every other graph-authority mutation takes,
+            // including the tick below, commit and checkout. The drain applies
+            // entity transactions to the live graph, and a mutation outside
+            // the gate can interleave with a commit planning its change from
+            // that same graph.
+            let _coordination = state.coordination_gate.lock().await;
+            if let Err(error) = drain_semantic_debt(&state).await {
+                warn!(
+                    error = %error,
+                    "a path whose bytes reached authority without a parse could not be re-parsed \
+                     at startup, so it still answers at the positions its previous bytes held"
+                );
+            }
+        }
+
         if enrichment_repair_owed {
             enrichment_repair_owed = false;
             match plan_unpublished_enrichment_repair(&state) {
@@ -3890,6 +3913,86 @@ mod tests {
             std::env::var_os("KIN_ALLOW_MASS_DELETION"),
             mass_delete_before,
             "graph-only mode must not set or clear the mass-deletion escape hatch"
+        );
+    }
+
+    /// FIR-3208. A daemon start pays the semantic debt a previous daemon left,
+    /// before the loop answers anything.
+    ///
+    /// The record is the only thing carrying a parse across a restart, and a
+    /// commit is the only other drain, so a loop that skipped this at startup
+    /// would serve the previous parse to every query until someone committed.
+    /// The store is put into exactly the shape a session publication leaves:
+    /// the exact tree published on its own, nothing parsed, the record naming
+    /// what is owed.
+    ///
+    /// Falsify by removing the once-per-life drain from `run_loop_armed`: the
+    /// span never moves and the poll below runs out.
+    #[tokio::test]
+    async fn a_daemon_start_pays_the_semantic_debt_a_previous_daemon_left() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let host = repo.path().join("shifted.rs");
+        let original = b"pub fn shifted() -> u32 { 7 }\n".to_vec();
+        std::fs::write(&host, &original).unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let start_line = |state: &DaemonState| -> Option<u32> {
+            state
+                .graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(FilePathId::new("shifted.rs")),
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find_map(|entity| entity.span.map(|span| span.start_line))
+        };
+        assert_eq!(start_line(&state), Some(0));
+
+        let mut shifted = b"// prepended\n".repeat(17);
+        shifted.extend_from_slice(&original);
+        std::fs::write(&host, &shifted).unwrap();
+        let admission = exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+        assert!(!admission.deltas.is_empty(), "the bytes moved");
+        crate::semantic_debt::record(&state, &crate::semantic_debt::owed_by(&admission.deltas));
+        let recorded = crate::semantic_debt::outstanding(&state);
+        let (owed, _) = crate::semantic_debt::partition_against_tree(&state, &recorded);
+        assert_eq!(owed.len(), 1, "the tree carries the body the record names");
+        assert_eq!(
+            start_line(&state),
+            Some(0),
+            "nothing has parsed the new bytes yet; that is the debt"
+        );
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let mut handle = tokio::spawn(run_loop(
+            Arc::clone(&state),
+            LoopConfig::default(),
+            cancel_rx,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while start_line(&state) != Some(17) {
+            assert!(
+                !handle.is_finished(),
+                "the loop exited before paying the debt a previous daemon left"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the loop never re-derived the path a previous daemon left owing; span is {:?}",
+                start_line(&state)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), &mut handle)
+            .await
+            .expect("the loop exits on shutdown")
+            .expect("the loop task must not panic")
+            .expect("the loop exits cleanly");
+        assert!(
+            !crate::semantic_debt::outstanding(&state).is_empty(),
+            "a startup drain pays the parse in the derived graph and leaves the record for the \
+             commit that makes it durable"
         );
     }
 
@@ -8102,6 +8205,72 @@ pub(crate) async fn sync_filesystem_with_graph_deferring_tree_publication(
     sync_filesystem_with_graph_publishing(state, TreePublication::DeferredToCaller).await
 }
 
+/// Re-derive the semantics every recorded debt still owes, and refuse in words
+/// if any of them cannot be.
+///
+/// Entries a later transition overtook are settled here rather than re-parsed:
+/// the tree no longer names the body they were recorded for, so the admission
+/// that moved it enriched the path already. What survives that filter is settled
+/// only by the commit that publishes it, because a commit is the transaction
+/// that makes a parse durable and a crash before one would otherwise clear the
+/// record for work nothing carried.
+pub(crate) async fn drain_semantic_debt(state: &DaemonState) -> Result<()> {
+    let recorded = crate::semantic_debt::outstanding(state);
+    if recorded.is_empty() {
+        return Ok(());
+    }
+    let (owed, spent) = crate::semantic_debt::partition_against_tree(state, &recorded);
+    crate::semantic_debt::settle(state, &spent);
+    if owed.is_empty() {
+        return Ok(());
+    }
+    info!(
+        paths = owed.len(),
+        "re-deriving the semantics for paths whose bytes reached authority without them"
+    );
+    let readmitted = readmit_semantics_for_paths(state, &owed).await;
+    let (unparseable, unresolved): (Vec<_>, Vec<_>) = readmitted
+        .failed
+        .into_iter()
+        .partition(|failure| failure.unparseable);
+    // Source the parser cannot read is the file's own state, and retaining
+    // last-known-good is the designed answer to it rather than a fault. An agent
+    // mid-edit produces exactly this, and refusing the commit until the syntax is
+    // fixed would leave a caller unable to record anything at all, which is a
+    // worse outcome than the spans this seam exists to keep current. So it is
+    // said out loud and the commit proceeds, which is what this file already did
+    // for such a path before any of this existed.
+    if !unparseable.is_empty() {
+        warn!(
+            files = unparseable
+                .iter()
+                .map(|failure| failure.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            "these paths could not be parsed, so they keep the spans their last readable \
+             version produced; the commit records their bytes either way"
+        );
+    }
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    // Everything else is this daemon failing at something it should have
+    // managed, and a caller can retry it. Letting one through would settle the
+    // record unpaid and reproduce the stale spans silently, which is the whole
+    // class this record exists to close.
+    Err(DaemonError::SemanticReadmissionFailed(format!(
+        "the bytes for {} of these paths are durable authority and their semantics could not be \
+         re-derived from them, so the graph still answers about them at the positions their \
+         previous bytes held: {}",
+        unresolved.len(),
+        unresolved
+            .iter()
+            .map(|failure| failure.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
 /// What re-deriving the semantic layer for one set of already-admitted paths
 /// produced.
 #[derive(Debug, Default)]
@@ -8112,7 +8281,40 @@ pub(crate) struct SemanticReadmission {
     /// Entity-source paths whose bytes moved and whose semantics could not be
     /// re-derived, named so a caller can refuse in words rather than report a
     /// count of zero.
-    pub(crate) failed: Vec<String>,
+    pub(crate) failed: Vec<SemanticFailure>,
+}
+
+/// One path whose semantics did not follow its bytes, and whether the file
+/// itself is the reason.
+///
+/// The distinction decides what a caller may do about it. Source the parser
+/// cannot read is the file's own state, and falling back to last-known-good is
+/// the designed answer rather than a fault: an agent mid-edit produces it
+/// constantly, and refusing every commit until the syntax is fixed would be a
+/// worse outcome than the stale spans this seam exists to prevent. Everything
+/// else is this daemon failing at something it should have managed, and a caller
+/// can retry it.
+#[derive(Debug, Clone)]
+pub(crate) struct SemanticFailure {
+    pub(crate) path: String,
+    /// The parser read the file and could not make sense of it.
+    pub(crate) unparseable: bool,
+}
+
+impl SemanticFailure {
+    fn unparseable(path: String) -> Self {
+        Self {
+            path,
+            unparseable: true,
+        }
+    }
+
+    fn unresolved(path: String) -> Self {
+        Self {
+            path,
+            unparseable: false,
+        }
+    }
 }
 
 /// Re-derive the semantic layer for paths whose exact bytes are already graph
@@ -8189,7 +8391,9 @@ pub(crate) async fn readmit_semantics_for_paths(
                     "the body this path's exact tree entry names is not readable, so its \
                      semantics cannot be re-derived from graph-owned truth"
                 );
-                outcome.failed.push(file_id.0.clone());
+                outcome
+                    .failed
+                    .push(SemanticFailure::unresolved(file_id.0.clone()));
                 continue;
             }
         };
@@ -8241,7 +8445,9 @@ pub(crate) async fn readmit_semantics_for_paths(
                      names, so its semantics were left for the admission that observes those \
                      bytes"
                 );
-                outcome.failed.push(file_id.0.clone());
+                outcome
+                    .failed
+                    .push(SemanticFailure::unresolved(file_id.0.clone()));
                 continue;
             }
             Err(error) => {
@@ -8251,7 +8457,9 @@ pub(crate) async fn readmit_semantics_for_paths(
                     "could not compare the host entry to graph authority before re-deriving \
                      this path's semantics"
                 );
-                outcome.failed.push(file_id.0.clone());
+                outcome
+                    .failed
+                    .push(SemanticFailure::unresolved(file_id.0.clone()));
                 continue;
             }
         }
@@ -8290,7 +8498,13 @@ pub(crate) async fn readmit_semantics_for_paths(
                         "published bytes were read but no semantic transaction came back, so \
                          this path still answers at the positions its previous parse recorded"
                     );
-                    outcome.failed.push(file_id.0.clone());
+                    outcome.failed.push(
+                        if matches!(reconciled, ReconcileOutcome::BrokenAst { .. }) {
+                            SemanticFailure::unparseable(file_id.0.clone())
+                        } else {
+                            SemanticFailure::unresolved(file_id.0.clone())
+                        },
+                    );
                     continue;
                 }
                 {
@@ -8302,7 +8516,9 @@ pub(crate) async fn readmit_semantics_for_paths(
                             "re-derived semantics for published bytes but the transaction would \
                              not apply"
                         );
-                        outcome.failed.push(file_id.0.clone());
+                        outcome
+                            .failed
+                            .push(SemanticFailure::unresolved(file_id.0.clone()));
                         continue;
                     }
                     if derived_entities {
@@ -8349,7 +8565,9 @@ pub(crate) async fn readmit_semantics_for_paths(
                     "published bytes could not be re-parsed, so this path's entities still \
                      answer at the positions they were parsed at"
                 );
-                outcome.failed.push(file_id.0.clone());
+                outcome
+                    .failed
+                    .push(SemanticFailure::unresolved(file_id.0.clone()));
             }
         }
     }
@@ -8542,6 +8760,25 @@ async fn sync_filesystem_with_graph_publishing_inner(
     // Recorded before anything below can fail, so a pass that dies part way
     // through enrichment still hands the deferral back to be closed.
     *deferred_out = exact_admission.deferred_tree.take();
+    // Drain what earlier publications owe a parser, on both paths and before the
+    // empty-transition conclusion below.
+    //
+    // On the empty path this is the whole point: an empty transition means the
+    // working copy and the graph agree about bytes, not that the graph agrees
+    // with itself, and returning without asking is what let a commit record a
+    // tree delta with no entity delta over a file whose declarations had all
+    // moved.
+    //
+    // On the non-empty path it matters for a different reason. This pass parses
+    // the paths ITS OWN transition moved, which need not include a path some
+    // earlier publication left owing, and the commit that carries this admission
+    // settles the whole record once its transaction reaches authority. Draining
+    // only on the empty path would let one unrelated edit clear a debt nothing
+    // had paid.
+    if let Err(error) = drain_semantic_debt(state).await {
+        drop(graph_mutation);
+        return Err(error);
+    }
     if exact_admission.deltas.is_empty() {
         drop(graph_mutation);
         return Ok(());
