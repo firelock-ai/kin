@@ -108,6 +108,10 @@ struct IndexedFixtureFile {
     entities: Vec<Entity>,
     same_file_relations: Vec<Relation>,
     artifact_id: ArtifactId,
+    /// This file's real content digest, carried so the tree entry admitting the
+    /// artifact names the same bytes the index was given. `kin_model::Hash256`
+    /// is a re-export of `kin_blobs::Hash256`, so one value serves both.
+    blob_hash: Hash256,
 }
 
 fn index_files(fixture: &Fixture) -> Vec<IndexedFixtureFile> {
@@ -118,6 +122,11 @@ fn index_files(fixture: &Fixture) -> Vec<IndexedFixtureFile> {
     ]
     .into_iter()
     .map(|(path, source)| {
+        // The file's real content digest, per file, not a shared zero hash. The
+        // daemon checks that the digest matches the bytes it indexed, so a
+        // placeholder is a fixture that stops resembling the product the moment
+        // that check tightens. The same value goes into the tree entry below.
+        let blob_hash = kin_blobs::digest(source.as_bytes());
         let indexed = pipeline
             .index_file_content_with_tests(
                 &FilePathId::new(path),
@@ -136,6 +145,7 @@ fn index_files(fixture: &Fixture) -> Vec<IndexedFixtureFile> {
             entities: indexed.entities,
             same_file_relations: indexed.relations,
             artifact_id: ArtifactId::new(),
+            blob_hash,
         }
     })
     .collect()
@@ -198,17 +208,16 @@ fn graph_with(files: &[IndexedFixtureFile], linked: &[Relation]) -> InMemoryGrap
     // refuses them at the write. A transaction carrying a `TreeDelta::Added`
     // is the product's own admission path.
     for file in files {
-        let mut seed = [0u8; 32];
-        for (slot, byte) in seed.iter_mut().zip(file.parse.file_path.as_bytes()) {
-            *slot = *byte;
-        }
         graph
             .apply_transaction_delta(&TransactionDelta {
                 tree_deltas: vec![TreeDelta::Added {
                     artifact_id: file.artifact_id,
                     new: LocatedEntry::new(
                         RepoPath::from_utf8(&file.parse.file_path).expect("fixture path is utf-8"),
-                        TreeEntry::blob(Hash256::from_bytes(seed), false),
+                        // The file's own content digest, the same one the index
+                        // was given. It was the path bytes padded with zeros,
+                        // which is a value no blob store would ever hold.
+                        TreeEntry::blob(file.blob_hash, false),
                     ),
                 }],
                 ..TransactionDelta::default()

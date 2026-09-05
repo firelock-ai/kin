@@ -1752,8 +1752,8 @@ fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
         counted["floor_reason"] = json!("receiver_name_candidates_withheld");
     }
     // The site numbers FIR-2398 added answer a narrower question than this
-    // object does: whether every RETURNED row could be located at a line, not
-    // whether the row set is whole. They are carried verbatim rather than folded
+    // object does: whether every RETURNED row's sites are whole, not whether the
+    // row set is whole. They are carried verbatim rather than folded
     // into `exact`, because collapsing the two is how a complete row set with one
     // unlocatable site would come to read as an incomplete answer.
     if let Some(sites) = payload.get("counts").and_then(|counts| {

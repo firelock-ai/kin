@@ -1056,6 +1056,15 @@ pub struct ReferenceRow {
     /// than a derived guess -- and `reference_lines_absent` then names which
     /// absence it is.
     pub reference_lines: Vec<u32>,
+    /// Why this row's `reference_lines` are a lower bound rather than the whole
+    /// set, and `None` when every kind behind the row came from a producer that
+    /// records each site.
+    ///
+    /// Separate from `reference_lines_absent` because a partial list and an
+    /// empty one are different follow-ups: an empty list sends a reader to
+    /// another surface, a partial one tells them the sites they have are real
+    /// and there may be more.
+    pub reference_lines_partial: Option<ReferenceLinesPartial>,
     /// Why this row carries no `reference_lines`, and `None` when it carries
     /// some.
     ///
@@ -1151,6 +1160,146 @@ impl ReferenceLinesAbsent {
     }
 }
 
+/// Why a reference row's site lines are a FLOOR rather than the whole set.
+///
+/// A row can carry lines and still be incomplete, and until this existed nothing
+/// in the response said so: `reference_sites_complete` asked only whether every
+/// row had at least one line, which a row holding one of five sites satisfies.
+/// express's `test/utils.js` calls `setCharset` on lines 50, 54, 58, 62 and 66,
+/// and `find_references` reported `reference_lines: [50]` under a `certified`
+/// verdict with both site flags reading complete.
+///
+/// The distinction is the producer's own contract, which is a graph fact rather
+/// than a guess: [`RelationOrigin`](kin_model::RelationOrigin) says which
+/// producer recorded an edge, and exactly one of the four records every site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceLinesPartial {
+    /// An edge behind this row came from language-server enrichment, which
+    /// records at most one site per edge.
+    ///
+    /// kin-lsp takes `CallHierarchyOutgoingCall.from_ranges.first()` for a call
+    /// edge, keeps the first location per target for a `UsesType` edge, and
+    /// carries no span at all on its `References` edges. Each is one site
+    /// standing in for however many the file holds.
+    LanguageServerEdge,
+    /// An edge behind this row came from a producer with no every-site
+    /// contract: `Manual`, or an origin added after this was written.
+    ///
+    /// A hand-authored edge asserts that the reference exists. A span on it is
+    /// one position somebody recorded, never a statement that the file holds no
+    /// others, so it cannot license a site total. An unrecognized origin lands
+    /// here too, because a producer nobody has checked has made no promise.
+    ProducerWithoutSiteContract,
+    /// An edge behind this row carries the linker's own marker saying the parse
+    /// or the call extraction that produced it was not exhaustive.
+    ///
+    /// `call_shape_incomplete_parse_v1` is stamped on evidence recovered from a
+    /// parse that was not fully valid, and `call_shape_incomplete_extraction_v1`
+    /// on a syntax-valid file whose adapter could not represent every call
+    /// expression. Both say sibling occurrences may have been omitted, in the
+    /// producer's own words. `relation_evidence` then writes the site span ONTO
+    /// that marker record rather than beside it, so such an edge arrives with a
+    /// real line and an explicit statement that the line is not the whole set:
+    /// the one shape a check reading only [`RelationOrigin`] cannot see.
+    IncompleteCallEvidence,
+}
+
+impl ReferenceLinesPartial {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LanguageServerEdge => "language_server_edge",
+            Self::ProducerWithoutSiteContract => "producer_without_site_contract",
+            Self::IncompleteCallEvidence => "incomplete_call_evidence",
+        }
+    }
+
+    /// Which gap is the more useful one to report when a row has several.
+    ///
+    /// They all mean the same thing to a caller, that the lines are a floor, so
+    /// the only question is which names the most specific cause. An edge whose
+    /// own evidence declares the parse incomplete has said so outright, which
+    /// beats anything inferred from its producer; a measured one-site-per-edge
+    /// producer beats the general case of a producer nobody has checked.
+    fn specificity(self) -> u8 {
+        match self {
+            Self::IncompleteCallEvidence => 2,
+            Self::LanguageServerEdge => 1,
+            Self::ProducerWithoutSiteContract => 0,
+        }
+    }
+}
+
+/// Whether one evidence record declares its own call coverage incomplete.
+///
+/// Read against the linker's exported constants rather than against copies of
+/// their strings, so a producer that renames a marker cannot leave this quietly
+/// matching nothing.
+fn evidence_declares_incomplete_calls(evidence: &kin_model::RelationEvidence) -> bool {
+    let Some(rule) = evidence.parser_rule.as_deref() else {
+        return false;
+    };
+    rule == kin_index::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1
+        || rule == kin_index::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1
+}
+
+/// Why this edge cannot license a site total, and `None` when it can.
+///
+/// The claim is made from positive proof, by naming the origins that carry an
+/// every-site contract, rather than from the absence of one known bad producer.
+/// Reading it the other way round, as `origin != Lsp`, certified `Manual` by
+/// default and would certify any origin added later the same way.
+///
+/// `Parsed` and `Inferred` both carry the contract, and the enum is misleading
+/// about why. Both are the linker's own output over one adapter extraction:
+/// `make_relation` (`kin-index/src/linker.rs`) picks between them purely on
+/// confidence, `origin = if confidence >= 1.0 { Parsed } else { Inferred }`, and
+/// builds the evidence for both from the same `ExtractedRelation::site`. So
+/// `Inferred` here describes how firmly the DESTINATION was resolved, never how
+/// many sites were recorded: an import-pinned cross-file call resolves at 0.9
+/// and is `Inferred` while carrying every call site the parse saw. The linker's
+/// two other `Inferred` producers, the external-import reference and the include
+/// marker, record no `source_span` at all, so they contribute no line to floor.
+///
+/// Treating `Inferred` as contract-less would floor a correct answer: the Python
+/// batch arm of `kin-cli`'s `reference_call_site_lines` reports both of its real
+/// parsed sites on a `type_resolved` row, and it went red under that reading.
+/// The origin is read only after the evidence, because the evidence can refuse
+/// on the linker's behalf. `relation_evidence` stamps an incomplete parse or an
+/// incomplete extraction onto the record it then writes the site span onto, so a
+/// `Parsed` or `Inferred` edge can carry a real line beside its producer's own
+/// statement that it did not see every call. An origin check alone reads that
+/// edge as complete.
+fn edge_site_contract_gap(
+    relation: &kin_model::relation::Relation,
+) -> Option<ReferenceLinesPartial> {
+    if relation
+        .evidence
+        .iter()
+        .any(evidence_declares_incomplete_calls)
+    {
+        return Some(ReferenceLinesPartial::IncompleteCallEvidence);
+    }
+    match relation.origin {
+        kin_model::RelationOrigin::Parsed | kin_model::RelationOrigin::Inferred => None,
+        kin_model::RelationOrigin::Lsp => Some(ReferenceLinesPartial::LanguageServerEdge),
+        _ => Some(ReferenceLinesPartial::ProducerWithoutSiteContract),
+    }
+}
+
+/// Keep the most specific gap a row has seen, by
+/// [`ReferenceLinesPartial::specificity`].
+fn merge_site_contract_gap(
+    current: &mut Option<ReferenceLinesPartial>,
+    incoming: Option<ReferenceLinesPartial>,
+) {
+    let Some(gap) = incoming else {
+        return;
+    };
+    if current.is_none_or(|held| gap.specificity() > held.specificity()) {
+        *current = Some(gap);
+    }
+}
+
 /// One row per REFERENCING ENTITY that reaches `entity_id` over an allowed
 /// relation kind.
 ///
@@ -1229,6 +1378,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
                 file_path: file_path.clone(),
                 start_line: entity_presentation_start_line(&entity),
                 reference_lines: Vec::new(),
+                reference_lines_partial: None,
                 reference_lines_absent: None,
                 signature: Some(entity.signature.clone()),
                 // Project the caller's bounded body once, where the entity is in
@@ -1263,6 +1413,14 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             .entry(source_entity_id)
             .or_default() += tally.outside_caller_file;
         push_reference_kind(&mut entry.relation_kinds, rel.kind);
+        // Any contribution without an every-site contract keeps the row a floor.
+        // A parsed edge holds every site the PARSE saw, which is not evidence
+        // about the occurrences some other edge stands for, and no coverage
+        // witness in the graph joins the two.
+        merge_site_contract_gap(
+            &mut entry.reference_lines_partial,
+            edge_site_contract_gap(&rel),
+        );
         let resolution = RelationResolution::of(&rel);
         entry.resolution = Some(match entry.resolution {
             Some(current) => current.max(resolution),
@@ -1335,6 +1493,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
                     file_path,
                     start_line: entity_presentation_start_line(&entity),
                     reference_lines: Vec::new(),
+                    reference_lines_partial: None,
                     reference_lines_absent: None,
                     signature: Some(entity.signature.clone()),
                     snippet,
@@ -1353,6 +1512,10 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
                 .entry(source_entity_id)
                 .or_default() += tally.outside_caller_file;
             push_reference_kind(&mut entry.relation_kinds, rel.kind);
+            merge_site_contract_gap(
+                &mut entry.reference_lines_partial,
+                edge_site_contract_gap(&rel),
+            );
             let resolution = RelationResolution::of(&rel);
             entry.resolution = Some(match entry.resolution {
                 Some(current) => current.max(resolution),
@@ -1373,6 +1536,12 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
         row.relation_kinds.sort_by_key(relation_kind_rank);
         row.reference_lines.sort_unstable();
         row.reference_lines.dedup();
+        // A row with no lines has nothing to call a floor: `reference_lines_absent`
+        // below is the whole story, and carrying both would state one absence
+        // twice under two names.
+        if row.reference_lines.is_empty() {
+            row.reference_lines_partial = None;
+        }
         row.reference_lines_absent = if !row.reference_lines.is_empty() {
             None
         } else if spans_outside_caller_file
