@@ -2905,7 +2905,7 @@ impl GraphStatusSettledCache {
     /// Record a reading that completed the full live fence. O(1), taken after
     /// the fence is released, so recording can never lengthen the window an
     /// embed worker waits on.
-    fn record(
+    pub(crate) fn record(
         &self,
         scope: kin_mcp::handlers::entities::GraphStatusScope,
         graph: &Arc<kin_db::InMemoryGraph>,
@@ -2961,12 +2961,12 @@ impl GraphStatusSettledCache {
 /// Reading index metadata needs no embedder and takes no additional lock beyond
 /// the index's own.
 #[cfg(feature = "vector")]
-fn selected_graph_index_population(graph: &kin_db::InMemoryGraph) -> Option<usize> {
+pub(crate) fn selected_graph_index_population(graph: &kin_db::InMemoryGraph) -> Option<usize> {
     graph.vector_index_stats().map(|(_, population)| population)
 }
 
 #[cfg(not(feature = "vector"))]
-fn selected_graph_index_population(_graph: &kin_db::InMemoryGraph) -> Option<usize> {
+pub(crate) fn selected_graph_index_population(_graph: &kin_db::InMemoryGraph) -> Option<usize> {
     None
 }
 
@@ -42131,13 +42131,27 @@ mod tests {
     /// The one case with nothing honest to publish still must not answer with a
     /// bare retry instruction: it names what was tried, the state that blocked
     /// it, and the condition that changes the outcome.
+    ///
+    /// Asked about a graph this daemon holds no settled reading of, because the
+    /// HEAD slot no longer reaches this state: `DaemonState::open` records a
+    /// reading before any embedding worker can exist. The refusal graded here is
+    /// still reachable, for a selected graph with no slot of its own, so what
+    /// moved is which graph reaches it and not what it must say.
     #[tokio::test]
     async fn graph_status_with_no_settled_reading_names_the_blocking_state() {
         let state = test_state();
-        let graph = Arc::clone(&state.graph);
+        let unseeded: Arc<kin_db::InMemoryGraph> = Arc::new(kin_db::InMemoryGraph::new());
         let _embedding_guard = state.embedding_work.lock().unwrap();
 
-        let result = head_graph_status(&state, &graph).await;
+        let result = mcp_graph_status_with_stable_authority(
+            &state,
+            None,
+            &unseeded,
+            RequestGraphAuthority::Head,
+            kin_mcp::handlers::entities::GraphStatusScope::Head,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.is_error, Some(true));
         let text = mcp_result_text(&result);
