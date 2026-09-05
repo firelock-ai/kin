@@ -57,10 +57,12 @@
 //! place. Production is ordinary application default credentials with no
 //! override at all.
 //!
-//! Opening a destination therefore names its [`GcsEndpointClass`], and
-//! [`OpenedGcsDestination`] carries that class back out with the backend. The
-//! class is an input, not something inferred from a handle afterwards, so an
-//! emulator cannot be recorded as production by a caller that forgot to ask.
+//! Opening a destination therefore takes a [`GcsEndpoint`], and
+//! [`OpenedGcsDestination`] carries its [`GcsEndpointClass`] back out beside the
+//! backend. The class is derived from the endpoint that was named, at one site
+//! shared by both entry points, rather than inferred from a handle afterwards,
+//! which a handle cannot answer. So an emulator cannot be recorded as
+//! production by a caller that forgot to ask.
 
 /// Longest artifact identifier a hosted control plane stores as bounded text.
 ///
@@ -317,16 +319,7 @@ impl GcsEndpointOverride {
             ));
         }
 
-        // A bracketed IPv6 literal has colons inside the host, so the port is
-        // whatever follows the closing bracket and nothing else. Splitting on
-        // the last colon without this refuses `[::1]` for having a port of
-        // "1]", which is a loud refusal wearing the wrong reason.
-        let port_separator = match authority.rfind(']') {
-            Some(bracket) => authority[bracket + 1..]
-                .find(':')
-                .map(|offset| bracket + 1 + offset),
-            None => authority.rfind(':'),
-        };
+        let port_separator = port_separator(authority).map_err(|reason| refuse(&reason))?;
 
         let (host, port) = match port_separator {
             None => (authority, if scheme == "https" { 443_u16 } else { 80 }),
@@ -360,6 +353,37 @@ impl GcsEndpointOverride {
     /// Where the value came from, for a record or a message.
     pub fn source_name(&self) -> &str {
         &self.source_name
+    }
+}
+
+/// Where the port begins in an authority, or the reason the authority is refused.
+///
+/// A bracketed address has colons inside the host, so its port is whatever
+/// follows the closing bracket and nothing else. Splitting on the last colon
+/// instead refuses `[::1]` for having a port of "1]", which is a loud refusal
+/// wearing the wrong reason.
+///
+/// A bracket anywhere else is refused rather than parsed. Looking past the last
+/// `]` without that check turns `host:4443]` into a host of `host:4443]` with
+/// the scheme's default port appended, which is a value normalized into the
+/// record a caller writes rather than the refusal it deserves.
+fn port_separator(authority: &str) -> Result<Option<usize>, String> {
+    match (authority.starts_with('['), authority.find(']')) {
+        (true, Some(bracket)) => match &authority[bracket + 1..] {
+            "" => Ok(None),
+            rest if rest.starts_with(':') => Ok(Some(bracket + 1)),
+            rest => Err(format!(
+                "it carries {rest:?} after the bracketed address; an endpoint is scheme, host \
+                 and port only"
+            )),
+        },
+        (true, None) => Err("it opens a bracketed address it never closes".to_owned()),
+        (false, Some(_)) => Err(
+            "it carries a ']' outside a bracketed address; an endpoint is \
+             scheme, host and port only"
+                .to_owned(),
+        ),
+        (false, None) => Ok(authority.rfind(':')),
     }
 }
 
@@ -478,8 +502,15 @@ mod backend {
     /// `#[must_use]` catches one shape and only one: a destination opened and
     /// then dropped whole. It does NOT catch a caller that keeps a field and
     /// discards the rest, because reading a field is a use, and the tests below
-    /// do exactly that. What actually keeps the class from being lost is that
-    /// nothing can build this value without naming an endpoint.
+    /// do exactly that.
+    ///
+    /// The guarantee that does hold is narrower than "this value always knows
+    /// its class", because the fields are public and a struct literal builds
+    /// one from nothing. It is that nothing in this module produces a BACKEND
+    /// without naming an endpoint: `client` is private, `mod backend` is
+    /// private, and `opened` is the only path to an `Arc<dyn StorageBackend>`.
+    /// A caller that hand-builds this struct brought its own backend and its
+    /// own class, so nothing was lost on the way here.
     #[must_use]
     pub struct OpenedGcsDestination {
         /// The backend a publication is handed.
@@ -511,15 +542,20 @@ mod backend {
         ///
         /// This builds the client and hands it to [`GcsDestination::opened`],
         /// which is the only place either entry point derives the endpoint
-        /// class. That is deliberate: a second derivation site is a second place
-        /// for an emulator to be recorded as production, and a review of this
-        /// module found exactly that mutant surviving when there were two.
+        /// class. That is deliberate: a second derivation site would be a second
+        /// place for an emulator to be recorded as production.
         pub fn open(
             &self,
             endpoint: &GcsEndpoint,
             artifact_id_prefix: &str,
             repository_id: &str,
         ) -> Result<OpenedGcsDestination, GcsDestinationError> {
+            // Before the client, not after. `opened` checks this too and is the
+            // unskippable gate; checking it here as well means a destination
+            // that can never be reported does not get a client built for it,
+            // and an operator whose prefix is too long is told that rather
+            // than told about credentials by a client that failed first.
+            self.check_artifact_id_budget(artifact_id_prefix, repository_id)?;
             let store = self.client(endpoint)?;
             self.opened(store, endpoint, artifact_id_prefix, repository_id)
         }
@@ -824,6 +860,22 @@ mod tests {
                 "it carries credentials before the host",
             ),
             ("http://user@storage.example.test", "it carries credentials"),
+            // A stray bracket after the port. Looking for the port past the
+            // last `]` is right for a bracketed address and wrong for this,
+            // which would otherwise normalize to a host of
+            // "storage.example.test:4443]" with port 80 appended.
+            (
+                "http://storage.example.test:4443]",
+                "it carries a ']' outside a bracketed address",
+            ),
+            (
+                "http://[::1",
+                "it opens a bracketed address it never closes",
+            ),
+            (
+                "http://[::1]x:4443",
+                "it carries \"x:4443\" after the bracketed address",
+            ),
         ] {
             let Err(error) = GcsEndpointOverride::parse(value, "OPERATOR_ENDPOINT") else {
                 panic!("endpoint {value:?} must be refused");
@@ -1185,9 +1237,8 @@ mod gcs_tests {
     #[test]
     fn opening_a_real_client_derives_the_class_from_the_endpoint_it_was_given() {
         // The one path the wiring commit will actually call. It builds a real
-        // client, which performs no network IO, and it is here because a review
-        // found a class-dropping mutant surviving inside it while every test
-        // went through the other entry point.
+        // client, which performs no network IO and needs no ambient
+        // credentials, and it is the entry point the other tests do not reach.
         let destination = destination(PREFIX);
         let emulator = destination
             .open(&emulator(), SCHEMA, REPOSITORY)
