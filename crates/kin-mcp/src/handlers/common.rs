@@ -1190,6 +1190,18 @@ pub enum ReferenceLinesPartial {
     /// others, so it cannot license a site total. An unrecognized origin lands
     /// here too, because a producer nobody has checked has made no promise.
     ProducerWithoutSiteContract,
+    /// An edge behind this row carries the linker's own marker saying the parse
+    /// or the call extraction that produced it was not exhaustive.
+    ///
+    /// `call_shape_incomplete_parse_v1` is stamped on evidence recovered from a
+    /// parse that was not fully valid, and `call_shape_incomplete_extraction_v1`
+    /// on a syntax-valid file whose adapter could not represent every call
+    /// expression. Both say sibling occurrences may have been omitted, in the
+    /// producer's own words. `relation_evidence` then writes the site span ONTO
+    /// that marker record rather than beside it, so such an edge arrives with a
+    /// real line and an explicit statement that the line is not the whole set:
+    /// the one shape a check reading only [`RelationOrigin`] cannot see.
+    IncompleteCallEvidence,
 }
 
 impl ReferenceLinesPartial {
@@ -1197,8 +1209,37 @@ impl ReferenceLinesPartial {
         match self {
             Self::LanguageServerEdge => "language_server_edge",
             Self::ProducerWithoutSiteContract => "producer_without_site_contract",
+            Self::IncompleteCallEvidence => "incomplete_call_evidence",
         }
     }
+
+    /// Which gap is the more useful one to report when a row has several.
+    ///
+    /// They all mean the same thing to a caller, that the lines are a floor, so
+    /// the only question is which names the most specific cause. An edge whose
+    /// own evidence declares the parse incomplete has said so outright, which
+    /// beats anything inferred from its producer; a measured one-site-per-edge
+    /// producer beats the general case of a producer nobody has checked.
+    fn specificity(self) -> u8 {
+        match self {
+            Self::IncompleteCallEvidence => 2,
+            Self::LanguageServerEdge => 1,
+            Self::ProducerWithoutSiteContract => 0,
+        }
+    }
+}
+
+/// Whether one evidence record declares its own call coverage incomplete.
+///
+/// Read against the linker's exported constants rather than against copies of
+/// their strings, so a producer that renames a marker cannot leave this quietly
+/// matching nothing.
+fn evidence_declares_incomplete_calls(evidence: &kin_model::RelationEvidence) -> bool {
+    let Some(rule) = evidence.parser_rule.as_deref() else {
+        return false;
+    };
+    rule == kin_index::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1
+        || rule == kin_index::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1
 }
 
 /// Why this edge cannot license a site total, and `None` when it can.
@@ -1222,9 +1263,22 @@ impl ReferenceLinesPartial {
 /// Treating `Inferred` as contract-less would floor a correct answer: the Python
 /// batch arm of `kin-cli`'s `reference_call_site_lines` reports both of its real
 /// parsed sites on a `type_resolved` row, and it went red under that reading.
+/// The origin is read only after the evidence, because the evidence can refuse
+/// on the linker's behalf. `relation_evidence` stamps an incomplete parse or an
+/// incomplete extraction onto the record it then writes the site span onto, so a
+/// `Parsed` or `Inferred` edge can carry a real line beside its producer's own
+/// statement that it did not see every call. An origin check alone reads that
+/// edge as complete.
 fn edge_site_contract_gap(
     relation: &kin_model::relation::Relation,
 ) -> Option<ReferenceLinesPartial> {
+    if relation
+        .evidence
+        .iter()
+        .any(evidence_declares_incomplete_calls)
+    {
+        return Some(ReferenceLinesPartial::IncompleteCallEvidence);
+    }
     match relation.origin {
         kin_model::RelationOrigin::Parsed | kin_model::RelationOrigin::Inferred => None,
         kin_model::RelationOrigin::Lsp => Some(ReferenceLinesPartial::LanguageServerEdge),
@@ -1232,20 +1286,17 @@ fn edge_site_contract_gap(
     }
 }
 
-/// Keep the most specific gap a row has seen.
-///
-/// Both values mean the same thing to a caller, that the lines are a floor, so
-/// the only question is which is more useful to read. `LanguageServerEdge` names
-/// a measured one-site-per-edge producer and points at a specific fix, so it
-/// wins over the general case.
+/// Keep the most specific gap a row has seen, by
+/// [`ReferenceLinesPartial::specificity`].
 fn merge_site_contract_gap(
     current: &mut Option<ReferenceLinesPartial>,
     incoming: Option<ReferenceLinesPartial>,
 ) {
-    match (*current, incoming) {
-        (_, None) => {}
-        (Some(ReferenceLinesPartial::LanguageServerEdge), _) => {}
-        (_, Some(gap)) => *current = Some(gap),
+    let Some(gap) = incoming else {
+        return;
+    };
+    if current.is_none_or(|held| gap.specificity() > held.specificity()) {
+        *current = Some(gap);
     }
 }
 

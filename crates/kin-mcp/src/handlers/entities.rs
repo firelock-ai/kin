@@ -1576,10 +1576,11 @@ sites could not be located OR are only a floor, with `known_reference_sites` the
 bound and each such row naming why under `reference_lines_absent_reason` (no lines at \
 all) or `reference_lines_partial_reason` (lines came back but there may be more). That \
 second reason is `language_server_edge` when an edge came from language-server \
-enrichment, which reports one site per edge, and `producer_without_site_contract` when \
-one was hand-authored, which proves a reference rather than an occurrence count. Only a \
-row built entirely from edges the parse produced lists every site it has, and only that \
-row sets neither reason. Rows omit the caller's body by \
+enrichment, which reports one site per edge, `producer_without_site_contract` when one \
+was hand-authored, which proves a reference rather than an occurrence count, and \
+`incomplete_call_evidence` when one carries the linker's marker for a recovered parse or \
+a call extraction that was not exhaustive. Only a row built entirely from edges a \
+complete parse produced lists every site it has, and only that row sets neither reason. Rows omit the caller's body by \
 default to keep the response small; pass include_snippets=true for the signature and a \
 bounded body excerpt, or drill to any row's entity_id with get_entity_source. \
 Use it to answer \"who calls / imports / uses this?\" before you \
@@ -1954,11 +1955,13 @@ fn reference_row_json(row: ReferenceRow, include_snippets: bool) -> serde_json::
             .map(ReferenceLinesAbsent::as_str),
         // Why the lines that DID come back are a floor: `language_server_edge`
         // (an edge behind this row came from language-server enrichment, which
-        // reports one site per edge) or `producer_without_site_contract` (one
-        // was hand-authored, or came from an origin with no checked contract,
-        // so it proves a reference rather than an occurrence count). Null when
-        // every edge behind the row came from the parse, and then
-        // `reference_line_count` is the whole count for this caller.
+        // reports one site per edge), `producer_without_site_contract` (one was
+        // hand-authored, or came from an origin with no checked contract, so it
+        // proves a reference rather than an occurrence count), or
+        // `incomplete_call_evidence` (one carries the linker's own marker saying
+        // the parse was recovered or the call extraction was not exhaustive).
+        // Null when every edge behind the row came from a complete parse, and
+        // then `reference_line_count` is the whole count for this caller.
         "reference_lines_partial_reason": row
             .reference_lines_partial
             .map(ReferenceLinesPartial::as_str),
@@ -8179,6 +8182,92 @@ mod tests {
         assert_eq!(body["counts"]["reference_sites"], serde_json::Value::Null);
         assert_eq!(body["counts"]["known_reference_sites"], 2);
         assert_eq!(body["counts"]["reference_sites_complete"], false);
+    }
+
+    /// An edge whose own evidence declares the parse or the extraction
+    /// incomplete does not certify its site set, at either confidence.
+    ///
+    /// This is the shape an origin check cannot see. `relation_evidence`
+    /// (`kin-index/src/linker.rs`) builds the shape record first, stamping
+    /// `call_shape_incomplete_parse_v1` when the parse was recovered or
+    /// `call_shape_incomplete_extraction_v1` when the adapter could not
+    /// represent every call expression, and then writes the site span ONTO that
+    /// record rather than beside it. So a `Parsed` or `Inferred` edge arrives
+    /// carrying a real line next to the linker's own statement that sibling
+    /// occurrences may have been omitted. Both markers are read from the
+    /// linker's exported constants, so renaming one there breaks this rather
+    /// than silently matching nothing.
+    #[tokio::test]
+    async fn find_references_will_not_certify_evidence_marked_incomplete() {
+        for (marker, origin, confidence, label) in [
+            (
+                kin_index::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1,
+                RelationOrigin::Parsed,
+                1.0_f32,
+                "recovered parse at full confidence",
+            ),
+            (
+                kin_index::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1,
+                RelationOrigin::Inferred,
+                0.9_f32,
+                "recovered parse at import-pinned confidence",
+            ),
+            (
+                kin_index::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1,
+                RelationOrigin::Parsed,
+                1.0_f32,
+                "incomplete extraction at full confidence",
+            ),
+            (
+                kin_index::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1,
+                RelationOrigin::Inferred,
+                0.9_f32,
+                "incomplete extraction at import-pinned confidence",
+            ),
+        ] {
+            let store = InMemoryGraph::new();
+            let caller = make_entity("caller", "src/a.rs");
+            let target = make_entity("target", "src/b.rs");
+            store.upsert_entity(&caller).unwrap();
+            store.upsert_entity(&target).unwrap();
+
+            // The site the linker writes onto the marker record, exactly as
+            // `relation_evidence` does: one record, both fields set.
+            let mut relation =
+                make_relation_with_site(caller.id, target.id, RelationKind::Calls, "src/a.rs", 11);
+            relation.origin = origin;
+            relation.confidence = confidence;
+            relation.evidence[0].parser_rule = Some(marker.to_string());
+            store.upsert_relation(&relation).unwrap();
+
+            let args = HashMap::from([(
+                "entity_id".to_string(),
+                serde_json::json!(target.id.to_string()),
+            )]);
+            let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+            let row = &body["references"].as_array().unwrap()[0];
+
+            // The line it does have is still served. A floor is not a refusal.
+            assert_eq!(
+                row["reference_lines"],
+                serde_json::json!([12]),
+                "{label}: the known site must survive: {row:#}"
+            );
+            assert_eq!(
+                row["reference_lines_partial_reason"], "incomplete_call_evidence",
+                "{label}: the edge's own evidence says the parse was short: {body:#}"
+            );
+            assert_eq!(
+                body["counts"]["reference_sites"],
+                serde_json::Value::Null,
+                "{label}: a site total over incomplete evidence is not a number: {body:#}"
+            );
+            assert_eq!(body["counts"]["known_reference_sites"], 1);
+            assert_eq!(
+                body["counts"]["reference_sites_complete"], false,
+                "{label}: {body:#}"
+            );
+        }
     }
 
     /// A kind ONLY the language server recorded makes the row a floor even when

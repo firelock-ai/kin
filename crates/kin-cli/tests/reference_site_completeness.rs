@@ -32,8 +32,11 @@
 use std::collections::HashMap;
 
 use kin_db::InMemoryGraph;
-use kin_index::linker::ArtifactIdentityMap;
-use kin_index::{FileParseData, IndexPipeline};
+use kin_index::linker::{ArtifactIdentityMap, IncrementalLinker};
+use kin_index::{
+    link_cross_file_incremental_with_completeness, FileParseCompletenessMap, FileParseData,
+    IndexPipeline,
+};
 use kin_model::{
     ArtifactId, Entity, EntityStore, FilePathId, GraphNodeId, Hash256, LocatedEntry, Relation,
     RelationEvidence, RelationId, RelationKind, RelationOrigin, RepoPath, SourceSpan,
@@ -349,5 +352,92 @@ async fn a_function_level_caller_lists_every_site_and_certifies_them() {
         body["counts"]["reference_sites_complete"],
         serde_json::json!(true),
         "a complete site set must still be able to say complete: {body:#}"
+    );
+}
+
+/// The linker's own incompleteness marker floors the row, and the sites it did
+/// record all survive.
+///
+/// Producer-backed rather than hand-stamped: the completeness map is the
+/// linker's input, so passing `ParseCompleteness::Partial` for the caller file
+/// makes `call_shape_evidence` emit `call_shape_incomplete_parse_v1` and
+/// `relation_evidence` write each call site's span ONTO that marker record.
+/// Every byte of the evidence under test is what the real linker produced.
+///
+/// The shape is the one an origin check cannot see: five real, correct lines
+/// beside the producer's own statement that the parse it read them from was not
+/// exhaustive. Listing all five and still refusing to certify is the honest
+/// answer, and it is what this asserts.
+#[tokio::test]
+async fn a_recovered_parse_floors_the_row_while_keeping_every_site_it_recorded() {
+    let sites = call_site_lines(FUNCTION_LEVEL_CALLER);
+    assert_eq!(sites.len(), 5, "the fixture must write five calls");
+
+    let files = index_files(FUNCTION_LEVEL_CALLER);
+    let mut linker = IncrementalLinker::new();
+    for file in &files {
+        linker.add_file(&file.parse.file_path, file.artifact_id, &file.entities);
+    }
+    // The one input that changes: this file's parse was recovered, not full.
+    let completeness: FileParseCompletenessMap = files
+        .iter()
+        .map(|file| {
+            let state = if file.parse.file_path == CALLER_PATH {
+                kin_model::ParseCompleteness::Partial("fixture: recovered parse".to_string())
+            } else {
+                kin_model::ParseCompleteness::Full
+            };
+            (file.parse.file_path.clone(), state)
+        })
+        .collect();
+    let batch: Vec<FileParseData> = files.iter().map(|file| file.parse.clone()).collect();
+    let linked = link_cross_file_incremental_with_completeness(&batch, &linker, &completeness)
+        .expect("incremental cross-file linking");
+    let graph = graph_with(&files, &linked);
+
+    let target = entity_in(&files, DEFS_PATH, "setCharset").clone();
+    let body = find_references(&graph, &target).await;
+    let rows = body["references"]
+        .as_array()
+        .unwrap_or_else(|| panic!("references array: {body:#}"));
+    let row = rows
+        .iter()
+        .find(|row| row["name"] == "run")
+        .unwrap_or_else(|| panic!("no row for caller `run`: {body:#}"));
+
+    // Non-vacuity for the fixture itself: if the marker never reached the graph
+    // this asserts nothing, so the evidence is read back from the linker's own
+    // output rather than assumed.
+    let marked = linked.iter().any(|relation| {
+        relation.evidence.iter().any(|evidence| {
+            evidence.parser_rule.as_deref()
+                == Some(kin_index::linker::CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1)
+                && evidence.source_span.is_some()
+        })
+    });
+    assert!(
+        marked,
+        "the linker must have stamped the incomplete-parse marker onto a spanned record, or \
+         this fixture proves nothing"
+    );
+
+    assert_eq!(
+        row["reference_lines"],
+        serde_json::json!(sites),
+        "every site the recovered parse did record must still be reported: {row:#}"
+    );
+    assert_eq!(
+        row["reference_lines_partial_reason"], "incomplete_call_evidence",
+        "the linker said the parse was short, so the answer must not certify: {row:#}"
+    );
+    assert_eq!(
+        body["counts"]["reference_sites"],
+        serde_json::Value::Null,
+        "a site total over incomplete evidence is not a number: {body:#}"
+    );
+    assert_eq!(
+        body["counts"]["reference_sites_complete"],
+        serde_json::json!(false),
+        "{body:#}"
     );
 }
