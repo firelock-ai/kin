@@ -4591,7 +4591,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
         let (state, _rx) = enriching_state(init.layout.clone());
-        crate::daemon::mark_files_enriched(&state, &["ledger/printing.py".to_string()]);
+        crate::daemon::mark_files_enriched(
+            &state,
+            &["ledger/printing.py".to_string()],
+            crate::daemon::current_marker_epoch(&state),
+        );
         assert!(
             crate::daemon::file_already_enriched(&state, "ledger/printing.py"),
             "the fixture has to start marked, or the assertion below proves nothing"
@@ -4604,6 +4608,155 @@ mod tests {
             "a file the merge did not touch can still have gained a cross-file edge through it, \
              and a sweep that skips the file cannot derive one; the evidence has to be retired so \
              the merge's own sweep visits it"
+        );
+    }
+
+    /// FIR-3242. A merge's demand outlives a full channel at the pass tail.
+    ///
+    /// `complete_lsp_sweep` swapped the pending bit to false and then threw
+    /// away what `queue_lsp_sweep` answered, and `queue_lsp_sweep` answers
+    /// false for a FULL channel exactly as it does for a closed one. So a
+    /// bounded queue with anything in it at the moment a pass ends consumed the
+    /// merge's demand and queued nothing, and the merged tree went back to
+    /// waiting for a command nobody knows to type.
+    ///
+    /// The empty-channel row is
+    /// `a_merge_admitted_while_a_sweep_runs_gets_one_after_that_sweep_ends`,
+    /// and it is the control this one is set beside: there the tail queues the
+    /// sweep and clears the bit, and both rows have to hold.
+    #[test]
+    fn a_merge_demand_outlives_a_full_channel_at_the_pass_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let (state, mut rx) = enriching_state(init.layout.clone());
+        state
+            .lsp_sweep_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            state.request_lsp_sweep_after_merge(),
+            "a merge admitted under a running pass is told its sweep is coming, which is the \
+             promise the rest of this test holds the daemon to"
+        );
+
+        // What a busy incremental path leaves behind, and what the tail below
+        // has to send into.
+        let filled = {
+            let tx = state
+                .lsp_enrichment_tx
+                .as_ref()
+                .expect("the fixture's daemon can enrich");
+            let mut filled = 0usize;
+            // Incremental messages, deliberately: a queue full of SWEEPS would
+            // complete one and drain the bit at that tail, which is the path
+            // this test exists to prove is not the only one.
+            while tx
+                .try_send(crate::state::LspEnrichmentMessage::Incremental(
+                    crate::state::LspEnrichmentRequest {
+                        file_id: kin_model::FilePathId::new("ledger/model.py"),
+                        changed_entity_ids: Vec::new(),
+                    },
+                ))
+                .is_ok()
+            {
+                filled += 1;
+            }
+            filled
+        };
+        assert!(
+            filled > 0,
+            "the fixture has to actually fill the queue, or the tail below meets an empty one \
+             and this test is the control instead"
+        );
+
+        crate::daemon::complete_lsp_sweep(&state, 0);
+
+        assert!(
+            state
+                .lsp_sweep_pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the tail could not queue into a full channel, so the demand has to still be \
+             recorded; it was consumed and the failure to place it was thrown away"
+        );
+
+        // And the demand is live rather than merely remembered. The retry that
+        // matters is NOT another sweep completing: with the queue holding
+        // nothing but incremental work, no sweep ever completes, and a demand
+        // only a tail could drain would sit in the bit forever. So this drives
+        // the drain the worker runs at its receive boundary, after it takes a
+        // message and before it blocks again, with no completion at all.
+        state
+            .lsp_sweep_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        rx.try_recv().expect("the worker takes one message");
+        crate::daemon::drain_pending_lsp_sweep(&state);
+
+        let mut delivered = false;
+        while let Ok(message) = rx.try_recv() {
+            delivered |= matches!(message, crate::state::LspEnrichmentMessage::Sweep);
+        }
+        assert!(
+            delivered,
+            "the receive boundary has to hand the merge its sweep once the queue has room; a \
+             demand nothing can ever act on is the same defect wearing a bit"
+        );
+        assert!(
+            !state
+                .lsp_sweep_pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "and the bit clears once the sweep is actually placed, or the next boundary queues a \
+             second one"
+        );
+    }
+
+    /// FIR-3242. A pass that started before the merge cannot restore what the
+    /// merge retired.
+    ///
+    /// The worker lists every entity once when it starts, and marks the files
+    /// it finished durable at its tail, and only then completes. A merge that
+    /// lands between those two points retires the marker set, and then that old
+    /// pass's tail marks its own files again, using language-server answers
+    /// taken before the merge existed. The sweep the merge queued then skips
+    /// exactly the files whose cross-file answers the merge changed.
+    ///
+    /// The retirement test beside this one asserts immediately after the settle
+    /// and never reaches the old tail, which is why it stayed green over this.
+    #[test]
+    fn a_pass_that_started_before_the_merge_cannot_restore_what_the_merge_retired() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let (state, _rx) = enriching_state(init.layout.clone());
+        state
+            .lsp_sweep_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let enriched_this_sweep = vec!["ledger/printing.py".to_string()];
+        // What the pass carries from the moment it listed the graph.
+        let started_at = crate::daemon::current_marker_epoch(&state);
+
+        settle_merged_graph(&state);
+
+        // The old pass reaches its tail: it judges its writes durable, marks
+        // what it finished, and only then completes.
+        crate::daemon::mark_files_enriched(&state, &enriched_this_sweep, started_at);
+        crate::daemon::complete_lsp_sweep(&state, 0);
+
+        assert!(
+            !crate::daemon::file_already_enriched(&state, "ledger/printing.py"),
+            "this pass took its answers before the merge existed, so its mark cannot outrank the \
+             merge's retirement; the sweep the merge queued has to visit the file"
+        );
+
+        // The control, and it is the whole reason this rule is a comparison
+        // rather than a refusal: a pass that started AFTER the merge still
+        // records what it finished. Without it the rule above is satisfied by a
+        // marker that never marks anything, which would retire the skip
+        // entirely and re-sweep the store on every pass forever.
+        let after_the_merge = crate::daemon::current_marker_epoch(&state);
+        crate::daemon::mark_files_enriched(&state, &enriched_this_sweep, after_the_merge);
+        assert!(
+            crate::daemon::file_already_enriched(&state, "ledger/printing.py"),
+            "a pass whose answers postdate the merge records them, or the marker has stopped \
+             being a marker"
         );
     }
 

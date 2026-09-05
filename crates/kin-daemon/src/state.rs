@@ -3187,6 +3187,18 @@ pub struct DaemonState {
     /// mutating. One coalesced bit rather than a counter, because the demand is
     /// "sweep the graph as it now stands" and two of those are one.
     pub lsp_sweep_pending: AtomicBool,
+    /// How many times this store's enrichment markers have been invalidated
+    /// wholesale.
+    ///
+    /// A cold sweep takes its language-server answers over a graph it lists
+    /// once, and records what it finished at its tail, long after. Anything
+    /// that invalidates the marker set in between makes that record false, and
+    /// the pass cannot see it: a merge retires every marker and the pass then
+    /// puts its own straight back, so the sweep the merge queued skips exactly
+    /// the files whose cross-file answers the merge changed. A pass carries the
+    /// value this held when it started, and its tail is refused when the value
+    /// has moved.
+    pub lsp_enriched_marker_epoch: AtomicU64,
     /// Files a sweep has finished enriching, so a later pass can skip them.
     ///
     /// An explicit marker rather than an inference from the graph. Two attempts
@@ -5305,6 +5317,7 @@ impl DaemonState {
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
             lsp_sweep_pending: AtomicBool::new(false),
+            lsp_enriched_marker_epoch: AtomicU64::new(0),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
             unpublished_enrichment: std::sync::Mutex::new(std::collections::HashSet::new()),
             cached_repo_id,
@@ -5674,6 +5687,7 @@ impl DaemonState {
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
             lsp_sweep_pending: AtomicBool::new(false),
+            lsp_enriched_marker_epoch: AtomicU64::new(0),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
             unpublished_enrichment: std::sync::Mutex::new(std::collections::HashSet::new()),
             cached_repo_id: repo_id.to_string(),
