@@ -205,7 +205,22 @@ pub enum RepositoryTransferError {
 /// times with no next step; the token that peer accepts was in its
 /// repository's `.kin/daemon.token` the whole time, and this names it.
 pub fn bearer_token_next_step(base_url: &str) -> String {
-    let address = redacted_remote_address(base_url);
+    let recipe = "for a peer daemon on this machine, set \
+                  KIN_REMOTE_BEARER_TOKEN=$(cat <peer>/.kin/daemon.token) where <peer> is that \
+                  repository's working directory; for KinLab, set KIN_REMOTE_BEARER_TOKEN to a \
+                  KinLab token";
+    let Some(address) = redacted_remote_address(base_url) else {
+        // Naming no remote is worse than naming one, and naming a WRONG one is
+        // worse than both: a string this helper cannot parse may be a host or
+        // may be half a password, and it has no way to tell. So it says which
+        // it is, and the recipe below still works without an address.
+        return format!(
+            "send a bearer token that remote accepts. Its configured URL is not a well-formed \
+             URL, so this refusal does not repeat it: an `@` outside a URL's authority may be \
+             part of a host or part of a password, and nothing here can tell them apart. Fix the \
+             remote's URL, then {recipe}, or run `kin auth login --base-url <that remote>`"
+        );
+    };
     let carried = if address == base_url.trim() {
         ""
     } else {
@@ -213,58 +228,70 @@ pub fn bearer_token_next_step(base_url: &str) -> String {
          sends the token from the environment rather than from the URL"
     };
     format!(
-        "send a bearer token the remote at {address} accepts: for a peer daemon on this \
-         machine, set KIN_REMOTE_BEARER_TOKEN=$(cat <peer>/.kin/daemon.token) where <peer> is \
-         that repository's working directory; for KinLab, run `kin auth login --base-url \
-         {address}` or set KIN_REMOTE_BEARER_TOKEN to a KinLab token{carried}"
+        "send a bearer token the remote at {address} accepts: {recipe}, or run `kin auth login \
+         --base-url {address}`{carried}"
     )
 }
 
-/// One remote's address with everything secret-bearing removed: the scheme,
-/// host, port and path a reader has to act on, and nothing else.
+/// One remote's address with everything secret-bearing removed, or `None` when
+/// this cannot parse the string well enough to vouch for any part of it.
 ///
 /// A refusal is the one place a stranger reads a whole remote URL back, so it
 /// is the one place a credential typed into a remote config is copied into a
 /// terminal, a bug report and a shell history. Three URL parts can carry one:
-/// the userinfo before `@`, the query, and the fragment. None of them is part
-/// of the address a caller needs, and Kin never authenticates from any of them,
-/// so all three go.
+/// the userinfo before `@`, the query, and the fragment. None is part of the
+/// address a caller needs and Kin authenticates from none of them, so all three
+/// go, and the scheme, host, port and path stay.
 ///
-/// The address itself stays. A message that named no remote at all would leak
-/// nothing and help nobody: a stranger with two accounts could not tell which
-/// peer refused them.
+/// **The `None` arm is the whole correctness of this function.** A URL's
+/// authority ends at the first `/`, `?` or `#`, and its userinfo lives before
+/// the last `@` inside that authority. An earlier version scanned for `@` only
+/// inside the authority and returned its input untouched when it found none,
+/// which made `https://alice:pa/ss@kinlab.ai/org` a complete no-op: the
+/// unencoded `/` ends the authority before the `@` that marks the userinfo, so
+/// the refusal printed that password verbatim. `https://alice:p?w@kinlab.ai/org`
+/// was worse, redacting to `https://alice:p`, which leaks half a credential and
+/// names a host that is not the remote.
 ///
-/// Hand-written rather than parsed, because this must answer for a string that
-/// is not a valid URL as safely as for one that is. A parser would have to
-/// choose between returning the input unchanged, which is the leak, and
-/// returning nothing, which is the useless message above. Cutting on the
-/// delimiters does neither: an unparseable string still loses its query, its
-/// fragment and its userinfo.
-pub fn redacted_remote_address(base_url: &str) -> String {
+/// No textual rule recovers from that, because the information is not there: in
+/// `https://alice:pa/ss@kinlab.ai/org` the `@` marks a userinfo, and in
+/// `https://kinlab.ai/a@b` an identical-looking `@` is an ordinary path
+/// character. A redactor cannot tell them apart, so it must not guess. An `@`
+/// at or after the authority's end means this is not a well-formed URL, and
+/// this returns `None` rather than vouch for a host that may be a password
+/// fragment. Callers say so instead of printing an address.
+///
+/// Hand-written rather than parsed, and that is not a shortcut: a lenient
+/// parser resolves `https://alice:pa/ss@kinlab.ai/org` to host `pa`, which is
+/// part of the password, so parsing would have produced a confident wrong
+/// answer where this produces an honest refusal.
+pub fn redacted_remote_address(base_url: &str) -> Option<String> {
     let trimmed = base_url.trim();
-    // Query and fragment first, so a userinfo scan can never run over one. A
-    // raw `?` or `#` cannot appear inside userinfo or a host; both are
-    // percent-encoded there.
-    let addressed = trimmed
-        .find(['?', '#'])
-        .map_or(trimmed, |cut| &trimmed[..cut]);
     // The authority is what lies between the scheme and the path. A string with
     // no scheme is treated as bare authority rather than skipped, so a
     // malformed remote loses its userinfo too.
-    let authority_start = addressed.find("://").map_or(0, |scheme_end| scheme_end + 3);
-    let authority_end = addressed[authority_start..]
-        .find('/')
-        .map_or(addressed.len(), |offset| authority_start + offset);
-    // The LAST `@`, because a password may itself contain an encoded one and the
-    // authority ends at the final separator.
-    match addressed[authority_start..authority_end].rfind('@') {
-        Some(at) => format!(
-            "{}{}",
-            &addressed[..authority_start],
-            &addressed[authority_start + at + 1..]
-        ),
-        None => addressed.to_string(),
+    let authority_start = trimmed.find("://").map_or(0, |scheme_end| scheme_end + 3);
+    let authority_end = trimmed[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(trimmed.len(), |offset| authority_start + offset);
+    // An `@` out here is the unparseable case above. Checked against the
+    // ORIGINAL string rather than one already shortened, because cutting the
+    // query first is exactly what hid the `?w@` shape.
+    if trimmed[authority_end..].contains('@') {
+        return None;
     }
+    // The LAST `@`, because a password may itself contain an encoded one and
+    // the userinfo ends at the final separator.
+    let host_start = match trimmed[authority_start..authority_end].rfind('@') {
+        Some(at) => authority_start + at + 1,
+        None => authority_start,
+    };
+    let kept = format!("{}{}", &trimmed[..authority_start], &trimmed[host_start..]);
+    // Query and fragment last, over a string that no longer carries a userinfo.
+    Some(match kept.find(['?', '#']) {
+        Some(cut) => kept[..cut].to_string(),
+        None => kept,
+    })
 }
 
 pub type Result<T> = std::result::Result<T, RepositoryTransferError>;
@@ -5124,7 +5151,7 @@ mod bearer_token_next_step_tests {
     fn the_next_step_keeps_the_address_a_reader_has_to_act_on() {
         let message = bearer_token_next_step(CREDENTIAL_BEARING);
         assert!(
-            message.contains("https://kinlab.example/"),
+            message.contains("https://kinlab.example"),
             "the remedy must still name which remote refused: {message}"
         );
     }
@@ -5165,16 +5192,64 @@ mod redacted_remote_address_tests {
             ),
             ("https://kinlab.ai/org#tok", "https://kinlab.ai/org"),
             ("https://u:p@kinlab.ai/org?t=v#f", "https://kinlab.ai/org"),
-            // A path that carries an `@` is a path, not userinfo, and a reader
-            // needs it: the authority ends at the first `/`.
-            ("https://kinlab.ai/a@b", "https://kinlab.ai/a@b"),
             // Not a URL at all. A parser would hand this back untouched, which
             // is the leak; the delimiters still say where the secret was.
             ("u:p@kinlab.ai/org?t=v", "kinlab.ai/org"),
             ("  https://kinlab.ai  ", "https://kinlab.ai"),
         ] {
-            assert_eq!(redacted_remote_address(input), expected, "for {input}");
+            assert_eq!(
+                redacted_remote_address(input).as_deref(),
+                Some(expected),
+                "for {input}"
+            );
         }
+    }
+
+    /// The `continue` in the property below is only honest if something else
+    /// pins which shapes take it. These are those shapes, and each one is a
+    /// measured leak from the review of this change: the authority-bounded scan
+    /// could not see either `@`, so before the `None` arm the first returned its
+    /// input untouched and the second returned `https://alice:p`, half a
+    /// password wearing a host's place in the sentence.
+    #[test]
+    fn a_userinfo_carrying_an_unencoded_delimiter_is_withheld_rather_than_guessed() {
+        for (case, input) in [
+            ("an unencoded slash", "https://alice:pa/ss@kinlab.ai/org"),
+            (
+                "an unencoded question mark",
+                "https://alice:p?w@kinlab.ai/org",
+            ),
+            ("an unencoded hash", "https://alice:p#w@kinlab.ai/org"),
+        ] {
+            assert_eq!(
+                redacted_remote_address(input),
+                None,
+                "{case}: a URL this cannot parse must be withheld, not guessed at"
+            );
+        }
+        // The same rule withholds an ordinary path that happens to carry an
+        // `@`. That is the cost of not guessing, taken deliberately: this
+        // cannot tell `/a@b` from a smuggled userinfo, and over-redacting an
+        // address is recoverable where printing a password is not.
+        assert_eq!(redacted_remote_address("https://kinlab.ai/a@b"), None);
+    }
+
+    /// A withheld address must not leave the refusal naming a remote it cannot
+    /// vouch for, and must still carry the recipe.
+    #[test]
+    fn the_next_step_names_no_address_when_it_cannot_parse_one() {
+        let message = super::bearer_token_next_step("https://alice:pa/ss@kinlab.ai/org");
+        for carried in ["pa/ss", "alice", "kinlab.ai"] {
+            assert!(
+                !message.contains(carried),
+                "the refusal named part of a URL it could not parse"
+            );
+        }
+        assert!(
+            message.contains("not a well-formed URL")
+                && message.contains("KIN_REMOTE_BEARER_TOKEN=$(cat <peer>/.kin/daemon.token)"),
+            "it must say why it named no remote and still give the recipe: {message}"
+        );
     }
 
     /// The property, stated once over every shape above: nothing a caller could
@@ -5195,14 +5270,23 @@ mod redacted_remote_address_tests {
                 "alice:s3cr3t@kinlab.ai#t0ken",
             ),
         ] {
-            let redacted = redacted_remote_address(input);
+            // Withholding is a pass here and the reason is the point: for the
+            // two unencoded-delimiter shapes there is no host this can name
+            // without risking naming a password fragment, so `None` IS the
+            // correct redaction rather than a gap in it.
+            let Some(redacted) = redacted_remote_address(input) else {
+                continue;
+            };
             assert!(
-                !redacted.contains("s3cr3t") && !redacted.contains("t0ken"),
+                !redacted.contains("s3cr3t")
+                    && !redacted.contains("t0ken")
+                    && !redacted.contains("pa/ss")
+                    && !redacted.contains("alice"),
                 "{case}: a credential survived redaction"
             );
             assert!(
-                !redacted.contains('?') && !redacted.contains('#'),
-                "{case}: a query or fragment survived redaction"
+                !redacted.contains('?') && !redacted.contains('#') && !redacted.contains('@'),
+                "{case}: a query, fragment or userinfo survived redaction"
             );
             assert!(
                 redacted.contains("kinlab.ai") || redacted.contains("127.0.0.1"),

@@ -16,8 +16,8 @@
 //! received a push, and that attribution is wrong: kin-remote's
 //! `transfer_transaction` builds every received pack with
 //! `workspace_mutation: None`, so a receive moves a ref and never the receiver's
-//! own base. Measured here on `0b67c5048` at 2026-09-05T21:43Z, an origin that
-//! received a push still served its own base from its own section; what folded
+//! own base. An origin that received a push was measured serving its own base
+//! from its own section before this change landed; what folded
 //! was the store whose base a branch switch had moved, which is what journey
 //! step 6 did before step 7 read it, and which is also what the product's own
 //! remedy for a workspace behind its ref asks a user to run.
@@ -325,9 +325,9 @@ fn a_replica_that_pulled_serves_its_workspace_base_from_a_section() {
 /// A received transfer moves a ref and nothing else: kin-remote's
 /// `transfer_transaction` builds every pack's transaction with
 /// `workspace_mutation: None`, so the receiver's workspace stays where it was
-/// and the section its last commit wrote still answers for it. Measured on
-/// `0b67c5048` at 2026-09-05T21:43Z, this case was already green, which is why
-/// it is stated as the regression guard it is rather than as a defect: a
+/// and the section its last commit wrote still answers for it. This case was
+/// measured already green before the change this file guards, which is why it
+/// is stated as the regression guard it is rather than as a defect: a
 /// post-receive refresh that wrote a section at the RECEIVED head would be
 /// writing one kin-db then refuses for this workspace, turning a store that
 /// serves into a store that folds.
