@@ -5415,7 +5415,13 @@ impl DaemonState {
         allowed_repo_ids: Option<HashSet<String>>,
         publication_control: Option<Arc<crate::publication_lease::PublicationControl>>,
     ) -> Result<Self> {
-        let text_index_path = layout.text_index_dir();
+        // Per repository, never the layout's one text-index directory. A hosted
+        // daemon serves many repositories through one layout, so a shared
+        // directory makes every repository's graph a writer of one segment
+        // image: each rebuild reclaims the files another repository's manifest
+        // names, and the load-time reconciliation refuses the result. See
+        // `KinLayout::hosted_text_index_dir` for why the component is a digest.
+        let text_index_path = layout.hosted_text_index_dir(repo_id);
         let (
             graph,
             generation,
@@ -8336,7 +8342,11 @@ impl DaemonState {
                     .as_ref()
                     .cloned()
                     .map(Arc::new);
-                let text_index_path = self.layout.text_index_dir();
+                // The same per-repository rule the hosted open takes. This is
+                // the site the five-repo spine root proof drives once per fleet
+                // repository, so a shared directory turns one proof into five
+                // writers of one image.
+                let text_index_path = self.layout.hosted_text_index_dir(repo_id);
                 let (query_snapshot, materialized_head) =
                     materialize_hosted_repository_snapshot(recovered.snapshot)?;
                 let graph = Arc::new(
@@ -11232,6 +11242,192 @@ mod tests {
         ));
         std::fs::remove_file(state.layout.kindb_vector_index_path()).unwrap();
         descriptor
+    }
+
+    /// How many times each repository is loaded in the isolation test.
+    ///
+    /// The failure it guards is two loads writing one on-disk image, so the
+    /// loads have to overlap. One round per repository would usually finish
+    /// before the next repository's thread started; several rounds keep every
+    /// repository writing for as long as the others are.
+    const HOSTED_LOAD_ISOLATION_ROUNDS: usize = 6;
+
+    /// A hosted daemon over one layout serving a five-repository fleet.
+    ///
+    /// Five because that is the fleet the hosted spine root proof loads, and
+    /// because the failure needs a repository to load against a directory some
+    /// OTHER repository is writing. Entity counts differ per repository on
+    /// purpose: a persistent text index reconciles its segment sums against its
+    /// manifest, so two repositories of equal size could disagree about which
+    /// documents are present while still agreeing about how many.
+    ///
+    /// Returns the temporary directories as well, because dropping either one
+    /// deletes the store under the daemon still holding it.
+    fn hosted_fleet_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        DaemonState,
+        Vec<(String, String)>,
+    ) {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+
+        let fleet: Vec<(&str, usize)> = vec![
+            ("kin", 12),
+            ("kin-db", 31),
+            ("kin-vfs", 7),
+            ("kinlab", 23),
+            ("kin-editor", 45),
+        ];
+        let mut witnesses = Vec::new();
+        {
+            let seed = kin_db::LocalFileBackend::new(storage.path());
+            for (repo_id, entities) in &fleet {
+                let symbol_stem = repo_id.replace('-', "_");
+                let graph = kin_db::InMemoryGraph::new();
+                let mut owned = Vec::with_capacity(*entities);
+                for index in 0..*entities {
+                    owned.push(test_entity(
+                        &format!("{symbol_stem}_symbol_{index}"),
+                        &format!("src/{repo_id}/module_{index}.rs"),
+                    ));
+                }
+                graph.batch_upsert_entities(&owned).unwrap();
+                let (bytes, _) = graph.serialize_snapshot_borrowed().unwrap();
+                kin_db::StorageBackend::save_snapshot(
+                    &seed,
+                    repo_id,
+                    &bytes,
+                    kin_db::GENERATION_INIT,
+                )
+                .unwrap();
+                witnesses.push(((*repo_id).to_string(), format!("{symbol_stem}_symbol_0")));
+            }
+        }
+
+        let allowed: HashSet<String> = fleet
+            .iter()
+            .map(|(repo_id, _)| (*repo_id).to_string())
+            .collect();
+        let state = DaemonState::open_with_backend(
+            layout,
+            Box::new(kin_db::LocalFileBackend::new(storage.path())),
+            "kin",
+            Some(allowed),
+        )
+        .unwrap();
+
+        (working, storage, state, witnesses)
+    }
+
+    /// Every hosted repository's graph loads, and answers out of its own text
+    /// index, while its siblings load beside it.
+    ///
+    /// A hosted daemon serves the fleet out of one layout and loads its
+    /// repositories concurrently: the reload gate is sharded by repository id,
+    /// so two different repositories are meant to load at once, and readiness,
+    /// the spine root proof and ordinary served reads all drive loads at the
+    /// same time. Pointing all of them at one persistent text-index directory
+    /// makes them writers of one segment image. Each rebuild reclaims the
+    /// segment files another repository's manifest names and publishes its own
+    /// counts over them, and the load-time segment-versus-manifest
+    /// reconciliation then refuses the image rather than serving a corpus that
+    /// is half somebody else's.
+    ///
+    /// Concurrent rather than sequential on purpose. Sequential loads of one
+    /// shared directory are wasteful but consistent, because each rebuild
+    /// reclaims the previous one cleanly, so a sequential fixture passes over
+    /// the very directory this test exists to keep repositories out of.
+    /// Overlapping the loads is what makes two writers visible, and it is what
+    /// the daemon does.
+    ///
+    /// Both halves matter. The loads succeeding is what readiness needs; the
+    /// witness search is what a served read needs, and an index that answers a
+    /// sibling's documents can satisfy the first while failing the second.
+    #[test]
+    fn concurrent_hosted_repo_loads_each_serve_their_own_text_index() {
+        let (_working, _storage, state, witnesses) = hosted_fleet_fixture();
+        let state = &state;
+        let refusals: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let held: Mutex<Vec<(String, String, Arc<HostedRepoCacheEntry>)>> = Mutex::new(Vec::new());
+
+        std::thread::scope(|scope| {
+            for (repo_id, witness) in &witnesses {
+                let refusals = &refusals;
+                let held = &held;
+                scope.spawn(move || {
+                    for _ in 0..HOSTED_LOAD_ISOLATION_ROUNDS {
+                        match state.load_repo_graph(repo_id) {
+                            Ok(entry) => held
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push((repo_id.clone(), witness.clone(), entry)),
+                            Err(error) => refusals
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(format!(
+                                    "load {repo_id} for the hosted spine root proof: {error}"
+                                )),
+                        }
+                    }
+                });
+            }
+        });
+
+        let refusals = refusals
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            refusals.is_empty(),
+            "every hosted repository load must succeed; {} refused, first: {}",
+            refusals.len(),
+            refusals.first().map(String::as_str).unwrap_or("")
+        );
+
+        // Every graph that loaded still answers for its own repository, with
+        // all of them still open. A shared image can satisfy the loads above
+        // and fail here, because the corpus on disk is the last writer's.
+        let held = held
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            held.len(),
+            witnesses.len() * HOSTED_LOAD_ISOLATION_ROUNDS,
+            "every load must have produced a cache entry"
+        );
+        for (repo_id, witness, entry) in &held {
+            let hits = entry
+                .graph
+                .text_search(witness, 8)
+                .unwrap_or_else(|error| panic!("{repo_id} text search: {error}"));
+            assert!(
+                !hits.is_empty(),
+                "{repo_id}'s own text index must answer for {witness}"
+            );
+        }
+    }
+
+    /// Two hosted repositories never share a text-index directory, whatever
+    /// their ids look like.
+    ///
+    /// The load path takes the repository id as a string, so this is the
+    /// assertion that the directory a load writes is a function of the id and
+    /// of nothing else the id can be confused with.
+    #[test]
+    fn hosted_text_index_directories_are_disjoint_across_the_served_fleet() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let fleet = ["kin", "kin-db", "kin-vfs", "kinlab", "kin-editor"];
+        let directories: HashSet<std::path::PathBuf> = fleet
+            .iter()
+            .map(|repo_id| layout.hosted_text_index_dir(repo_id))
+            .collect();
+        assert_eq!(
+            directories.len(),
+            fleet.len(),
+            "each served repository must get its own text-index directory"
+        );
     }
 
     #[test]

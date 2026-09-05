@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use crate::error::KinError;
 
@@ -217,6 +220,33 @@ impl KinLayout {
     /// `.kin/kindb/text-index/` — Persistent tantivy text index directory.
     pub fn text_index_dir(&self) -> PathBuf {
         self.kindb_dir().join("text-index")
+    }
+
+    /// `.kin/kindb/text-index/hosted/<digest>/` — the persistent text index for
+    /// one hosted repository's served graph.
+    ///
+    /// A hosted daemon serves many repositories out of one layout, and a
+    /// persistent text index is a directory of segment files under one manifest
+    /// that names them. Two graphs pointed at one directory are two writers of
+    /// one image: each reclaims the segment files the other's manifest names,
+    /// and the load-time reconciliation then refuses an image whose segments
+    /// and manifest disagree. So the directory is per repository, and the
+    /// repository is what names it.
+    ///
+    /// The name is a digest and not the repository id, because a repository id
+    /// is not a path component. [`kin_model::RepositoryId`] refuses only the
+    /// empty string, ids over 255 bytes and control characters, so `../peer`,
+    /// `/etc/kin` and `a/b` are all valid ids and all escape or collide as
+    /// path components. A digest has none of those shapes: it is a fixed-length
+    /// string over `0-9a-f`, one per distinct id byte string, so `Kin` and
+    /// `kin` land apart and `a/b` and `a_b` land apart.
+    ///
+    /// 128 bits of SHA-256, which is a collision bound far beyond a fleet of
+    /// repository ids and short enough to read in a directory listing.
+    pub fn hosted_text_index_dir(&self, repo_id: &str) -> PathBuf {
+        self.text_index_dir()
+            .join("hosted")
+            .join(hosted_text_index_component(repo_id))
     }
 
     /// `.kin/stashes/` — Named overlay snapshots.
@@ -498,9 +528,99 @@ fn is_managed_kin_home(candidate: &Path) -> bool {
     false
 }
 
+/// The path component naming one hosted repository's text index.
+///
+/// Free-standing so a caller can name the component without a layout, and so
+/// the mapping has one definition: every hosted site derives its directory from
+/// this, and a second derivation elsewhere would be a second answer.
+fn hosted_text_index_component(repo_id: &str) -> String {
+    let digest = Sha256::digest(repo_id.as_bytes());
+    let mut component = String::with_capacity(32);
+    for byte in &digest[..16] {
+        // `write!` into a `String` cannot fail; the result is consumed so the
+        // formatting contract stays visible rather than being swallowed.
+        let _ = write!(component, "{byte:02x}");
+    }
+    component
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repository id is not a path component, and this is where that is
+    /// enforced.
+    ///
+    /// `kin_model::RepositoryId::new` refuses only the empty string, ids over
+    /// 255 bytes and control characters, so every id below is a legal
+    /// repository id. Joined raw, the first three escape the directory the
+    /// hosted daemon owns and the last two collide with a sibling. Every one of
+    /// them has to land inside the hosted root, under a name made only of hex
+    /// digits.
+    #[test]
+    fn hosted_text_index_component_admits_no_path_shape() {
+        let layout = KinLayout::new(PathBuf::from("/repo/.kin"));
+        let hosted_root = layout.text_index_dir().join("hosted");
+        for repo_id in [
+            "../peer", "..", "/etc/kin", "a/b", "a_b", "kin", "Kin", "kin.", " kin",
+        ] {
+            let dir = layout.hosted_text_index_dir(repo_id);
+            let component = dir
+                .strip_prefix(&hosted_root)
+                .unwrap_or_else(|_| panic!("{repo_id:?} escaped the hosted text-index root"));
+            assert_eq!(
+                component.components().count(),
+                1,
+                "{repo_id:?} produced more than one path component"
+            );
+            let name = component.to_string_lossy();
+            assert_eq!(name.len(), 32, "{repo_id:?} produced {name:?}");
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{repo_id:?} produced {name:?}"
+            );
+        }
+    }
+
+    /// Ids that a filesystem or a careless sanitizer would fold together stay
+    /// apart.
+    ///
+    /// Case and delimiter folding are the two ways a per-repository directory
+    /// quietly becomes a shared one: `Kin` and `kin` are distinct repositories
+    /// on a case-sensitive store, and `a/b` and `a_b` are distinct
+    /// repositories that a slash-to-underscore rewrite would merge. A digest
+    /// over the exact id bytes folds neither.
+    #[test]
+    fn hosted_text_index_directories_separate_ids_a_sanitizer_would_fold() {
+        let layout = KinLayout::new(PathBuf::from("/repo/.kin"));
+        let ids = ["kin", "Kin", "KIN", "a/b", "a_b", "a-b", "../kin", "kin/"];
+        let directories: std::collections::HashSet<PathBuf> = ids
+            .iter()
+            .map(|repo_id| layout.hosted_text_index_dir(repo_id))
+            .collect();
+        assert_eq!(
+            directories.len(),
+            ids.len(),
+            "distinct repository ids must get distinct directories"
+        );
+    }
+
+    /// The same id names the same directory every time, in this process and in
+    /// the next one.
+    ///
+    /// A hosted pod reopens its store across restarts and a rebuilt index is
+    /// only reusable if the name is stable, so the mapping is pinned to a
+    /// literal rather than recomputed by the test. A change to the digest, its
+    /// truncation or the namespace fails here.
+    #[test]
+    fn hosted_text_index_directory_is_stable_for_an_id() {
+        let layout = KinLayout::new(PathBuf::from("/repo/.kin"));
+        assert_eq!(
+            layout.hosted_text_index_dir("kin"),
+            PathBuf::from("/repo/.kin/kindb/text-index/hosted/c1d6b0ba57d78fec8689f0877d805355")
+        );
+    }
 
     #[test]
     fn layout_paths() {
