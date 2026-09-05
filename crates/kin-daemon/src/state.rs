@@ -38,14 +38,19 @@ use crate::error::{DaemonError, Result};
 use crate::hosted_start;
 use crate::session_registry::SessionCoordinator;
 
-/// Borrowed immutable history used to materialize a hosted repository ref.
+/// Borrowed immutable history for resolving a change out of persisted
+/// authority without building a graph to throw away.
 ///
 /// Repository-v6 snapshots intentionally leave their top-level graph domains
 /// empty. `ChangeStore::resolve_graph_at` needs only `get_change`, so borrowing
 /// the admitted change map avoids cloning the payload-heavy history into a
 /// throwaway graph before every hosted load.
-struct HostedAuthorityHistory<'a> {
-    changes: &'a HashMap<SemanticChangeId, SemanticChange>,
+///
+/// `pub(crate)` for the second caller with that same shape: the native commit
+/// planner resolves its baseline at the parent change and reads nothing else
+/// from the graph it was building for it (`commit_deltas.rs`).
+pub(crate) struct HostedAuthorityHistory<'a> {
+    pub(crate) changes: &'a HashMap<SemanticChangeId, SemanticChange>,
 }
 
 impl HostedAuthorityHistory<'_> {
@@ -1813,6 +1818,22 @@ impl CachedAuthorityRefusal {
     pub(crate) fn into_reason(self) -> String {
         self.reason
     }
+}
+
+/// What the authority proof this process already holds says about serving one
+/// read, before any durable refresh is considered.
+enum CachedReadAuthority<'a> {
+    /// The proof still binds to durable identity. Serve from it, with no
+    /// hydration and no graph load.
+    Proved(&'a dyn kin_spine::SpineBackend),
+    /// Refuse now. A lost admission, an active rollout or evidence this reader
+    /// cannot read are conditions in the control plane rather than heads that
+    /// moved, so a full pass reaches the same refusal one process-wide
+    /// hydration later.
+    Refuse,
+    /// Nothing usable is cached, or durable identity moved under what was. Take
+    /// the full pass once and answer from what it establishes.
+    Reprove,
 }
 
 fn hosted_spine_authority_vector_is_stable(
@@ -3853,6 +3874,70 @@ impl DaemonState {
             < crate::api::GRAPH_STATUS_UNANSWERABLE_STREAK
     }
 
+    /// Record a coherent settled `kin_graph_status` reading of the HEAD graph.
+    ///
+    /// The status sampler reads every counter under `embedding_work` so the set
+    /// describes one instant, and the background worker holds that lock for the
+    /// length of a batch. A status call landing inside a batch therefore spends
+    /// its whole bounded budget without sampling and answers from the settled
+    /// cache instead. This is what puts a reading in that cache.
+    ///
+    /// Called at two points and only two: the end of the open, before any
+    /// embedding worker exists, and the start of each background batch, from
+    /// inside the guard that batch already holds.
+    ///
+    /// # The caller owns the fence
+    ///
+    /// This takes no lock. `embedding_work` is a non-reentrant `std::sync::Mutex`
+    /// and the batch-boundary caller already holds it, so acquiring it here would
+    /// self-deadlock. Call this only where no embedding work can be in flight:
+    /// holding `embedding_work`, or before the worker exists.
+    ///
+    /// # Nothing incoherent is recorded
+    ///
+    /// The authority epoch is read before the counters and revalidated after
+    /// them, as the live sampler does. An epoch that could not be read, or that
+    /// moved during the capture, records nothing. An absent settled reading is a
+    /// state the status path reports honestly; a torn one would be published as
+    /// fact and would fail `GraphStatusReport::validate` on its cross-counter
+    /// invariants.
+    ///
+    /// # Cost
+    ///
+    /// This cache may not cost work proportional to the graph. `entity_count`
+    /// and `relation_count` are map lengths and `vector_index_stats` is index
+    /// metadata, all O(1). `embedding_status` can scan, but kin-db memoizes it on
+    /// the graph truth epoch and the vector index key-set token: a batch changes
+    /// that token, so a reading taken after a batch always misses and rescans,
+    /// while one taken before it lands on the memo the worker's own batch
+    /// decision just filled. That is why the batch call site is the top of the
+    /// batch and not the bottom.
+    pub(crate) fn seed_settled_head_graph_status(&self) {
+        let Some(authority_epoch) = self.stable_graph_authority_epoch() else {
+            return;
+        };
+        let embeddings = self.graph.embedding_status();
+        let observation = kin_mcp::handlers::entities::GraphStatusObservation {
+            authority_epoch,
+            entity_count: self.graph.entity_count(),
+            relation_count: self.graph.relation_count(),
+            embeddings_indexed: embeddings.indexed,
+            embeddings_pending: embeddings.pending,
+            embeddings_total: embeddings.total,
+            embedding_index_keys: crate::api::selected_graph_index_population(&self.graph),
+            durable_entity_count: self.durable_entity_count(),
+            durable_relation_count: self.durable_relation_count(),
+        };
+        if !self.graph_authority_epoch_is_current(authority_epoch) {
+            return;
+        }
+        self.graph_status_settled.record(
+            kin_mcp::handlers::entities::GraphStatusScope::Head,
+            &self.graph,
+            observation,
+        );
+    }
+
     /// Load a persisted vector-index sidecar into a graph that was NOT built
     /// through `SnapshotManager` (the storage-backend path uses
     /// `InMemoryGraph::from_snapshot_with_text_index`, which does not load the
@@ -5495,6 +5580,12 @@ impl DaemonState {
             }
         }
         state.register_daemon_system_session();
+        // The first settled status reading, taken here because this is the last
+        // instant before the daemon can start embedding. A background pass holds
+        // `embedding_work` across whole batches and the status sampler needs that
+        // same lock, so without a reading recorded now a status call during the
+        // initial pass has nothing to answer from.
+        state.seed_settled_head_graph_status();
         phases.emit(&state.cached_repo_id, &state.layout);
         Ok(state)
     }
@@ -6728,6 +6819,74 @@ impl DaemonState {
         Some(spine)
     }
 
+    /// Whether this read can be answered from the authority proof this process
+    /// already holds, without re-establishing it.
+    ///
+    /// Establishing authority costs one full durable cache hydration plus a
+    /// whole-fleet double-collect that loads every repository graph and
+    /// recomputes every root. Every `/spine/*` query took that pass on every
+    /// request. On the five-repo hosted fleet the hydration half alone measured
+    /// a 7.92 s median over 48 passes and a 10.15 s p90, and the whole pass the
+    /// 10.46 s median recorded on
+    /// [`Self::hosted_readiness_spine_authority`]. A control plane that gives
+    /// its org-graph read 6 s therefore never saw an answer: it aborted every
+    /// time and rendered the fleet with no links between its repositories while
+    /// this daemon held 1489 of them.
+    ///
+    /// So a query answers the way a readiness probe does, from the proof the
+    /// publication, rollout and background passes establish. The reuse is
+    /// conditional on identity and never on age:
+    /// [`Self::assert_cached_hosted_spine_authority`] re-proves every
+    /// repository's committed head and source cursor on every call, so a
+    /// superseded generation is refused here rather than served.
+    fn cached_spine_read_authority(&self) -> CachedReadAuthority<'_> {
+        #[cfg(test)]
+        if self.hosted_in_memory_spine_allowed.load(Ordering::SeqCst) {
+            return CachedReadAuthority::Reprove;
+        }
+        // Hosted, and only with publication control. A local daemon
+        // re-registers its primary against the live root instead, and
+        // `assert_cached_hosted_spine_authority` answers `Ok` when there is no
+        // control to read, which means "nothing to check against" rather than
+        // "checked". Reading that `Ok` as a proof is how a process holding no
+        // control record would begin certifying its own cache.
+        if self.storage_backend.is_none() || self.publication_control.is_none() {
+            return CachedReadAuthority::Reprove;
+        }
+        // An installed proof is required for the same reason. Without one the
+        // check has nothing to bind durable identity to, and its verdict says
+        // nothing about whether this cache may answer.
+        //
+        // Read under its own statement so the guard is dropped before the check
+        // below takes the same lock.
+        let proved = self
+            .hosted_spine_authority_proof
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        if !proved {
+            return CachedReadAuthority::Reprove;
+        }
+        let Ok(backend) = self.initialized_spine_backend() else {
+            return CachedReadAuthority::Reprove;
+        };
+        match self.assert_cached_hosted_spine_authority(backend) {
+            Ok(()) => CachedReadAuthority::Proved(backend),
+            Err(refusal) if refusal.superseded => CachedReadAuthority::Reprove,
+            Err(refusal) => {
+                // Record it for the same reason the admission branch below
+                // does: the caller renders `spine_unavailable_reason` into the
+                // 503, and a refusal with no reason names nothing.
+                *self
+                    .spine_initialization_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(refusal.into_reason());
+                CachedReadAuthority::Refuse
+            }
+        }
+    }
+
     /// Acquire one query authority that remains stable through the caller's
     /// read. Hosted and local writers use the same gate, so the proof cannot be
     /// invalidated in the gap between readiness and response construction.
@@ -6751,7 +6910,13 @@ impl DaemonState {
                 return None;
             }
         }
-        let backend = self.ensure_spine()?;
+        // The gate and the admission assert above are unchanged and still run
+        // first, so nothing below can answer for a reader that is not admitted.
+        let backend = match self.cached_spine_read_authority() {
+            CachedReadAuthority::Proved(backend) => backend,
+            CachedReadAuthority::Refuse => return None,
+            CachedReadAuthority::Reprove => self.ensure_spine()?,
+        };
         Some(SpineAuthorityReadGuard {
             backend,
             _publication_gate: publication_gate,

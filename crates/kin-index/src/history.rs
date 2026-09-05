@@ -56,7 +56,7 @@ use crate::pipeline::IndexPipeline;
 /// version keeps whatever its past was authored to contain until it is admitted
 /// again. Carrying the authoring version on the wire, automatic re-derivation,
 /// migration and refusing to answer over a gap all remain open follow-up work.
-pub const HYDRATION_SEMANTICS_VERSION: u32 = 10;
+pub const HYDRATION_SEMANTICS_VERSION: u32 = 11;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.
 ///
@@ -1289,6 +1289,137 @@ mod tests {
             error.to_string().contains("was not enriched first"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn span_provenance_history_tracks_exact_tree_bytes_and_reuses_unchanged_files() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+        let initial = b"def merge_setting(value):\n    return value\n";
+        write(&repository, "src/sessions.py", initial);
+        write(
+            &repository,
+            "src/unchanged.py",
+            b"def unchanged():\n    return 7\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "initial source"]);
+        let shifted = b"# leading source comment\ndef merge_setting(value):\n    return value\n";
+        write(&repository, "src/sessions.py", shifted);
+        git(&repository, &["add", "--all"]);
+        git(
+            &repository,
+            &[
+                "commit",
+                "-m",
+                "move function without changing its behavior",
+            ],
+        );
+        write(&repository, "README.md", b"unrelated artifact change\n");
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "retain source unchanged"]);
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repository,
+            RepositoryId::new("span-provenance-history").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let trees = trees_by_change(&plan);
+        // Enrichment must use the captured graph and CAS, even when a checkout differs.
+        write(
+            &repository,
+            "src/sessions.py",
+            b"def unrelated_checkout():\n    pass\n",
+        );
+        let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
+        assert_eq!(deltas.len(), 3);
+        let mut entities = BTreeMap::new();
+        for delta in &deltas {
+            for change in &delta.entity_deltas {
+                if let Some(entity) = change.new_state() {
+                    entities.insert(entity.id, entity.clone());
+                }
+            }
+            assert_eq!(
+                entities
+                    .values()
+                    .filter(|entity| entity.kind == EntityKind::Function)
+                    .count(),
+                2,
+                "both fixture functions must survive replay"
+            );
+            let tree = &trees[&delta.change_id];
+            for entity in entities.values() {
+                let path = entity.file_origin.as_ref().unwrap();
+                let artifact = tree
+                    .artifact_at_path(&kin_model::RepoPath::from_utf8(&path.0).unwrap())
+                    .unwrap();
+                let digest = artifact.entry.blob_identity().unwrap();
+                assert_eq!(
+                    entity
+                        .metadata
+                        .extra
+                        .get("blob_hash")
+                        .and_then(|value| value.as_str()),
+                    Some(digest.to_string().as_str()),
+                    "{} span must bind its exact historical tree body",
+                    entity.name
+                );
+                let body = blob_store
+                    .read(&kin_blobs::Hash256::from_bytes(*digest.as_bytes()))
+                    .unwrap();
+                let span = entity.span.as_ref().unwrap();
+                let excerpt = &body[span.start_byte as usize..span.end_byte as usize];
+                if entity.kind == EntityKind::Function {
+                    assert!(String::from_utf8_lossy(excerpt).contains(&entity.name));
+                }
+            }
+        }
+        let moved = deltas[1]
+            .entity_deltas
+            .iter()
+            .find_map(|delta| match delta {
+                EntityDelta::Modified { old, new } if new.name == "merge_setting" => {
+                    Some((old, new))
+                }
+                _ => None,
+            })
+            .expect("span-only edit must persist a modified entity");
+        assert_eq!(moved.0.id, moved.1.id);
+        assert_eq!(moved.0.fingerprint, moved.1.fingerprint);
+        assert_ne!(
+            moved.0.metadata.extra["blob_hash"],
+            moved.1.metadata.extra["blob_hash"]
+        );
+        assert!(
+            deltas[2].entity_deltas.is_empty(),
+            "unchanged source needs no semantic delta"
+        );
+        let bindings = deltas
+            .iter()
+            .map(|delta| {
+                kin_git::HistoricalSemanticBinding::borrowed(
+                    delta.change_id,
+                    &delta.entity_deltas,
+                    &delta.relation_deltas,
+                )
+            })
+            .collect::<Vec<_>>();
+        let enriched = plan
+            .with_historical_semantics(&blob_store, bindings)
+            .unwrap();
+        let admitted = admit_semantic_git_import(&enriched, &blob_store).unwrap();
+        admitted.validate(&blob_store).unwrap();
+        assert_eq!(admitted.changes[1].entity_deltas, deltas[1].entity_deltas);
     }
 
     fn trees_by_change(

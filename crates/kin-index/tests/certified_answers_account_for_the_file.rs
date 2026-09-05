@@ -26,13 +26,13 @@
 use kin_index::IndexPipeline;
 use kin_model::{FilePathId, ParseCompleteness};
 
-fn blob_hash() -> kin_blobs::Hash256 {
-    kin_blobs::Hash256::from_bytes([7; 32])
-}
-
 fn index(path: &str, source: &str) -> kin_index::IndexedFile {
     IndexPipeline::new()
-        .index_file_content_with_tests(&FilePathId::new(path), source.as_bytes(), blob_hash())
+        .index_file_content_with_tests(
+            &FilePathId::new(path),
+            source.as_bytes(),
+            kin_blobs::digest(source.as_bytes()),
+        )
         .unwrap_or_else(|error| panic!("indexing {path} failed: {error}"))
         .indexed_file
 }

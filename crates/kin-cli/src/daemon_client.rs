@@ -8219,6 +8219,93 @@ pub async fn resolve_daemon_url_if_running_async(layout: &KinLayout) -> Option<S
     supervisor_route_for_repo_if_running_async(layout.root()).await
 }
 
+/// What this repository's own record says about its daemon, when supervisor
+/// resolution produced no endpoint.
+///
+/// [`resolve_daemon_url_if_running_async`] answers `Option<String>`, and its
+/// `None` collapses seven outcomes: no live supervisor, a route request that did
+/// not send, did not return 2xx or did not parse, an endpoint that failed the
+/// trust check, a `/health` probe that did the same, and a health answer that did
+/// not identify this repository as serving. None of those establishes whether a
+/// daemon process exists, so that `None` must not be rendered as a claim about
+/// one.
+///
+/// While authority loads, a daemon serves a warming surface whose `/readiness`
+/// answers 503 with `warming: true` and whose `/health` answers 200 with
+/// `status: "warming"`. [`probe_daemon_endpoint`] reads exactly that, on a
+/// deadline, and returns [`EndpointVerdict::LiveNotReady`] carrying the flag and
+/// the daemon's own detail; [`supervisor_route_for_repo`] has always used it.
+/// This asks it about the endpoint the repository itself recorded in
+/// `.kin/daemon.pid` and `.kin/daemon.port`.
+///
+/// Additive by construction: supervisor resolution is asked first and unchanged,
+/// so this can only turn a false absence into a true reading and never the
+/// reverse.
+#[derive(Debug)]
+pub enum RunningDaemonReading {
+    /// A daemon answered readiness and identified itself as serving this
+    /// repository, at this base URL.
+    Serving(String),
+    /// A daemon process is alive and has not finished opening repository
+    /// authority. `warming` is the daemon's own flag rather than this probe's
+    /// inference: true means it said so, false means it never answered readiness
+    /// at all, and those are different news for a reader.
+    OpeningAuthority {
+        pid: u32,
+        port: u16,
+        detail: String,
+        waited: Duration,
+        warming: bool,
+    },
+    /// Nothing this repository recorded is alive, so there is no daemon.
+    Absent,
+}
+
+/// Resolve this repository's daemon without ever starting one, and say which of
+/// the three states was found rather than collapsing two of them into `None`.
+///
+/// The wait is bounded by [`existing_daemon_ready_timeout_secs`], the same knob
+/// and the same default the auto-start path already waits on, and it ends early
+/// the moment readiness answers. It polls the daemon's own readiness signal and
+/// never sleeps on a guess or infers liveness from the filesystem: the endpoint
+/// files say where to ask, and the answer comes from the daemon.
+pub async fn running_daemon_reading(layout: &KinLayout) -> RunningDaemonReading {
+    if let Some(url) = resolve_daemon_url_if_running_async(layout).await {
+        return RunningDaemonReading::Serving(url);
+    }
+    let kin_root = layout.root();
+    let Some(endpoint) = live_daemon_endpoint(kin_root) else {
+        return RunningDaemonReading::Absent;
+    };
+    let started = Instant::now();
+    let verdict = probe_daemon_endpoint(
+        kin_root,
+        endpoint,
+        Duration::from_secs(existing_daemon_ready_timeout_secs()),
+    )
+    .await;
+    match verdict {
+        EndpointVerdict::Serving(base_url) => RunningDaemonReading::Serving(base_url),
+        EndpointVerdict::LiveNotReady {
+            pid,
+            port,
+            detail,
+            warming,
+        } => RunningDaemonReading::OpeningAuthority {
+            pid,
+            port,
+            detail,
+            waited: started.elapsed(),
+            warming,
+        },
+        // Positive evidence the record is wrong: the recorded process is gone,
+        // or the endpoint answered and named a different repository. Either way
+        // no daemon is serving this one, which is the sentence the caller has
+        // always printed and which is finally true here.
+        EndpointVerdict::Invalid(_) => RunningDaemonReading::Absent,
+    }
+}
+
 pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {
     resolve_daemon_url_inner(layout, None).await
 }

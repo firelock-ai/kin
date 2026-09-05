@@ -23,7 +23,11 @@ fn ingest_equivalence_hash(source: &str, entity: &str, ext: &str) -> Hash256 {
     let pipeline = IndexPipeline::new();
     let file_id = FilePathId::new(format!("pkg/mod.{ext}"));
     let indexed = pipeline
-        .index_file_content_with_tests(&file_id, source.as_bytes(), zero())
+        .index_file_content_with_tests(
+            &file_id,
+            source.as_bytes(),
+            kin_blobs::digest(source.as_bytes()),
+        )
         .expect("indexing should succeed")
         .indexed_file;
     indexed

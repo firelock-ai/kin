@@ -687,14 +687,51 @@ fn record_commit_provenance(
         .create_actor(&actor.actor)
         .map_err(|error| format!("record committing agent actor: {error}"))?;
 
-    // Scoped to the entities this change actually moved, which is what keeps a
-    // folded-in pending file from being attributed to the agent. Such a file
-    // reaches the change as a tree delta and nothing else, because the prospective
-    // graph reparses only the files the staged operations spliced, so it
-    // contributes no entity delta, receives no attribution event here, and leaves
-    // every entity inside it answering `kin_provenance_query` with the authorship
-    // it already had. The fold is declared at the level it happened at, in the
-    // change message, which the `change_id` recorded below leads to.
+    // Scoped to the entities this change moved that the agent's own operations
+    // wrote, which is what keeps a folded-in pending file from being attributed
+    // to the agent.
+    //
+    // A carried file's entities DO move in this change. They have to: a change
+    // that publishes new bytes for a file must publish the semantics those bytes
+    // derive to, or it seals a tree and an entity set that describe different
+    // source (see `derive_carried_pending_semantics`). That is a content
+    // revision, and it belongs in the change. It is not an authorship claim, and
+    // that is why it is filtered out here rather than left to reach the audit
+    // trail: every entity inside a carried file keeps answering
+    // `kin_provenance_query` with the authorship it already had, and the fold is
+    // declared at the level it happened at, in the change message, which the
+    // `change_id` recorded below leads to.
+    let carried_origins = carried_pending_files
+        .iter()
+        .filter_map(|path| path.as_utf8().map(FilePathId::new))
+        .collect::<HashSet<_>>();
+    // Where each entity this change names lives, read from the change's own
+    // payloads before the graph. A removed entity is gone from the graph by
+    // here, so a lookup alone would report it as owned by no file and wave it
+    // through; the delta still carries the payload that says which file it came
+    // from. The graph answers for the rest, which is every relation endpoint
+    // this change did not otherwise touch.
+    let mut origin_of = HashMap::new();
+    for delta in &committed.change.entity_deltas {
+        let entity = match delta {
+            EntityDelta::Added { new } | EntityDelta::Modified { new, .. } => new,
+            EntityDelta::Removed { old } => old,
+        };
+        if let Some(origin) = entity.file_origin.clone() {
+            origin_of.insert(entity.id, origin);
+        }
+    }
+    let is_carried = |entity_id: &kin_model::EntityId| -> bool {
+        if let Some(origin) = origin_of.get(entity_id) {
+            return carried_origins.contains(origin);
+        }
+        graph
+            .get_entity(entity_id)
+            .ok()
+            .flatten()
+            .and_then(|entity| entity.file_origin)
+            .is_some_and(|origin| carried_origins.contains(&origin))
+    };
     let mut entities = committed
         .change
         .entity_deltas
@@ -703,14 +740,23 @@ fn record_commit_provenance(
             EntityDelta::Added { new } | EntityDelta::Modified { new, .. } => new.id,
             EntityDelta::Removed { old } => old.id,
         })
+        .filter(|entity_id| !is_carried(entity_id))
         .collect::<Vec<_>>();
-    // A relation-only commit changed no entity, so it has no entity delta to
-    // scope to, but it is still an agent write against the entities the relation
-    // joins. Scoping it to the change alone made it unfindable: every reader
-    // that answers "who touched this entity" selects changes by scanning entity
-    // deltas, which a relation-only change has none of, so the commit was
+    // A relation-only commit changed no entity of its own, so it has no entity
+    // delta to scope to, but it is still an agent write against the entities the
+    // relation joins. Scoping it to the change alone made it unfindable: every
+    // reader that answers "who touched this entity" selects changes by scanning
+    // entity deltas, which a relation-only change has none of, so the commit was
     // recorded and invisible. Its endpoints are the entities an operator would
     // ask about, so they are what it is attributed to.
+    //
+    // The carried filter applies to this source as well as to the one above, and
+    // that is the whole reason it is written twice rather than once. A carried
+    // file now contributes entity deltas, so a relation-only transaction beside
+    // a carried edit to one of its endpoints leaves the list above empty, opens
+    // this fallback, and would hand the carried endpoint straight back to the
+    // committing session. The trigger is "no scopes the agent authored" rather
+    // than "no entity deltas" for the same reason.
     if entities.is_empty() {
         entities.extend(
             committed
@@ -726,7 +772,8 @@ fn record_commit_provenance(
                 .filter_map(|endpoint| match endpoint {
                     GraphNodeId::Entity(id) => Some(id),
                     _ => None,
-                }),
+                })
+                .filter(|entity_id| !is_carried(entity_id)),
         );
     }
     entities.sort_unstable();
@@ -1300,18 +1347,46 @@ fn plan_exact_transaction(
         );
     }
 
-    let native = plan_native_commit_from_base_declaring_carry(
+    let plan_against = |graph: &kin_db::InMemoryGraph| {
+        plan_native_commit_from_base_declaring_carry(
+            graph,
+            state.blobs.as_ref(),
+            authority_context,
+            operation_id,
+            kin_model::Timestamp::now(),
+            actor.author.clone(),
+            &authored_files,
+            &|carried| commit_message(&transaction.transaction_id, carried),
+            base,
+        )
+        .map_err(|error| format!("plan exact MCP repository commit: {error}"))
+    };
+    let native = plan_against(&prospective)?;
+    // Planned first, then read for what it carries, because the carried set is
+    // not knowable until the published tree deltas are: it is the fold
+    // `carried_pending_paths` computes from them. Taking it from the plan rather
+    // than computing it a second way is what keeps the files re-derived below
+    // and the files declared in the reply the same set by construction.
+    let native = match derive_carried_pending_semantics(
+        state,
         &prospective,
-        state.blobs.as_ref(),
+        &pipeline,
         authority_context,
-        operation_id,
-        kin_model::Timestamp::now(),
-        actor.author.clone(),
-        &authored_files,
-        &|carried| commit_message(&transaction.transaction_id, carried),
-        base,
-    )
-    .map_err(|error| format!("plan exact MCP repository commit: {error}"))?;
+        &native,
+        &mut layouts,
+    )? {
+        // The carry moved no semantics, so this plan already describes the graph
+        // it was planned from and nothing is spent on the common case.
+        CarriedDerivation::AlreadyCoherent => native,
+        // Semantics moved under the carried paths, so the plan is stale by
+        // exactly that much. Planned once more and never in a loop: the second
+        // pass publishes the same tree bytes as the first, so it carries the
+        // same set, and re-deriving that set again would find nothing.
+        CarriedDerivation::Derived => {
+            drop(native);
+            plan_against(&prospective)?
+        }
+    };
     let carried_pending_files = native.carried_pending_files.clone();
     Ok(ExactMcpPlan {
         native,
@@ -1337,9 +1412,11 @@ const CARRIED_SAMPLE: usize = 10;
 /// When something was carried, the first line says so on its own, because a
 /// subject-only view of history is where a reader is most likely to meet this
 /// change and least able to ask a follow-up question. The body then says what
-/// the fold does not do: the bytes move, the semantics of those files are not
-/// re-derived here, so the entities inside them keep the authorship they
-/// already had rather than silently becoming this agent's work.
+/// the fold does and does not do: the bytes move and the semantics move with
+/// them, because a change that published one without the other would describe
+/// two different sources, and the entities inside those files keep the
+/// authorship they already had rather than silently becoming this agent's work,
+/// because no operation here wrote them.
 fn commit_message(transaction_id: &str, carried: &[RepoPath]) -> String {
     if carried.is_empty() {
         return format!("MCP transaction {transaction_id}");
@@ -1359,8 +1436,10 @@ fn commit_message(transaction_id: &str, carried: &[RepoPath]) -> String {
         "MCP transaction {transaction_id} (also admitted {count} pending working-tree {files})\n\n\
          The workspace already held admitted working-tree content its base change did not carry, \
          so this change publishes that content beside the staged operations rather than reverting \
-         it. No operation in this transaction authored it, and its semantics are not re-derived \
-         here, so the entities inside it keep the authorship they already had.\n\
+         it, and re-derives its semantics from the exact bytes published here, because a change \
+         that moved one without the other would describe two different sources. No operation in \
+         this transaction authored that content, so the entities inside it keep the authorship \
+         they already had.\n\
          Carried: {sample}"
     )
 }
@@ -2117,6 +2196,253 @@ fn plan_replaced_source_files(
         layouts.push(layout);
     }
     Ok(())
+}
+
+/// What re-deriving the carried paths did to the prospective graph.
+enum CarriedDerivation {
+    /// Nothing semantic moved. Every carried path's entities already described
+    /// the bytes the plan publishes for it, so the plan that produced the
+    /// carried set still describes the graph it was planned from.
+    AlreadyCoherent,
+    /// Semantics moved under one or more carried paths, so the plan is stale by
+    /// exactly that much and has to be planned again.
+    Derived,
+}
+
+/// Re-derive the semantics of every file this commit carries in, so the change
+/// it seals describes the bytes it publishes.
+///
+/// The two commit surfaces plan from different graphs. The CLI route is handed
+/// the daemon's live derived graph, which the reconcile loop keeps current
+/// against the working tree, so a pending file's entities there came from the
+/// pending bytes. The MCP route is handed repository authority's own workspace
+/// graph snapshot, whose tree is the workspace tree and whose entities are
+/// whatever the last published semantic delta left, because
+/// `publish_workspace_tree` advances that tree with an empty
+/// `WorkspaceSemanticDelta`. [`plan_exact_transaction`] reparses only the files
+/// its staged operations name, so a file the workspace admitted and no
+/// operation authored arrives at publication as new bytes standing over old
+/// entity spans, and the change seals both.
+///
+/// Declaring the carry does not settle that. The declaration says who authored
+/// the file, and this is about whether one change's tree and entities agree
+/// with each other. Nothing downstream repairs it either:
+/// [`install_authority_graph`] corrects the live graph ONTO authority, so on
+/// this path it propagates the disagreement rather than closing it, and
+/// `semantic_workspace_matches` passes because both sides then hold the same
+/// wrong answer.
+///
+/// Every byte read here is graph-owned. The paths come from the plan's own
+/// carried set rather than from a second computation, so the files re-derived
+/// are exactly the files the reply and the change message declare; the blob
+/// identities come from the tree deltas that same change publishes; and the
+/// bodies come out of repository CAS through [`load_native_source_blob`], never
+/// off the working copy.
+///
+/// Republishing a carried file's semantics is not a claim on its authorship.
+/// The reconciler matches the entities the graph already holds against the
+/// declarations the new bytes parse to, so an entity that merely changed body
+/// keeps its id, its lineage and every incoming edge, and
+/// [`record_commit_provenance`] keeps the carried paths out of the attribution
+/// it writes.
+fn derive_carried_pending_semantics(
+    state: &DaemonState,
+    prospective: &kin_db::InMemoryGraph,
+    pipeline: &kin_index::IndexPipeline,
+    authority_context: &LocalRepositoryAuthorityContext,
+    planned: &crate::repository_commit::NativeCommitPlan,
+    layouts: &mut Vec<FileLayout>,
+) -> Result<CarriedDerivation, String> {
+    if planned.carried_pending_files.is_empty() {
+        return Ok(CarriedDerivation::AlreadyCoherent);
+    }
+    let carried = planned
+        .carried_pending_files
+        .iter()
+        .collect::<BTreeSet<_>>();
+    let mut reconciler = kin_reconcile::Reconciler::new(PathBuf::new());
+    reconciler.seed_cross_file_linker_from_graph(prospective);
+    let mut derived = false;
+
+    for delta in &planned.change.tree_deltas {
+        // A deletion is named through its old state, which is the only state it
+        // has, exactly as `carried_pending_paths` names it.
+        let Some(path) = delta
+            .new_state()
+            .or_else(|| delta.old_state())
+            .map(|located| &located.path)
+        else {
+            continue;
+        };
+        // Only the carried half. A path this transaction's operations wrote was
+        // reparsed when it was planned, and parsing the same bytes again would
+        // be work to conclude nothing.
+        if !carried.contains(&path) {
+            continue;
+        }
+        let file_id = path
+            .as_utf8()
+            .map(FilePathId::new)
+            .ok_or_else(|| format!("carried repository path {path} is not valid UTF-8"))?;
+
+        let Some(located) = delta.new_state() else {
+            // A carried removal, which two independent mechanisms make
+            // unreachable rather than one. Ambient admission publishes the tree
+            // and no semantics, so vacating a path that way would leave that
+            // path's entities standing over a tree that no longer carries it,
+            // and repository authority refuses the transaction outright:
+            // "transaction leaves entity <id> on repository path <path> absent
+            // from the staged tree; carry its exact entity removal or relocation
+            // in the same delta". The seam that does vacate a path,
+            // `commit_session_workspace_admission`, derives the retirement
+            // through `retire_semantics_on_vacated` and carries it in the same
+            // transaction. So a carried tree delta is an addition or an update,
+            // and the only removals that reach a plan are the ones a staged
+            // `delete` authored, which are not carried.
+            //
+            // Asserted rather than repaired. A retirement written here would be
+            // a branch nothing can reach and nothing can falsify, and if either
+            // mechanism above ever regresses, sealing a change quietly is the
+            // wrong answer and saying so is the right one.
+            let standing = prospective
+                .query_entities(&kin_model::EntityFilter {
+                    file_path: Some(file_id.clone()),
+                    ..Default::default()
+                })
+                .map_err(|error| format!("read carried entities for {path}: {error}"))?;
+            if standing.is_empty() {
+                continue;
+            }
+            return Err(format!(
+                "this commit carries a removal of {path} that no operation in it authored, and \
+                 the graph still holds {} entities derived from that path. Repository authority \
+                 does not admit a vacated path without retiring its semantics, so this state \
+                 should be unreachable; report it rather than working around it. Nothing was \
+                 published.",
+                standing.len()
+            ));
+        };
+        // Named per variant rather than left to a wildcard, so a new entry kind
+        // cannot be handed to the parser by accident.
+        //
+        // Neither a symlink nor a gitlink carries a source body, so neither is
+        // parsed and neither is ever dereferenced: a symlink's target is not
+        // this repository's answer for this path. What they CAN carry is the
+        // previous occupant's entities, and that is not an assumption this code
+        // gets to make about the tree. kin-db revalidates an invalidated path by
+        // requiring an artifact to remain at it and does not require that
+        // artifact to be a blob (0.7.104 `src/engine/graph.rs:8705`), so a
+        // same-path source-to-symlink conversion satisfies every check while the
+        // old entities keep describing bytes the repository no longer holds.
+        // That is this function's own defect wearing a different tree entry, so
+        // it gets the same refusal the unsupported-blob arm gives.
+        let hash = match &located.entry {
+            TreeEntry::Blob { hash, .. } => *hash,
+            TreeEntry::Symlink { .. } => {
+                refuse_carry_standing_over_unparsed_content(
+                    prospective,
+                    &file_id,
+                    path,
+                    "a symlink",
+                )?;
+                continue;
+            }
+            TreeEntry::Gitlink { .. } => {
+                refuse_carry_standing_over_unparsed_content(
+                    prospective,
+                    &file_id,
+                    path,
+                    "a submodule pointer",
+                )?;
+                continue;
+            }
+        };
+        let body = load_native_source_blob(authority_context, hash)
+            .map_err(|error| format!("load carried source body for {path}: {error}"))?;
+        let digest = state
+            .blobs
+            .write(&body)
+            .map_err(|error| format!("store carried source {path}: {error}"))?;
+        let indexed = pipeline
+            .index_any_content(&file_id, &body, digest)
+            .map_err(|error| format!("parse carried source {path}: {error}"))?;
+        let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
+            // The third shape of the same condition: content the parser cannot
+            // derive entities from, standing where entities already are.
+            refuse_carry_standing_over_unparsed_content(
+                prospective,
+                &file_id,
+                path,
+                "content that no longer classifies as supported entity source",
+            )?;
+            continue;
+        };
+        let reconcile = reconciler
+            .reconcile_indexed_content(&indexed, state.blobs.as_ref(), prospective)
+            .map_err(|error| format!("derive semantics for carried source {path}: {error}"))?;
+        // Entity and relation deltas are the only two that change what the
+        // sealed change carries, so they are what decides whether the plan has
+        // to be taken again. A carried file whose edit moved neither leaves the
+        // first plan correct.
+        derived |= !reconcile.delta.entity_deltas.is_empty()
+            || !reconcile.delta.relation_deltas.is_empty();
+        prospective
+            .apply_transaction_delta(&reconcile.delta)
+            .map_err(|error| format!("apply derived semantics for carried {path}: {error}"))?;
+        let layout = reconciler
+            .projection()
+            .get_layout(&file_id)
+            .cloned()
+            .ok_or_else(|| format!("parsing produced no file layout for carried source {path}"))?;
+        prospective
+            .upsert_file_layout(&layout)
+            .map_err(|error| format!("install prospective layout for carried {path}: {error}"))?;
+        layouts.push(layout);
+    }
+
+    Ok(if derived {
+        CarriedDerivation::Derived
+    } else {
+        CarriedDerivation::AlreadyCoherent
+    })
+}
+
+/// Refuse a carried path whose new tree entry cannot have derived the entities
+/// the graph still holds for it.
+///
+/// One helper for three arms, because "the content at this path cannot be what
+/// those entities describe" is one condition whether the new entry is a symlink,
+/// a submodule pointer, or a blob that stopped classifying as source. Nothing
+/// standing there is the ordinary tree-only carry, and returns quietly.
+///
+/// A refusal rather than a retirement, and rather than a skip. Publishing the
+/// entities over content they never came from is the defect this module is
+/// closing. Retiring somebody else's entities is not this commit's call to
+/// make: no operation in it named that file. So it says what it found, names
+/// the path, and gives the three ways out.
+fn refuse_carry_standing_over_unparsed_content(
+    prospective: &kin_db::InMemoryGraph,
+    file_id: &FilePathId,
+    path: &RepoPath,
+    became: &str,
+) -> Result<(), String> {
+    let standing = prospective
+        .query_entities(&kin_model::EntityFilter {
+            file_path: Some(file_id.clone()),
+            ..Default::default()
+        })
+        .map_err(|error| format!("read carried entities for {path}: {error}"))?;
+    if standing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the workspace holds pending content for {path} whose new tree entry is {became}, and \
+         committing it would publish the {} entities the graph still derives from the source it \
+         replaces over content they never came from. Stage that file in this transaction with \
+         verb 'replace' to re-derive it or verb 'delete' to retire it, or revert the working file, \
+         then re-send this transaction unchanged.",
+        standing.len()
+    ))
 }
 
 fn apply_relation_operations(
@@ -2974,7 +3300,29 @@ mod tests {
             })
             .unwrap();
 
-        let base = load_native_commit_base(&state.layout).unwrap();
+        publish_pending_workspace_tree(state);
+    }
+
+    /// Advance workspace authority to whatever the live graph's tree now holds,
+    /// publishing no semantic change.
+    ///
+    /// The second half of every ambient admission, shared by the helpers above
+    /// and below so a pending edit, a pending addition and a pending removal all
+    /// reach authority through the same call the reconcile loop uses. This is
+    /// where the split the MCP commit route inherits is created:
+    /// `publish_workspace_tree` moves the tree and hands it an empty
+    /// `WorkspaceSemanticDelta`.
+    fn publish_pending_workspace_tree(state: &Arc<DaemonState>) {
+        try_publish_pending_workspace_tree(state)
+            .expect("a moved working tree must advance workspace authority");
+    }
+
+    /// The same publication, handing back what repository authority said.
+    ///
+    /// Ambient admission is refused for some transitions and the refusal is the
+    /// interesting half, so one caller needs it rather than a panic.
+    fn try_publish_pending_workspace_tree(state: &Arc<DaemonState>) -> crate::error::Result<()> {
+        let base = load_native_commit_base(&state.layout)?;
         let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
             state.layout.working_dir(),
             base.roots.clone(),
@@ -2987,12 +3335,85 @@ mod tests {
             &admitted,
             OperationId::new(),
             AuthorId::new("kin-session-reconcile"),
-        )
-        .unwrap()
-        .expect("an edited working tree must advance workspace authority");
+        )?
+        .expect("a moved working tree must advance workspace authority");
         state
             .record_repository_authority_commit(admission.receipt.generation)
             .unwrap();
+        Ok(())
+    }
+
+    /// Leave one brand new working file admitted the way the watcher leaves it.
+    ///
+    /// The workspace tree gains a path its base change never carried and no
+    /// semantic change is published for it, so the change that follows carries
+    /// this path as a `TreeDelta::Added` with no entities behind it.
+    fn admit_pending_working_tree_file(state: &Arc<DaemonState>, file: &str, content: &[u8]) {
+        let path = RepoPath::from_utf8(file).unwrap();
+        let target = state.layout.working_dir().join(file);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&target, content).unwrap();
+        let digest = state.blobs.write(content).unwrap();
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        path,
+                        TreeEntry::blob(Hash256::from_bytes(digest.0), false),
+                    ),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        publish_pending_workspace_tree(state);
+    }
+
+    /// Leave one working file's removal admitted the way the watcher leaves it.
+    ///
+    /// The entities go with the artifact in the LIVE graph, because kin-db
+    /// refuses a tree transition that strands an entity on a path the staged
+    /// tree no longer carries. Workspace authority still learns only about the
+    /// tree, because that is all `publish_workspace_tree` publishes, which is
+    /// what leaves the entities standing on the authority side.
+    fn admit_pending_working_tree_removal(
+        state: &Arc<DaemonState>,
+        file: &str,
+    ) -> crate::error::Result<()> {
+        let path = RepoPath::from_utf8(file).unwrap();
+        let file_id = FilePathId::new(file);
+        std::fs::remove_file(state.layout.working_dir().join(file)).unwrap();
+        let artifact = state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&path)
+            .cloned()
+            .expect("a pending removal takes an already admitted artifact");
+        let standing = state
+            .graph
+            .query_entities(&EntityFilter {
+                file_path: Some(file_id),
+                ..EntityFilter::default()
+            })
+            .unwrap();
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: standing
+                    .into_iter()
+                    .map(|old| EntityDelta::Removed { old })
+                    .collect(),
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id: artifact.artifact_id,
+                    old: artifact.located_entry(),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        try_publish_pending_workspace_tree(state)
     }
 
     /// Whether workspace authority still holds a tree its base change does not.
@@ -7787,12 +8208,25 @@ mod tests {
 
     /// Carrying a file in never rewrites who authored what is inside it.
     ///
-    /// A carried file reaches the change as a tree delta and nothing else, so
-    /// its entities gain no revision and no attribution event. That is what
-    /// keeps a provenance reader from being told the agent wrote a human's
-    /// uncommitted work. The fold is still reachable from provenance, one level
-    /// up, because the change every attributed entity names carries the
-    /// declaration in its message.
+    /// A carried file reaches the change as a tree delta AND the semantics those
+    /// bytes derive to, because a change that published one without the other
+    /// would seal a tree and an entity set describing different source. So its
+    /// entities do gain a revision, and that revision is a statement about
+    /// content, not about authorship: the entity keeps its id and the change it
+    /// was created in, and no attribution event names it, which is what keeps a
+    /// provenance reader from being told the agent wrote a human's uncommitted
+    /// work. The fold is also reachable from provenance one level up, because
+    /// the change every attributed entity names carries the declaration in its
+    /// message.
+    ///
+    /// The assertion that the carried entity's history did NOT contain this
+    /// change was here until the incoherence it described was fixed. It could
+    /// not survive the fix and be true at the same time: `get_entity_history`
+    /// selects changes by scanning entity deltas, so the only change that
+    /// satisfies it is one that publishes bytes for a file and no semantics for
+    /// them. What that assertion was protecting is below, in the origin change
+    /// and the attribution, and it is asserted there rather than through the
+    /// absence of a revision.
     #[test]
     fn a_carried_file_keeps_the_authorship_its_entities_already_had() {
         let (_dir, state) = test_state();
@@ -7821,13 +8255,23 @@ mod tests {
         assert!(
             carried_history
                 .iter()
-                .all(|change| change.id.to_string() != change_id),
-            "the carried file's entity must not be attributed to the agent's change"
+                .any(|change| change.id.to_string() == change_id),
+            "the change that republished the carried file's bytes must carry its semantics too, \
+             or it seals a tree and an entity set describing different source"
         );
         assert_eq!(
             carried_history.first().map(|change| change.id),
             Some(installed_change),
-            "the carried file's entity keeps the change it already had"
+            "the carried file's entity keeps the change it was created in"
+        );
+        assert_eq!(
+            state
+                .graph
+                .get_entity(&carried_entity.id)
+                .unwrap()
+                .map(|entity| (entity.name, entity.kind)),
+            Some((carried_entity.name.clone(), carried_entity.kind)),
+            "the carried file's entity keeps the identity it already had"
         );
 
         let attributed = state
@@ -7870,5 +8314,1111 @@ mod tests {
             "the change an audit event names must declare the fold: {}",
             declared.message
         );
+    }
+
+    /// How the store's own entities disagree with the exact bytes it publishes
+    /// for one file.
+    ///
+    /// The oracle is Kin's own parser reading Kin's own CAS: the graph names a
+    /// blob for the path, the blob is read back out of repository CAS rather
+    /// than off the working copy, and the entities it parses to are compared
+    /// with the entities the graph answers with for that file. `None` is a
+    /// coherent file. Anything else is a file whose entities describe bytes the
+    /// repository no longer holds, which is what a change that seals newer tree
+    /// bytes over older semantic spans leaves behind.
+    ///
+    /// Read against the live graph on purpose. `install_authority_graph` levels
+    /// it onto repository authority inside every commit reply and
+    /// `verify_workspace_matches_authority` refuses if it did not, so after a
+    /// commit the live graph, authority and the change just sealed are the same
+    /// answer, and asking the cheapest of the three asks all of them.
+    fn semantic_disagreement(state: &Arc<DaemonState>, file: &str) -> Option<String> {
+        let file_id = FilePathId::new(file);
+        let path = RepoPath::from_utf8(file).unwrap();
+        let tree = state.graph.resolved_tree();
+        let artifact = tree
+            .artifact_at_path(&path)
+            .unwrap_or_else(|| panic!("the store must publish {file}"));
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            panic!("{file} must be a blob in the published tree");
+        };
+        let body = load_native_source_blob(&state.layout, hash)
+            .unwrap_or_else(|error| panic!("repository CAS must hold the body of {file}: {error}"));
+        let digest = state.blobs.write(&body).unwrap();
+        let indexed = kin_index::IndexPipeline::new()
+            .index_any_content(&file_id, &body, digest)
+            .unwrap();
+        let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
+            panic!("{file} must classify as supported source");
+        };
+        for parsed in &indexed.entities {
+            let held = state
+                .graph
+                .query_entities(&EntityFilter {
+                    name_pattern: Some(parsed.name.clone()),
+                    file_path: Some(file_id.clone()),
+                    ..EntityFilter::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find(|entity| entity.name == parsed.name);
+            let Some(held) = held else {
+                return Some(format!(
+                    "{file}: the published bytes declare {} and the store holds no entity by that \
+                     name",
+                    parsed.name
+                ));
+            };
+            if held.fingerprint.behavior_hash != parsed.fingerprint.behavior_hash {
+                return Some(format!(
+                    "{file}: entity {} answers with behaviour hash {} while the exact bytes the \
+                     store publishes for it parse to {}",
+                    parsed.name, held.fingerprint.behavior_hash, parsed.fingerprint.behavior_hash
+                ));
+            }
+            let held_span = held
+                .span
+                .as_ref()
+                .map(|span| (span.start_byte, span.end_byte));
+            let parsed_span = parsed
+                .span
+                .as_ref()
+                .map(|span| (span.start_byte, span.end_byte));
+            if held_span != parsed_span {
+                return Some(format!(
+                    "{file}: entity {} answers with span {held_span:?} while the exact bytes the \
+                     store publishes for it place it at {parsed_span:?}",
+                    parsed.name
+                ));
+            }
+        }
+        None
+    }
+
+    /// A commit over MCP must publish entities that describe the bytes it
+    /// published, for a carried file as much as for an authored one.
+    ///
+    /// The two commit surfaces plan from different graphs. The CLI route is
+    /// handed the daemon's live derived graph, which the reconcile loop keeps
+    /// current, so a pending file's entities there came from the pending bytes.
+    /// The MCP route is handed repository authority's own workspace graph
+    /// snapshot, whose tree is the workspace tree and whose entities are
+    /// whatever the last published semantic delta left, because
+    /// `publish_workspace_tree` advances the tree with an empty
+    /// `WorkspaceSemanticDelta`. `plan_exact_transaction` reparses only the
+    /// files its staged operations name, so a carried file reaches the sealed
+    /// change as new tree bytes over old entity spans and nothing on that path
+    /// re-derives them.
+    ///
+    /// Declaring the carry does not make that acceptable. The declaration is
+    /// about authorship, and this is about whether canonical truth agrees with
+    /// itself.
+    #[test]
+    fn a_carried_immediate_edit_commits_entities_that_describe_the_bytes_it_published() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 1 }\n",
+            "other",
+        );
+        admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 100 }\n");
+
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        let reply = commit_reply(&result);
+        assert_eq!(
+            reply["carried_pending_files"],
+            serde_json::json!(["src/other.rs"]),
+            "the fixture must actually exercise the carry: {reply:#}"
+        );
+
+        // The control for the check itself. The authored file is re-derived by
+        // the edit path, so a checker that could not tell a coherent file from
+        // an incoherent one would report this one too.
+        assert_eq!(
+            semantic_disagreement(&state, "src/lib.rs"),
+            None,
+            "the file the operation authored must be coherent, or the check below proves nothing"
+        );
+        assert_eq!(
+            semantic_disagreement(&state, "src/other.rs"),
+            None,
+            "the carried file's entities must describe the bytes this commit published for it"
+        );
+    }
+
+    /// The same defect where no span moves, so only a fingerprint can catch it.
+    ///
+    /// `return 1` to `return 7` leaves every byte offset in the file identical,
+    /// so a coherence check written as a span or a length comparison passes over
+    /// it while the entity's body is still wrong. `behavior_hash` is the hash of
+    /// an entity's full source text, so it is the field that moves, and this arm
+    /// exists to keep the check honest about which one it reads.
+    #[test]
+    fn a_carried_same_length_body_edit_commits_entities_that_describe_the_bytes_it_published() {
+        const BEFORE: &[u8] = b"pub fn other() -> u8 { 1 }\n";
+        const AFTER: &[u8] = b"pub fn other() -> u8 { 7 }\n";
+        assert_eq!(
+            BEFORE.len(),
+            AFTER.len(),
+            "this arm's whole point is that no span moves"
+        );
+
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let (carried_entity, _) = install_exact_source(&state, "src/other.rs", BEFORE, "other");
+        let span_before = carried_entity
+            .span
+            .as_ref()
+            .map(|span| (span.start_byte, span.end_byte))
+            .expect("an installed source entity has a span");
+        admit_pending_working_tree_edit(&state, "src/other.rs", AFTER);
+
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        let reply = commit_reply(&result);
+        assert_eq!(
+            reply["carried_pending_files"],
+            serde_json::json!(["src/other.rs"]),
+            "the fixture must actually exercise the carry: {reply:#}"
+        );
+
+        assert_eq!(
+            semantic_disagreement(&state, "src/lib.rs"),
+            None,
+            "the file the operation authored must be coherent, or the check below proves nothing"
+        );
+        assert_eq!(
+            semantic_disagreement(&state, "src/other.rs"),
+            None,
+            "the carried file's entities must describe the bytes this commit published for it, \
+             including when the edit moved no byte offset"
+        );
+
+        let carried_after = state
+            .graph
+            .get_entity(&carried_entity.id)
+            .unwrap()
+            .expect("the carried entity keeps its identity across the commit");
+        assert_eq!(
+            carried_after
+                .span
+                .as_ref()
+                .map(|span| (span.start_byte, span.end_byte)),
+            Some(span_before),
+            "a same-length edit must leave the span exactly where it was, so the assertion above \
+             can only have been answered by the fingerprint"
+        );
+    }
+
+    /// The same defect on a store nothing in this process derived.
+    ///
+    /// Reopening drops every graph this process built and rebuilds the daemon's
+    /// view from what the store persisted, so the commit that follows plans
+    /// against cold repository authority and cold source. If the incoherence
+    /// were an artifact of live in-memory state carried across the admission it
+    /// would not survive here; it does, because the snapshot the MCP route plans
+    /// from is the persisted one.
+    #[test]
+    fn a_carried_edit_committed_after_a_reopen_publishes_entities_that_describe_its_tree() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 1 }\n",
+            "other",
+        );
+        admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
+
+        let layout = state.layout.clone();
+        drop(state);
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        let reply = commit_reply(&result);
+        assert_eq!(
+            reply["carried_pending_files"],
+            serde_json::json!(["src/other.rs"]),
+            "the fixture must actually exercise the carry: {reply:#}"
+        );
+
+        assert_eq!(
+            semantic_disagreement(&state, "src/lib.rs"),
+            None,
+            "the file the operation authored must be coherent, or the check below proves nothing"
+        );
+        assert_eq!(
+            semantic_disagreement(&state, "src/other.rs"),
+            None,
+            "a cold graph and cold source must still publish entities that describe the bytes the \
+             commit published"
+        );
+    }
+
+    /// The success contract a carried commit already has, held to while the
+    /// semantics are repaired.
+    ///
+    /// Deriving a carried file's semantics into the commit is the fix, and the
+    /// thing it could plausibly break is everything this asserts: the commit
+    /// still lands, the reply and the change record still declare the fold, the
+    /// carried entity keeps its identity and the change it was created in, and
+    /// no attribution event names it. Republishing an entity's bytes is not the
+    /// same as claiming its authorship, and this is where the two stay separate.
+    #[test]
+    fn a_coherent_carried_pending_commit_still_succeeds_and_declares_the_carry() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let (carried_entity, installed_change) = install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 1 }\n",
+            "other",
+        );
+        admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
+
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "a workspace holding pending content must still commit: {}",
+            result_text(&result)
+        );
+        let reply = commit_reply(&result);
+        let change_id = reply["change_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            reply["staged_operation_files"],
+            serde_json::json!(["src/lib.rs"])
+        );
+        assert_eq!(
+            reply["carried_pending_files"],
+            serde_json::json!(["src/other.rs"])
+        );
+        assert_eq!(
+            reply["modified_files"],
+            serde_json::json!(["src/lib.rs", "src/other.rs"])
+        );
+
+        let declared = state
+            .graph
+            .get_entity_history(&entity.id)
+            .unwrap()
+            .into_iter()
+            .find(|change| change.id.to_string() == change_id)
+            .expect("the published change is reachable from the entity the operation wrote");
+        assert!(
+            declared
+                .message
+                .contains("also admitted 1 pending working-tree file")
+                && declared.message.contains("src/other.rs"),
+            "the change record must still state the fold and sample it: {}",
+            declared.message
+        );
+
+        let carried_after = state
+            .graph
+            .get_entity(&carried_entity.id)
+            .unwrap()
+            .expect("the carried entity keeps the identity it already had");
+        assert_eq!(carried_after.name, carried_entity.name);
+        assert_eq!(carried_after.kind, carried_entity.kind);
+        assert_eq!(
+            state
+                .graph
+                .get_entity_history(&carried_entity.id)
+                .unwrap()
+                .first()
+                .map(|change| change.id),
+            Some(installed_change),
+            "the carried entity keeps the change it was created in"
+        );
+
+        let attributed = state
+            .graph
+            .query_audit_events(None, 64)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.action == "kin_transaction_commit"
+                    && event
+                        .details
+                        .as_deref()
+                        .is_some_and(|details| details.contains(&change_id))
+            })
+            .filter_map(|event| match event.target_scope {
+                Some(WorkScope::Entity(id)) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            attributed.contains(&entity.id),
+            "the entity the operation wrote is attributed to the committing session"
+        );
+        assert!(
+            !attributed.contains(&carried_entity.id),
+            "republishing a carried entity's bytes must not attribute it to the committing session"
+        );
+
+        assert!(
+            !workspace_is_dirty(&state),
+            "the commit must leave the workspace level with its base"
+        );
+    }
+
+    /// A carried path the workspace ADDED reaches the change with the entities
+    /// its bytes derive to.
+    ///
+    /// The other carried arms exercise a `TreeDelta::Updated`, where the entity
+    /// deltas are modifications. This one is the admission of untracked content:
+    /// the workspace tree gains a path its base change never carried, and
+    /// because ambient admission publishes no semantic delta, the change would
+    /// otherwise publish a source file with no entities inside it at all. That
+    /// is not a subtler version of the same defect; it is a file the graph
+    /// cannot answer a single question about.
+    #[test]
+    fn a_carried_added_path_commits_the_entities_its_bytes_derive_to() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        admit_pending_working_tree_file(&state, "src/added.rs", b"pub fn added() -> u8 { 5 }\n");
+
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        let reply = commit_reply(&result);
+        assert_eq!(
+            reply["carried_pending_files"],
+            serde_json::json!(["src/added.rs"]),
+            "the fixture must actually exercise the carry: {reply:#}"
+        );
+
+        assert_eq!(
+            semantic_disagreement(&state, "src/lib.rs"),
+            None,
+            "the file the operation authored must be coherent, or the check below proves nothing"
+        );
+        assert_eq!(
+            semantic_disagreement(&state, "src/added.rs"),
+            None,
+            "a carried file the workspace admitted must reach the change with its entities"
+        );
+        assert!(
+            state
+                .graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(FilePathId::new("src/added.rs")),
+                    ..EntityFilter::default()
+                })
+                .unwrap()
+                .iter()
+                .any(|held| held.name == "added"),
+            "the graph must be able to answer about the file the commit published"
+        );
+    }
+
+    /// A vacated path takes its semantics with it, and this is the mechanism
+    /// rather than an assumption.
+    ///
+    /// Ambient admission publishes the workspace tree, and a tree that stops
+    /// carrying a path has to carry the removal of everything that path owned in
+    /// the same transaction: kin-db refuses a transition that leaves an entity on
+    /// a path the staged tree no longer holds, and it refuses the whole
+    /// transition rather than the one entity. `publish_workspace_tree` derives
+    /// that retirement through `retire_semantics_on_vacated` over authority's own
+    /// workspace snapshot, which is the same rule
+    /// `commit_session_workspace_admission` applies to its own vacated set.
+    ///
+    /// So a carried removal never reaches the MCP commit planner. By the time it
+    /// plans, the admission has already published the path's departure together
+    /// with its semantics, and every carried tree delta the planner sees is an
+    /// addition or an update; the only removals that reach a plan are the ones a
+    /// staged `delete` authored, which are not carried. That is why
+    /// `derive_carried_pending_semantics` asserts the invariant instead of
+    /// implementing a retirement, and this is what makes the assertion evidence
+    /// rather than decoration.
+    ///
+    /// A surviving artifact can move through one `TreeDelta::Updated`, which is
+    /// not a vacancy and is not retired as one; the move tests below cover that
+    /// path through an MCP commit and cold reopen.
+    ///
+    /// Falsify by publishing `WorkspaceSemanticDelta::default()` from
+    /// `publish_workspace_tree`: repository authority refuses the admission and
+    /// the first assertion below fails on that refusal.
+    #[test]
+    fn ambient_admission_vacates_a_path_by_retiring_its_semantics() {
+        let (_dir, state) = test_state();
+        let (kept, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let (gone, _) = install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 1 }\n",
+            "other",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+
+        admit_pending_working_tree_removal(&state, "src/other.rs")
+            .expect("the admission carries the vacated path's retirement, so authority accepts it");
+
+        assert_ne!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "the admission has to move repository authority, or it published nothing at all"
+        );
+
+        let published: Vec<Entity> = {
+            let context = authority_context(&state).unwrap();
+            let workspace_id = context.workspace_id();
+            let authority = context.open().unwrap();
+            let lease = authority.read_authority();
+            lease
+                .workspace_graph_snapshot(&workspace_id)
+                .unwrap()
+                .expect("repository authority holds a workspace graph snapshot")
+                .entities
+                .values()
+                .cloned()
+                .collect()
+        };
+        assert!(
+            !published.iter().any(|entity| entity.id == gone.id),
+            "the vacated path's entity still stands in repository authority, so it answers \
+             queries with nothing in the tree behind it"
+        );
+        assert!(
+            published.iter().any(|entity| entity.id == kept.id),
+            "an untouched sibling lost its entity, so the retirement took more than the path \
+             that vacated"
+        );
+    }
+
+    /// A carried path whose new bytes stop being source is refused by name, not
+    /// published with the old entities still standing over them.
+    ///
+    /// Deriving cannot answer this one: there is nothing to parse, so there are
+    /// no entities to replace the ones the graph holds. Publishing anyway is the
+    /// defect in its worst form, entities describing source the repository is
+    /// about to stop holding. Retiring them silently is not this commit's call
+    /// either, because no operation in it named that file and a retirement is a
+    /// decision about somebody else's work. So it refuses, names the path, says
+    /// what the graph still holds, and gives the three ways out.
+    #[test]
+    fn a_carried_path_that_stops_being_source_is_refused_by_name() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 1 }\n",
+            "other",
+        );
+        // Not valid UTF-8, so the classifier cannot call it entity source no
+        // matter what the extension says.
+        admit_pending_working_tree_edit(&state, "src/other.rs", &[0xff, 0xfe, 0x00, 0x01]);
+        let before = load_native_commit_base(&state.layout).unwrap();
+
+        let sessions = test_sessions();
+        let (transaction_id, arguments) =
+            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "publishing stale entities under bytes they never came from is not an option: {}",
+            result_text(&result)
+        );
+        let message = result_text(&result);
+        assert!(
+            message.contains("src/other.rs"),
+            "the refusal must name the path that cannot be derived: {message}"
+        );
+        assert!(
+            message.contains("no longer classifies as supported entity source"),
+            "the refusal must say what is wrong with it: {message}"
+        );
+        assert!(
+            message.contains("'replace'") && message.contains("'delete'"),
+            "the refusal must say what to do about it: {message}"
+        );
+        assert_eq!(
+            sessions.get_transaction(&transaction_id).unwrap().state,
+            "active",
+            "a refused commit leaves the transaction where the caller can retry it"
+        );
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "no repository authority may move behind a refusal"
+        );
+    }
+
+    /// Leave one source path converted to a symlink the way a working session
+    /// leaves it, and hand back whatever refused if something did.
+    ///
+    /// A real transition, not a fabricated tree: the working copy gets an actual
+    /// symlink and the admitted tree is the one the live graph resolves. Both
+    /// halves can refuse, and which one refuses is the interesting answer, so
+    /// neither is unwrapped here.
+    #[cfg(unix)]
+    fn admit_pending_working_tree_symlink(
+        state: &Arc<DaemonState>,
+        file: &str,
+        target: &str,
+    ) -> crate::error::Result<()> {
+        let path = RepoPath::from_utf8(file).unwrap();
+        let on_disk = state.layout.working_dir().join(file);
+        std::fs::remove_file(&on_disk).unwrap();
+        std::os::unix::fs::symlink(target, &on_disk).unwrap();
+        let digest = state.blobs.write(target.as_bytes()).unwrap();
+        let artifact = state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&path)
+            .cloned()
+            .expect("a conversion lands on an already admitted artifact");
+        state.graph.apply_transaction_delta(&TransactionDelta {
+            tree_deltas: vec![TreeDelta::Updated {
+                artifact_id: artifact.artifact_id,
+                old: artifact.located_entry(),
+                new: LocatedEntry::new(path, TreeEntry::symlink(Hash256::from_bytes(digest.0))),
+            }],
+            ..TransactionDelta::default()
+        })?;
+        try_publish_pending_workspace_tree(state)
+    }
+
+    /// A carried path that became a symlink is refused by name, not skipped.
+    ///
+    /// The first cut of the derivation skipped every non-blob tree entry on the
+    /// reasoning that a symlink carries no source body and therefore no entities
+    /// to disagree with it. The first half is true and the second does not
+    /// follow: the tree and the semantics are independent, and kin-db
+    /// revalidates an invalidated path by requiring an artifact to remain at it
+    /// without requiring that artifact to be a blob (0.7.104
+    /// `src/engine/graph.rs:8705`). So a same-path source-to-symlink conversion
+    /// satisfies every check while the entities the old source derived keep
+    /// standing, and the skip published them over a link. It is the same defect
+    /// as an unsupported blob, so it gets the same refusal.
+    #[cfg(unix)]
+    #[test]
+    fn a_carried_source_to_symlink_conversion_is_refused_by_name() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 1 }\n",
+            "other",
+        );
+        admit_pending_working_tree_symlink(&state, "src/other.rs", "lib.rs").expect(
+            "if some earlier layer refuses this conversion, that mechanism is the finding and \
+             this test must be rewritten around it rather than deleted",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+
+        let sessions = test_sessions();
+        let (transaction_id, arguments) =
+            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "publishing source entities over a symlink is not an option: {}",
+            result_text(&result)
+        );
+        let message = result_text(&result);
+        assert!(
+            message.contains("src/other.rs"),
+            "the refusal must name the path it cannot derive: {message}"
+        );
+        assert!(
+            message.contains("a symlink"),
+            "the refusal must say what the path became: {message}"
+        );
+        assert!(
+            message.contains("'replace'") && message.contains("'delete'"),
+            "the refusal must say what to do about it: {message}"
+        );
+        assert_eq!(
+            sessions.get_transaction(&transaction_id).unwrap().state,
+            "active",
+            "a refused commit leaves the transaction where the caller can retry it"
+        );
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "no repository authority may move behind a refusal"
+        );
+    }
+
+    /// A newly admitted symlink with nothing standing under it stays a legal
+    /// tree-only carry, and its target is never resolved through the parser.
+    ///
+    /// The control for the refusal above. A symlink is a perfectly ordinary
+    /// thing for a workspace to carry, and refusing every one of them would
+    /// trade one broken commit for another. The refusal is about the entities
+    /// standing at the path, not about the entry kind, and this is what says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_carried_symlink_with_no_standing_entities_is_a_legal_tree_only_carry() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+
+        let path = RepoPath::from_utf8("src/link.rs").unwrap();
+        let on_disk = state.layout.working_dir().join("src/link.rs");
+        std::os::unix::fs::symlink("lib.rs", &on_disk).unwrap();
+        let digest = state.blobs.write(b"lib.rs").unwrap();
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: LocatedEntry::new(path, TreeEntry::symlink(Hash256::from_bytes(digest.0))),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        publish_pending_workspace_tree(&state);
+
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "a symlink nothing derives entities from must still commit: {}",
+            result_text(&result)
+        );
+        let reply = commit_reply(&result);
+        assert_eq!(
+            reply["carried_pending_files"],
+            serde_json::json!(["src/link.rs"]),
+            "the symlink is carried and declared like any other pending path: {reply:#}"
+        );
+        assert!(
+            state
+                .graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(FilePathId::new("src/link.rs")),
+                    ..EntityFilter::default()
+                })
+                .unwrap()
+                .is_empty(),
+            "the link's target must never be resolved through the parser on its behalf"
+        );
+        assert_eq!(
+            semantic_disagreement(&state, "src/lib.rs"),
+            None,
+            "the file the operation authored stays coherent beside a carried symlink"
+        );
+    }
+
+    /// A relation-only commit beside a carried edit attributes the endpoint the
+    /// agent joined and not the one it carried.
+    ///
+    /// The carried-path filter that keeps a folded-in file out of attribution
+    /// applies while entity-delta scopes are collected. A relation-only commit
+    /// has no entity deltas of its own, so it falls back to the relation's
+    /// endpoints, and once a carried file contributes entity deltas the two
+    /// interact: the carried entity is filtered out of the first list, the list
+    /// is empty, the fallback opens, and an unfiltered fallback hands the carried
+    /// endpoint straight back to the committing session. Both sources are
+    /// filtered for that reason.
+    #[test]
+    fn a_relation_only_commit_beside_a_carry_attributes_only_the_endpoint_it_joined() {
+        let (_dir, state) = test_state();
+        let (caller, _) = install_exact_source(
+            &state,
+            "src/caller.rs",
+            b"pub fn caller() -> u8 { 1 }\n",
+            "caller",
+        );
+        let (callee, _) = install_exact_source(
+            &state,
+            "src/callee.rs",
+            b"pub fn callee() -> u8 { 2 }\n",
+            "callee",
+        );
+        // The carried half, on the callee's own path, so the commit re-derives
+        // the entity the staged relation points at.
+        admit_pending_working_tree_edit(&state, "src/callee.rs", b"pub fn callee() -> u8 { 7 }\n");
+
+        let sessions = kin_mcp::SessionRegistry::new();
+        let session = start_agent_session(&sessions, "gemini-cli", "relation-writer");
+        let session_id = session.session_id.to_string();
+        let transaction = sessions
+            .begin_transaction(&session_id, "relations")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "create".to_string(),
+                    target: String::new(),
+                    payload: Some(kin_mcp::McpMutationPayload::Relation {
+                        from: caller.id,
+                        to: callee.id,
+                        kind: kin_model::relation::RelationKind::Calls,
+                    }),
+                    body: None,
+                    description: "link the call".to_string(),
+                    destination: None,
+                }],
+            )
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "a relation-only commit beside a carry must still land: {}",
+            result_text(&result)
+        );
+        let reply = commit_reply(&result);
+        assert_eq!(
+            reply["carried_pending_files"],
+            serde_json::json!(["src/callee.rs"]),
+            "the fixture must actually exercise the carry: {reply:#}"
+        );
+
+        let scoped = state
+            .graph
+            .query_audit_events(Some(&mcp_actor_id(&session_id)), 16)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.target_scope {
+                Some(WorkScope::Entity(id)) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            scoped.contains(&caller.id),
+            "the endpoint the agent joined and did not carry is still attributed to it"
+        );
+        assert!(
+            !scoped.contains(&callee.id),
+            "an endpoint inside a carried file must not reach the committing session's \
+             attribution through the relation fallback"
+        );
+        assert_eq!(
+            semantic_disagreement(&state, "src/callee.rs"),
+            None,
+            "the carried endpoint's own entities still describe the bytes this commit published"
+        );
+    }
+
+    /// Preserve each artifact identity while moving one path in the desired tree.
+    fn moved_workspace_tree(
+        tree: &kin_model::ResolvedTree,
+        from: &RepoPath,
+        to: &RepoPath,
+    ) -> kin_model::ResolvedTree {
+        kin_model::ResolvedTree::from_artifacts(tree.artifacts_by_path().map(|artifact| {
+            let path = if &artifact.path == from {
+                to.clone()
+            } else {
+                artifact.path.clone()
+            };
+            kin_model::ResolvedArtifact::new(artifact.artifact_id, path, artifact.entry.clone())
+        }))
+        .expect("moving one artifact keeps every identity and every path unique")
+    }
+
+    fn move_incoming_edge(caller: &Entity, moved: &Entity) -> Relation {
+        Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::relation::RelationKind::Calls,
+            src: GraphNodeId::Entity(caller.id),
+            dst: GraphNodeId::Entity(moved.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Manual,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn assert_carried_move_identity(
+        state: &DaemonState,
+        original: &Entity,
+        artifact: kin_model::ArtifactId,
+        incoming: &Relation,
+    ) {
+        let moved = state
+            .graph
+            .get_entity(&original.id)
+            .unwrap()
+            .expect("a carried move must preserve entity identity");
+        assert_eq!(moved.file_origin, Some(FilePathId::new("src/new.rs")));
+        assert_eq!(
+            moved.span.as_ref().unwrap().file,
+            FilePathId::new("src/new.rs")
+        );
+        assert_eq!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&RepoPath::from_utf8("src/new.rs").unwrap())
+                .unwrap()
+                .artifact_id,
+            artifact
+        );
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&RepoPath::from_utf8("src/old.rs").unwrap())
+            .is_none());
+        assert_eq!(
+            state
+                .graph
+                .get_all_relations_for_node(&incoming.dst)
+                .unwrap()
+                .iter()
+                .find(|edge| edge.id == incoming.id),
+            Some(incoming)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn session_move_keeps_identity_and_incoming_edges_through_mcp_commit_and_reopen() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let (_dir, state) = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (caller, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let (moved, _) = install_exact_source(
+            &state,
+            "src/old.rs",
+            b"pub fn moved() -> u8 { 7 }\n",
+            "moved",
+        );
+        let artifact = state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&RepoPath::from_utf8("src/old.rs").unwrap())
+            .unwrap()
+            .artifact_id;
+        let incoming = move_incoming_edge(&caller, &moved);
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                relation_deltas: vec![RelationDelta::Added {
+                    new: incoming.clone(),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        commit_live_graph(&state, "publish incoming edge before move", true);
+        let layout = state.layout.clone();
+        let session = layout.runs_dir().join("session-mcp-carried-move");
+        let app = crate::api::router(Arc::clone(&state));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/session-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"session_dir": session}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        std::fs::rename(session.join("src/old.rs"), session.join("src/new.rs")).unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"session_dir": session, "confirm_mass_deletion": false})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        assert_carried_move_identity(&state, &moved, artifact, &incoming);
+        drop(app);
+        drop(state);
+
+        let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        assert_carried_move_identity(&state, &moved, artifact, &incoming);
+        crate::loop_runner::drain_semantic_debt(&state)
+            .await
+            .unwrap();
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(&sessions, &caller, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        let reply = commit_reply(&result);
+        assert_eq!(
+            reply["carried_pending_files"],
+            serde_json::json!(["src/new.rs"])
+        );
+        assert_carried_move_identity(&state, &moved, artifact, &incoming);
+        assert_eq!(semantic_disagreement(&state, "src/new.rs"), None);
+        assert_eq!(semantic_disagreement(&state, "src/lib.rs"), None);
+        drop(state);
+
+        let cold = Arc::new(DaemonState::open(layout).unwrap());
+        assert_carried_move_identity(&cold, &moved, artifact, &incoming);
+        assert_eq!(semantic_disagreement(&cold, "src/new.rs"), None);
+        assert_eq!(semantic_disagreement(&cold, "src/lib.rs"), None);
+    }
+
+    #[test]
+    fn session_move_plans_relocation_without_retiring_identity_or_incoming_edges() {
+        let (_dir, state) = test_state();
+        let (caller, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let (moved, _) = install_exact_source(
+            &state,
+            "src/old.rs",
+            b"pub fn moved() -> u8 { 7 }\n",
+            "moved",
+        );
+        let incoming = move_incoming_edge(&caller, &moved);
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                relation_deltas: vec![RelationDelta::Added {
+                    new: incoming.clone(),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        commit_live_graph(&state, "publish incoming edge before move", false);
+        let base = load_native_commit_base(&state.layout).unwrap();
+        let from_path = RepoPath::from_utf8("src/old.rs").unwrap();
+        let to_path = RepoPath::from_utf8("src/new.rs").unwrap();
+        let artifact = base.tree.artifact_at_path(&from_path).unwrap().artifact_id;
+        let moved_tree = moved_workspace_tree(&base.tree, &from_path, &to_path);
+        let deltas = kin_core::exact_tree_correction(&base.tree, &moved_tree).unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert!(
+            matches!(&deltas[0], TreeDelta::Updated { artifact_id, old, new }
+                if *artifact_id == artifact && old.path == from_path && new.path == to_path)
+        );
+        let vacated = crate::repository_commit::VacatedPaths::from_deltas(&deltas);
+        assert!(
+            vacated.is_empty(),
+            "a surviving artifact must not be retired"
+        );
+        let retirement = crate::repository_commit::retire_semantics_on_vacated(
+            &base.graph.to_snapshot(),
+            &vacated,
+        )
+        .unwrap();
+        assert!(retirement.entity_deltas().is_empty());
+        assert!(retirement.relation_deltas().is_empty());
+        let relocations = crate::repository_commit::plan_session_entity_relocations(
+            state.graph.as_ref(),
+            &FilePathId::new("src/old.rs"),
+            &FilePathId::new("src/new.rs"),
+        )
+        .unwrap();
+        assert!(relocations.iter().any(|delta| matches!(delta,
+                EntityDelta::Modified { old, new }
+                    if old.id == moved.id && new.id == moved.id
+                        && new.file_origin == Some(FilePathId::new("src/new.rs")))));
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: deltas,
+                entity_deltas: relocations,
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        assert_carried_move_identity(&state, &moved, artifact, &incoming);
     }
 }

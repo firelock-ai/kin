@@ -105,7 +105,7 @@ impl ActiveApiRepositoryAuthority {
     }
 }
 
-fn repository_authority_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+pub(crate) fn repository_authority_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (
         StatusCode::FAILED_DEPENDENCY,
         format!("this repository's authority could not be opened: {error}"),
@@ -1203,6 +1203,15 @@ struct RepoScopedMcpToolCallRequest {
 }
 
 const REPO_SCOPED_SEMANTIC_CAPABILITY: &str = "repo_scoped_semantic_tools_v1";
+/// This daemon serves one file's bytes for a repository and ref.
+///
+/// A capability rather than a probe, because the caller that needs it is a
+/// hosted control plane talking to whatever image production currently runs,
+/// and the alternative is guessing from a 404: an unmatched axum route and a
+/// path the ref genuinely does not carry both answer 404, and only one of
+/// them means "ask an older daemon a different question". Advertising it is
+/// what lets that caller keep a truthful fallback instead of a heuristic.
+const REPO_SCOPED_BLOB_CAPABILITY: &str = "repo_scoped_blob_v1";
 /// Retained continuations per repository, not per daemon.
 ///
 /// A per-daemon cap is a shared resource across tenants, and the eviction that
@@ -2212,6 +2221,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/repos/{repo_id}/health", get(repo_health))
         .route("/repos/{repo_id}/entities", get(repo_entities))
         .route("/repos/{repo_id}/files", get(repo_files))
+        .route("/repos/{repo_id}/blob", get(crate::repo_blob::repo_blob))
         .route("/repos/{repo_id}/refs", get(repo_refs))
         .route("/repos/{repo_id}/history", get(repo_history))
         .route(
@@ -2905,7 +2915,7 @@ impl GraphStatusSettledCache {
     /// Record a reading that completed the full live fence. O(1), taken after
     /// the fence is released, so recording can never lengthen the window an
     /// embed worker waits on.
-    fn record(
+    pub(crate) fn record(
         &self,
         scope: kin_mcp::handlers::entities::GraphStatusScope,
         graph: &Arc<kin_db::InMemoryGraph>,
@@ -2961,12 +2971,12 @@ impl GraphStatusSettledCache {
 /// Reading index metadata needs no embedder and takes no additional lock beyond
 /// the index's own.
 #[cfg(feature = "vector")]
-fn selected_graph_index_population(graph: &kin_db::InMemoryGraph) -> Option<usize> {
+pub(crate) fn selected_graph_index_population(graph: &kin_db::InMemoryGraph) -> Option<usize> {
     graph.vector_index_stats().map(|(_, population)| population)
 }
 
 #[cfg(not(feature = "vector"))]
-fn selected_graph_index_population(_graph: &kin_db::InMemoryGraph) -> Option<usize> {
+pub(crate) fn selected_graph_index_population(_graph: &kin_db::InMemoryGraph) -> Option<usize> {
     None
 }
 
@@ -6304,6 +6314,7 @@ async fn reconcile_session_workspace(
         )
         .map_err(repository_commit_error)?;
         let vacated = plan.vacated.clone();
+        let module_relocations = plan.module_relocations.clone();
         let committed = crate::repository_commit::commit_session_workspace_admission(
             &state.layout,
             state.blobs.as_ref(),
@@ -6343,12 +6354,28 @@ async fn reconcile_session_workspace(
             // here was refused after authority had already moved, leaving the
             // two graphs holding different trees. Targeted reads rather than a
             // snapshot of the whole store, which this path cannot afford.
-            let (retired_entity_deltas, retired_relation_deltas) =
+            let (mut retired_entity_deltas, retired_relation_deltas) =
                 crate::repository_commit::retire_live_semantics_on_vacated(
                     state.graph.as_ref(),
                     &vacated,
                 )
                 .map_err(repository_commit_error)?;
+            let moves = crate::repository_commit::session_artifact_moves(observation.deltas());
+            for (from, to) in &moves {
+                retired_entity_deltas.extend(
+                    crate::repository_commit::plan_session_entity_relocations(
+                        state.graph.as_ref(),
+                        from,
+                        to,
+                    )
+                    .map_err(repository_commit_error)?,
+                );
+            }
+            crate::repository_commit::bind_session_module_relocations(
+                &mut retired_entity_deltas,
+                &module_relocations,
+            )
+            .map_err(repository_commit_error)?;
             state
                 .graph
                 .apply_transaction_delta(&TransactionDelta {
@@ -6358,6 +6385,24 @@ async fn reconcile_session_workspace(
                     ..TransactionDelta::default()
                 })
                 .map_err(internal_error)?;
+            // Destination facets are re-derived below from exact admitted
+            // bytes. Clear only departed keys; a swap's keys still belong to
+            // surviving artifacts and must not erase each other's records.
+            for (from, _) in &moves {
+                let old_path = RepoPath::from_utf8(from.0.clone()).map_err(internal_error)?;
+                if observation
+                    .desired_tree()
+                    .artifact_at_path(&old_path)
+                    .is_none()
+                {
+                    crate::loop_runner::clear_incompatible_facets_in(
+                        state.graph.as_ref(),
+                        from,
+                        crate::loop_runner::EnrichmentFacet::None,
+                    )
+                    .map_err(internal_error)?;
+                }
+            }
             for delta in &retired_entity_deltas {
                 let kin_model::EntityDelta::Removed { old } = delta else {
                     continue;
@@ -6555,7 +6600,7 @@ fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String
 /// how the placeholder author this endpoint used to stamp reached permanent
 /// history. A request that names nobody is refused by deserialization rather
 /// than completed by the daemon.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandCommitRequest {
     operation_id: kin_model::OperationId,
@@ -6571,6 +6616,26 @@ struct CommandCommitRequest {
     session_id: Option<String>,
 }
 
+/// Why one attempt at publishing a commit did not produce a change.
+///
+/// Two answers rather than one, because they ask for different next steps. A
+/// refusal is already worded for the caller and travels out as it is. Semantics
+/// that have not caught up with their bytes is not a refusal yet: the parse that
+/// settles it is one bounded pass away, and this route takes that pass before it
+/// decides. Recovering the difference from the worded refusal afterwards would
+/// mean matching on message text, and a classification inferred from a failure
+/// string stops holding the first time the wording moves.
+enum CommitAttempt {
+    Refused((StatusCode, String)),
+    SemanticsBehindTree(Vec<RepoPath>),
+}
+
+impl From<(StatusCode, String)> for CommitAttempt {
+    fn from(refusal: (StatusCode, String)) -> Self {
+        Self::Refused(refusal)
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct CommandCommitResponse {
     change_id: String,
@@ -6580,6 +6645,79 @@ struct CommandCommitResponse {
     entity_count: usize,
     relation_count: usize,
     file_count: usize,
+}
+
+/// Copy the bodies a bounded re-derivation is about to read back into ingestion
+/// staging, from the store that durably holds them.
+///
+/// The detector that names these paths reads each one's tree-named body through
+/// `source_cas::read_publishable_source`, which answers from ingestion staging
+/// first and from repository CAS second. `readmit_semantics_for_paths` reads
+/// staging alone. Staging is disposable and repository CAS is not, so a store
+/// that reopened after its staged copies were pruned reaches this with the
+/// detector able to read every body and the re-derivation able to read none: the
+/// readmission fails its read, the second plan refuses exactly as the first did,
+/// and every later commit repeats it. Nothing is lost and nothing repairs it.
+///
+/// So the exact bodies the refused paths name are re-ingested first. This is
+/// explicit ingestion of bytes the repository already published, bounded to the
+/// paths the planner refused, and it changes no identity: the body is written
+/// back under the content address the tree already names.
+///
+/// A path whose body neither store holds is left alone. That absence is the
+/// publication's own refusal to make by name, and the re-derivation reports it
+/// as unresolved exactly as it did before.
+fn stage_refused_bodies_from_repository_cas(
+    state: &DaemonState,
+    owed: &std::collections::BTreeSet<RepoPath>,
+) -> usize {
+    let Ok(context) =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+    else {
+        return 0;
+    };
+    let Ok(authority) = context.open() else {
+        return 0;
+    };
+    let tree = state.graph.resolved_tree();
+    let mut refilled = 0;
+    for path in owed {
+        let Some(artifact) = tree.artifact_at_path(path) else {
+            continue;
+        };
+        let kin_model::TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        let staged_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        if state.blobs.read(&staged_hash).is_ok() {
+            continue;
+        }
+        match crate::source_cas::read_publishable_source(&state.blobs, &authority, hash) {
+            Ok(source) => match state.blobs.write(source.body()) {
+                Ok(written) if written == staged_hash => refilled += 1,
+                Ok(written) => warn!(
+                    path = %path,
+                    expected = %staged_hash,
+                    written = %written,
+                    "re-ingesting a published body produced a different content address, so it \
+                     was not the body this path's tree entry names"
+                ),
+                Err(error) => warn!(
+                    path = %path,
+                    error = %error,
+                    "the body repository CAS holds for this path could not be re-ingested, so \
+                     its semantics cannot be re-derived"
+                ),
+            },
+            Err(error) => warn!(
+                path = %path,
+                error = %error,
+                "neither store holds the body this path's tree entry names, so its semantics \
+                 cannot be re-derived"
+            ),
+        }
+    }
+    refilled
 }
 
 async fn command_commit(
@@ -6671,7 +6809,57 @@ async fn command_commit(
     .await
     .map_err(commit_admission_error)?;
 
-    match command_commit_after_admission(&state, request, deferred_tree.as_ref()) {
+    // A commit plans its tree half and its entity half out of one live graph,
+    // and that graph is allowed to be behind itself: an exact-tree admission
+    // moves a path's bytes into authority on its own, and the parse that moves
+    // that path's spans onto them runs afterwards and does not survive the daemon
+    // that ran it. The drain above repairs the paths a writer recorded as owed.
+    // For anything it missed the planner refuses by name, and the answer is one
+    // bounded re-derivation of exactly those paths through the seam the drain
+    // uses, under the gate this commit already holds, before asking again.
+    //
+    // Once, not in a loop. The re-derivation is best effort and the planner is
+    // the guarantee: a second refusal is the store saying the parse will not
+    // settle from here, and asking again until it does would hold the gate for
+    // as long as the caller waits.
+    let attempt =
+        match command_commit_after_admission(&state, request.clone(), deferred_tree.as_ref()) {
+            Err(CommitAttempt::SemanticsBehindTree(paths)) => {
+                let owed: std::collections::BTreeSet<RepoPath> = paths.into_iter().collect();
+                let named = owed
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let waiting_since = Instant::now();
+                // The re-derivation reads ingestion staging and the detector
+                // reads staging plus repository CAS, so the bodies it is about
+                // to read are put back within reach first. On a store whose
+                // staged copies are gone this is the difference between one
+                // repair and a permanent refusal.
+                let refilled = stage_refused_bodies_from_repository_cas(&state, &owed);
+                // Its own commit phase, so what the wait cost is attributed on the
+                // phase table beside the planning it precedes rather than hiding
+                // inside it.
+                let readmitted = crate::mcp_commit::timed_commit_phase_async(
+                    "await_pending_reconcile",
+                    crate::loop_runner::readmit_semantics_for_paths(&state, &owed),
+                )
+                .await;
+                info!(
+                    paths = %named,
+                    refilled,
+                    enriched = readmitted.enriched,
+                    unresolved = readmitted.failed.len(),
+                    waited_ms = waiting_since.elapsed().as_millis(),
+                    "these paths held entities their own admitted bytes do not reproduce, so this \
+                     commit re-derived them before planning the change that seals those bytes"
+                );
+                command_commit_after_admission(&state, request, deferred_tree.as_ref())
+            }
+            attempted => attempted,
+        };
+    match attempt {
         Ok(response) => {
             // A transaction that reached authority carried the tree the graph
             // holds with it, which is the divergence an earlier unclosed
@@ -6718,11 +6906,21 @@ async fn command_commit(
             crate::semantic_debt::settle_all(&state);
             Ok(response)
         }
-        Err(error) => {
-            if let Some(admitted) = deferred_tree {
-                crate::loop_runner::publish_deferred_tree_after_failure(&state, &admitted);
+        Err(CommitAttempt::SemanticsBehindTree(paths)) => {
+            if let Some(admitted) = deferred_tree.as_ref() {
+                crate::loop_runner::publish_deferred_tree_after_failure(&state, admitted);
             }
-            Err(error)
+            Err(repository_commit_error(
+                crate::error::DaemonError::SemanticsBehindTree {
+                    paths: paths.iter().map(ToString::to_string).collect(),
+                },
+            ))
+        }
+        Err(CommitAttempt::Refused(refusal)) => {
+            if let Some(admitted) = deferred_tree.as_ref() {
+                crate::loop_runner::publish_deferred_tree_after_failure(&state, admitted);
+            }
+            Err(refusal)
         }
     }
 }
@@ -6738,12 +6936,12 @@ fn command_commit_after_admission(
     state: &Arc<DaemonState>,
     request: CommandCommitRequest,
     observed: Option<&crate::repository_commit::AdmittedWorkspaceTree>,
-) -> Result<Json<CommandCommitResponse>, (StatusCode, String)> {
+) -> Result<Json<CommandCommitResponse>, CommitAttempt> {
     let graph = &*state.graph;
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
             .map_err(repository_commit_error)?;
-    let plan = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
+    let planned = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
         if let Some(expected_head) = request.expected_head {
             crate::repository_commit::plan_native_amend(
                 graph,
@@ -6772,11 +6970,24 @@ fn command_commit_after_admission(
                 })?,
             )
         }
-    })
-    .map_err(repository_commit_error)?;
+    });
+    let plan = match planned {
+        Ok(plan) => plan,
+        // The one planning outcome this route can still do something about, so
+        // it keeps its paths instead of being flattened into a worded refusal.
+        Err(crate::error::DaemonError::SemanticsBehindTree { paths }) => {
+            return Err(CommitAttempt::SemanticsBehindTree(
+                paths
+                    .into_iter()
+                    .filter_map(|path| RepoPath::from_utf8(path).ok())
+                    .collect(),
+            ))
+        }
+        Err(error) => return Err(repository_commit_error(error).into()),
+    };
     if !request.amend {
         if let Some(refusal) = refuse_a_successor_that_records_nothing(&plan) {
-            return Err(refusal);
+            return Err(refusal.into());
         }
     }
     let change_id = plan.change.id;
@@ -6832,7 +7043,10 @@ fn command_commit_after_admission(
                             foreign_blocks.len()
                         ),
                     });
-                    return Err((StatusCode::CONFLICT, body.to_string()));
+                    return Err(CommitAttempt::Refused((
+                        StatusCode::CONFLICT,
+                        body.to_string(),
+                    )));
                 }
             }
         }
@@ -6986,6 +7200,18 @@ fn projection_blocked_refusal(error: &crate::error::DaemonError) -> Option<(Stat
 fn repository_commit_error(error: crate::error::DaemonError) -> (StatusCode, String) {
     if let Some(refusal) = projection_blocked_refusal(&error) {
         return refusal;
+    }
+    // Semantics that have not caught up with their bytes is a state of the store
+    // a caller can act on, not a fault in it: the files are intact, the bytes are
+    // authority, and one re-derivation settles it. Answering it as an internal
+    // error would send a reader to the daemon for files they can see.
+    if let crate::error::DaemonError::SemanticsBehindTree { paths } = &error {
+        let body = serde_json::json!({
+            "error": "semantics_behind_tree",
+            "message": error.to_string(),
+            "paths": paths,
+        });
+        return (StatusCode::CONFLICT, body.to_string());
     }
     let status = match &error {
         crate::error::DaemonError::Graph(kin_db::KinDbError::Model(
@@ -15094,7 +15320,7 @@ async fn repository_ref_metadata(
     Ok(Arc::new(repository_metadata(&snapshot)?.clone()))
 }
 
-fn default_repository_ref(
+pub(crate) fn default_repository_ref(
     metadata: &kin_db::PersistedRepositoryAuthority,
 ) -> Result<Option<&kin_model::RepositoryRef>, (StatusCode, String)> {
     crate::state::select_repository_default_ref(metadata).map_err(repository_authority_error)
@@ -15126,7 +15352,7 @@ fn default_repository_ref(
 /// A local daemon keeps opening its own authority. Its startup cache entry
 /// carries no envelope, so there is nothing cached for the local arm to read,
 /// and a local repository has no publication cursor to bind reuse to.
-enum RepositoryReadView {
+pub(crate) enum RepositoryReadView {
     Hosted {
         generation: Arc<crate::state::HostedRepoCacheEntry>,
         metadata: Arc<kin_db::PersistedRepositoryAuthority>,
@@ -15146,7 +15372,9 @@ impl RepositoryReadView {
     /// wearing that name spends the guard's allowlist on a call that touches no
     /// filesystem, and the guard runs only in the `check` job, which pull
     /// requests skip, so the cost lands on main rather than on the PR.
-    fn authority(&self) -> Result<&kin_db::PersistedRepositoryAuthority, (StatusCode, String)> {
+    pub(crate) fn authority(
+        &self,
+    ) -> Result<&kin_db::PersistedRepositoryAuthority, (StatusCode, String)> {
         match self {
             Self::Hosted { metadata, .. } => Ok(metadata.as_ref()),
             Self::Local { snapshot } => repository_metadata(snapshot),
@@ -15154,7 +15382,7 @@ impl RepositoryReadView {
     }
 
     /// Resolve one ref target to the change it names.
-    fn resolve_target(
+    pub(crate) fn resolve_target(
         &self,
         target: &kin_model::RefTarget,
     ) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
@@ -15182,7 +15410,7 @@ impl RepositoryReadView {
     /// its own snapshot, and a caller still holding the view would keep two
     /// copies of one repository resident for the length of the response, which
     /// is the memory shape this change exists to remove.
-    fn resolve_tree_at(
+    pub(crate) fn resolve_tree_at(
         self,
         state: &DaemonState,
         change_id: &kin_model::SemanticChangeId,
@@ -15205,7 +15433,7 @@ impl RepositoryReadView {
 /// Addressability is decided first and by the same rule
 /// [`repo_scoped_graph`] uses, so an id this daemon does not serve keeps
 /// answering the refusal that already names both identities.
-async fn repository_read_view(
+pub(crate) async fn repository_read_view(
     state: &DaemonState,
     repo_id: &str,
 ) -> Result<RepositoryReadView, (StatusCode, String)> {
@@ -15267,7 +15495,7 @@ fn repository_tree_at(
         .map_err(repository_authority_error)
 }
 
-fn short_ref_name(name: &kin_model::RefName) -> String {
+pub(crate) fn short_ref_name(name: &kin_model::RefName) -> String {
     let bytes = name.as_bytes();
     for prefix in [b"refs/heads/".as_slice(), b"refs/tags/".as_slice()] {
         if let Some(short) = bytes.strip_prefix(prefix) {
@@ -16196,7 +16424,12 @@ async fn repo_health(
         semantic_capabilities: state
             .storage_backend
             .as_ref()
-            .map(|_| vec![REPO_SCOPED_SEMANTIC_CAPABILITY.to_string()])
+            .map(|_| {
+                vec![
+                    REPO_SCOPED_SEMANTIC_CAPABILITY.to_string(),
+                    REPO_SCOPED_BLOB_CAPABILITY.to_string(),
+                ]
+            })
             .unwrap_or_default(),
         repository_read_cache: RepositoryReadCacheHealth {
             hits: state
@@ -18091,30 +18324,27 @@ impl ExactSourceEntry {
     }
 }
 
-fn parse_exact_source_change_id(
-    source_change_id: &str,
+/// Parse a canonical semantic change id out of one named request field.
+///
+/// The field name is a parameter because the refusal is the whole value here:
+/// two routes accept a change id under two different names, and a message that
+/// names the wrong one sends a caller looking at the wrong parameter.
+pub(crate) fn parse_semantic_change_id(
+    field: &str,
+    value: &str,
 ) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
-    if source_change_id.len() != 64
-        || !source_change_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "source_change_id must be a canonical 64-character hexadecimal semantic change ID"
-                .to_string(),
+            format!("{field} must be a canonical 64-character hexadecimal semantic change ID"),
         ));
     }
-    let decoded = hex::decode(source_change_id).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("invalid source_change_id: {error}"),
-        )
-    })?;
+    let decoded = hex::decode(value)
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid {field}: {error}")))?;
     let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            "source_change_id must decode to 32 bytes".to_string(),
+            format!("{field} must decode to 32 bytes"),
         )
     })?;
     Ok(kin_model::SemanticChangeId::from_hash(
@@ -18333,49 +18563,86 @@ fn build_exact_source_tar_gz(
     Ok((bytes, manifest_hash))
 }
 
+/// One repository's source-CAS reader, its arm chosen once for a whole read.
+///
+/// Two callers need the same choice and neither should re-derive it: the exact
+/// source archive, which loads every artifact in a tree, and
+/// [`crate::repo_blob`], which loads one. Handing back a loader rather than a
+/// per-call function is what keeps the local arm's authority opened once. That
+/// open re-reads the whole authority out of storage and revalidates its
+/// history, so paying it per artifact is the shape [`RepositoryReadView`]
+/// exists to remove.
+pub(crate) type RepositorySourceBlobLoader = Box<
+    dyn FnMut(&RepoPath, kin_model::Hash256, u64) -> Result<Option<Vec<u8>>, (StatusCode, String)>
+        + Send,
+>;
+
+/// Open the reader for `repo_id`'s exact source bytes.
+///
+/// Capability decides which authority answers, by the same rule
+/// [`repository_read_view`] uses and for the same reason: a daemon with a
+/// storage backend reaches every repository it serves through that backend, and
+/// a daemon without one has only the local binding it opened at startup. Reading
+/// the tree from one authority and the bytes from the other is what this rule
+/// exists to stop, and it is reachable: `cached_repo_id` is the id this daemon
+/// resolved from its own manifest, so a hosted daemon serving a repository of
+/// that name would otherwise resolve the tree from its generation and then look
+/// for the bytes in a local CAS it does not have.
+///
+/// Neither arm has a filesystem fallback, and `Ok(None)` from either means the
+/// bytes were never persisted rather than that they might be found somewhere
+/// else.
+pub(crate) fn repository_source_blob_loader(
+    state: &DaemonState,
+    repo_id: &str,
+) -> Result<RepositorySourceBlobLoader, (StatusCode, String)> {
+    let Some(backend) = state.storage_backend.as_ref().map(Arc::clone) else {
+        let authority = ActiveApiRepositoryAuthority::open(state)?;
+        return Ok(Box::new(
+            move |path: &RepoPath, digest: kin_model::Hash256, _remaining_bytes: u64| {
+                authority.manager.load_source_blob(digest).map_err(|error| {
+                    (
+                        StatusCode::FAILED_DEPENDENCY,
+                        format!("repository CAS blob load failed for {path} at {digest}: {error}"),
+                    )
+                })
+            },
+        ));
+    };
+    let repo_id = repo_id.to_string();
+    Ok(Box::new(
+        move |path: &RepoPath, digest: kin_model::Hash256, remaining_bytes: u64| {
+            backend
+                .load_source_blob_bounded(&repo_id, *digest.as_bytes(), remaining_bytes)
+                .map_err(|error| {
+                    let status = if matches!(
+                        &error,
+                        kin_db::KinDbError::SourceBlobReadLimitExceeded { .. }
+                    ) {
+                        StatusCode::PAYLOAD_TOO_LARGE
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    };
+                    (
+                        status,
+                        format!(
+                            "immutable source blob load failed for {} at {}: {error}",
+                            path, digest
+                        ),
+                    )
+                })
+        },
+    ))
+}
+
 fn load_exact_source_entries(
     state: &DaemonState,
     repo_id: &str,
     tree: &kin_model::ResolvedTree,
 ) -> Result<Vec<ExactSourceEntry>, (StatusCode, String)> {
-    if repo_id == state.cached_repo_id {
-        let authority = ActiveApiRepositoryAuthority::open(state)?;
-        return load_exact_source_entries_with(tree, |path, digest, _remaining_bytes| {
-            authority.manager.load_source_blob(digest).map_err(|error| {
-                (
-                    StatusCode::FAILED_DEPENDENCY,
-                    format!("repository CAS blob load failed for {path} at {digest}: {error}"),
-                )
-            })
-        });
-    }
-
-    let backend = state.storage_backend.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "exact source export requires immutable backend source storage".to_string(),
-        )
-    })?;
+    let mut load_blob = repository_source_blob_loader(state, repo_id)?;
     load_exact_source_entries_with(tree, |path, digest, remaining_bytes| {
-        backend
-            .load_source_blob_bounded(repo_id, *digest.as_bytes(), remaining_bytes)
-            .map_err(|error| {
-                let status = if matches!(
-                    &error,
-                    kin_db::KinDbError::SourceBlobReadLimitExceeded { .. }
-                ) {
-                    StatusCode::PAYLOAD_TOO_LARGE
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                };
-                (
-                    status,
-                    format!(
-                        "immutable source blob load failed for {} at {}: {error}",
-                        path, digest
-                    ),
-                )
-            })
+        load_blob(path, digest, remaining_bytes)
     })
 }
 
@@ -18538,7 +18805,7 @@ async fn repo_exact_source_tar_gz(
     // complete in-memory archive. Serialize this bounded path until backend
     // streaming lands so concurrent requests cannot multiply peak RSS.
     let archive_permit = try_acquire_exact_source_archive_slot(exact_source_archive_exports())?;
-    let requested_change = parse_exact_source_change_id(&source_change_id)?;
+    let requested_change = parse_semantic_change_id("source_change_id", &source_change_id)?;
     let view = repository_read_view(&state, &repo_id).await?;
     if view.change(&requested_change)?.is_none() {
         return Err((
@@ -19050,6 +19317,8 @@ fn bind_std_listener(
 
 #[cfg(test)]
 mod tests {
+    mod session_identity;
+    mod session_move_identity;
     /// THE WIRING SPINE (FIR-2524, captain's rider). The envelope the impact
     /// route hands the CLI must carry the daemon's degraded signals.
     ///
@@ -23365,6 +23634,597 @@ mod tests {
         );
     }
 
+    /// Read one file's bytes and the digest the route verified them against.
+    ///
+    /// The paths these tests use carry no character a query string would need
+    /// escaped, and the assertion below keeps it that way rather than leaving a
+    /// silently mis-encoded path to look like an absent file.
+    async fn repo_blob_read(
+        state: Arc<DaemonState>,
+        repo_id: &str,
+        path: &str,
+    ) -> (StatusCode, Vec<u8>) {
+        assert!(
+            path.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte)),
+            "this helper does not escape {path}"
+        );
+        repo_route(state, &format!("/repos/{repo_id}/blob?path={path}")).await
+    }
+
+    /// The blob route answers a published file with its exact bytes (FIR-3277).
+    ///
+    /// This is the whole point of the route, so it is graded end to end through
+    /// the router rather than only at the verification helper: the bytes the
+    /// publication persisted come back, and `content_sha256` is the digest they
+    /// were checked against rather than a digest recomputed for the response.
+    #[tokio::test]
+    async fn the_blob_route_serves_published_bytes_under_the_digest_it_verified() {
+        let repo_id = format!("hostedblob-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        let source = "fn first_symbol() {}\n";
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0001,
+            "publish a file to read",
+            &[("first_symbol", "src/first.rs", source)],
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let (status, body) = repo_blob_read(Arc::clone(&state), &repo_id, "src/first.rs").await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the blob route must answer: {message}"
+        );
+        let blob: crate::repo_blob::RepoBlobResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(blob.display_path, "src/first.rs");
+        assert_eq!(blob.content.as_deref(), Some(source));
+        assert!(blob.is_utf8);
+        assert_eq!(blob.byte_len, source.len() as u64);
+        let expected: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+        assert_eq!(
+            blob.content_sha256,
+            hex::encode(expected),
+            "the response must name the digest the bytes were verified against"
+        );
+        assert_eq!(blob.resolved_ref.as_deref(), Some("main"));
+    }
+
+    /// A path the ref's tree does not carry is a refusal, never a filesystem
+    /// read that might find one (FIR-3277).
+    #[tokio::test]
+    async fn the_blob_route_refuses_a_path_the_ref_does_not_carry() {
+        let repo_id = format!("hostedblob-absent-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0002,
+            "publish a file to read",
+            &[("first_symbol", "src/first.rs", "fn first_symbol() {}\n")],
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let (status, body) =
+            repo_blob_read(Arc::clone(&state), &repo_id, "src/never_published.rs").await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::NOT_FOUND, "{message}");
+        assert!(
+            message.contains("src/never_published.rs"),
+            "the refusal must name the path asked for: {message}"
+        );
+    }
+
+    /// The blob route is addressed the way every other repo route is, so an
+    /// unpublished repository refuses here for the same named reason (FIR-3277).
+    ///
+    /// It also proves the route is registered at all: an unmatched axum route
+    /// answers 404 with an empty body, and this answers 424 with a sentence.
+    #[tokio::test]
+    async fn the_blob_route_shares_the_repo_addressing_refusal() {
+        let repo_id = format!("hostedblob-unpublished-{}", Uuid::new_v4());
+        let (state, _working, _storage) = replica_state(&repo_id);
+
+        let (status, body) = repo_blob_read(Arc::clone(&state), &repo_id, "src/first.rs").await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::FAILED_DEPENDENCY, "{message}");
+        assert!(
+            message.contains("authority envelope"),
+            "the refusal must name the missing envelope: {message}"
+        );
+    }
+
+    /// Drive one blob request and keep its response headers.
+    ///
+    /// `repo_route` drops them, and the refusal kind this route publishes lives
+    /// in a header precisely so a caller does not have to read English. A test
+    /// that could not see the header could not grade the contract.
+    async fn repo_blob_route(
+        state: Arc<DaemonState>,
+        path: &str,
+    ) -> (StatusCode, Option<String>, Vec<u8>) {
+        let response = router(state)
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let refusal = response
+            .headers()
+            .get(crate::repo_blob::REPO_BLOB_REFUSAL_HEADER)
+            .map(|value| value.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, refusal, body.to_vec())
+    }
+
+    /// Point a second, non-default ref at an earlier change (FIR-3277).
+    ///
+    /// `publish_hosted_semantic_change` only ever moves `main`, so a test that
+    /// wants to prove a read honours the ref it was given needs a ref that is
+    /// not `main` and does not point where `main` points. This writes one, and
+    /// nothing else: no change, no workspace mutation, no default-ref move.
+    fn add_hosted_ref(
+        storage: &FsPath,
+        repository_id: &RepositoryId,
+        operation: u128,
+        ref_name: kin_model::RefName,
+        target: SemanticChangeId,
+    ) {
+        use kin_model::{
+            RefExpectation, RefMutation, RefTarget, RefUpdatePolicy, RepositoryTransaction,
+            REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        };
+
+        let manager = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(kin_db::LocalFileBackend::new(storage.to_path_buf())),
+        )
+        .unwrap();
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::from_uuid(Uuid::from_u128(operation)),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("repo-scoped-blob-test"),
+            reason: format!("point {ref_name} at a change"),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: vec![RefMutation {
+                name: ref_name,
+                expected: RefExpectation::MustNotExist,
+                new_target: Some(RefTarget::change(target)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: None,
+        };
+        drop(lease);
+        manager.commit_repository_transaction(transaction).unwrap();
+    }
+
+    /// The blob route reads the ref it was given, not the default one (FIR-3277).
+    ///
+    /// Every other test here reads the default ref, so none of them can tell a
+    /// route that honours `ref` from one that ignores it: both answer the same
+    /// bytes. This publishes two generations, points `legacy` at the first, and
+    /// reads across the gap in three ways that only a ref-honouring route gets
+    /// right. Make `resolve_read_point` ignore its `reference` argument and all
+    /// three go red: the second generation's file becomes readable at a ref
+    /// whose tree never carried it, and the first generation's read comes back
+    /// labelled with `main` and the second change's id.
+    #[tokio::test]
+    async fn the_blob_route_serves_the_requested_ref_rather_than_the_default() {
+        let repo_id = format!("hostedblob-ref-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        let first_source = "fn only_in_first() {}\n";
+        let second_source = "fn only_in_second() {}\n";
+
+        let (first_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0011,
+            "publish the first generation",
+            &[("only_in_first", "src/only_in_first.rs", first_source)],
+        );
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first_change),
+            0x3277_0012,
+            "publish the second generation",
+            &[("only_in_second", "src/only_in_second.rs", second_source)],
+        );
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3277_0013,
+            kin_model::RefName::branch(b"legacy").unwrap(),
+            first_change,
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        // The default ref carries both generations' files, so this is the arm
+        // that would still pass under a route that ignores `ref`. It is here to
+        // establish that the second file is readable at all, which is what makes
+        // the refusal below evidence rather than an absent fixture.
+        let (status, body) =
+            repo_blob_read(Arc::clone(&state), &repo_id, "src/only_in_second.rs").await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let at_default: crate::repo_blob::RepoBlobResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(at_default.content.as_deref(), Some(second_source));
+        assert_eq!(at_default.resolved_ref.as_deref(), Some("main"));
+
+        // The same path at a ref whose tree never carried it. A route that fell
+        // back to the default would answer 200 here.
+        let (status, refusal, body) = repo_blob_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/blob?path=src/only_in_second.rs&ref=legacy"),
+        )
+        .await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a ref whose tree lacks the path must refuse, not serve the default ref: {message}"
+        );
+        assert_eq!(
+            refusal.as_deref(),
+            Some("path-not-found"),
+            "a ref that exists and lacks the path is the absent-side case: {message}"
+        );
+        assert!(
+            message.contains("legacy"),
+            "the refusal must name the ref it read: {message}"
+        );
+
+        // And the ref's own bytes, labelled with the ref and the change it
+        // resolved to rather than with the default's.
+        let (status, body) = repo_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/blob?path=src/only_in_first.rs&ref=legacy"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let at_legacy: crate::repo_blob::RepoBlobResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(at_legacy.content.as_deref(), Some(first_source));
+        assert_eq!(at_legacy.requested_ref.as_deref(), Some("legacy"));
+        assert_eq!(at_legacy.resolved_ref.as_deref(), Some("legacy"));
+        assert_eq!(at_legacy.change_id, first_change.to_string());
+
+        // A canonical change id is the other read point the route accepts, and
+        // it names no ref because none was involved.
+        let (status, body) = repo_route(
+            Arc::clone(&state),
+            &format!(
+                "/repos/{repo_id}/blob?path=src/only_in_first.rs&ref={}",
+                first_change
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let at_change: crate::repo_blob::RepoBlobResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(at_change.content.as_deref(), Some(first_source));
+        assert_eq!(at_change.resolved_ref, None);
+        assert_eq!(at_change.change_id, first_change.to_string());
+
+        // And a ref this repository does not carry at all. It shares its status
+        // with the case above and means the opposite: nothing was resolved, no
+        // tree was read, and no path was looked up in one. A caller that read
+        // this as an absent side would assemble a comparison out of a file that
+        // was never missing.
+        let (status, refusal, body) = repo_blob_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/blob?path=src/only_in_first.rs&ref=no-such-ref"),
+        )
+        .await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::NOT_FOUND, "{message}");
+        assert_eq!(
+            refusal.as_deref(),
+            Some("unknown-ref"),
+            "an unresolvable ref must not wear the absent-path kind: {message}"
+        );
+        assert!(
+            message.contains("no-such-ref"),
+            "the refusal must name the ref that could not be resolved: {message}"
+        );
+    }
+
+    /// A ref's full name outranks another ref's short alias (FIR-3277).
+    ///
+    /// A branch may be named so that its own short alias is another ref's full
+    /// name: `refs/heads/refs/tags/v1` shortens to `refs/tags/v1`, which is the
+    /// tag `refs/tags/v1`'s full name. A lookup that accepts either spelling in
+    /// one pass answers with whichever the ref list holds first, so an explicit
+    /// full name can serve a different ref's bytes, and nothing about the
+    /// response says so. Both refs here resolve, they point at different
+    /// changes, and only one of them is the one that was asked for.
+    #[tokio::test]
+    async fn a_full_ref_name_outranks_another_refs_short_alias() {
+        let repo_id = format!("hostedblob-alias-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        let first_source = "fn only_in_first() {}\n";
+        let second_source = "fn only_in_second() {}\n";
+
+        let (first_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0031,
+            "publish the first generation",
+            &[("only_in_first", "src/only_in_first.rs", first_source)],
+        );
+        let (second_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first_change),
+            0x3277_0032,
+            "publish the second generation",
+            &[("only_in_second", "src/only_in_second.rs", second_source)],
+        );
+        // The branch whose SHORT name is the tag's FULL name, pointed at the
+        // first generation, and the tag itself pointed at the second.
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3277_0033,
+            kin_model::RefName::branch(b"refs/tags/v1").unwrap(),
+            first_change,
+        );
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3277_0034,
+            kin_model::RefName::tag(b"v1").unwrap(),
+            second_change,
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let (status, refusal, body) = repo_blob_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/blob?path=src/only_in_second.rs&ref=refs/tags/v1"),
+        )
+        .await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the tag named in full must answer, refusal={refusal:?}: {message}"
+        );
+        let blob: crate::repo_blob::RepoBlobResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            blob.change_id,
+            second_change.to_string(),
+            "the full name names the tag, not the branch that shortens to it"
+        );
+        assert_eq!(blob.resolved_ref.as_deref(), Some("v1"));
+        assert_eq!(blob.content.as_deref(), Some(second_source));
+    }
+
+    /// A short alias two refs answer to is refused, not guessed (FIR-3277).
+    #[tokio::test]
+    async fn a_short_alias_two_refs_answer_to_is_refused() {
+        let repo_id = format!("hostedblob-ambiguous-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+
+        let (first_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0041,
+            "publish the first generation",
+            &[(
+                "only_in_first",
+                "src/only_in_first.rs",
+                "fn only_in_first() {}\n",
+            )],
+        );
+        let (second_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first_change),
+            0x3277_0042,
+            "publish the second generation",
+            &[(
+                "only_in_second",
+                "src/only_in_second.rs",
+                "fn only_in_second() {}\n",
+            )],
+        );
+        // A branch and a tag that share the short alias `v2` and point at
+        // different changes, so picking either one serves the wrong bytes.
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3277_0043,
+            kin_model::RefName::branch(b"v2").unwrap(),
+            first_change,
+        );
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3277_0044,
+            kin_model::RefName::tag(b"v2").unwrap(),
+            second_change,
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let (status, refusal, body) = repo_blob_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/blob?path=src/only_in_first.rs&ref=v2"),
+        )
+        .await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::CONFLICT, "{message}");
+        assert_eq!(refusal.as_deref(), Some("ambiguous-ref"), "{message}");
+        assert!(
+            message.contains("refs/heads/v2") && message.contains("refs/tags/v2"),
+            "the refusal must name both refs so a caller can pick one: {message}"
+        );
+    }
+
+    /// The blob route publishes its refusal kind on every refusal (FIR-3277).
+    ///
+    /// The header is the contract a hosted caller branches on, so an arm that
+    /// forgot to set it would look like a missing header rather than a wrong
+    /// one, and a caller reading `undefined` would fall back to whatever its
+    /// default is. Three different refusals, three different kinds, one shape.
+    #[tokio::test]
+    async fn every_blob_refusal_carries_its_kind() {
+        let repo_id = format!("hostedblob-kinds-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0021,
+            "publish a file to read",
+            &[("first_symbol", "src/first.rs", "fn first_symbol() {}\n")],
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let cases = [
+            (
+                "path=src/absent.rs",
+                StatusCode::NOT_FOUND,
+                "path-not-found",
+            ),
+            (
+                "path=src/first.rs&ref=no-such-ref",
+                StatusCode::NOT_FOUND,
+                "unknown-ref",
+            ),
+        ];
+        for (query, expected_status, expected_kind) in cases {
+            let (status, refusal, body) = repo_blob_route(
+                Arc::clone(&state),
+                &format!("/repos/{repo_id}/blob?{query}"),
+            )
+            .await;
+            let message = String::from_utf8_lossy(&body);
+            assert_eq!(status, expected_status, "{query}: {message}");
+            assert_eq!(
+                refusal.as_deref(),
+                Some(expected_kind),
+                "{query}: {message}"
+            );
+        }
+
+        // A repository this daemon does not serve, which shares its status with
+        // the two above and is neither of them.
+        let (status, refusal, body) = repo_blob_route(
+            Arc::clone(&state),
+            "/repos/not-served-here/blob?path=src/first.rs",
+        )
+        .await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::NOT_FOUND, "{message}");
+        assert_eq!(refusal.as_deref(), Some("unknown-repository"), "{message}");
+    }
+
+    /// A malformed query is named too, not left to the extractor (FIR-3277).
+    ///
+    /// `Query<T>` refuses a missing or repeated parameter before a handler body
+    /// runs, and that refusal carries no `x-kin-blob-refusal`. To a caller
+    /// branching on the header, an absent header and a wrong one are the same
+    /// reading, so a malformed request would look like a route that forgot to
+    /// name its refusal. These are the requests the handler never gets to think
+    /// about, and they are the ones most likely to be read wrong.
+    #[tokio::test]
+    async fn a_malformed_blob_query_is_refused_by_name() {
+        let repo_id = format!("hostedblob-query-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3277_0051,
+            "publish a file to read",
+            &[("first_symbol", "src/first.rs", "fn first_symbol() {}\n")],
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        // No `path` at all, and the same parameter given twice. Both are refused
+        // before the handler resolves anything, and both must still say so.
+        for query in [
+            "",
+            "?ref=main",
+            "?path=src/first.rs&path=src/other.rs",
+            "?path=a&ref=b&ref=c",
+        ] {
+            let (status, refusal, body) =
+                repo_blob_route(Arc::clone(&state), &format!("/repos/{repo_id}/blob{query}")).await;
+            let message = String::from_utf8_lossy(&body);
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "query {query:?} must be refused: {message}"
+            );
+            assert_eq!(
+                refusal.as_deref(),
+                Some("bad-request"),
+                "query {query:?} must be refused BY NAME: {message}"
+            );
+        }
+
+        // The control: a well-formed query on the same repository answers, so
+        // the four above are refused for their own shape and not because this
+        // fixture refuses everything.
+        let (status, refusal, body) = repo_blob_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/blob?path=src/first.rs"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(refusal, None, "a successful read carries no refusal header");
+    }
+
+    /// A hosted daemon says it can serve one file's bytes (FIR-3277).
+    ///
+    /// The hosted control plane keys its fallback on this string, so an image
+    /// that carries the route and does not advertise it is the same outage as
+    /// one that carries neither. Graded here rather than left implicit.
+    #[tokio::test]
+    async fn a_hosted_daemon_advertises_the_repo_scoped_blob_capability() {
+        let repo_id = format!("hostedblob-capability-{}", Uuid::new_v4());
+        let (state, _working, _storage) = replica_state(&repo_id);
+
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/health")).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let health: RepoHealthResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            health
+                .semantic_capabilities
+                .iter()
+                .any(|capability| capability == REPO_SCOPED_BLOB_CAPABILITY),
+            "a daemon carrying the blob route must advertise it: {:?}",
+            health.semantic_capabilities
+        );
+    }
+
     /// A publication that moves the generation is not answered from the tree
     /// resolved before it (FIR-2924).
     ///
@@ -23948,7 +24808,10 @@ mod tests {
         let health: RepoHealthResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             health.semantic_capabilities,
-            vec![REPO_SCOPED_SEMANTIC_CAPABILITY.to_string()]
+            vec![
+                REPO_SCOPED_SEMANTIC_CAPABILITY.to_string(),
+                REPO_SCOPED_BLOB_CAPABILITY.to_string(),
+            ]
         );
 
         // Authentication must run before even the cheap repository-address
@@ -29670,6 +30533,31 @@ mod tests {
         );
     }
 
+    /// The entity an install derived for `path`, named and of the kind asked for.
+    ///
+    /// Fixtures take the entity the install produced rather than upserting a
+    /// hand-made one beside it. Installing a source file derives its entities the
+    /// way the daemon's admission does, so a second entity with the same name on
+    /// the same path is a graph the daemon never produces, and a query that then
+    /// names two entities resolves an ambiguity the fixture never meant to build.
+    fn derived_entity(
+        state: &Arc<DaemonState>,
+        path: &str,
+        name: &str,
+        kind: EntityKind,
+    ) -> Entity {
+        state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new(path)),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.name == name && candidate.kind == kind)
+            .unwrap_or_else(|| panic!("installing {path} must derive {kind:?} {name}"))
+    }
+
     fn test_entity(name: &str, path: &str) -> Entity {
         Entity {
             id: EntityId::new(),
@@ -29780,6 +30668,28 @@ mod tests {
                 external_reference_deltas: Vec::new(),
             })
             .unwrap();
+        // The admission that puts a source file's bytes in the tree derives its
+        // entities in the same pass. Seeding the bytes alone leaves the graph
+        // holding no semantics for a path it is about to seal, which is the
+        // defect the commit planner refuses, so a fixture that skips it is
+        // building that state rather than an ordinary installed file.
+        let file_id = kin_model::FilePathId::new(rel_path);
+        if let Ok(kin_index::IndexedAny::EntitySource(indexed)) =
+            kin_index::IndexPipeline::new().index_any_content(&file_id, content, blob_hash)
+        {
+            state
+                .graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    entity_deltas: indexed
+                        .entities
+                        .iter()
+                        .cloned()
+                        .map(|new| kin_model::EntityDelta::Added { new })
+                        .collect(),
+                    ..kin_model::TransactionDelta::default()
+                })
+                .unwrap();
+        }
         let plan = crate::repository_commit::plan_native_commit(
             &state.graph,
             &state.blobs,
@@ -33581,6 +34491,14 @@ mod tests {
         /// readiness probe's per-repository reads are measured rather than
         /// assumed free.
         cursor_probe_delay: Option<Duration>,
+        /// Cursor probes inside the backend right now, and the most that were
+        /// ever there together. Concurrency is a structural property, so it is
+        /// counted rather than inferred from how long a probe took: a shared
+        /// CI runner can add a second of scheduling to any wall-clock reading,
+        /// and a bound tight enough to separate concurrent from serial is
+        /// tight enough to fail on that noise. This one cannot.
+        cursor_probes_in_flight: usize,
+        peak_cursor_probes_in_flight: usize,
     }
 
     #[derive(Clone)]
@@ -33697,6 +34615,23 @@ mod tests {
 
         fn charge_each_cursor_probe(&self, cost: Duration) {
             self.0.lock().unwrap().cursor_probe_delay = Some(cost);
+        }
+
+        fn enter_cursor_probe(&self) {
+            let mut state = self.0.lock().unwrap();
+            state.cursor_probes_in_flight += 1;
+            state.peak_cursor_probes_in_flight = state
+                .peak_cursor_probes_in_flight
+                .max(state.cursor_probes_in_flight);
+        }
+
+        fn leave_cursor_probe(&self) {
+            self.0.lock().unwrap().cursor_probes_in_flight -= 1;
+        }
+
+        /// The most source cursor probes this backend ever served at one time.
+        fn peak_concurrent_cursor_probes(&self) -> usize {
+            self.0.lock().unwrap().peak_cursor_probes_in_flight
         }
 
         fn cursor_probe_delay(&self) -> Option<Duration> {
@@ -33913,9 +34848,11 @@ mod tests {
             // Count the probe before parking on any rendezvous, so a blocked
             // probe still shows up in `cursor_probes`.
             self.faulting.record_cursor_probe(repo_id);
+            self.faulting.enter_cursor_probe();
             if let Some(cost) = self.faulting.cursor_probe_delay() {
                 std::thread::sleep(cost);
             }
+            self.faulting.leave_cursor_probe();
             if let Some(block) = self.faulting.cursor_probe_block_for(repo_id) {
                 block.arrive_and_wait();
             }
@@ -35641,6 +36578,7 @@ mod tests {
             "a refused commit must record no change at all"
         );
     }
+
     /// FIR-3200. Read the published start line of the sole entity a path holds.
     #[cfg(unix)]
     fn published_start_line(state: &Arc<DaemonState>, path: &str) -> u32 {
@@ -36054,6 +36992,239 @@ mod tests {
             published_start_line(&reopened, "shifted.rs"),
             before,
             "an unparseable file keeps its last readable version's spans"
+        );
+    }
+
+    /// FIR-3208, the half a record cannot cover. A commit re-derives a stale
+    /// path no debt row ever named, then seals the bytes with the spans they
+    /// produce.
+    ///
+    /// The record the drain works from is written by the writers that know they
+    /// owe a parse. A path can reach the same state with no row at all: the
+    /// startup layout backfill finds the staleness by comparing the graph's
+    /// spans against a fresh parse of the tree's own bytes, publishes the layout
+    /// as partial, and enqueues an ordinary host event for the ambient loop,
+    /// recording nothing. A commit landing before that event is serviced plans
+    /// its tree half and its entity half out of a graph that does not agree with
+    /// itself, and seals the new bytes against the old spans. Removing the
+    /// record here is what leaves the planner's own check standing alone.
+    ///
+    /// Falsifies both halves of that check. Remove the barrier from
+    /// `plan_native_commit_inner` and the commit succeeds with the span still
+    /// where the pre-edit parse left it, so the assertion below fails. Remove
+    /// the one re-derivation from `command_commit` and the commit answers 409
+    /// `semantics_behind_tree`, so `commit_through_api` fails on the status.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_re_derives_a_stale_path_no_debt_row_ever_named() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = layout.root().join("runs/session-unrecorded-stale-path");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        reconcile_session_through_api(&app, &session_dir).await;
+
+        // The restart is what makes the graph stale: the publication's own
+        // re-derivation lives in the derived graph, and the next daemon rebuilds
+        // that from a history this publication deliberately did not write.
+        drop(app);
+        drop(state);
+        // And this is what makes it a path nothing recorded. The `expect` is the
+        // fixture's own guard: if the reconcile stopped writing the record, the
+        // removal proves nothing and this test has to say so rather than pass.
+        std::fs::remove_file(layout.root().join("semantic-debt.json")).expect(
+            "the session reconcile must have recorded what it owed, or removing the record \
+             proves nothing",
+        );
+
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before,
+            "the reopened graph has to answer at the pre-edit position, or there is nothing for \
+             the commit to re-derive"
+        );
+
+        let reopened_app = router(Arc::clone(&reopened));
+        commit_through_api(
+            &reopened_app,
+            kin_model::OperationId::new(),
+            "commit the session's edit",
+        )
+        .await;
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the commit had to re-derive a stale path nothing had recorded before it could seal \
+             the bytes that moved those spans"
+        );
+    }
+
+    /// The bounded repair has to reach a body only repository CAS still holds.
+    ///
+    /// The detector reads each refused path's tree-named body through
+    /// `source_cas::read_publishable_source`, which answers from ingestion
+    /// staging first and repository CAS second. `readmit_semantics_for_paths`
+    /// reads staging alone, and staging is disposable: a store that reopened
+    /// after its staged copies were pruned reaches the repair with every body
+    /// durable and none of them staged. The re-derivation then fails its read,
+    /// the second plan refuses exactly as the first did, and every later commit
+    /// repeats it, with no body lost and nothing that repairs it.
+    ///
+    /// The fixture removes ONLY the staged copy and asserts repository CAS still
+    /// holds the same body, so this is a missing staged copy rather than a
+    /// missing body. It then reopens a second time, cold, and asserts the
+    /// persisted entities reproduce a parse of the body the tree names, because a
+    /// repair that only moved the live graph would pass a check of that graph.
+    ///
+    /// Falsify by removing the refill from `command_commit`: the commit answers
+    /// 409 `semantics_behind_tree` and `commit_through_api` fails on the status.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_re_derives_a_stale_path_whose_body_only_repository_cas_holds() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = layout.root().join("runs/session-staging-pruned");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        reconcile_session_through_api(&app, &session_dir).await;
+
+        drop(app);
+        drop(state);
+        std::fs::remove_file(layout.root().join("semantic-debt.json")).expect(
+            "the session reconcile must have recorded what it owed, or removing the record \
+             proves nothing",
+        );
+
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before,
+            "the reopened graph has to answer at the pre-edit position, or there is nothing for \
+             the commit to re-derive"
+        );
+
+        // Prune the staged copy the way a reopen on a pruned ingestion CAS does,
+        // and prove the durable body is still there, or this fixture is about an
+        // absent body rather than an absent staged copy.
+        let repo_path = RepoPath::from_utf8("shifted.rs".to_string()).unwrap();
+        let tree = reopened.graph.resolved_tree();
+        let kin_model::TreeEntry::Blob { hash, .. } =
+            tree.artifact_at_path(&repo_path).unwrap().entry
+        else {
+            panic!("the fixture is a regular file");
+        };
+        drop(tree);
+        let staged_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        reopened.blobs.delete(&staged_hash).unwrap();
+        assert!(
+            reopened.blobs.read(&staged_hash).is_err(),
+            "the staged copy has to be gone, or the refill under test is never exercised"
+        );
+        let sealed_body = {
+            let context =
+                crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(
+                    &reopened,
+                )
+                .unwrap();
+            let authority = context.open().unwrap();
+            crate::source_cas::read_publishable_source(&reopened.blobs, &authority, hash)
+                .expect("repository CAS still holds the published body")
+                .body()
+                .to_vec()
+        };
+
+        let reopened_app = router(Arc::clone(&reopened));
+        commit_through_api(
+            &reopened_app,
+            kin_model::OperationId::new(),
+            "commit the session's edit with staging pruned",
+        )
+        .await;
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the commit had to re-derive from the body repository CAS holds before it could seal \
+             the bytes that moved those spans"
+        );
+
+        // A second cold reopen. The repair has to be in durable authority rather
+        // than only in the graph the committing process happened to hold.
+        drop(reopened_app);
+        drop(reopened);
+        let cold = Arc::new(DaemonState::open(layout).unwrap());
+        cold.is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            published_start_line(&cold, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the re-derived spans have to survive a cold reopen, or the commit sealed a repair \
+             nothing persisted"
+        );
+        let persisted = cold
+            .graph
+            .query_entities(&kin_model::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new("shifted.rs")),
+                ..Default::default()
+            })
+            .unwrap();
+        let fresh = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(
+                &kin_model::FilePathId::new("shifted.rs"),
+                &sealed_body,
+                staged_hash,
+            )
+            .unwrap()
+            .indexed_file
+            .entities;
+        assert!(
+            !persisted.is_empty() && !fresh.is_empty(),
+            "both sides of the comparison have to hold something, or it proves nothing"
+        );
+        assert!(
+            crate::repository_commit::semantics_follow_the_bytes(&persisted, &fresh),
+            "after a cold reopen the persisted entities have to reproduce a parse of the body \
+             the tree names, bodies and all, not merely sit at the right line"
         );
     }
 
@@ -38441,6 +39612,16 @@ mod tests {
     /// Untracking is not enough. Entities are what rank, so a purge that left
     /// them behind produced the worst reading of all: the artifact listing no
     /// longer names the file while search and locate still return it.
+    ///
+    /// The purged path reaches the graph the way an ambient admission leaves
+    /// one: its bytes in repository authority, its entities derived into the
+    /// live graph, and no commit publishing a semantic delta for them. That is
+    /// the state this eviction is about, and admitting through the daemon's own
+    /// `/commands/admit` is what produces it rather than a hand-placed entity
+    /// standing in for a parse. The committed shape, whose entities repository
+    /// authority holds too, is covered by
+    /// `purge_ignored_retires_the_entities_a_commit_published_for_a_vacated_path`
+    /// and is red for a reason of its own.
     #[tokio::test]
     async fn purge_ignored_evicts_the_entities_that_made_a_path_rank() {
         let state = test_state();
@@ -38448,27 +39629,33 @@ mod tests {
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        // The rule lands after the admission, which is the whole scenario: a
-        // repository that already carries a path is told to stop carrying it.
         for (path, content) in [
             (
                 "investor/deck/build_deck.py",
                 &b"def valuation(): pass\n"[..],
             ),
             ("src/lib.py", &b"def kept(): pass\n"[..]),
-            (".kinignore", &b"investor\n"[..]),
         ] {
             install_working_copy_file(&state, path, content, false);
-            install_repository_file(&state, path, content);
         }
+        let app = router(Arc::clone(&state));
+        admit_through_api(&app).await;
 
-        let private = test_entity("valuation", "investor/deck/build_deck.py");
-        let kept = test_entity("kept", "src/lib.py");
-        state.graph.upsert_entity(&private).unwrap();
-        state.graph.upsert_entity(&kept).unwrap();
+        // The rule lands after the admission, which is the whole scenario: a
+        // repository that already carries a path is told to stop carrying it.
+        // It stays untracked on purpose, because admitting it would retract the
+        // covered path on its own and leave this purge nothing to do.
+        install_working_copy_file(&state, ".kinignore", b"investor\n", false);
+
+        let private = derived_entity(
+            &state,
+            "investor/deck/build_deck.py",
+            "valuation",
+            EntityKind::Function,
+        );
+        let kept = derived_entity(&state, "src/lib.py", "kept", EntityKind::Function);
         assert!(state.graph.get_entity(&private.id).unwrap().is_some());
 
-        let app = router(Arc::clone(&state));
         let (_, applied) = purge_ignored_through_api(&app, true).await;
         assert_eq!(applied["report"]["purge_count"], json!(1));
 
@@ -38491,6 +39678,311 @@ mod tests {
         // entity, so the purge removed one path rather than clearing the graph.
         assert!(live.contains("src/lib.py"));
         assert_eq!(state.graph.get_entity(&kept.id).unwrap(), Some(kept));
+    }
+
+    /// The same purge over a path a COMMIT published entities for, which is what
+    /// a repository that has ever committed its source actually holds.
+    ///
+    /// `repository_commit::publish_workspace_tree` used to carry
+    /// `WorkspaceSemanticDelta::default()`, so the tree publication that retires
+    /// the path left repository authority holding entities on it and kin-db
+    /// refused the whole transition with "transaction leaves entity ... absent
+    /// from the staged tree". The session admission in that same module carries
+    /// `retire_semantics_on_vacated` over its vacated set; the tree publication
+    /// did not, and every caller of `publish_exact_workspace_tree` inherited the
+    /// gap, the watch loop's standalone admission included.
+    ///
+    /// Falsify by restoring `WorkspaceSemanticDelta::default()` in
+    /// `publish_workspace_tree`: the purge answers 409 and this fails on the
+    /// status.
+    #[tokio::test]
+    async fn purge_ignored_retires_the_entities_a_commit_published_for_a_vacated_path() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Committed, not merely admitted: the install plans and commits a native
+        // change, so its entity deltas reach repository authority exactly as a
+        // person's `kin commit` would put them there.
+        for (path, content) in [
+            (
+                "investor/deck/build_deck.py",
+                &b"def valuation(): pass\n"[..],
+            ),
+            ("src/lib.py", &b"def kept(): pass\n"[..]),
+        ] {
+            install_working_copy_file(&state, path, content, false);
+            install_repository_file(&state, path, content);
+        }
+        install_working_copy_file(&state, ".kinignore", b"investor\n", false);
+        let app = router(Arc::clone(&state));
+
+        let private = derived_entity(
+            &state,
+            "investor/deck/build_deck.py",
+            "valuation",
+            EntityKind::Function,
+        );
+
+        let (_, applied) = purge_ignored_through_api(&app, true).await;
+        assert_eq!(applied["report"]["purge_count"], json!(1));
+        assert!(!tracked_paths(&state).contains("investor/deck/build_deck.py"));
+        assert!(
+            state.graph.get_entity(&private.id).unwrap().is_none(),
+            "a purged path's entity still resolves, so it still ranks"
+        );
+    }
+
+    /// Deleting a committed entity-owning file has to reconcile.
+    ///
+    /// The watch loop's standalone admission publishes its exact tree through
+    /// `publish_exact_workspace_tree`, the same seam the purge uses, so the same
+    /// missing retirement refused it: a removal of a path repository authority
+    /// holds entities for strands them and kin-db refuses the whole transition
+    /// rather than the one entity. `rm` of a plain file reconciled and `rm` of an
+    /// entity-owning file did not.
+    ///
+    /// The path is COMMITTED on purpose. A merely admitted file's entities live
+    /// in the live graph, which the loop evicts on its own; only a commit puts
+    /// them in repository authority, where the publication has to carry their
+    /// removal in the same delta.
+    ///
+    /// Falsify by restoring `WorkspaceSemanticDelta::default()` in
+    /// `publish_workspace_tree`: the admission answers 409 and
+    /// `admit_through_api` fails on the status.
+    #[tokio::test]
+    async fn admitting_a_deleted_entity_owning_file_retires_its_semantics() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        for (path, content) in [
+            ("src/kept.py", &b"def kept(): pass\n"[..]),
+            ("src/gone.py", &b"def gone(): pass\n"[..]),
+        ] {
+            install_working_copy_file(&state, path, content, false);
+            install_repository_file(&state, path, content);
+        }
+        let doomed = derived_entity(&state, "src/gone.py", "gone", EntityKind::Function);
+        let kept = derived_entity(&state, "src/kept.py", "kept", EntityKind::Function);
+        assert!(
+            state.graph.get_entity(&doomed.id).unwrap().is_some(),
+            "the deleted path has to own an entity, or this admission has nothing to retire"
+        );
+
+        std::fs::remove_file(state.layout.working_dir().join("src/gone.py")).unwrap();
+        let app = router(Arc::clone(&state));
+        admit_through_api(&app).await;
+
+        let live = tracked_paths(&state);
+        assert!(
+            !live.contains("src/gone.py"),
+            "the admission has to retire the deleted path: {live:?}"
+        );
+        assert!(
+            state.graph.get_entity(&doomed.id).unwrap().is_none(),
+            "a deleted path's entity still resolves, so it still answers queries with nothing \
+             on disk behind it"
+        );
+        assert!(state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new("src/gone.py")),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+
+        // The two-sided arm: an untouched sibling keeps both its artifact and
+        // its entity, so the admission retired one path rather than the tree.
+        assert!(live.contains("src/kept.py"));
+        assert_eq!(state.graph.get_entity(&kept.id).unwrap(), Some(kept));
+    }
+
+    /// A move across BASENAMES keeps every identity it carries, at three points.
+    ///
+    /// `kin_core::exact_tree` plans a move as ONE `TreeDelta::Updated` with the
+    /// artifact identity kept and the paths differing, never as a removal beside
+    /// an arrival, because that pair would mint new entity ids and orphan every
+    /// incoming reference. So the publication that records the move relocates
+    /// what the old path owned in the same delta.
+    ///
+    /// The module entity is the hard half and the basename is why. A file's
+    /// module takes its NAME and its SIGNATURE from the path it sits on, so
+    /// `src/old.py` moving to `lib/new.py` has to keep one id while its name
+    /// goes from `old` to `new`. A move that keeps the basename cannot exercise
+    /// that at all, which is what makes this fixture rename the file rather than
+    /// only move it.
+    ///
+    /// Graded at three points, because each one can pass while the next fails.
+    /// Live, straight after the admission. Then after an edit and a commit,
+    /// which re-parses the body at its new path: a later parse mints the id the
+    /// NEW path implies, so an id that survives here is one the relocation bound
+    /// rather than one the parse happened to agree on. Then after a cold reopen,
+    /// which rebuilds the graph from repository authority alone and is the only
+    /// one of the three that grades what was durably published.
+    ///
+    /// An incoming edge is carried through all three, because relocating an
+    /// entity while its references drop is the orphaning the single `Updated`
+    /// exists to prevent.
+    #[tokio::test]
+    async fn admitting_a_moved_entity_owning_file_keeps_its_semantics() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let layout = state.layout.clone();
+
+        install_working_copy_file(&state, "src/old.py", b"def moved(): pass\n", false);
+        install_repository_file(&state, "src/old.py", b"def moved(): pass\n");
+        install_working_copy_file(&state, "src/caller.py", b"def caller(): pass\n", false);
+        install_repository_file(&state, "src/caller.py", b"def caller(): pass\n");
+        let function = derived_entity(&state, "src/old.py", "moved", EntityKind::Function);
+        let module = derived_entity(&state, "src/old.py", "old", EntityKind::Module);
+        let caller = derived_entity(&state, "src/caller.py", "caller", EntityKind::Function);
+        link_every_class(&state, &caller, &function);
+        let incoming = inbound_relation_count(&state, function.id);
+        assert!(
+            incoming > 0,
+            "the fixture must hold an incoming edge, or the orphaning arm asserts nothing"
+        );
+
+        std::fs::create_dir_all(layout.working_dir().join("lib")).unwrap();
+        std::fs::rename(
+            layout.working_dir().join("src/old.py"),
+            layout.working_dir().join("lib/new.py"),
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        admit_through_api(&app).await;
+
+        let live = tracked_paths(&state);
+        assert!(
+            live.contains("lib/new.py") && !live.contains("src/old.py"),
+            "the admission has to record the move: {live:?}"
+        );
+
+        // Point one: live, straight after the admission. The bytes have not
+        // changed, so the offsets may not either.
+        assert_moved_identity(&state, &module, "new", true, "live");
+        assert_moved_identity(&state, &function, "moved", true, "live");
+        assert_eq!(
+            inbound_relation_count(&state, function.id),
+            incoming,
+            "live: the move dropped an incoming edge"
+        );
+
+        // Point two: after an edit and a commit, so the body is parsed again at
+        // its new path and the ids that parse would mint are the new path's.
+        std::fs::write(
+            layout.working_dir().join("lib/new.py"),
+            b"def moved(): pass\n\n\ndef later(): pass\n",
+        )
+        .unwrap();
+        commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "commit an edit at the path the file moved to",
+        )
+        .await;
+        assert_moved_identity(&state, &module, "new", false, "after the edit and commit");
+        assert_moved_identity(
+            &state,
+            &function,
+            "moved",
+            false,
+            "after the edit and commit",
+        );
+        assert_eq!(
+            inbound_relation_count(&state, function.id),
+            incoming,
+            "after the edit and commit: an incoming edge was dropped"
+        );
+
+        // Point three: a cold reopen, which rebuilds from repository authority.
+        drop(app);
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        assert_moved_identity(&reopened, &module, "new", false, "after a cold reopen");
+        assert_moved_identity(&reopened, &function, "moved", false, "after a cold reopen");
+        assert_eq!(
+            inbound_relation_count(&reopened, function.id),
+            incoming,
+            "after a cold reopen: an incoming edge was dropped"
+        );
+    }
+
+    /// Every relation with this entity at either end, which is what a relocation
+    /// has to leave standing.
+    fn inbound_relation_count(state: &Arc<DaemonState>, entity: kin_model::EntityId) -> usize {
+        state
+            .graph
+            .get_all_relations_for_node(&kin_model::GraphNodeId::Entity(entity))
+            .unwrap()
+            .len()
+    }
+
+    /// One moved identity, graded on the fields a relocation has to preserve or
+    /// carry forward.
+    ///
+    /// The id is the identity itself and never moves. The name and the signature
+    /// follow the path, which is the module case: `src/old.py` becoming
+    /// `lib/new.py` renames its module. The span names the new path, and its byte
+    /// offsets hold only while the bytes have not changed.
+    fn assert_moved_identity(
+        state: &Arc<DaemonState>,
+        before: &Entity,
+        name: &str,
+        bytes_unchanged: bool,
+        at: &str,
+    ) {
+        let after = state
+            .graph
+            .get_entity(&before.id)
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{at}: the moved file's {name} entity lost its identity {}",
+                    before.id
+                )
+            });
+        assert_eq!(
+            after.name, name,
+            "{at}: the moved entity carries the wrong name"
+        );
+        assert_eq!(
+            after.file_origin.as_ref().map(|origin| origin.0.as_str()),
+            Some("lib/new.py"),
+            "{at}: the moved entity still answers at its old path"
+        );
+        if after.kind == EntityKind::Module {
+            assert!(
+                after.signature.contains("lib/new.py"),
+                "{at}: the module's signature still names the path it moved off: {}",
+                after.signature
+            );
+        }
+        let span = after
+            .span
+            .as_ref()
+            .unwrap_or_else(|| panic!("{at}: the moved entity lost its span"));
+        assert_eq!(
+            span.file.0, "lib/new.py",
+            "{at}: the span still names the path the file moved off"
+        );
+        if bytes_unchanged {
+            let before_span = before
+                .span
+                .as_ref()
+                .expect("the fixture entity carries a span");
+            assert_eq!(
+                (span.start_byte, span.end_byte),
+                (before_span.start_byte, before_span.end_byte),
+                "{at}: the bytes did not change, so the offsets may not either"
+            );
+        }
     }
 
     fn branch_change(state: &DaemonState) -> SemanticChangeId {
@@ -41236,10 +42728,10 @@ mod tests {
             "def handler():\n    return 'checkout drift'\n",
         )
         .unwrap();
-        let mut entity = test_entity("handler", "src/lib.py");
-        entity.span.as_mut().unwrap().end_byte = source.len();
-        entity.span.as_mut().unwrap().end_line = 2;
-        state.graph.upsert_entity(&entity).unwrap();
+        // The entity under test is the one installing the file derived, which
+        // is what the daemon's admission leaves behind. A hand-made duplicate
+        // on the same path made this query name two entities and the endpoint
+        // return three records for a fixture that holds one definition.
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -41268,16 +42760,39 @@ mod tests {
             .unwrap();
         let result: kin_cli::commands::search::DaemonSearchResponse =
             serde_json::from_slice(&body).unwrap();
-        assert_eq!(result.records.len(), 1);
-        match result.records.first().unwrap() {
-            kin_cli::commands::search::DaemonSearchRecord::Entity(entity) => {
-                assert_eq!(entity.name, "handler");
-                assert_eq!(entity.file.as_deref(), Some("src/lib.py"));
-                assert_eq!(entity.body.as_deref(), Some("def handler():"));
-                assert_eq!(entity.body_omitted_line_count, 1);
-            }
-            other => panic!("expected entity record, got {other:?}"),
-        }
+        // Installing a real source file derives the file's own module beside its
+        // function, and a text search for the function's name matches the
+        // module's body as well, so the graph answers with two records where a
+        // single hand-made entity answered with one. Both are named here rather
+        // than counted, because the count on its own says nothing about which
+        // record the body assertions below are about.
+        let mut named: Vec<(&str, &str)> = result
+            .records
+            .iter()
+            .map(|record| match record {
+                kin_cli::commands::search::DaemonSearchRecord::Entity(entity) => {
+                    (entity.name.as_str(), entity.kind.as_str())
+                }
+                other => panic!("expected entity records, got {other:?}"),
+            })
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, [("handler", "Function"), ("lib", "Module")]);
+        let entity = result
+            .records
+            .iter()
+            .find_map(|record| match record {
+                kin_cli::commands::search::DaemonSearchRecord::Entity(entity)
+                    if entity.name == "handler" =>
+                {
+                    Some(entity)
+                }
+                _ => None,
+            })
+            .expect("the search must return the function the query names");
+        assert_eq!(entity.file.as_deref(), Some("src/lib.py"));
+        assert_eq!(entity.body.as_deref(), Some("def handler():"));
+        assert_eq!(entity.body_omitted_line_count, 1);
     }
 
     #[tokio::test]
@@ -42104,13 +43619,27 @@ mod tests {
     /// The one case with nothing honest to publish still must not answer with a
     /// bare retry instruction: it names what was tried, the state that blocked
     /// it, and the condition that changes the outcome.
+    ///
+    /// Asked about a graph this daemon holds no settled reading of, because the
+    /// HEAD slot no longer reaches this state: `DaemonState::open` records a
+    /// reading before any embedding worker can exist. The refusal graded here is
+    /// still reachable, for a selected graph with no slot of its own, so what
+    /// moved is which graph reaches it and not what it must say.
     #[tokio::test]
     async fn graph_status_with_no_settled_reading_names_the_blocking_state() {
         let state = test_state();
-        let graph = Arc::clone(&state.graph);
+        let unseeded: Arc<kin_db::InMemoryGraph> = Arc::new(kin_db::InMemoryGraph::new());
         let _embedding_guard = state.embedding_work.lock().unwrap();
 
-        let result = head_graph_status(&state, &graph).await;
+        let result = mcp_graph_status_with_stable_authority(
+            &state,
+            None,
+            &unseeded,
+            RequestGraphAuthority::Head,
+            kin_mcp::handlers::entities::GraphStatusScope::Head,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.is_error, Some(true));
         let text = mcp_result_text(&result);
@@ -44140,13 +45669,12 @@ mod tests {
         let state = test_state();
         // Coverage healthy on purpose, so the degradation is the only reason
         // left to refuse and the assertion cannot pass for the wrong cause.
-        let mut caller = test_entity("caller", "src/a.py");
-        let mut callee = test_entity("callee", "src/b.py");
-        let mut orphan = test_entity("orphan", "src/orphan.py");
-        for entity in [&mut caller, &mut callee, &mut orphan] {
-            install_trace_fixture_file(&state, entity);
-            state.graph.upsert_entity(entity).unwrap();
-        }
+        let caller = install_trace_fixture_file(&state, "caller", "src/a.py");
+        let callee = install_trace_fixture_file(&state, "callee", "src/b.py");
+        // The focal has to reach nothing AND hold no same-file neighbour, so it
+        // is the module of a file that declares nothing rather than a function
+        // sitting beside its own module.
+        install_lone_module_fixture_file(&state, "orphan");
         link_every_class(&state, &caller, &callee);
         state
             .is_initialized
@@ -44191,12 +45719,8 @@ mod tests {
     #[tokio::test]
     async fn a_trace_that_finds_dependencies_stays_unqualified_even_when_degraded() {
         let state = test_state();
-        let mut caller = test_entity("caller", "src/a.py");
-        let mut callee = test_entity("callee", "src/b.py");
-        for entity in [&mut caller, &mut callee] {
-            install_trace_fixture_file(&state, entity);
-            state.graph.upsert_entity(entity).unwrap();
-        }
+        let caller = install_trace_fixture_file(&state, "caller", "src/a.py");
+        let callee = install_trace_fixture_file(&state, "callee", "src/b.py");
         link_every_class(&state, &caller, &callee);
         state
             .is_initialized
@@ -44221,31 +45745,46 @@ mod tests {
         );
     }
 
-    /// Put an entity's file into repository authority and the working copy.
+    /// Install a source file that declares nothing, and hand back the module
+    /// entity that is then the file's ONLY entity.
     ///
-    /// `/trace` resolves a repository authority binding before it renders, so a
-    /// graph-only fixture answers 500 and the assertions below never run.
-    fn install_trace_fixture_file(state: &Arc<DaemonState>, entity: &mut Entity) {
-        let path = entity
-            .file_origin
-            .as_ref()
-            .expect("trace fixture entities carry a file")
-            .0
-            .clone();
-        let source = format!("def {}():\n    return 1\n", entity.name);
+    /// A trace focal that must reach nothing needs a file with no same-file
+    /// neighbour either. `kin_context::build_context_pack` fills an empty
+    /// dependency walk with same-file neighbours and the trace's absence
+    /// qualifier prints only while `dependency_signatures` is empty, so a focal
+    /// sitting in a file that also holds its own module never reaches that
+    /// branch. A Python file holding a function derives both, so the file here
+    /// declares nothing and its module is the focal.
+    fn install_lone_module_fixture_file(state: &Arc<DaemonState>, name: &str) -> Entity {
+        let path = format!("src/{name}.py");
+        let source =
+            format!("# {name} declares nothing, so its module is this file's one entity\n");
         install_repository_file(state, &path, source.as_bytes());
         let working = state.layout.working_dir().join(&path);
         std::fs::create_dir_all(working.parent().unwrap()).unwrap();
         std::fs::write(&working, source.as_bytes()).unwrap();
-        // `test_entity` spans 0..0, which the route rejects against a file that
-        // has bytes. Left unfixed the route answers 500 and every assertion
-        // below never runs.
-        let span = entity
-            .span
-            .as_mut()
-            .expect("trace fixture entities carry a span");
-        span.end_byte = source.len();
-        span.end_line = 2;
+        derived_entity(state, &path, name, EntityKind::Module)
+    }
+
+    /// Put a fixture's file into repository authority and the working copy, and
+    /// hand back the entity the install derived from its bytes.
+    ///
+    /// `/trace` resolves a repository authority binding before it renders, so a
+    /// graph-only fixture answers 500 and the assertions below never run.
+    ///
+    /// The entity comes from the install rather than from `test_entity` because
+    /// installing a source file derives one already, exactly as the daemon's
+    /// admission does. Upserting a second hand-made entity on the same path
+    /// builds a graph the daemon never produces: `orphan` named three entities
+    /// and `caller` two, and the trace then resolved an ambiguity these tests
+    /// never meant to exercise.
+    fn install_trace_fixture_file(state: &Arc<DaemonState>, name: &str, path: &str) -> Entity {
+        let source = format!("def {name}():\n    return 1\n");
+        install_repository_file(state, path, source.as_bytes());
+        let working = state.layout.working_dir().join(path);
+        std::fs::create_dir_all(working.parent().unwrap()).unwrap();
+        std::fs::write(&working, source.as_bytes()).unwrap();
+        derived_entity(state, path, name, EntityKind::Function)
     }
 
     /// Drive `/trace` in its DEFAULT rendering and return the lines it printed.
@@ -45401,6 +46940,17 @@ mod tests {
     /// measure or charge what the store is asked for. The storage root comes
     /// back too, so a test can advance a repository's source publication the
     /// way a sibling writer does.
+    /// The hosted fixture publishes this many repositories, which is also how
+    /// many source cursor probes one bundle observation issues at once.
+    const HOSTED_FIXTURE_FLEET_SIZE: usize = 5;
+    /// The one published cross-repo relationship this fixture's fleet carries.
+    /// The importing repo's graph references the imported repo's symbol, so the
+    /// rollout's edge phase resolves it and a read of `/spine/edges` over this
+    /// fixture has something to be non-empty about.
+    const HOSTED_FIXTURE_IMPORTING_REPO: &str = "kin-db";
+    const HOSTED_FIXTURE_IMPORTED_REPO: &str = "kin";
+    const HOSTED_FIXTURE_IMPORTED_SYMBOL: &str = "kin_entity";
+
     fn hosted_test_state_over(
         spine_store: Arc<dyn kin_spine::SpineStore>,
     ) -> (
@@ -45418,6 +46968,11 @@ mod tests {
             "kin-vfs".to_string(),
             "kinlab".to_string(),
         ];
+        assert_eq!(
+            fleet.len(),
+            HOSTED_FIXTURE_FLEET_SIZE,
+            "the fleet size the concurrency assertion reads must be this fleet's size"
+        );
         let mut environment = kin_core::test_env::EnvVarGuard::new();
         environment.apply("GOOGLE_CLOUD_PROJECT", Some("fixture-project"));
         environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
@@ -45429,12 +46984,49 @@ mod tests {
         let backend_root = tempfile::tempdir().unwrap();
         for repo_id in &fleet {
             let graph = kin_db::InMemoryGraph::new();
-            graph
-                .upsert_entity(&test_entity(
-                    &format!("{}_entity", repo_id.replace('-', "_")),
-                    "src/lib.rs",
-                ))
-                .unwrap();
+            let owned = test_entity(
+                &format!("{}_entity", repo_id.replace('-', "_")),
+                "src/lib.rs",
+            );
+            graph.upsert_entity(&owned).unwrap();
+            // One real cross-repo import, so this fleet publishes a non-empty
+            // edge set. Without it every fixture repo is an island, and a test
+            // reading `/spine/edges` cannot tell a served snapshot from an
+            // empty one: `complete` and the repo list read identically either
+            // way. The importing repo references the imported repo's symbol by
+            // name, carrying the `import_source` and the evidence token the
+            // resolver binds on, which is the shape admission enrichment writes.
+            if repo_id == HOSTED_FIXTURE_IMPORTING_REPO {
+                // The endpoint the relation names has to exist, because
+                // serializing a snapshot refuses a relation whose destination is
+                // unadmitted. It is an EXTERNAL entity with no file of its own,
+                // which is what admission enrichment writes for a symbol another
+                // repository owns, and what makes the import read as unresolved
+                // here rather than as a local definition.
+                let mut imported = test_entity(HOSTED_FIXTURE_IMPORTED_SYMBOL, "src/lib.rs");
+                imported.role = kin_model::EntityRole::External;
+                imported.file_origin = None;
+                imported.span = None;
+                graph.upsert_entity(&imported).unwrap();
+                graph
+                    .upsert_relation(&kin_model::Relation {
+                        id: kin_model::RelationId::new(),
+                        kind: kin_model::RelationKind::Calls,
+                        src: kin_model::GraphNodeId::Entity(owned.id),
+                        dst: kin_model::GraphNodeId::Entity(imported.id),
+                        confidence: 1.0,
+                        origin: kin_model::RelationOrigin::Parsed,
+                        created_in: None,
+                        import_source: Some(HOSTED_FIXTURE_IMPORTED_REPO.to_string()),
+                        evidence: vec![kin_model::RelationEvidence {
+                            token: Some(format!(
+                                "{HOSTED_FIXTURE_IMPORTED_REPO}::{HOSTED_FIXTURE_IMPORTED_SYMBOL}"
+                            )),
+                            ..Default::default()
+                        }],
+                    })
+                    .unwrap();
+            }
             kin_db::StorageBackend::save_snapshot(
                 &kin_db::LocalFileBackend::new(backend_root.path()),
                 repo_id,
@@ -45532,6 +47124,10 @@ mod tests {
         hydration_charge_ms: std::sync::atomic::AtomicU64,
         point_charge_ms: std::sync::atomic::AtomicU64,
         fail_next_hydration: std::sync::atomic::AtomicBool,
+        /// Fails the next active-fence read once. That read is the third thing
+        /// the cached-authority check makes and it maps to a BLOCKED refusal,
+        /// which is the one verdict a reader must not answer by re-proving.
+        fail_next_rollout_fence_load: std::sync::atomic::AtomicBool,
         /// Runs on every committed-head read, so a test can move durable state
         /// while a probe is between its two bundle observations.
         on_head_read: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -45546,6 +47142,7 @@ mod tests {
                 hydration_charge_ms: std::sync::atomic::AtomicU64::new(0),
                 point_charge_ms: std::sync::atomic::AtomicU64::new(0),
                 fail_next_hydration: std::sync::atomic::AtomicBool::new(false),
+                fail_next_rollout_fence_load: std::sync::atomic::AtomicBool::new(false),
                 on_head_read: std::sync::Mutex::new(None),
             }
         }
@@ -45569,6 +47166,15 @@ mod tests {
         /// this fleet publishes exactly where it is.
         fn fail_next_hydration(&self) {
             self.fail_next_hydration
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Fail the next active Firestore fence read once, leaving every durable
+        /// identity this fleet publishes exactly where it is. The cached
+        /// authority check reads that fence before it reads anything else, so
+        /// this is how a test reaches its blocked verdict without moving a head.
+        fn fail_next_rollout_fence_load(&self) {
+            self.fail_next_rollout_fence_load
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -45645,6 +47251,14 @@ mod tests {
         ) -> std::result::Result<Option<kin_spine::LoadedSpineRolloutFence>, kin_spine::SpineError>
         {
             self.charge_point_read();
+            if self
+                .fail_next_rollout_fence_load
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(kin_spine::SpineError::Backend(
+                    "injected active rollout fence read failure".to_string(),
+                ));
+            }
             self.inner.load_rollout_fence()
         }
 
@@ -46137,13 +47751,21 @@ mod tests {
     /// The probe must answer from the proof this process already holds, at a
     /// cost that is counted rather than assumed.
     ///
-    /// Every read the probe makes is charged here, not just the hydration: the
-    /// publication-control record, the active Firestore fence, the committed
-    /// heads, and every repository's source publication cursor. The per-repo
-    /// cursor charge is deliberately the largest, because it is the one the
-    /// probe issues five at a time: served in series those ten reads alone
-    /// would cost two seconds, so a bound of 1.5 s fails a serial
-    /// implementation and passes a concurrent one.
+    /// Every read the probe makes is charged and counted: the publication
+    /// control record, the active Firestore fence, the committed heads, and
+    /// every repository's source publication cursor. What must NOT appear is a
+    /// durable cache hydration, and what must appear is the whole fleet's
+    /// cursor probes in flight together.
+    ///
+    /// The concurrency claim is asserted structurally rather than by wall
+    /// clock. An earlier version of this test proved it with a 1.5 s bound,
+    /// reasoning that ten cursor probes served in series would cost 2 s of
+    /// charges on their own. That bound failed on a shared CI runner at
+    /// 1.538 s with exactly the right reads and no hydration: the runner had
+    /// added about 900 ms of scheduling to 560 ms of charges. A bound tight
+    /// enough to separate concurrent from serial is tight enough to fail on
+    /// that noise, so the peak in-flight count carries the claim now and the
+    /// wall clock only guards against a hydration coming back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_hosted_readiness_probe_answers_without_a_durable_spine_refresh() {
         let (state, store, _backend_root, meters, _environment) =
@@ -46155,7 +47777,7 @@ mod tests {
             .charge_each_record_read(Duration::from_millis(20));
         meters
             .cursor_probes
-            .charge_each_cursor_probe(Duration::from_millis(200));
+            .charge_each_cursor_probe(Duration::from_millis(100));
         let hydrations_before = store.hydration_reads();
         let point_reads_before = store.point_reads();
         let record_reads_before = meters.control.record_reads();
@@ -46169,10 +47791,11 @@ mod tests {
         let point_reads = store.point_reads() - point_reads_before;
         let record_reads = meters.control.record_reads() - record_reads_before;
         let cursor_probes = meters.cursor_probes.total_cursor_probes() - cursor_probes_before;
+        let peak_concurrent = meters.cursor_probes.peak_concurrent_cursor_probes();
         println!(
             "readiness probe cost: {elapsed:?}, {hydrations} hydration(s), \
              {point_reads} spine point read(s), {record_reads} control record read(s), \
-             {cursor_probes} source cursor probe(s)"
+             {cursor_probes} source cursor probe(s), {peak_concurrent} of them at once"
         );
 
         assert_eq!(
@@ -46185,21 +47808,37 @@ mod tests {
             "the probe hydrated the durable spine cache. Establishing authority is what \
              the publication and rollout paths do; a probe reports it."
         );
-        assert!(
-            elapsed < Duration::from_millis(1500),
-            "readiness took {elapsed:?} for {point_reads} spine point reads, {record_reads} \
-             control record reads and {cursor_probes} source cursor probes. The kubelet \
-             allows 3 s on the startup probe and 1 s on the readiness probe, and ten \
-             cursor probes served in series would cost 2 s of that on their own."
+        // This one number carries both halves of the contract. The probe takes
+        // TWO sequential identity observations, and each issues the fleet's
+        // cursor probes together, so the peak in flight is the fleet size: a
+        // serial implementation drives it to one, and two waves that overlapped
+        // would drive it to twice the fleet, which would mean the second
+        // observation was not observing anything the first had not already
+        // settled.
+        assert_eq!(
+            peak_concurrent, HOSTED_FIXTURE_FLEET_SIZE,
+            "{peak_concurrent} source cursor probes were in flight at the peak, not the \
+             fleet's {HOSTED_FIXTURE_FLEET_SIZE}. One means they are issued in series, and \
+             the probe then pays a round trip per repository instead of one for the fleet; \
+             twice the fleet would mean the two identity observations overlapped, and the \
+             second one proves nothing unless it starts after the first has finished."
         );
         assert!(
-            point_reads <= 4 && record_reads <= 4 && cursor_probes <= 12,
+            elapsed < Duration::from_secs(3),
+            "readiness took {elapsed:?} for {point_reads} spine point reads, {record_reads} \
+             control record reads and {cursor_probes} source cursor probes, which are \
+             charged at 20, 20 and 100 ms. A durable cache hydration is charged 10 s here, \
+             so this bound is what catches one coming back onto the probe path; the \
+             concurrency claim is the peak count above, not this."
+        );
+        assert_eq!(
+            (point_reads, record_reads, cursor_probes),
+            (4, 4, 2 * HOSTED_FIXTURE_FLEET_SIZE),
             "the probe made {point_reads} spine point reads, {record_reads} control record \
-             reads and {cursor_probes} source cursor probes. Two complete bundle \
-             observations of one heads read and one cursor read per repository, plus the \
-             admission, runtime-authority and active-fence reads taken on BOTH sides of \
-             that bundle, is the whole budget; anything past it is a read nobody \
-             accounted for."
+             reads and {cursor_probes} source cursor probes. The budget is exactly two \
+             identity observations, each one committed-head listing plus one cursor read \
+             per repository, bracketed by the admission, runtime-authority and active-fence \
+             reads taken on both sides; anything else is a read nobody accounted for."
         );
     }
 
@@ -46460,6 +48099,198 @@ mod tests {
         assert!(
             !proved,
             "the pass itself must fail, or the window under test never existed"
+        );
+    }
+
+    // -- A query answers from the proof rather than re-establishing it ------
+    //
+    // FIR-3269. Every `/spine/*` query took the full authority pass on every
+    // request: one durable cache hydration plus a whole-fleet double-collect
+    // that loads every repository graph and recomputes every root. On the
+    // five-repo hosted fleet on 2026-09-05 the hydration half alone measured a
+    // 7.92 s median over 48 passes and a 10.15 s p90, and the whole pass the
+    // 10.46 s median recorded above. The control plane gives its org-graph read
+    // 6 s, so every read aborted and the org graph rendered seventeen
+    // repositories with no links between them while the daemon held 1489 of
+    // them and had published them four minutes after start.
+    //
+    // These three are a set. The first fails if a query re-establishes the
+    // proof. The second fails if the cheap answer stopped being an honest one.
+    // The third fails if a refusal re-proving cannot fix starts paying for a
+    // pass anyway.
+
+    /// Read `/spine/edges` through the hosted router, exactly as the control
+    /// plane does: authenticated, over a state that carries publication
+    /// control, so the reader-admission middleware runs ahead of the handler.
+    async fn read_spine_edges(state: Arc<DaemonState>) -> (StatusCode, Option<serde_json::Value>) {
+        let response = router_with_publication_control_auth(
+            state,
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        )
+        .oneshot(
+            Request::get("/spine/edges")
+                .header("authorization", "Bearer daemon-test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).ok())
+    }
+
+    /// A hosted query must answer from the proof this process already holds.
+    #[tokio::test]
+    async fn spine_edges_answers_from_the_cached_authority_proof_without_rehydrating() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        // A hydration is charged what a real one costs, so a pass returning to
+        // the query path shows up as wall clock as well as a count.
+        store.charge_each_hydration(Duration::from_secs(10));
+        let hydrations_before = store.hydration_reads();
+
+        let started = Instant::now();
+        let (status, body) = read_spine_edges(Arc::clone(&state)).await;
+        let elapsed = started.elapsed();
+        let hydrations = store.hydration_reads() - hydrations_before;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an admitted hosted reader holding a current authority proof must serve its \
+             cross-repo snapshot"
+        );
+        assert_eq!(
+            hydrations, 0,
+            "the query hydrated the durable spine cache. Establishing authority is what the \
+             publication, rollout and background passes do; a query reads what they left."
+        );
+        let body = body.expect("the snapshot must be JSON");
+        assert_eq!(
+            body["complete"], true,
+            "an incomplete edge snapshot is a proof gap, and serving one from the cached \
+             path would hide exactly what this route exists to report"
+        );
+        let repos = body["repos"]
+            .as_array()
+            .expect("the snapshot names the fleet it was read from")
+            .len();
+        assert_eq!(
+            repos, HOSTED_FIXTURE_FLEET_SIZE,
+            "the snapshot covered {repos} repositories, not the fleet's \
+             {HOSTED_FIXTURE_FLEET_SIZE}"
+        );
+        // Everything above reads the same whether the cached path served the
+        // fleet's real edge set or an empty one, which is the exact shape of the
+        // production failure: seventeen repositories rendered with no links
+        // between them, under an answer that called itself complete. So the
+        // payload is asserted on its content, not only on its counters.
+        let edges = body["edges"]
+            .as_array()
+            .expect("the snapshot carries its edge set");
+        assert!(
+            !edges.is_empty(),
+            "the cached path served an empty edge set over a fleet that publishes one"
+        );
+        assert!(
+            edges.iter().any(|edge| {
+                edge["src_repo"] == HOSTED_FIXTURE_IMPORTING_REPO
+                    && edge["dst_repo"] == HOSTED_FIXTURE_IMPORTED_REPO
+            }),
+            "the fleet's published cross-repo edge, {HOSTED_FIXTURE_IMPORTING_REPO} to \
+             {HOSTED_FIXTURE_IMPORTED_REPO}, is not in the served snapshot: {edges:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the query took {elapsed:?}. A durable cache hydration is charged 10 s here, so \
+             this bound is what catches one coming back onto the query path."
+        );
+    }
+
+    /// A source publication that moves past the proof must re-prove once, and
+    /// answer from what that pass finds rather than from the proof it had.
+    #[tokio::test]
+    async fn spine_edges_reproves_when_a_repository_source_advanced_under_the_proof() {
+        let (state, store, backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        let (status, _) = read_spine_edges(Arc::clone(&state)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the fixture must serve first, or the refusal below proves nothing"
+        );
+
+        // Everything the cached path checks stays exactly where it is except
+        // one repository's source publication. An ordinary publication does not
+        // move the rollout fence, so nothing but durable identity catches this.
+        advance_repo_source_publication(&backend_root, "kin-db");
+        let hydrations_before = store.hydration_reads();
+
+        let (status, _) = read_spine_edges(Arc::clone(&state)).await;
+        let hydrations = store.hydration_reads() - hydrations_before;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a proof built against a superseded generation must not certify a query. \
+             Answering from it is the one thing the cheap path may never do."
+        );
+        assert_eq!(
+            hydrations, 1,
+            "a superseded proof must fall through to exactly one full pass, so the query \
+             answers from what is durably there now instead of refusing on a stale reading"
+        );
+        assert!(
+            state.ensure_spine().is_none(),
+            "and the full pass must agree: a repository whose source cursor is ahead of its \
+             committed spine head cannot be proved, so the refusal above is the cheap path \
+             reaching the verdict the expensive one reaches"
+        );
+    }
+
+    /// A refusal that re-proving cannot fix must not pay for a pass.
+    ///
+    /// A lost admission, an active rollout and an unreadable active fence are
+    /// blocked rather than superseded: the condition is in the control plane
+    /// this reader binds to, not in a head that moved, so a full pass reaches
+    /// the same refusal one process-wide hydration later. Readiness has carried
+    /// that distinction since FIR-3255, in
+    /// `a_hosted_readiness_probe_refuses_while_a_rollout_holds_the_fleet`; this
+    /// is the query route's half of the same contract.
+    #[tokio::test]
+    async fn spine_edges_refuses_without_reproving_when_the_cached_authority_is_blocked() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        let (status, _) = read_spine_edges(Arc::clone(&state)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the fixture must serve first, or the refusal below proves nothing"
+        );
+
+        // The active Firestore fence is the third read the cached check makes
+        // and the first that can fail while every durable identity stays put.
+        store.fail_next_rollout_fence_load();
+        let hydrations_before = store.hydration_reads();
+
+        let (status, _) = read_spine_edges(Arc::clone(&state)).await;
+        let hydrations = store.hydration_reads() - hydrations_before;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a reader that cannot read the authority its cached proof is bound to must \
+             refuse rather than serve"
+        );
+        assert_eq!(
+            hydrations, 0,
+            "the blocked refusal hydrated the durable cache. Re-proving cannot fix a control \
+             plane the reader cannot read, so the pass refuses a second time having taken \
+             the process-wide hydration lock to do it."
         );
     }
 
@@ -49274,12 +51105,8 @@ mod tests {
     /// behavior.
     fn reference_fixture() -> (Arc<DaemonState>, Entity) {
         let state = test_state();
-        let mut target = test_entity("sweep_target", "src/target.py");
-        let mut caller = test_entity("sweep_caller", "src/caller.py");
-        for entity in [&mut target, &mut caller] {
-            install_trace_fixture_file(&state, entity);
-            state.graph.upsert_entity(entity).unwrap();
-        }
+        let target = install_trace_fixture_file(&state, "sweep_target", "src/target.py");
+        let caller = install_trace_fixture_file(&state, "sweep_caller", "src/caller.py");
         link_every_class(&state, &caller, &target);
         (state, target)
     }
@@ -52906,28 +54733,23 @@ mod tests {
         let second =
             "\ndef parse_config_list(paths):\n    return [parse_config(p) for p in paths]\n";
         let source = format!("{first}{second}");
-        install_repository_file(&state, "src/config.py", source.as_bytes());
-        install_working_copy_file(&state, "src/config.py", source.as_bytes(), false);
+        // The module entity an install derives takes the file stem, so a path of
+        // `src/config.py` would put an entity named `config` in this graph and
+        // the descriptive query below would name it by name. Keeping the stem
+        // outside the query is what leaves `all_fallback` a statement about the
+        // query rather than about the fixture's file name.
+        install_repository_file(&state, "src/loader.py", source.as_bytes());
+        install_working_copy_file(&state, "src/loader.py", source.as_bytes(), false);
 
-        for (name, start_byte, end_byte, preview) in [
-            ("parse_config", 0, first.len(), "def parse_config(path):"),
-            (
-                "parse_config_list",
-                first.len(),
-                source.len(),
-                "def parse_config_list(paths):",
-            ),
+        // The two definitions are the ones the install derived from those bytes,
+        // carrying their real spans. Upserting hand-made entities beside them
+        // would leave the graph holding each definition twice, which is a shape
+        // the daemon never produces.
+        for (name, preview) in [
+            ("parse_config", "def parse_config(path):"),
+            ("parse_config_list", "def parse_config_list(paths):"),
         ] {
-            let mut entity = test_entity(name, "src/config.py");
-            entity.span = Some(SourceSpan {
-                file: kin_model::FilePathId::new("src/config.py"),
-                start_byte,
-                end_byte,
-                start_line: 0,
-                start_col: 0,
-                end_line: 1,
-                end_col: 24,
-            });
+            let mut entity = derived_entity(&state, "src/loader.py", name, EntityKind::Function);
             // The fused ranker reads this to call an entity a definition rather
             // than a bare reference, and only definitions are ranked.
             entity
@@ -53910,27 +55732,23 @@ mod tests {
         let valid_source = "def valid_func():\n    return 42\n";
         install_repository_file(&state, "src/good.py", valid_source.as_bytes());
         install_working_copy_file(&state, "src/good.py", valid_source.as_bytes(), false);
-        let mut valid_entity = test_entity("valid_func", "src/good.py");
-        valid_entity.span = Some(SourceSpan {
-            file: kin_model::FilePathId::new("src/good.py"),
-            start_byte: 0,
-            end_byte: valid_source.len(),
-            start_line: 0,
-            start_col: 0,
-            end_line: 1,
-            end_col: 15,
-        });
+        let mut valid_entity =
+            derived_entity(&state, "src/good.py", "valid_func", EntityKind::Function);
         valid_entity.metadata.extra.insert(
             "embedding_body_preview".to_string(),
             json!("def valid_func():"),
         );
         state.graph.upsert_entity(&valid_entity).unwrap();
 
-        // bad.py has valid source text but bad_entity has an out-of-bounds span (100..200 > 25)
+        // bad.py has valid source text; the entity the install derived for it is
+        // given an out-of-bounds span (100..200 > 25), which is the unreadable
+        // source under test. The derived entity is corrupted rather than joined
+        // by a hand-made twin, because a readable second `bad_func` outranks the
+        // unreadable one and the page then reports no degradation at all.
         let bad_source = "def bad_func():\n    pass\n";
         install_repository_file(&state, "src/bad.py", bad_source.as_bytes());
         install_working_copy_file(&state, "src/bad.py", bad_source.as_bytes(), false);
-        let mut bad_entity = test_entity("bad_func", "src/bad.py");
+        let mut bad_entity = derived_entity(&state, "src/bad.py", "bad_func", EntityKind::Function);
         bad_entity.span = Some(SourceSpan {
             file: kin_model::FilePathId::new("src/bad.py"),
             start_byte: 100,
@@ -53976,16 +55794,8 @@ mod tests {
         let valid_source = "def valid_func():\n    return 42\n";
         install_repository_file(&state, "src/good.py", valid_source.as_bytes());
         install_working_copy_file(&state, "src/good.py", valid_source.as_bytes(), false);
-        let mut valid_entity = test_entity("valid_func", "src/good.py");
-        valid_entity.span = Some(SourceSpan {
-            file: kin_model::FilePathId::new("src/good.py"),
-            start_byte: 0,
-            end_byte: valid_source.len(),
-            start_line: 0,
-            start_col: 0,
-            end_line: 1,
-            end_col: 15,
-        });
+        let mut valid_entity =
+            derived_entity(&state, "src/good.py", "valid_func", EntityKind::Function);
         valid_entity.metadata.extra.insert(
             "embedding_body_preview".to_string(),
             json!("def valid_func():"),
