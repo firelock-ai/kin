@@ -300,7 +300,19 @@ pub fn read_pinned_published_authority(
         .map_err(Indeterminate)?;
     let lease = pinned.read_authority();
     let roots = lease.roots().clone();
-    let authority = lease.metadata().clone();
+    // Read out of the pinned snapshot itself rather than through the lease's
+    // metadata accessor. It is the same value by construction, since the view
+    // this manager opened reports these bytes and no journal frames, and taking
+    // it from the snapshot says where it came from.
+    let authority = lease
+        .snapshot()
+        .repository_authority
+        .clone()
+        .ok_or_else(|| {
+            Indeterminate(KinDbError::StorageError(
+                "pinned snapshot carries no repository authority".into(),
+            ))
+        })?;
     drop(lease);
     let source_closure = SourceBodyClosure {
         bodies: lock_recovering(&referenced).clone(),
