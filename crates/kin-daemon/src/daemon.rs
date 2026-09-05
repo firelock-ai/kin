@@ -1952,21 +1952,66 @@ fn graph_holds_language_server_relations(state: &DaemonState) -> bool {
 /// So the set is written once, after publication succeeds. Resume-after-kill
 /// degrades in the correct direction: a hard kill now re-sweeps, which is right,
 /// because a hard kill did not publish either.
-pub(crate) fn mark_files_enriched(state: &DaemonState, files: &[String]) {
+/// The marker generation a pass starting now would be recording against.
+///
+/// Read once when a pass takes its entity snapshot and carried to its tail,
+/// never read at the tail: the whole point is to notice that the set moved
+/// between the two.
+pub(crate) fn current_marker_epoch(state: &DaemonState) -> u64 {
+    state
+        .lsp_enriched_marker_epoch
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Persist the enrichment marker set for this store.
+///
+/// Called ONLY with the `lsp_enriched_files` guard held by the caller, so the
+/// in-memory set and its durable record move together. Two writers that release
+/// before they persist can land in either order, and the losing order
+/// reintroduces at the next daemon start exactly the skips the winner retired.
+///
+/// One write site for both the marking path and the merge's retirement, which is
+/// also what keeps this file's raw filesystem touches to the three the
+/// zero-file-search allowlist accounts for.
+fn persist_enriched_marker(state: &DaemonState, files: &[String]) {
+    if let Ok(bytes) = serde_json::to_vec(files) {
+        let _ = std::fs::write(lsp_enriched_marker_path(state), bytes);
+    }
+}
+
+pub(crate) fn mark_files_enriched(state: &DaemonState, files: &[String], captured_epoch: u64) {
     if files.is_empty() {
         return;
     }
-    let snapshot = {
+    {
         let Ok(mut marked) = state.lsp_enriched_files.lock() else {
             return;
         };
+        // Read INSIDE the guard the insert happens under, and never before it.
+        // Read outside, a pass could satisfy this comparison, wait while a
+        // merge advanced the generation and cleared the set, and then insert
+        // its stale marks beneath that clear. That is the silent skip this
+        // whole rule exists to end, so the generation and the set move as one.
+        let epoch = state
+            .lsp_enriched_marker_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if epoch != captured_epoch {
+            warn!(
+                files = files.len(),
+                captured_epoch,
+                epoch,
+                "not recording these files as enriched: the marker set was invalidated after \
+                 this pass started, so its answers describe a graph that has since moved"
+            );
+            return;
+        }
         for file in files {
             marked.insert(file.clone());
         }
-        marked.iter().cloned().collect::<Vec<_>>()
-    };
-    if let Ok(bytes) = serde_json::to_vec(&snapshot) {
-        let _ = std::fs::write(lsp_enriched_marker_path(state), bytes);
+        // Written INSIDE the guard, not after it. Written after, an old pass's
+        // snapshot could reach the file behind the cleared write a merge just
+        // made, and the next daemon would load the stale skips straight back.
+        persist_enriched_marker(state, &marked.iter().cloned().collect::<Vec<_>>());
     }
 }
 
@@ -2045,8 +2090,28 @@ pub(crate) fn complete_lsp_sweep(state: &DaemonState, files_blocked: u64) {
     // demand waited here rather than being queued beside this one, so that a
     // caller waiting on `lsp_sweeps_completed` could not see the wrong pass
     // finish. Drained after the running flag clears, so the queue accepts it.
-    if state.take_pending_lsp_sweep() {
-        state.queue_lsp_sweep();
+    drain_pending_lsp_sweep(state);
+}
+
+/// Hand the worker a sweep a merge asked for while a pass was running, if the
+/// queue will take one now.
+///
+/// The bit is RESTORED when the queue refuses. `queue_lsp_sweep` answers false
+/// for a FULL channel exactly as it does for a closed one, and consuming the bit
+/// while ignoring that answer threw the demand away in the one case it exists
+/// for.
+///
+/// Called at the worker's receive boundary as well as at a sweep's tail, and the
+/// receive boundary is the one that makes it converge: the tail runs only when a
+/// sweep COMPLETES, so a queue full of incremental work with no sweep queued
+/// would drain message by message while the demand sat in the bit forever. At
+/// the boundary the worker has just taken a message, so the next attempt has
+/// room.
+pub(crate) fn drain_pending_lsp_sweep(state: &DaemonState) {
+    if state.take_pending_lsp_sweep() && !state.queue_lsp_sweep() {
+        state
+            .lsp_sweep_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2068,12 +2133,37 @@ pub(crate) fn complete_lsp_sweep(state: &DaemonState, files_blocked: u64) {
 /// built on: a wrong skip is silent and loses the answers, a wrong re-sweep
 /// only costs time.
 pub(crate) fn retire_enrichment_evidence_for_merge(state: &DaemonState) {
-    let Ok(marked) = state.lsp_enriched_files.lock() else {
-        return;
+    let retired = {
+        // One critical section, and the same lock taken first by every writer
+        // of this evidence. Bumping outside it would let a pass's tail read the
+        // old generation, block here, and then insert beneath the clear below,
+        // which is the interleaving the generation exists to refuse.
+        let Ok(mut marked) = state.lsp_enriched_files.lock() else {
+            return;
+        };
+        // Bumped unconditionally, and before the clear, because what a merge
+        // invalidates is not only what is marked at this instant: a sweep
+        // already in flight is holding the files it is about to mark, derived
+        // from language-server answers taken before this merge existed, and an
+        // empty marker set right now does not mean there is nothing to
+        // invalidate.
+        state
+            .lsp_enriched_marker_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let retired = marked.len();
+        marked.clear();
+        if retired > 0 {
+            persist_enriched_marker(state, &[]);
+        }
+        retired
     };
-    let files: Vec<String> = marked.iter().cloned().collect();
-    drop(marked);
-    retire_enrichment_marker(state, &files);
+    if retired > 0 {
+        debug!(
+            files = retired,
+            "retired every enrichment marker for a published merge; the sweep it queued \
+             re-derives them"
+        );
+    }
 }
 
 /// The batch size one embedding pass may use under a pressure verdict.
@@ -5133,6 +5223,13 @@ pub async fn run_with_authority_on(
                     break;
                 }
 
+                // A merge admitted while a pass was running left its demand on
+                // the pending bit. Drained here, at the receive boundary, and
+                // not only at a sweep's tail: the tail runs only when a sweep
+                // completes, so a queue holding nothing but incremental work
+                // would drain forever with the demand still sitting in the bit.
+                drain_pending_lsp_sweep(&lsp_state);
+
                 // Process buffered requests first (always incremental), then wait for new messages.
                 let message = if let Some(buffered) = pending_buffer.pop() {
                     LspEnrichmentMessage::Incremental(buffered)
@@ -5413,6 +5510,13 @@ pub async fn run_with_authority_on(
                         lsp_state
                             .lsp_sweep_files_done
                             .store(0, std::sync::atomic::Ordering::SeqCst);
+
+                        // The marker generation this pass's answers describe,
+                        // captured with the entity snapshot they are taken over
+                        // rather than at the tail, because the tail is where
+                        // the record is written and by then the graph may have
+                        // moved underneath every answer in it.
+                        let marker_epoch = current_marker_epoch(&lsp_state);
 
                         // Get all entities from the graph.
                         use kin_model::EntityStore;
@@ -5898,7 +6002,7 @@ pub async fn run_with_authority_on(
                             );
                         }
                         if sweep_marker_is_durable(total_relations, published) {
-                            mark_files_enriched(&lsp_state, &enriched_this_sweep);
+                            mark_files_enriched(&lsp_state, &enriched_this_sweep, marker_epoch);
                         } else {
                             warn!(
                                 files = enriched_this_sweep.len(),
@@ -7261,7 +7365,7 @@ mod tests {
         ];
         let never_reached = "src/requests/models.py";
 
-        super::mark_files_enriched(&state, &completed);
+        super::mark_files_enriched(&state, &completed, super::current_marker_epoch(&state));
 
         for file in &completed {
             assert!(
@@ -7907,6 +8011,7 @@ mod enrichment_marker_tests {
         super::mark_files_enriched(
             &state,
             &["src/sessions.py".to_string(), "src/adapters.py".to_string()],
+            super::current_marker_epoch(&state),
         );
         assert!(
             file_already_enriched(&state, "src/sessions.py"),
@@ -7949,7 +8054,11 @@ mod enrichment_marker_tests {
         let init = kin_core::init(repo_dir.path()).unwrap();
         let state = DaemonState::open(init.layout).unwrap();
         install_language_server_relation(&state);
-        super::mark_files_enriched(&state, &["src/sessions.py".to_string()]);
+        super::mark_files_enriched(
+            &state,
+            &["src/sessions.py".to_string()],
+            super::current_marker_epoch(&state),
+        );
 
         super::retire_enrichment_marker(&state, &["src/models.py".to_string()]);
 
@@ -9598,7 +9707,7 @@ mod sweep_lifecycle_tests {
 
             sweep_started(&state);
             // The sweep's tail, in the order the sweep runs it.
-            mark_files_enriched(&state, &files);
+            mark_files_enriched(&state, &files, super::current_marker_epoch(&state));
             let counted = sweep_finished(&state, false, files.len());
 
             assert_eq!(
