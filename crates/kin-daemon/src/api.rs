@@ -239,10 +239,13 @@ pub(crate) struct ProjectionAuthorityCache {
     /// The refs routes' envelope, keyed on the same publication identity as
     /// every slot above it.
     ref_metadata: std::sync::Mutex<Option<HeldRefMetadata>>,
-    /// The manager this daemon publishes through, kept across publications so an
-    /// edit costs no whole-store open; see [`HeldWriteAuthority`]. The
-    /// admission slot above is derived from it, so after a publication both are
-    /// relabelled together and the next reconcile tick opens nothing.
+    /// The manager this daemon publishes through, held for the life of one
+    /// publication; see [`HeldWriteAuthority`]. The admission pair's open
+    /// installs it, the publication and the enrichment publish go through it,
+    /// and the read-index finalization forgets it, so one edit costs one
+    /// whole-store open rather than the two or three it cost before and nothing
+    /// decoded stays resident between edits. The admission slot above is derived
+    /// from it and relabelled with it.
     writer: std::sync::Mutex<Option<HeldWriteAuthority>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
@@ -293,7 +296,7 @@ struct HeldRefMetadata {
     metadata: Arc<kin_db::PersistedRepositoryAuthority>,
 }
 
-/// The authority this daemon publishes through, held across publications.
+/// The authority this daemon publishes through, held for one publication.
 ///
 /// A publication used to open the persisted authority, commit through it and
 /// drop it, and the open is O(store): kin-db decodes the change map (93.8 percent
@@ -304,18 +307,28 @@ struct HeldRefMetadata {
 /// resident set that way before any commit ran (FIR-3203).
 ///
 /// After its own commit the manager's in-memory state IS the durable successor,
-/// so the next publication can go through it with no open at all, as long as
-/// nothing else wrote in between. The label says which publication this manager
-/// is at. It is taken under the commit-point lock the freeze holds, so it cannot
-/// name a publication that landed after this manager's own; a reuse reads the
-/// durable record first and misses the moment any other writer moved it. If a
-/// writer moves it between that read and the commit, kin-db's successor
-/// compare-and-swap refuses the commit with a generation mismatch and the slot
-/// is forgotten, so a stale manager can never overwrite a foreign publication.
+/// so every later reader of that publication can go through it with no open at
+/// all: the enrichment publish and then the read-index finalization, which is
+/// the last of them and forgets the slot.
+///
+/// The label says which publication this manager is at. It is read the instant
+/// after a plain commit, under no lock at all, so a foreign publication landing
+/// between the commit and the read DOES leave this manager one generation behind
+/// while wearing the current label; see
+/// [`publication_identity_after_commit`]. That window is closed by kin-db, not
+/// by this label: an ordinary reuse reads the durable record first and misses
+/// the moment any other writer moved it, and a manager that slipped through the
+/// window is refused at the commit by kin-db's successor compare-and-swap with a
+/// generation mismatch, after which the slot is forgotten. Either way a stale
+/// manager can never overwrite a foreign publication. The test that pins the
+/// second path is
+/// `a_held_authority_that_fell_behind_is_refused_by_the_cas_and_forgotten`.
 struct HeldWriteAuthority {
-    /// Read strictly before the load, or under the freeze of the commit this
-    /// manager performed, for the reason [`HeldProjectionAuthority::published`]
-    /// gives.
+    /// Read strictly before the load, or immediately after the commit this
+    /// manager performed. The first case is the reason
+    /// [`HeldProjectionAuthority::published`] gives; the second carries the
+    /// window this type's own documentation names, and kin-db's compare-and-swap
+    /// is what closes it.
     published: LocalPublicationIdentity,
     manager: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
 }
