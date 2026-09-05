@@ -3176,6 +3176,17 @@ pub struct DaemonState {
     pub lsp_sweep_languages_skipped: std::sync::Mutex<Vec<SweepLanguageSkip>>,
     /// Set while a sweep is in flight.
     pub lsp_sweep_running: AtomicBool,
+    /// A sweep that was asked for while one was already running.
+    ///
+    /// The running pass lists every entity and builds its file grouping and its
+    /// target index once when it starts, so it cannot visit a file or reach an
+    /// endpoint that arrived after that. A merge admitted underneath it needs a
+    /// pass of its own, and queueing one immediately is not the answer: a caller
+    /// waits on `lsp_sweeps_completed`, so two passes over one graph let a
+    /// waiter see the first finish and return over a graph the second is still
+    /// mutating. One coalesced bit rather than a counter, because the demand is
+    /// "sweep the graph as it now stands" and two of those are one.
+    pub lsp_sweep_pending: AtomicBool,
     /// Files a sweep has finished enriching, so a later pass can skip them.
     ///
     /// An explicit marker rather than an inference from the graph. Two attempts
@@ -5293,6 +5304,7 @@ impl DaemonState {
             lsp_sweep_languages_skipped: std::sync::Mutex::new(Vec::new()),
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
+            lsp_sweep_pending: AtomicBool::new(false),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
             unpublished_enrichment: std::sync::Mutex::new(std::collections::HashSet::new()),
             cached_repo_id,
@@ -5661,6 +5673,7 @@ impl DaemonState {
             lsp_sweep_languages_skipped: std::sync::Mutex::new(Vec::new()),
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
+            lsp_sweep_pending: AtomicBool::new(false),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
             unpublished_enrichment: std::sync::Mutex::new(std::collections::HashSet::new()),
             cached_repo_id: repo_id.to_string(),
@@ -11139,15 +11152,64 @@ impl DaemonState {
             return false;
         }
         if let Some(ref tx) = self.lsp_enrichment_tx {
-            if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
-                tx.try_send(LspEnrichmentMessage::Sweep)
-            {
-                warn!("LSP enrichment channel full, sweep request dropped");
-                return false;
-            }
-            return true;
+            // Every arm named. `is_some` on the sender establishes that a
+            // sender exists, not that anything is left to receive, and matching
+            // only `Full` let a channel whose receiver a supervisor halt had
+            // already dropped fall through to `true`. A caller that took that
+            // answer reported a sweep it had not queued and could not queue.
+            return match tx.try_send(LspEnrichmentMessage::Sweep) {
+                Ok(()) => true,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    warn!("LSP enrichment channel full, sweep request dropped");
+                    false
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    warn!("LSP enrichment worker is gone, sweep request dropped");
+                    false
+                }
+            };
         }
         false
+    }
+
+    /// Ask for a sweep over the graph a merge just published, and answer
+    /// whether one is coming.
+    ///
+    /// [`Self::queue_lsp_sweep`] answers a different question, "is a sweep
+    /// running", and a merge cannot use that answer: the running pass took its
+    /// entity, file and target snapshot before this merge existed and cannot
+    /// visit the merged tree. So a refusal on that ground is recorded as demand
+    /// the worker drains when its pass ends, and only a channel that can never
+    /// deliver reads as no.
+    ///
+    /// The demand is published BEFORE the attempt to queue, so a pass that ends
+    /// between the two calls drains it at its tail rather than racing past it.
+    /// The cost of losing that race in the other direction is one redundant
+    /// sweep, which is the cheap direction to be wrong in; the cost of losing it
+    /// the way the ordering avoids is a merged graph nothing ever converges.
+    pub fn request_lsp_sweep_after_merge(&self) -> bool {
+        self.lsp_sweep_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .lsp_sweep_running
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return true;
+        }
+        if self.queue_lsp_sweep() {
+            self.lsp_sweep_pending
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return true;
+        }
+        self.lsp_sweep_pending
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        false
+    }
+
+    /// Take the pending sweep demand, if there is one.
+    pub fn take_pending_lsp_sweep(&self) -> bool {
+        self.lsp_sweep_pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Return the current reconciliation status as a human-readable string.
