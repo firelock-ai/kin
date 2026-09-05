@@ -205,12 +205,66 @@ pub enum RepositoryTransferError {
 /// times with no next step; the token that peer accepts was in its
 /// repository's `.kin/daemon.token` the whole time, and this names it.
 pub fn bearer_token_next_step(base_url: &str) -> String {
+    let address = redacted_remote_address(base_url);
+    let carried = if address == base_url.trim() {
+        ""
+    } else {
+        ". The address above is that remote without the credentials its URL carried, because Kin \
+         sends the token from the environment rather than from the URL"
+    };
     format!(
-        "send a bearer token the remote at {base_url} accepts: for a peer daemon on this \
+        "send a bearer token the remote at {address} accepts: for a peer daemon on this \
          machine, set KIN_REMOTE_BEARER_TOKEN=$(cat <peer>/.kin/daemon.token) where <peer> is \
          that repository's working directory; for KinLab, run `kin auth login --base-url \
-         {base_url}` or set KIN_REMOTE_BEARER_TOKEN to a KinLab token"
+         {address}` or set KIN_REMOTE_BEARER_TOKEN to a KinLab token{carried}"
     )
+}
+
+/// One remote's address with everything secret-bearing removed: the scheme,
+/// host, port and path a reader has to act on, and nothing else.
+///
+/// A refusal is the one place a stranger reads a whole remote URL back, so it
+/// is the one place a credential typed into a remote config is copied into a
+/// terminal, a bug report and a shell history. Three URL parts can carry one:
+/// the userinfo before `@`, the query, and the fragment. None of them is part
+/// of the address a caller needs, and Kin never authenticates from any of them,
+/// so all three go.
+///
+/// The address itself stays. A message that named no remote at all would leak
+/// nothing and help nobody: a stranger with two accounts could not tell which
+/// peer refused them.
+///
+/// Hand-written rather than parsed, because this must answer for a string that
+/// is not a valid URL as safely as for one that is. A parser would have to
+/// choose between returning the input unchanged, which is the leak, and
+/// returning nothing, which is the useless message above. Cutting on the
+/// delimiters does neither: an unparseable string still loses its query, its
+/// fragment and its userinfo.
+pub fn redacted_remote_address(base_url: &str) -> String {
+    let trimmed = base_url.trim();
+    // Query and fragment first, so a userinfo scan can never run over one. A
+    // raw `?` or `#` cannot appear inside userinfo or a host; both are
+    // percent-encoded there.
+    let addressed = trimmed
+        .find(['?', '#'])
+        .map_or(trimmed, |cut| &trimmed[..cut]);
+    // The authority is what lies between the scheme and the path. A string with
+    // no scheme is treated as bare authority rather than skipped, so a
+    // malformed remote loses its userinfo too.
+    let authority_start = addressed.find("://").map_or(0, |scheme_end| scheme_end + 3);
+    let authority_end = addressed[authority_start..]
+        .find('/')
+        .map_or(addressed.len(), |offset| authority_start + offset);
+    // The LAST `@`, because a password may itself contain an encoded one and the
+    // authority ends at the final separator.
+    match addressed[authority_start..authority_end].rfind('@') {
+        Some(at) => format!(
+            "{}{}",
+            &addressed[..authority_start],
+            &addressed[authority_start + at + 1..]
+        ),
+        None => addressed.to_string(),
+    }
 }
 
 pub type Result<T> = std::result::Result<T, RepositoryTransferError>;
@@ -4996,6 +5050,141 @@ mod tests {
                 RepositoryTransferApplyOutcome::IdempotentReplay
             );
             assert_eq!(calls.get(), 1, "the replay re-ran the policy");
+        }
+    }
+}
+
+#[cfg(test)]
+mod bearer_token_next_step_tests {
+    use super::bearer_token_next_step;
+
+    /// A remote whose locator carries every credential shape a URL can hold.
+    ///
+    /// `kin clone` refuses one of these at its own boundary, but this function
+    /// is not reached only from clone: the 401 arm of the HTTP transport and
+    /// two `kin remote` pre-flights build the same sentence from a configured
+    /// remote's URL, and nothing between a config file and this format string
+    /// strips anything.
+    const CREDENTIAL_BEARING: &str =
+        "https://alice:s3cr3tpassw0rd@kinlab.example/base?access_token=t0kenvalue#frag";
+
+    /// The refusal is the one place a stranger reads a whole URL back, so it is
+    /// the one place a credential typed into a remote config gets copied into a
+    /// terminal, a bug report and a shell history.
+    #[test]
+    fn the_next_step_never_echoes_a_credential_from_the_url_it_names() {
+        let message = bearer_token_next_step(CREDENTIAL_BEARING);
+        for secret in ["s3cr3tpassw0rd", "t0kenvalue", "alice:"] {
+            assert!(
+                !message.contains(secret),
+                "the remedy echoed {secret} out of the remote URL: {message}"
+            );
+        }
+        assert!(
+            !message.contains("access_token"),
+            "and must not echo the query that carried one: {message}"
+        );
+    }
+
+    /// The positive control for the assertions above: a message that redacted
+    /// everything, including the recipe, would pass all of them and help nobody.
+    #[test]
+    fn the_next_step_still_names_the_environment_variable_and_its_recipe() {
+        let message = bearer_token_next_step(CREDENTIAL_BEARING);
+        assert!(
+            message.contains("KIN_REMOTE_BEARER_TOKEN=$(cat <peer>/.kin/daemon.token)"),
+            "the remedy must still name the token a same-machine peer accepts: {message}"
+        );
+        assert!(
+            message.contains("kin auth login --base-url"),
+            "and still name the hosted alternative: {message}"
+        );
+    }
+
+    /// The redaction may not cost a reader the address they have to act on.
+    ///
+    /// A message that named no remote at all would pass the negative above and
+    /// leave a stranger with two accounts and no way to tell which peer refused
+    /// them, so the scheme, host and port survive and only the credentials go.
+    #[test]
+    fn the_next_step_keeps_the_address_a_reader_has_to_act_on() {
+        let message = bearer_token_next_step(CREDENTIAL_BEARING);
+        assert!(
+            message.contains("https://kinlab.example/"),
+            "the remedy must still name which remote refused: {message}"
+        );
+    }
+
+    /// An ordinary loopback peer, which is the shape the journey met, must read
+    /// exactly as it did before. Redaction that rewrote a clean URL would break
+    /// the one command a stranger copies.
+    #[test]
+    fn a_peer_url_with_no_credentials_is_named_unchanged() {
+        let message = bearer_token_next_step("http://127.0.0.1:53848");
+        assert!(
+            message.contains("the remote at http://127.0.0.1:53848 accepts"),
+            "a clean peer endpoint must be named verbatim: {message}"
+        );
+        assert!(
+            message.contains("kin auth login --base-url http://127.0.0.1:53848"),
+            "including in the hosted alternative: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod redacted_remote_address_tests {
+    use super::redacted_remote_address;
+
+    /// The address a caller acts on survives every part that can carry a
+    /// secret, and only those parts go.
+    #[test]
+    fn only_the_secret_bearing_parts_of_a_url_are_removed() {
+        for (input, expected) in [
+            ("http://127.0.0.1:53848", "http://127.0.0.1:53848"),
+            ("https://kinlab.ai/org/repo", "https://kinlab.ai/org/repo"),
+            ("https://user:pw@kinlab.ai/org", "https://kinlab.ai/org"),
+            ("https://token@kinlab.ai", "https://kinlab.ai"),
+            (
+                "https://kinlab.ai/org?access_token=v",
+                "https://kinlab.ai/org",
+            ),
+            ("https://kinlab.ai/org#tok", "https://kinlab.ai/org"),
+            ("https://u:p@kinlab.ai/org?t=v#f", "https://kinlab.ai/org"),
+            // A path that carries an `@` is a path, not userinfo, and a reader
+            // needs it: the authority ends at the first `/`.
+            ("https://kinlab.ai/a@b", "https://kinlab.ai/a@b"),
+            // Not a URL at all. A parser would hand this back untouched, which
+            // is the leak; the delimiters still say where the secret was.
+            ("u:p@kinlab.ai/org?t=v", "kinlab.ai/org"),
+            ("  https://kinlab.ai  ", "https://kinlab.ai"),
+        ] {
+            assert_eq!(redacted_remote_address(input), expected, "for {input}");
+        }
+    }
+
+    /// The property, stated once over every shape above: nothing a caller could
+    /// have put a secret in survives.
+    #[test]
+    fn no_userinfo_query_or_fragment_survives_redaction() {
+        for input in [
+            "https://alice:s3cr3t@kinlab.ai/org?access_token=t0ken#frag",
+            "http://s3cr3t@127.0.0.1:53848?t0ken=1",
+            "alice:s3cr3t@kinlab.ai#t0ken",
+        ] {
+            let redacted = redacted_remote_address(input);
+            assert!(
+                !redacted.contains("s3cr3t") && !redacted.contains("t0ken"),
+                "{input} redacted to {redacted}"
+            );
+            assert!(
+                !redacted.contains('?') && !redacted.contains('#'),
+                "{input} redacted to {redacted}"
+            );
+            assert!(
+                redacted.contains("kinlab.ai") || redacted.contains("127.0.0.1"),
+                "the host a reader acts on must survive: {input} redacted to {redacted}"
+            );
         }
     }
 }

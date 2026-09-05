@@ -2139,10 +2139,21 @@ pub(crate) fn commit_native_plan(
 /// transaction above is durable and the change is committed; a memoization that
 /// did not persist is a slower next open, not a failed commit, and turning one
 /// into the other would be a strictly worse product than the row this fixes.
-fn refresh_workspace_base_graph_section(
+/// `transition` names the local repository operation that moved the base, so a
+/// log line says which one paid for the refresh. A commit is not the only such
+/// operation: a branch switch, a pull's follow of a moved ref and a merge all
+/// move the workspace base without committing through this module, and every
+/// one of them left a section behind that kin-db then refuses. Journey GAP-4
+/// read that refusal on an origin right after it received a push, which is the
+/// one transfer that does NOT move a base: a received pack carries
+/// `workspace_mutation: None` (`kin-remote`'s `transfer_transaction`), so the
+/// staleness the journey saw came from the branch switches and the merge that
+/// preceded it.
+pub(crate) fn refresh_workspace_base_graph_section(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     repository_id: &kin_model::RepositoryId,
     workspace_id: WorkspaceId,
+    transition: &'static str,
 ) {
     let changes_in_store = authority.read_authority().snapshot().changes.len();
     let started = std::time::Instant::now();
@@ -2154,22 +2165,25 @@ fn refresh_workspace_base_graph_section(
         Ok(Some(outcome)) => tracing::info!(
             repository = %repository_id,
             workspace = %workspace_id,
+            transition,
             changes_in_store,
             elapsed_ms,
             outcome = ?outcome,
-            "refreshed the workspace base graph section after a native commit"
+            "refreshed the workspace base graph section after a local repository transition"
         ),
         Ok(None) => tracing::info!(
             repository = %repository_id,
             workspace = %workspace_id,
+            transition,
             "no workspace to refresh a graph section for"
         ),
         Err(error) => tracing::warn!(
             repository = %repository_id,
             workspace = %workspace_id,
+            transition,
             elapsed_ms,
             %error,
-            "the workspace base graph section did not persist after this commit, so the next \
+            "the workspace base graph section did not persist after this transition, so the next \
              open folds this base out of history; `kin graph materialize` writes one"
         ),
     }
@@ -2375,6 +2389,7 @@ fn commit_native_plan_with_working_copy_proof(
         &authority,
         &repository_id,
         authority_context.workspace_id(),
+        "native commit",
     );
     Ok(NativeCommitResult {
         change: plan.change,

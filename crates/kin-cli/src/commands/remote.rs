@@ -598,7 +598,7 @@ pub async fn lease(
     if native_remote_bearer_token(&target.base_url).is_none() {
         anyhow::bail!(
             "no auth token available for {}; {}",
-            target.base_url,
+            kin_remote::repository_transfer::redacted_remote_address(&target.base_url),
             kin_remote::repository_transfer::bearer_token_next_step(&target.base_url)
         );
     }
@@ -976,7 +976,7 @@ pub async fn sessions(remote: Option<String>, json: bool) -> Result<()> {
     if native_remote_bearer_token(&target.base_url).is_none() {
         anyhow::bail!(
             "no auth token available for {}; {}",
-            target.base_url,
+            kin_remote::repository_transfer::redacted_remote_address(&target.base_url),
             kin_remote::repository_transfer::bearer_token_next_step(&target.base_url)
         );
     }

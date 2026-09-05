@@ -186,6 +186,7 @@ async fn clone_native(source: NativeCloneSource, target: &Path) -> Result<()> {
         true,
     )
     .context("persist native clone origin")?;
+    materialize_cloned_base(&layout).await;
     let request = CommandTransferRequest {
         remote_base_url: source.endpoint.base_url.clone(),
         remote_token: source.endpoint.auth_token,
@@ -253,6 +254,47 @@ async fn clone_native(source: NativeCloneSource, target: &Path) -> Result<()> {
         println!("  Head: {head}");
     }
     Ok(())
+}
+
+/// Persist the cloned replica's workspace base graph section, before this
+/// command starts a daemon on it.
+///
+/// A clone's history does NOT arrive through the transfer receiver. It arrives
+/// inside `kin_core::init::replica::initialize`, as one bootstrap transaction
+/// committed into a staged layout, so every refresh that hangs off a receive or
+/// a workspace transition is on a path this replica never took, and a fresh
+/// clone read `Graph section: absent, so every open of this store folds this
+/// workspace's base out of history` while naming `kin graph materialize` as the
+/// fix. Journey GAP-4. A stranger's first act on a peer's repository should not
+/// leave them a store that pays a full history fold at every open.
+///
+/// Here rather than inside `initialize`, and here rather than after the
+/// transfer below, because this is the one moment nothing holds the store:
+/// `materialize_workspace_base_offline` takes repository runtime authority
+/// first, and the transfer below connects a daemon that holds it. A clone whose
+/// own pull then admits more history moves the base again, and the daemon's own
+/// follow of that moved ref refreshes the section for it.
+///
+/// Never fatal, exactly as `kin init` treats the same phase: the replica is
+/// durable, complete and verified, and a memoization that did not persist is a
+/// slower next open rather than a failed clone. The warning names the retry, and
+/// `kin graph status` and `kin doctor` keep reading the state from the store, so
+/// a failure here is disclosed rather than papered over.
+async fn materialize_cloned_base(layout: &kin_core::KinLayout) {
+    let layout = layout.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::commands::repository_authority::materialize_workspace_base_offline(&layout)
+    })
+    .await;
+    let error = match outcome {
+        Ok(Ok(_)) => return,
+        Ok(Err(error)) => error,
+        Err(error) => anyhow::anyhow!("graph-section materialization did not complete: {error}"),
+    };
+    eprintln!(
+        "warning: the clone completed, but preparing its first graph reopen did not; run \
+         `kin graph materialize` in the clone to retry: {error:#}"
+    );
 }
 
 fn require_available_target(target: &Path) -> Result<bool> {
