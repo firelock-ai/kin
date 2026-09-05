@@ -146,35 +146,11 @@ pub fn resolve_commit_identity(layout: &KinLayout) -> Result<CommitIdentity, Kin
 /// The `[table]` a `default_author` key was written under, when the config
 /// carries one anywhere but the top level.
 ///
-/// Read as a plain TOML document rather than through [`KinConfig`], because
-/// the typed config is exactly what cannot see the key: every table type
-/// ignores fields it does not declare, so the misplaced line is dropped on
-/// deserialization and leaves no trace. The walk is depth-first so a key
-/// nested two tables down is still named by its full dotted path. A document
-/// that does not parse yields nothing here, and the caller falls through to
-/// the generic refusal.
+/// The read lives in [`KinConfig::misplaced_top_level_key`], beside the loader
+/// that reads the same file: config IO is that module's boundary, and this one
+/// only asks the question.
 fn misplaced_default_author(layout: &KinLayout) -> Option<String> {
-    let contents = std::fs::read_to_string(layout.config_path()).ok()?;
-    let document: toml::Table = toml::from_str(&contents).ok()?;
-    fn find(table: &toml::Table, prefix: &str) -> Option<String> {
-        for (key, value) in table {
-            let path = if prefix.is_empty() {
-                key.clone()
-            } else {
-                format!("{prefix}.{key}")
-            };
-            if let Some(nested) = value.as_table() {
-                if nested.contains_key("default_author") {
-                    return Some(path);
-                }
-                if let Some(found) = find(nested, &path) {
-                    return Some(found);
-                }
-            }
-        }
-        None
-    }
-    find(&document, "")
+    KinConfig::misplaced_top_level_key(&layout.config_path(), "default_author")
 }
 
 /// The explicit Kin-specific author for this repository, when one is set and
