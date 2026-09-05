@@ -1952,7 +1952,7 @@ fn graph_holds_language_server_relations(state: &DaemonState) -> bool {
 /// So the set is written once, after publication succeeds. Resume-after-kill
 /// degrades in the correct direction: a hard kill now re-sweeps, which is right,
 /// because a hard kill did not publish either.
-fn mark_files_enriched(state: &DaemonState, files: &[String]) {
+pub(crate) fn mark_files_enriched(state: &DaemonState, files: &[String]) {
     if files.is_empty() {
         return;
     }
@@ -2017,6 +2017,63 @@ pub(crate) fn retire_enrichment_marker(state: &DaemonState, files: &[String]) {
     if let Ok(bytes) = serde_json::to_vec(&snapshot) {
         let _ = std::fs::write(lsp_enriched_marker_path(state), bytes);
     }
+}
+
+/// Publish that the cold sweep this worker was running has ended.
+///
+/// Extracted from the worker's own tail so the daemon has one named place where
+/// a sweep finishes. Every caller of a sweep waits on `lsp_sweeps_completed`
+/// rather than on `lsp_sweep_running`, because polling `running` alone races
+/// the worker, so the two have to move together and this is where they do.
+///
+/// Marked complete even when the loop broke early on shutdown or a supervisor
+/// halt, which is the behaviour the tail already had: a waiter blocked on a
+/// counter that only advances on a clean finish would wait out its whole budget
+/// on a sweep that already stopped.
+pub(crate) fn complete_lsp_sweep(state: &DaemonState, files_blocked: u64) {
+    state
+        .lsp_sweep_running
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    state
+        .lsp_sweeps_completed
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state
+        .lsp_sweep_files_blocked
+        .store(files_blocked, std::sync::atomic::Ordering::SeqCst);
+    // A merge admitted while this pass ran could not be covered by it, because
+    // the pass had already taken its entity, file and target snapshot. Its
+    // demand waited here rather than being queued beside this one, so that a
+    // caller waiting on `lsp_sweeps_completed` could not see the wrong pass
+    // finish. Drained after the running flag clears, so the queue accepts it.
+    if state.take_pending_lsp_sweep() {
+        state.queue_lsp_sweep();
+    }
+}
+
+/// Retire every enrichment marker this store holds, because a merge changed
+/// what the files they name can bind to.
+///
+/// The marker means "the enrichment for this file is durable", and the sweep
+/// skips a marked file before it asks a language server anything. A merge makes
+/// that claim false for files nothing edited: a caller on one branch and its
+/// callee on the other produce an edge that exists only once the merge exists,
+/// and the caller's file is unchanged by the merge, was legitimately marked
+/// when it was swept, and is skipped by the sweep the merge queues. Retiring
+/// only the files the merge changed does not close it, because the answer that
+/// went stale is a cross-file one whose target moved elsewhere.
+///
+/// So the whole set goes. It costs the merge's own sweep one re-derivation of
+/// this store and is the cheap direction to be wrong in, the same asymmetry
+/// [`load_lsp_enriched_marker`] and [`retire_enrichment_marker`] are already
+/// built on: a wrong skip is silent and loses the answers, a wrong re-sweep
+/// only costs time.
+pub(crate) fn retire_enrichment_evidence_for_merge(state: &DaemonState) {
+    let Ok(marked) = state.lsp_enriched_files.lock() else {
+        return;
+    };
+    let files: Vec<String> = marked.iter().cloned().collect();
+    drop(marked);
+    retire_enrichment_marker(state, &files);
 }
 
 /// The batch size one embedding pass may use under a pressure verdict.
@@ -3220,7 +3277,7 @@ mod sweep_backfill_gate_tests {
 }
 
 /// Whether the sweep has already finished this file.
-fn file_already_enriched(state: &DaemonState, file: &str) -> bool {
+pub(crate) fn file_already_enriched(state: &DaemonState, file: &str) -> bool {
     state
         .lsp_enriched_files
         .lock()
@@ -5852,21 +5909,11 @@ pub async fn run_with_authority_on(
                         }
 
                         // Marked complete even when the loop broke early on
-                        // shutdown or a supervisor halt. A waiter blocked on a
-                        // counter that only advances on a clean finish would
-                        // wait out its whole budget on a sweep that already
-                        // stopped, and report a timeout for a pass that ended
-                        // seconds in. What was enriched is durable either way,
-                        // and the next sweep resumes from it.
-                        lsp_state
-                            .lsp_sweep_running
-                            .store(false, std::sync::atomic::Ordering::SeqCst);
-                        lsp_state
-                            .lsp_sweeps_completed
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        lsp_state
-                            .lsp_sweep_files_blocked
-                            .store(tally.blocked() as u64, std::sync::atomic::Ordering::SeqCst);
+                        // shutdown or a supervisor halt. What was enriched is
+                        // durable either way, and the next sweep resumes from
+                        // it. The reason the counters move together, and the
+                        // demand this drains, are on the function.
+                        complete_lsp_sweep(&lsp_state, tally.blocked() as u64);
                         // Published with the counts, so a caller reading a
                         // nonzero blocked count can also say which language it
                         // lost and what this process saw. Replaces the previous
