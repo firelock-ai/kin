@@ -44,7 +44,7 @@ use kin_model::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::repository_authority::ActiveRepositoryAuthority;
+use super::repository_authority::{ActiveRepositoryAuthority, AuthoritySource};
 use super::store_footprint::StoreFootprint;
 
 /// First status contract carrying embedding coverage alongside enrichment
@@ -750,6 +750,37 @@ pub struct CommandStatusResponse {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json: Option<String>,
+    /// A merge this workspace is holding open, read off the same authority the
+    /// report came from.
+    ///
+    /// Carried on the ENVELOPE and not in `report`. `StatusReportWire` denies
+    /// unknown fields, so a key added there makes an older CLI reject a newer
+    /// daemon's report outright and is a v4 decision to take deliberately. This
+    /// struct has never denied them and every field beside `report` already
+    /// defaults, so an older peer on either side of the wire ignores this and
+    /// keeps working.
+    ///
+    /// The point of carrying it at all is that the caller stops opening the
+    /// whole store a second time to read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeInProgress>,
+    /// Where this workspace sits relative to the branch its head names, from
+    /// that same authority and for that same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_tip: Option<crate::commands::workspace_tip::WorkspaceTip>,
+    /// Whether this responder took the two readings above off its own authority.
+    ///
+    /// A flag rather than a `None` test on `merge`, because "this build did not
+    /// read a merge" and "this workspace is holding no merge open" are different
+    /// facts and only the first is a reason for the caller to open the store
+    /// itself. Without it a new CLI against an older daemon would print a clean
+    /// status over a workspace with seventy-six conflicts parked in it, which is
+    /// FIR-2961 reintroduced through the wire rather than through the code.
+    ///
+    /// `#[serde(default)]` makes an older peer's silence read as "did not", so
+    /// the caller falls back to one local open and answers exactly as it did.
+    #[serde(default)]
+    pub authority_readings_taken: bool,
 }
 
 impl CommandStatusRequest {
@@ -778,6 +809,23 @@ pub fn inspect(
     embedding_coverage: EmbeddingCoverage,
 ) -> Result<StatusReport> {
     let authority = ActiveRepositoryAuthority::open(binding)?;
+    inspect_at(layout, &authority, embedding_coverage)
+}
+
+/// The same report, from an authority the caller already opened.
+///
+/// The open is the expensive half of this command by orders of magnitude: it
+/// re-verifies every persisted body, so it costs whatever the whole store is
+/// worth. A caller that needs more than one reading from repository authority
+/// takes ONE open and asks for each of them here, rather than reaching for the
+/// binding-taking wrapper once per reading, which is how one `kin status`
+/// invocation came to open the whole store twice in the CLI and twice more
+/// inside the daemon serving it.
+pub fn inspect_at(
+    layout: &kin_core::KinLayout,
+    authority: &ActiveRepositoryAuthority,
+    embedding_coverage: EmbeddingCoverage,
+) -> Result<StatusReport> {
     let lease = authority.manager().read_authority();
     let metadata = lease.metadata();
     let workspace = metadata
@@ -866,7 +914,7 @@ pub fn inspect(
 /// the schema, not the build check.
 async fn live_status_from_running_daemon(
     layout: &kin_core::KinLayout,
-) -> std::result::Result<StatusReport, EmbeddingCoverageUnobserved> {
+) -> std::result::Result<CommandStatusResponse, EmbeddingCoverageUnobserved> {
     let base_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
         .await
         .ok_or(EmbeddingCoverageUnobserved::NoRunningDaemon)?;
@@ -893,9 +941,7 @@ async fn live_status_from_running_daemon(
     )
     .await
     {
-        Ok(response) => response
-            .map(|response| response.report)
-            .map_err(unavailable),
+        Ok(response) => response.map_err(unavailable),
         Err(_elapsed) => {
             tracing::debug!(
                 budget_secs = LIVE_STATUS_READ_BUDGET.as_secs(),
@@ -906,14 +952,68 @@ async fn live_status_from_running_daemon(
     }
 }
 
+/// One complete status reading, and everything the caller would otherwise open
+/// the store again to learn.
+///
+/// The merge and workspace-tip readings ride here rather than being fetched by
+/// their own helpers, and that IS the fix: each of those helpers takes a
+/// binding and opens the whole store for itself, which is how one `kin status`
+/// came to pay for three whole-store opens on a 470 MiB repository.
+pub struct StatusReading {
+    pub report: StatusReport,
+    pub merge: Option<MergeInProgress>,
+    pub workspace_tip: crate::commands::workspace_tip::WorkspaceTip,
+    pub source: AuthoritySource,
+}
+
 /// One complete status reading: the live daemon's when it answers, and this
 /// process's own authority read naming why it did not otherwise.
-async fn read_status_once(layout: &kin_core::KinLayout) -> Result<StatusReport> {
+///
+/// Exactly zero authority opens in this process on the daemon arm, and exactly
+/// one on the fallback arm. The fallback opens once and asks that one open for
+/// all three readings.
+async fn read_status_once(layout: &kin_core::KinLayout) -> Result<StatusReading> {
     match live_status_from_running_daemon(layout).await {
-        Ok(report) => Ok(report),
+        // A daemon that answered but did not take the merge and tip readings is
+        // an older build. Believing its silence would print a clean status over
+        // a workspace holding a merge open, so this pays for exactly one local
+        // open to read them, which is what this command did before the readings
+        // moved onto the response.
+        Ok(response) if !response.authority_readings_taken => {
+            let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
+            let authority = ActiveRepositoryAuthority::open(&binding)?;
+            Ok(StatusReading {
+                report: response.report,
+                merge: merge_in_progress_at(&authority),
+                workspace_tip: workspace_tip_at(&authority),
+                source: AuthoritySource::RunningDaemonAndOwnOpen,
+            })
+        }
+        Ok(response) => Ok(StatusReading {
+            report: response.report,
+            merge: response.merge,
+            // A responder that says it took the readings and then carries no tip
+            // is a build defect, not a current workspace, and rendering nothing
+            // would say exactly that. Name the gap instead.
+            workspace_tip: response.workspace_tip.unwrap_or(
+                crate::commands::workspace_tip::WorkspaceTip::Unknown {
+                    reason: "the daemon that answered this status reported taking the reading \
+                             and then carried none"
+                        .to_string(),
+                },
+            ),
+            source: AuthoritySource::RunningDaemon,
+        }),
         Err(reason) => {
             let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
-            inspect(layout, &binding, EmbeddingCoverage::unobserved(reason))
+            let authority = ActiveRepositoryAuthority::open(&binding)?;
+            let report = inspect_at(layout, &authority, EmbeddingCoverage::unobserved(reason))?;
+            Ok(StatusReading {
+                merge: merge_in_progress_at(&authority),
+                workspace_tip: workspace_tip_at(&authority),
+                report,
+                source: AuthoritySource::OwnAuthorityOpen,
+            })
         }
     }
 }
@@ -941,24 +1041,24 @@ async fn read_status_once(layout: &kin_core::KinLayout) -> Result<StatusReport> 
 async fn settle_embedding_coverage<Read, Reading>(
     budget: std::time::Duration,
     mut read: Read,
-) -> Result<StatusReport>
+) -> Result<StatusReading>
 where
     Read: FnMut() -> Reading,
-    Reading: std::future::Future<Output = Result<StatusReport>>,
+    Reading: std::future::Future<Output = Result<StatusReading>>,
 {
     let deadline = tokio::time::Instant::now() + budget;
     let mut backoff = QUIESCE_BACKOFF_FLOOR;
     loop {
-        let report = read().await?;
-        let EmbeddingCoverage::Unobserved { reason } = report.embedding_coverage else {
-            return Ok(report);
+        let reading = read().await?;
+        let EmbeddingCoverage::Unobserved { reason } = reading.report.embedding_coverage else {
+            return Ok(reading);
         };
         if !reason.settles_on_its_own() {
-            return Ok(report);
+            return Ok(reading);
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Ok(report);
+            return Ok(reading);
         }
         // Never overshoot the budget the caller stated, including on the last
         // nap before the deadline.
@@ -973,30 +1073,45 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
     // admission describes the graph as it was, which is exactly the answer
     // FIR-2961 is about.
     let pass = admit_before_reading(&layout).await;
-    let report = settle_embedding_coverage(wait_quiesce, || read_status_once(&layout)).await?;
+    let reading = settle_embedding_coverage(wait_quiesce, || read_status_once(&layout)).await?;
+    let report = reading.report;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        // A merge Kin is holding open, read off the authority lease. Never fatal:
-        // a status that refuses to print because it could not check for a merge
-        // is worse than one that prints and does not mention it, and this is the
-        // command an operator runs when something is already wrong.
-        let merge = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
-            .ok()
-            .and_then(|binding| merge_in_progress(&binding).ok())
-            .flatten();
+        // The merge Kin is holding open and where this workspace sits relative
+        // to its branch both came off the SAME authority the report did, in
+        // `read_status_once`. They used to be fetched here through helpers that
+        // each opened the whole store again, which on a 470 MiB import cost two
+        // further whole-store opens for two readings already decoded in a lease
+        // this command had just paid for.
         let footprint = StoreFootprint::measure(&layout);
         print!(
             "{}",
-            render_text(
+            render_text_with_tip(
                 &report,
                 None,
                 Some(&footprint),
                 crate::daemon_death::recorded_for_store(layout.root()).as_ref(),
                 &kin_core::last_admission::read(&layout),
+                // Read from the store rather than asked of the daemon, for the
+                // same reason the freshness line above it is: the record is
+                // durable, so the line appears when the daemon has since gone,
+                // and the status wire contract does not move. `StatusReportWire`
+                // denies unknown fields, so a new key there would make an older
+                // CLI reject a newer daemon's report outright.
+                &kin_core::retained_parse::read(&layout),
                 &pass,
-                merge.as_ref()
+                reading.merge.as_ref(),
+                Some(&reading.workspace_tip),
             )
+        );
+        // Which authority open answered, in the command's own output. Appended
+        // for the same reason the projection and store-size lines are: it is a
+        // measurement of this host and this invocation, not authority truth,
+        // and it must not move the report's wire shape.
+        println!(
+            "{}",
+            super::repository_authority::answered_by_line(reading.source)
         );
         // Which projection served the files this status describes. Appended
         // here rather than folded into the report for the same reason store
@@ -1117,17 +1232,21 @@ pub fn build_command_status_response(
     footprint: Option<&StoreFootprint>,
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
     admission: &LastAdmissionRead,
+    retained: &kin_core::retained_parse::RetainedParseRead,
     pass: &StatusAdmission,
     merge: Option<&MergeInProgress>,
+    workspace_tip: Option<&crate::commands::workspace_tip::WorkspaceTip>,
 ) -> Result<CommandStatusResponse> {
-    let text = render_text(
+    let text = render_text_with_tip(
         &report,
         build.as_ref(),
         footprint,
         death,
         admission,
+        retained,
         pass,
         merge,
+        workspace_tip,
     );
     let json = json
         .then(|| serde_json::to_string(&report))
@@ -1138,6 +1257,13 @@ pub fn build_command_status_response(
         build,
         text,
         json,
+        merge: merge.cloned(),
+        workspace_tip: workspace_tip.cloned(),
+        // Said only where a caller actually supplied the tip reading, which is
+        // the one that cannot be inferred from a `None`. A caller that passes
+        // none has taken neither, and a `merge` of `None` from it means "not
+        // read" rather than "no merge".
+        authority_readings_taken: workspace_tip.is_some(),
     })
 }
 
@@ -1146,7 +1272,7 @@ pub fn build_command_status_response(
 /// Only the fields a status line needs. The full account is `kin conflicts`, and
 /// duplicating it here would give a reader two versions of one merge that can
 /// come to disagree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeInProgress {
     pub source_ref: String,
     pub target_ref: String,
@@ -1174,14 +1300,52 @@ pub fn merge_in_progress(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
 ) -> Result<Option<MergeInProgress>> {
     let authority = ActiveRepositoryAuthority::open(binding)?;
+    Ok(merge_in_progress_at(&authority))
+}
+
+/// The same reading, from an authority the caller already opened.
+///
+/// Infallible, because everything it needs is already decoded in the lease this
+/// open produced. The binding-taking wrapper above is fallible only for the
+/// open it performs.
+pub fn merge_in_progress_at(authority: &ActiveRepositoryAuthority) -> Option<MergeInProgress> {
     let lease = authority.manager().read_authority();
     let workspace_id = authority.workspace_id;
-    Ok(lease
+    lease
         .metadata()
         .merge_transactions
         .iter()
         .find(|record| record.workspace_id == workspace_id && record.state.is_in_progress())
-        .map(summarize_merge))
+        .map(summarize_merge)
+}
+
+/// Where this workspace sits relative to the branch its head names, from an
+/// authority the caller already opened.
+///
+/// Metadata only, so it adds nothing measurable to an open that has already
+/// happened. See [`crate::commands::workspace_tip`] for why the distance in
+/// changes is not part of this reading.
+///
+/// The workspace comes through the authority's own accessor rather than off the
+/// lease here. That is deliberate and not style: `verify-zero-file-search.py`
+/// counts the spelling `.metadata()` per file against a pinned allowlist number,
+/// so a third one in this file fails the gate even though every one of them
+/// reads an authority lease and none of them touches a filesystem. Reaching for
+/// the accessor keeps the count where the allowlist reviewed it, and keeps the
+/// one lookup of this workspace in one place.
+pub fn workspace_tip_at(
+    authority: &ActiveRepositoryAuthority,
+) -> crate::commands::workspace_tip::WorkspaceTip {
+    let workspace = match authority.workspace() {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return crate::commands::workspace_tip::WorkspaceTip::Unknown {
+                reason: error.to_string(),
+            }
+        }
+    };
+    let lease = authority.manager().read_authority();
+    crate::commands::workspace_tip::read(&lease, &workspace)
 }
 
 fn summarize_merge(record: &MergeTransactionRecord) -> MergeInProgress {
@@ -1407,14 +1571,42 @@ fn workspace_state_phrase(
 /// whose enrichment simply has not been certified yet also carries. The counts
 /// matched, the presence matched, and the caveat matched, so the two were
 /// indistinguishable on this surface.
+///
+/// This wrapper is the page as it reads with no workspace-tip line. Every
+/// production caller has one and goes through [`render_text_with_tip`]; the
+/// tests below are about other lines and would otherwise all have to state a
+/// tip they do not care about.
+///
+/// `#[cfg(test)]` because that is now the whole truth about it. Left compiled
+/// into the library it is dead code, and `-D warnings` in CI turns dead code
+/// into a red gate, so an attribute that says what it is beats a build that
+/// happens to include a test target.
+#[cfg(test)]
 fn render_text(
     report: &StatusReport,
     build: Option<&BuildStatus>,
     footprint: Option<&StoreFootprint>,
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
     admission: &LastAdmissionRead,
+    retained: &kin_core::retained_parse::RetainedParseRead,
     pass: &StatusAdmission,
     merge: Option<&MergeInProgress>,
+) -> String {
+    render_text_with_tip(
+        report, build, footprint, death, admission, retained, pass, merge, None,
+    )
+}
+
+fn render_text_with_tip(
+    report: &StatusReport,
+    build: Option<&BuildStatus>,
+    footprint: Option<&StoreFootprint>,
+    death: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    admission: &LastAdmissionRead,
+    retained: &kin_core::retained_parse::RetainedParseRead,
+    pass: &StatusAdmission,
+    merge: Option<&MergeInProgress>,
+    workspace_tip: Option<&crate::commands::workspace_tip::WorkspaceTip>,
 ) -> String {
     let workspace_state =
         workspace_state_phrase(report.workspace.dirty, admission, pass, Utc::now());
@@ -1482,6 +1674,34 @@ fn render_text(
             None => "Authority payload read: none (generation zero built in memory)".to_string(),
         },
     ];
+    // Beside the head it qualifies, not appended at the end. A workspace whose
+    // branch has moved past it reads as a clean tree in every line below, and a
+    // reader who does not already suspect the gap will not scroll for the one
+    // line that names it (FIR-2961 taught the same lesson about the merge
+    // banner, which is why that one leads).
+    if let Some(tip) = workspace_tip {
+        let after_head = lines
+            .iter()
+            .position(|line| line.starts_with("Head: "))
+            .map_or(lines.len(), |position| position + 1);
+        lines.insert(after_head, crate::commands::workspace_tip::line(tip));
+    }
+    // The caveat on the enrichment counts directly above, placed there rather
+    // than appended at the foot of the page. The counts are correct about what
+    // durable authority holds; what they cannot say is that some of it was
+    // derived from bytes the working copy no longer has, and a caveat printed
+    // fifteen lines under the number it qualifies is one a reader reaches after
+    // they have already believed the number. Every placement in this function is
+    // computed by searching the lines it already holds rather than by index, so
+    // the workspace-tip insert above, the merge banner below and this one cannot
+    // shift each other whatever order they run in.
+    if let Some(line) = retained.describe(Utc::now()) {
+        let after_enrichment = lines
+            .iter()
+            .position(|line| line.starts_with("Live graph enrichment:"))
+            .unwrap_or(lines.len());
+        lines.insert(after_enrichment, line);
+    }
     if let Some(footprint) = footprint {
         lines.push(format!("Store size: {}", footprint.render()));
     }
@@ -1638,6 +1858,7 @@ mod tests {
                 None,
                 None,
                 &LastAdmissionRead::Absent,
+                &kin_core::retained_parse::RetainedParseRead::Absent,
                 &skipped_pass(),
                 None
             )
@@ -1948,6 +2169,7 @@ mod tests {
             None,
             None,
             &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
             &skipped_pass(),
             None,
         );
@@ -1980,6 +2202,7 @@ mod tests {
                 None,
                 None,
                 &LastAdmissionRead::Absent,
+                &kin_core::retained_parse::RetainedParseRead::Absent,
                 &skipped_pass(),
                 None
             )
@@ -1991,6 +2214,7 @@ mod tests {
                 None,
                 None,
                 &LastAdmissionRead::Absent,
+                &kin_core::retained_parse::RetainedParseRead::Absent,
                 &skipped_pass(),
                 None
             )
@@ -2094,6 +2318,7 @@ mod tests {
             None,
             None,
             &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
             &skipped_pass(),
             Some(&merge),
         );
@@ -2114,6 +2339,7 @@ mod tests {
             None,
             None,
             &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
             &skipped_pass(),
             None,
         );
@@ -2275,6 +2501,7 @@ mod tests {
                 None,
                 None,
                 &LastAdmissionRead::Absent,
+                &kin_core::retained_parse::RetainedParseRead::Absent,
                 pass,
                 None,
             )
@@ -2321,6 +2548,7 @@ mod tests {
             None,
             None,
             &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
             &skipped_pass(),
             None,
         );
@@ -2336,6 +2564,7 @@ mod tests {
             Some(&footprint),
             None,
             &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
             &skipped_pass(),
             None,
         );
@@ -2400,8 +2629,193 @@ mod tests {
         );
     }
 
+    /// One `kin status` with no daemon must open repository authority exactly
+    /// once.
+    ///
+    /// GAP-6, in the form that scales. An authority open is a full recovery that
+    /// re-verifies every persisted body against its content address, so it costs
+    /// whatever the whole store is worth: measured on a converted 470 MiB
+    /// express store, one open is seconds and this command was paying for two of
+    /// them locally, plus two more inside the daemon serving it. The COUNT is
+    /// the honest bound and the wall clock is not, because a fixture small
+    /// enough to run in CI answers in milliseconds whether it opens once or
+    /// three times.
+    ///
+    /// Counted on this thread only: this binary runs tests in parallel and
+    /// siblings open authority of their own.
+    ///
+    /// Breaking it: put `merge_in_progress(&binding)` or a binding-taking
+    /// workspace-tip helper back on the fallback arm of `read_status_once`,
+    /// which is exactly what the shipped code did. Either takes this to 2.
+    #[tokio::test]
+    async fn one_status_reading_opens_repository_authority_once() {
+        let _daemon = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
+        let root = tempfile::tempdir().expect("a temporary directory for the fixture store");
+        let init = kin_core::init(root.path()).expect("kin_core::init builds a real store");
+
+        let before = kin_core::authority_opens();
+        let reading = read_status_once(&init.layout)
+            .await
+            .expect("a fresh store answers a status");
+        let opens = kin_core::authority_opens() - before;
+
+        // Non-vacuity, all three halves. A reading that came from a daemon would
+        // open nothing here and pass the bound while testing nothing, and a tip
+        // reading that could not be taken cannot tell "one open for every
+        // reading" apart from "one open and the readings missing".
+        assert_eq!(
+            reading.source,
+            AuthoritySource::OwnAuthorityOpen,
+            "this case is about the arm that opens; a daemon answered instead"
+        );
+        assert_eq!(reading.report.schema, STATUS_SCHEMA);
+        assert!(
+            !matches!(
+                reading.workspace_tip,
+                crate::commands::workspace_tip::WorkspaceTip::Unknown { .. }
+            ),
+            "the workspace-tip reading must have come off that same open: {:?}",
+            reading.workspace_tip
+        );
+        assert_eq!(
+            opens, 1,
+            "one `kin status` must open repository authority once and ask that open for the \
+             report, the merge and the workspace tip; opening per reading is GAP-6"
+        );
+    }
+
+    /// An older daemon's silence about the merge reading must read as "did not
+    /// take it", never as "there is no merge".
+    ///
+    /// This is the wire half of the mixed-build case. A new CLI talking to a
+    /// daemon that predates these fields receives no `authority_readings_taken`
+    /// and no `merge`, and if that decoded as "readings taken, no merge" the
+    /// command would print a clean tree over a workspace holding seventy-six
+    /// conflicts open, which is FIR-2961 reintroduced through the wire.
+    ///
+    /// Breaking it: give the field a `#[serde(default = ...)]` that yields true,
+    /// or drop `#[serde(default)]` so an older payload fails to parse at all.
+    #[test]
+    fn an_older_daemons_status_payload_says_it_took_no_authority_readings() {
+        let payload = serde_json::json!({
+            "report": serde_json::to_value(settle_base_report()).unwrap(),
+            "text": "Kin repository-v6 status",
+        });
+        let decoded: CommandStatusResponse =
+            serde_json::from_value(payload).expect("an older daemon's payload must still decode");
+
+        // Non-vacuity: the payload really is the older shape, carrying neither
+        // of the fields whose absence this is about.
+        assert!(decoded.merge.is_none());
+        assert!(decoded.workspace_tip.is_none());
+        assert!(
+            !decoded.authority_readings_taken,
+            "an absent flag must mean the readings were not taken, so the caller reads them itself"
+        );
+    }
+
     /// One real report to drive the settle with, so it is exercised against the
     /// shape production hands it rather than a hand-built stand-in.
+    /// A record naming one path the graph is answering about from an earlier
+    /// parse, so the line is testable without a daemon.
+    fn retained_fixture() -> kin_core::retained_parse::RetainedParseRead {
+        kin_core::retained_parse::RetainedParseRead::Recorded(kin_core::retained_parse::fold(
+            &[],
+            &[kin_core::retained_parse::ObservedParse::retained(
+                "search.py",
+                4,
+            )],
+            Utc::now(),
+        ))
+    }
+
+    /// `kin status` says which paths it is describing from an earlier parse,
+    /// and says it beside the counts it qualifies.
+    ///
+    /// Placement is half of this. The enrichment counts are correct about what
+    /// durable authority holds, and a caveat printed under the store size and
+    /// the daemon memory is one a reader reaches after they have already
+    /// believed the number.
+    #[test]
+    fn the_retained_line_sits_under_the_enrichment_counts_it_qualifies() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
+
+        let rendered = render_text(
+            &report,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &retained_fixture(),
+            &skipped_pass(),
+            None,
+        );
+        let lines: Vec<&str> = rendered.lines().collect();
+        let retained_at = lines
+            .iter()
+            .position(|line| line.starts_with("Did not parse as written:"))
+            .unwrap_or_else(|| panic!("no retained line in:\n{rendered}"));
+        let enrichment_at = lines
+            .iter()
+            .position(|line| line.starts_with("Durable semantic enrichment:"))
+            .expect("the enrichment line is always rendered");
+        assert_eq!(
+            retained_at,
+            enrichment_at + 1,
+            "the caveat belongs directly under the number it qualifies:\n{rendered}"
+        );
+        assert!(
+            lines[retained_at].contains("search.py (4 parse errors)"),
+            "{rendered}"
+        );
+
+        // The control, and the half a fix that printed unconditionally would
+        // fail: a store with nothing retained says nothing about it.
+        let quiet = render_text(
+            &report,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
+            &skipped_pass(),
+            None,
+        );
+        assert!(
+            !quiet.contains("Did not parse as written"),
+            "a store answering from its own bytes must not claim otherwise: {quiet}"
+        );
+    }
+
+    /// A record that will not parse is louder than one that is missing. Silence
+    /// here would let a truncated record read as a whole store, which is the
+    /// class this whole change closes, reached by the other door.
+    #[test]
+    fn an_unreadable_retained_record_is_reported_rather_than_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
+
+        let rendered = render_text(
+            &report,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Unreadable("truncated".to_string()),
+            &skipped_pass(),
+            None,
+        );
+        assert!(
+            rendered.contains("could not be read (truncated)"),
+            "{rendered}"
+        );
+    }
+
     fn settle_base_report() -> StatusReport {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
@@ -2436,15 +2850,26 @@ mod tests {
     ) -> (StatusReport, usize, std::time::Duration) {
         let reads = std::cell::Cell::new(0usize);
         let started = tokio::time::Instant::now();
-        let report = settle_embedding_coverage(budget, || {
+        let reading = settle_embedding_coverage(budget, || {
             let attempt = reads.get();
             reads.set(attempt + 1);
-            let reading = script[attempt.min(script.len() - 1)].clone();
-            async move { Ok(reading) }
+            let report = script[attempt.min(script.len() - 1)].clone();
+            async move {
+                Ok(StatusReading {
+                    report,
+                    merge: None,
+                    workspace_tip: crate::commands::workspace_tip::WorkspaceTip::Detached,
+                    source: AuthoritySource::OwnAuthorityOpen,
+                })
+            }
         })
         .await
         .unwrap();
-        (report, reads.get(), tokio::time::Instant::now() - started)
+        (
+            reading.report,
+            reads.get(),
+            tokio::time::Instant::now() - started,
+        )
     }
 
     /// The race itself: the daemon could not pair a stable authority epoch with

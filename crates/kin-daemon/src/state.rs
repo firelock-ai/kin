@@ -2730,6 +2730,20 @@ pub struct DaemonState {
     /// `u64::MAX` rather than an `Option` so the sentinel and the counter share
     /// one atomic read; [`Self::durable_entity_count`] is the only reader.
     durable_entity_count: AtomicU64,
+    /// Relations durable repository authority carried at that same levelling,
+    /// or `u64::MAX` when this daemon never levelled (FIR-3202).
+    ///
+    /// The counter above answers half the question. A language-server
+    /// enrichment sweep writes its relations into the live graph with
+    /// `upsert_relation` and records nothing, exactly as ambient admission does
+    /// for entities, so a store whose entity counts were level served
+    /// `861 entities, 0 uncommitted; durable repository authority records
+    /// everything answering here` while 3,438 swept relations answered every
+    /// query and no committed change carried any of them. Recorded at the same
+    /// two moments and read under the same fences as the entity count, because
+    /// two counters levelled at different instants would publish a difference
+    /// nobody observed.
+    durable_relation_count: AtomicU64,
     pub blobs: Arc<BlobStore>,
     /// Why the derived ingestion CAS could not be hydrated from graph
     /// Why a persisted local or hosted vector artifact was not installed when
@@ -3503,6 +3517,26 @@ impl DaemonState {
         &self,
     ) -> Option<Arc<kin_core::hydration_semantics::HydrationStampCapability>> {
         self.local_kindb_capability.as_ref().map(Arc::clone)
+    }
+
+    /// The creation-time replay-semantics version this daemon's own store
+    /// records, for declaration beside history this daemon publishes.
+    ///
+    /// Read through the startup-pinned handle rather than by resolving `.kin`
+    /// again, for the reason `HydrationStampCapability` states: a path resolved
+    /// at request time can name a directory this daemon never pinned, and a
+    /// sender that declared another store's number would make a receiver keep a
+    /// record over history that number never spoke for.
+    ///
+    /// `None` on a hosted daemon, which owns no such record, and `None` on a
+    /// local store whose record is absent or will not parse, because a sender
+    /// that cannot read its own record has nothing to declare. Both leave the
+    /// receiver discarding its own record, which is what every transfer did
+    /// before the wire carried this at all.
+    pub(crate) fn local_hydration_creation_version(&self) -> Option<u32> {
+        self.local_kindb_capability
+            .as_ref()
+            .and_then(|capability| capability.read().created_under())
     }
 
     /// Clone the complete repository identity/storage capability pinned when
@@ -5146,6 +5180,9 @@ impl DaemonState {
         // Baseline for the shutdown anti-wipe guard: the entity count loaded
         // from the on-disk snapshot. Read before `graph` is moved into the state.
         let loaded_entity_count = graph.entity_count();
+        // The relation half of the durability baseline, read from the same
+        // snapshot at the same instant so the two describe one graph.
+        let loaded_relation_count = graph.relation_count();
 
         let coordination_events = CoordinationEventLog::open(&layout, &cached_repo_id)?;
         let coordination_event_persist_failures = coordination_events.persisted_failure_count();
@@ -5262,6 +5299,7 @@ impl DaemonState {
             cached_workspace_id: Some(workspace_id),
             is_shutdown: AtomicBool::new(false),
             durable_entity_count: AtomicU64::new(loaded_entity_count as u64),
+            durable_relation_count: AtomicU64::new(loaded_relation_count as u64),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             retired_graph_only_members: Default::default(),
@@ -5502,8 +5540,10 @@ impl DaemonState {
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
 
         // Baseline for the shutdown anti-wipe guard (entity count loaded from
-        // the backend snapshot).
+        // the backend snapshot), and beside it the relation count from the same
+        // snapshot at the same instant.
         let loaded_entity_count = graph.entity_count();
+        let loaded_relation_count = graph.relation_count();
         let spine_disabled = Self::spine_disabled_from_env();
 
         let coordination_events = CoordinationEventLog::open(&layout, repo_id)?;
@@ -5621,6 +5661,7 @@ impl DaemonState {
             cached_workspace_id: None,
             is_shutdown: AtomicBool::new(false),
             durable_entity_count: AtomicU64::new(loaded_entity_count as u64),
+            durable_relation_count: AtomicU64::new(loaded_relation_count as u64),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             retired_graph_only_members: Default::default(),
@@ -10678,6 +10719,32 @@ impl DaemonState {
         // clamping is the only way a real store could ever be read as "never
         // levelled". A repository with `u64::MAX` entities does not exist.
         self.durable_entity_count
+            .store(count.min(u64::MAX - 1), Ordering::Relaxed);
+    }
+
+    /// How many relations durable repository authority carried at that same
+    /// levelling, or `None` when this daemon never levelled (FIR-3202).
+    ///
+    /// `None` is a real answer here for the reason it is for entities: a daemon
+    /// that never levelled cannot say how much of its live relation set is
+    /// recorded, and zero would report all of it as uncommitted.
+    pub fn durable_relation_count(&self) -> Option<u64> {
+        match self.durable_relation_count.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            count => Some(count),
+        }
+    }
+
+    /// Record that the live query graph now carries every relation durable
+    /// authority carries, and how many that is.
+    ///
+    /// Called from the same two levelling paths as
+    /// [`Self::record_durable_entity_count`] and from nowhere else. A path that
+    /// levels one counter and not the other publishes a difference no
+    /// observation produced, which is the shape of wrong answer the block this
+    /// feeds exists to refuse.
+    pub fn record_durable_relation_count(&self, count: u64) {
+        self.durable_relation_count
             .store(count.min(u64::MAX - 1), Ordering::Relaxed);
     }
 

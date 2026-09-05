@@ -149,9 +149,12 @@ enum Command {
     /// commit prints, so this surface and that one cannot drift (FIR-2627).
     #[command(long_about = commands::commit_progress::COMMIT_LONG_ABOUT)]
     Commit {
-        /// Commit message
-        #[arg(short, long)]
-        message: String,
+        /// Commit message; amend preserves the existing message when omitted
+        #[arg(short, long, required_unless_present = "amend")]
+        message: Option<String>,
+        /// Replace the current change with the full working state, preserving its parents
+        #[arg(long)]
+        amend: bool,
         /// Suppress progress output (only print final summary)
         #[arg(short, long)]
         quiet: bool,
@@ -694,7 +697,7 @@ enum Command {
     },
     /// Resolve repository-v6 merge conflicts
     ///
-    /// Nine flags name a resolution and at least one is required, which is a
+    /// At least one resolution flag is required, which is a
     /// group rather than a per-argument condition. `kin conflicts` is the
     /// read-only view of the same transaction, so nothing here has to accept
     /// an empty invocation in order to be inspectable.
@@ -702,7 +705,7 @@ enum Command {
         .required(true)
         .multiple(true)
         .args([
-            "ours", "theirs", "base", "remove", "keep_path",
+            "ours", "theirs", "base", "remove", "keep_path", "file",
             "all_ours", "all_theirs", "do_continue", "abort",
         ]))]
     Resolve {
@@ -721,6 +724,9 @@ enum Command {
         /// Settle a contested path by naming the artifact that keeps it
         #[arg(long, value_name = "PATH=ARTIFACT")]
         keep_path: Vec<String>,
+        /// Resolve a conflicted repository path using the exact bytes in FILE
+        #[arg(long, num_args = 2, value_names = ["PATH", "FILE"], action = clap::ArgAction::Append)]
+        file: Vec<String>,
         /// Resolve all remaining conflicts keeping your version
         #[arg(long)]
         all_ours: bool,
@@ -832,10 +838,13 @@ enum Command {
     },
     /// Clone a repository
     Clone {
-        /// Git repository URL (native Kin transport is an explicit open gate)
+        /// Native Kin locator or Git repository URL
         url: String,
         /// Target directory (defaults to repo name)
         path: Option<String>,
+        /// Native repository identity when URL is a peer daemon HTTP endpoint
+        #[arg(long)]
+        repository: Option<String>,
     },
     /// Restore an exact path or subtree from immutable repository-v6 history
     Checkout {
@@ -2848,11 +2857,15 @@ fn run() -> Result<()> {
                         commands::resources::run(json, profile).await
                     }
                 },
-                Command::Commit { message, quiet } => {
+                Command::Commit {
+                    message,
+                    quiet,
+                    amend,
+                } => {
                     commands::capabilities::require_ready("commit")?;
-                    commands::commit::run(message, quiet).await
+                    commands::commit::run(message, quiet, amend).await
                 }
-                Command::Log { count, json } => commands::log::run(count, json),
+                Command::Log { count, json } => commands::log::run(count, json).await,
                 Command::Branch { action } => match action {
                     BranchAction::List { json } => commands::branch::list(json).await,
                     BranchAction::Create { name, ref_hex } => {
@@ -3456,6 +3469,7 @@ fn run() -> Result<()> {
                     base,
                     remove,
                     keep_path,
+                    file,
                     all_ours,
                     all_theirs,
                     do_continue,
@@ -3470,6 +3484,7 @@ fn run() -> Result<()> {
                         base,
                         remove,
                         keep_path,
+                        file,
                         all_ours,
                         all_theirs,
                         do_continue,
@@ -3632,7 +3647,11 @@ fn run() -> Result<()> {
                     commands::capabilities::require_ready("pull")?;
                     commands::transfer::pull(remote, url, reference, json).await
                 }
-                Command::Clone { url, path } => commands::clone::run(url, path).await,
+                Command::Clone {
+                    url,
+                    path,
+                    repository,
+                } => commands::clone::run(url, path, repository).await,
                 Command::Checkout {
                     path,
                     path_hex,
@@ -5316,6 +5335,42 @@ mod tests {
         });
     }
 
+    #[test]
+    fn file_resolution_accepts_repeated_pairs_and_rejects_missing_bodies() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "kin",
+                "resolve",
+                "--file",
+                "src/a=b.rs",
+                "/tmp/a=b.rs",
+                "--file",
+                "notes.txt",
+                "/tmp/notes.txt",
+                "--json",
+            ])
+            .expect("explicit file resolutions are a complete invocation");
+            match cli.command {
+                Command::Resolve { file, json, .. } => {
+                    assert_eq!(
+                        file,
+                        ["src/a=b.rs", "/tmp/a=b.rs", "notes.txt", "/tmp/notes.txt"]
+                    );
+                    assert!(json);
+                }
+                _ => panic!("expected resolve"),
+            }
+            for argv in [
+                &["kin", "resolve", "--file"][..],
+                &["kin", "resolve", "--file", "src/code.rs"][..],
+                &["kin", "resolve", "--file", "src/code.rs", "--json"][..],
+            ] {
+                let error = Cli::try_parse_from(argv).err().expect("a body is required");
+                assert_eq!(error.exit_code(), 2);
+            }
+        });
+    }
+
     /// FIR-2938. The server has read `provider` on `/auth/login` for as long
     /// as it has had more than one, and the web page offers both, but the CLI
     /// sent nothing, so a terminal user could not reach the GitHub sign-in at
@@ -5609,6 +5664,36 @@ mod tests {
                      an open gate"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn commit_amend_preserves_message_unless_overridden() {
+        on_cli_test_stack(|| {
+            assert!(Cli::try_parse_from(["kin", "commit"]).is_err());
+            let cli = Cli::try_parse_from(["kin", "commit", "--amend"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Commit {
+                    amend: true,
+                    message: None,
+                    ..
+                }
+            ));
+            let cli =
+                Cli::try_parse_from(["kin", "commit", "--amend", "-m", "correction"]).unwrap();
+            assert!(
+                matches!(cli.command, Command::Commit { amend: true, message: Some(message), .. } if message == "correction")
+            );
+            let cli = Cli::try_parse_from(["kin", "commit", "-m", "new change"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Commit {
+                    amend: false,
+                    message: Some(_),
+                    ..
+                }
+            ));
         });
     }
 

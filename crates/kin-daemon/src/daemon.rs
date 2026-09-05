@@ -3469,7 +3469,7 @@ const ENRICHMENT_WRITE_BATCH: usize = 256;
 /// the graph is the truth being written to, and it is the only surface that can
 /// separate "never written" from "written, then a later step failed".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct EnrichmentWrite {
+pub(crate) struct EnrichmentWrite {
     /// Relations the graph holds afterwards, counted from the graph.
     published: usize,
     /// Relations this write was asked to publish.
@@ -3647,7 +3647,7 @@ fn held_relation_ids(
     held
 }
 
-fn install_lsp_relations(
+pub(crate) fn install_lsp_relations(
     state: &DaemonState,
     relations: &[kin_model::Relation],
 ) -> EnrichmentWrite {

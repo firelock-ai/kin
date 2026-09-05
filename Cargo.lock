@@ -141,7 +141,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -152,7 +152,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -448,7 +448,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes 3.0.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -465,7 +465,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "winx",
 ]
 
@@ -1130,7 +1130,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1239,7 +1239,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3052,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "kin-agent"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3081,14 +3081,14 @@ dependencies = [
 
 [[package]]
 name = "kin-buildinfo"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "sha2 0.11.0",
 ]
 
 [[package]]
 name = "kin-cli"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "age",
  "anyhow",
@@ -3169,7 +3169,7 @@ dependencies = [
 
 [[package]]
 name = "kin-context"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3185,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "kin-core"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -3220,7 +3220,7 @@ dependencies = [
 
 [[package]]
 name = "kin-daemon"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "kin-daemon-spawn"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "fs2",
  "libc",
@@ -3295,9 +3295,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.7.101"
+version = "0.7.102"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "79b731269e751a17239f0cca406d8140bc4ef3e658a7e47f3d56ef872b997dbb"
+checksum = "a112df686bd7ba5433912c5dc9032a09dd915b387bde295196f1e17a73fc31b4"
 dependencies = [
  "bincode",
  "bstr",
@@ -3342,7 +3342,7 @@ dependencies = [
 
 [[package]]
 name = "kin-git"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "cap-std",
  "chrono",
@@ -3367,7 +3367,7 @@ dependencies = [
 
 [[package]]
 name = "kin-index"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "hex",
  "kin-blobs",
@@ -3419,7 +3419,7 @@ dependencies = [
 
 [[package]]
 name = "kin-integration-tests"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "kin-blobs",
  "kin-context",
@@ -3454,7 +3454,7 @@ dependencies = [
 
 [[package]]
 name = "kin-mcp"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "base64 0.23.0",
  "hex",
@@ -3485,7 +3485,7 @@ dependencies = [
 
 [[package]]
 name = "kin-migrate"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "kin-blobs",
@@ -3535,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "kin-notifier-macos"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "block2",
  "objc2 0.6.4",
@@ -3547,7 +3547,7 @@ dependencies = [
 
 [[package]]
 name = "kin-notify"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3558,7 +3558,7 @@ dependencies = [
 
 [[package]]
 name = "kin-parser"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "kin-model",
  "pretty_assertions",
@@ -3588,7 +3588,7 @@ dependencies = [
 
 [[package]]
 name = "kin-projection"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3603,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "kin-ranking"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "kin-model",
  "serde",
@@ -3612,7 +3612,7 @@ dependencies = [
 
 [[package]]
 name = "kin-reconcile"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3632,7 +3632,7 @@ dependencies = [
 
 [[package]]
 name = "kin-registry"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -3665,7 +3665,7 @@ dependencies = [
 
 [[package]]
 name = "kin-remote"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "base64 0.23.0",
  "chrono",
@@ -3686,7 +3686,7 @@ dependencies = [
 
 [[package]]
 name = "kin-review"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "kin-runtime"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "kin-blobs",
@@ -3735,7 +3735,7 @@ dependencies = [
 
 [[package]]
 name = "kin-semantic-contracts"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "kin-db",
  "kin-model",
@@ -3750,7 +3750,7 @@ dependencies = [
 
 [[package]]
 name = "kin-spine"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "hashbrown 0.15.5",
@@ -4158,7 +4158,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5080,7 +5080,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5149,7 +5149,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5602,7 +5602,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5746,7 +5746,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6679,7 +6679,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

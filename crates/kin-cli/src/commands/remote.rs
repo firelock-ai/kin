@@ -538,7 +538,7 @@ pub async fn add(
     let layout = crate::commands::require_repository_layout()?;
     let host = RemoteHostKind::from_str(&host).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown remote host '{}'; expected github, gitlab, bitbucket, or kinlab",
+            "unknown remote host '{}'; expected github, gitlab, bitbucket, kinlab, or peer",
             host
         )
     })?;
@@ -597,9 +597,9 @@ pub async fn lease(
     )?;
     if native_remote_bearer_token(&target.base_url).is_none() {
         anyhow::bail!(
-            "no KinLab auth token available for {}. Run `kin auth login --base-url {}` or set KIN_REMOTE_BEARER_TOKEN.",
+            "no auth token available for {}; {}",
             target.base_url,
-            target.base_url
+            kin_remote::repository_transfer::bearer_token_next_step(&target.base_url)
         );
     }
 
@@ -899,6 +899,7 @@ fn map_to_remote_ref(remote: &RemoteRefConfig) -> kin_remote::RemoteRef {
             RemoteHostKind::GitLab => kin_remote::HostKind::GitLab,
             RemoteHostKind::Bitbucket => kin_remote::HostKind::Bitbucket,
             RemoteHostKind::KinLab => kin_remote::HostKind::KinLab,
+            RemoteHostKind::Peer => kin_remote::HostKind::Peer,
         },
         transport: match remote.transport {
             RemoteTransportKind::GitExport => kin_remote::TransportKind::GitExport,
@@ -974,9 +975,9 @@ pub async fn sessions(remote: Option<String>, json: bool) -> Result<()> {
     )?;
     if native_remote_bearer_token(&target.base_url).is_none() {
         anyhow::bail!(
-            "no KinLab auth token available for {}. Run `kin auth login --base-url {}` or set KIN_REMOTE_BEARER_TOKEN.",
+            "no auth token available for {}; {}",
             target.base_url,
-            target.base_url
+            kin_remote::repository_transfer::bearer_token_next_step(&target.base_url)
         );
     }
 

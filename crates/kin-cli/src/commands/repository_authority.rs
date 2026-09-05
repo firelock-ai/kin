@@ -264,6 +264,56 @@ impl RequestRepositoryAuthority {
     }
 }
 
+/// Which authority open answered one command.
+///
+/// Printed, not inferred. The two paths cost different orders of magnitude on a
+/// real store, so a reader whose `kin status` took thirty seconds needs to be
+/// able to see which one they got without reading a log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthoritySource {
+    /// The daemon serving this repository answered, from the authority it holds
+    /// open for the current publication, and this process opened nothing.
+    RunningDaemon,
+    /// The daemon answered, and this process still had to open the store for a
+    /// reading that daemon's build does not carry.
+    ///
+    /// Its own arm rather than folded into either neighbour, because both of
+    /// those would be a lie a reader could act on: "the daemon answered" hides
+    /// an open that took seconds, and "no daemon answered" sends them to start
+    /// one that is already running.
+    RunningDaemonAndOwnOpen,
+    /// This command opened repository authority itself.
+    OwnAuthorityOpen,
+}
+
+/// The line naming which authority open answered this invocation.
+///
+/// Worded so the number beside it is explained rather than merely reported: an
+/// open re-verifies every persisted body, so it costs whatever the whole store
+/// is worth, and a reader who waited thirty seconds needs to know they were the
+/// one paying for it.
+///
+/// Real, not theater. Each verb passes the arm it actually took, and the arms
+/// are distinguishable at the call site rather than guessed from a daemon
+/// liveness probe taken afterwards.
+pub fn answered_by_line(source: AuthoritySource) -> String {
+    match source {
+        AuthoritySource::RunningDaemon => "Answered by: this repository's daemon, from the \
+             authority it already holds open for the current publication"
+            .to_string(),
+        AuthoritySource::RunningDaemonAndOwnOpen => "Answered by: this repository's daemon, plus \
+             one repository-authority open in this command because that daemon's build does not \
+             carry every reading this page prints; `kin daemon stop` and re-run to restart it on \
+             this build"
+            .to_string(),
+        AuthoritySource::OwnAuthorityOpen => "Answered by: this command's own \
+             repository-authority open, which re-verifies every persisted body; no daemon \
+             answered. Start this repository's daemon to serve it from one open per publication \
+             instead"
+            .to_string(),
+    }
+}
+
 impl ActiveRepositoryAuthority {
     /// Open the authority from durable storage.
     ///

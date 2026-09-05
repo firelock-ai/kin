@@ -7,11 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.8] - 2026-09-04
+## [0.7.0] - 2026-09-05
 
 ### Changed
 
 - Say which half of readiness refused, and how long it waited (#1486)
+- Read every release page before planning promotions (#1488)
+- Report unavailable enrichment after language-server installation (#1490)
+- Count semantic changes, not every hash a read surface prints (#1492)
+- First-contact truth follow-ups: the model fetch and the replayed graph sample (#1491)
+- Accept the release's own receipt as a stranger-run link (#1495)
+- Support native commit amend with exact head leases (#1496)
+- Support authored files in durable merge resolution (#1498)
+- Clone native repository history and exact source bodies (#1497)
+- Report entity change by content, not by artifact (#1493)
+- Parse a session's bytes where the session publishes them (#1499)
 
 
 ## [0.6.7] - 2026-09-04

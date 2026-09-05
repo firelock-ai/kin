@@ -53,6 +53,15 @@
       ]
     },
     {
+      "file": "crates/kin-cli/src/commands/resolve.rs",
+      "reason": "Explicit merge input boundary: --file reads the caller-selected input once with a bounded reader, then submits those bytes as a merge decision. The daemon persists them in repository CAS and derives semantic state from that immutable input. Only this open expression is exempt; conflict inspection and every other primitive in the module remain guarded.",
+      "owner": "kin-cli",
+      "expiration": "2027-01-29",
+      "allow_match": [
+        "let input = std::fs::File::open(source)"
+      ]
+    },
+    {
       "file": "crates/kin-cli/src/commands/spec.rs",
       "reason": "Known violation under repair, not a boundary claim. Unlike every other entry here, these reads ARE the answer authority: `kin spec list` and `kin spec show` resolve their result by walking and parsing .kin/specs/*.json, which is exactly what the Zero File-Search Authority Rule forbids on a query path. The entry exists so the violation is visible, owned, and dated rather than invisible, which it was until this module entered the scanned query set: nothing had ever reported it. It is not evidence the path is graph-backed and must not be read as one. The reason it cannot simply be fixed is storage, not wiring: the pinned registry crates carry no home for a spec. kin_model::Spec is a bare data struct, GraphStore composes EntityStore, ChangeStore, WorkStore, ReviewStore, VerificationStore, ProvenanceStore and SessionStore and none of them has a spec method, and kin-db imports SpecId without using it. Mapping a spec onto a WorkItem would drop constraints, affected systems, validation requirements and the free-string scope, so the faithful fix is a SpecStore in kin-model and kin-db, which is a bottom-up registry publish. Tracked on the internal board for the command and for the store substrate; both pins and this entry come out when the query path reads graph truth. Pinned to the seven exact expressions rather than the whole file, so the debt cannot grow: any newly added filesystem primitive in this module fails the guard. Re-dated from 2026-10-31 to 2027-01-29 on 2026-09-03. The original date was set while neither zero-file-search guard graded a pull request, so it was a tracking date rather than a merge blocker. kin#1448 moved both guards into fast-gate-lint, which carries the required \"Fast gate lint and policy\" context and no job-level if, so from that landing the expiry blocks every kin pull request on the day it fires, whatever that pull request touches. The fix is the SpecStore train described above: kin-model, then kin-db, then a registry publish, carrying a GraphSnapshot format version, which is not schedulable against the old date. Measured on 2026-09-03 against the current pins: still no SpecStore in kin-model 0.7.23 or kin-db 0.7.96, and kin-db still imports SpecId at types.rs:15 without using it. The new date is kin-cli's own review day under the staggering this guard now recommends, so it is not a day any other owner's entries share.",
       "owner": "kin-cli",
@@ -520,8 +529,22 @@
       ]
     },
     {
+      "file": "crates/kin-core/src/retained_parse.rs",
+      "reason": "Durable bookkeeping record published beside the last-admission and relation-census markers, not an answer authority. The excused bodies read and write .kin/kindb/retained-parse, which names the repository paths whose current bytes did not parse and whose entities the graph is therefore still answering from an earlier parse. The daemon reconciles under ReconcilePolicy::FallbackToLkg, so the reconciler already knows this and logged it as `broken AST, retaining LKG state` while `kin status`, `kin diff`, `kin commit`, `kin graph status` and `kin doctor` each reported a whole store over that file; this record is what lets the five say so instead. It is written only by the daemon's two reconcile seams, from the paths a pass actually observed, and read only by those reporting surfaces. The record names no entity, carries no repository content, holds no file body, and cannot change what any query returns: it moves a disclosure toward or away from caution, never a locate, search, context, trace, review or xref answer, and a reader that lied in either direction would change only whether a line is printed. Publication is a temp-and-rename with an fsync of the staged file and then of the containing directory, the same shape last_admission.rs and relation_census.rs beside it use, and the two cfg-gated sync_directory_metadata bodies are that directory fsync. Routing through a shared boundary helper instead was not available: kin-core exposes no public atomic-write path, and config.rs, registry.rs, last_admission.rs, relation_census.rs and the daemon's state.rs each open-code their own. Function-scoped rather than whole-file so the rest of the module stays scanned, including the three-way read classification, the fold rule that decides which paths a pass settles, and the sentence every surface renders, and so any newly added filesystem primitive here fails the guard until it is justified. `record` is the fold and publish entry point and performs no filesystem call of its own beyond `read` and `write`.",
+      "owner": "kin-core",
+      "expiration": "2026-12-31",
+      "allow_fn": [
+        "read",
+        "write",
+        {
+          "fn": "sync_directory_metadata",
+          "count": 2
+        }
+      ]
+    },
+    {
       "file": "crates/kin-core/src/hydration_semantics.rs",
-      "reason": "Durable creation-time record published beside the last-admission and relation-census markers, not an answer authority. The excused bodies read, write and remove .kin/kindb/hydration-semantics, which records the replay-semantics version in force when the store was created, so `kin graph status`, `kin doctor` and the `_kin` envelope can disclose that a store's persisted history cannot be shown to match the version this build derives instead of printing an all-clear over it (FIR-2829). It is written once, into the STAGED layout before the rename that publishes `.kin`, and removed once, at the commit boundary of a native transfer, because the transfer protocol carries no authoring version and a receiver must stop claiming one for history authored elsewhere. The record names no entity, carries no repository content, and cannot change what any query returns: a reader that lied in either direction would move a disclosure toward or away from caution, never a locate, search, context, trace, review or xref result. Publication is a temp-and-rename with an fsync of the staged file and then of the containing directory, the same shape last_admission.rs and relation_census.rs beside it use, and the two cfg-gated sync_directory_metadata bodies are that directory fsync. Routing through a shared boundary helper instead was not available: kin-core exposes no public atomic-write path, and config.rs, registry.rs, last_admission.rs, relation_census.rs and the daemon's state.rs each open-code their own. Function-scoped rather than whole-file so the rest of the module stays scanned, including the standing comparison, the canonical sentence and the direction-safe remedies every surface renders, and so any newly added filesystem primitive here fails the guard until it is justified. invalidate_for_unversioned_transfer carries a count of two, one body per addressing mode: the free function resolves the ambient path for tests, and the HydrationStampCapability method reaches the same file through the directory handle the daemon pinned at startup. Only the first is flagged by the scan, and pinning both by name means a third body added under either name still fails the guard on its own. The two allow_match pins are that retained handle, which no function-scoped pin can reach: the struct field sits inside no function body at all, and its open sits in HydrationStampCapability::open beside the cap_std directory the same struct holds. The handle is the durability mechanism for the removal on both platforms. A cap_std directory descriptor refuses fsync with EBADF on Linux while macOS accepts it, so making the unlink durable needs the same File::open(dir).sync_all() shape the record's writer already uses, opened once beside the capability rather than resolved again at request time. Both pins are exact expressions, so the rest of each line stays scanned and a second primitive added beside either one still fails the guard on its own.",
+      "reason": "Durable creation-time record published beside the last-admission and relation-census markers, not an answer authority. The excused bodies read, write and remove .kin/kindb/hydration-semantics, which records the replay-semantics version in force when the store was created, so `kin graph status`, `kin doctor` and the `_kin` envelope can disclose that a store's persisted history cannot be shown to match the version this build derives instead of printing an all-clear over it (FIR-2829). It is written once, into the STAGED layout before the rename that publishes `.kin`, and removed once, at the commit boundary of a native transfer, because the transfer protocol carries no authoring version and a receiver must stop claiming one for history authored elsewhere. The record names no entity, carries no repository content, and cannot change what any query returns: a reader that lied in either direction would move a disclosure toward or away from caution, never a locate, search, context, trace, review or xref result. Publication is a temp-and-rename with an fsync of the staged file and then of the containing directory, the same shape last_admission.rs and relation_census.rs beside it use, and the two cfg-gated sync_directory_metadata bodies are that directory fsync. Routing through a shared boundary helper instead was not available: kin-core exposes no public atomic-write path, and config.rs, registry.rs, last_admission.rs, relation_census.rs and the daemon's state.rs each open-code their own. Function-scoped rather than whole-file so the rest of the module stays scanned, including the standing comparison, the canonical sentence and the direction-safe remedies every surface renders, and so any newly added filesystem primitive here fails the guard until it is justified. invalidate_for_unversioned_transfer carries a count of two, one body per addressing mode: the free function resolves the ambient path for tests, and the HydrationStampCapability method reaches the same file through the directory handle the daemon pinned at startup. Only the first is flagged by the scan, and pinning both by name means a third body added under either name still fails the guard on its own. read carries a count of two for the same reason and in the same two modes. A transfer receiver now compares the version a pack declared against what this store recorded, and it must read that record through the handle it pinned at startup rather than by resolving `.kin` again at request time, for the reason the removal already states: a path resolved per request can name a directory this daemon never pinned. Only the free function is flagged by the scan, because the capability's body reaches the same file through the cap_std directory rather than through std::fs, and both are pinned by name so a third body added under either still fails the guard on its own. One parser sits behind both, so the ambient path and the retained handle cannot disagree about what a given record says. The two allow_match pins are that retained handle, which no function-scoped pin can reach: the struct field sits inside no function body at all, and its open sits in HydrationStampCapability::open beside the cap_std directory the same struct holds. The handle is the durability mechanism for the removal on both platforms. A cap_std directory descriptor refuses fsync with EBADF on Linux while macOS accepts it, so making the unlink durable needs the same File::open(dir).sync_all() shape the record's writer already uses, opened once beside the capability rather than resolved again at request time. Both pins are exact expressions, so the rest of each line stays scanned and a second primitive added beside either one still fails the guard on its own.",
       "owner": "kin-core",
       "expiration": "2026-12-31",
       "allow_match": [
@@ -529,7 +552,10 @@
         "sync_handle: std::fs::File::open(kindb_dir)?,"
       ],
       "allow_fn": [
-        "read",
+        {
+          "fn": "read",
+          "count": 2
+        },
         "write",
         {
           "fn": "invalidate_for_unversioned_transfer",
@@ -561,6 +587,17 @@
         "let _ = std::fs::write(footprint_record_path(kin_root), body);",
         "let raw = std::fs::read(footprint_record_path(kin_root)).ok()?;",
         "let _ = std::fs::remove_file(footprint_record_path(kin_root));"
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/semantic_debt.rs",
+      "reason": "Semantic-debt record boundary. Three primitives on one bookkeeping file at <kin_root>/semantic-debt.json: one read of what is owed, one rewrite when an entry is recorded or settled, and one removal when a commit settles the whole record. It names repository paths whose exact bytes reached authority without a parse, and nothing else. No repository content is read here and no query answer derives from it: what the record names is decided against graph truth by partition_against_tree before anything acts on it, and the parse it triggers reads the body the exact tree names from graph-owned CAS rather than from the filesystem. An absent or unparseable record degrades to the behaviour that existed before it, a path answering at the positions its previous parse recorded, rather than to a wrong answer this daemon believes. It is a file rather than in-memory state for the same reason the unpublished-enrichment marker beside it is: the fact it carries is only ever read by a LATER process. A session reconcile publishes the workspace tree with no history and no ref move, entities reach durable authority only inside a semantic change, so the re-derivation it triggers has nothing to ride and dies with the daemon that performed it. Measured, not assumed: a daemon reopened between a session's edit and its commit read the pre-edit span back, and a synchronous snapshot immediately after the re-derivation did not change that. Function-scoped so the rest of the module stays scanned, and the module holds no other filesystem call.",
+      "owner": "kin-daemon",
+      "expiration": "2027-09-24",
+      "allow_fn": [
+        "outstanding",
+        "write",
+        "settle_all"
       ]
     },
     {
@@ -659,13 +696,13 @@
     },
     {
       "file": "crates/kin-daemon/src/repository_commit.rs",
-      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified. The count is the six occurrences in scanned code. It deliberately does not cover the module's test paths, which the guard never reads: counting those too would have let a routine test refactor release budget for a real filesystem probe in a scanned path without changing the declared number. The count rose from six to seven when `authority_workspace_tree` was added, which reads the same lease for the workspace's exact tree so a daemon whose derived graph outran authority can be returned to it; the read lives in this module rather than beside its caller precisely so it lands inside this accounting.",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified. The count is the six occurrences in scanned code. It deliberately does not cover the module's test paths, which the guard never reads: counting those too would have let a routine test refactor release budget for a real filesystem probe in a scanned path without changing the declared number. The count rose from six to seven when `authority_workspace_tree` was added, which reads the same lease for the workspace's exact tree so a daemon whose derived graph outran authority can be returned to it; the read lives in this module rather than beside its caller precisely so it lands inside this accounting. Nine since `kin commit --amend`: `validate_native_amend_head` reads `lease.metadata()` twice on `authority.read_authority()`, once to find the local workspace and once to resolve that workspace's head, so the selected head is checked before filesystem admission can mutate the workspace; both are graph-owned authority reads, not filesystem probes, so the count moved from seven to nine without widening the exemption in kind.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_match": [
         {
           "expr": ".metadata()",
-          "count": 7
+          "count": 9
         }
       ]
     },
@@ -962,6 +999,21 @@
       "reason": "Repository conversion, end to end, and the largest of these at 102 reported sites. It runs before any graph exists, on the source tree and on the staging directories it mints itself, and its output is the .kin repository rather than an answer to a query. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
       "owner": "kin-core",
       "expiration": "2027-02-26"
+    },
+    {
+      "file": "crates/kin-core/src/init/replica.rs",
+      "reason": "Explicit replica initialization and projection boundary. These operations inspect only the requested clone destination and private staging directories, then publish a verified repository and its graph-derived workspace. No filesystem content answers a semantic query. Each filesystem operation is pinned so new access requires review.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26",
+      "allow_match": [
+        "std::fs::create_dir_all(parent)",
+        "parent.canonicalize()",
+        "stage.path().canonicalize()",
+        "std::fs::remove_dir(&target)",
+        "std::fs::symlink_metadata(target)",
+        "!metadata.file_type().is_dir()",
+        "std::fs::read_dir(target)"
+      ]
     },
     {
       "file": "crates/kin-core/src/init_attempt.rs",

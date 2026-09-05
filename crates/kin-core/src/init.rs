@@ -31,6 +31,8 @@ use crate::error::{KinError, Result};
 use crate::layout::{KinLayout, KIN_LAYOUT_VERSION};
 use crate::manifest::KinManifest;
 
+pub mod replica;
+
 const INIT_STAGE_PREFIX: &str = ".kin.init-";
 const INIT_STAGE_OWNER_SUFFIX: &str = ".owner";
 const INIT_STAGE_OWNER_SCHEMA_VERSION: u32 = 1;
@@ -291,6 +293,31 @@ impl PreparedRepositoryInit {
     /// This is the read side of [`Self::save_source_blob`], and it exists so
     /// admission can prove the staged repository owns every body its admitted
     /// trees reference before that repository is published.
+    /// Reconcile the creation record this staging already wrote against the
+    /// version a bootstrap pack declared for the history about to be committed
+    /// into it.
+    ///
+    /// A replica bootstrap is a received transfer that never reaches the
+    /// transfer receiver: it is admitted here, inside the staged layout, which
+    /// is also where [`crate::hydration_semantics::stamp_staged`] wrote this
+    /// build's version moments earlier. Without this, a replica published from
+    /// another host's history read `Current` over it, which is exactly the
+    /// false certification the receiver's own reconciliation prevents.
+    ///
+    /// Running it here rather than after publication is the cheapest correct
+    /// place: nothing is visible yet, so a failure aborts the conversion and
+    /// cleans up staging instead of publishing a store that misreports itself.
+    pub fn reconcile_bootstrap_hydration_semantics(&self, declared: Option<u32>) -> Result<()> {
+        if crate::hydration_semantics::transfer_preserves_creation_record(
+            crate::hydration_semantics::read(&self.layout).created_under(),
+            declared,
+        ) {
+            return Ok(());
+        }
+        crate::hydration_semantics::invalidate_for_unversioned_transfer(&self.layout)
+            .map_err(|error| KinError::io(self.layout.kindb_hydration_semantics_path(), error))
+    }
+
     pub fn load_source_blob(&self, digest: Hash256) -> Result<Option<Vec<u8>>> {
         self.authority()?
             .load_source_blob(digest)
@@ -305,6 +332,14 @@ impl PreparedRepositoryInit {
     pub fn commit_repository_bootstrap(
         &mut self,
         transaction: RepositoryTransaction,
+    ) -> Result<&RepositoryBootstrap> {
+        self.commit_bootstrap(transaction, None)
+    }
+
+    fn commit_bootstrap(
+        &mut self,
+        transaction: RepositoryTransaction,
+        receiver_case: Option<AdmissionCase>,
     ) -> Result<&RepositoryBootstrap> {
         verify_metadata_seal(&self.layout, &self.metadata_seal)?;
         let operation_id = transaction.operation_id;
@@ -355,6 +390,7 @@ impl PreparedRepositoryInit {
                     transaction,
                     repository_id,
                     workspace_id,
+                    receiver_case,
                 )?;
                 if bootstrap.receipt.generation != 1
                     || bootstrap.receipt.roots_before != *initial_roots
@@ -1448,7 +1484,7 @@ where
         &prepared_default_ref,
         &initial_roots,
     )?;
-    commit_bootstrap_transaction(authority, transaction, &repository_id, workspace_id)
+    commit_bootstrap_transaction(authority, transaction, &repository_id, workspace_id, None)
 }
 
 fn build_repository_bootstrap_transaction(
@@ -1570,6 +1606,7 @@ fn commit_bootstrap_transaction<B>(
     transaction: RepositoryTransaction,
     repository_id: &RepositoryId,
     workspace_id: WorkspaceId,
+    receiver_case: Option<AdmissionCase>,
 ) -> Result<RepositoryBootstrap>
 where
     B: StorageBackend + 'static,
@@ -1604,9 +1641,13 @@ where
             changes = transaction.changes.len()
         )
         .entered();
-        authority
-            .commit_repository_transaction(transaction)
-            .map_err(graph_error)?
+        match receiver_case {
+            Some(case) => {
+                authority.commit_transferred_repository_transaction(transaction, Some(case))
+            }
+            None => authority.commit_repository_transaction(transaction),
+        }
+        .map_err(graph_error)?
     };
     let workspace = {
         crate::report_admission_progress("binding workspace to committed roots");

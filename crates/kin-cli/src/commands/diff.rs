@@ -30,6 +30,14 @@ pub struct DiffRequest {
     pub head: Option<String>,
     #[serde(default)]
     pub json: bool,
+    /// Whether the caller wants whole bodies rather than the trimmed content
+    /// rows, so the server can read CAS on the caller's behalf.
+    ///
+    /// `#[serde(default)]` because this crosses the daemon wire and an older
+    /// peer neither sends nor understands it; a daemon that ignores it answers
+    /// exactly as it did, and the caller's own fallback fills the content in.
+    #[serde(default)]
+    pub full_bodies: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +46,15 @@ pub struct DiffResponse {
     pub lines: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<DiffReport>,
+    /// Whether this responder read artifact content into `report`.
+    ///
+    /// A flag rather than an empty-vector test, because "this build did not
+    /// read content" and "the content rows are genuinely empty" are different
+    /// facts and only the first is a reason for the caller to open the whole
+    /// store and read CAS itself. `#[serde(default)]` makes an older peer's
+    /// silence read as the first, which is what it means.
+    #[serde(default)]
+    pub artifact_content_rendered: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +97,13 @@ pub struct DiffSummary {
     pub entities_added: usize,
     pub entities_modified: usize,
     pub entities_removed: usize,
+    /// Entities that appear in a changed artifact on both endpoints while their
+    /// own content is identical.
+    ///
+    /// Counted rather than silently dropped, and `#[serde(default)]` because
+    /// this crosses the daemon wire and an older peer sends none.
+    #[serde(default)]
+    pub entities_unchanged: usize,
     pub relations_added: usize,
     pub relations_modified: usize,
     pub relations_removed: usize,
@@ -248,6 +272,21 @@ pub fn inspect_with_endpoint_entities(
     live: Option<&kin_db::InMemoryGraph>,
 ) -> Result<(DiffReport, DiffEndpointEntities)> {
     let authority = ActiveRepositoryAuthority::open(binding)?;
+    inspect_with_endpoint_entities_at(&authority, base, head, live)
+}
+
+/// The same pair, from an authority the caller already opened.
+///
+/// An open re-verifies every persisted body, so a caller that wants the report
+/// AND the artifact content behind it takes one open and asks it for both.
+/// Reaching for the binding-taking wrapper twice is what made a local `kin diff`
+/// on a converted 470 MiB store pay for two whole-store opens.
+pub fn inspect_with_endpoint_entities_at(
+    authority: &ActiveRepositoryAuthority,
+    base: Option<&str>,
+    head: Option<&str>,
+    live: Option<&kin_db::InMemoryGraph>,
+) -> Result<(DiffReport, DiffEndpointEntities)> {
     let lease = authority.manager().read_authority();
     let metadata = lease.metadata();
     let workspace = metadata
@@ -311,9 +350,15 @@ pub fn inspect_with_endpoint_entities(
         &mut base_state,
         &mut head_state,
     );
-    let entity_deltas = diff_entities(&base_state.entities, &head_state.entities);
+    let (entity_deltas, entities_unchanged) =
+        diff_entities(&base_state.entities, &head_state.entities);
     let relation_deltas = diff_relations(&base_state.relations, &head_state.relations);
-    let summary = summarize(&artifact_deltas, &entity_deltas, &relation_deltas);
+    let summary = summarize(
+        &artifact_deltas,
+        &entity_deltas,
+        &relation_deltas,
+        entities_unchanged,
+    );
 
     let report = DiffReport {
         artifact_content: Vec::new(),
@@ -615,27 +660,52 @@ fn diff_trees(base: &ResolvedTree, head: &ResolvedTree) -> Vec<TreeDelta> {
         .collect()
 }
 
+/// The entity transitions between two graph states, and how many file-level
+/// ones were withheld.
+///
+/// A `Modified` delta is reported when the entity's own CONTENT moved, asked
+/// through [`kin_core::workspace_semantics::entity_content_agrees`], which is
+/// the same question `kin conflicts`, `kin log`, `kin blame` and `kin history`
+/// ask. Comparing the whole `Entity` here is what made `kin diff` answer a
+/// two-function commit with `Entities: +1 ~11 -0` and list nine functions the
+/// author never touched: `reconciler` stamps the whole FILE's blob hash into
+/// every entity's `metadata.extra`, and editing one function moves the byte
+/// span of every entity below it, so every entity in a changed file compares
+/// unequal.
+///
+/// The withheld count is returned rather than dropped. Those revisions are
+/// real, they are what the file did, and a reader who cannot see that they
+/// exist has lost information rather than been spared noise. That is the
+/// contract `kin blame` already holds its own listing to.
 fn diff_entities(
     base: &HashMap<EntityId, Entity>,
     head: &HashMap<EntityId, Entity>,
-) -> Vec<EntityDelta> {
-    base.keys()
+) -> (Vec<EntityDelta>, usize) {
+    let mut deltas = Vec::new();
+    let mut withheld = 0usize;
+    for entity_id in base
+        .keys()
         .copied()
         .chain(head.keys().copied())
         .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter_map(
-            |entity_id| match (base.get(&entity_id), head.get(&entity_id)) {
-                (None, Some(new)) => Some(EntityDelta::Added { new: new.clone() }),
-                (Some(old), Some(new)) if old != new => Some(EntityDelta::Modified {
-                    old: old.clone(),
-                    new: new.clone(),
-                }),
-                (Some(old), None) => Some(EntityDelta::Removed { old: old.clone() }),
-                (Some(_), Some(_)) | (None, None) => None,
-            },
-        )
-        .collect()
+    {
+        match (base.get(&entity_id), head.get(&entity_id)) {
+            (None, Some(new)) => deltas.push(EntityDelta::Added { new: new.clone() }),
+            (Some(old), Some(new)) if old != new => {
+                if kin_core::workspace_semantics::entity_content_agrees(old, new) {
+                    withheld += 1;
+                } else {
+                    deltas.push(EntityDelta::Modified {
+                        old: old.clone(),
+                        new: new.clone(),
+                    });
+                }
+            }
+            (Some(old), None) => deltas.push(EntityDelta::Removed { old: old.clone() }),
+            (Some(_), Some(_)) | (None, None) => {}
+        }
+    }
+    (deltas, withheld)
 }
 
 fn diff_relations(
@@ -665,8 +735,12 @@ fn summarize(
     artifacts: &[TreeDelta],
     entities: &[EntityDelta],
     relations: &[RelationDelta],
+    entities_unchanged: usize,
 ) -> DiffSummary {
-    let mut summary = DiffSummary::default();
+    let mut summary = DiffSummary {
+        entities_unchanged,
+        ..DiffSummary::default()
+    };
     for delta in artifacts {
         match delta {
             TreeDelta::Added { .. } => summary.artifacts_added += 1,
@@ -729,7 +803,8 @@ pub async fn run(
     // local answer, which names its own gap rather than printing a zero that
     // reads like an answer.
     if !json && workspace_endpoint {
-        if let Some(response) = daemon_diff(&layout, &base, &head).await {
+        if let Some(response) = daemon_diff(&layout, &base, &head, full_bodies).await {
+            let content_rendered = response.artifact_content_rendered;
             for line in response.lines {
                 println!("{line}");
             }
@@ -738,12 +813,25 @@ pub async fn run(
                 //
                 // The daemon renders its own header lines and this appends after
                 // them, so its output stays byte-identical and the wire payload
-                // is unchanged. The report it already returns carries both blob
-                // hashes, so the CLI opens its own binding and reads CAS here.
-                // Two renderings of a content diff would drift, and the one
-                // nobody runs would be the one that drifts.
-                for line in content_lines_for(&layout, report, full_bodies) {
-                    println!("{line}");
+                // is unchanged. Two renderings of a content diff would drift,
+                // and the one nobody runs would be the one that drifts.
+                //
+                // The bodies come from the responder's own authority when it
+                // read them, and only from a local open when it did not. That
+                // second arm is a peer too old to carry the rows, and it is the
+                // whole of what used to happen every time: the answer arrived
+                // from a warm daemon and the command then re-verified the entire
+                // store to print the bodies beneath it.
+                if content_rendered {
+                    for row in &report.artifact_content {
+                        for line in render_content_lines(row) {
+                            println!("{line}");
+                        }
+                    }
+                } else {
+                    for line in content_lines_for(&layout, report, full_bodies) {
+                        println!("{line}");
+                    }
                 }
                 if let Some(line) = semantic_scope_line(report.semantic_basis.as_ref()) {
                     println!("{line}");
@@ -754,23 +842,37 @@ pub async fn run(
                     "Admission scope: this diff was not measured against the working copy: {why}"
                 );
             }
+            if let Some(line) = retained_parse_line(&layout) {
+                println!("{line}");
+            }
             println!("{}", admitted_scope_line(&layout));
+            println!(
+                "{}",
+                crate::commands::repository_authority::answered_by_line(if content_rendered {
+                    crate::commands::repository_authority::AuthoritySource::RunningDaemon
+                } else {
+                    crate::commands::repository_authority::AuthoritySource::RunningDaemonAndOwnOpen
+                })
+            );
             return Ok(());
         }
     }
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
+    // ONE open for both readings. The report and the artifact bodies beneath it
+    // come from the same authority, where this used to open the whole store,
+    // build the report, and then open it a second time to read CAS.
+    //
     // No live graph on this path: the CLI opens durable authority in-process and
     // the entities a workspace endpoint needs live in the daemon's graph. So this
     // derives nothing and the basis says so by name, which is the zero
     // file-search rule applied to a read: when the graph cannot answer, report
     // the gap rather than a zero that reads like an answer.
-    let mut report = inspect(&binding, base.as_deref(), head.as_deref(), None)?;
-    if let Ok(authority) =
-        crate::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)
-    {
-        report.artifact_content =
-            collect_artifact_content(&authority, &report.artifact_deltas, full_bodies);
-    }
+    let authority =
+        crate::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)?;
+    let (mut report, _) =
+        inspect_with_endpoint_entities_at(&authority, base.as_deref(), head.as_deref(), None)?;
+    report.artifact_content =
+        collect_artifact_content(&authority, &report.artifact_deltas, full_bodies);
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -788,9 +890,31 @@ pub async fn run(
         if let Some(crate::commands::status::StatusAdmission::Skipped(why)) = pass.as_ref() {
             println!("Admission scope: this diff was not measured against the working copy: {why}");
         }
+        if let Some(line) = retained_parse_line(&layout) {
+            println!("{line}");
+        }
         println!("{}", admitted_scope_line(&layout));
+        println!(
+            "{}",
+            crate::commands::repository_authority::answered_by_line(
+                crate::commands::repository_authority::AuthoritySource::OwnAuthorityOpen
+            )
+        );
     }
     Ok(())
+}
+
+/// The paths this diff's entity counts were derived from an earlier parse for.
+///
+/// Printed by both routes and read from the store rather than carried on the
+/// wire, so the daemon's rendered lines stay byte-identical and one record
+/// answers for `kin diff`, `kin status`, `kin commit`, `kin graph status` and
+/// `kin doctor` alike. Without it a broken edit prints `Entities: +0 ~0 -0`
+/// beside a hunk that plainly changed a function, and the zero is correct: the
+/// bytes did not parse, so nothing was derived from them. The zero is the
+/// answer; this line is what the zero means.
+fn retained_parse_line(layout: &kin_core::KinLayout) -> Option<String> {
+    kin_core::retained_parse::read(layout).describe(chrono::Utc::now())
 }
 
 /// Content lines for a report the daemon rendered, read from this CLI's own CAS.
@@ -827,6 +951,7 @@ async fn daemon_diff(
     layout: &kin_core::KinLayout,
     base: &Option<String>,
     head: &Option<String>,
+    full_bodies: bool,
 ) -> Option<DiffResponse> {
     let base_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await?;
     let client =
@@ -837,6 +962,10 @@ async fn daemon_diff(
         // The daemon renders its own lines and this path only takes the text
         // path, so it never asks for the JSON shape.
         json: false,
+        // Said out loud so the responder can read the bodies from the authority
+        // it already holds. A peer that does not know the field ignores it and
+        // answers as it always did, and the caller fills the content in.
+        full_bodies,
     };
     client.diff(&request).await.ok()
 }
@@ -951,16 +1080,59 @@ pub fn build_diff_response(
     request: &DiffRequest,
     live: Option<&kin_db::InMemoryGraph>,
 ) -> Result<DiffResponse> {
-    let report = inspect(
-        binding,
+    let authority = ActiveRepositoryAuthority::open(binding)?;
+    build_diff_response_at(&authority, request, live)
+}
+
+/// The same response, from an authority the caller already opened, with the
+/// artifact content read on the caller's behalf.
+///
+/// Reading content here is what lets a `kin diff` served by this response skip
+/// an authority open of its own. It used to open its own binding and read CAS
+/// after printing the daemon's lines, which meant the answer arrived from a
+/// warm daemon and the command then spent seconds re-verifying the whole store
+/// to render the bodies under it.
+pub fn build_diff_response_at(
+    authority: &ActiveRepositoryAuthority,
+    request: &DiffRequest,
+    live: Option<&kin_db::InMemoryGraph>,
+) -> Result<DiffResponse> {
+    let (mut report, _) = inspect_with_endpoint_entities_at(
+        authority,
         request.base.as_deref(),
         request.head.as_deref(),
         live,
     )?;
+    let lines = render_lines(&report);
+    report.artifact_content =
+        collect_artifact_content(authority, &report.artifact_deltas, request.full_bodies);
     Ok(DiffResponse {
-        lines: render_lines(&report),
+        lines,
         report: Some(report),
+        artifact_content_rendered: true,
     })
+}
+
+/// The line naming what the entity counts did not show.
+///
+/// Named rather than silent. The withheld revisions are real, they are what the
+/// file did, and a reader who cannot see that they exist has lost information
+/// rather than been spared noise.
+///
+/// Half of `kin blame`'s contract, not all of it. Blame names its withheld
+/// count AND takes `--all-revisions` to list them; `kin diff` names the count
+/// and has no flag that shows them yet. Saying so here rather than claiming the
+/// whole contract, because the flag is the follow-up and a comment that claims
+/// it is the reason nobody writes it.
+fn unchanged_entities_line(unchanged: usize) -> Option<String> {
+    if unchanged == 0 {
+        return None;
+    }
+    let plural = if unchanged == 1 { "y" } else { "ies" };
+    Some(format!(
+        "{unchanged} entit{plural} moved with a changed artifact without changing; \
+         they are not counted above"
+    ))
 }
 
 fn render_lines(report: &DiffReport) -> Vec<String> {
@@ -988,6 +1160,9 @@ fn render_lines(report: &DiffReport) -> Vec<String> {
             report.summary.relations_removed
         ),
     ];
+    if let Some(line) = unchanged_entities_line(report.summary.entities_unchanged) {
+        lines.push(line);
+    }
     for delta in &report.artifact_deltas {
         lines.push(render_tree_delta(delta));
     }
@@ -1269,6 +1444,86 @@ mod tests {
         SemanticFingerprint, Visibility,
     };
 
+    /// One diff answer must open repository authority exactly once, report and
+    /// artifact bodies together.
+    ///
+    /// GAP-6, in the form that scales. An authority open is a full recovery that
+    /// re-verifies every persisted body against its content address, so it costs
+    /// whatever the whole store is worth: measured on a converted 470 MiB
+    /// express store, one open is seconds. The COUNT is the honest bound and the
+    /// wall clock is not, because a fixture small enough to run in CI answers in
+    /// milliseconds whether it opens once or twice.
+    ///
+    /// Counted on this thread only: this binary runs tests in parallel and
+    /// siblings open authority of their own.
+    ///
+    /// Breaking it: read the artifact content through a second
+    /// `ActiveRepositoryAuthority::open` on the binding, which is what both the
+    /// local arm and the daemon arm of `kin diff` used to do. Either takes this
+    /// to 2. Note the second open was UNCONDITIONAL in the shipped code, so this
+    /// bound goes red on a fixture with no artifact deltas too.
+    #[test]
+    fn one_diff_answer_opens_repository_authority_once() {
+        let root = tempfile::tempdir().expect("a temporary directory for the fixture store");
+        let init = kin_core::init(root.path()).expect("kin_core::init builds a real store");
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout)
+            .expect("the fixture store binds");
+        let request = DiffRequest {
+            base: None,
+            head: None,
+            json: false,
+            full_bodies: false,
+        };
+
+        let before = kin_core::authority_opens();
+        let response =
+            build_diff_response(&binding, &request, None).expect("a fresh store answers a diff");
+        let opens = kin_core::authority_opens() - before;
+
+        // Non-vacuity first. A response with no report, or one that did not
+        // claim to have read content, cannot tell "one open for both" apart from
+        // "one open and the second reading skipped".
+        let report = response
+            .report
+            .as_ref()
+            .expect("the diff report must be real");
+        assert_eq!(report.schema, DIFF_SCHEMA);
+        assert!(
+            response.artifact_content_rendered,
+            "the responder must say it read artifact content, or its caller opens the store itself"
+        );
+        assert_eq!(
+            opens, 1,
+            "one diff answer must open repository authority once and ask that open for both the \
+             report and the artifact bodies; opening per reading is GAP-6"
+        );
+    }
+
+    /// An older daemon's silence about artifact content must read as "did not
+    /// read it", so the caller still renders the bodies.
+    ///
+    /// The wire half of the mixed-build case. A `false` here is what sends the
+    /// caller down its own local open, and a payload that decoded as `true`
+    /// would print a diff with every content row missing and nothing saying so.
+    ///
+    /// Breaking it: give the field a `#[serde(default = ...)]` that yields true,
+    /// or drop `#[serde(default)]` so an older payload fails to parse at all.
+    #[test]
+    fn an_older_daemons_diff_payload_says_it_rendered_no_artifact_content() {
+        let decoded: DiffResponse = serde_json::from_value(serde_json::json!({
+            "lines": ["Kin repository-v6 diff"],
+        }))
+        .expect("an older daemon's payload must still decode");
+
+        // Non-vacuity: the payload really is the older shape.
+        assert!(decoded.report.is_none());
+        assert_eq!(decoded.lines.len(), 1);
+        assert!(
+            !decoded.artifact_content_rendered,
+            "an absent flag must mean the content was not read, so the caller reads it itself"
+        );
+    }
+
     fn entity(id: EntityId, name: &str) -> Entity {
         Entity {
             id,
@@ -1294,6 +1549,122 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    /// `entity`, plus the file-level noise a real reconcile stamps on every
+    /// entity in a touched file whether or not that entity moved: the whole
+    /// FILE's blob hash in `metadata.extra`, and the byte span everything below
+    /// an edit shifts to.
+    fn entity_stamped(id: EntityId, name: &str, body: u8, stamp: u8) -> Entity {
+        let mut built = entity(id, name);
+        built.fingerprint.ast_hash = Hash256::from_bytes([body; 32]);
+        built.fingerprint.behavior_hash = Hash256::from_bytes([body; 32]);
+        built.fingerprint.equivalence_hash = Hash256::from_bytes([body; 32]);
+        built.metadata.extra.insert(
+            "artifact_blob".to_string(),
+            serde_json::Value::String(format!("{stamp:02x}")),
+        );
+        built.span = Some(kin_model::SourceSpan {
+            file: FilePathId::new("ledger/reporting.py"),
+            start_byte: usize::from(stamp) * 100,
+            end_byte: usize::from(stamp) * 100 + 40,
+            start_line: u32::from(stamp),
+            start_col: 0,
+            end_line: u32::from(stamp) + 3,
+            end_col: 0,
+        });
+        built
+    }
+
+    /// The vcs stranger run's `kin diff` finding, rebuilt.
+    ///
+    /// A commit that edited two function bodies reported
+    /// `Entities: +1 ~11 -0` and listed nine functions the author never
+    /// touched, because `diff_entities` compared the whole `Entity` and every
+    /// entity in a changed file carries that file's blob hash and a shifted
+    /// span. Twelve entities live in the two changed files, one is new, and
+    /// exactly one of the survivors was edited.
+    ///
+    /// Breaking it: put `old != new` back in place of the content comparison in
+    /// `diff_entities` and this reports eleven modified.
+    #[test]
+    fn a_two_function_commit_reports_the_functions_it_changed() {
+        let ids: Vec<EntityId> = (0..12).map(|_| EntityId::new()).collect();
+        let added = EntityId::new();
+        let mut base = HashMap::new();
+        let mut head = HashMap::new();
+        for (index, id) in ids.iter().enumerate() {
+            let name = format!("entity_{index}");
+            base.insert(*id, entity_stamped(*id, &name, 1, 0x10));
+            // Only the first survivor's own body moved. Every other entity
+            // moved only with its file.
+            let body = if index == 0 { 2 } else { 1 };
+            head.insert(*id, entity_stamped(*id, &name, body, 0x30));
+        }
+        head.insert(added, entity_stamped(added, "format_currency", 9, 0x30));
+
+        let (deltas, unchanged) = diff_entities(&base, &head);
+        let summary = summarize(&[], &deltas, &[], unchanged);
+        assert_eq!(summary.entities_added, 1, "{deltas:#?}");
+        assert_eq!(
+            summary.entities_modified, 1,
+            "one function body moved, not eleven: {deltas:#?}"
+        );
+        assert_eq!(summary.entities_removed, 0);
+        assert_eq!(
+            summary.entities_unchanged, 11,
+            "the eleven that moved with their file are counted, not dropped"
+        );
+
+        // Counted is not enough. A reader has to be able to SEE that they
+        // exist, which is the contract `kin blame` already holds itself to.
+        let line =
+            unchanged_entities_line(summary.entities_unchanged).expect("a withheld count says so");
+        assert!(line.contains("11"), "{line}");
+    }
+
+    /// `kin diff` says what its zero means.
+    ///
+    /// `Entities: +0 ~0 -0` beside a hunk that plainly changed a function is
+    /// correct and unreadable: the bytes did not parse, so nothing was derived
+    /// from them. Journey GAP-9 is that the zero stood alone. Both routes print
+    /// this from the same store record, so the daemon-rendered lines and the
+    /// local ones cannot come to disagree.
+    #[test]
+    fn the_diff_line_names_a_file_the_graph_answers_about_from_an_earlier_parse() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+
+        // The control first, and it is the half a line printed unconditionally
+        // would fail.
+        assert!(
+            retained_parse_line(&init.layout).is_none(),
+            "a store with no record says nothing about retained parses"
+        );
+
+        kin_core::retained_parse::record(
+            &init.layout,
+            &[kin_core::retained_parse::ObservedParse::retained(
+                "search.py",
+                4,
+            )],
+        );
+        let line = retained_parse_line(&init.layout).expect("a recorded path speaks");
+        assert!(line.contains("search.py (4 parse errors)"), "{line}");
+        assert!(line.contains("The bytes on disk do not parse"), "{line}");
+    }
+
+    /// The control for the withheld-count test above. A diff that elides
+    /// nothing must say nothing about eliding, or every diff reads as trimmed.
+    #[test]
+    fn a_diff_that_withholds_nothing_says_nothing_about_withholding() {
+        let id = EntityId::new();
+        let base = HashMap::from([(id, entity_stamped(id, "format_totals", 1, 0x10))]);
+        let head = HashMap::from([(id, entity_stamped(id, "format_totals", 2, 0x30))]);
+        let (deltas, unchanged) = diff_entities(&base, &head);
+        assert_eq!(deltas.len(), 1, "a real body change is still reported");
+        assert_eq!(unchanged, 0);
+        assert!(unchanged_entities_line(unchanged).is_none());
     }
 
     fn entity_in(id: EntityId, name: &str, file: &str) -> Entity {
@@ -1388,7 +1759,7 @@ mod tests {
         );
 
         // And the delta says what happened, which is the whole point.
-        let deltas = diff_entities(&base.entities, &head.entities);
+        let (deltas, _) = diff_entities(&base.entities, &head.entities);
         assert_eq!(deltas.len(), 2, "one added, one removed: {deltas:?}");
 
         match basis {
@@ -1530,7 +1901,7 @@ mod tests {
         let base_relations = HashMap::new();
         let head_relations = HashMap::from([(relation_id, relation.clone())]);
 
-        let entity_deltas = diff_entities(&base_entities, &head_entities);
+        let (entity_deltas, _) = diff_entities(&base_entities, &head_entities);
         let relation_deltas = diff_relations(&base_relations, &head_relations);
         assert_eq!(entity_deltas.len(), 3);
         assert!(entity_deltas.iter().any(|delta| {

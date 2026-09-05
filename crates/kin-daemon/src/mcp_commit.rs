@@ -2416,6 +2416,12 @@ fn finalize_committed_transaction(
     // that this commit did not publish, and reading the live count here would
     // record those as durable.
     state.record_durable_entity_count(authority.graph.entity_count() as u64);
+    // The relation half, from the authority graph for the reason the entity
+    // count is taken from it: an ambient admission or an enrichment sweep may
+    // already have added relations to the live graph that this commit did not
+    // publish, and reading the live count here would record those as durable
+    // (FIR-3202).
+    state.record_durable_relation_count(authority.graph.relation_count() as u64);
     let layouts = timed_finalize_step("rebuild_changed_layouts", || {
         if planned_layouts.is_empty() && committed.file_count > 0 {
             rebuild_changed_layouts(state, &authority, &committed.change)

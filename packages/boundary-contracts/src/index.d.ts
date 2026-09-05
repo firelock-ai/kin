@@ -616,7 +616,7 @@ export interface RepositoryTransferLimits {
 }
 
 export interface RepositoryTransferStatus {
-  schema_version: 4;
+  schema_version: 5;
   protocol: "kin-repository-v6-fast-forward";
   repository_id: string;
   destination_ref: RepositoryTransferRefName;
@@ -650,7 +650,7 @@ export interface RepositoryRefAdvertisementEntry {
  * reproduce rather than treat as an error.
  */
 export interface RepositoryRefAdvertisement {
-  schema_version: 4;
+  schema_version: 5;
   protocol: "kin-repository-v6-fast-forward";
   repository_id: string;
   refs: RepositoryRefAdvertisementEntry[];
@@ -686,7 +686,7 @@ export interface RepositoryTransferBody {
 }
 
 export interface RepositoryTransferPack {
-  schema_version: 4;
+  schema_version: 5;
   protocol: "kin-repository-v6-fast-forward";
   transfer_id: string;
   operation_id: string;
@@ -721,10 +721,18 @@ export interface RepositoryTransferPack {
   external_objects: Record<string, unknown>[];
   aliases: Record<string, unknown>[];
   bodies: RepositoryTransferBody[];
+  /**
+   * The replay-semantics version the SENDING store records at its own creation,
+   * or `null` when it records none. A receiver keeps its own creation record
+   * only when this equals what that record says; anything else, `null`
+   * included, costs the receiver that record. A hosted sender owns no local
+   * record and sends `null`.
+   */
+  source_hydration_semantics: number | null;
 }
 
 export interface RepositoryTransferReceipt {
-  schema_version: 4;
+  schema_version: 5;
   protocol: "kin-repository-v6-fast-forward";
   transfer_id: string;
   repository_id: string;
@@ -766,7 +774,7 @@ export interface HostedRepositoryTransferRefusal {
  */
 export interface HostedRepositoryTransferSeam {
   protocol: "kin-repository-v6-fast-forward";
-  schemaVersion: 4;
+  schemaVersion: 5;
   routeTemplate: string;
   authorizationScheme: "Bearer";
   orgScoped: true;

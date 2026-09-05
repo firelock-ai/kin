@@ -145,6 +145,41 @@ pub(crate) enum EnrichmentFacet {
     None,
 }
 
+/// What one reconcile outcome says about the path's current bytes, for the
+/// durable record every reporting surface reads.
+///
+/// `BrokenAst` is the one outcome that means the graph has started answering
+/// about this path from an earlier parse: it derives nothing, retains what the
+/// last good parse left, and the daemon reconciles under
+/// `ReconcilePolicy::FallbackToLkg`, so it is the ordinary case rather than an
+/// edge. `Updated` and `FileRemoved` settle the path, because both re-derived
+/// from the bytes this pass just read.
+///
+/// `Conflict` also retains last-known-good state and is deliberately not
+/// recorded. It is a held merge rather than a file whose syntax is broken, it
+/// has its own surface, and folding the two into one line would tell a reader to
+/// go fix a syntax error in a file whose syntax is fine.
+///
+/// A path the tree admits without a UTF-8 spelling yields nothing, because the
+/// record is keyed by the path string every reporting surface renders.
+fn observed_parse_of(
+    repo_path: &RepoPath,
+    outcome: &kin_reconcile::ReconcileOutcome,
+) -> Option<kin_core::retained_parse::ObservedParse> {
+    use kin_core::retained_parse::ObservedParse;
+    use kin_reconcile::ReconcileOutcome;
+    let path = repo_path.as_utf8()?;
+    match outcome {
+        ReconcileOutcome::BrokenAst { error_ranges, .. } => {
+            Some(ObservedParse::retained(path, error_ranges.len()))
+        }
+        ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. } => {
+            Some(ObservedParse::settled(path))
+        }
+        ReconcileOutcome::Conflict(_) => None,
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct FacetCleanup {
     pub(crate) removed_entities: Vec<EntityId>,
@@ -170,15 +205,14 @@ struct ExactTreeAdmission {
     /// the caller can publish it standalone if its own transaction never
     /// reaches authority.
     deferred_tree: Option<crate::repository_commit::AdmittedWorkspaceTree>,
-    /// The pass derived a transition and then stood down for a commit that had
-    /// entered the daemon while it worked. Nothing was published and nothing was
-    /// applied to the derived graph, so the caller must treat this pass as not
-    /// having happened and let the commit admit the working copy itself.
-    yielded_to_pending_commit: bool,
+    /// The pass yielded to a pending commit or an open merge. Nothing was
+    /// published or applied to the derived graph. The caller retains its host
+    /// events until repository authority can admit them.
+    yielded_authority: bool,
 }
 
 impl ExactTreeAdmission {
-    /// A pass that stood down for a commit already inside the daemon.
+    /// A pass that stood down for a pending commit or an open merge.
     ///
     /// It carries no deltas because it admitted nothing: the transition it
     /// derived was dropped unpublished, so reporting it would name work that
@@ -190,7 +224,7 @@ impl ExactTreeAdmission {
             semantic_events: Vec::new(),
             policy,
             deferred_tree: None,
-            yielded_to_pending_commit: true,
+            yielded_authority: true,
         }
     }
 }
@@ -684,6 +718,15 @@ fn exact_tree_admission(
     // while the host walk is running fails the whole admission instead of
     // having its desired tree replanned onto the newer authority.
     let (expected_roots, policy) = current_authority_admission(state)?;
+    if publication == TreePublication::StandaloneUnlessACommitIsWaiting
+        && crate::api::cached_authority_has_open_merge(state)
+            .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?
+    {
+        // A conflict edit belongs to the open merge until resolution publishes
+        // it. Ambient admission would move its restore generation and make the
+        // saved resolution stale. The watcher retains this pass's events.
+        return Ok(ExactTreeAdmission::yielded(policy));
+    }
     let previous = state.graph.resolved_tree();
     let tracked_paths = previous
         .artifacts_by_path()
@@ -986,7 +1029,7 @@ fn exact_tree_admission(
         semantic_events: dedup_file_events(semantic_events),
         policy,
         deferred_tree,
-        yielded_to_pending_commit: false,
+        yielded_authority: false,
     })
 }
 
@@ -1010,7 +1053,7 @@ pub(crate) fn ambient_admission_for_test(
         Some(observation),
         TreePublication::StandaloneUnlessACommitIsWaiting,
     )
-    .map(|admission| admission.yielded_to_pending_commit)
+    .map(|admission| admission.yielded_authority)
 }
 
 /// Report whether one planned exact-tree transition moves a repository member
@@ -2471,6 +2514,12 @@ pub async fn run_loop_armed(
     // Owed once per daemon life, and independent of the catch-up window: the
     // paths it recovers are exactly the ones whose host modification time puts
     // them outside that window, which is why the window cannot see them.
+    // The semantic debt one previous daemon left, owed once per daemon life and
+    // before this loop answers anything. A path whose bytes reached authority
+    // without a parse is a wrong answer this daemon is able to know about, and
+    // waiting for the next commit to drain it would serve the previous parse to
+    // every query in between.
+    let mut semantic_debt_drain_owed = true;
     let mut enrichment_repair_owed = true;
     // Owed once per daemon life for the same reason and on the same schedule:
     // a store converted from Git carries entities whose parse observation was
@@ -2637,6 +2686,23 @@ pub async fn run_loop_armed(
         // answered every query as an absence, and a store that has been in that
         // state deserves the count said out loud rather than repaired in
         // silence.
+        if semantic_debt_drain_owed {
+            semantic_debt_drain_owed = false;
+            // Under the gate every other graph-authority mutation takes,
+            // including the tick below, commit and checkout. The drain applies
+            // entity transactions to the live graph, and a mutation outside
+            // the gate can interleave with a commit planning its change from
+            // that same graph.
+            let _coordination = state.coordination_gate.lock().await;
+            if let Err(error) = drain_semantic_debt(&state).await {
+                warn!(
+                    error = %error,
+                    "a path whose bytes reached authority without a parse could not be re-parsed \
+                     at startup, so it still answers at the positions its previous bytes held"
+                );
+            }
+        }
+
         if enrichment_repair_owed {
             enrichment_repair_owed = false;
             match plan_unpublished_enrichment_repair(&state) {
@@ -2983,7 +3049,7 @@ pub async fn run_loop_armed(
             // nothing. Its events go back on the queue rather than into the
             // retry ladder: nothing failed, and the next round will find them
             // either already admitted by the commit or still owed.
-            Ok(admission) if admission.yielded_to_pending_commit => {
+            Ok(admission) if admission.yielded_authority => {
                 commit_yields += 1;
                 drop(graph_mutation);
                 drop(reconciler);
@@ -2991,8 +3057,7 @@ pub async fn run_loop_armed(
                 enqueue_file_events(&mut pending_events, watcher_batch);
                 debug!(
                     consecutive = commit_yields,
-                    "stood this reconcile round down at its publication for a commit inside \
-                     the daemon"
+                    "retained this reconcile round for a pending commit or an open merge"
                 );
                 state
                     .reconciliation_status
@@ -3044,6 +3109,12 @@ pub async fn run_loop_armed(
         let mut batch = watcher_batch;
         batch.extend(exact_admission.semantic_events.iter().cloned());
         let batch = dedup_file_events(batch);
+
+        // What this pass sees about which paths the graph is answering about
+        // from an earlier parse. Collected here and published once below rather
+        // than written per file, because the record is one document and a pass
+        // that touched forty paths must not rewrite it forty times.
+        let mut observed_parses: Vec<kin_core::retained_parse::ObservedParse> = Vec::new();
 
         for event in &batch {
             let admitted = match admit_file_event_with_exact_tree(
@@ -3275,6 +3346,15 @@ pub async fn run_loop_armed(
                             }
                             graph_changed = true;
                             state.bump_version();
+                            // A removed path settles its retained-parse entry
+                            // here, because it never reaches the reconcile
+                            // below. Without this, deleting a file whose syntax
+                            // was broken would leave every surface naming a path
+                            // the repository no longer has.
+                            if let Some(path) = repo_path.as_utf8() {
+                                observed_parses
+                                    .push(kin_core::retained_parse::ObservedParse::settled(path));
+                            }
                             debug!(file = %repo_path, "removed exact repository-tree entry");
                         }
                         Err(error) => warn!(
@@ -3298,6 +3378,7 @@ pub async fn run_loop_armed(
                 Ok(result) => {
                     let (outcome, delta) = result.into_parts();
                     debug!(?outcome, "reconcile outcome");
+                    observed_parses.extend(observed_parse_of(&semantic_repo_path, &outcome));
 
                     use kin_reconcile::ReconcileOutcome;
                     let should_apply = matches!(
@@ -3520,6 +3601,14 @@ pub async fn run_loop_armed(
             }
         }
         drop(graph_mutation);
+
+        // One publication for the whole pass, after the graph mutation is
+        // released so a marker write never sits under it, and before the
+        // reconciler lock is released below so it cannot interleave with the
+        // complete sync's own publication. `record` folds these observations
+        // into whatever the record already held and leaves every path this pass
+        // did not look at exactly as it was.
+        kin_core::retained_parse::record(&state.layout, &observed_parses);
 
         // Every path this tick looked at without deferring is stable as far as
         // the pass can tell, so its ladder is forgotten and its next deferral
@@ -3883,6 +3972,86 @@ mod tests {
             std::env::var_os("KIN_ALLOW_MASS_DELETION"),
             mass_delete_before,
             "graph-only mode must not set or clear the mass-deletion escape hatch"
+        );
+    }
+
+    /// FIR-3208. A daemon start pays the semantic debt a previous daemon left,
+    /// before the loop answers anything.
+    ///
+    /// The record is the only thing carrying a parse across a restart, and a
+    /// commit is the only other drain, so a loop that skipped this at startup
+    /// would serve the previous parse to every query until someone committed.
+    /// The store is put into exactly the shape a session publication leaves:
+    /// the exact tree published on its own, nothing parsed, the record naming
+    /// what is owed.
+    ///
+    /// Falsify by removing the once-per-life drain from `run_loop_armed`: the
+    /// span never moves and the poll below runs out.
+    #[tokio::test]
+    async fn a_daemon_start_pays_the_semantic_debt_a_previous_daemon_left() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let host = repo.path().join("shifted.rs");
+        let original = b"pub fn shifted() -> u32 { 7 }\n".to_vec();
+        std::fs::write(&host, &original).unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let start_line = |state: &DaemonState| -> Option<u32> {
+            state
+                .graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(FilePathId::new("shifted.rs")),
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find_map(|entity| entity.span.map(|span| span.start_line))
+        };
+        assert_eq!(start_line(&state), Some(0));
+
+        let mut shifted = b"// prepended\n".repeat(17);
+        shifted.extend_from_slice(&original);
+        std::fs::write(&host, &shifted).unwrap();
+        let admission = exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+        assert!(!admission.deltas.is_empty(), "the bytes moved");
+        crate::semantic_debt::record(&state, &crate::semantic_debt::owed_by(&admission.deltas));
+        let recorded = crate::semantic_debt::outstanding(&state);
+        let (owed, _) = crate::semantic_debt::partition_against_tree(&state, &recorded);
+        assert_eq!(owed.len(), 1, "the tree carries the body the record names");
+        assert_eq!(
+            start_line(&state),
+            Some(0),
+            "nothing has parsed the new bytes yet; that is the debt"
+        );
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let mut handle = tokio::spawn(run_loop(
+            Arc::clone(&state),
+            LoopConfig::default(),
+            cancel_rx,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while start_line(&state) != Some(17) {
+            assert!(
+                !handle.is_finished(),
+                "the loop exited before paying the debt a previous daemon left"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the loop never re-derived the path a previous daemon left owing; span is {:?}",
+                start_line(&state)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), &mut handle)
+            .await
+            .expect("the loop exits on shutdown")
+            .expect("the loop task must not panic")
+            .expect("the loop exits cleanly");
+        assert!(
+            !crate::semantic_debt::outstanding(&state).is_empty(),
+            "a startup drain pays the parse in the derived graph and leaves the record for the \
+             commit that makes it durable"
         );
     }
 
@@ -6814,6 +6983,79 @@ mod tests {
     /// cfg-gated pair collapsed both parsed halves onto whichever half the graph
     /// returned first. Two deltas for one entity is not a transaction, so the
     /// whole reconcile was refused and the edit never became queryable.
+    /// The complete sync records which paths it could not parse, and clears the
+    /// record when they parse again.
+    ///
+    /// This is the seam `/commands/admit` and `/commands/commit` both drive, so
+    /// it is the pass a reader is looking at when they run `kin status`,
+    /// `kin diff` or `kin commit`. Journey GAP-9: the reconciler logged `broken
+    /// AST, retaining LKG state` and every one of those surfaces reported a
+    /// whole store, because the outcome reached nothing but the log.
+    ///
+    /// Three assertions and each is a different failure. The store starts clean,
+    /// so a record written unconditionally fails the first. The broken pass
+    /// names the path with the reconciler's own error count, so a seam that
+    /// dropped the outcome fails the second. The fixed pass clears it, so a
+    /// write that only ever adds fails the third.
+    #[tokio::test]
+    async fn a_complete_sync_records_a_file_it_could_not_parse_and_clears_it_when_fixed() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir().to_path_buf();
+
+        std::fs::write(
+            root.join("search.py"),
+            b"def tokenize(text):\n    return [word.lower() for word in text.split()]\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert_eq!(
+            entity_names_for(&state, "search.py"),
+            vec!["search".to_string(), "tokenize".to_string()],
+            "the fixture needs the module and its function admitted"
+        );
+        assert!(
+            kin_core::retained_parse::read(&state.layout)
+                .paths()
+                .is_empty(),
+            "a store whose every file parses must record no retained path: {:?}",
+            kin_core::retained_parse::read(&state.layout)
+        );
+
+        // The same edit the journey drove: the closing bracket of the list
+        // comprehension removed, which `ast.parse` rejects.
+        std::fs::write(
+            root.join("search.py"),
+            b"def tokenize(text):\n    return [word.lower() for word in text.split(\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let broken = kin_core::retained_parse::read(&state.layout);
+        let errors = broken.errors_for("search.py").unwrap_or_else(|| {
+            panic!("the pass that could not parse search.py recorded nothing: {broken:?}")
+        });
+        assert!(
+            errors > 0,
+            "the record carries the reconciler's own error count, not a placeholder"
+        );
+        assert!(
+            !entity_names_for(&state, "search.py").is_empty(),
+            "the entities are RETAINED, which is why the record has to say so"
+        );
+
+        std::fs::write(
+            root.join("search.py"),
+            b"def tokenize(text):\n    return [word.lower() for word in text.split()]\n\ndef find(h, n):\n    return h\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert_eq!(
+            kin_core::retained_parse::read(&state.layout).errors_for("search.py"),
+            None,
+            "a path that parses again must leave the record, or every surface names it forever"
+        );
+    }
+
     #[tokio::test]
     async fn an_edit_above_a_duplicated_declaration_admits_the_new_entity() {
         let repo = tempfile::tempdir().unwrap();
@@ -6930,7 +7172,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            !admission.yielded_to_pending_commit,
+            !admission.yielded_authority,
             "there is no commit to stand down for"
         );
         assert!(
@@ -6989,7 +7231,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            admission.yielded_to_pending_commit,
+            admission.yielded_authority,
             "a commit inside the daemon must take this tick's publication"
         );
         assert!(
@@ -7019,7 +7261,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !admission.yielded_to_pending_commit,
+            !admission.yielded_authority,
             "the daemon is quiet again, so the next round admits"
         );
         assert_eq!(
@@ -8095,6 +8337,381 @@ pub(crate) async fn sync_filesystem_with_graph_deferring_tree_publication(
     sync_filesystem_with_graph_publishing(state, TreePublication::DeferredToCaller).await
 }
 
+/// Re-derive the semantics every recorded debt still owes, and refuse in words
+/// if any of them cannot be.
+///
+/// Entries a later transition overtook are settled here rather than re-parsed:
+/// the tree no longer names the body they were recorded for, so the admission
+/// that moved it enriched the path already. What survives that filter is settled
+/// only by the commit that publishes it, because a commit is the transaction
+/// that makes a parse durable and a crash before one would otherwise clear the
+/// record for work nothing carried.
+pub(crate) async fn drain_semantic_debt(state: &DaemonState) -> Result<()> {
+    let recorded = crate::semantic_debt::outstanding(state);
+    if recorded.is_empty() {
+        return Ok(());
+    }
+    let (owed, spent) = crate::semantic_debt::partition_against_tree(state, &recorded);
+    crate::semantic_debt::settle(state, &spent);
+    if owed.is_empty() {
+        return Ok(());
+    }
+    info!(
+        paths = owed.len(),
+        "re-deriving the semantics for paths whose bytes reached authority without them"
+    );
+    let readmitted = readmit_semantics_for_paths(state, &owed).await;
+    let (unparseable, unresolved): (Vec<_>, Vec<_>) = readmitted
+        .failed
+        .into_iter()
+        .partition(|failure| failure.unparseable);
+    // Source the parser cannot read is the file's own state, and retaining
+    // last-known-good is the designed answer to it rather than a fault. An agent
+    // mid-edit produces exactly this, and refusing the commit until the syntax is
+    // fixed would leave a caller unable to record anything at all, which is a
+    // worse outcome than the spans this seam exists to keep current. So it is
+    // said out loud and the commit proceeds, which is what this file already did
+    // for such a path before any of this existed.
+    if !unparseable.is_empty() {
+        warn!(
+            files = unparseable
+                .iter()
+                .map(|failure| failure.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            "these paths could not be parsed, so they keep the spans their last readable \
+             version produced; the commit records their bytes either way"
+        );
+    }
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    // Everything else is this daemon failing at something it should have
+    // managed, and a caller can retry it. Letting one through would settle the
+    // record unpaid and reproduce the stale spans silently, which is the whole
+    // class this record exists to close.
+    Err(DaemonError::SemanticReadmissionFailed(format!(
+        "the bytes for {} of these paths are durable authority and their semantics could not be \
+         re-derived from them, so the graph still answers about them at the positions their \
+         previous bytes held: {}",
+        unresolved.len(),
+        unresolved
+            .iter()
+            .map(|failure| failure.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+/// What re-deriving the semantic layer for one set of already-admitted paths
+/// produced.
+#[derive(Debug, Default)]
+pub(crate) struct SemanticReadmission {
+    /// Paths whose semantic layer was re-derived from the bytes graph authority
+    /// now holds.
+    pub(crate) enriched: usize,
+    /// Entity-source paths whose bytes moved and whose semantics could not be
+    /// re-derived, named so a caller can refuse in words rather than report a
+    /// count of zero.
+    pub(crate) failed: Vec<SemanticFailure>,
+}
+
+/// One path whose semantics did not follow its bytes, and whether the file
+/// itself is the reason.
+///
+/// The distinction decides what a caller may do about it. Source the parser
+/// cannot read is the file's own state, and falling back to last-known-good is
+/// the designed answer rather than a fault: an agent mid-edit produces it
+/// constantly, and refusing every commit until the syntax is fixed would be a
+/// worse outcome than the stale spans this seam exists to prevent. Everything
+/// else is this daemon failing at something it should have managed, and a caller
+/// can retry it.
+#[derive(Debug, Clone)]
+pub(crate) struct SemanticFailure {
+    pub(crate) path: String,
+    /// The parser read the file and could not make sense of it.
+    pub(crate) unparseable: bool,
+}
+
+impl SemanticFailure {
+    fn unparseable(path: String) -> Self {
+        Self {
+            path,
+            unparseable: true,
+        }
+    }
+
+    fn unresolved(path: String) -> Self {
+        Self {
+            path,
+            unparseable: false,
+        }
+    }
+}
+
+/// Re-derive the semantic layer for paths whose exact bytes are already graph
+/// authority.
+///
+/// [`sync_filesystem_with_graph_publishing_inner`] runs enrichment as the second
+/// half of admitting a transition it planned itself, and returns before that
+/// half when the transition is empty. A disposable session publishes a complete
+/// exact tree through a different route and parses none of it, so by the time
+/// the next commit forces an admission the working copy and the graph tree
+/// already agree, the transition really is empty, and the file whose bytes just
+/// moved is never offered to a parser. Its entities keep the spans they were
+/// parsed at, and every read surface serves those spans under an envelope with
+/// nothing to report. On a converted `psf/requests` an edit that prepended
+/// seventeen lines left every line number in the file seventeen short of the
+/// bytes on disk.
+///
+/// So the parse belongs where the bytes were published rather than at the commit
+/// after it. This is that half on its own, driven by a caller that already knows
+/// which paths its publication moved.
+///
+/// Content comes from the body the exact tree names, and the host is re-read
+/// only to prove it still holds that same body, which is the same
+/// [`host_entry_matches_graph`] guard the admission's own enrichment uses: bytes
+/// written after a publication may not enrich against the tree that publication
+/// established. A path the graph no longer carries, a symlink, a Gitlink and a
+/// path with no UTF-8 rendering are skipped rather than failed. None of them is
+/// source owned by that path, and the exact tree already records what each one
+/// is.
+///
+/// Failure is reported and never fatal here. Membership is durable before this
+/// runs and a parser may not retract it, which is the invariant stated beside
+/// the admission's own enrichment loop. What a re-parse it could not perform
+/// means for the reply is the caller's decision, not this function's.
+pub(crate) async fn readmit_semantics_for_paths(
+    state: &DaemonState,
+    paths: &BTreeSet<RepoPath>,
+) -> SemanticReadmission {
+    let mut outcome = SemanticReadmission::default();
+    if paths.is_empty() {
+        return outcome;
+    }
+    let working_dir = state.layout.working_dir();
+    let tree = state.graph.resolved_tree();
+    let enrichment_pipeline = IndexPipeline::new();
+    let mut reconciler = state.reconciler.write().await;
+    let mut graph_changed = false;
+
+    for repo_path in paths {
+        let Some(artifact) = tree.artifact_at_path(repo_path) else {
+            continue;
+        };
+        // Symlinks and Gitlinks are never parsed as source owned by the link
+        // path, which is the rule the layout backfill and the admission loop
+        // both apply.
+        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        let Some(file_id) = semantic_file_id(repo_path) else {
+            continue;
+        };
+        let Ok(host_path) = kin_index::host_path_from_repo_path(working_dir, repo_path) else {
+            continue;
+        };
+        // `TreeEntry` carries kin-model's hash and the blob store speaks
+        // kin-blobs', so the identity crosses that boundary by bytes.
+        let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        let content = match state.blobs.read(&body_hash) {
+            Ok(content) => content,
+            Err(error) => {
+                warn!(
+                    file = %file_id,
+                    error = %error,
+                    "the body this path's exact tree entry names is not readable, so its \
+                     semantics cannot be re-derived from graph-owned truth"
+                );
+                outcome
+                    .failed
+                    .push(SemanticFailure::unresolved(file_id.0.clone()));
+                continue;
+            }
+        };
+
+        let classification = FileClassifier::classify_with_content(&host_path, &content);
+        if classification != FileClassification::EntitySource {
+            match enrichment_pipeline.index_any_content(&file_id, &content, body_hash) {
+                Ok(indexed) => match persist_non_entity_enrichment(state, indexed) {
+                    Ok((persisted, cleanup)) => {
+                        for id in cleanup.removed_entities {
+                            state.emit_event(DaemonEvent::EntityChanged {
+                                entity_id: id,
+                                node: None,
+                                change_type: ChangeType::Deleted,
+                                file_path: Some(persisted.0.clone()),
+                                session_id: None,
+                            });
+                        }
+                        graph_changed = true;
+                        outcome.enriched += 1;
+                    }
+                    Err(error) => {
+                        warn!(
+                            file = %file_id,
+                            error = %error,
+                            "published bytes re-indexed but facet persistence failed"
+                        );
+                    }
+                },
+                Err(error) => warn!(
+                    file = %file_id,
+                    error = %error,
+                    "published bytes could not be re-indexed as a non-entity artifact"
+                ),
+            }
+            continue;
+        }
+
+        // The host is consulted for identity only. A working copy that no longer
+        // holds the published body is a path some other writer has moved past,
+        // and enriching from it would publish facets against a tree entry this
+        // publication did not establish.
+        match host_entry_matches_graph(state, &host_path, repo_path) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    file = %file_id,
+                    "the host entry no longer matches the body this path's exact tree entry \
+                     names, so its semantics were left for the admission that observes those \
+                     bytes"
+                );
+                outcome
+                    .failed
+                    .push(SemanticFailure::unresolved(file_id.0.clone()));
+                continue;
+            }
+            Err(error) => {
+                warn!(
+                    file = %file_id,
+                    error = %error,
+                    "could not compare the host entry to graph authority before re-deriving \
+                     this path's semantics"
+                );
+                outcome
+                    .failed
+                    .push(SemanticFailure::unresolved(file_id.0.clone()));
+                continue;
+            }
+        }
+
+        if let Err(error) =
+            clear_incompatible_facets(state, &file_id, EnrichmentFacet::EntitySource)
+        {
+            warn!(
+                file = %file_id,
+                error = %error,
+                "incompatible facet cleanup failed before re-deriving this path's semantics"
+            );
+        }
+
+        let event = FileEvent::Changed(host_path);
+        match reconciler.reconcile_file_change(&event, &state.blobs, state.graph.as_ref()) {
+            Ok(result) => {
+                let (reconciled, delta) = result.into_parts();
+                use kin_reconcile::ReconcileOutcome;
+                let should_apply = matches!(
+                    &reconciled,
+                    ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. }
+                );
+                // `BrokenAst` and `Conflict` retain last-known-good state and
+                // derive nothing, so the file keeps the spans its previous parse
+                // recorded. Counting either as enrichment would be this whole
+                // change's own defect one level down: a clean summary over a
+                // file that still answers at its old positions. The daemon
+                // reconciles under `ReconcilePolicy::FallbackToLkg`, so a
+                // syntactically broken file is the ordinary case rather than an
+                // edge, and it is exactly the case an agent produces mid-edit.
+                if !should_apply {
+                    warn!(
+                        file = %file_id,
+                        outcome = ?reconciled,
+                        "published bytes were read but no semantic transaction came back, so \
+                         this path still answers at the positions its previous parse recorded"
+                    );
+                    outcome.failed.push(
+                        if matches!(reconciled, ReconcileOutcome::BrokenAst { .. }) {
+                            SemanticFailure::unparseable(file_id.0.clone())
+                        } else {
+                            SemanticFailure::unresolved(file_id.0.clone())
+                        },
+                    );
+                    continue;
+                }
+                {
+                    let derived_entities = !delta.entity_deltas.is_empty();
+                    if let Err(error) = state.graph.apply_transaction_delta(&delta) {
+                        warn!(
+                            file = %file_id,
+                            error = %error,
+                            "re-derived semantics for published bytes but the transaction would \
+                             not apply"
+                        );
+                        outcome
+                            .failed
+                            .push(SemanticFailure::unresolved(file_id.0.clone()));
+                        continue;
+                    }
+                    if derived_entities {
+                        mark_enrichment_unpublished(state, &file_id);
+                    }
+                    // The file's declarations just moved, so whatever a language
+                    // server said about them was said at positions this delta
+                    // retired.
+                    crate::daemon::retire_enrichment_marker(
+                        state,
+                        std::slice::from_ref(&file_id.0),
+                    );
+                    if let Err(error) =
+                        state.persist_projection_truth_from_reconcile(&reconciler, &reconciled)
+                    {
+                        warn!(
+                            file = %file_id,
+                            error = %error,
+                            "failed to persist projection truth after re-deriving semantics"
+                        );
+                    }
+                    if let ReconcileOutcome::FileRemoved {
+                        removed, file_id, ..
+                    } = &reconciled
+                    {
+                        for id in removed {
+                            state.emit_event(DaemonEvent::EntityChanged {
+                                entity_id: *id,
+                                node: None,
+                                change_type: ChangeType::Deleted,
+                                file_path: Some(file_id.0.clone()),
+                                session_id: None,
+                            });
+                        }
+                    }
+                    graph_changed = true;
+                    outcome.enriched += 1;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    file = %file_id,
+                    error = %error,
+                    "published bytes could not be re-parsed, so this path's entities still \
+                     answer at the positions they were parsed at"
+                );
+                outcome
+                    .failed
+                    .push(SemanticFailure::unresolved(file_id.0.clone()));
+            }
+        }
+    }
+
+    drop(reconciler);
+    if graph_changed {
+        state.mark_dirty();
+        state.bump_version();
+    }
+    outcome
+}
+
 async fn sync_filesystem_with_graph_publishing(
     state: &DaemonState,
     publication: TreePublication,
@@ -8275,6 +8892,25 @@ async fn sync_filesystem_with_graph_publishing_inner(
     // Recorded before anything below can fail, so a pass that dies part way
     // through enrichment still hands the deferral back to be closed.
     *deferred_out = exact_admission.deferred_tree.take();
+    // Drain what earlier publications owe a parser, on both paths and before the
+    // empty-transition conclusion below.
+    //
+    // On the empty path this is the whole point: an empty transition means the
+    // working copy and the graph agree about bytes, not that the graph agrees
+    // with itself, and returning without asking is what let a commit record a
+    // tree delta with no entity delta over a file whose declarations had all
+    // moved.
+    //
+    // On the non-empty path it matters for a different reason. This pass parses
+    // the paths ITS OWN transition moved, which need not include a path some
+    // earlier publication left owing, and the commit that carries this admission
+    // settles the whole record once its transaction reaches authority. Draining
+    // only on the empty path would let one unrelated edit clear a debt nothing
+    // had paid.
+    if let Err(error) = drain_semantic_debt(state).await {
+        drop(graph_mutation);
+        return Err(error);
+    }
     if exact_admission.deltas.is_empty() {
         drop(graph_mutation);
         return Ok(());
@@ -8293,6 +8929,12 @@ async fn sync_filesystem_with_graph_publishing_inner(
     let mut graph_changed = true;
     let enrichment_pipeline = IndexPipeline::new();
     state.bump_version();
+
+    // The same per-pass collection the ambient tick takes, on the seam
+    // `/commands/admit` and `/commands/commit` both drive. This is the pass a
+    // reader is usually looking at when they run `kin status` or `kin commit`,
+    // because both admit before they read.
+    let mut observed_parses: Vec<kin_core::retained_parse::ObservedParse> = Vec::new();
 
     for event in events {
         let admitted = match admit_file_event_with_exact_tree(
@@ -8456,6 +9098,13 @@ async fn sync_filesystem_with_graph_publishing_inner(
                             }
                         }
                         graph_changed = true;
+                        // Settled here for the same reason as on the ambient
+                        // tick: a removed path never reaches the reconcile
+                        // below, so nothing else would clear its entry.
+                        if let Some(path) = repo_path.as_utf8() {
+                            observed_parses
+                                .push(kin_core::retained_parse::ObservedParse::settled(path));
+                        }
                         debug!(file = %repo_path, "removed exact tree entry during complete sync");
                     }
                     Err(error) => warn!(
@@ -8473,6 +9122,7 @@ async fn sync_filesystem_with_graph_publishing_inner(
         {
             Ok(result) => {
                 let (outcome, delta) = result.into_parts();
+                observed_parses.extend(observed_parse_of(&semantic_repo_path, &outcome));
                 use kin_reconcile::ReconcileOutcome;
                 let should_apply = matches!(
                     &outcome,
@@ -8559,6 +9209,18 @@ async fn sync_filesystem_with_graph_publishing_inner(
         }
     }
 
+    // One publication for the whole pass, and it happens while this pass still
+    // holds the reconciler lock, which is what serializes it against the
+    // ambient tick's own publication. `record` is a read-modify-write of one
+    // document, so two passes interleaving it would let the later write drop
+    // what the earlier one learned. The tick publishes under the same lock for
+    // the same reason.
+    //
+    // Every `continue` in the loop above falls through to here, so a pass that
+    // skipped one file still publishes what it learned about the rest. A pass
+    // that REFUSES does not reach this, and that is the right direction: the
+    // observations it took describe a transition it then declined to complete.
+    kin_core::retained_parse::record(&state.layout, &observed_parses);
     drop(reconciler);
 
     if graph_changed {

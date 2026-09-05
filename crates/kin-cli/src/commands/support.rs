@@ -80,10 +80,13 @@ impl SupportJson {
 pub fn inspect_support_graph(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
+    kin_root: Option<&std::path::Path>,
 ) -> Result<SupportJson> {
+    let retained = kin_core::retained_parse::read_at_root(kin_root);
     let health = super::graph_health::inspect_graph(
         &super::repository_authority::RequestRepositoryAuthority::pinned(binding.clone()),
         graph,
+        &retained,
     )?;
     let stats = graph.graph_stats();
     Ok(SupportJson::from_parts(&stats, health))

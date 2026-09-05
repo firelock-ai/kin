@@ -764,13 +764,24 @@ fn degradations_reading(payload: &Value) -> Reading {
 }
 
 /// The completeness signal's own reading of the substrate and the numbers.
-/// Graph freshness as a verdict input: wired, and deliberately weighing nothing
-/// until the durable marker reaches the health wire.
+/// Graph freshness as a verdict input. The selected graph's own stale-sample
+/// disclosure refuses; the admission clock still weighs nothing.
 ///
-/// The clock reaches the envelope now (see [`crate::envelope::GraphFreshness`]),
-/// which is the half of FIR-2226 that could be done honestly here. This is the
-/// seam that will carry it into the verdict, and it reports [`Reading::Silent`]
-/// in every state on purpose, contributing neither agreement nor refusal.
+/// Two readings share one field and only one of them is decidable here, which is
+/// why this is a match rather than a single verdict over
+/// [`crate::envelope::GraphFreshness`].
+///
+/// **Why the replayed sample refuses.** `Stale` is a positive observation the
+/// status producer made: the selected graph could not be sampled live after a
+/// counted number of attempts, the failure mode is named, and the age of the
+/// observation whose counters this response replays is measured in
+/// milliseconds. Nothing is inferred from an absence, so the objection this
+/// module raises against the clock below does not reach it. It has to refuse,
+/// because completeness is a reading of the SUBSTRATE and says nothing about
+/// whether the sample was live: an answer replaying counters from an earlier
+/// observation could reach `_kin.verdict` as certified with every coverage
+/// class complete, which is the false all-clear this whole module exists to
+/// stop.
 ///
 /// **Why not refuse when no admission is recorded.** The wire's clock is the
 /// daemon's in-memory record, set only by a completed exact-tree admission pass,
@@ -787,16 +798,25 @@ fn degradations_reading(payload: &Value) -> Reading {
 /// state exactly the false all-clear for the case this cannot see: a months-stale
 /// store under a daemon that has been up the whole time and admitted once.
 ///
-/// Both halves need the same missing fact, a reading the daemon does not
-/// publish: the durable last-admission marker, which survives a restart and
-/// carries `tracked_artifacts` beside its timestamp. With it, absence and
-/// staleness separate and this becomes a real input. Until then, silence is the
-/// only honest reading, and a silent input never contributes agreement, so
-/// nothing here can license an answer either.
+/// Both admission-clock halves need the same missing fact, a reading the daemon
+/// does not publish: the durable last-admission marker, which survives a restart
+/// and carries `tracked_artifacts` beside its timestamp. With it, absence and
+/// staleness separate and the clock becomes a real input too. Until then,
+/// silence is the only honest reading of it, and a silent input never
+/// contributes agreement, so nothing there can license an answer either.
 fn graph_freshness_reading(envelope: &Envelope) -> Reading {
-    // Read so the field is provably consumed and the seam is not decorative.
-    let _ = envelope.freshness.as_ref();
-    Reading::Silent
+    match envelope.freshness.as_ref() {
+        // The clause is taken from the type rather than written again here, so
+        // the sentence `_kin.freshness` publishes and the one the verdict
+        // refuses with cannot drift apart.
+        Some(stale @ crate::envelope::GraphFreshness::Stale { .. }) => {
+            match stale.limiting_factor() {
+                Some(clause) => Reading::Inconclusive(vec![clause]),
+                None => Reading::Silent,
+            }
+        }
+        Some(_) | None => Reading::Silent,
+    }
 }
 
 fn completeness_reading(envelope: &Envelope) -> Reading {
@@ -1092,20 +1112,26 @@ fn headline_count_disagreements(response: &Value) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// FIR-2226 step 1. The clock reaches the envelope; the verdict seam is
-    /// wired and deliberately weighs nothing yet.
+    /// The freshness field carries two readings and they are graded apart.
     ///
-    /// The arms below assert exactly that and no more. An earlier version of
-    /// this change refused when no admission was recorded, and the acceptance
-    /// suite's anti-vacuity control caught it certifying nothing: absence of the
-    /// in-memory clock is the ordinary state of a healthy fresh store, so
-    /// refusing on it floors every answer on every such store. The arms are
-    /// written against what this can honestly claim rather than against what it
-    /// was hoped to do.
+    /// The ADMISSION CLOCK weighs nothing. An earlier version of the change
+    /// that wired it refused when no admission was recorded, and the
+    /// acceptance suite's anti-vacuity control caught it
+    /// certifying nothing: absence of the in-memory clock is the ordinary state
+    /// of a healthy fresh store, so refusing on it floors every answer on every
+    /// such store. Those arms are written against what the clock can honestly
+    /// claim rather than against what it was hoped to do.
     ///
-    /// Driven through `with_health` using the producer's own field names, and
-    /// both are `skip_serializing_if = "Option::is_none"` there, which is why the
-    /// no-clock arm omits the key rather than setting it null.
+    /// The REPLAYED SAMPLE refuses, because it is an observation rather than an
+    /// absence: a named failure mode, a counted number of live attempts, and a
+    /// measured age. Its arms are the ones that must stay separate from the
+    /// clock's, since a graph selected for this answer can be stale while HEAD
+    /// was admitted seconds ago.
+    ///
+    /// The clock arms are driven through `with_health` using the producer's own
+    /// field names, and both are `skip_serializing_if = "Option::is_none"`
+    /// there, which is why the no-clock arm omits the key rather than setting it
+    /// null.
     mod graph_freshness {
         use super::*;
 
@@ -1199,6 +1225,129 @@ mod tests {
             ));
         }
 
+        /// The replayed sample the status producer publishes: the selected graph
+        /// could not be sampled live, so the counters beside it are an
+        /// observation from a measured while ago.
+        fn replayed_sample() -> Envelope {
+            with_clock().with_selected_graph_staleness(
+                "the authority epoch moved under the sample",
+                4_200,
+                Some(19),
+                3,
+            )
+        }
+
+        /// A coverage reading with nothing wrong with it, which is what makes
+        /// the arm below worth having: without the freshness input this exact
+        /// envelope certifies.
+        fn complete_coverage() -> crate::envelope::Completeness {
+            crate::envelope::Completeness {
+                status: "complete".to_string(),
+                bound: "exact".to_string(),
+                substrate: "graph".to_string(),
+                classes: Map::new(),
+                decided_by: Vec::new(),
+                counted: None,
+                reference_resolution: None,
+                limits: Vec::new(),
+                note: "Every class this answer depended on was observed present.".to_string(),
+            }
+        }
+
+        /// The replayed sample refuses, and it refuses with the sentence the
+        /// envelope publishes rather than with a second copy of it.
+        #[test]
+        fn a_replayed_sample_refuses_with_the_clause_the_envelope_publishes() {
+            let envelope = replayed_sample();
+            let reading = graph_freshness_reading(&envelope);
+            let state = reading.state();
+            let Reading::Inconclusive(clauses) = reading else {
+                panic!("a replayed sample is an observation, not an absence: {state}");
+            };
+            assert_eq!(
+                clauses,
+                vec![envelope
+                    .freshness
+                    .as_ref()
+                    .expect("the fixture sets a freshness")
+                    .limiting_factor()
+                    .expect("a stale sample names a limiting factor")],
+                "the verdict refuses with the type's own sentence"
+            );
+            let clause = &clauses[0];
+            assert!(
+                clause.starts_with("selected_graph_sample_stale:")
+                    && clause.contains("after 3 attempt(s)")
+                    && clause.contains("the authority epoch moved under the sample")
+                    && clause.contains("4200 ms earlier"),
+                "the factor names the failure mode, the attempts and the age: {clause}"
+            );
+        }
+
+        /// Complete coverage over counters that replay an earlier
+        /// observation. `completeness` is a reading of the SUBSTRATE
+        /// and cannot see that the sample was not live, so before this arm
+        /// existed `_kin.verdict` read certified here.
+        #[test]
+        fn a_replayed_sample_with_complete_coverage_reads_inconclusive() {
+            let mut envelope = replayed_sample();
+            envelope.completeness = Some(complete_coverage());
+
+            let verdict = Verdict::compute(
+                "find_references",
+                &populated_reference_payload("present"),
+                &envelope,
+                None,
+            )
+            .expect("the readings are not all silent");
+
+            assert!(
+                !verdict.certified,
+                "a replayed sample cannot be certified over: {:?}",
+                verdict.limiting_factor
+            );
+            assert_eq!(
+                verdict
+                    .inputs
+                    .get("graph_freshness")
+                    .and_then(Value::as_str),
+                Some(INCONCLUSIVE),
+                "and the refusing input is named in the stamp: {:?}",
+                verdict.inputs
+            );
+            assert!(
+                verdict
+                    .limiting_factor
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("selected_graph_sample_stale"),
+                "the factor names it: {:?}",
+                verdict.limiting_factor
+            );
+
+            // The control that makes the arm above mean something: the same
+            // coverage under a live sample still certifies, so the refusal is
+            // the freshness reading rather than anything else in this fixture.
+            let mut live = with_clock();
+            live.completeness = Some(complete_coverage());
+            // Named for the sample rather than for the outcome. A local called
+            // `certified` matches CodeQL's certificate-name heuristic for
+            // `rust/cleartext-logging`, and `assert!` counts as a log sink, so
+            // the earlier spelling raised a high-severity alert on this test.
+            let live_sample = Verdict::compute(
+                "find_references",
+                &populated_reference_payload("present"),
+                &live,
+                None,
+            )
+            .expect("the readings are not all silent");
+            assert!(
+                live_sample.certified,
+                "the fixture certifies without the stale sample: {:?}",
+                live_sample.limiting_factor
+            );
+        }
+
         /// The readings array and the stamp's derivation agree on every name,
         /// which neither side can prove on its own.
         ///
@@ -1251,11 +1400,19 @@ mod tests {
             }
         }
 
-        /// End to end: neither store may pick up a freshness clause, and the
-        /// input is present in the stamp as `not_applicable` rather than absent,
-        /// so the seam is visible to a reader and to the next reading added.
+        /// End to end: neither ADMISSION-CLOCK store may pick up a freshness
+        /// clause, and the input is present in the stamp as `not_applicable`
+        /// rather than absent, so the seam is visible to a reader.
+        ///
+        /// Scoped to the clock deliberately. A replayed sample is exempt because
+        /// it is a different reading with a different basis, and it is required
+        /// to put its clause in the factor by
+        /// `a_replayed_sample_with_complete_coverage_reads_inconclusive` below.
+        /// Widened here from the admission label alone to every freshness label,
+        /// so a future arm that starts refusing on the clock cannot slip past
+        /// this by choosing a different word.
         #[test]
-        fn neither_store_puts_a_freshness_clause_in_the_verdict() {
+        fn neither_admission_clock_state_puts_a_freshness_clause_in_the_verdict() {
             for envelope in [with_clock(), without_clock()] {
                 let verdict = Verdict::compute(
                     "find_references",
@@ -1273,13 +1430,11 @@ mod tests {
                     "the seam is wired and weighs nothing: {:?}",
                     verdict.inputs
                 );
+                let factor = verdict.limiting_factor.as_deref().unwrap_or_default();
                 assert!(
-                    !verdict
-                        .limiting_factor
-                        .as_deref()
-                        .unwrap_or_default()
-                        .contains("graph_admission"),
-                    "no freshness clause may reach the factor yet: {:?}",
+                    !factor.contains("graph_admission")
+                        && !factor.contains("selected_graph_sample_stale"),
+                    "no freshness clause may reach the factor from an admission clock: {:?}",
                     verdict.limiting_factor
                 );
             }

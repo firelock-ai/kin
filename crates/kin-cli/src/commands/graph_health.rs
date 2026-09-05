@@ -109,8 +109,9 @@ struct ContaminationSummary {
 pub(crate) fn inspect_graph(
     authority: &RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
+    retained: &kin_core::retained_parse::RetainedParseRead,
 ) -> Result<GraphHealthReport> {
-    inspect_graph_with_pending_embeddings(authority, graph, None)
+    inspect_graph_with_pending_embeddings(authority, graph, None, retained)
 }
 
 /// Build the report against a pending count the caller already sampled.
@@ -128,9 +129,10 @@ pub(crate) fn inspect_graph_with_pending_embeddings(
     authority: &RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     pending_embeddings: Option<usize>,
+    retained: &kin_core::retained_parse::RetainedParseRead,
 ) -> Result<GraphHealthReport> {
     let entities = graph.list_all_entities()?;
-    inspect_graph_with_entities(authority, graph, &entities, pending_embeddings)
+    inspect_graph_with_entities(authority, graph, &entities, pending_embeddings, retained)
 }
 
 /// Build the report against an entity listing the caller already took.
@@ -140,11 +142,18 @@ pub(crate) fn inspect_graph_with_pending_embeddings(
 /// it once and passing it here is what keeps one response from cloning the
 /// whole entity table three times: once for the renderer's counters, once for
 /// this report, and once more inside contamination collection.
+///
+/// `retained` is the daemon's durable record of which paths did not parse from
+/// their current bytes. It is passed in rather than read here, because this
+/// function is handed a graph and an authority and never a store root, and
+/// because a caller that has no record to offer must say so rather than have one
+/// invented for it.
 pub(crate) fn inspect_graph_with_entities(
     authority: &RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     entities: &[kin_model::Entity],
     pending_embeddings: Option<usize>,
+    retained: &kin_core::retained_parse::RetainedParseRead,
 ) -> Result<GraphHealthReport> {
     let stats = graph.graph_stats();
     // One resolved-tree clone for the whole report, for the same reason.
@@ -158,10 +167,14 @@ pub(crate) fn inspect_graph_with_entities(
     // census is collected separately because the reference collector starts
     // from the entity table, and a file that produced no entity is invisible to
     // it by construction: that is exactly the population a parse hole lives in.
-    let reference_edge_coverage =
-        kin_core::reference_coverage::collect_reference_edge_coverage(graph)?.with_parse_coverage(
-            kin_core::reference_coverage::collect_parse_coverage_from(&resolved_tree, entities),
-        );
+    let reference_edge_coverage = kin_core::reference_coverage::collect_reference_edge_coverage(
+        graph,
+    )?
+    .with_parse_coverage(kin_core::reference_coverage::collect_parse_coverage_from(
+        &resolved_tree,
+        entities,
+        retained,
+    ));
     Ok(build_graph_health_report(
         &stats,
         &supported_inputs,

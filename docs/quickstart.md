@@ -354,6 +354,24 @@ Save a new semantic change snapshot:
 kin commit -m "refactor: optimize user query path"
 ```
 
+### Branch and merge
+
+A branch is a ref over the same immutable history, and a merge composes both
+sides by entity identity against their common base rather than by line:
+
+```sh
+kin branch create cap-backoff   # a new ref at the current head
+kin branch switch cap-backoff   # move the workspace onto it; uncommitted work comes along
+kin commit -m "Raise the backoff cap to a minute"
+kin branch switch main
+kin merge cap-backoff           # one merge change carrying both parents
+```
+
+A merge that does not compose is parked as a durable conflict record rather
+than refused: `kin conflicts` shows it and `kin resolve` settles it. The
+[README runs this loop end to end](../README.md#version-control-without-git)
+in an empty directory, with the output of a real run.
+
 ### View history
 
 ```sh

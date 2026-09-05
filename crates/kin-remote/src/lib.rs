@@ -21,6 +21,7 @@ pub enum HostKind {
     GitLab,
     Bitbucket,
     KinLab,
+    Peer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

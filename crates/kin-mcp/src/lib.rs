@@ -10,6 +10,7 @@ pub mod envelope;
 pub mod error;
 pub mod handlers;
 pub mod negative;
+pub mod remediation;
 pub mod server;
 pub mod session;
 pub mod startup_binding;
@@ -37,6 +38,7 @@ pub use negative::NEGATIVE_KEY;
 pub use server::{
     process_daemon_message, process_message, run_stdio, run_stdio_daemon, BoundRepo,
     McpServerConfig, RepoBinder, SessionAuthorityMode, WorkspaceBinding,
+    FIRST_TOOLS_CALL_STARTUP_BIND_GRACE,
 };
 pub use session::{
     AssistantSession, CommitRefusal, CommitRefusalCode, CoordinationEnforcementMode,

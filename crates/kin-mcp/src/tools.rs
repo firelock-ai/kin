@@ -740,7 +740,7 @@ fn registered_tools() -> ToolsListResult {
                             "description": "Direction of traversal: 'calls' walks outgoing edges (focal -> callees), 'callers' walks incoming edges (callers -> focal), 'both' merges. Default 'both'.",
                             "default": "both"
                         },
-                        "limit_per_step": { "type": "integer", "description": "Max relations expanded per step (default 5, capped at 25). Kept by relevance, not by relation order; a step whose fan-out was cut says so with the count it dropped.", "default": 5, "minimum": 1, "maximum": 25 },
+                        "limit_per_step": { "type": "integer", "description": "Max relations expanded per step (default 5, capped at 25). Kept by relevance, not by relation order; a step whose fan-out was cut says so with the count it dropped.", "default": 5, "minimum": 1, "maximum": crate::remediation::TRACE_MAX_LIMIT_PER_STEP },
                         "target": { "type": "string", "description": "A symbol you are trying to reach, by exact name or UUID. Neighbors from which it is still reachable inside the requested depth survive the per-step cap ahead of neighbors that are not, so the question decides what a narrow walk keeps instead of proximity deciding it. Optional; a target that resolves to nothing is reported in degradations and the chain is still returned." },
                         "include_body": {
                             "type": "boolean",
@@ -774,7 +774,7 @@ fn registered_tools() -> ToolsListResult {
                         "to": { "type": "string", "description": "Target end, in the same forms." },
                         "from_file": { "type": "string", "description": "Pin `from` to the entity of that name in the file this path or path suffix names. Same request as the name@file spelling." },
                         "to_file": { "type": "string", "description": "Pin `to` the same way." },
-                        "max_depth": { "type": "integer", "description": "Hops walked between the two ends (default 6, ceiling 12). Containment hops joining a class to its members are not counted.", "default": 6, "minimum": 1, "maximum": 12 },
+                        "max_depth": { "type": "integer", "description": "Hops walked between the two ends (default 6, ceiling 12). Containment hops joining a class to its members are not counted.", "default": 6, "minimum": 1, "maximum": crate::remediation::PATH_MAX_MAX_DEPTH },
                         "limit": { "type": "integer", "description": "Routes returned, shortest first (default 3, ceiling 25). `routes_total` says how many shortest routes exist.", "default": 3, "minimum": 1, "maximum": 25 },
                         "direction": {
                             "type": "string",
@@ -1908,6 +1908,63 @@ mod tests {
         assert!(
             checked >= 11,
             "the sweep found only {checked} budget parameters, so it is not reaching the schemas"
+        );
+    }
+
+    /// The number the schema refuses past and the number the remediation quotes
+    /// are one constant, and this holds the served schema to it.
+    ///
+    /// The stranger was told to "re-query with `limit_per_step` above 25" by a
+    /// producer that read its cap off the clip, while this schema declared
+    /// `"maximum": 25` from a separate literal. Either drifting alone would
+    /// bring the advice back.
+    #[test]
+    fn the_trace_step_ceiling_the_schema_declares_is_the_one_the_remediation_quotes() {
+        let tools = tool_definitions();
+        let trace = tools
+            .tools
+            .iter()
+            .find(|tool| tool.name == "trace_data_flow")
+            .expect("trace_data_flow is registered");
+        let property = &trace.input_schema["properties"]["limit_per_step"];
+        assert_eq!(
+            property["maximum"].as_u64(),
+            Some(crate::remediation::TRACE_MAX_LIMIT_PER_STEP as u64),
+            "the schema ceiling and the remediation ceiling have drifted apart: {property}"
+        );
+        let description = property["description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains(&format!(
+                "capped at {}",
+                crate::remediation::TRACE_MAX_LIMIT_PER_STEP
+            )),
+            "the description names a different cap from the one enforced: {description}"
+        );
+    }
+
+    /// The same pin for `trace_path`'s `max_depth`, which the gap quotes as
+    /// "ceiling 12" and the handler clamps to.
+    #[test]
+    fn the_path_depth_ceiling_the_schema_declares_is_the_one_the_gap_quotes() {
+        let tools = tool_definitions();
+        let path = tools
+            .tools
+            .iter()
+            .find(|tool| tool.name == crate::handlers::path::TOOL_NAME)
+            .expect("trace_path is registered");
+        let property = &path.input_schema["properties"]["max_depth"];
+        assert_eq!(
+            property["maximum"].as_u64(),
+            Some(crate::remediation::PATH_MAX_MAX_DEPTH as u64),
+            "the schema ceiling and the gap's ceiling have drifted apart: {property}"
+        );
+        let description = property["description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains(&format!(
+                "ceiling {}",
+                crate::remediation::PATH_MAX_MAX_DEPTH
+            )),
+            "the description names a different ceiling from the one enforced: {description}"
         );
     }
 

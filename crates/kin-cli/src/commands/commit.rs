@@ -7,7 +7,7 @@ use super::commit_progress::{
     daemon_death_explanation, PhaseTail, AUTHORITY_NOT_GIT_NOTE, DETACHED_HEAD_NOTE,
 };
 
-pub async fn run(message: String, quiet: bool) -> Result<()> {
+pub async fn run(message: Option<String>, quiet: bool, amend: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     // Before attribution, before the daemon is resolved, before anything this
     // command does for itself. The ambient reconcile tick and this commit both
@@ -21,11 +21,20 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     // exists.
     let _announced = CommitAnnouncement::announce(layout.root());
 
-    let result = run_daemon_commit(&layout, &message, quiet).await?;
+    let result = run_daemon_commit(&layout, message.as_deref(), quiet, amend).await?;
     if !quiet {
         println!(
             "{}",
-            render_commit_summary(&result, pending_enrichment(&layout).await.as_deref())
+            render_commit_summary(
+                &result,
+                pending_enrichment(&layout).await.as_deref(),
+                // Read after the commit, like the enrichment line beside it, and
+                // for the same reason: the question is what the store the reader
+                // now has is answering about from an earlier parse. The commit
+                // itself drives the admission that refreshes this record, so by
+                // the time this reads it, it describes the change just made.
+                retained_parse(&layout).as_deref(),
+            )
         );
     }
     Ok(())
@@ -140,13 +149,30 @@ impl Drop for CommitAnnouncement {
     }
 }
 
+/// The paths this commit recorded whose bytes the parser could not read.
+///
+/// A commit over a file whose syntax is broken succeeds, and should: the bytes
+/// are durable, the history is right, and refusing would leave an agent
+/// mid-edit unable to record anything at all. What it must not do is print
+/// `(0 entities, 0 relations, 1 artifacts)` and stop, because that zero is the
+/// count of what the broken parse derived and reads as a change that touched no
+/// code. Every failure answers `None`: a disclosure must never turn a landed
+/// commit into an error.
+fn retained_parse(layout: &kin_core::KinLayout) -> Option<String> {
+    kin_core::retained_parse::read(layout).describe(chrono::Utc::now())
+}
+
 /// What a successful `kin commit` prints.
 ///
 /// The second line is said every time, because the surprise is permanent: the
 /// working tree this change came from stays dirty and `git log` never moves.
 /// Without it a brownfield user commits all day and reads `git status` as proof
 /// that nothing happened.
-fn render_commit_summary(result: &DaemonCommitResult, pending: Option<&str>) -> String {
+fn render_commit_summary(
+    result: &DaemonCommitResult,
+    pending: Option<&str>,
+    retained: Option<&str>,
+) -> String {
     let landed = match &result.branch {
         Some(branch) => format!("on branch '{branch}'"),
         None => "on a detached HEAD, which no branch names".to_string(),
@@ -164,8 +190,15 @@ fn render_commit_summary(result: &DaemonCommitResult, pending: Option<&str>) -> 
             None => format!("\n{DETACHED_HEAD_NOTE}"),
         },
     );
-    match pending {
+    let summary = match pending {
         Some(pending) => format!("{summary}\n{pending}"),
+        None => summary,
+    };
+    // Last, and after the enrichment line, because it is the only line here a
+    // reader has to act on. Enrichment catches up on its own; a file whose
+    // syntax is broken never does.
+    match retained {
+        Some(retained) => format!("{summary}\n{retained}"),
         None => summary,
     }
 }
@@ -205,8 +238,9 @@ const PHASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 
 async fn run_daemon_commit(
     layout: &kin_core::KinLayout,
-    message: &str,
+    message: Option<&str>,
     quiet: bool,
+    amend: bool,
 ) -> Result<DaemonCommitResult> {
     // Resolved here, in the caller's own environment and working directory,
     // rather than inside the daemon. The daemon is spawned with every `GIT_*`
@@ -215,6 +249,15 @@ async fn run_daemon_commit(
     // this command". Resolution also comes before the daemon is contacted: a
     // commit that cannot be attributed must not reach the authority path at all.
     let author = crate::commands::require_commit_author_for(layout)?;
+    let expected_head = if amend {
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
+        let authority = super::repository_authority::ActiveRepositoryAuthority::open(&binding)?;
+        Some(authority.current_change_id()?.ok_or_else(|| {
+            anyhow::anyhow!("cannot amend an unborn workspace; create a commit first")
+        })?)
+    } else {
+        None
+    };
     let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
         .await?
         .ok_or_else(|| crate::daemon_client::daemon_required_error("commit", layout))?;
@@ -224,17 +267,22 @@ async fn run_daemon_commit(
     // the byte-identical repository transaction.
     let operation_id = kin_model::OperationId::new();
     let timestamp = kin_model::Timestamp::now();
+    let mut payload = serde_json::json!({
+        "operation_id": operation_id,
+        "timestamp": timestamp,
+        "message": message,
+        "author": author,
+    });
+    if let Some(expected_head) = expected_head {
+        payload["amend"] = serde_json::json!(true);
+        payload["expected_head"] = serde_json::json!(expected_head);
+    }
     let mut request = client
         .post(format!(
             "{}/commands/commit",
             daemon_url.trim_end_matches('/')
         ))
-        .json(&serde_json::json!({
-            "operation_id": operation_id,
-            "timestamp": timestamp,
-            "message": message,
-            "author": author,
-        }));
+        .json(&payload);
     if let Some(token) = crate::daemon_client::resolve_daemon_auth_token() {
         request = request.bearer_auth(token);
     }
@@ -688,7 +736,7 @@ mod tests {
     fn the_commit_summary_names_a_detached_head_and_how_to_leave_it() {
         let mut result = landed_result();
         result.branch = None;
-        let text = render_commit_summary(&result, None);
+        let text = render_commit_summary(&result, None, None);
         assert!(
             text.contains("on a detached HEAD"),
             "a detached commit must say so rather than name a branch: {text}"
@@ -711,7 +759,7 @@ mod tests {
         );
 
         // The control, same renderer, same fixture but for the one field.
-        let on_branch = render_commit_summary(&landed_result(), None);
+        let on_branch = render_commit_summary(&landed_result(), None, None);
         assert!(
             on_branch.contains("on branch 'refs/heads/main'"),
             "a branch commit still names its branch: {on_branch}"
@@ -863,7 +911,10 @@ mod tests {
             .expect("a commit with no reply deadline waits for the daemon");
         let result: DaemonCommitResult = response.json().await.unwrap();
         assert_eq!(result.change_id, "5b8ca7b7");
-        assert_eq!(render_commit_summary(&result, None).lines().count(), 2);
+        assert_eq!(
+            render_commit_summary(&result, None, None).lines().count(),
+            2
+        );
 
         serving.abort();
     }
@@ -979,6 +1030,7 @@ mod tests {
                 file_count: 1,
             },
             None,
+            None,
         );
         assert!(
             summary.contains("Created semantic change 9ade4452cd80"),
@@ -1069,8 +1121,8 @@ mod tests {
             relation_count: 0,
             file_count: 2,
         };
-        let quiet = render_commit_summary(&result, None);
-        let noisy = render_commit_summary(&result, Some("Cross-file enrichment is behind."));
+        let quiet = render_commit_summary(&result, None, None);
+        let noisy = render_commit_summary(&result, Some("Cross-file enrichment is behind."), None);
 
         assert_eq!(quiet.lines().count(), 2, "{quiet}");
         assert_eq!(noisy.lines().count(), 3, "{noisy}");
@@ -1122,6 +1174,53 @@ mod tests {
              worth any of it"
         );
         silent.abort();
+    }
+
+    /// A commit over a file whose bytes the parser could not read says so, and
+    /// says it without moving anything above it.
+    ///
+    /// The counts are correct and stay: zero entities is what the broken parse
+    /// derived. Journey GAP-9 is that the zero was the whole message, so a
+    /// stranger read `(0 entities, 0 relations, 1 artifacts)` on a commit that
+    /// had just recorded a file the graph would go on answering about at
+    /// positions its bytes no longer held.
+    #[test]
+    fn a_commit_over_a_file_that_did_not_parse_names_it_beneath_the_counts() {
+        let result = DaemonCommitResult {
+            change_id: "b41b7f45e102".to_string(),
+            branch: Some("refs/heads/main".to_string()),
+            entity_count: 0,
+            relation_count: 0,
+            file_count: 1,
+        };
+        let retained = "Did not parse as written: search.py (4 parse errors). The bytes on disk \
+                        do not parse.";
+
+        let quiet = render_commit_summary(&result, None, None);
+        let named = render_commit_summary(&result, None, Some(retained));
+
+        assert_eq!(quiet.lines().count(), 2, "{quiet}");
+        assert_eq!(named.lines().count(), 3, "{named}");
+        assert_eq!(
+            quiet.lines().take(2).collect::<Vec<_>>(),
+            named.lines().take(2).collect::<Vec<_>>(),
+            "the change id, the counts and the git-status note are unchanged"
+        );
+        assert!(named.ends_with(retained), "{named}");
+        assert!(
+            named.contains("(0 entities, 0 relations, 1 artifacts)"),
+            "the counts stay: zero is what the broken parse derived: {named}"
+        );
+
+        // The retained line goes last, under the enrichment line, because
+        // enrichment catches up on its own and a broken syntax never does.
+        let both = render_commit_summary(
+            &result,
+            Some("Cross-file enrichment is behind."),
+            Some(retained),
+        );
+        assert_eq!(both.lines().count(), 4, "{both}");
+        assert!(both.ends_with(retained), "{both}");
     }
 
     /// The announcement this command publishes before it does anything else,

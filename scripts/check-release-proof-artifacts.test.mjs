@@ -16,6 +16,7 @@ import {
   LEGACY_DRIVER_ENDPOINT_FIELD,
   PREFLIGHT_RECORD,
   PREFLIGHT_SCHEMA,
+  PROVENANCE_ASSET,
   REFERENCE_DRIVER_ENDPOINT,
   REQUIRE_MODES,
   STRANGER_RECORD,
@@ -23,6 +24,7 @@ import {
   evidencePath,
   fetchEvidence,
   judgePreflight,
+  judgeReleaseProvenance,
   judgeStranger,
   main,
   parseRunEnv,
@@ -573,9 +575,16 @@ test('require preflight still judges a stranger record that exists', async () =>
       require: 'preflight',
       env: {},
       log: () => {},
+      // Three reads now, not two. A stranger record naming bytes no preflight
+      // leg judged sends the gate to the release surface for a second receipt,
+      // and this candidate has no release: an empty listing is what says so.
+      // Without the route the stub's default 404 would fail closed and this
+      // assertion would pass on a transport error instead of on the refusal it
+      // is about.
       fetchImpl: stubFetch({
         [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
         [STRANGER_RECORD]: ok(strangerRecordText({ archive_sha256: ARCHIVE_UNJUDGED })),
+        '/releases?': jsonOk([]),
       }),
     }),
     /the stranger ran, but not on these bytes/,
@@ -966,6 +975,452 @@ test('main holds on absence when no commit to bridge from is given', async () =>
     /the proof loop has not recorded this candidate/,
   );
   assert.equal(bridged, false);
+});
+
+// ── the release's own receipt ─────────────────────────────────────────────
+//
+// The second link, and the reason there had to be one. A preflight leg judges
+// an rc-build archive; release.yml rebuilds at the tag, so the archive a
+// developer downloads from a release is never a preflight leg. Requiring the
+// preflight link alone made the released-byte proof of any release unable to
+// lift that release's own pending notice. Measured on v0.6.7 on 2026-09-04:
+// three complete arms on the public Linux aarch64 archive
+// f23d321d3ab5bc425063aa50ba2e70a9f0efcbfe164521fcaf343b4efff4d2c0, refused as
+// "not on these bytes" while release-provenance.json for that exact commit
+// listed it as artifacts[1].archive.sha256.
+
+// Bytes that exist only in the release, never among the preflight legs, which
+// is the whole shape of the case.
+const RELEASED_ARCHIVE = '4'.repeat(64);
+const RELEASE_TAG = 'v9.9.9';
+const ASSET_URL = `https://api.github.com/repos/${REPO}/releases/assets/1`;
+
+// Shaped on the real v0.6.7 asset: schema_version 2, the commit at kin.commit
+// rather than at a top-level `commit`, and repeated on every artifact beside
+// the archive sha256 the release shipped.
+const provenanceRecord = (over = {}) => ({
+  schema_version: 2,
+  release_tag: RELEASE_TAG,
+  kin: { commit: SHA, cargo_lock_sha256: '0'.repeat(64) },
+  artifacts: [
+    {
+      artifact: 'kin-linux-aarch64',
+      target: 'aarch64-unknown-linux-musl',
+      kin: { commit: SHA },
+      archive: { name: 'kin-linux-aarch64.tar.gz', sha256: RELEASED_ARCHIVE, size_bytes: 1 },
+    },
+  ],
+  ...over,
+});
+
+const releaseListing = (over = {}) => [
+  {
+    tag_name: RELEASE_TAG,
+    draft: false,
+    assets: [
+      { name: 'checksums-sha256.txt', url: `${ASSET_URL}0` },
+      { name: PROVENANCE_ASSET, url: ASSET_URL },
+    ],
+    ...over,
+  },
+];
+
+// Every route main() needs to reach the release receipt. Overridable one at a
+// time so each refusal below changes exactly one thing.
+const releaseRoutes = ({
+  stranger = strangerRecordText({ archive_sha256: RELEASED_ARCHIVE }),
+  listing = releaseListing(),
+  ref = jsonOk({ object: { type: 'commit', sha: SHA } }),
+  asset = ok(JSON.stringify(provenanceRecord())),
+} = {}) => ({
+  [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
+  [STRANGER_RECORD]: ok(stranger),
+  '/releases/assets/': asset,
+  '/releases?': jsonOk(listing),
+  '/git/ref/tags/': ref,
+});
+
+test('main accepts a stranger run on the bytes the release of that commit shipped', async () => {
+  const lines = [];
+  const result = await main({
+    sha: SHA,
+    repository: REPO,
+    env: {},
+    log: (line) => lines.push(line),
+    fetchImpl: stubFetch(releaseRoutes()),
+  });
+  // The preflight legs do not contain these bytes and are not supposed to.
+  assert.equal(preflightRecord().legs.some((leg) => leg.result.archive.sha256 === RELEASED_ARCHIVE), false);
+  assert.equal(result.archive, RELEASED_ARCHIVE);
+  assert.equal(result.stranger.state, 'complete');
+  assert.equal(result.stranger.link, 'release-provenance');
+  assert.deepEqual(result.stranger.arms, ['green', 'brown', 'vcs']);
+  assert.match(lines.join('\n'), new RegExp(`linked to this candidate by release ${RELEASE_TAG}`));
+});
+
+// The preflight link is untouched, and it still answers without asking the
+// release surface anything. A second receipt that got consulted on the ordinary
+// path would put a network read, and a network failure, in front of every
+// release the gate already proves.
+test('main links a run on preflight bytes without reading the release surface', async () => {
+  let asked = '';
+  const result = await main({
+    sha: SHA,
+    repository: REPO,
+    env: {},
+    log: () => {},
+    fetchImpl: async (url) => {
+      if (url.includes('/releases') || url.includes('/git/ref/tags/')) {
+        asked = url;
+      }
+      return stubFetch({
+        [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
+        [STRANGER_RECORD]: ok(strangerRecordText()),
+      })(url);
+    },
+  });
+  assert.equal(result.archive, ARCHIVE_A);
+  assert.equal(result.stranger.link, 'preflight');
+  assert.equal(asked, '', `the gate read ${asked} when the preflight legs already answered`);
+});
+
+// Neither receipt names these bytes, so the stranger ran on some other build
+// and this candidate is not proven. The refusal must name BOTH sets it checked,
+// or a reader is sent to look at half of what was consulted.
+test('main refuses a run on bytes neither the preflight nor the release names', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch(
+        releaseRoutes({ stranger: strangerRecordText({ archive_sha256: ARCHIVE_UNJUDGED }) }),
+      ),
+    }),
+    (error) => {
+      assert.match(error.message, /the stranger ran, but not on these bytes/);
+      assert.match(error.message, new RegExp(`no preflight leg for ${SHA} judged`));
+      assert.match(error.message, new RegExp(`release ${RELEASE_TAG} shipped`));
+      return true;
+    },
+  );
+});
+
+// A release whose tag resolves to this candidate while its own receipt is about
+// another build is tampering, not absence, so it refuses rather than being
+// skipped in favour of the next release.
+test('main refuses a release provenance that is about another commit', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch(
+        releaseRoutes({
+          asset: ok(JSON.stringify(provenanceRecord({ kin: { commit: OTHER_SHA } }))),
+        }),
+      ),
+    }),
+    /records commit b{40}, not a{40}; the release exists but its provenance is about a different build/,
+  );
+  // The same refusal one level down: the top of the record agrees while the
+  // artifact carrying the bytes does not.
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch(
+        releaseRoutes({
+          asset: ok(
+            JSON.stringify(
+              provenanceRecord({
+                artifacts: [
+                  {
+                    artifact: 'kin-linux-aarch64',
+                    kin: { commit: OTHER_SHA },
+                    archive: { sha256: RELEASED_ARCHIVE },
+                  },
+                ],
+              }),
+            ),
+          ),
+        }),
+      ),
+    }),
+    /artifact "kin-linux-aarch64" records commit b{40}, not a{40}/,
+  );
+});
+
+// A real release of this exact commit, read successfully, that simply does not
+// ship the bytes the stranger ran. Existence of a receipt is not the test; the
+// archive appearing in it is.
+test('main refuses when the release of the candidate ships other bytes', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch(
+        releaseRoutes({
+          asset: ok(
+            JSON.stringify(
+              provenanceRecord({
+                artifacts: [
+                  {
+                    artifact: 'kin-linux-x86_64',
+                    kin: { commit: SHA },
+                    archive: { sha256: ARCHIVE_B },
+                  },
+                ],
+              }),
+            ),
+          ),
+        }),
+      ),
+    }),
+    (error) => {
+      assert.match(error.message, /the stranger ran, but not on these bytes/);
+      assert.match(error.message, new RegExp(`release ${RELEASE_TAG} shipped \\(${ARCHIVE_B}\\)`));
+      return true;
+    },
+  );
+});
+
+// No release of this candidate at all. The refusal has to say the release
+// surface was searched and came back empty, rather than reporting as though
+// only the preflight was ever asked.
+test('main names the empty release surface when nothing shipped these bytes', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch(
+        releaseRoutes({
+          stranger: strangerRecordText({ archive_sha256: ARCHIVE_UNJUDGED }),
+          listing: [],
+        }),
+      ),
+    }),
+    new RegExp(`no published release of ${SHA} carries a ${PROVENANCE_ASSET}`),
+  );
+});
+
+// Fails closed, the same way an unreadable evidence record does. A release
+// listing that could not be read must not be reported as a listing with no
+// release in it: this search can only ever ADD an acceptance, and an answer we
+// could not read must not be turned into a sentence about what exists.
+test('main fails closed when the release surface cannot be read', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch({
+        [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
+        [STRANGER_RECORD]: ok(strangerRecordText({ archive_sha256: RELEASED_ARCHIVE })),
+        '/releases?': { ok: false, status: 502, statusText: 'Bad Gateway' },
+      }),
+    }),
+    /could not list the releases of firelock-ai\/kin: HTTP 502 Bad Gateway/,
+  );
+});
+
+// A draft is not published, so nothing about it is a claim yet, and a release
+// carrying no receipt cannot be the second link. Both are skipped rather than
+// read, and the search goes on to the release that can answer.
+//
+// The draft's own receipt is about another build and sits at its own asset URL,
+// so a gate that stopped skipping drafts would take it FIRST, being newest, and
+// refuse. Without that the draft would carry the same bytes as the release
+// below it and the test would pass either way.
+test('findReleaseProvenance skips a draft and a release with no receipt', async () => {
+  const result = await main({
+    sha: SHA,
+    repository: REPO,
+    env: {},
+    log: () => {},
+    fetchImpl: stubFetch({
+      // First, because the stub answers on the first fragment that matches and
+      // the shared '/releases/assets/' route below would otherwise swallow this
+      // URL and hand the draft the good record.
+      '/releases/assets/1-draft': ok(
+        JSON.stringify(provenanceRecord({ kin: { commit: OTHER_SHA } })),
+      ),
+      ...releaseRoutes({
+        listing: [
+          {
+            tag_name: 'v9.9.9-draft',
+            draft: true,
+            assets: [{ name: PROVENANCE_ASSET, url: `${ASSET_URL}-draft` }],
+          },
+          {
+            tag_name: 'v9.9.8',
+            draft: false,
+            assets: [{ name: 'checksums-sha256.txt', url: `${ASSET_URL}-other` }],
+          },
+          ...releaseListing(),
+        ],
+      }),
+    }),
+  });
+  assert.equal(result.stranger.link, 'release-provenance');
+});
+
+// A release whose tag resolves to some other commit is not this candidate's,
+// whatever its receipt says. The foreign receipt here claims the candidate at
+// kin.commit and lists the very archive the stranger ran, so a gate that
+// stopped comparing the tag's commit would read it and ACCEPT. The candidate's
+// own release is absent, so the right answer is a refusal, and the foreign
+// asset must never be fetched at all; the tag ref must, or the skip was never
+// exercised.
+test('findReleaseProvenance skips a release whose tag resolves to another commit', async () => {
+  const seen = [];
+  const foreignAsset = `${ASSET_URL}-foreign`;
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: async (url) => {
+        seen.push(url);
+        return stubFetch({
+          [foreignAsset]: ok(JSON.stringify(provenanceRecord())),
+          '/git/ref/tags/v9.9.10': jsonOk({ object: { type: 'commit', sha: OTHER_SHA } }),
+          ...releaseRoutes({
+            listing: [
+              {
+                tag_name: 'v9.9.10',
+                draft: false,
+                assets: [{ name: PROVENANCE_ASSET, url: foreignAsset }],
+              },
+            ],
+          }),
+        })(url);
+      },
+    }),
+    new RegExp(`no published release of ${SHA} carries a ${PROVENANCE_ASSET}`),
+  );
+  assert.equal(
+    seen.some((url) => url.includes('/git/ref/tags/v9.9.10')),
+    true,
+    'the foreign tag was never resolved, so the skip was not exercised',
+  );
+  assert.equal(seen.includes(foreignAsset), false, "the foreign release's receipt was read");
+});
+
+// A receipt the release surface says exists and then does not serve. Fails
+// closed in BOTH require modes, with the transport answer in the message and
+// without the absence flag: the flag is what lets a caller widen on a missing
+// stranger record, and a missing release receipt must never be read that way,
+// or "we could not tell" becomes "no receipt, so judge on the preflight alone".
+test('main fails closed when the release provenance asset is missing', async () => {
+  for (const requireMode of REQUIRE_MODES) {
+    await assert.rejects(
+      main({
+        sha: SHA,
+        repository: REPO,
+        require: requireMode,
+        env: {},
+        log: () => {},
+        fetchImpl: stubFetch(
+          releaseRoutes({ asset: { ok: false, status: 404, statusText: 'Not Found' } }),
+        ),
+      }),
+      (error) => {
+        assert.match(
+          error.message,
+          new RegExp(`could not read ${PROVENANCE_ASSET} from release ${RELEASE_TAG}: HTTP 404 Not Found`),
+        );
+        assert.doesNotMatch(
+          error.message,
+          /has not recorded this candidate|does not exist on the release-evidence branch/,
+        );
+        assert.equal(
+          error.evidenceAbsent,
+          undefined,
+          `under require ${requireMode} a missing receipt wore the absence flag a caller may act on`,
+        );
+        return true;
+      },
+    );
+  }
+});
+
+// A rejected request, as distinct from an HTTP failure above: the listing
+// never answered at all. It refuses with the release-surface context in the
+// message, so an operator reading a blocked promotion sees which read died
+// rather than a bare socket error.
+test('main fails closed when the release listing cannot be reached', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: async (url) => {
+        if (url.includes('/releases?')) {
+          throw new Error('socket hang up');
+        }
+        return stubFetch(releaseRoutes())(url);
+      },
+    }),
+    /could not reach GitHub to list the releases of firelock-ai\/kin: socket hang up/,
+  );
+});
+
+// The same door for a transport failure on the asset alone: the listing and
+// the tag answered, the bytes did not arrive. Not agreement, not absence.
+test('main fails closed when the release provenance asset cannot be reached', async () => {
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: async (url) => {
+        if (url.includes('/releases/assets/')) {
+          throw new Error('socket hang up');
+        }
+        return stubFetch(releaseRoutes())(url);
+      },
+    }),
+    new RegExp(`could not reach GitHub to read ${PROVENANCE_ASSET} from release ${RELEASE_TAG}: socket hang up`),
+  );
+});
+
+test('judgeReleaseProvenance refuses a record that is not one', () => {
+  throwsWith(
+    () => judgeReleaseProvenance(null, SHA, RELEASE_TAG),
+    /did not parse as a release provenance record/,
+  );
+  throwsWith(
+    () => judgeReleaseProvenance([], SHA, RELEASE_TAG),
+    /did not parse as a release provenance record/,
+  );
+  throwsWith(
+    () => judgeReleaseProvenance(provenanceRecord({ artifacts: [] }), SHA, RELEASE_TAG),
+    /lists no artifacts, so it names no released bytes/,
+  );
+  throwsWith(
+    () =>
+      judgeReleaseProvenance(
+        provenanceRecord({
+          artifacts: [{ artifact: 'kin-linux-aarch64', kin: { commit: SHA }, archive: {} }],
+        }),
+        SHA,
+        RELEASE_TAG,
+      ),
+    /records no archive sha256/,
+  );
 });
 
 test('the gate runs from a copy reached through a symlinked directory', () => {

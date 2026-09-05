@@ -215,8 +215,90 @@ impl EmbedModelFetch {
         ))
     }
 
+    /// Whether the fetch MOVED across a window the caller already held, taken
+    /// from two measurements of the same directory rather than from a worker
+    /// nobody asked.
+    ///
+    /// [`Self::probe`] takes `embed_pass_working` from a caller that holds the
+    /// daemon's own account of its embed pass. A one-shot CLI surface holds no
+    /// such account, and passing `true` there asserts it: an `.incomplete` blob
+    /// left by a download that died last week reads exactly like one being
+    /// written to right now, and so does an air-gapped host whose fetch never
+    /// started. Both were then told a download was in flight and to wait for it.
+    ///
+    /// `hf-hub` streams into an `.incomplete` blob in the model's own cache
+    /// directory, so bytes that grew between the two probes are a fetch that is
+    /// running, with nothing inferred and nothing assumed. The converse is NOT
+    /// claimed: a window that saw no growth is reported as a window that saw no
+    /// growth, never as a dead fetch, because a slow link inside a short window
+    /// looks the same. That asymmetry is the whole point. Over-claiming sends a
+    /// reader away to wait for something that may never arrive; under-claiming
+    /// costs them one command.
+    pub fn with_progress_since(mut self, earlier: &Self) -> Self {
+        self.fetching = !self.present
+            && self.no_fetch_reason.is_none()
+            && self.fetched_bytes > earlier.fetched_bytes;
+        self
+    }
+
+    /// The line a ranked answer owes a reader when the weights it would have
+    /// ranked with are not on this machine, or `None` when the model is not
+    /// what stands in the way.
+    ///
+    /// Three sentences, and only one of them tells the reader to wait. Which
+    /// one is decided by [`Self::fetching`], which on this path means bytes
+    /// were measured arriving rather than a worker was assumed to be running.
+    ///
+    /// It exists because a fast `kin init` on a small repository returns before
+    /// the fetch does. On `expressjs/body-parser` the whole command took ten
+    /// seconds against a fixed 523 MB download, so the first `kin locate` ran
+    /// with no embeddings at all and said only that no row had cleared the
+    /// answer floor. That sentence is true and it names the wrong cause:
+    /// nothing about the query or the store was short, the weights had simply
+    /// not arrived.
+    pub fn retrieval_clause(&self) -> Option<String> {
+        if self.present || self.no_fetch_reason.is_some() {
+            return None;
+        }
+        // Bytes moved while this answer was being produced. This is the only
+        // arm that may promise an arrival, because it is the only one holding
+        // evidence of one.
+        if self.fetching {
+            return Some(format!(
+                "embedding model still downloading ({}); results are lexical until it lands",
+                self.render_progress()
+            ));
+        }
+        // Nothing here and nothing arriving. An air-gapped host reaches this,
+        // and telling it to wait is telling it to wait forever, so the egress
+        // the fetch needs leads and the command that starts it closes.
+        if self.fetched_bytes == 0 {
+            return Some(format!(
+                "the {} embedding model is not on this machine and no bytes of it have arrived, \
+                 so no row here can carry vector evidence; the fetch needs egress to {} and `kin \
+                 embed` runs it",
+                self.model_id,
+                endpoint_host()
+            ));
+        }
+        // Part of it is here and none of it moved. Says exactly that, because a
+        // stalled download and a slow one are indistinguishable inside one
+        // window and only one of them is worth waiting for.
+        Some(format!(
+            "the {} embedding model is not on this machine yet ({} in the cache) and none of it \
+             arrived while this answer was produced, so no row here can carry vector evidence; \
+             run `kin embed` to fetch it now",
+            self.model_id,
+            self.render_progress()
+        ))
+    }
+
     /// `N of 523 MB` where the total is known, `N MB fetched` where it is not.
-    fn render_progress(&self) -> String {
+    ///
+    /// Visible to the crate because `kin init`'s closing summary renders the
+    /// same numerator, and a second copy of this formatting would let the two
+    /// surfaces disagree about the same bytes.
+    pub(crate) fn render_progress(&self) -> String {
         match self.expected_bytes {
             Some(expected) => format!(
                 "{} of {}",
@@ -513,6 +595,111 @@ mod tests {
         assert!(
             stalled.contains("no bytes of it have arrived yet"),
             "a fetch that moved nothing says so: {stalled}"
+        );
+    }
+
+    /// The only arm that may tell a reader to wait, and it may only be reached
+    /// by bytes that were measured arriving.
+    #[test]
+    #[serial_test::serial]
+    fn a_ranked_answer_promises_an_arrival_only_when_bytes_actually_moved() {
+        let _endpoint = kin_core::test_env::EnvVarGuard::unset("HF_ENDPOINT");
+        let earlier = fetching(120 * 1024 * 1024);
+        let moved = fetching(137 * 1024 * 1024).with_progress_since(&earlier);
+        assert!(
+            moved.fetching,
+            "growth across the window is a running fetch"
+        );
+        assert_eq!(
+            moved
+                .retrieval_clause()
+                .expect("a fetch that moved has a clause"),
+            "embedding model still downloading (137 of 523 MB); results are lexical until it lands"
+        );
+    }
+
+    /// An `.incomplete` blob from a download that already died reads exactly
+    /// like one being written to right now, so a window that saw no growth must
+    /// not promise an arrival.
+    #[test]
+    #[serial_test::serial]
+    fn a_stalled_cache_is_never_reported_as_a_download_in_flight() {
+        let _endpoint = kin_core::test_env::EnvVarGuard::unset("HF_ENDPOINT");
+        let earlier = fetching(137 * 1024 * 1024);
+        let stalled = fetching(137 * 1024 * 1024).with_progress_since(&earlier);
+        assert!(
+            !stalled.fetching,
+            "no growth across the window is not a running fetch"
+        );
+        let clause = stalled
+            .retrieval_clause()
+            .expect("an absent model still explains the rows");
+        assert!(
+            clause.contains("137 of 523 MB in the cache")
+                && clause.contains("none of it arrived while this answer was produced")
+                && clause.contains("run `kin embed` to fetch it now"),
+            "it reports what was measured and hands over the command: {clause}"
+        );
+        assert!(
+            !clause.contains("still downloading") && !clause.contains("until it lands"),
+            "and never tells the reader to wait on evidence it does not have: {clause}"
+        );
+    }
+
+    /// The air-gapped host. Nothing here, nothing arriving, and no instruction
+    /// to wait for something that will never come.
+    #[test]
+    #[serial_test::serial]
+    fn an_unreachable_host_is_told_about_egress_and_never_told_to_wait() {
+        let _endpoint = kin_core::test_env::EnvVarGuard::unset("HF_ENDPOINT");
+        let earlier = fetching(0);
+        let offline = fetching(0).with_progress_since(&earlier);
+        assert!(!offline.fetching);
+        let clause = offline
+            .retrieval_clause()
+            .expect("an absent model still explains the rows");
+        assert!(
+            clause.contains("no bytes of it have arrived")
+                && clause.contains("needs egress to huggingface.co")
+                && clause.contains("`kin embed` runs it"),
+            "the egress it needs leads and the command that starts it closes: {clause}"
+        );
+        assert!(
+            !clause.contains("until it lands"),
+            "an air-gapped host is never told to wait: {clause}"
+        );
+    }
+
+    /// Every state in which the model is not the blocker renders nothing, so
+    /// the line can never appear beside an answer it does not explain.
+    ///
+    /// `with_progress_since` is applied to each, because a cached model whose
+    /// byte count fell to zero would otherwise show growth in reverse.
+    #[test]
+    fn a_ranked_answer_says_nothing_when_the_model_is_not_the_blocker() {
+        let cached = EmbedModelFetch {
+            present: true,
+            fetching: false,
+            ..fetching(DEFAULT_EMBED_MODEL_BYTES)
+        };
+        assert_eq!(
+            cached
+                .clone()
+                .with_progress_since(&fetching(0))
+                .retrieval_clause(),
+            None,
+            "a resolved snapshot owes no clause however the byte counts read"
+        );
+
+        let remote = EmbedModelFetch {
+            model_id: "text-embedding-3-small".to_string(),
+            no_fetch_reason: Some("the openai provider embeds over HTTP".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            remote.with_progress_since(&fetching(0)).retrieval_clause(),
+            None,
+            "a configuration that fetches nothing is never reported as fetching"
         );
     }
 

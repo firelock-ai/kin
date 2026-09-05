@@ -103,30 +103,36 @@ fn projection_error(
 /// and the revisions it mints are real: they are what the file did. What was
 /// wrong is reporting them as changes to an entity that did not change.
 ///
-/// `behavior_hash` is the discriminator because kin-model documents it as the
-/// hash of the entity's full source text, changing on any body edit. It is a
-/// field of `SemanticFingerprint`, computed from source, and is not touched by
-/// the `metadata.extra` stamp that causes the over-report, so an entity whose
-/// own text did not move carries the same one across a file-level revision.
+/// The discriminator is [`kin_core::workspace_semantics::entity_content_agrees`],
+/// which is the fleet's ONE answer to "did this entity itself change" and is
+/// what `kin conflicts`, `kin diff` and `kin log` now ask too. It is not
+/// touched by the `metadata.extra` stamp or by a span shift, so an entity whose
+/// own text did not move compares equal across a file-level revision.
 pub(crate) fn split_own_revisions(
     revisions: &[EntityRevision],
 ) -> (Vec<EntityRevision>, Vec<EntityRevision>) {
     let mut own = Vec::new();
     let mut withheld = Vec::new();
-    let mut last: Option<kin_model::Hash256> = None;
+    let mut last: Option<Entity> = None;
     for revision in revisions {
-        let behavior = revision.entity.fingerprint.behavior_hash;
-        match last {
+        match last.as_ref() {
             // The introduction is always the entity's own: there is nothing
             // before it for its text to be unchanged FROM.
             None => {
                 own.push(revision.clone());
-                last = Some(behavior);
+                last = Some(revision.entity.clone());
             }
-            Some(previous) if previous == behavior => withheld.push(revision.clone()),
+            Some(previous)
+                if kin_core::workspace_semantics::entity_content_agrees(
+                    previous,
+                    &revision.entity,
+                ) =>
+            {
+                withheld.push(revision.clone())
+            }
             Some(_) => {
                 own.push(revision.clone());
-                last = Some(behavior);
+                last = Some(revision.entity.clone());
             }
         }
     }

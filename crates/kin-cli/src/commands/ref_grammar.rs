@@ -268,35 +268,42 @@ pub(crate) fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
 
 /// The one change whose id starts with `prefix`, or a refusal that says why not.
 ///
-/// The candidate set is the authority snapshot's own change map, which both
-/// callers already hold a lease on. That map IS the repository's history, so a
-/// prefix is matched against every change kin holds rather than against the
-/// slice reachable from one branch: an id an operator read out of
+/// `candidates` is the authority snapshot's own change map, which both callers
+/// already hold a lease on. That map IS the repository's history, so a prefix is
+/// matched against every change kin holds rather than against the slice
+/// reachable from one branch: an id an operator read out of
 /// `kin history --ref <branch>` resolves here whatever branch they are standing
 /// on. Nothing on disk is consulted; the ids come from graph-owned authority.
+///
+/// It arrives as an iterator of ids rather than as the lease itself so that the
+/// refusal below can be graded on a collision that was CONSTRUCTED. Change ids
+/// are hashes, so two of a small repository's own ids sharing four hexadecimal
+/// characters is a one-in-tens-of-thousands accident, and a check that waits for
+/// one is a check that never runs. Taking the ids alone lets the tests below
+/// hand this two that collide by construction, which is the only reason the
+/// ambiguity arm is graded at all.
 ///
 /// Ambiguity is refused rather than resolved to whichever candidate came first.
 /// Picking one would be the worst outcome available: it answers, it looks right,
 /// and it silently describes a different point in history than the operator
 /// meant.
 fn resolve_change_prefix(
-    lease: &kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
+    candidates: impl Iterator<Item = SemanticChangeId>,
     original: &str,
     prefix: &str,
 ) -> Result<SemanticChangeId> {
-    let mut matches = Vec::new();
-    for change_id in lease.snapshot().changes.keys() {
-        if change_id.to_string().starts_with(prefix) {
-            matches.push(*change_id);
-            if matches.len() > AMBIGUITY_PREVIEW {
-                break;
-            }
-        }
-    }
-    // Sorted so an ambiguity refusal names the same candidates in the same order
-    // every run. A HashMap's iteration order is not stable and an error message
-    // that reshuffles between two runs of one command reads like two different
-    // failures.
+    // Every match is collected before any is named, and the sort is what makes
+    // the refusal reproducible. The early exit this used to take once
+    // `AMBIGUITY_PREVIEW` candidates were in hand ran BEFORE that sort, so which
+    // ids a refusal named came from the change map's iteration order, which a
+    // HashMap does not promise: two runs of one command could name two different
+    // sets and read like two different failures. The filter is a string prefix
+    // over a set bounded by the repository's own history, so collecting it whole
+    // costs nothing worth that ambiguity, and it makes the count an exact number
+    // rather than a floor.
+    let mut matches: Vec<SemanticChangeId> = candidates
+        .filter(|change_id| change_id.to_string().starts_with(prefix))
+        .collect();
     matches.sort();
     match matches.len() {
         0 => Err(ref_error(
@@ -310,14 +317,21 @@ fn resolve_change_prefix(
         count => {
             let preview = matches
                 .iter()
+                .take(AMBIGUITY_PREVIEW)
                 .map(|candidate| candidate.to_string()[..12].to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
+            let unnamed = count.saturating_sub(AMBIGUITY_PREVIEW);
+            let elision = if unnamed == 0 {
+                String::new()
+            } else {
+                format!(", and {unnamed} more")
+            };
             Err(ref_error(
                 original,
                 format!(
-                    "'{prefix}' is ambiguous: at least {count} semantic changes begin with it \
-                     ({preview}); use more characters"
+                    "'{prefix}' is ambiguous: {count} semantic changes begin with it \
+                     ({preview}{elision}); use more characters"
                 ),
             ))
         }
@@ -510,7 +524,7 @@ where
             parse_change_id(value).map_err(|error| ref_error(original, error.to_string()))?
         } else if is_change_prefix(value) {
             let (lease, _) = authority.parts(original)?;
-            resolve_change_prefix(lease, original, value)?
+            resolve_change_prefix(lease.snapshot().changes.keys().copied(), original, value)?
         } else {
             return Err(ref_error(
                 original,
@@ -600,7 +614,8 @@ where
 
     if is_change_prefix(core) {
         let (lease, _) = authority.parts(original)?;
-        let change_id = resolve_change_prefix(lease, original, core)?;
+        let change_id =
+            resolve_change_prefix(lease.snapshot().changes.keys().copied(), original, core)?;
         return resolve_present_change(graph, original, change_id);
     }
 
@@ -726,5 +741,143 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A full-width change id that starts with `prefix` and is padded with `fill`.
+    ///
+    /// Built rather than mined. Two of a three-commit repository's own ids
+    /// sharing four hexadecimal characters is a one-in-tens-of-thousands
+    /// accident, so a test that seeds a fixture and hopes for a collision is a
+    /// test that almost never reaches the code it was written for. These ids are
+    /// never stored or replayed; they exist only to be matched against a prefix,
+    /// which is the whole of what the function under test does.
+    ///
+    /// The padding runs to the full width rather than sitting in the last
+    /// character on purpose: a refusal previews twelve characters of each
+    /// candidate, so ids that differ only in their sixty-fourth would preview
+    /// identically and an assertion that both were named would hold over a
+    /// message that named one of them twice.
+    fn id_with_prefix(prefix: &str, fill: char) -> SemanticChangeId {
+        let mut hex = String::from(prefix);
+        while hex.len() < CHANGE_ID_HEX {
+            hex.push(fill);
+        }
+        parse_change_id(&hex).expect("constructed a full-width change id")
+    }
+
+    /// Ambiguity is refused, and the refusal says which selector and how many.
+    ///
+    /// This is the arm an operator meets when a short id they typed names more
+    /// than one point in history. Resolving it would be the worst outcome
+    /// available: it answers, it looks right, and it describes a change the
+    /// operator did not mean. `kin diff`, `kin blame --ref` and
+    /// `kin history --ref` all reach this through `resolve`, and the test above
+    /// pins that they hold no resolver of their own, so a refusal here is their
+    /// refusal.
+    #[test]
+    fn an_ambiguous_short_prefix_is_refused_naming_the_selector_and_the_count() {
+        let first = id_with_prefix("adfc", 'a');
+        let second = id_with_prefix("adfc", 'b');
+        let other = id_with_prefix("beef", 'c');
+
+        let error = resolve_change_prefix([first, other, second].into_iter(), "adfc", "adfc")
+            .expect_err("two changes begin with adfc, so it names no single point in history");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("'adfc'"),
+            "the refusal must quote the selector the operator typed, or they cannot tell \
+             which endpoint to lengthen: {message}"
+        );
+        assert!(
+            message.contains("2 semantic changes"),
+            "the refusal must say how many changes the prefix matches: {message}"
+        );
+        for candidate in [first, second] {
+            assert!(
+                message.contains(&candidate.to_string()[..12]),
+                "the refusal must name candidate {candidate} so the operator can pick one: \
+                 {message}"
+            );
+        }
+    }
+
+    /// The positive control: a prefix that names one change still resolves.
+    ///
+    /// Without it, a `resolve_change_prefix` that refused every prefix outright
+    /// would pass the ambiguity test above, and the widening FIR-3015 landed
+    /// would be gone with nothing red.
+    #[test]
+    fn a_unique_short_prefix_still_resolves() {
+        let first = id_with_prefix("adfc", 'a');
+        let second = id_with_prefix("adfc", 'b');
+        let other = id_with_prefix("beef", 'c');
+
+        let resolved = resolve_change_prefix([first, other, second].into_iter(), "beef", "beef")
+            .expect("exactly one change begins with beef");
+        assert_eq!(resolved, other);
+    }
+
+    /// A prefix nothing begins with is a different refusal from an ambiguous one.
+    ///
+    /// One says lengthen what you typed and the other says kin does not hold it.
+    /// Collapsing them would send an operator hunting for a longer id that does
+    /// not exist.
+    #[test]
+    fn a_prefix_no_change_begins_with_is_refused_as_absent_rather_than_ambiguous() {
+        let error =
+            resolve_change_prefix([id_with_prefix("adfc", 'a')].into_iter(), "dead", "dead")
+                .expect_err("no change begins with dead");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no semantic change") && message.contains("'dead'"),
+            "an absent prefix must say kin holds nothing under it: {message}"
+        );
+        assert!(
+            !message.contains("ambiguous"),
+            "an absent prefix is not an ambiguous one: {message}"
+        );
+    }
+
+    /// One command, one refusal, whatever order the change map hands its keys in.
+    ///
+    /// The candidate ids come from a `HashMap`'s keys, whose iteration order is
+    /// not promised between two runs of one binary. This used to stop collecting
+    /// at `AMBIGUITY_PREVIEW` matches BEFORE sorting them, so the set a refusal
+    /// named was whichever ones iteration reached first and two runs could print
+    /// two different failures for one command. Six candidates, so the elision
+    /// arm is exercised too.
+    #[test]
+    fn an_ambiguous_refusal_reads_the_same_whatever_order_the_candidates_arrive_in() {
+        let ids: Vec<SemanticChangeId> = "abcdef"
+            .chars()
+            .map(|tail| id_with_prefix("adfc", tail))
+            .collect();
+        let mut reversed = ids.clone();
+        reversed.reverse();
+
+        let forward = format!(
+            "{:#}",
+            resolve_change_prefix(ids.iter().copied(), "adfc", "adfc")
+                .expect_err("six changes begin with adfc")
+        );
+        let backward = format!(
+            "{:#}",
+            resolve_change_prefix(reversed.into_iter(), "adfc", "adfc")
+                .expect_err("six changes begin with adfc")
+        );
+
+        assert_eq!(
+            forward, backward,
+            "the refusal must not depend on key order"
+        );
+        assert!(
+            forward.contains("6 semantic changes"),
+            "the count is exact, not a floor: {forward}"
+        );
+        assert!(
+            forward.contains("and 2 more"),
+            "a refusal that names only {AMBIGUITY_PREVIEW} of 6 must say so: {forward}"
+        );
     }
 }

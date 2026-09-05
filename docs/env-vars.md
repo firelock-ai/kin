@@ -72,9 +72,9 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_PRIMARY_REPO_ID` | string | *(unset)* | operational | primary repo id for a multi-repo daemon |
 | `KIN_PROFILE` | string | accuracy-v2 | correctness | retrieval quality profile: accuracy-v2 (default: measured-accuracy levers, cross-encoder off), accuracy-v1 (opt-in: adds the budget-gated cross-encoder when its model is cached), compat-v0 (pre-profile lever defaults); proof runs pin this explicitly |
 | `KIN_REGEN_ENV_DOC` | string | *(unset)* | diagnostic | dev/test tooling: set to regenerate docs/env-vars.md from the registry |
-| `KIN_REMOTE_AUTH_TOKEN` | secret | *(unset)* | secret | fallback KinLab auth token read after KIN_REMOTE_BEARER_TOKEN |
+| `KIN_REMOTE_AUTH_TOKEN` | secret | *(unset)* | secret | fallback bearer token for a native Kin remote, read after KIN_REMOTE_BEARER_TOKEN |
 | `KIN_REMOTE_BASE_URL` | url | *(unset)* | operational | KinLab base URL for remote and federation calls |
-| `KIN_REMOTE_BEARER_TOKEN` | secret | *(unset)* | secret | KinLab bearer token used when no stored auth session is present |
+| `KIN_REMOTE_BEARER_TOKEN` | secret | *(unset)* | secret | bearer token for a native Kin remote when no stored auth session is present: a KinLab token, or for a peer daemon on this machine the contents of that repository's .kin/daemon.token |
 | `KIN_REMOTE_HTTP_TIMEOUT_SECS` | seconds>=0 | 600 | operational | HTTP timeout for native Kin remote repository transfer endpoints, in whole seconds; defaults to 600 |
 | `KIN_REMOTE_URL` | url | *(unset)* | operational | native remote endpoint URL |
 | `KIN_REPO_ID` | string | *(unset)* | operational | active repo id override |

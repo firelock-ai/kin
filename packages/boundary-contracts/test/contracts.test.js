@@ -301,7 +301,7 @@ test('repository transfer declarations match the Rust schema authority', async (
 
   assert.ok(versionMatch, 'Rust transfer schema authority must remain readable');
   const schemaVersion = Number(versionMatch[1]);
-  assert.equal(schemaVersion, 4, 'update the shared declarations for each schema revision');
+  assert.equal(schemaVersion, 5, 'update the shared declarations for each schema revision');
 
   for (const contract of [
     'RepositoryTransferStatus',
@@ -692,6 +692,30 @@ test('the hosted transfer seam is one contract three implementations read', asyn
   );
   assert.ok(version, 'the Rust schema version constant must remain readable');
   assert.equal(Number(version[1]), seam.schemaVersion);
+
+  // The seam's own declared literal, which nothing paired with the contract
+  // until now. kin#1512 bumped the four snake_case `schema_version` literals in
+  // the declarations and left this camelCase one at 4, so a TypeScript consumer
+  // read 4 where both the contract and the runtime said 5, and every suite
+  // stayed green. Read out of the interface rather than restated here, so a
+  // second hand-typed copy cannot drift with the first.
+  const seamInterface = declarations.match(
+    /export interface HostedRepositoryTransferSeam \{([\s\S]*?)\n\}/
+  );
+  assert.ok(
+    seamInterface,
+    'HostedRepositoryTransferSeam must remain declared, or this pairing is reading nothing'
+  );
+  const declaredSeamVersion = seamInterface[1].match(/\n  schemaVersion: (\d+);/);
+  assert.ok(
+    declaredSeamVersion,
+    'HostedRepositoryTransferSeam must declare schemaVersion as a literal, so a consumer reads the number rather than `number`'
+  );
+  assert.equal(
+    Number(declaredSeamVersion[1]),
+    seam.schemaVersion,
+    'the declared seam schemaVersion and the contract disagree, so a TypeScript consumer reads a version the runtime does not send'
+  );
 });
 
 test('the hosted transfer route is built from the contract, and refuses what it cannot address', async () => {

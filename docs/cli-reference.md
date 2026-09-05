@@ -83,14 +83,20 @@ agent-driven setup should branch on it rather than treating the run as done.
 
 Clone a repository
 
+A hosted locator such as `kinlab://<org>/<repository-id>` carries its repository identity with it. A plain peer daemon HTTP endpoint does not, so `--repository` supplies the identity to adopt there. A Git clone URL takes neither, and passing `--repository` with one is refused before any negotiation rather than failing later against a remote that was never a Kin peer.
+
 ```
-kin clone <url> [path]
+kin clone <url> [path] [options]
 ```
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<url>` | yes | Git repository URL (native Kin transport is an explicit open gate) |
+| `<url>` | yes | Native Kin locator or Git repository URL |
 | `[path]` | no | Target directory (defaults to repo name) |
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--repository <repository>` |  | Native repository identity when URL is a peer daemon HTTP endpoint |
 
 ### `kin status`
 
@@ -113,13 +119,16 @@ The commit lands in Kin's own authority, not in Git. Nothing is written to `.git
 
 > Recorded in Kin authority, not in git. `git status` stays dirty until you run `kin eject` or push this branch to a Kin remote.
 
+`kin commit --amend` replaces the current change with the full working state and keeps that change's parents. The message is kept unless `-m` supplies a new one. The replaced change stays immutable in history with its author, and the amend is recorded as the caller's operation. An amend is refused while a merge is open and when the selected head moved since it was read. A detached workspace amends only its own workspace and moves no ref. A plain `kin commit` with nothing to record still refuses as before.
+
 ```
 kin commit [options]
 ```
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-m, --message <message>` |  | Commit message |
+| `-m, --message <message>` |  | Commit message; amend preserves the existing message when omitted |
+| `--amend` |  | Replace the current change with the full working state, preserving its parents |
 | `-q, --quiet` |  | Suppress progress output (only print final summary) |
 
 ### `kin log`
@@ -671,7 +680,7 @@ kin conflicts [options]
 
 ### `kin resolve`
 
-Resolve repository-v6 merge conflicts Nine flags name a resolution and at least one is required, which is a group rather than a per-argument condition. `kin conflicts` is the read-only view of the same transaction, so nothing here has to accept an empty invocation in order to be inspectable.
+Resolve repository-v6 merge conflicts Ten flags name a resolution and at least one is required, which is a group rather than a per-argument condition. `kin conflicts` is the read-only view of the same transaction, so nothing here has to accept an empty invocation in order to be inspectable.
 
 ```
 kin resolve [options]
@@ -684,12 +693,43 @@ kin resolve [options]
 | `--base <selector>` |  | Keep the merge base version of a conflicting identity. Repeatable. |
 | `--remove <selector>` |  | Settle a conflicting identity by dropping it from the merge. Repeatable. |
 | `--keep-path <path=artifact>` |  | Settle a contested path by naming the artifact that keeps it. Repeatable. |
+| `--file <path> <file>` |  | Resolve a conflicted repository path using the exact bytes in `<file>`, which is the form that takes a file you merged by hand. `<path>` is the conflicted repository path or artifact identity from `kin conflicts`. Repeatable; the bodies of one request total at most 8 MiB. |
 | `--all-ours` |  | Resolve all remaining conflicts keeping your version |
 | `--all-theirs` |  | Resolve all remaining conflicts keeping the incoming version |
 | `--do-continue`, `--continue` |  | Complete the merge after all conflicts are resolved. `--continue` is an accepted alias that the CLI parses but does not list in `--help`, so a reader coming from Git will find it works. |
 | `--abort` |  | Abort the merge and discard conflict state |
 | `--expect <hash>` |  | Require the merge transaction to still be the one this identity names |
 | `--json` |  | Emit the machine-readable merge transaction record |
+
+`--file` is the form for a conflict you settle by writing the merged file yourself, the way a
+Git user edits past conflict markers. It takes the repository path and a file holding the
+complete body you want, records those exact bytes, and derives the entities from them, so one
+call settles the artifact conflict and every entity conflict inside that file. `--all-ours` and
+`--all-theirs` are the other way to clear a file in one call, and they keep one side whole, which
+is rarely what a two-sided edit wants. A file that both branches changed on one run, and what
+settled it:
+
+```
+$ kin merge cap-backoff
+Merging refs/heads/cap-backoff into refs/heads/main left 3 unresolved conflict(s); the merge is held as merge transaction 7b942cddee6acda03d7fba308215e7b71cd20d08256e68cd9f04ec491b014817 (authority generation 8)
+  - artifact retry.py (18564001-2f7e-4247-92ef-ae4e61e36365): changed on both branches with different content
+  - entity retry in retry.py (0a69467a-63d6-5c34-ac35-632cefde30b7): changed on both branches with different content
+  - entity backoff in retry.py (6cd876cf-cc8a-50bd-94be-e0a2fde3208d): changed on both branches with different content
+Settle each conflict with `kin resolve`, then `kin resolve --continue`, or discard the merge with `kin resolve --abort`
+Exit 8: the merge is parked with conflicts; `kin conflicts` lists them
+
+$ kin resolve --file retry.py /tmp/retry-merged.py
+Settled 3 conflict(s); merge transaction 672a290099aa89f23566753a876674309b3b6e9fae39eb72b969794dffbb397e has 3 of 3 conflict(s) settled
+Publish the merge with `kin resolve --continue`
+
+$ kin resolve --continue
+Merged refs/heads/cap-backoff into refs/heads/main as change 6aa69c3b80300026f03afa8a4beecf3440beacebfb14445d2d17a257a28481c7 after settling 3 conflict(s) (1 projected entries, authority generation 10)
+```
+
+The merge exits 8 while it is parked, and nothing moves until `--continue`. A call carries up
+to 8 MiB of authored input; related files can be settled across separate calls, and a later
+`--ours` or `--theirs` for the same subject does not overwrite an authored body, though another
+`--file` for the path replaces it.
 
 ### `kin stash`
 

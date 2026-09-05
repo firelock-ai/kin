@@ -5112,15 +5112,23 @@ fn parse_coverage_row_for_unread_graph(
 /// Turn the census into a row, split from its fetch so it is testable without a
 /// daemon.
 ///
-/// Healthy in every state, and that is a deliberate retreat rather than an
+/// Healthy on a count alone, and that is a deliberate retreat rather than an
 /// oversight. A verdict needs a signal that separates a language the extractor
-/// failed on from a file that legitimately declares nothing, and no such signal
-/// exists in graph-owned state today: a side-effect script, a re-export and a
-/// comment-only file each produce no entity and are each perfectly correct.
-/// Measured on a five-file JavaScript repository holding one real module beside
-/// one of each of those, the ratio reads 1/5, which is worse than the express
-/// checkout this census was built for. So the row reports the count and names
-/// the files, and leaves the reading to a person who can open them.
+/// failed on from a file that legitimately declares nothing: a side-effect
+/// script, a re-export and a comment-only file each produce no entity and are
+/// each perfectly correct. Measured on a five-file JavaScript repository holding
+/// one real module beside one of each of those, the ratio reads 1/5, which is
+/// worse than the express checkout this census was built for. So a silent file
+/// is reported with its path and the reading is left to a person who can open
+/// it.
+///
+/// One arm now reaches a verdict, because one signal now exists. The daemon's
+/// reconcile seams record which paths did not parse from their CURRENT bytes,
+/// and a file in that set is not one of the three correct silences: it is on
+/// disk, it does not parse, and the entities the graph still serves for it came
+/// from bytes it no longer has. That row goes to attention with the paths named
+/// and a next step, and the `with_entities` numerator beside it already excludes
+/// them.
 pub(crate) fn parse_coverage_health(
     census: &kin_core::reference_coverage::ParseCoverageCensus,
 ) -> HealthCheck {
@@ -5136,6 +5144,9 @@ pub(crate) fn parse_coverage_health(
         );
     }
 
+    // The same numerator the census section prints, which excludes a file whose
+    // current bytes did not parse. A row reading `python 2/2` above a sentence
+    // naming one of those two would be two readings of one store on one line.
     let summary = census
         .languages
         .iter()
@@ -5148,16 +5159,38 @@ pub(crate) fn parse_coverage_health(
         .collect::<Vec<String>>()
         .join("; ");
 
-    let silent = census.silent_file_lines();
-    if silent.is_empty() {
-        return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, summary);
+    // The one arm of this row that reaches a verdict, and the reason it can is
+    // the signal the paragraph above says did not exist. A file the graph is
+    // answering about from an earlier parse is not one of the three correct
+    // silences: its bytes are on disk, they do not parse, and every span,
+    // reference and enumeration over it describes bytes it no longer has. The
+    // daemon's reconcile seams record exactly that set, so this row can now
+    // separate the case worth acting on from the population it sits in.
+    //
+    // `Pending` rather than `Missing`: the graph is answering and every answer
+    // it gives about every other file is still true, so this needs attention
+    // without failing readiness, exactly as the reference-edge row beside it
+    // does for a gap a person can close.
+    // Both populations reach the detail, and only one reaches the verdict. An
+    // early return on the retained arm dropped the silent sample from any store
+    // holding both, which is the store most worth reading: a reader told about
+    // one broken file would never learn that seventy-five others declare
+    // nothing. The severity and the fix stay gated on the retained set alone,
+    // because a silent file is not evidence that anything failed.
+    let mut detail = vec![summary];
+    detail.extend(census.retained_file_lines());
+    detail.extend(census.silent_file_lines());
+    let detail = detail.join("; ");
+
+    if !census.any_retained() {
+        return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, detail);
     }
-    HealthCheck::new(
-        ID,
-        LABEL,
-        HealthStatus::Healthy,
-        format!("{summary}; {}", silent.join("; ")),
-    )
+    HealthCheck::new(ID, LABEL, HealthStatus::Pending, detail).with_manual_fix(format!(
+        "fix the syntax in {} and run `kin admit`, which re-derives them; until then Kin answers \
+         about those paths from an earlier parse where it has one, and not at all where it does \
+         not",
+        census.retained_paths().join(", ")
+    ))
 }
 
 /// Whether this store serves its graph from the persisted section or folds its
@@ -5234,13 +5267,24 @@ fn graph_section_row_for_unread_graph(
 /// Turn the section state into a row, split from its fetch so every branch is
 /// testable without a daemon.
 ///
-/// `Degraded` for a folding store, and the severity is chosen rather than
+/// `Stale` for a folding store, and the severity is chosen rather than
 /// inherited. A store that folds is completely correct; it is only paying a full
 /// history replay at every open, which on the kin store was 47 seconds of a 95
 /// second one. `Missing` and `Misconfigured` fail the whole report, and a store
-/// that answers every question correctly must not do that. `Degraded` costs it
-/// the all-clear and nothing else, which is exactly the claim the evidence
-/// supports, and it names the one command that changes it.
+/// that answers every question correctly must not do that. What is wanted is a
+/// status that costs the all-clear and nothing else.
+///
+/// Two statuses do exactly that, and the row carried the wrong one. `Degraded`
+/// is documented on the enum as "a real shortfall in the machine or container
+/// Kin was asked to run on", and `setup.rs` reads it at its word: its closing
+/// line prints "Degraded rows are host limits: Graph section." So a first
+/// `kin commit` in a fresh repository told its owner that a memoization nobody
+/// had written yet was a property of their machine, over a store holding one
+/// change, with an internal repair command beside it (journey GAP-4). `Stale`
+/// carries the same roll-up behaviour for this row, keeping it out of `Ready`
+/// through `needs_attention` and out of `Failing` through `blocks_readiness`,
+/// and it says the true thing: this store's acceleration is not current. The
+/// row still names the one command that changes it.
 ///
 /// A refused section is reported with kin-db's own refusal word because that is
 /// the word its own log carries, so an operator comparing this row against
@@ -5254,9 +5298,14 @@ pub(crate) fn graph_section_health(
     let status = match state.standing {
         kin_core::graph_section::GraphSectionStanding::Serving
         | kin_core::graph_section::GraphSectionStanding::Unborn => HealthStatus::Healthy,
-        kin_core::graph_section::GraphSectionStanding::Folding => HealthStatus::Degraded,
+        kin_core::graph_section::GraphSectionStanding::Folding => HealthStatus::Stale,
         // Never healthy. A state that could not be read is not a state that is
         // fine, and rendering it as one is the invisibility this row replaces.
+        // It shares `Stale` with a folding store, and the two stay separate
+        // where `kin_core::graph_section` keeps them separate, in the sentence:
+        // one says the store folds and how big the fold is, the other says the
+        // state could not be read and why. What the module refuses is rendering
+        // either as a clean bill, and neither is one.
         kin_core::graph_section::GraphSectionStanding::Unknown => HealthStatus::Stale,
     };
     let check = HealthCheck::new(ID, LABEL, status, state.doctor_detail());
@@ -7188,9 +7237,15 @@ mod tests {
     fn a_folding_store_loses_the_all_clear_without_failing_the_report() {
         let row = graph_section_health(&folding_section_state());
         assert!(
-            matches!(row.status, HealthStatus::Degraded),
-            "a folding store is degraded, not broken: {:?}",
+            matches!(row.status, HealthStatus::Stale),
+            "a folding store's acceleration is out of date, not broken, and not a host limit: \
+             {:?}",
             row.status
+        );
+        assert!(
+            !matches!(row.status, HealthStatus::Degraded),
+            "`Degraded` is the host-shortfall status, and `setup.rs` prints `Degraded rows are \
+             host limits`; a store that one `kin graph materialize` fixes is not a host limit"
         );
         assert!(
             !blocks_readiness(&row),
@@ -11925,7 +11980,7 @@ mod tests {
 
         // The state under test: absent when the command opened and absent when
         // it closed, which is what a cold container with no egress budget gets.
-        let init_line = crate::commands::init::embedding_model_notice(&absent, false, None);
+        let init_line = crate::commands::init::embedding_model_notice(&absent, &absent, None);
         let doctor = embedding_model_check_from(&absent, Some(true));
 
         assert!(
@@ -12405,10 +12460,18 @@ mod tests {
             assert!(matches!(unknown.status, HealthStatus::Stale));
             let fix = unknown.manual_fix.as_deref().unwrap_or_default();
             assert!(
-                fix.starts_with("upgrade Kin before changing this store"),
+                fix.starts_with("upgrade Kin to the newest build"),
                 "unknown provenance must not trigger destructive advice: {unknown:?}"
             );
-            assert!(fix.contains("separate fresh store"));
+            // The doctor row a native store reads after a sync it could not
+            // match. It may not name re-ingest as a step that keeps this
+            // store's history, because a native store has no source to
+            // re-ingest from.
+            assert!(
+                !fix.contains("re-ingest the repository into a separate fresh store"),
+                "unknown provenance must not presume a source outside the store: {fix}"
+            );
+            assert!(fix.contains("keeps serving its history"));
             assert!(!blocks_readiness(&unknown));
         }
 
@@ -12519,11 +12582,32 @@ mod tests {
             tracked,
             with_entities: tracked.saturating_sub(silent),
             silent,
+            retained: 0,
             sample: if silent > 0 {
                 vec!["lib/express.js".to_string()]
             } else {
                 Vec::new()
             },
+            retained_sample: Vec::new(),
+        }
+    }
+
+    /// One census row for a language holding a file the graph is answering
+    /// about from an earlier parse, so this row's own verdict is testable
+    /// without a daemon or a store.
+    fn retained_census_row(
+        language: &str,
+        tracked: usize,
+        retained: usize,
+    ) -> kin_core::reference_coverage::LanguageParseCoverage {
+        kin_core::reference_coverage::LanguageParseCoverage {
+            language: language.to_string(),
+            tracked,
+            with_entities: tracked.saturating_sub(retained),
+            silent: 0,
+            retained,
+            sample: Vec::new(),
+            retained_sample: vec!["search.py (4 parse errors)".to_string()],
         }
     }
 
@@ -12562,6 +12646,99 @@ mod tests {
             silent.manual_fix
         );
         assert!(!blocks_readiness(&silent));
+    }
+
+    /// The one arm of this row that judges, and the control that keeps it from
+    /// judging everything.
+    ///
+    /// A file the graph is answering about from an earlier parse is the case
+    /// this row's own doc comment said it could not see: not a side-effect
+    /// script, not a re-export, not a comment-only file, but source on disk that
+    /// does not parse, whose every span and reference describes bytes that are
+    /// gone. It goes to attention with the path named and a next step. A silent
+    /// file, in the same run, still does not.
+    #[test]
+    fn a_file_retained_from_an_earlier_parse_needs_attention_and_names_its_next_step() {
+        let retained = parse_coverage_health(&kin_core::reference_coverage::ParseCoverageCensus {
+            languages: vec![retained_census_row("python", 2, 1)],
+        });
+        assert!(
+            needs_attention(&retained),
+            "a file answering from bytes it no longer has is a gap, not a count: {:?}",
+            retained.status
+        );
+        assert!(
+            !blocks_readiness(&retained),
+            "the graph is still answering, so this must not fail readiness: {:?}",
+            retained.status
+        );
+        assert!(
+            retained.detail.contains("python 1/2"),
+            "the numerator excludes the retained file: {}",
+            retained.detail
+        );
+        assert!(
+            retained.detail.contains("search.py (4 parse errors)"),
+            "the row names the path and the reconciler's own count: {}",
+            retained.detail
+        );
+        let fix = retained
+            .manual_fix
+            .as_deref()
+            .expect("a gap a person can close carries the step that closes it");
+        assert!(
+            fix.contains("search.py") && fix.contains("kin admit"),
+            "{fix}"
+        );
+
+        // The control, and it is the half that matters: a silent file is not
+        // this case. A row that went to attention on every census would say
+        // nothing, and the paragraph above it explains at length why.
+        let silent = parse_coverage_health(&kin_core::reference_coverage::ParseCoverageCensus {
+            languages: vec![parse_census_row("javascript", 141, 75)],
+        });
+        assert!(
+            !needs_attention(&silent),
+            "75 files that declare nothing is not 75 defects: {:?}",
+            silent.status
+        );
+        assert!(silent.manual_fix.is_none());
+    }
+
+    /// A store holding both populations reports both.
+    ///
+    /// The retained arm used to return before the silent one ran, so exactly the
+    /// store worth reading, one broken file among seventy-five that declare
+    /// nothing, lost the larger half of its own row. The verdict still comes
+    /// from the retained set alone.
+    #[test]
+    fn a_store_holding_both_a_retained_file_and_silent_ones_reports_both() {
+        let row = parse_coverage_health(&kin_core::reference_coverage::ParseCoverageCensus {
+            languages: vec![
+                retained_census_row("python", 2, 1),
+                parse_census_row("javascript", 141, 75),
+            ],
+        });
+        assert!(needs_attention(&row), "{:?}", row.status);
+        for expected in [
+            "search.py (4 parse errors)",
+            "lib/express.js",
+            "python 1/2",
+            "javascript 66/141",
+        ] {
+            assert!(
+                row.detail.contains(expected),
+                "the row must carry {expected}: {}",
+                row.detail
+            );
+        }
+        assert!(
+            row.manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("search.py") && !fix.contains("express.js")),
+            "the fix names only what a person can fix: {:?}",
+            row.manual_fix
+        );
     }
 
     /// A daemon that never measured parse coverage and a store whose files are

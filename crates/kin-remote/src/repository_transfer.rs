@@ -118,7 +118,14 @@ pub const REPOSITORY_TRANSFER_PROTOCOL: &str = "kin-repository-v6-fast-forward";
 /// 3 hashed raw JSON for the whole pack, including unordered entity metadata
 /// maps. A receiver reconstructing one of those maps could therefore reject a
 /// semantically identical pack under a different byte order.
-pub const REPOSITORY_TRANSFER_SCHEMA_VERSION: u32 = 4;
+///
+/// Version 5 adds [`RepositoryTransferPack::source_hydration_semantics`], which
+/// is what lets a receiver keep its own hydration creation record through a
+/// sync. Every receiver before it discarded that record on every admission,
+/// because the wire said nothing about which replay semantics authored the
+/// history it moved, so two replicas of one build lost certification on their
+/// first push. A version 4 peer is refused by name, same as versions 1 to 3.
+pub const REPOSITORY_TRANSFER_SCHEMA_VERSION: u32 = 5;
 pub const FEATURE_EXACT_TREES: &str = "exact-trees-v1";
 pub const FEATURE_IMMUTABLE_SOURCE_CAS: &str = "immutable-source-cas-v1";
 pub const FEATURE_REF_CAS: &str = "ref-cas-v1";
@@ -176,6 +183,34 @@ pub enum RepositoryTransferError {
     Conflict(String),
     #[error("repository transfer storage failed: {0}")]
     Storage(String),
+    /// The peer answered HTTP 401: it serves the repository and refused the
+    /// call for want of a bearer token it accepts.
+    ///
+    /// Its own variant rather than a `Storage` message, because the next step
+    /// is a credential and nothing about storage, and a caller keying on the
+    /// variant (the daemon that relays it, a test that pins it) must not have
+    /// to parse prose to tell the two apart.
+    #[error("repository transfer refused for want of a bearer token: {0}")]
+    Unauthenticated(String),
+}
+
+/// What a caller refused with HTTP 401 does next, for the remote at
+/// `base_url`.
+///
+/// One sentence for every surface that meets the refusal: `kin clone`
+/// straight through this transport, `kin pull` and `kin push` through the
+/// local daemon that relays it, and the CLI's own pre-flight on a remote
+/// whose token it cannot find. A stranger cloning from a peer daemon on the
+/// same machine met the bare `{"error":"Authentication required"}` three
+/// times with no next step; the token that peer accepts was in its
+/// repository's `.kin/daemon.token` the whole time, and this names it.
+pub fn bearer_token_next_step(base_url: &str) -> String {
+    format!(
+        "send a bearer token the remote at {base_url} accepts: for a peer daemon on this \
+         machine, set KIN_REMOTE_BEARER_TOKEN=$(cat <peer>/.kin/daemon.token) where <peer> is \
+         that repository's working directory; for KinLab, run `kin auth login --base-url \
+         {base_url}` or set KIN_REMOTE_BEARER_TOKEN to a KinLab token"
+    )
 }
 
 pub type Result<T> = std::result::Result<T, RepositoryTransferError>;
@@ -304,6 +339,177 @@ pub struct RepositoryTransferExpectation {
     pub git_authority_hash: Option<Hash256>,
     pub supported_features: Vec<String>,
     pub limits: RepositoryTransferLimits,
+}
+
+/// Bind an initial transfer to actual, unpublished generation-zero roots.
+pub fn replica_bootstrap_expectation(
+    repository_id: RepositoryId,
+    default_ref: RefName,
+    roots: RootBundle,
+) -> Result<RepositoryTransferExpectation> {
+    let expectation = RepositoryTransferExpectation {
+        repository_id,
+        destination_ref: default_ref,
+        destination_target: None,
+        destination_head: None,
+        roots,
+        default_ref: None,
+        git_authority_hash: None,
+        supported_features: required_features(),
+        limits: RepositoryTransferLimits::default(),
+    };
+    validate_expectation(&expectation)?;
+    if !destination_is_unborn(&expectation) {
+        return Err(invalid(
+            "replica bootstrap requires generation-zero authority",
+        ));
+    }
+    Ok(expectation)
+}
+
+/// A validated first transfer and the complete source bodies it references.
+pub struct ReplicaBootstrap {
+    pub transaction: RepositoryTransaction,
+    pub bodies: Vec<(Hash256, Vec<u8>)>,
+    /// What the bootstrap pack declared about the replay semantics of the
+    /// history it carries, forwarded so the staging that writes this replica's
+    /// creation stamp can reconcile against it.
+    ///
+    /// Read off the pack here rather than by the caller reaching into it again,
+    /// so the one place that validated the pack is the one place that reports
+    /// what it said.
+    pub source_hydration_semantics: Option<u32>,
+}
+
+/// Compose a validated transfer and its first workspace as one transaction.
+///
+/// No source path is read here. Every projected byte and semantic entity comes
+/// from the exact history and bodies the pack carries.
+pub fn prepare_replica_bootstrap(
+    pack: &RepositoryTransferPack,
+    expectation: &RepositoryTransferExpectation,
+    workspace_id: WorkspaceId,
+    case: AdmissionCase,
+) -> Result<ReplicaBootstrap> {
+    use kin_model::{
+        EffectiveAdmissionPolicyStamp, EntityDelta, FrozenLocalOverlay, FrozenLocalOverlayDelta,
+        LocatedEntry, RelationDelta, TreeDelta, WorkspaceExpectation, WorkspaceHead,
+        WorkspaceMutation, WorkspaceSemanticDelta,
+    };
+    validate_expectation(expectation)?;
+    if !destination_is_unborn(expectation)
+        || pack.repository_id != expectation.repository_id
+        || pack.source_ref != expectation.destination_ref
+        || pack.destination_ref != expectation.destination_ref
+        || pack.expected_destination_roots != expectation.roots
+        || pack.expected_destination_head != expectation.destination_head
+        || pack.expected_destination_target != expectation.destination_target
+        || pack.expected_destination_default_ref != expectation.default_ref
+        || pack.expected_destination_git_authority_hash != expectation.git_authority_hash
+    {
+        return Err(invalid(
+            "replica pack does not bind the unborn destination identity and roots",
+        ));
+    }
+    validate_pack(pack, &expectation.limits)?;
+    validate_change_and_tree_closure(std::iter::empty(), pack)?;
+    let decoded = pack
+        .bodies
+        .iter()
+        .map(|body| Ok((body.hash, body.decode()?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    for record in &pack.external_objects {
+        let bytes = decoded
+            .get(&record.body_hash)
+            .ok_or_else(|| invalid("replica pack omits an external object body"))?;
+        record.validate_raw(bytes).map_err(model)?;
+    }
+    let store = TransferChangeStore {
+        changes: pack
+            .changes
+            .iter()
+            .cloned()
+            .map(|change| (change.id, change))
+            .collect(),
+    };
+    for identity in &pack.trees {
+        let tree = store.resolve_tree_at(&identity.change_id).map_err(model)?;
+        for artifact in tree.artifacts() {
+            if artifact
+                .entry
+                .blob_identity()
+                .is_some_and(|hash| !decoded.contains_key(&hash))
+            {
+                return Err(invalid(format!(
+                    "replica pack omits a historical body at {}",
+                    artifact.path
+                )));
+            }
+        }
+    }
+    let target = store.resolve_graph_at(&pack.source_head).map_err(model)?;
+    let mut cursor = Some(pack.source_head);
+    let shared = loop {
+        let id = cursor.ok_or_else(|| invalid("replica head has no shared admission policy"))?;
+        let change = store
+            .changes
+            .get(&id)
+            .ok_or_else(|| invalid("replica policy history is incomplete"))?;
+        if let Some(delta) = &change.admission_policy_delta {
+            break delta
+                .new
+                .clone()
+                .ok_or_else(|| invalid("replica head removes its admission policy"))?;
+        }
+        cursor = change.parents.first().copied();
+    };
+    let overlay = FrozenLocalOverlay::new(workspace_id, 0, case, Vec::new()).map_err(model)?;
+    let policy = EffectiveAdmissionPolicyStamp {
+        shared: shared.stamp(),
+        local: overlay.stamp(),
+    };
+    let mut transaction = transfer_transaction(pack, AuthorId::new("kin"))?;
+    transaction.workspace_mutation = Some(WorkspaceMutation {
+        workspace_id,
+        expected: WorkspaceExpectation::MustNotExist,
+        new_generation: 0,
+        new_head: WorkspaceHead::Symbolic {
+            target: expectation.destination_ref.clone(),
+        },
+        new_base_target: Some(published_ref_target(pack)),
+        new_base_tree_hash: Some(pack.source_tree_hash),
+        tree_deltas: target
+            .tree
+            .artifacts()
+            .map(|artifact| TreeDelta::Added {
+                artifact_id: artifact.artifact_id,
+                new: LocatedEntry::new(artifact.path.clone(), artifact.entry),
+            })
+            .collect(),
+        new_tree_hash: pack.source_tree_hash,
+        semantic_delta: WorkspaceSemanticDelta::new(
+            target
+                .entities
+                .into_values()
+                .map(|new| EntityDelta::Added { new })
+                .collect(),
+            target
+                .relations
+                .into_values()
+                .map(|new| RelationDelta::Added { new })
+                .collect(),
+        )
+        .map_err(model)?,
+        new_shared_admission_policy: shared,
+        new_admission_policy: policy,
+    });
+    transaction.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(overlay));
+    transaction.validate().map_err(model)?;
+    Ok(ReplicaBootstrap {
+        transaction,
+        bodies: decoded.into_iter().collect(),
+        source_hydration_semantics: pack.source_hydration_semantics,
+    })
 }
 
 impl TryFrom<RepositoryTransferStatus> for RepositoryTransferExpectation {
@@ -447,6 +653,29 @@ pub struct RepositoryTransferPack {
     /// Deduplicated immutable bytes needed by new tree states and external
     /// records. Gitlinks deliberately have no body.
     pub bodies: Vec<RepositoryTransferBody>,
+    /// The replay-semantics version the SENDING store records at its own
+    /// creation, declared beside the history this pack carries.
+    ///
+    /// A receiver compares it against its own creation record and keeps that
+    /// record only when the two agree; see
+    /// `kin_core::hydration_semantics::transfer_preserves_creation_record`,
+    /// which is where the comparison lives. The claim is exactly what the
+    /// sender's own record claims and no more: it says which version was in
+    /// force when the sending store was created, not that every delta in this
+    /// pack was authored by that build.
+    ///
+    /// `None` is honest and common. A hosted daemon owns no local creation
+    /// record, and a sender whose own record is absent or unreadable has nothing
+    /// to declare. Both leave the receiver discarding its record, which is what
+    /// every transfer did before this field existed.
+    ///
+    /// `#[serde(default)]` so a schema 4 pack still deserializes and is refused
+    /// by the version check with its own sentence, rather than dying earlier as
+    /// a missing field. It is always serialized, and
+    /// [`compute_transfer_id`] binds it, so stripping it from a pack that
+    /// declared one is caught as a transfer-identity mismatch.
+    #[serde(default)]
+    pub source_hydration_semantics: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -649,10 +878,17 @@ enum Assembled {
     OverNegotiatedBound(String),
 }
 
+/// `source_hydration_semantics` is the creation-time replay version the SENDING
+/// store records, or `None` when it records none this caller can read. It is
+/// declared rather than derived here on purpose: the record is a file beside the
+/// store, and the authority this function holds is a storage backend that may
+/// not be a local one at all, so only the caller that pinned the store can speak
+/// for it.
 pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     authority: &RepositoryAuthorityManager<B>,
     source_ref: &RefName,
     expectation: &RepositoryTransferExpectation,
+    source_hydration_semantics: Option<u32>,
 ) -> Result<RepositoryTransferPack> {
     let expectation = locally_bounded_expectation(expectation)?;
     let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
@@ -667,7 +903,14 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
         remaining: 0,
         is_smallest_publishable_step: false,
     };
-    match assemble_segment_pack(authority, &context, &expectation, source_ref, &plan)? {
+    match assemble_segment_pack(
+        authority,
+        &context,
+        &expectation,
+        source_ref,
+        &plan,
+        source_hydration_semantics,
+    )? {
         Assembled::Pack(pack) => Ok(*pack),
         Assembled::OverNegotiatedBound(reason) => Err(invalid(reason)),
     }
@@ -681,10 +924,14 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
 /// is published atomically on its own. What it cannot split is one change: a
 /// single change whose new bodies exceed the negotiated byte bound is refused
 /// by name, because there is no smaller step that still lands a valid head.
+/// `source_hydration_semantics` is what [`build_repository_transfer_pack`]
+/// documents, and every pack of one segmented publication declares the same
+/// value, because they all come out of one sending store.
 pub fn build_repository_transfer_segment<B: StorageBackend + ?Sized + 'static>(
     authority: &RepositoryAuthorityManager<B>,
     source_ref: &RefName,
     expectation: &RepositoryTransferExpectation,
+    source_hydration_semantics: Option<u32>,
 ) -> Result<RepositoryTransferSegment> {
     let expectation = locally_bounded_expectation(expectation)?;
     let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
@@ -710,7 +957,14 @@ pub fn build_repository_transfer_segment<B: StorageBackend + ?Sized + 'static>(
             budget,
         )?;
         let planned = plan.ordered.len();
-        match assemble_segment_pack(authority, &context, &expectation, source_ref, &plan)? {
+        match assemble_segment_pack(
+            authority,
+            &context,
+            &expectation,
+            source_ref,
+            &plan,
+            source_hydration_semantics,
+        )? {
             Assembled::Pack(pack) => {
                 return Ok(RepositoryTransferSegment {
                     pack: *pack,
@@ -1004,6 +1258,7 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
     expectation: &RepositoryTransferExpectation,
     source_ref: &RefName,
     plan: &SegmentPlan,
+    source_hydration_semantics: Option<u32>,
 ) -> Result<Assembled> {
     // An empty closure means the two replicas already resolve the ref to the
     // same change. The pack then publishes that head and carries nothing,
@@ -1170,6 +1425,7 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
         external_objects,
         aliases,
         bodies,
+        source_hydration_semantics,
     };
     pack.transfer_id = compute_transfer_id(&pack)?;
     // The sender checks its own work against the ceilings it ASSEMBLED under,
@@ -2151,6 +2407,7 @@ struct RepositoryTransferIdentity<'a> {
     external_objects: &'a [ExternalObjectRecord],
     aliases: &'a [ExternalChangeAlias],
     bodies: Vec<RepositoryTransferBodyIdentity>,
+    source_hydration_semantics: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -2195,6 +2452,7 @@ fn compute_transfer_id(pack: &RepositoryTransferPack) -> Result<Hash256> {
                 byte_len: body.byte_len,
             })
             .collect(),
+        source_hydration_semantics: pack.source_hydration_semantics,
     };
     let payload = serde_json::to_vec(&identity)
         .map_err(|error| invalid(format!("serialize transfer identity: {error}")))?;
@@ -2459,7 +2717,17 @@ mod tests {
     /// A transfer's receive no longer needs one: it is admitted as a transfer
     /// and held to the shared policy instead (FIR-2959).
     fn seed_native_line(manager: &TestManager, main: &RefName) {
-        let change = native_change(Vec::new(), "native root", Vec::new());
+        let mut change = native_change(Vec::new(), "native root", Vec::new());
+        // A real native root carries a shared admission policy, and a fixture
+        // without one cannot bootstrap a replica: `prepare_replica_bootstrap`
+        // walks the first-parent line for it and refuses a head that has none
+        // ("replica head has no shared admission policy"). Seeding it here
+        // rather than in one test keeps the two publishers this helper builds
+        // describing the same kind of store.
+        change.admission_policy_delta = Some(kin_model::AdmissionPolicyDelta::initialize(
+            kin_model::SharedAdmissionPolicy::empty(0),
+        ));
+        change.id = compute_semantic_change_id(&change).unwrap();
         let lease = manager.read_authority();
         let transaction = RepositoryTransaction {
             schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
@@ -2912,7 +3180,7 @@ mod tests {
 
         let status = repository_transfer_status(&destination, &repository_id, &main).unwrap();
         let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
-        let pack = build_repository_transfer_pack(&source, &main, &expectation).unwrap();
+        let pack = build_repository_transfer_pack(&source, &main, &expectation, None).unwrap();
         TransferFixture {
             _source_dir: source_dir,
             _destination_dir: destination_dir,
@@ -3031,6 +3299,9 @@ mod tests {
             external_objects,
             aliases,
             bodies,
+            // A Git-admitted bootstrap fixture speaks for no local store, so it
+            // declares nothing, which is the same thing a hosted sender does.
+            source_hydration_semantics: None,
         };
         pack.transfer_id = compute_transfer_id(&pack).unwrap();
         pack
@@ -3165,7 +3436,7 @@ mod tests {
         let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
 
         let segment =
-            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation, None)
                 .expect("a publisher with Git authority may bootstrap an unborn replica");
         let pack = segment.pack;
         assert_eq!(
@@ -3231,9 +3502,10 @@ mod tests {
         let status =
             repository_transfer_status(&empty, &fixture.repository_id, &fixture.main).unwrap();
         let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
-        let pack = build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
-            .expect("a publisher with Git authority may bootstrap an unborn replica")
-            .pack;
+        let pack =
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation, None)
+                .expect("a publisher with Git authority may bootstrap an unborn replica")
+                .pack;
         let native_child = pack
             .changes
             .iter()
@@ -3297,7 +3569,7 @@ mod tests {
             repository_transfer_status(&empty, &fixture.repository_id, &fixture.main).unwrap();
         let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
         let mut pack =
-            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation, None)
                 .expect("the sender builds the bootstrap; the refusal is the receiver's")
                 .pack;
 
@@ -3379,6 +3651,50 @@ mod tests {
         );
     }
 
+    /// The bootstrap forwards what the pack declared.
+    ///
+    /// This is the one hop between the wire and the CLI clone door: `kin clone`
+    /// hands `ReplicaBootstrap` to `kin_core::init::replica::initialize`, and
+    /// the staging there reconciles the replica's fresh creation stamp against
+    /// this field. Dropped here, that staging reconciles against nothing and
+    /// publishes a replica certifying history it never authored.
+    #[test]
+    fn a_replica_bootstrap_forwards_the_packs_declared_hydration_version() {
+        let repository_id = RepositoryId::new("repository-transfer-test").unwrap();
+        let main = RefName::branch(b"main").unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = manager(&source_dir, &repository_id);
+        seed_native_line(&source, &main);
+
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = manager(&empty_dir, &repository_id);
+        let status = repository_transfer_status(&empty, &repository_id, &main).unwrap();
+        let expectation = replica_bootstrap_expectation(
+            repository_id.clone(),
+            main.clone(),
+            status.roots.clone(),
+        )
+        .expect("an untouched manager is generation-zero");
+
+        // Both values, because forwarding a constant would satisfy one of them.
+        for (nonce, declared) in [(0x901u128, Some(10u32)), (0x902, None)] {
+            let pack = build_repository_transfer_pack(&source, &main, &expectation, declared)
+                .expect("a native publisher bootstraps an unborn replica");
+            assert_eq!(pack.source_hydration_semantics, declared);
+            let bootstrap = prepare_replica_bootstrap(
+                &pack,
+                &expectation,
+                WorkspaceId::from_uuid(Uuid::from_u128(nonce)),
+                AdmissionCase::Sensitive,
+            )
+            .unwrap_or_else(|error| panic!("the bootstrap fixture was refused: {error}"));
+            assert_eq!(
+                bootstrap.source_hydration_semantics, declared,
+                "the bootstrap dropped the declaration the replica's staging reconciles against"
+            );
+        }
+    }
+
     /// The control: a publisher with NO Git authority negotiating with the same
     /// unborn replica builds an ordinary pack, not a bootstrap.
     ///
@@ -3398,7 +3714,7 @@ mod tests {
             repository_transfer_status(&empty, &fixture.repository_id, &fixture.main).unwrap();
         let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
 
-        let segment = build_repository_transfer_segment(&native, &fixture.main, &expectation)
+        let segment = build_repository_transfer_segment(&native, &fixture.main, &expectation, None)
             .expect("a native publisher may publish into an unborn replica");
         assert!(
             segment.pack.git_authority_bootstrap.is_none(),
@@ -3432,7 +3748,7 @@ mod tests {
             source_ref: &RefName,
             expectation: &RepositoryTransferExpectation,
         ) -> Result<RepositoryTransferPack> {
-            build_repository_transfer_segment(self.0, source_ref, expectation)
+            build_repository_transfer_segment(self.0, source_ref, expectation, None)
                 .map(|segment| segment.pack)
         }
 
@@ -3938,7 +4254,7 @@ mod tests {
         );
 
         let segment =
-            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation, None)
                 .unwrap();
         validate_pack(&segment.pack, &RepositoryTransferLimits::default())
             .expect("the locally bounded exporter must build a valid pack");
@@ -4131,7 +4447,8 @@ mod tests {
         let mut full = RepositoryTransferExpectation::try_from(status).unwrap();
         full.destination_target = None;
         full.destination_head = None;
-        let pack = build_repository_transfer_pack(&fixture.source, &fixture.main, &full).unwrap();
+        let pack =
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &full, None).unwrap();
         assert!(pack.bodies.len() >= 2);
 
         // The sender deduplicates bodies through an ordered set, so a pack it
@@ -4161,6 +4478,64 @@ mod tests {
         duplicate.transfer_id = compute_transfer_id(&duplicate).unwrap();
         let error = validate_pack(&duplicate, &RepositoryTransferLimits::default()).unwrap_err();
         assert!(error.to_string().contains("duplicate source body"));
+    }
+
+    /// The declaration is bound by the transfer identity, so no peer or proxy
+    /// can add, change or strip it in flight.
+    ///
+    /// It has to be bound, because the receiver ACTS on it: a declaration forged
+    /// to match the receiver's own record would make that receiver keep a
+    /// creation-time number over history the number does not speak for, which is
+    /// the false `Current` the discard exists to prevent.
+    #[test]
+    fn the_declared_hydration_version_is_bound_by_the_transfer_identity() {
+        let fixture = fixture();
+        let status =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        let mut full = RepositoryTransferExpectation::try_from(status).unwrap();
+        full.destination_target = None;
+        full.destination_head = None;
+        let pack = build_repository_transfer_pack(&fixture.source, &fixture.main, &full, Some(10))
+            .unwrap();
+        assert_eq!(pack.source_hydration_semantics, Some(10));
+        validate_pack(&pack, &RepositoryTransferLimits::default()).unwrap();
+
+        for tampered in [None, Some(9), Some(11)] {
+            let mut forged = pack.clone();
+            forged.source_hydration_semantics = tampered;
+            let error = validate_pack(&forged, &RepositoryTransferLimits::default()).unwrap_err();
+            assert!(
+                error.to_string().contains("transfer identity"),
+                "declaring {tampered:?} in place of Some(10) was accepted: {error}"
+            );
+        }
+
+        // Declaring nothing is a pack, not a refusal. Every hosted sender and
+        // every build older than this field publishes one.
+        let undeclared =
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &full, None).unwrap();
+        assert_eq!(undeclared.source_hydration_semantics, None);
+        validate_pack(&undeclared, &RepositoryTransferLimits::default()).unwrap();
+
+        // A schema 4 pack carries no such key at all. `#[serde(default)]` is why
+        // it still decodes, and decoding is what lets the version check refuse
+        // it with its own sentence instead of a missing-field parse error.
+        let mut older = serde_json::to_value(&pack).unwrap();
+        let object = older.as_object_mut().unwrap();
+        assert!(
+            object.remove("source_hydration_semantics").is_some(),
+            "the field is not serialized under the name this arm removes"
+        );
+        object.insert("schema_version".to_string(), serde_json::json!(4));
+        let decoded: RepositoryTransferPack =
+            serde_json::from_value(older).expect("a schema 4 shaped pack must still decode");
+        assert_eq!(decoded.source_hydration_semantics, None);
+        let error = validate_pack(&decoded, &RepositoryTransferLimits::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported schema version 4"),
+            "a schema 4 pack must be refused by version: {error}"
+        );
     }
 
     #[test]
@@ -4256,7 +4631,7 @@ mod tests {
         full_expectation.destination_target = None;
         full_expectation.destination_head = None;
         let mut missing_parent =
-            build_repository_transfer_pack(&fixture.source, &fixture.main, &full_expectation)
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &full_expectation, None)
                 .unwrap();
         assert!(missing_parent.changes.len() >= 3);
         missing_parent.changes.remove(0);
@@ -4416,7 +4791,7 @@ mod tests {
         non_fast_forward.destination_target = Some(RefTarget::change(unrelated));
         non_fast_forward.destination_head = Some(unrelated);
         let error =
-            build_repository_transfer_pack(&fixture.source, &fixture.main, &non_fast_forward)
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &non_fast_forward, None)
                 .unwrap_err();
         assert!(error.to_string().contains("is not an ancestor"));
 
@@ -4426,7 +4801,7 @@ mod tests {
             .supported_features
             .retain(|feature| feature != FEATURE_RAW_REPOSITORY_PATHS);
         let error =
-            build_repository_transfer_pack(&fixture.source, &fixture.main, &non_fast_forward)
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &non_fast_forward, None)
                 .unwrap_err();
         assert!(error.to_string().contains(FEATURE_RAW_REPOSITORY_PATHS));
     }

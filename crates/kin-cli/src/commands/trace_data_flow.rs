@@ -34,7 +34,10 @@ use crate::commands::repository_authority::{
 const DEFAULT_DEPTH: usize = 3;
 const MAX_DEPTH: usize = 8;
 const DEFAULT_LIMIT_PER_STEP: usize = 5;
-const MAX_LIMIT_PER_STEP: usize = 25;
+// The one number the schema declares, the hosted validator enforces and the
+// spine-clip remediation quotes. A separate literal here is how the advice
+// came to recommend a value the call refuses.
+const MAX_LIMIT_PER_STEP: usize = kin_mcp::remediation::TRACE_MAX_LIMIT_PER_STEP;
 const MAX_TOTAL_STEPS: usize = 200;
 
 use kin_mcp::budget::Elision;
@@ -458,7 +461,9 @@ pub struct TraceStep {
     /// node and left every step indistinguishable from a complete one.
     pub fanout_truncated: bool,
     /// How many of this node's neighbors the cap dropped. Re-query this node
-    /// with a wider `limit_per_step` to recover exactly them.
+    /// with a wider `limit_per_step`, up to the ceiling the schema declares, to
+    /// recover exactly them; at the ceiling they are listed by
+    /// `graph_neighborhood` instead.
     pub fanout_dropped: usize,
     /// Why the walk stopped here instead of expanding this node, or null for an
     /// ordinary step. `external_reference` means the repository defines nothing
@@ -1434,9 +1439,13 @@ fn record_spine_clipping(response: &mut TraceDataFlowResponse) {
                 widest.entity_name,
                 dropped,
             ),
-            remediation: format!(
-                "name the symbol you are looking for as `target` so the cap ranks toward it, or                  re-query '{}' with limit_per_step above {}",
-                widest.entity_name, widest.limit_per_step
+            // One producer for both arms, and it reads the ceiling the schema
+            // declares, so a clip at the cap is never told to go above it.
+            remediation: kin_mcp::remediation::spine_clipped(
+                &widest.entity_name,
+                &widest.entity_id,
+                widest.limit_per_step,
+                dropped,
             ),
         },
     );
@@ -2119,9 +2128,8 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
             ),
             remediation: format!(
                 "ask for the shape directly with include_body: false, or narrow the walk with a \
-                 smaller depth or limit_per_step; raise max_response_chars, up to the {} this \
-                 server will build, only if the caller's own result limit accepts a larger payload",
-                kin_mcp::handlers::common::TRACE_MAX_MAX_RESPONSE_CHARS
+                 smaller depth or limit_per_step; {}",
+                kin_mcp::remediation::response_budget_clause("max_response_chars", ceiling, None)
             ),
         },
     );
@@ -3015,6 +3023,104 @@ mod tests {
     /// it is the ladder in `kin_index::resolution`, and a fixture that stamped
     /// every edge 1.0 would have proven nothing about which term did the
     /// clipping.
+    /// A focal with more callees than the widest cap the call accepts. The
+    /// stranger's node had 28 against a ceiling of 25.
+    fn wide_fanout_graph(callees: usize) -> (InMemoryGraph, EntityId) {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("HTTPAdapter.send", "src/requests/adapters.py");
+        let focal_id = focal.id;
+        graph.upsert_entity(&focal).unwrap();
+        for index in 0..callees {
+            let callee = make_entity(&format!("helper_{index:02}"), "src/requests/adapters.py");
+            graph.upsert_entity(&callee).unwrap();
+            graph
+                .upsert_relation(&make_relation(focal_id, callee.id, RelationKind::Calls))
+                .unwrap();
+        }
+        (graph, focal_id)
+    }
+
+    /// The stranger's exact call on this arm: a 28-callee node clipped at the
+    /// 25 ceiling. The disclosure used to send them to "re-query with
+    /// limit_per_step above 25", a value every surface refuses.
+    #[test]
+    fn a_clip_at_the_cap_never_recommends_a_value_the_schema_rejects() {
+        let (graph, focal_id) = wide_fanout_graph(28);
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, MAX_LIMIT_PER_STEP),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.total_steps, MAX_LIMIT_PER_STEP,
+            "the cap keeps exactly the ceiling"
+        );
+        assert_eq!(response.clipped_steps[0].dropped_callees, 3);
+        let disclosure = response
+            .degradations
+            .iter()
+            .find(|degradation| degradation.reason == "spine_clipped")
+            .expect("a spine clip must be disclosed");
+        assert!(
+            !disclosure
+                .remediation
+                .contains(&format!("above {MAX_LIMIT_PER_STEP}")),
+            "the advice names a value the schema rejects: {}",
+            disclosure.remediation
+        );
+        assert!(
+            disclosure
+                .remediation
+                .contains(&format!("already at its {MAX_LIMIT_PER_STEP} ceiling")),
+            "a clip at the cap must say the cap is the ceiling: {}",
+            disclosure.remediation
+        );
+        assert!(
+            disclosure.remediation.contains("3 neighbor(s)"),
+            "and say what was dropped: {}",
+            disclosure.remediation
+        );
+        assert!(
+            disclosure.remediation.contains("graph_neighborhood")
+                && disclosure.remediation.contains(&focal_id.to_string()),
+            "and name the alternative by the id it takes: {}",
+            disclosure.remediation
+        );
+    }
+
+    /// The control for the clip path: under the cap the advice still says to
+    /// widen, bounded by the ceiling, because widening still works there.
+    #[test]
+    fn a_clip_under_the_cap_still_says_to_widen_within_the_ceiling() {
+        let (graph, focal_id) = requests_send_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 4),
+        )
+        .unwrap();
+
+        let disclosure = response
+            .degradations
+            .iter()
+            .find(|degradation| degradation.reason == "spine_clipped")
+            .expect("a spine clip must be disclosed");
+        assert!(
+            disclosure.remediation.contains("limit_per_step above 4")
+                && disclosure
+                    .remediation
+                    .contains(&format!("at most {MAX_LIMIT_PER_STEP}")),
+            "under the cap the knob is still the fix, bounded: {}",
+            disclosure.remediation
+        );
+    }
+
     fn requests_send_graph() -> (InMemoryGraph, EntityId) {
         let graph = InMemoryGraph::new();
         let focal = make_entity("Session.send", "src/requests/sessions.py");

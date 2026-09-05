@@ -84,7 +84,8 @@ pub struct CommitIdentity {
 pub const IDENTITY_REMEDIATION: &str = "Set your Git identity:\n  \
      git config --global user.name \"Your Name\"\n  \
      git config --global user.email \"you@example.com\"\n\
-     Or set a Kin-specific author in .kin/config.toml:\n  \
+     Or set a Kin-specific author in .kin/config.toml, at the top level, above the first \
+     [section]:\n  \
      default_author = \"Your Name <you@example.com>\"";
 
 /// The message a mint refuses with when nobody can be named as its author.
@@ -94,6 +95,26 @@ pub fn unresolved_identity_message() -> String {
          Authorship is provenance. A change attributed to nobody cannot support review \
          attribution, blame, or audit, and it cannot be corrected later without rewriting \
          history, so kin refuses to invent one.\n\n\
+         {IDENTITY_REMEDIATION}"
+    )
+}
+
+/// The same refusal when the config carries a `default_author` that nothing
+/// reads, because it sits under a `[table]`.
+///
+/// The generic message tells a person to add `default_author = "..."` to
+/// `.kin/config.toml`. Appended to a file whose last section is
+/// `[resources]`, that line is `resources.default_author` to TOML, the loader
+/// ignores it, and the identical refusal repeats with no hint that the line was
+/// read and scoped away. A person who followed the instructions and got the
+/// same words back has been told nothing; this names the line and where it
+/// has to move.
+pub fn misplaced_identity_message(table: &str) -> String {
+    format!(
+        "kin has no author identity to record for this change.\n\n\
+         .kin/config.toml sets default_author under [{table}], where TOML scopes it to that \
+         table and kin does not read it. Move the line to the top level of the file, above \
+         the first [section], so it reads as the repository's own default_author.\n\n\
          {IDENTITY_REMEDIATION}"
     )
 }
@@ -114,7 +135,22 @@ pub fn resolve_commit_identity(layout: &KinLayout) -> Result<CommitIdentity, Kin
     if let Some(identity) = git_identity(layout.working_dir()) {
         return Ok(identity);
     }
+    // Checked only on the way to a refusal: a resolved identity needs no
+    // diagnosis, and a misplaced key never outranks a real one above it.
+    if let Some(table) = misplaced_default_author(layout) {
+        return Err(KinError::Config(misplaced_identity_message(&table)));
+    }
     Err(KinError::Config(unresolved_identity_message()))
+}
+
+/// The `[table]` a `default_author` key was written under, when the config
+/// carries one anywhere but the top level.
+///
+/// The read lives in [`KinConfig::misplaced_top_level_key`], beside the loader
+/// that reads the same file: config IO is that module's boundary, and this one
+/// only asks the question.
+fn misplaced_default_author(layout: &KinLayout) -> Option<String> {
+    KinConfig::misplaced_top_level_key(&layout.config_path(), "default_author")
 }
 
 /// The explicit Kin-specific author for this repository, when one is set and
@@ -391,6 +427,81 @@ mod tests {
         );
         assert!(message.contains("default_author"), "{message}");
         assert!(!message.contains("unknown"), "{message}");
+        assert!(
+            message.contains("at the top level, above the first"),
+            "the refusal must say where the key goes, because a line appended under a \
+             [table] is scoped away: {message}"
+        );
+    }
+
+    /// The journey the refusal sent a person on: append the line it names to a
+    /// config whose last section is `[resources]`, and get the identical
+    /// refusal back. The second refusal has to name the misplacement.
+    #[test]
+    fn a_default_author_appended_under_a_table_is_named_as_misplaced() {
+        let fixture = Fixture::new();
+        fixture.init_git();
+        fs::write(
+            fixture.layout.config_path(),
+            "default_branch = \"main\"\n\n[resources]\nprofile = \"interactive\"\n\
+             default_author = \"Kin Author <kin@example.com>\"\n",
+        )
+        .expect("write kin config");
+
+        let error = fixture
+            .resolve()
+            .expect_err("a scoped-away key is not an identity");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("under [resources]"),
+            "the refusal must name the table that swallowed the key: {message}"
+        );
+        assert!(
+            message.contains("Move the line to the top level"),
+            "and say where it has to go: {message}"
+        );
+        assert!(
+            message.contains("git config --global user.name"),
+            "the generic remedies still stand beside it: {message}"
+        );
+    }
+
+    /// A key two tables down is still found, and named by its full path, so
+    /// the diagnosis does not depend on the misplacement being shallow.
+    #[test]
+    fn a_default_author_nested_two_tables_down_is_named_by_its_path() {
+        let fixture = Fixture::new();
+        fixture.init_git();
+        fs::write(
+            fixture.layout.config_path(),
+            "[context]\n[context.tiers]\ndefault_author = \"Kin Author <kin@example.com>\"\n",
+        )
+        .expect("write kin config");
+
+        let message = fixture
+            .resolve()
+            .expect_err("a scoped-away key is not an identity")
+            .to_string();
+        assert!(message.contains("under [context.tiers]"), "{message}");
+    }
+
+    /// The control: a top-level `default_author` resolves, so the misplacement
+    /// check cannot be satisfied by refusing every config that mentions the key.
+    #[test]
+    fn a_top_level_default_author_above_a_table_still_resolves() {
+        let fixture = Fixture::new();
+        fixture.init_git();
+        fs::write(
+            fixture.layout.config_path(),
+            "default_author = \"Kin Author <kin@example.com>\"\n\n[resources]\nprofile = \
+             \"interactive\"\n",
+        )
+        .expect("write kin config");
+
+        let identity = fixture.resolve().expect("a top-level key is the identity");
+        assert_eq!(identity.author, "Kin Author <kin@example.com>");
+        assert_eq!(identity.source, IdentitySource::KinConfig);
     }
 
     /// A repository that never had Git in it still resolves from host scope,

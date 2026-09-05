@@ -236,6 +236,9 @@ pub(crate) struct ProjectionAuthorityCache {
     /// that function at one instant, serialized at 2.2 seconds per open
     /// because an open is O(store).
     admission: std::sync::Mutex<Option<HeldAdmission>>,
+    /// The refs routes' envelope, keyed on the same publication identity as
+    /// every slot above it.
+    ref_metadata: std::sync::Mutex<Option<HeldRefMetadata>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
     load_gate: std::sync::Mutex<()>,
@@ -268,6 +271,21 @@ struct HeldCommandAuthority {
     /// [`HeldProjectionAuthority::published`] and for the same reason.
     published: LocalPublicationIdentity,
     authority: Arc<kin_cli::commands::repository_authority::ActiveRepositoryAuthority>,
+}
+
+/// The repository authority envelope a refs read answers from.
+///
+/// Held as an `Arc` rather than rebuilt, because the envelope carries an
+/// operation log and a receipt per change, so cloning it is O(history) and
+/// paying that per request is the same defect one layer down from the open it
+/// replaces. The hosted arm already hands out `Arc<PersistedRepositoryAuthority>`
+/// out of its generation-bound cache entry; this is the local arm's equivalent.
+#[derive(Clone)]
+struct HeldRefMetadata {
+    /// Read strictly before the authority it came out of was loaded, exactly as
+    /// for [`HeldProjectionAuthority::published`] and for the same reason.
+    published: LocalPublicationIdentity,
+    metadata: Arc<kin_db::PersistedRepositoryAuthority>,
 }
 
 #[derive(Clone)]
@@ -370,10 +388,32 @@ impl ProjectionAuthorityCache {
         });
     }
 
+    fn reuse_ref_metadata(
+        &self,
+        published: &LocalPublicationIdentity,
+    ) -> Option<Arc<kin_db::PersistedRepositoryAuthority>> {
+        lock_recover(&self.ref_metadata)
+            .as_ref()
+            .filter(|held| &held.published == published)
+            .map(|held| Arc::clone(&held.metadata))
+    }
+
+    fn install_ref_metadata(
+        &self,
+        published: LocalPublicationIdentity,
+        metadata: Arc<kin_db::PersistedRepositoryAuthority>,
+    ) {
+        *lock_recover(&self.ref_metadata) = Some(HeldRefMetadata {
+            published,
+            metadata,
+        });
+    }
+
     fn invalidate(&self) {
         *lock_recover(&self.held) = None;
         *lock_recover(&self.query) = None;
         *lock_recover(&self.command) = None;
+        *lock_recover(&self.ref_metadata) = None;
     }
 }
 
@@ -444,6 +484,84 @@ fn projection_repository_authority(
         "projection repository authority loaded"
     );
     Ok(authority)
+}
+
+/// The repository authority envelope a local daemon's refs routes answer from.
+///
+/// Blocking: reads storage metadata and, on a publication change, loads the
+/// complete durable authority. Callers run it on a blocking thread.
+///
+/// This exists because `/repos/{repo_id}/refs` used to reach
+/// [`ActiveApiRepositoryAuthority::open`] directly on every request, and an
+/// open reads the durable publication in full, so the read was proportional to
+/// whole-repository size rather than to the ref set it returns. Measured on
+/// 2026-09-04 against a `kin init` store of firelock-ai/kin itself (2864
+/// changes, 111 refs, a 21685-byte response): ten cold reads had a median of
+/// 39.33 s and ten warm reads on the same daemon a median of 44.63 s, which is
+/// the same distribution because there was nothing to warm into. The hosted
+/// route in front of it refuses at 12 s.
+///
+/// The envelope is cached per durable publication rather than per request, in
+/// the same [`ProjectionAuthorityCache`] and against the same publication
+/// identity as the three authority wrappers beside it, so it inherits their
+/// invalidation contract instead of adding a second one. The label is read
+/// before the load it describes, which at worst costs one spurious reload and
+/// never serves a publication that has moved.
+fn local_repository_ref_metadata(
+    state: &DaemonState,
+) -> Result<Arc<kin_db::PersistedRepositoryAuthority>, (StatusCode, String)> {
+    let backend = state.local_repository_backend().ok_or_else(|| {
+        repository_authority_error("local daemon is missing its startup storage capability")
+    })?;
+    let repository_id = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?
+        .repository_id()
+        .clone();
+    // The pinned-namespace probe runs before the reuse check, exactly as the
+    // three sibling resolvers run it, so a `.kin/kindb` replaced under the
+    // daemon cannot keep being answered from the envelope of the store it
+    // replaced. It decodes no snapshot and takes no repository lock.
+    if let Err(error) = confirm_pinned_projection_namespace(&backend, &repository_id) {
+        state.projection_authority.invalidate();
+        return Err(error);
+    }
+
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(metadata) = state.projection_authority.reuse_ref_metadata(&published) {
+        return Ok(metadata);
+    }
+
+    // The authority open itself is already cached and gated one layer down, so
+    // this reaches a full open only when that slot misses too.
+    let authority = projection_repository_authority(state)?;
+    // Re-check after that open. A burst of concurrent cold requests is
+    // serialized by the gate inside `projection_repository_authority` and then
+    // released one at a time into the clone below, and the clone is O(history);
+    // whoever loses the race takes the envelope the winner installed instead of
+    // cloning a second copy of it.
+    if let Some(metadata) = state.projection_authority.reuse_ref_metadata(&published) {
+        return Ok(metadata);
+    }
+    let metadata = {
+        let lease = authority.manager.read_authority();
+        lease
+            .snapshot()
+            .repository_authority
+            .as_ref()
+            .ok_or_else(|| {
+                (
+                    StatusCode::FAILED_DEPENDENCY,
+                    "snapshot has no repository-v6 authority envelope".to_string(),
+                )
+            })?
+            .clone()
+    };
+    let metadata = Arc::new(metadata);
+    state
+        .projection_authority
+        .install_ref_metadata(published, Arc::clone(&metadata));
+    Ok(metadata)
 }
 
 /// Resolve the repository-v6 authority the MCP query tools read source from.
@@ -674,6 +792,14 @@ pub(crate) fn cached_authority_admission(
     Ok((admission.roots, admission.policy))
 }
 
+pub(crate) fn cached_authority_has_open_merge(
+    state: &DaemonState,
+) -> Result<bool, (StatusCode, String)> {
+    Ok(cached_authority_admission_entry(state)?
+        .open_merge
+        .is_some())
+}
+
 fn refuse_commit_during_open_merge(state: &DaemonState) -> Result<(), (StatusCode, String)> {
     let admission = cached_authority_admission_entry(state)?;
     let Some(open_merge) = admission.open_merge else {
@@ -833,6 +959,19 @@ pub struct HealthResponse {
     /// means the live graph is entirely uncommitted.
     #[serde(default)]
     pub durable_entity_count: Option<u64>,
+    /// Relations in the live query graph.
+    ///
+    /// The half the entity pair above could not answer. A store whose entity
+    /// counts were level published an all-clear over 3,438 relations a
+    /// language-server sweep had written into the live graph and no commit
+    /// carried, because nothing on this endpoint counted them (FIR-3202).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_relation_count: Option<usize>,
+    /// Relations durable repository authority carried at the same levelling as
+    /// `durable_entity_count`. Absent, never zero, when this daemon has never
+    /// levelled.
+    #[serde(default)]
+    pub durable_relation_count: Option<u64>,
     pub graph_loaded: bool,
     pub reconciliation_status: String,
     pub repo_id: String,
@@ -1783,6 +1922,13 @@ fn is_process_liveness_route(path: &str) -> bool {
     path == "/health"
 }
 
+/// The routes a kubelet readiness probe is pointed at. Both are served by
+/// `readiness`; `/ready` is the older spelling clients still poll.
+fn is_readiness_route(path: &str) -> bool {
+    let path = path.strip_prefix("/v2").unwrap_or(path);
+    path == "/readiness" || path == "/ready"
+}
+
 /// A hosted daemon may expose the authenticated rollout surface while its
 /// reader admission is absent or moving, but it must not serve graph authority
 /// under an unadmitted image. This keeps first bootstrap and recovery possible
@@ -1801,6 +1947,20 @@ async fn hosted_reader_admission(
     if let Some(control) = state.publication_control.as_ref() {
         if let Err(error) = control.assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
         {
+            // This answers the kubelet's readiness probe before the readiness
+            // handler ever runs, and the kubelet keeps only the status code.
+            // A hosted daemon whose reader is not yet admitted therefore fails
+            // its rollout with nothing in its log saying so, unless it is said
+            // here. Only the probe route logs, so a busy unadmitted daemon does
+            // not write a line per refused request; the probe arrives every
+            // few seconds and stops the moment the reader is admitted.
+            if is_readiness_route(request.uri().path()) {
+                tracing::warn!(
+                    refused_on = "reader admission",
+                    %error,
+                    "readiness refused"
+                );
+            }
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
@@ -2009,7 +2169,12 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/branch", post(command_branch))
         .route("/commands/merge", post(command_merge))
         .route("/commands/conflicts", post(command_conflicts))
-        .route("/commands/resolve", post(command_resolve))
+        .route(
+            "/commands/resolve",
+            post(command_resolve).layer(DefaultBodyLimit::max(
+                kin_cli::commands::resolve::MAX_RESOLVE_REQUEST_BYTES,
+            )),
+        )
         .route("/commands/drift", post(command_drift))
         .route("/commands/tag", post(command_tag))
         .route("/commands/admit", post(command_admit))
@@ -2848,6 +3013,11 @@ async fn mcp_graph_status_with_stable_authority(
                     // open and at commit, and neither can run while this fence
                     // is held.
                     durable_entity_count: state.durable_entity_count(),
+                    // The relation half, under that same fence and levelled at
+                    // those same two moments. Without it the block built from
+                    // this observation certifies an entity layer and says
+                    // nothing about the edges answering beside it (FIR-3202).
+                    durable_relation_count: state.durable_relation_count(),
                 }
             }),
             Err(std::sync::TryLockError::WouldBlock) => None,
@@ -3759,6 +3929,10 @@ async fn health(
     let uptime_seconds = state.started_at.elapsed().as_secs();
     let graph = Arc::clone(&state.graph);
     let entity_count = graph.entity_count();
+    // Read off the same graph handle at the same instant as the entity count,
+    // so the pair a caller subtracts against the durable readings below
+    // describes one graph rather than two.
+    let relation_count = graph.relation_count();
     let graph_loaded = entity_count > 0;
     let external_session_count = state
         .coordinator
@@ -3858,6 +4032,8 @@ async fn health(
         uptime_seconds,
         graph_entity_count: Some(entity_count),
         durable_entity_count: state.durable_entity_count(),
+        graph_relation_count: Some(relation_count),
+        durable_relation_count: state.durable_relation_count(),
         graph_loaded,
         reconciliation_status: state.reconciliation_status_str().to_string(),
         repo_id: primary_repo_id(&state),
@@ -3914,13 +4090,20 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let initialized = state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed);
-    let authority_started = Instant::now();
-    let hosted_spine_ready = if initialized && state.hosted_spine_readiness_required() {
-        state.acquire_spine_read_authority().await.is_some()
+    let hosted = state.hosted_spine_readiness_required();
+    // `None` means the authority check did not run, which is the case on the
+    // initialization half and on every local daemon. Carrying the timing as an
+    // Option keeps a branch that never consulted the gate from ever printing a
+    // measured-looking zero for it.
+    let mut authority_wait: Option<Duration> = None;
+    let hosted_spine_ready = if initialized && hosted {
+        let started = Instant::now();
+        let ready = state.acquire_spine_read_authority().await.is_some();
+        authority_wait = Some(started.elapsed());
+        ready
     } else {
         true
     };
-    let authority_wait = authority_started.elapsed();
     let warming = state.spine_warming() || (initialized && !hosted_spine_ready);
 
     if initialized && hosted_spine_ready {
@@ -3932,8 +4115,8 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
             }),
         )
     } else {
-        // Say which half refused, and how long the authority check spent
-        // waiting, because a refusal that says nothing is how a rollout gets
+        // Say which half refused, and when the authority check ran, how long
+        // it waited, because a refusal that says nothing is how a rollout gets
         // read as a broken daemon.
         //
         // On 2026-09-04 a hosted daemon bound port 4219 at 464 s into its
@@ -3941,25 +4124,41 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
         // ready. Nothing in that pod's log said whether it was still
         // uninitialized or whether the spine authority was refusing, and
         // Kubernetes records only the status code, so the post-mortem could
-        // name a mechanism and not confirm it. This is the line that would
+        // name a mechanism and not confirm it. These are the lines that would
         // have answered it.
         //
-        // WARN rather than DEBUG on purpose: a hosted daemon that cannot
-        // serve is the operator's problem whether or not anyone raised the
-        // log level first, and this stops as soon as the daemon is ready.
-        tracing::warn!(
-            initialized,
-            hosted_spine_ready,
-            warming,
-            refused_on = if !initialized {
-                "initialization"
-            } else {
-                "hosted spine authority"
-            },
-            authority_wait_ms = authority_wait.as_millis() as u64,
-            spine_gate_wait_ms = state.last_spine_gate_read_wait().as_millis() as u64,
-            "readiness refused"
-        );
+        // Hosted only. A local daemon answers 503 for the whole of its first
+        // reconcile, the CLI polls it every 200 ms while it does, and there is
+        // nothing an operator can act on in that window, so a line here would
+        // be a wall of warnings on every first `kin daemon`. A hosted daemon
+        // that cannot serve is the operator's problem whether or not anyone
+        // raised the log level first, which is why this is WARN and not DEBUG,
+        // and it stops as soon as the daemon is ready.
+        //
+        // Two lines rather than one with optional fields, so the
+        // initialization half carries no durations at all: on that half the
+        // authority check never ran, and a printed zero reads as "the gate was
+        // fine" when the truth is "the gate was never asked".
+        if hosted {
+            match authority_wait {
+                None => tracing::warn!(
+                    initialized,
+                    hosted_spine_ready,
+                    warming,
+                    refused_on = "initialization",
+                    "readiness refused"
+                ),
+                Some(waited) => tracing::warn!(
+                    initialized,
+                    hosted_spine_ready,
+                    warming,
+                    refused_on = "hosted spine authority",
+                    authority_wait_ms = waited.as_millis() as u64,
+                    spine_gate_wait_ms = state.last_spine_gate_read_wait().as_millis() as u64,
+                    "readiness refused"
+                ),
+            }
+        }
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ReadinessResponse {
@@ -4548,11 +4747,16 @@ async fn command_status(
         ));
     }
 
-    let repository_authority = state
-        .local_repository_authority_binding()
-        .map_err(repository_authority_error)?;
+    // One open per publication, not three per request. This route used to take
+    // the raw binding and hand it to two kin-cli helpers that each opened the
+    // whole store for themselves, and the CLI then opened a third time on its
+    // own side for the same merge reading. On a converted 470 MiB store one
+    // open costs seconds because it re-verifies every persisted body, so the
+    // request paid that price three times over for two readings that cannot
+    // vary inside one publication.
+    let repository_authority = command_repository_authority(&state)?;
     let embedding_coverage = live_embedding_coverage(&state).await;
-    let report = kin_cli::commands::status::inspect(
+    let report = kin_cli::commands::status::inspect_at(
         &state.layout,
         &repository_authority,
         embedding_coverage,
@@ -4572,10 +4776,10 @@ async fn command_status(
         daemon_source_known: daemon_build.source_known,
         daemon_dependency_provenance: daemon_build.dependency_provenance.to_string(),
     };
-    let merge = kin_core::LocalRepositoryAuthorityBinding::from_layout(&state.layout)
-        .ok()
-        .and_then(|binding| kin_cli::commands::status::merge_in_progress(&binding).ok())
-        .flatten();
+    // Both readings come off the authority this request already holds, not from
+    // a binding that would open the whole store again for each of them.
+    let merge = kin_cli::commands::status::merge_in_progress_at(&repository_authority);
+    let workspace_tip = kin_cli::commands::status::workspace_tip_at(&repository_authority);
     let response = kin_cli::commands::status::build_command_status_response(
         report,
         request.json,
@@ -4589,6 +4793,11 @@ async fn command_status(
         // durable marker rather than from this daemon's own probes, which reset
         // on restart and then report every store as never admitted (FIR-2961).
         &kin_core::last_admission::read(&state.layout),
+        // Which paths the graph is answering about from an earlier parse, read
+        // from the record this daemon's own reconcile seams write. The CLI takes
+        // its own read of the same record, so the two renderings of one store
+        // agree without this response carrying a new field.
+        &kin_core::retained_parse::read(&state.layout),
         // This endpoint stays a pure read. The CLI admits before it reads, which
         // is where the founder's 2026-08-30 decision applies, and a caller of
         // this route drives its own admission through `/commands/admit`. Saying
@@ -4603,6 +4812,7 @@ async fn command_status(
         // Never fatal: a status route that 500s because it could not check for a
         // merge is worse than one that answers and does not mention it.
         merge.as_ref(),
+        Some(&workspace_tip),
     )
     .map_err(internal_error)?;
     Ok(Json(response))
@@ -5246,13 +5456,15 @@ async fn command_diff(
         ));
     }
 
-    let repository_authority = state
-        .local_repository_authority_binding()
-        .map_err(repository_authority_error)?;
+    // One open per publication rather than one per request, for the same reason
+    // `/commands/status` and `/commands/log` take it: an open re-verifies every
+    // persisted body, and neither the diff nor the artifact bodies under it can
+    // vary inside one publication.
+    let repository_authority = command_repository_authority(&state)?;
     // The live graph, which is the whole point of routing a workspace diff here:
     // a workspace endpoint's entities are DERIVED, and this process is the only
     // one that holds them. Read per moved path rather than snapshot-cloned.
-    let response = kin_cli::commands::diff::build_diff_response(
+    let response = kin_cli::commands::diff::build_diff_response_at(
         &repository_authority,
         &request,
         Some(state.graph.as_ref()),
@@ -5277,14 +5489,18 @@ async fn command_log(
         ));
     }
 
+    // The session gate is unchanged: this route still resolves the caller's
+    // session graph, which `build_log_response` has always taken and never read,
+    // so that a session's bookkeeping behaves exactly as it did.
     let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let repository_authority = state
-        .local_repository_authority_binding()
-        .map_err(repository_authority_error)?;
-    let response =
-        kin_cli::commands::log::build_log_response(&repository_authority, graph.as_ref(), &request)
-            .map_err(internal_error)?;
+    let _graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    // One open per publication rather than one per request. This handler used to
+    // hand the raw binding to a helper that opened the whole store for itself,
+    // which on a converted 470 MiB store is seconds of re-verifying every
+    // persisted body for a history read that cannot vary inside one publication.
+    let repository_authority = command_repository_authority(&state)?;
+    let response = kin_cli::commands::log::build_log_response_at(&repository_authority, &request)
+        .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -6028,14 +6244,19 @@ async fn reconcile_session_workspace(
         ));
     }
 
-    let (authority_generation, workspace_generation, idempotent_replay) = if observation
-        .deltas()
-        .is_empty()
-    {
+    let (
+        authority_generation,
+        workspace_generation,
+        idempotent_replay,
+        semantic_enriched,
+        semantic_failures,
+    ) = if observation.deltas().is_empty() {
         (
             observation.base().authority_roots.generation,
             observation.base().source_workspace.generation,
             false,
+            0,
+            Vec::new(),
         )
     } else {
         let authority_context =
@@ -6048,6 +6269,7 @@ async fn reconcile_session_workspace(
             &observation,
         )
         .map_err(repository_commit_error)?;
+        let vacated = plan.vacated.clone();
         let committed = crate::repository_commit::commit_session_workspace_admission(
             &state.layout,
             state.blobs.as_ref(),
@@ -6076,13 +6298,57 @@ async fn reconcile_session_workspace(
 
         let graph_tree = state.graph.resolved_tree();
         if graph_tree == observation.base().source_workspace.tree {
+            // Entities retire with the paths that owned them, in the same
+            // step as the tree moves, so the live graph never holds an entity
+            // authority just refused to carry. Read from the LIVE graph with
+            // the plan's vacated set, never copied from the plan: the plan's
+            // delta was diffed against authority, and the live graph can
+            // already hold newer payloads for these entities from an earlier
+            // session's readmission. kin-db checks a removal's old payload
+            // against the graph it lands on, so authority's payload applied
+            // here was refused after authority had already moved, leaving the
+            // two graphs holding different trees. Targeted reads rather than a
+            // snapshot of the whole store, which this path cannot afford.
+            let (retired_entity_deltas, retired_relation_deltas) =
+                crate::repository_commit::retire_live_semantics_on_vacated(
+                    state.graph.as_ref(),
+                    &vacated,
+                )
+                .map_err(repository_commit_error)?;
             state
                 .graph
                 .apply_transaction_delta(&TransactionDelta {
                     tree_deltas: observation.deltas().to_vec(),
+                    entity_deltas: retired_entity_deltas.clone(),
+                    relation_deltas: retired_relation_deltas,
                     ..TransactionDelta::default()
                 })
                 .map_err(internal_error)?;
+            for delta in &retired_entity_deltas {
+                let kin_model::EntityDelta::Removed { old } = delta else {
+                    continue;
+                };
+                if let Some(file_id) = &old.file_origin {
+                    if let Err(error) = crate::loop_runner::clear_incompatible_facets_in(
+                        state.graph.as_ref(),
+                        file_id,
+                        crate::loop_runner::EnrichmentFacet::None,
+                    ) {
+                        warn!(
+                            file = %file_id,
+                            error = %error,
+                            "retired a vacated path's entities but could not clear every facet"
+                        );
+                    }
+                }
+                state.emit_event(DaemonEvent::EntityChanged {
+                    entity_id: old.id,
+                    node: None,
+                    change_type: crate::state::ChangeType::Deleted,
+                    file_path: old.file_origin.as_ref().map(|file| file.0.clone()),
+                    session_id: None,
+                });
+            }
         } else if graph_tree != *observation.desired_tree() {
             return Err((
                 StatusCode::CONFLICT,
@@ -6098,6 +6364,32 @@ async fn reconcile_session_workspace(
             old_root_hash: Some(previous_tree_hash.to_string()),
             new_root_hash: desired_tree_hash.to_string(),
         });
+        // The exact tree is published and nothing has parsed it. Re-derive the
+        // semantic layer for the paths this publication moved, here, under the
+        // gate that published them.
+        //
+        // Leaving it to the next commit does not work, and that is the whole
+        // defect. A commit forces one complete admission, and that admission
+        // plans its transition from the working copy this publication has
+        // already made current, so the transition is empty and it returns before
+        // its own enrichment half ever runs. The bytes moved, the parse never
+        // happened, and every read surface kept answering at the positions the
+        // previous parse recorded. On a converted `psf/requests` an edit that
+        // prepended seventeen lines left the whole file answering seventeen
+        // lines short, under an envelope with nothing to report.
+        // Record what this publication owes a parser before parsing any of it,
+        // and leave the record standing after. Re-deriving here fixes the live
+        // daemon and nothing more: entities reach durable authority only inside
+        // a semantic change, this publication deliberately writes no history,
+        // and a derived-graph mutation no change carries is gone when the next
+        // daemon replays that history. Measured, not assumed. A daemon reopened
+        // between this publication and its commit read the pre-edit span back,
+        // and a synchronous snapshot immediately after the re-derivation did not
+        // change that. The commit that publishes is what settles the record.
+        crate::semantic_debt::record(&state, &crate::semantic_debt::owed_by(observation.deltas()));
+        let readmitted =
+            crate::loop_runner::readmit_semantics_for_paths(&state, &published_paths(&observation))
+                .await;
         (
             committed.receipt.generation,
             observation
@@ -6106,11 +6398,13 @@ async fn reconcile_session_workspace(
                 .generation
                 .saturating_add(1),
             committed.idempotent_replay,
+            readmitted.enriched,
+            readmitted.failed,
         )
     };
 
     drop(graph_mutation);
-    Ok(Json(kin_cli::commands::reconcile::ReconcileSummary {
+    let summary = kin_cli::commands::reconcile::ReconcileSummary {
         schema: kin_cli::commands::reconcile::RECONCILE_SUMMARY_SCHEMA.to_string(),
         operation_id: observation.base().reconcile_operation_id,
         repository_id: observation.base().repository_id.clone(),
@@ -6126,10 +6420,72 @@ async fn reconcile_session_workspace(
         observed_materialized_artifacts: observation.observed_materialized_artifacts(),
         preserved_graph_only_artifacts: observation.preserved_graph_only_artifacts(),
         observed_body_bytes: observation.observed_body_bytes(),
-        semantic_files_enriched: 0,
-        semantic_enrichment_failures: 0,
+        semantic_files_enriched: semantic_enriched,
+        semantic_enrichment_failures: semantic_failures.len(),
         changes,
-    }))
+    };
+    if !semantic_failures.is_empty() {
+        let named = semantic_failures
+            .iter()
+            .map(|failure| failure.path.clone())
+            .collect::<Vec<_>>();
+        return Err(semantic_readmission_refused(&summary, &named));
+    }
+    Ok(Json(summary))
+}
+
+/// Every repository path one session publication moved.
+///
+/// Both sides of every delta. A rename's old path leaves the tree and its new
+/// path enters it, and the readmission skips whatever the tree no longer
+/// carries, so naming both sides costs nothing and misses nothing.
+fn published_paths(
+    observation: &kin_cli::commands::reconcile::SessionReconcileObservation,
+) -> std::collections::BTreeSet<RepoPath> {
+    let mut paths = std::collections::BTreeSet::new();
+    for delta in observation.deltas() {
+        if let Some(old) = delta.old_state() {
+            paths.insert(old.path.clone());
+        }
+        if let Some(new) = delta.new_state() {
+            paths.insert(new.path.clone());
+        }
+    }
+    paths
+}
+
+/// Refuse a reconcile whose exact tree published but whose semantics did not.
+///
+/// The bytes are durable before this is reached and a parser may not retract
+/// them, so this is not a rollback and the body says so outright: the tree
+/// moved, and the graph cannot answer about these files at the positions their
+/// new bytes hold. Returning it as a refusal rather than as a degradation block
+/// inside a 200 is what makes `kin reconcile` exit non-zero, because the CLI
+/// treats any non-success status as an error and prints the body; a caller that
+/// reads a clean summary and a zero has no way to learn that the file it just
+/// edited still answers at its old spans, which is the failure this whole change
+/// exists to end.
+///
+/// The complete summary travels inside the refusal, so nothing a success would
+/// have reported is lost by refusing.
+fn semantic_readmission_refused(
+    summary: &kin_cli::commands::reconcile::ReconcileSummary,
+    failed: &[String],
+) -> (StatusCode, String) {
+    let body = serde_json::json!({
+        "error": "semantic_readmission_failed",
+        "message": format!(
+            "the exact tree published as {} but {} of the files it moved could not be \
+             re-parsed, so the graph still answers about them at the positions their previous \
+             bytes held: {}",
+            summary.desired_tree_hash,
+            failed.len(),
+            failed.join(", ")
+        ),
+        "files": failed,
+        "summary": summary,
+    });
+    (StatusCode::CONFLICT, body.to_string())
 }
 
 fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String) {
@@ -6170,7 +6526,12 @@ fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String
 struct CommandCommitRequest {
     operation_id: kin_model::OperationId,
     timestamp: kin_model::Timestamp,
-    message: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    amend: bool,
+    #[serde(default)]
+    expected_head: Option<kin_model::SemanticChangeId>,
     author: kin_model::AuthorId,
     #[serde(default)]
     session_id: Option<String>,
@@ -6195,6 +6556,25 @@ async fn command_commit(
         return Err(filesystem_ingest_disabled_response(
             "/commands/commit",
             &state.layout.working_dir().display().to_string(),
+        ));
+    }
+
+    if request.amend != request.expected_head.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "amend requires the exact expected_head; ordinary commit must not supply one"
+                .to_string(),
+        ));
+    }
+    if request
+        .message
+        .as_ref()
+        .is_some_and(|message| message.trim().is_empty())
+        || (!request.amend && request.message.is_none())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "native commit message must not be empty".to_string(),
         ));
     }
 
@@ -6231,6 +6611,13 @@ async fn command_commit(
     // Refuse before forced admission can advance that generation and strand
     // resolutions already persisted on the transaction.
     refuse_commit_during_open_merge(&state)?;
+    if let Some(expected_head) = request.expected_head {
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .map_err(repository_commit_error)?;
+        crate::repository_commit::validate_native_amend_head(&context, expected_head)
+            .map_err(repository_commit_error)?;
+    }
     // The admission derives the exact tree from the working copy but does not
     // publish it. This commit's own transaction carries that tree transition
     // beside the semantic change, so one repository-authority successor is
@@ -6288,6 +6675,13 @@ async fn command_commit(
                 &state.layout,
                 state.graph.resolved_tree().len() as u64,
             );
+            // This transaction reached authority, and a commit derives its
+            // change from the live graph, so every parse the admission above put
+            // back into that graph is in history now. Nothing the record named
+            // is still owed. Settled here rather than at the drain because a
+            // crash between the two would otherwise clear the record for work no
+            // change carried, which is the loss the record exists to prevent.
+            crate::semantic_debt::settle_all(&state);
             Ok(response)
         }
         Err(error) => {
@@ -6316,19 +6710,40 @@ fn command_commit_after_admission(
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
             .map_err(repository_commit_error)?;
     let plan = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
-        crate::repository_commit::plan_native_commit(
-            graph,
-            state.blobs.as_ref(),
-            &authority_context,
-            request.operation_id,
-            request.timestamp,
-            request.author,
-            request.message,
-        )
+        if let Some(expected_head) = request.expected_head {
+            crate::repository_commit::plan_native_amend(
+                graph,
+                state.blobs.as_ref(),
+                &authority_context,
+                request.operation_id,
+                request.timestamp,
+                request.author,
+                &crate::repository_commit::NativeAmend {
+                    expected_head,
+                    message: request.message,
+                },
+            )
+        } else {
+            crate::repository_commit::plan_native_commit(
+                graph,
+                state.blobs.as_ref(),
+                &authority_context,
+                request.operation_id,
+                request.timestamp,
+                request.author,
+                request.message.ok_or_else(|| {
+                    crate::error::DaemonError::IncompatibleRepo(
+                        "native commit message must not be empty".to_string(),
+                    )
+                })?,
+            )
+        }
     })
     .map_err(repository_commit_error)?;
-    if let Some(refusal) = refuse_a_successor_that_records_nothing(&plan) {
-        return Err(refusal);
+    if !request.amend {
+        if let Some(refusal) = refuse_a_successor_that_records_nothing(&plan) {
+            return Err(refusal);
+        }
     }
     let change_id = plan.change.id;
     let branch_name = plan.target.branch().map(|name| name.to_string());
@@ -6341,14 +6756,10 @@ fn command_commit_after_admission(
         use kin_model::session::IntentScope;
 
         let scopes: Vec<IntentScope> = plan
-            .change
-            .entity_deltas
+            .entity_scope_ids
             .iter()
-            .map(|delta| match delta {
-                kin_model::EntityDelta::Added { new } => IntentScope::Entity(new.id),
-                kin_model::EntityDelta::Modified { new, .. } => IntentScope::Entity(new.id),
-                kin_model::EntityDelta::Removed { old } => IntentScope::Entity(old.id),
-            })
+            .copied()
+            .map(IntentScope::Entity)
             .collect();
 
         if !scopes.is_empty() {
@@ -6426,6 +6837,10 @@ fn command_commit_after_admission(
     // live graph rather than from the plan, because a plan's `entity_count` is
     // the size of its delta and this is the size of the whole.
     state.record_durable_entity_count(graph.entity_count() as u64);
+    // The relation half of the same levelling, from the same live graph at the
+    // same instant. Recording one counter and not the other would publish a
+    // difference no observation produced (FIR-3202).
+    state.record_durable_relation_count(graph.relation_count() as u64);
     // The relation set just moved and the change is installed, so this is the
     // baseline the next `kin graph status` compares against. Recorded after the
     // install rather than from the plan, for the reason the entity count above
@@ -6503,10 +6918,22 @@ fn refuse_a_successor_that_records_nothing(
 /// they can see. On 0.5.52 it reached them as `HTTP 500 Internal Server Error:
 /// Core error: ...` (FIR-2664). Everything else stays an internal error.
 fn commit_admission_error(error: crate::error::DaemonError) -> (StatusCode, String) {
-    match projection_blocked_refusal(&error) {
-        Some(refusal) => refusal,
-        None => internal_error(error),
+    if let Some(refusal) = projection_blocked_refusal(&error) {
+        return refusal;
     }
+    // A parse this daemon could not perform over bytes that are already durable
+    // authority. The store is intact and nothing needs repairing, so answering
+    // it as an internal error would send a reader to the daemon for a file they
+    // can see. It is a refusal in words, naming the files, exactly as the
+    // reconcile that first owed the parse refuses.
+    if let crate::error::DaemonError::SemanticReadmissionFailed(message) = &error {
+        let body = serde_json::json!({
+            "error": "semantic_readmission_failed",
+            "message": message,
+        });
+        return (StatusCode::CONFLICT, body.to_string());
+    }
+    internal_error(error)
 }
 
 /// The worded refusal for a blocked projection, when `error` is one.
@@ -8318,6 +8745,11 @@ async fn measure_untracked_host_content(state: &Arc<DaemonState>) {
 async fn daemon_health_snapshot(state: &Arc<DaemonState>) -> serde_json::Value {
     measure_untracked_host_content(state).await;
     let entity_count = state.graph.entity_count();
+    // Both live counts off one graph handle before anything else runs, so the
+    // envelope's durability block subtracts a pair from one instant. The
+    // relation half is what makes that block cover the whole graph rather than
+    // the entity layer alone (FIR-3202).
+    let relation_count = state.graph.relation_count();
     serde_json::json!({
         "initialized": state
             .is_initialized
@@ -8325,6 +8757,8 @@ async fn daemon_health_snapshot(state: &Arc<DaemonState>) -> serde_json::Value {
         "graph_loaded": entity_count > 0,
         "graph_entity_count": entity_count as u64,
         "durable_entity_count": state.durable_entity_count(),
+        "graph_relation_count": relation_count as u64,
+        "durable_relation_count": state.durable_relation_count(),
         "graph_generation": state
             .snapshot_generation
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -8935,9 +9369,12 @@ async fn support(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    let result =
-        kin_cli::commands::support::inspect_support_graph(&repository_authority, graph.as_ref())
-            .map_err(internal_error)?;
+    let result = kin_cli::commands::support::inspect_support_graph(
+        &repository_authority,
+        graph.as_ref(),
+        Some(state.layout.root()),
+    )
+    .map_err(internal_error)?;
     Ok(Json(result))
 }
 
@@ -12772,7 +13209,12 @@ fn validate_repo_scoped_tool_arguments(
                 )));
             }
             validate_optional_u64_range(arguments, "depth", 1, 8)?;
-            validate_optional_u64_range(arguments, "limit_per_step", 1, 25)?;
+            validate_optional_u64_range(
+                arguments,
+                "limit_per_step",
+                1,
+                kin_mcp::remediation::TRACE_MAX_LIMIT_PER_STEP as u64,
+            )?;
             for key in ["include_body", "compact", "include_type_edges"] {
                 validate_optional_bool(arguments, key)?;
             }
@@ -14601,6 +15043,19 @@ async fn repository_ref_metadata(
             });
     }
 
+    // The daemon's own repository answers from the publication-keyed cache. Any
+    // other id falls through to the snapshot path, which is where the refusal
+    // that names the served identity lives.
+    if repo_id == state.cached_repo_id {
+        // `block_in_place` rather than an inline call, because a publication
+        // change still pays a full open here and this route is reached from the
+        // async request path; the same wrapper the rest of the daemon uses to
+        // keep liveness answering through a blocking step.
+        return crate::lifecycle::without_blocking_runtime_worker(|| {
+            local_repository_ref_metadata(state)
+        });
+    }
+
     let snapshot = repository_authority_snapshot(state, repo_id).await?;
     Ok(Arc::new(repository_metadata(&snapshot)?.clone()))
 }
@@ -14868,13 +15323,22 @@ fn configured_transfer_limits() -> kin_remote::repository_transfer::RepositoryTr
 /// because the failure this repairs was a receiver that admitted history and
 /// left the store describing itself by a record that predates it.
 ///
-/// The policy is to discard the hydration creation stamp. The transfer protocol
-/// carries no authoring version beside the history it moves, so a receiver that
-/// kept its own creation number would certify replay semantics for deltas
-/// authored on another host by another build. Deleting the record is the
-/// conservative half of that trade: the store reads unstamped and every surface
-/// discloses it, instead of reading current and certifying an absence over
-/// history whose provenance nothing recorded.
+/// The policy is to reconcile the hydration creation stamp against what the pack
+/// declared. `RepositoryTransferPack::source_hydration_semantics` carries the
+/// sending store's own creation record, so a receiver whose record says the same
+/// number keeps it: the arriving deltas were replayed under the same semantics
+/// this store's own history was. Anything else discards the record, which is
+/// what every receiver did unconditionally before the wire carried a version,
+/// and which is still what a hosted or older sender gets, because both declare
+/// nothing. The store then reads unstamped and every surface discloses it,
+/// instead of reading current and certifying an absence over history whose
+/// provenance nothing recorded.
+///
+/// Keeping is not the same as claiming the pack's contents. The declaration says
+/// which version was in force when the SENDING store was created, exactly as the
+/// receiver's own record says it for this one, and the comparison in
+/// `kin_core::hydration_semantics::transfer_preserves_creation_record` is the
+/// only place that reads it.
 ///
 /// A hosted daemon runs no policy. Its storage backend is not a local `.kin`
 /// layout, and the scaffolding directory beside it belongs to no repository
@@ -14943,7 +15407,7 @@ fn apply_received_repository_transfer_pack(
         &configured_transfer_limits(),
         receiver_case,
         || match local_kindb {
-            Some(kindb) => kindb.invalidate_for_unversioned_transfer(),
+            Some(kindb) => kindb.reconcile_after_transfer(pack.source_hydration_semantics),
             None => Ok(()),
         },
     )
@@ -14998,6 +15462,11 @@ fn repository_transfer_error(
         RepositoryTransferError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
         RepositoryTransferError::Conflict(_) => StatusCode::CONFLICT,
         RepositoryTransferError::Storage(_) => StatusCode::FAILED_DEPENDENCY,
+        // The PEER wanted a credential, not this daemon. Relayed as the
+        // dependency failure it is rather than as a 401 of this daemon's own,
+        // which the CLI would read as its local token being refused. The
+        // message carries the credential the peer accepts and where it lives.
+        RepositoryTransferError::Unauthenticated(_) => StatusCode::FAILED_DEPENDENCY,
     };
     (status, error.to_string())
 }
@@ -15060,6 +15529,10 @@ async fn repo_transfer_export(
         &authority,
         &request.source_ref,
         &request.expectation,
+        // This daemon's own store speaks for the history it is exporting. A
+        // hosted daemon reads `None` here by construction and the puller then
+        // discards its record, exactly as before.
+        state.local_hydration_creation_version(),
     )
     .map_err(repository_transfer_error)?;
     Ok(Json(segment.pack))
@@ -15295,6 +15768,9 @@ async fn command_push(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let context = transfer_command_context(&state, &request)?;
     let (source_ref, destination_ref) = context.publication_refs()?;
+    // Read before the blocking hop, because `context` moves into it and the
+    // record belongs to this daemon's store rather than to the context.
+    let source_hydration_semantics = state.local_hydration_creation_version();
     // Negotiation blocks on peer HTTP and on authority reads, so it must not run
     // on the async executor that also serves this daemon's own transfer seam.
     let outcome = tokio::task::spawn_blocking(move || {
@@ -15304,6 +15780,7 @@ async fn command_push(
             &context.repository_id,
             &source_ref,
             &destination_ref,
+            source_hydration_semantics,
         )
     })
     .await
@@ -21831,6 +22308,7 @@ mod tests {
             &source,
             &destination_ref,
             &expectation,
+            None,
         )
         .unwrap();
         assert!(segment.is_final());
@@ -22534,6 +23012,104 @@ mod tests {
         assert!(
             detail.contains("authority envelope"),
             "the refusal must name the missing envelope, got: {detail}"
+        );
+    }
+
+    /// A refs read costs one durable-authority open per publication, not one
+    /// per request (FIR-3180).
+    ///
+    /// `/repos/{repo_id}/refs` reached [`ActiveApiRepositoryAuthority::open`]
+    /// on every request, and an open reads the durable publication in full, so
+    /// the read was proportional to whole-repository size rather than to the
+    /// ref set it returns. Measured on 2026-09-04 against a `kin init` store of
+    /// firelock-ai/kin itself, 2864 changes and 111 refs answering in 21685
+    /// bytes: ten cold reads had a median of 39.33 s and ten warm reads on the
+    /// same daemon a median of 44.63 s, the same distribution because there was
+    /// nothing to warm into. The hosted route in front of it refuses at 12 s.
+    ///
+    /// Two arms, because they fail differently. Reuse proves the slot is
+    /// consulted at all. Invalidation proves it is keyed on the publication
+    /// rather than pinned for the life of the process, which is how this kind
+    /// of cache turns a latency fix into a correctness bug: a refs read that
+    /// keeps answering from the publication before a commit is worse than a
+    /// slow one.
+    ///
+    /// Every response is asserted OK before any count is read. A count that did
+    /// not move reads the same whether reuse worked or every request failed
+    /// early, and only one of those is the property.
+    #[tokio::test]
+    async fn a_refs_read_costs_one_authority_open_per_publication() {
+        let state = test_state();
+        install_repository_file(&state, "src/lib.py", b"def handler():\n    return 1\n");
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let repo_id = state.cached_repo_id.clone();
+        let path = format!("/repos/{repo_id}/refs");
+        let app = router(Arc::clone(&state));
+
+        // Warm the publication once, so the count below measures reuse rather
+        // than the first load every path has to pay.
+        let (status, first) = repo_route(Arc::clone(&state), &path).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the fixture must answer a refs read: {}",
+            String::from_utf8_lossy(&first)
+        );
+        let before = state.projection_authority.loads();
+
+        for call in 1..=8 {
+            let (status, body) = repo_route(Arc::clone(&state), &path).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "reuse call {call} failed: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                body, first,
+                "reuse call {call} returned different bytes at one publication, so the reads \
+                 being counted are not the identical read this covers"
+            );
+        }
+        assert_eq!(
+            state.projection_authority.loads(),
+            before,
+            "eight refs reads at one publication must open the durable authority zero further \
+             times; each open reads the whole publication and re-verifies every CAS body"
+        );
+
+        // A publication moves the identity the slot is keyed on, so the next
+        // read must reload and must answer from the new publication.
+        install_repository_file(&state, "src/next.py", b"def added():\n    return 2\n");
+        commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "publish a second change so the refs slot must invalidate",
+        )
+        .await;
+        // Counted AFTER the commit, not before it. A commit opens authority for
+        // its own reasons, so a count taken before it is satisfied by the
+        // commit's open and says nothing about the read. This one moves only if
+        // the refs read itself reloaded.
+        let after_commit = state.projection_authority.loads();
+        let (status, after) = repo_route(Arc::clone(&state), &path).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the read after a publication must answer: {}",
+            String::from_utf8_lossy(&after)
+        );
+        assert_ne!(
+            after, first,
+            "the refs read after a publication still returns the pre-commit head, so the slot \
+             is pinned rather than keyed on the publication"
+        );
+        assert_eq!(
+            state.projection_authority.loads(),
+            after_commit + 1,
+            "the refs read after a publication must itself reload the authority exactly once"
         );
     }
 
@@ -25863,6 +26439,7 @@ mod tests {
             &source_authority,
             &destination_ref,
             &expectation,
+            None,
         )
         .unwrap();
         assert!(
@@ -25873,14 +26450,14 @@ mod tests {
             segment.pack.schema_version,
             kin_remote::repository_transfer::REPOSITORY_TRANSFER_SCHEMA_VERSION
         );
-        assert_eq!(segment.pack.schema_version, 4);
+        assert_eq!(segment.pack.schema_version, 5);
         assert!(
             segment
                 .pack
                 .changes
                 .iter()
                 .any(|change| !change.entity_deltas.is_empty()),
-            "schema 4 must carry the imported semantic entity deltas"
+            "schema 5 must carry the imported semantic entity deltas"
         );
 
         let response = router(Arc::clone(&destination_state))
@@ -26943,6 +27520,7 @@ mod tests {
                 &authority.manager,
                 &main,
                 &expectation,
+                None,
             );
 
             if fits {
@@ -27580,6 +28158,7 @@ mod tests {
             repository_id: &RepositoryId,
             destination_kindb: &FsPath,
             operation: u128,
+            declared: Option<u32>,
         ) -> kin_remote::repository_transfer::RepositoryTransferPack {
             let source_storage = tempfile::tempdir().unwrap();
             let source_head = seed_replica_change(
@@ -27615,6 +28194,7 @@ mod tests {
                 &source,
                 &destination_ref,
                 &expectation,
+                declared,
             )
             .unwrap();
             assert!(
@@ -27622,6 +28202,10 @@ mod tests {
                 "the one-change fixture fits one segment"
             );
             assert_eq!(segment.pack.source_head, source_head);
+            assert_eq!(
+                segment.pack.source_hydration_semantics, declared,
+                "the fixture must publish the declaration the arm is about"
+            );
             segment.pack
         }
 
@@ -27661,14 +28245,21 @@ mod tests {
             (state, layout, working)
         }
 
-        /// Inbound receive, which is also where a `kin push` lands.
+        /// Inbound receive, which is also where a `kin push` lands, from a
+        /// sender that declares no creation version of its own.
+        ///
+        /// That is a hosted daemon, or any build older than the wire field, and
+        /// it must still cost the receiver its record: nothing said which replay
+        /// semantics authored the arriving deltas, so the receiver's own number
+        /// cannot speak for them.
         #[tokio::test]
-        async fn an_http_receive_discards_the_receivers_creation_record() {
+        async fn an_http_receive_from_an_undeclared_sender_discards_the_creation_record() {
             let (state, layout, _working) = local_replica();
             let repo_id = state.cached_repo_id.clone();
             let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
             let destination_ref = kin_model::RefName::branch(b"main").unwrap();
-            let pack = pack_for_local_destination(&repository_id, &layout.kindb_dir(), 0x2829);
+            let pack =
+                pack_for_local_destination(&repository_id, &layout.kindb_dir(), 0x2829, None);
             let admitted_head = pack.source_head;
             restamp_current(&layout);
 
@@ -27682,7 +28273,84 @@ mod tests {
                 receipt.destination_head, admitted_head,
                 "the fixture must prove history actually moved"
             );
-            assert_unstamped(&layout, "an inbound receive");
+            assert_unstamped(&layout, "an inbound receive from an undeclared sender");
+        }
+
+        /// The defect this whole change ends, at the boundary that produced it.
+        ///
+        /// Measured on 2026-09-05 on two scratch native stores minutes old, on
+        /// the build this lane branched from: the receiver's `kin doctor` went
+        /// from `version 10 at creation` to `STALE ... records no hydration
+        /// semantics version` the instant a push landed, and every agent answer
+        /// over that store read `inconclusive` from then on, with a remedy
+        /// telling it to upgrade a build minutes old.
+        #[tokio::test]
+        async fn an_http_receive_declaring_this_stores_version_keeps_the_creation_record() {
+            let (state, layout, _working) = local_replica();
+            let repo_id = state.cached_repo_id.clone();
+            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+            let pack = pack_for_local_destination(
+                &repository_id,
+                &layout.kindb_dir(),
+                0x2831,
+                Some(hydration_semantics::binary_version()),
+            );
+            let admitted_head = pack.source_head;
+            restamp_current(&layout);
+            let before = hydration_semantics::read(&layout);
+
+            let (status, body) =
+                post_receive(Arc::clone(&state), &repo_id, &destination_ref, &pack).await;
+            assert_eq!(status, StatusCode::OK, "the receive must commit: {body}");
+            let receipt: kin_remote::repository_transfer::RepositoryTransferReceipt =
+                serde_json::from_str(&body).expect("the route answers a receipt");
+            assert_eq!(
+                receipt.destination_head, admitted_head,
+                "the fixture must prove history actually moved"
+            );
+
+            assert_eq!(
+                hydration_semantics::read(&layout),
+                before,
+                "an agreeing declaration must leave the record byte-identical"
+            );
+            assert!(
+                !hydration_semantics::standing(&layout).is_gap(),
+                "a receiver lost certification to a sender recording its own version"
+            );
+        }
+
+        /// The arm that keeps the one above from becoming "keep it always".
+        ///
+        /// A sender one version behind is exactly the case the discard was
+        /// written for: keeping the record here would certify this store's
+        /// creation number over deltas replayed under another one.
+        #[tokio::test]
+        async fn an_http_receive_declaring_another_version_discards_the_creation_record() {
+            let (state, layout, _working) = local_replica();
+            let repo_id = state.cached_repo_id.clone();
+            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+            let pack = pack_for_local_destination(
+                &repository_id,
+                &layout.kindb_dir(),
+                0x2832,
+                Some(hydration_semantics::binary_version() - 1),
+            );
+            let admitted_head = pack.source_head;
+            restamp_current(&layout);
+
+            let (status, body) =
+                post_receive(Arc::clone(&state), &repo_id, &destination_ref, &pack).await;
+            assert_eq!(status, StatusCode::OK, "the receive must commit: {body}");
+            let receipt: kin_remote::repository_transfer::RepositoryTransferReceipt =
+                serde_json::from_str(&body).expect("the route answers a receipt");
+            assert_eq!(
+                receipt.destination_head, admitted_head,
+                "the fixture must prove history actually moved"
+            );
+            assert_unstamped(&layout, "an inbound receive declaring another version");
         }
 
         /// The control that makes the arm above mean something: a receiver that
@@ -27694,7 +28362,12 @@ mod tests {
             let repo_id = state.cached_repo_id.clone();
             let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
             let destination_ref = kin_model::RefName::branch(b"main").unwrap();
-            let mut pack = pack_for_local_destination(&repository_id, &layout.kindb_dir(), 0x2830);
+            let mut pack = pack_for_local_destination(
+                &repository_id,
+                &layout.kindb_dir(),
+                0x2830,
+                Some(hydration_semantics::binary_version()),
+            );
             // A destination ref the route did not ask for. Refused by identity,
             // well before anything durable moves.
             pack.destination_ref = kin_model::RefName::branch(b"not-the-route").unwrap();
@@ -27784,6 +28457,53 @@ mod tests {
             assert!(
                 !hydration_semantics::standing(&layout).is_gap(),
                 "a pull that admitted nothing discarded the creation record"
+            );
+        }
+
+        /// Native clone between two stores this build created, over real HTTP.
+        ///
+        /// This is the journey run's step 7 in a test: the peer serves its own
+        /// creation record on the export, the replica is stamped by the same
+        /// build, and the finished replica must still certify. Before the wire
+        /// carried the declaration this arm was impossible to satisfy, because
+        /// the receiver discarded on every admission.
+        #[tokio::test]
+        async fn a_native_clone_of_a_matching_source_keeps_the_replicas_record() {
+            let peer = native_clone_peer().await;
+            assert_eq!(
+                hydration_semantics::standing(&peer.layout),
+                HydrationStanding::Current {
+                    version: hydration_semantics::binary_version()
+                },
+                "the peer must start current, or this arm proves nothing"
+            );
+
+            let destination = tempfile::tempdir().unwrap();
+            let cloned = crate::replica_adoption::clone_native_replica(
+                destination.path(),
+                clone_endpoint(&peer.url),
+                &peer.repository_id,
+            )
+            .await
+            .expect("a native clone of a served peer");
+            assert!(
+                cloned.transfer.outcome.moved_history(),
+                "the clone admitted no history, so it says nothing about the commit boundary"
+            );
+
+            assert_eq!(
+                hydration_semantics::standing(&cloned.state.layout),
+                HydrationStanding::Current {
+                    version: hydration_semantics::binary_version()
+                },
+                "a replica of a peer this build created lost its creation record"
+            );
+            assert_eq!(
+                hydration_semantics::standing(&peer.layout),
+                HydrationStanding::Current {
+                    version: hydration_semantics::binary_version()
+                },
+                "the transfer moved the source's own creation record, which it must never do"
             );
         }
 
@@ -28350,6 +29070,7 @@ mod tests {
                 &pushed_repository_id,
                 &main,
                 &main,
+                None,
             )
         })
         .await
@@ -34854,6 +35575,1407 @@ mod tests {
             "a refused commit must record no change at all"
         );
     }
+    /// FIR-3200. Read the published start line of the sole entity a path holds.
+    #[cfg(unix)]
+    fn published_start_line(state: &Arc<DaemonState>, path: &str) -> u32 {
+        let entities = state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new(path)),
+                ..Default::default()
+            })
+            .unwrap();
+        let spanned = entities
+            .iter()
+            .filter_map(|entity| entity.span.as_ref().map(|span| span.start_line))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spanned.len(),
+            1,
+            "the fixture holds exactly one spanned entity at {path}, found {spanned:?}"
+        );
+        spanned[0]
+    }
+
+    /// FIR-3200 measurement. Reproduce the brownfield stranger's stale span:
+    /// an edit that arrives through a disposable session, the session reconcile
+    /// that publishes its exact tree, and the ordinary commit after it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_after_a_session_reconcile_republishes_the_moved_span() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let host_path = repo.path().join("shifted.rs");
+        std::fs::write(&host_path, b"pub fn shifted() -> u32 { 7 }\n").unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+        eprintln!("FIR-3200 measurement: committed start_line={before}");
+
+        let session_dir = state.layout.root().join("runs/session-fir3200");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        let summary = reconcile_session_through_api(&app, &session_dir).await;
+        eprintln!(
+            "FIR-3200 measurement: reconcile modified={} enriched={} after_reconcile_start_line={}",
+            summary.modified,
+            summary.semantic_files_enriched,
+            published_start_line(&state, "shifted.rs")
+        );
+        assert_eq!(
+            summary.semantic_files_enriched, 1,
+            "the reconcile must report the file it re-parsed rather than a hardcoded zero"
+        );
+        assert_eq!(summary.semantic_enrichment_failures, 0);
+
+        let commit = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
+                            "message": "commit the session's edit"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let commit_status = commit.status();
+        let commit_body = axum::body::to_bytes(commit.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        eprintln!(
+            "FIR-3200 measurement: commit status={commit_status} body={}",
+            String::from_utf8_lossy(&commit_body)
+        );
+
+        let after = published_start_line(&state, "shifted.rs");
+        eprintln!("FIR-3200 measurement: after_commit start_line={after}");
+        assert_eq!(
+            after,
+            before + PREPENDED_LINES,
+            "the published span must move with the bytes the session changed"
+        );
+    }
+
+    /// FIR-3200, the reopen arm. The session that makes the edit and the commit
+    /// that publishes it are routinely separated by a daemon restart, which is
+    /// what makes where the parse happens matter rather than merely when. A
+    /// daemon that comes up after the session reconcile must load a graph whose
+    /// spans already match its own tree, with nothing left owed to it.
+    ///
+    /// Falsify it the way its sibling falsifies: replace the
+    /// `readmit_semantics_for_paths` call in `reconcile_session_workspace` with
+    /// `SemanticReadmission::default()`, the pair of zeros that stood there
+    /// before, and this reopens onto a graph seventeen lines behind its bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_daemon_reopened_after_a_session_reconcile_answers_at_the_moved_span() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = layout.root().join("runs/session-fir3200-reopen");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        let summary = reconcile_session_through_api(&app, &session_dir).await;
+        assert_eq!(summary.semantic_files_enriched, 1);
+        assert_eq!(summary.semantic_enrichment_failures, 0);
+
+        // The daemon dies here, between the session's edit and the commit that
+        // publishes it. Whatever the readmission derived has to be on disk
+        // already for the next one to load it.
+        drop(app);
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // The seam the reconcile loop drives once per daemon life, before it
+        // answers anything. Called directly here because this test drives the
+        // daemon's HTTP surface rather than its loop, and what is being asserted
+        // is that the record carries the parse across the restart, not that a
+        // background task eventually fires.
+        crate::loop_runner::drain_semantic_debt(&reopened)
+            .await
+            .unwrap();
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "a reopened daemon must load the spans the session's bytes hold"
+        );
+
+        let reopened_app = router(Arc::clone(&reopened));
+        commit_through_api(
+            &reopened_app,
+            kin_model::OperationId::new(),
+            "commit the session's edit after a restart",
+        )
+        .await;
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the commit after a restart must not move the span back"
+        );
+    }
+
+    /// FIR-3208. A drain that is not a commit settles nothing.
+    ///
+    /// The record exists because a re-derivation lives in the derived graph and
+    /// dies with the daemon that performed it; only a commit puts it in
+    /// history. So a drain at startup pays the parse and must leave the record
+    /// standing, or the next restart before a commit reads the pre-edit span
+    /// with nothing left to say otherwise.
+    ///
+    /// Falsify by moving `settle_all` into `drain_semantic_debt`: the first
+    /// assertion on the record goes red, and the second reopen reads the
+    /// pre-edit span with no record to pay it from.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_drain_without_a_commit_leaves_the_record_standing() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+        let session_dir = layout.root().join("runs/session-fir3208-standing");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        reconcile_session_through_api(&app, &session_dir).await;
+        drop(app);
+        drop(state);
+
+        // First restart: the drain pays the parse, and the record stands.
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        crate::loop_runner::drain_semantic_debt(&reopened)
+            .await
+            .unwrap();
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES
+        );
+        assert!(
+            !crate::semantic_debt::outstanding(&reopened).is_empty(),
+            "a drain pays the parse in the derived graph; only a commit may settle the record"
+        );
+        drop(reopened);
+
+        // Second restart, still no commit: the derived graph is stale again
+        // and the record is what makes that recoverable.
+        let again = Arc::new(DaemonState::open(layout).unwrap());
+        again
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            published_start_line(&again, "shifted.rs"),
+            before,
+            "nothing durable carried the parse across the restart"
+        );
+        crate::loop_runner::drain_semantic_debt(&again)
+            .await
+            .unwrap();
+        assert_eq!(
+            published_start_line(&again, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the standing record pays it again"
+        );
+
+        // The commit is what settles it.
+        let again_app = router(Arc::clone(&again));
+        commit_through_api(
+            &again_app,
+            kin_model::OperationId::new(),
+            "commit the session's edit",
+        )
+        .await;
+        assert!(
+            crate::semantic_debt::outstanding(&again).is_empty(),
+            "a commit that reached authority settles the whole record"
+        );
+    }
+
+    /// FIR-3208. One unrelated edit must not settle a debt nothing has paid.
+    ///
+    /// The commit that carries an admission clears the whole record once its
+    /// transaction reaches authority. An admission that drained only when its
+    /// own transition was empty would therefore let a one-line edit somewhere
+    /// else discard a parse another file was still owed, and the file would stay
+    /// stale with the record saying it was settled.
+    ///
+    /// Found by reading the settle point rather than from a failure, and it is
+    /// the same mistake the empty-delta return made in the first place: a
+    /// conclusion drawn from the wrong question. The admission's own transition
+    /// says what THIS pass moved, never what an earlier one left owing.
+    ///
+    /// Falsify by moving the `drain_semantic_debt` call back inside the
+    /// `exact_admission.deltas.is_empty()` arm: this commit then has a non-empty
+    /// transition of its own, never drains, settles the record anyway, and the
+    /// span stays where the pre-edit parse left it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn an_unrelated_edit_does_not_settle_a_debt_nothing_paid() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = layout.root().join("runs/session-fir3208-unrelated");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        reconcile_session_through_api(&app, &session_dir).await;
+
+        // The restart is what makes the debt matter: the publication's own
+        // re-derivation lives in the derived graph, and the next daemon rebuilds
+        // that from a history this publication deliberately did not write.
+        drop(app);
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // A commit whose own transition is non-empty and has nothing to do with
+        // the file that is owed a parse.
+        std::fs::write(
+            repo.path().join("unrelated.rs"),
+            b"pub fn unrelated() -> u32 { 9 }\n",
+        )
+        .unwrap();
+        let reopened_app = router(Arc::clone(&reopened));
+        commit_through_api(
+            &reopened_app,
+            kin_model::OperationId::new(),
+            "commit an unrelated file",
+        )
+        .await;
+
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "a commit that settles the record must first pay what it settles"
+        );
+    }
+
+    /// FIR-3208. An unparseable file does not block the commit.
+    ///
+    /// Source the parser cannot read is the file's own state, and retaining
+    /// last-known-good is the designed answer to it rather than a fault. An
+    /// agent mid-edit produces exactly this, so refusing every commit until the
+    /// syntax is fixed would leave a caller unable to record anything at all,
+    /// which is worse than the stale spans this record exists to prevent. The
+    /// commit records the bytes and the file keeps the spans its last readable
+    /// version produced, which is what this seam did for such a file before any
+    /// of this existed.
+    ///
+    /// Falsify by dropping the `unparseable` partition in `drain_semantic_debt`
+    /// and refusing on every failure: this commit then 409s and a caller with one
+    /// half-written file can record nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn an_unparseable_file_keeps_its_spans_and_does_not_block_the_commit() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = layout.root().join("runs/session-fir3208-broken");
+        materialize_session_through_api(&app, &session_dir).await;
+        let session_file = session_dir.join("shifted.rs");
+        prepend_session_lines(&session_file, 17);
+        let mut broken = std::fs::read(&session_file).unwrap();
+        broken.extend_from_slice(b"pub fn half_written(\n");
+        std::fs::write(&session_file, &broken).unwrap();
+        // The reconcile refuses, because the caller who just published these
+        // bytes is the one who needs to know their semantics did not follow.
+        let refusal = app
+            .clone()
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"session_dir": session_dir, "confirm_mass_deletion": false})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refusal.status(), StatusCode::CONFLICT);
+
+        // The commit after it does not refuse. The caller has been told once,
+        // the bytes are durable, and blocking them buys nothing.
+        drop(app);
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let reopened_app = router(Arc::clone(&reopened));
+        commit_through_api(
+            &reopened_app,
+            kin_model::OperationId::new(),
+            "commit a half-written file",
+        )
+        .await;
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before,
+            "an unparseable file keeps its last readable version's spans"
+        );
+    }
+
+    /// FIR-3208. A drain failure that is NOT the file's own fault refuses the
+    /// commit.
+    ///
+    /// The two halves have to be told apart or the split is meaningless. This
+    /// failure is transient and the caller can retry it; letting it through would
+    /// settle the record unpaid and reproduce the stale spans silently, which is
+    /// the whole class the record exists to close.
+    ///
+    /// The trigger is graph-owned rather than contrived: the record names a body
+    /// the exact tree still carries, and the CAS cannot produce it. That is the
+    /// shape of a store whose ingestion CAS was pruned under it.
+    ///
+    /// Falsify by treating every drain failure as unparseable: this commit then
+    /// succeeds and settles a record nothing paid.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_drain_failure_that_is_not_the_file_refuses_the_commit() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+
+        let repo_path = RepoPath::from_utf8("shifted.rs".to_string()).unwrap();
+        let tree = state.graph.resolved_tree();
+        let kin_model::TreeEntry::Blob { hash, .. } =
+            tree.artifact_at_path(&repo_path).unwrap().entry
+        else {
+            panic!("the fixture is a regular file");
+        };
+        drop(tree);
+        crate::semantic_debt::record(
+            &state,
+            &[crate::semantic_debt::SemanticDebt {
+                path: "shifted.rs".to_string(),
+                body: hash.to_string(),
+            }],
+        );
+        let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        state.blobs.delete(&body_hash).unwrap();
+
+        std::fs::write(
+            repo.path().join("other.rs"),
+            b"pub fn other() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
+                            "message": "commit while a debt cannot be paid"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a drain failure the caller can retry must refuse rather than settle unpaid: {body}"
+        );
+        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(refusal["error"], "semantic_readmission_failed");
+        assert!(
+            refusal["message"].as_str().unwrap().contains("shifted.rs"),
+            "the refusal names the path it could not pay: {body}"
+        );
+    }
+
+    /// FIR-3200. A session that publishes a file the parser cannot parse is
+    /// refused in words, and the bytes stay published.
+    ///
+    /// This is the arm I could not build a deterministic trigger for until
+    /// review found the defect underneath it. The daemon reconciles under
+    /// `ReconcilePolicy::FallbackToLkg`, so unparseable source comes back as
+    /// `ReconcileOutcome::BrokenAst`: last-known-good state retained, no
+    /// transaction derived, the file still answering at the positions its
+    /// previous parse recorded. Counting that as enrichment reproduced this
+    /// change's own defect one level down, on the most ordinary agent case there
+    /// is, a file caught mid-edit.
+    ///
+    /// So the trigger is the ordinary case: prepend the seventeen lines and
+    /// leave the file syntactically broken. The reconcile must name the file
+    /// rather than report a clean summary, and the tree must still carry the
+    /// bytes, because a parser never retracts membership.
+    ///
+    /// Falsify by restoring the unconditional `outcome.enriched += 1` outside
+    /// the applied-delta arm: this returns 200 with enriched 1 and failures 0
+    /// over a file whose span never moved.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_session_publishing_unparseable_source_is_refused_and_keeps_its_bytes() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = state.layout.root().join("runs/session-fir3200-broken");
+        materialize_session_through_api(&app, &session_dir).await;
+        let session_file = session_dir.join("shifted.rs");
+        prepend_session_lines(&session_file, 17);
+        let mut broken = std::fs::read(&session_file).unwrap();
+        broken.extend_from_slice(b"pub fn half_written(\n");
+        std::fs::write(&session_file, &broken).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_dir": session_dir,
+                            "confirm_mass_deletion": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a reconcile that could not re-parse what it published must not read as a clean \
+             success: {body}"
+        );
+        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(refusal["error"], "semantic_readmission_failed");
+        assert_eq!(refusal["files"], json!(["shifted.rs"]));
+        assert_eq!(refusal["summary"]["semantic_files_enriched"], json!(0));
+        assert_eq!(refusal["summary"]["semantic_enrichment_failures"], json!(1));
+
+        // Membership is not in doubt, and a parser may not retract it. The
+        // refusal is a report of a graph gap, never a rollback.
+        let tree = state.graph.resolved_tree();
+        let published = tree
+            .artifact_at_path(&RepoPath::from_utf8("shifted.rs".to_string()).unwrap())
+            .expect("the path stays in the exact tree");
+        let kin_model::TreeEntry::Blob { hash, .. } = published.entry else {
+            panic!("the fixture is a regular file");
+        };
+        assert_eq!(
+            state
+                .blobs
+                .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
+                .expect("the published body is readable"),
+            broken,
+            "the refusal reports a gap in the graph and never retracts the bytes"
+        );
+        assert_eq!(
+            published_start_line(&state, "shifted.rs"),
+            before,
+            "an unparseable file keeps its last-known-good spans, which is what the refusal is \
+             telling the caller about"
+        );
+    }
+
+    /// FIR-3200. The refusal a reconcile returns when its bytes published and
+    /// their semantics did not.
+    ///
+    /// The shape is the whole point, so the shape is what is asserted: a status
+    /// the CLI turns into a non-zero exit, every file named, and the complete
+    /// summary carried inside so refusing costs a caller nothing a success would
+    /// have told them. A 200 with a degradation block would satisfy none of
+    /// that: `daemon_client::reconcile` returns `Ok` for any success status and
+    /// the caller reads a clean summary, which is the exact failure this change
+    /// exists to end.
+    ///
+    /// Falsify by returning `StatusCode::OK` from `semantic_readmission_refused`,
+    /// or by dropping `files` from its body: the first assertion goes red on the
+    /// status, the second on the name.
+    #[test]
+    fn a_reconcile_whose_semantics_did_not_publish_refuses_and_names_the_files() {
+        let summary = kin_cli::commands::reconcile::ReconcileSummary {
+            schema: kin_cli::commands::reconcile::RECONCILE_SUMMARY_SCHEMA.to_string(),
+            operation_id: kin_model::OperationId::new(),
+            repository_id: RepositoryId::new("refusal-shape".to_string()).unwrap(),
+            authority_generation: 7,
+            workspace_generation: 9,
+            previous_tree_hash: Hash256::from_bytes([0x11; 32]),
+            desired_tree_hash: Hash256::from_bytes([0x22; 32]),
+            idempotent_replay: false,
+            changed: true,
+            added: 0,
+            modified: 1,
+            removed: 0,
+            observed_materialized_artifacts: 1,
+            preserved_graph_only_artifacts: 0,
+            observed_body_bytes: 512,
+            semantic_files_enriched: 0,
+            semantic_enrichment_failures: 1,
+            changes: Vec::new(),
+        };
+
+        let (status, body) =
+            semantic_readmission_refused(&summary, &["src/shifted.rs".to_string()]);
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the CLI turns any non-success status into a non-zero exit; a 2xx here reads as a \
+             clean reconcile over a file that still answers at its old spans"
+        );
+        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(refusal["error"], "semantic_readmission_failed");
+        assert_eq!(
+            refusal["files"],
+            json!(["src/shifted.rs"]),
+            "a reader cannot act on a count; the refusal has to name the file"
+        );
+        assert!(
+            refusal["message"]
+                .as_str()
+                .unwrap()
+                .contains("src/shifted.rs"),
+            "the sentence a person reads must name the file too: {body}"
+        );
+        assert_eq!(
+            refusal["summary"]["semantic_enrichment_failures"],
+            json!(1),
+            "refusing must not cost the caller what a success would have reported"
+        );
+        assert_eq!(refusal["summary"]["modified"], json!(1));
+    }
+
+    /// FIR-3200. Materialize a disposable session projection, the way
+    /// `kin exec` does before it runs anything.
+    #[cfg(unix)]
+    async fn materialize_session_through_api(app: &axum::Router, session_dir: &std::path::Path) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/session-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_dir": session_dir.display().to_string(),
+                            "strategy": null,
+                            "scope": null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    }
+
+    /// FIR-3200. The edit shape the stranger arm hit: content prepended above
+    /// every declaration in the file, so a stale parse is visible as an offset
+    /// rather than as a missing entity.
+    #[cfg(unix)]
+    fn prepend_session_lines(session_file: &std::path::Path, lines: u32) {
+        let original = std::fs::read(session_file).unwrap();
+        let mut shifted = b"// prepended by the session\n".repeat(lines as usize);
+        shifted.extend_from_slice(&original);
+        std::fs::write(session_file, &shifted).unwrap();
+    }
+
+    /// FIR-3200. Admit one session's observation and return its summary.
+    #[cfg(unix)]
+    async fn reconcile_session_through_api(
+        app: &axum::Router,
+        session_dir: &std::path::Path,
+    ) -> kin_cli::commands::reconcile::ReconcileSummary {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_dir": session_dir,
+                            "confirm_mass_deletion": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn amend_request_through_api(
+        app: &axum::Router,
+        expected_head: SemanticChangeId,
+        message: Option<&str>,
+    ) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": Timestamp::now(),
+                            "author": "Amending Actor <actor@example.invalid>",
+                            "message": message,
+                            "amend": true,
+                            "expected_head": expected_head,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn commit_amend_keeps_pending_sources_and_semantics_after_restart() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout;
+        let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        let app = router(Arc::clone(&state));
+        std::fs::write(
+            repo.path().join("main.rs"),
+            b"pub fn answer() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let first =
+            commit_through_api(&app, kin_model::OperationId::new(), "original message").await;
+        let original = state.graph.get_change(&first).unwrap().unwrap();
+        std::fs::write(
+            repo.path().join("main.rs"),
+            b"pub fn answer() -> u32 { 2 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("extra.rs"),
+            b"pub fn extra() -> bool { true }\n",
+        )
+        .unwrap();
+        let (status, body) = amend_request_through_api(&app, first, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let amended = branch_change(&state);
+        assert_ne!(amended, first);
+        let change = state.graph.get_change(&amended).unwrap().unwrap();
+        assert_eq!(change.parents, original.parents);
+        assert_eq!(change.message, original.message);
+        assert_eq!(change.author, original.author);
+        assert_eq!(state.graph.get_change(&first).unwrap().unwrap(), original);
+        let desired = state.graph.to_snapshot();
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let lease = authority.manager.read_authority();
+        let operation = lease.metadata().operation_log.last().unwrap();
+        assert_eq!(
+            operation.actor,
+            AuthorId::new("Amending Actor <actor@example.invalid>")
+        );
+        assert_eq!(
+            operation.ref_mutations[0].expected,
+            kin_model::RefExpectation::MustEqual {
+                target: kin_model::RefTarget::change(first)
+            }
+        );
+        assert!(!lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .is_dirty());
+        drop(lease);
+        drop(authority);
+        drop(app);
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        assert_eq!(branch_change(&reopened), amended);
+        let restored = reopened.graph.to_snapshot();
+        assert_eq!(restored.resolved_tree, desired.resolved_tree);
+        assert_eq!(restored.entities, desired.entities);
+        assert_eq!(
+            std::fs::read(repo.path().join("extra.rs")).unwrap(),
+            b"pub fn extra() -> bool { true }\n"
+        );
+        let app = router(Arc::clone(&reopened));
+        let (status, body) =
+            amend_request_through_api(&app, amended, Some("revised message")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            reopened
+                .graph
+                .get_change(&branch_change(&reopened))
+                .unwrap()
+                .unwrap()
+                .message,
+            "revised message"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn commit_amend_allows_an_explicit_replacement_with_no_content_delta() {
+        let repo = tempfile::tempdir().unwrap();
+        let state =
+            Arc::new(DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap());
+        let app = router(Arc::clone(&state));
+        std::fs::write(repo.path().join("value.txt"), b"one\n").unwrap();
+        let first = commit_through_api(&app, kin_model::OperationId::new(), "first").await;
+        std::fs::write(repo.path().join("value.txt"), b"two\n").unwrap();
+        let second = commit_through_api(&app, kin_model::OperationId::new(), "second").await;
+        std::fs::write(repo.path().join("value.txt"), b"one\n").unwrap();
+        let (status, body) =
+            amend_request_through_api(&app, second, Some("intentional empty replacement")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let change = state
+            .graph
+            .get_change(&branch_change(&state))
+            .unwrap()
+            .unwrap();
+        assert_eq!(change.parents, vec![first]);
+        assert!(change.entity_deltas.is_empty());
+        assert!(change.relation_deltas.is_empty());
+        assert!(change.tree_deltas.is_empty());
+        assert!(change.admission_policy_delta.is_none());
+    }
+
+    /// Read this store's graph-section standing the way every reporting surface
+    /// does, off a fresh authority open.
+    fn graph_section_standing(
+        state: &Arc<DaemonState>,
+    ) -> kin_core::graph_section::GraphSectionStanding {
+        let authority =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(state)
+                .expect("open the pinned local repository authority");
+        let lease = authority.manager.read_authority();
+        kin_core::graph_section::read(&lease, &authority.workspace_id).standing
+    }
+
+    /// A commit leaves this workspace's base graph section written, so the
+    /// store it hands back does not fold its history at every open.
+    ///
+    /// This is journey GAP-4. `kin init` materializes a section and nothing
+    /// else did, so the FIRST commit in a repository built with Kin left
+    /// `kin doctor` printing `✗ Graph section DEGRADED ... kin graph
+    /// materialize writes one`, on a store holding one change, with the setup
+    /// footer calling it a host limit. The same absence costs an admitted
+    /// repository far more: an express store of 470 MiB opened in 37.9 seconds
+    /// with `folded_changes=3834` because one commit had refused its section,
+    /// and every later open paid it again.
+    ///
+    /// Three assertions rather than one, because the interesting states are
+    /// before, at the boundary and after. An unborn workspace has no base to
+    /// memoize and must not be reported as folding; the first commit is where
+    /// the old behaviour broke; and the second commit is where a section
+    /// written once and never refreshed would come back as `present but
+    /// refused`, which reads differently and is just as slow.
+    ///
+    /// Falsified by deleting the `refresh_workspace_base_graph_section` call at
+    /// the end of `commit_native_plan_with_working_copy_proof`: both commit
+    /// assertions then report `Folding`.
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_leaves_the_workspace_base_graph_section_written() {
+        let repo = tempfile::tempdir().unwrap();
+        let state =
+            Arc::new(DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap());
+        let app = router(Arc::clone(&state));
+
+        assert_eq!(
+            graph_section_standing(&state),
+            kin_core::graph_section::GraphSectionStanding::Unborn,
+            "a workspace with no base target has nothing to fold and nothing to memoize"
+        );
+
+        std::fs::write(
+            repo.path().join("notes.py"),
+            b"def add(a, b):\n    return a + b\n",
+        )
+        .unwrap();
+        commit_through_api(&app, kin_model::OperationId::new(), "first").await;
+        assert_eq!(
+            graph_section_standing(&state),
+            kin_core::graph_section::GraphSectionStanding::Serving,
+            "the first commit must leave a section that answers for the base it just published"
+        );
+
+        std::fs::write(
+            repo.path().join("notes.py"),
+            b"def add(a, b):\n    return b + a\n",
+        )
+        .unwrap();
+        commit_through_api(&app, kin_model::OperationId::new(), "second").await;
+        assert_eq!(
+            graph_section_standing(&state),
+            kin_core::graph_section::GraphSectionStanding::Serving,
+            "a second commit must refresh the section it moved the base past, not leave it refused"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn commit_amend_rejects_stale_head_before_admitting_pending_files() {
+        let repo = tempfile::tempdir().unwrap();
+        let state =
+            Arc::new(DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap());
+        let app = router(Arc::clone(&state));
+        std::fs::write(repo.path().join("value.txt"), b"one\n").unwrap();
+        let first = commit_through_api(&app, kin_model::OperationId::new(), "first").await;
+        std::fs::write(repo.path().join("value.txt"), b"two\n").unwrap();
+        let second = commit_through_api(&app, kin_model::OperationId::new(), "second").await;
+        std::fs::write(
+            repo.path().join("not_admitted.rs"),
+            b"pub fn pending() {}\n",
+        )
+        .unwrap();
+        let before = generation_pair(&state);
+        let (status, body) = amend_request_through_api(&app, first, None).await;
+        assert!(status.is_client_error(), "{status}: {body}");
+        assert!(body.contains("HEAD is now"), "{body}");
+        assert_eq!(generation_pair(&state), before);
+        assert_eq!(branch_change(&state), second);
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&kin_model::RepoPath::from_utf8("not_admitted.rs").unwrap())
+            .is_none());
+        assert_eq!(
+            std::fs::read(repo.path().join("not_admitted.rs")).unwrap(),
+            b"pub fn pending() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn commit_amend_cannot_drop_a_leased_entity_by_reverting_its_old_change() {
+        let repo = tempfile::tempdir().unwrap();
+        let state =
+            Arc::new(DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap());
+        let app = router(Arc::clone(&state));
+        std::fs::write(repo.path().join("value.txt"), b"base\n").unwrap();
+        commit_through_api(&app, kin_model::OperationId::new(), "base").await;
+        std::fs::write(repo.path().join("main.rs"), b"pub fn value() -> u8 { 1 }\n").unwrap();
+        let second = commit_through_api(&app, kin_model::OperationId::new(), "add source").await;
+        let change = state.graph.get_change(&second).unwrap().unwrap();
+        assert!(change
+            .entity_deltas
+            .iter()
+            .all(|delta| matches!(delta, EntityDelta::Added { .. })));
+        let entity = change
+            .entity_deltas
+            .first()
+            .expect("the added source must have a semantic delta")
+            .target_id();
+        let owner = state
+            .coordinator
+            .register_session(
+                "codex",
+                "lease owner",
+                SessionTransport::Mcp,
+                None,
+                repo.path().to_path_buf(),
+                SessionCapabilities {
+                    can_write: true,
+                    can_commit: true,
+                    ..SessionCapabilities::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            state
+                .coordinator
+                .register_intent(
+                    &owner,
+                    vec![IntentScope::Entity(entity)],
+                    LockType::Hard,
+                    "protected entity",
+                    None,
+                )
+                .unwrap(),
+            crate::session_registry::IntentRegistrationResult::Registered { .. }
+        ));
+        std::fs::remove_file(repo.path().join("main.rs")).unwrap();
+        let count = state.graph.to_snapshot().changes.len();
+        let (status, body) = amend_request_through_api(&app, second, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("lease_conflict"), "{body}");
+        assert_eq!(branch_change(&state), second);
+        assert_eq!(state.graph.to_snapshot().changes.len(), count);
+        assert!(!repo.path().join("main.rs").exists());
+        assert!(state.graph.get_entity(&entity).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn commit_amend_during_open_merge_refuses_before_admission() {
+        let (state, _layout, repository, _, _) = universal_branch_test_state("amend-open-merge");
+        let app = router(Arc::clone(&state));
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: main-conflict\n",
+        )
+        .unwrap();
+        let head =
+            commit_through_api(&app, kin_model::OperationId::new(), "conflicting main").await;
+        let merge = kin_cli::commands::merge::MergeRequest {
+            source: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("merge test"),
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/merge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&merge).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .unwrap();
+        let merged: kin_cli::commands::merge::MergeResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(matches!(
+            merged.report.unwrap().outcome,
+            kin_cli::commands::merge::MergeOutcome::Conflicted
+        ));
+        let before = generation_pair(&state);
+        std::fs::write(repository.join("pending.txt"), b"pending outside merge\n").unwrap();
+        let (status, body) = amend_request_through_api(&app, head, Some("must refuse")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body.contains("merge transaction") && body.contains("still open"),
+            "{body}"
+        );
+        assert_eq!(generation_pair(&state), before);
+        assert_eq!(branch_change(&state), head);
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&kin_model::RepoPath::from_utf8("pending.txt").unwrap())
+            .is_none());
+    }
+
+    /// FIR-3209. A session that deletes an entity-owning file reconciles, the
+    /// file's entities are absent from every query afterwards, and the next
+    /// commit records the removal.
+    ///
+    /// kin-db refuses a transition that leaves an entity on a path the staged
+    /// tree no longer carries, and it names the remedy in its own message:
+    /// "carry its exact entity removal or relocation in the same delta". The
+    /// invariant is right and the session admission was the caller that owed
+    /// the removal, so an agent's `rm` of a source file could not reconcile at
+    /// all. The existing session-reconcile test deletes `delete.me`, a file with
+    /// no entities, which is why the suite was green over this.
+    ///
+    /// Falsify by restoring `semantic_delta: WorkspaceSemanticDelta::default()`
+    /// in `plan_session_workspace_admission`: the reconcile returns the 500 the
+    /// review's control probe measured, and `gone.rs` keeps its entity with no
+    /// file behind it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_session_that_deletes_an_entity_source_file_retires_its_entities() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(repo.path().join("keep.rs"), b"pub fn keep() -> u32 { 1 }\n").unwrap();
+        std::fs::write(repo.path().join("gone.rs"), b"pub fn gone() -> u32 { 7 }\n").unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixtures").await;
+        let entities_at = |path: &str| {
+            state
+                .graph
+                .query_entities(&kin_db::EntityFilter {
+                    file_path: Some(kin_model::FilePathId::new(path)),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let gone_before = entities_at("gone.rs");
+        eprintln!(
+            "FIR-3209 measurement: before gone.rs entities={} keep.rs entities={}",
+            gone_before.len(),
+            entities_at("keep.rs").len()
+        );
+        assert_eq!(gone_before.len(), 1, "the fixture owns exactly one entity");
+        let gone_id = gone_before[0].id;
+
+        let session_dir = state.layout.root().join("runs/session-fir3209");
+        materialize_session_through_api(&app, &session_dir).await;
+        std::fs::remove_file(session_dir.join("gone.rs")).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"session_dir": session_dir, "confirm_mass_deletion": false})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+        eprintln!(
+            "FIR-3209 measurement: reconcile status={status} after gone.rs entities={} body={body}",
+            entities_at("gone.rs").len()
+        );
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "deleting a source file in a session is an ordinary edit and must reconcile: {body}"
+        );
+        let summary: kin_cli::commands::reconcile::ReconcileSummary =
+            serde_json::from_str(&body).unwrap();
+        assert_eq!(summary.removed, 1);
+
+        // Absent from every query, not only the by-path one the invariant is
+        // phrased in: by id, by name, and from the exact tree.
+        assert!(
+            entities_at("gone.rs").is_empty(),
+            "an entity must not outlive the path that owned it"
+        );
+        assert_eq!(entities_at("keep.rs").len(), 1, "the sibling is untouched");
+        assert!(state.graph.get_entity(&gone_id).unwrap().is_none());
+        assert!(state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                name_pattern: Some("gone".to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&RepoPath::from_utf8("gone.rs".to_string()).unwrap())
+            .is_none());
+
+        // The next commit carries the removal into history.
+        let change_id =
+            commit_through_api(&app, kin_model::OperationId::new(), "commit the deletion").await;
+        let change = state.graph.get_change(&change_id).unwrap().unwrap();
+        assert!(
+            change.entity_deltas.iter().any(|delta| matches!(
+                delta,
+                kin_model::EntityDelta::Removed { old } if old.id == gone_id
+            )),
+            "the commit after the session must record the entity's removal: {:?}",
+            change.entity_deltas
+        );
+        assert!(
+            change
+                .tree_deltas
+                .iter()
+                .any(|delta| matches!(delta, kin_model::TreeDelta::Removed { .. })),
+            "and the file's removal beside it"
+        );
+    }
+
+    /// FIR-3209, the artifact half. A session that deletes a file another file
+    /// imports.
+    ///
+    /// The cross-file linker mints an artifact-to-artifact `Imports` edge that
+    /// no entity reaches, and kin-db validates every relation endpoint against
+    /// the staged artifact set, so retiring the file's entities alone left one
+    /// edge standing and the whole transaction was refused with "unadmitted
+    /// destination endpoint". Measured red by review1503's probe C at 03476033c.
+    ///
+    /// Falsify by dropping the `GraphNodeId::Artifact` arm from `departs` in
+    /// `retire_semantics_on_vacated`: the 500 returns with that message.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_session_that_deletes_an_imported_file_retires_its_artifact_edges() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("gone.ts"),
+            b"export function gone(): number { return 7; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("keep.ts"),
+            b"import { gone } from \"./gone\";\nexport function keep(): number { return gone(); }\n",
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixtures").await;
+        let gone_path = RepoPath::from_utf8("gone.ts".to_string()).unwrap();
+        let gone_artifact = state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&gone_path)
+            .map(|artifact| artifact.artifact_id)
+            .expect("the fixture is in the tree");
+        let gone_node = kin_model::GraphNodeId::Artifact(gone_artifact);
+        assert!(
+            !state
+                .graph
+                .get_all_relations_for_node(&gone_node)
+                .unwrap()
+                .is_empty(),
+            "the fixture only means something if the linker bound an edge to the artifact node"
+        );
+
+        let session_dir = state.layout.root().join("runs/session-fir3209-imported");
+        materialize_session_through_api(&app, &session_dir).await;
+        std::fs::remove_file(session_dir.join("gone.ts")).unwrap();
+        let summary = reconcile_session_through_api(&app, &session_dir).await;
+        assert_eq!(summary.removed, 1);
+
+        assert!(state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&gone_path)
+            .is_none());
+        assert!(
+            state
+                .graph
+                .get_all_relations_for_node(&gone_node)
+                .unwrap()
+                .is_empty(),
+            "no relation may outlive the artifact node it is bound to"
+        );
+        assert!(state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new("gone.ts")),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+        assert!(!state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new("keep.ts")),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+        commit_through_api(&app, kin_model::OperationId::new(), "commit the deletion").await;
+    }
+
+    /// FIR-3209, the split-brain half. Modify an entity-owning file in one
+    /// session, then delete it in the next.
+    ///
+    /// The first reconcile's readmission re-derives the path's entities into
+    /// the live graph only, so authority and the live graph now hold different
+    /// payloads for the same entity. A removal delta diffed against authority
+    /// and then applied to the live graph is refused there, "stale old payload
+    /// for removed entity", after authority has already committed, which left
+    /// the two graphs on different trees. Measured red by review1503's probe E
+    /// at 03476033c. Each graph now diffs itself with the same vacated set.
+    ///
+    /// Falsify by applying the plan's authority-derived deltas to the live
+    /// graph instead of the live-derived ones: the delete reconcile 500s with
+    /// that message after the authority commit is durable.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_session_that_deletes_a_file_an_earlier_session_modified_reconciles() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(repo.path().join("keep.rs"), b"pub fn keep() -> u32 { 1 }\n").unwrap();
+        std::fs::write(repo.path().join("gone.rs"), b"pub fn gone() -> u32 { 7 }\n").unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixtures").await;
+        let entities_at = |path: &str| {
+            state
+                .graph
+                .query_entities(&kin_db::EntityFilter {
+                    file_path: Some(kin_model::FilePathId::new(path)),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        assert_eq!(entities_at("gone.rs").len(), 1);
+
+        let first = state.layout.root().join("runs/session-fir3209-modify");
+        materialize_session_through_api(&app, &first).await;
+        prepend_session_lines(&first.join("gone.rs"), 17);
+        let modified = reconcile_session_through_api(&app, &first).await;
+        assert_eq!(modified.semantic_files_enriched, 1);
+        assert_eq!(
+            entities_at("gone.rs")[0].span.as_ref().unwrap().start_line,
+            17,
+            "the live graph moved on; authority did not"
+        );
+
+        let second = state.layout.root().join("runs/session-fir3209-then-delete");
+        materialize_session_through_api(&app, &second).await;
+        std::fs::remove_file(second.join("gone.rs")).unwrap();
+        let deleted = reconcile_session_through_api(&app, &second).await;
+        assert_eq!(deleted.removed, 1);
+        assert!(entities_at("gone.rs").is_empty());
+        assert_eq!(entities_at("keep.rs").len(), 1);
+
+        // The two graphs must still be level: a third session materializes and
+        // the next commit carries the removal into history.
+        let change_id =
+            commit_through_api(&app, kin_model::OperationId::new(), "commit the deletion").await;
+        let change = state.graph.get_change(&change_id).unwrap().unwrap();
+        assert!(
+            change.entity_deltas.iter().any(|delta| matches!(
+                delta,
+                kin_model::EntityDelta::Removed { old }
+                    if old.file_origin.as_ref().is_some_and(|f| f.0 == "gone.rs")
+            )),
+            "history must record the removal: {:?}",
+            change.entity_deltas
+        );
+    }
 
     /// Changes in repository authority, read the way `kin log` reads them.
     #[cfg(unix)]
@@ -36447,6 +38569,104 @@ mod tests {
              cannot be evidence about what a publication did to it"
         );
         (bare, roots)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn ambient_admission_preserves_open_merge_restore_generation_across_restart() {
+        let (state, layout, repository, _, _) = universal_branch_test_state("ambient-open-merge");
+        let path = repository.join("selected/compose.yaml");
+        let original = b"services:\n  api:\n    image: main-conflict\n";
+        std::fs::write(&path, original).unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "create a real conflict",
+        )
+        .await;
+        let response = crate::repository_merge::execute(
+            &state,
+            &kin_cli::commands::merge::MergeRequest {
+                source: kin_model::RefName::branch(b"feature").unwrap(),
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("ambient-merge-test"),
+            },
+        )
+        .unwrap_or_else(|refusal| {
+            panic!(
+                "fixture merge refused: {}",
+                axum::response::IntoResponse::into_response(refusal).status()
+            )
+        });
+        assert!(matches!(
+            response.report.unwrap().outcome,
+            kin_cli::commands::merge::MergeOutcome::Conflicted
+        ));
+        let before = cached_authority_admission_entry(&state).unwrap();
+        assert!(
+            before.open_merge.is_some(),
+            "the fixture must hold a durable open merge"
+        );
+        let expected_tree = state.graph.resolved_tree();
+        let authored = b"services:\n  api:\n    image: hand-authored-resolution\n";
+        std::fs::write(&path, authored).unwrap();
+        let observation =
+            std::iter::once(RepoPath::from_utf8("selected/compose.yaml").unwrap()).collect();
+        let yielded = crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap();
+        assert_eq!(
+            cached_authority_admission_entry(&state).unwrap().roots,
+            before.roots,
+            "an ambient conflict edit must not advance the merge restore generation"
+        );
+        assert!(yielded, "the watcher must retain the unadmitted event");
+        assert_eq!(state.graph.resolved_tree(), expected_tree);
+        assert_eq!(std::fs::read(&path).unwrap(), authored);
+        drop(app);
+        drop(state);
+
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        assert!(crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
+        assert_eq!(
+            cached_authority_admission_entry(&state).unwrap().roots,
+            before.roots
+        );
+        assert_eq!(state.graph.resolved_tree(), expected_tree);
+        // Restore the projection before aborting; this test exercises the
+        // ambient gate independently of custom-resolution projection policy.
+        std::fs::write(&path, original).unwrap();
+        crate::repository_merge_state::execute_resolve(
+            &state,
+            &kin_cli::commands::resolve::ResolveRequest {
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("ambient-merge-test"),
+                action: kin_cli::commands::resolve::ResolveAction::Abort,
+                expected_record: None,
+            },
+        )
+        .unwrap_or_else(|refusal| {
+            panic!(
+                "fixture abort refused: {}",
+                axum::response::IntoResponse::into_response(refusal).status()
+            )
+        });
+        assert!(!cached_authority_has_open_merge(&state).unwrap());
+        std::fs::write(&path, authored).unwrap();
+        let after_abort = cached_authority_admission_entry(&state)
+            .unwrap()
+            .roots
+            .generation;
+        assert!(!crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
+        assert_eq!(
+            cached_authority_admission_entry(&state)
+                .unwrap()
+                .roots
+                .generation,
+            after_abort + 1,
+            "the retained observation must admit normally after the merge closes"
+        );
+        assert_ne!(state.graph.resolved_tree(), expected_tree);
     }
 
     /// A merge published through `resolve --continue` must reach the live graph
@@ -38216,6 +40436,203 @@ mod tests {
         assert_eq!(
             authority.graph.relation_count(),
             state.graph.relation_count()
+        );
+    }
+
+    /// One committed relation over two committed entities, so both durability
+    /// axes are level with authority through the real MCP transaction path,
+    /// which is the levelling `finalize_committed_transaction` records.
+    async fn state_levelled_by_a_relation_commit() -> (Arc<DaemonState>, Entity, Entity) {
+        let state = test_state();
+        let mut caller = test_entity("caller", "src/lib.rs");
+        caller.file_origin = None;
+        caller.span = None;
+        let mut callee = test_entity("callee", "src/lib.rs");
+        callee.file_origin = None;
+        callee.span = None;
+        install_repository_entities(&state, vec![caller.clone(), callee.clone()]);
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session_id = mcp_test_session(&state);
+
+        let begin = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            serde_json::json!({ "session_id": session_id, "scope": "file:src/lib.rs" }),
+        )
+        .await;
+        let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+        let _stage = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": tx_id,
+                "operations": [{
+                    "verb": "add",
+                    "target": "",
+                    "payload": { "Relation": {
+                        "from": caller.id, "to": callee.id, "kind": RelationKind::Calls }},
+                    "description": ""
+                }]
+            }),
+        )
+        .await;
+        let commit = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            serde_json::json!({ "transaction_id": tx_id }),
+        )
+        .await;
+        assert_ne!(
+            commit.is_error,
+            Some(true),
+            "commit failed: {}",
+            mcp_result_text(&commit)
+        );
+        (state, caller, callee)
+    }
+
+    /// The durability block every daemon-built envelope is decorated from,
+    /// read off the production health snapshot rather than a hand-built body.
+    async fn durability_block(state: &Arc<DaemonState>) -> kin_mcp::envelope::Durability {
+        kin_mcp::Envelope::daemon()
+            .with_health(&daemon_health_snapshot(state).await)
+            .durability
+            .expect("a daemon that counted its graph carries a durability block")
+    }
+
+    /// FIR-3202. The stranger's shape, driven through the sweep's own write
+    /// path: entities level with authority, then a language-server enrichment
+    /// pass installs a relation into the live graph and commits nothing.
+    ///
+    /// Before the fix this block read `recorded`, `live_only_entities: 0` and
+    /// "2 entities, 0 uncommitted; durable repository authority records
+    /// everything answering here" both before and after the sweep, byte for
+    /// byte, while the live relation count went from 1 to 2. On the brown arm
+    /// the same block said the same sentence over 3,438 swept relations.
+    #[tokio::test]
+    async fn a_relation_the_sweep_wrote_and_no_commit_carries_is_reported_uncommitted() {
+        let (state, caller, callee) = state_levelled_by_a_relation_commit().await;
+        let relations_before = state.graph.relation_count();
+
+        let published = crate::daemon::install_lsp_relations(
+            &state,
+            &[kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: RelationKind::References,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            state.graph.relation_count(),
+            relations_before + 1,
+            "the fixture has to put a relation in the live graph, or it measures nothing: {published:?}"
+        );
+
+        let block = durability_block(&state).await;
+        assert_eq!(
+            block.live_only_relations,
+            Some(1),
+            "the swept relation belongs to no committed change and the count has to say so: {}",
+            block.note
+        );
+        assert_eq!(
+            block.live_only_entities,
+            Some(0),
+            "no entity moved, and the entity axis must not borrow the relation reading: {}",
+            block.note
+        );
+        assert_eq!(block.state, "live_uncommitted", "{}", block.note);
+        assert!(
+            block
+                .note
+                .contains("0 entities and 1 relations are uncommitted"),
+            "the note states the uncommitted count of each: {}",
+            block.note
+        );
+        assert!(
+            !block.note.contains("everything"),
+            "no sentence over one axis may claim the whole graph: {}",
+            block.note
+        );
+    }
+
+    /// The control. Right after a commit that captured every live relation, the
+    /// same block reads level on both axes, so the disclosure above is a
+    /// reading and not a fixture that always fires.
+    #[tokio::test]
+    async fn a_commit_that_carries_every_live_relation_reads_recorded_on_both_axes() {
+        let (state, _caller, _callee) = state_levelled_by_a_relation_commit().await;
+        assert!(
+            state.graph.relation_count() > 0,
+            "the control has to hold a relation, or a zero here proves nothing"
+        );
+
+        let block = durability_block(&state).await;
+        assert_eq!(block.state, "recorded", "{}", block.note);
+        assert_eq!(block.live_only_entities, Some(0), "{}", block.note);
+        assert_eq!(block.live_only_relations, Some(0), "{}", block.note);
+        assert_eq!(
+            block.live_relations,
+            Some(state.graph.relation_count() as u64)
+        );
+        assert_eq!(block.durable_relations, block.live_relations);
+    }
+
+    /// The same two readings on the graph-status path, which samples its own
+    /// counters under the embedding fence rather than reading `/health`.
+    #[tokio::test]
+    async fn graph_status_carries_the_durable_relation_count_beside_the_live_one() {
+        let (state, caller, callee) = state_levelled_by_a_relation_commit().await;
+        let level = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_graph_status",
+            serde_json::json!({}),
+        )
+        .await;
+        let level: serde_json::Value = serde_json::from_str(&mcp_result_text(&level)).unwrap();
+        assert_eq!(
+            level["durable_relation_count"], level["relation_count"],
+            "level after the commit: {level}"
+        );
+
+        crate::daemon::install_lsp_relations(
+            &state,
+            &[kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: RelationKind::UsesType,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            }],
+        );
+        let swept = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_graph_status",
+            serde_json::json!({}),
+        )
+        .await;
+        let swept: serde_json::Value = serde_json::from_str(&mcp_result_text(&swept)).unwrap();
+        assert_eq!(
+            swept["relation_count"].as_u64(),
+            level["relation_count"].as_u64().map(|count| count + 1),
+            "the sweep moved the live count: {swept}"
+        );
+        assert_eq!(
+            swept["durable_relation_count"], level["durable_relation_count"],
+            "nothing levelled, so the durable count must not move: {swept}"
         );
     }
 
@@ -40562,7 +42979,14 @@ mod tests {
         assert_eq!(summary.preserved_graph_only_artifacts, 2);
         #[cfg(not(target_os = "macos"))]
         assert_eq!(summary.preserved_graph_only_artifacts, 1);
-        assert_eq!(summary.semantic_files_enriched, 0);
+        // Four of the five paths this observation moved carry a body the
+        // publication can re-index: `compose.yaml`, `assets/policy.unknown`,
+        // `bin/verify` and `notes/new.odd`. The symlink and the removal are
+        // skipped, because neither is source owned by its path. The zero this
+        // assertion used to carry was a literal in the handler rather than a
+        // measurement, and it read as "nothing needed parsing" over files that
+        // had just changed.
+        assert_eq!(summary.semantic_files_enriched, 4);
         assert_eq!(summary.semantic_enrichment_failures, 0);
 
         let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
@@ -42892,8 +45316,86 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_refused_readiness_says_which_half_refused() {
+    /// A hosted daemon as production composes it: a GCS-shaped storage backend
+    /// over a local file root, the exact five-repo fleet, publication control
+    /// over an in-memory store, and a durable spine over a cold fake store.
+    /// `hosted_spine_readiness_required()` is true on it, which is the whole
+    /// point: the readiness tests below run the half that FIR-3179 is about,
+    /// not the local half that `test_state()` gives.
+    ///
+    /// The environment guard is returned so it lives as long as the state;
+    /// dropping it restores the variables.
+    fn hosted_test_state() -> (Arc<DaemonState>, kin_core::test_env::EnvVarGuard) {
+        const READER: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let fleet = vec![
+            "kin".to_string(),
+            "kin-db".to_string(),
+            "kin-editor".to_string(),
+            "kin-vfs".to_string(),
+            "kinlab".to_string(),
+        ];
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        environment.apply("GOOGLE_CLOUD_PROJECT", Some("fixture-project"));
+        environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
+        environment.apply("KIN_GCS_PREFIX", Some("fixture-prefix"));
+        environment.apply("KIN_REPO_IDS", Some(&fleet.join(",")));
+        environment.apply::<_, &str>("KIN_DISABLE_SPINE", None);
+        let scope = "gcs://fixture-bucket/fixture-prefix";
+
+        let backend_root = tempfile::tempdir().unwrap();
+        for repo_id in &fleet {
+            let graph = kin_db::InMemoryGraph::new();
+            graph
+                .upsert_entity(&test_entity(
+                    &format!("{}_entity", repo_id.replace('-', "_")),
+                    "src/lib.rs",
+                ))
+                .unwrap();
+            kin_db::StorageBackend::save_snapshot(
+                &kin_db::LocalFileBackend::new(backend_root.path()),
+                repo_id,
+                &graph.to_snapshot().to_bytes().unwrap(),
+                kin_db::GENERATION_INIT,
+            )
+            .unwrap();
+        }
+        // The root outlives the state through the leak below; a test fixture
+        // that lives for one test does not need to reclaim it.
+        let backend_root = Box::leak(Box::new(backend_root));
+
+        let repo = tempfile::tempdir().unwrap();
+        let repo = Box::leak(Box::new(repo));
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let store = Arc::new(crate::publication_lease::InMemoryPublicationControlStore::default());
+        let control = Arc::new(
+            crate::publication_lease::PublicationControl::new(scope, READER, fleet.clone(), store)
+                .unwrap(),
+        );
+        let state = Arc::new(
+            DaemonState::open_with_backend_and_publication_control(
+                initialized.layout,
+                Box::new(kin_db::LocalFileBackend::new(backend_root.path())),
+                "kin",
+                Some(fleet.iter().cloned().collect()),
+                control,
+            )
+            .unwrap(),
+        );
+        state.install_hosted_durable_spine_for_test(Arc::new(
+            kin_spine::FirestoreSpineBackend::with_store(Arc::new(
+                kin_spine::test_support::FakeSpineStore::cold(),
+            )),
+        ));
+        assert!(
+            state.hosted_spine_readiness_required(),
+            "the fixture must put readiness on the hosted half, or these tests \
+             exercise nothing FIR-3179 is about"
+        );
+        (state, environment)
+    }
+
+    fn capturing_warnings() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
         let captured = CapturedLog::new();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(captured.clone())
@@ -42901,42 +45403,166 @@ mod tests {
             .with_ansi(false)
             .finish();
         // `set_default` is thread-local and `#[tokio::test]` runs the future on
-        // this thread, so the handler below writes into `captured`.
-        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        // this thread, so the handler writes into `captured`.
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
 
+    async fn probe_readiness(state: Arc<DaemonState>) -> StatusCode {
+        probe_readiness_on(router(state)).await
+    }
+
+    /// The composed fixture carries publication control, and `router()` refuses
+    /// to serve such a state without the authenticated router. `/readiness`
+    /// itself is exempt from the bearer (see `is_publication_control_route`),
+    /// so the probe below sends none, exactly as a kubelet would.
+    /// Through the full hosted router, admission middleware included, with no
+    /// bearer, exactly as a kubelet sends it.
+    async fn probe_hosted_readiness(state: Arc<DaemonState>) -> StatusCode {
+        probe_readiness_on(router_with_publication_control_auth(
+            state,
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        ))
+        .await
+    }
+
+    /// The handler on its own. On a hosted daemon whose reader is not admitted,
+    /// `hosted_reader_admission` answers the probe route before the handler
+    /// runs, so the handler's two halves can only be exercised by calling it
+    /// directly; the middleware path has its own test.
+    async fn call_readiness_handler(state: Arc<DaemonState>) -> StatusCode {
+        readiness(State(state)).await.into_response().status()
+    }
+
+    async fn probe_readiness_on(app: Router) -> StatusCode {
+        app.oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_local_daemon_still_initializing_logs_no_readiness_refusal() {
+        let (captured, _guard) = capturing_warnings();
         // `test_state()` opens a real repo, and `DaemonState::open` sets
         // `is_initialized` from whether a snapshot loaded, so the fixture
-        // arrives ready. Put it back to the state a starting daemon is in, so
-        // the first half is what refuses.
+        // arrives ready. Put it back to the state a starting daemon is in.
         let state = test_state();
         state
             .is_initialized
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        let response = router(state)
-            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !state.hosted_spine_readiness_required(),
+            "test_state() is the local half by construction"
+        );
+        assert_eq!(
+            probe_readiness(state).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let logged = captured.text();
+        assert!(
+            !logged.contains("readiness refused"),
+            "a local daemon answers 503 for its whole first reconcile while the CLI \
+             polls it every 200 ms; a WARN there is a wall of noise on every first \
+             `kin daemon`, not a signal. Captured output was: {logged:?}"
+        );
+    }
 
+    #[tokio::test]
+    async fn a_hosted_daemon_refused_on_initialization_says_so_with_no_durations() {
+        // Build the fixture first: a hosted open installs its own tracing
+        // default on this thread, and a capture installed before it would be
+        // shadowed for the rest of the test and read back empty.
+        let (state, _environment) = hosted_test_state();
+        let (captured, _guard) = capturing_warnings();
+        state
+            .is_initialized
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            call_readiness_handler(state).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         let logged = captured.text();
         assert!(
             logged.contains("readiness refused"),
-            "a 503 from /readiness must say so in the log; Kubernetes keeps only \
-             the status code, so an unlogged refusal is an unanswerable rollout \
-             failure. Captured output was: {logged:?}"
+            "a hosted 503 must say so in the log; Kubernetes keeps only the status \
+             code. Captured output was: {logged:?}"
         );
         assert!(
             logged.contains("refused_on=\"initialization\""),
-            "the refusal must name which half refused, so a reader does not have \
-             to guess between initialization and the spine authority. Captured \
+            "the refusal must name the initialization half. Captured output was: \
+             {logged:?}"
+        );
+        assert!(
+            !logged.contains("authority_wait_ms") && !logged.contains("spine_gate_wait_ms"),
+            "on the initialization half the authority check never ran, so no duration \
+             may be printed: a zero there reads as \"the gate was fine\" when the gate \
+             was never asked. Captured output was: {logged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hosted_daemon_refused_by_the_spine_authority_reports_both_waits() {
+        // Build the fixture first: a hosted open installs its own tracing
+        // default on this thread, and a capture installed before it would be
+        // shadowed for the rest of the test and read back empty.
+        let (state, _environment) = hosted_test_state();
+        let (captured, _guard) = capturing_warnings();
+        assert!(
+            state
+                .is_initialized
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the fixture loads a snapshot for kin, so it is initialized and the \
+             refusal, if any, comes from the spine authority half"
+        );
+        // A cold durable spine with no admitted reader refuses authority, so
+        // this is the branch where the two durations are real measurements.
+        let status = call_readiness_handler(state).await;
+        let logged = captured.text();
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a hosted daemon whose spine authority has not admitted its reader must \
+             not report ready. Captured output was: {logged:?}"
+        );
+        assert!(
+            logged.contains("refused_on=\"hosted spine authority\""),
+            "the refusal must name the spine authority half. Captured output was: \
+             {logged:?}"
+        );
+        assert!(
+            logged.contains("authority_wait_ms=") && logged.contains("spine_gate_wait_ms="),
+            "on the authority half both waits were measured and must be reported; \
+             the gate wait is what separates a slow open from starvation behind the \
+             refresh passes. Captured output was: {logged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unadmitted_hosted_reader_refuses_the_probe_and_says_so() {
+        let (state, _environment) = hosted_test_state();
+        let (captured, _guard) = capturing_warnings();
+        // Through the whole hosted router. The reader in this fixture was never
+        // admitted, so `hosted_reader_admission` answers the probe itself and
+        // the readiness handler never runs.
+        assert_eq!(
+            probe_hosted_readiness(state).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let logged = captured.text();
+        assert!(
+            logged.contains("readiness refused")
+                && logged.contains("refused_on=\"reader admission\""),
+            "a probe refused by reader admission is a 503 the kubelet cannot explain; the \
+             middleware must say so, because the handler behind it never runs. Captured \
              output was: {logged:?}"
         );
         assert!(
-            logged.contains("spine_gate_wait_ms="),
-            "the refusal must report how long the authority check waited for the \
-             publication gate, which is the measurement that separates a slow \
-             open from starvation behind the refresh passes. Captured output \
-             was: {logged:?}"
+            !logged.contains("refused_on=\"hosted spine authority\"")
+                && !logged.contains("refused_on=\"initialization\""),
+            "the handler must not also have logged, or the same refusal is reported twice \
+             with two different reasons. Captured output was: {logged:?}"
         );
     }
 
