@@ -125,6 +125,14 @@ impl IndexPipeline {
         source: &[u8],
         blob_hash: kin_blobs::Hash256,
     ) -> Result<IndexedFileWithTests> {
+        let actual = kin_blobs::digest(source);
+        if actual != blob_hash {
+            return Err(IndexError::SourceDigestMismatch {
+                path: file_id.0.clone(),
+                expected: blob_hash,
+                actual,
+            });
+        }
         let path = Path::new(&file_id.0);
         let ext = path
             .extension()
@@ -170,6 +178,7 @@ impl IndexPipeline {
                 ent
             })
             .collect();
+        attach_span_source_digest(&mut entities, blob_hash);
         attach_file_context_metadata(&mut entities, file_id, &imports);
         attach_file_reference_parse_counts(
             &mut entities,
@@ -330,6 +339,7 @@ impl IndexPipeline {
                 ent
             })
             .collect();
+        attach_span_source_digest(&mut entities, blob_hash);
         attach_file_context_metadata(&mut entities, file_id, &imports);
         attach_file_reference_parse_counts(
             &mut entities,
@@ -641,6 +651,17 @@ pub fn normalize_file_path_id(path: &Path, root: &Path) -> FilePathId {
     let relative = path.strip_prefix(root).unwrap_or(path);
     let normalized = relative.to_string_lossy().replace('\\', "/");
     FilePathId::new(normalized)
+}
+
+/// Bind parser-derived spans to the complete source blob, including trivia.
+fn attach_span_source_digest(entities: &mut [Entity], blob_hash: kin_blobs::Hash256) {
+    let digest = blob_hash.to_string();
+    for entity in entities {
+        entity
+            .metadata
+            .extra
+            .insert("blob_hash".into(), digest.clone().into());
+    }
 }
 
 /// Attach the behavior-equivalence class to each entity of a participating
@@ -1731,6 +1752,128 @@ mod tests {
             role_of("shipped"),
             EntityRole::Source,
             "the production function beside it keeps its role"
+        );
+    }
+
+    fn assert_span_blob_provenance(indexed: &IndexedFile, source: &[u8]) {
+        let expected = kin_blobs::digest(source).to_string();
+        assert_eq!(indexed.blob_hash.to_string(), expected);
+        assert!(
+            !indexed.entities.is_empty(),
+            "source fixture must produce entities"
+        );
+        for entity in &indexed.entities {
+            let span = entity
+                .span
+                .as_ref()
+                .expect("parsed entity must have a span");
+            assert!(source
+                .get(span.start_byte as usize..span.end_byte as usize)
+                .is_some());
+            assert_eq!(
+                entity
+                    .metadata
+                    .extra
+                    .get("blob_hash")
+                    .and_then(|value| value.as_str()),
+                Some(expected.as_str()),
+                "{} span must name the exact parsed source blob",
+                entity.name
+            );
+        }
+    }
+
+    #[test]
+    fn span_provenance_current_content_and_file_ingestion_bind_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+        for (relative, source) in [
+            (
+                "src/lib.rs",
+                &b"// exact file bytes\npub fn answer() -> u8 { 1 }\n"[..],
+            ),
+            (
+                "src/sessions.py",
+                &b"# exact file bytes\ndef merge_setting(value):\n    return value\n"[..],
+            ),
+        ] {
+            let path = write_repo_file(dir.path(), relative, source);
+            let blob_hash = blob_store.write(source).unwrap();
+            let content = pipeline
+                .index_file_content_with_tests(&FilePathId::new(relative), source, blob_hash)
+                .unwrap()
+                .indexed_file;
+            assert_span_blob_provenance(&content, source);
+            let file = pipeline
+                .index_file_relative(&path, &blob_store, dir.path())
+                .unwrap();
+            assert_span_blob_provenance(&file, source);
+            assert_eq!(file.entities, content.entities);
+        }
+    }
+
+    #[test]
+    fn span_provenance_incremental_edit_advances_digest_for_unchanged_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+        let before = b"pub fn answer() -> u8 { 1 }\n";
+        let after = b"\npub fn answer() -> u8 { 1 }\n";
+        let path = write_repo_file(dir.path(), "src/lib.rs", before);
+        let (old, tree) = pipeline
+            .index_file_relative_with_hint(&path, &blob_store, dir.path(), None, None)
+            .unwrap();
+        assert_span_blob_provenance(&old, before);
+        std::fs::write(&path, after).unwrap();
+        let hint = kin_parser::EditHint {
+            start_byte: 0,
+            old_end_byte: 0,
+            new_end_byte: 1,
+        };
+        let (new, _) = pipeline
+            .index_file_relative_with_hint(&path, &blob_store, dir.path(), Some(&tree), Some(&hint))
+            .unwrap();
+        assert_span_blob_provenance(&new, after);
+        assert_ne!(old.blob_hash, new.blob_hash);
+        let old_answer = old
+            .entities
+            .iter()
+            .find(|entity| entity.name == "answer")
+            .unwrap();
+        let new_answer = new
+            .entities
+            .iter()
+            .find(|entity| entity.name == "answer")
+            .unwrap();
+        assert_eq!(old_answer.fingerprint, new_answer.fingerprint);
+        assert_ne!(old_answer.span, new_answer.span);
+        let full = pipeline
+            .index_file_relative(&path, &blob_store, dir.path())
+            .unwrap();
+        assert_eq!(new.entities, full.entities);
+    }
+
+    #[test]
+    fn span_provenance_rejects_digest_for_different_source_bytes() {
+        let source = b"pub fn answer() -> u8 { 1 }\n";
+        let unrelated = kin_blobs::digest(b"pub fn answer() -> u8 { 2 }\n");
+        let error = IndexPipeline::new()
+            .index_file_content_with_tests(&FilePathId::new("src/lib.rs"), source, unrelated)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("supplied blob digest"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(&unrelated.to_string()),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&kin_blobs::digest(source).to_string()),
+            "{error}"
         );
     }
 }

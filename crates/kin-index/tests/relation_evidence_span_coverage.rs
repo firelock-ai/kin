@@ -554,7 +554,6 @@ impl Counts {
 /// either arm counts for that edge.
 fn measure(files: &[(String, Vec<u8>)]) -> Counts {
     let pipeline = IndexPipeline::new();
-    let blob_hash = kin_blobs::Hash256::from_bytes([0u8; 32]);
 
     let mut merged: HashMap<RelationId, Relation> = HashMap::new();
     let mut parse_data = Vec::new();
@@ -563,7 +562,7 @@ fn measure(files: &[(String, Vec<u8>)]) -> Counts {
     for (path, source) in files {
         let file_id = FilePathId::new(path);
         let indexed = pipeline
-            .index_file_content_with_tests(&file_id, source, blob_hash)
+            .index_file_content_with_tests(&file_id, source, kin_blobs::digest(source))
             .unwrap_or_else(|error| panic!("index `{path}`: {error}"))
             .indexed_file;
 
