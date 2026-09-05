@@ -591,6 +591,128 @@ fn settled_entity_count(repo: &Path, home: &Path, port: u16) -> u64 {
 /// embedding-work lock is held, because every count the payload reports has to
 /// describe one instant and it cannot sample them while embedding is moving.
 /// The answer carries that instruction and no observation.
+/// Whether one `kin_graph_status` body is a live sample rather than a replay.
+///
+/// The two fields carry each other by construction: a replayed reading always
+/// discloses `stale` beside `last_settled_selected_graph`, and a live one never
+/// does. Reading both is what stops a relabelling from passing here, so this
+/// asks for the live label AND the absence of the disclosure rather than either
+/// alone.
+fn sample_is_live(status: &serde_json::Value) -> bool {
+    status["sampling"] == "point_in_time_selected_graph" && status["stale"].is_null()
+}
+
+/// Wait for a LIVE reading of the commit's own effect before asserting on it.
+///
+/// The growth direction of this test already waits on the observable, in
+/// [`wait_for_live_growth`]. The recording direction did not: it went straight
+/// from `kin commit` to a settle whose only retry condition is
+/// [`asks_for_retry`], which matches one literal refusal about sampling. A
+/// status that answers successfully from `last_settled_selected_graph` is not
+/// that refusal, so the settle accepted it and the assertions below read
+/// counters captured before the commit ran.
+///
+/// That is what CI saw on 2026-09-05: `durable_entities` 2 and `live_entities`
+/// 5 after the commit, digit for digit the pre-commit sample, seventeen seconds
+/// into a shard with 4,484 tests in flight. `command_commit_after_admission`
+/// records both durable counters before it returns success, so a fresh reading
+/// taken after that return cannot hold the old pair.
+///
+/// This waits for a sample that says it is live, under the same budget the
+/// settle uses, and fails loud with the last body it read. It cannot turn a
+/// broken daemon green by waiting: every assertion after it is unchanged, and a
+/// LIVE sample that is still unlevelled ends the wait's patience with that body
+/// quoted, because a live reading of stale counters is the product answering
+/// and not this harness racing it.
+fn wait_for_a_fresh_recorded_sample(
+    repo: &Path,
+    home: &Path,
+    port: u16,
+) -> Vec<(u64, serde_json::Value)> {
+    let started = Instant::now();
+    let mut deadline = started + retry_bound();
+    let mut reads = 0_u32;
+    let mut replays = 0_u32;
+    let mut live_but_unlevelled: Option<serde_json::Value> = None;
+    loop {
+        let session = settled_mcp_session(repo, home, port);
+        let status = payload(&session, 2, "kin_graph_status");
+        reads += 1;
+        if sample_is_live(&status) {
+            if durability(&status)["state"] == "recorded" {
+                return session;
+            }
+            // Keep the first one. If the wait ends here rather than on a run of
+            // replays, the counters are behind in the product and no amount of
+            // waiting in a test is the answer.
+            live_but_unlevelled.get_or_insert_with(|| durability(&status));
+        } else {
+            replays += 1;
+        }
+        deadline = widened_settle_deadline(deadline, started, retry_bound());
+        assert!(
+            Instant::now() < deadline,
+            "the commit returned and durable authority still does not carry the graph after \
+             {reads} read(s), {replays} of them replays of an earlier settled sample. {}",
+            match &live_but_unlevelled {
+                Some(block) => format!(
+                    "A LIVE sample read {block}, so the counters are behind in the daemon rather \
+                     than the sampling being stale: this is the product, not the test"
+                ),
+                None => "No live sample was ever taken, so every reading replayed an instant \
+                         before the commit"
+                    .to_string(),
+            }
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The deterministic control for [`sample_is_live`].
+///
+/// Without it the freshness check is a condition nothing proves: a predicate
+/// that accepted everything would leave this test passing exactly as it does
+/// now, and the race would come back the next time a shard ran hot.
+#[test]
+fn a_replayed_status_sample_is_not_accepted_as_a_live_one() {
+    let live = serde_json::json!({
+        "sampling": "point_in_time_selected_graph",
+        "entity_count": 5,
+    });
+    assert!(
+        sample_is_live(&live),
+        "a point-in-time sample with no staleness beside it is the live reading"
+    );
+
+    let replayed = serde_json::json!({
+        "sampling": "last_settled_selected_graph",
+        "stale": {"as_of_ms_ago": 1_200, "blocked_by": "embedding work"},
+        "entity_count": 5,
+    });
+    assert!(
+        !sample_is_live(&replayed),
+        "a replayed sample discloses staleness and must not be read as live"
+    );
+
+    // Each field alone, because either one passing on its own is a relabelling
+    // this check would wave through.
+    assert!(
+        !sample_is_live(&serde_json::json!({
+            "sampling": "last_settled_selected_graph",
+            "entity_count": 5,
+        })),
+        "the replay label alone is enough to reject"
+    );
+    assert!(
+        !sample_is_live(&serde_json::json!({
+            "sampling": "point_in_time_selected_graph",
+            "stale": {"as_of_ms_ago": 1_200},
+            "entity_count": 5,
+        })),
+        "a staleness disclosure alone is enough to reject"
+    );
+}
+
 fn asks_for_retry(payload: &serde_json::Value) -> bool {
     payload
         .get("message")
@@ -790,8 +912,14 @@ fn mcp_status_and_locate_disclose_live_only_entities_and_then_stop_once_a_commit
     );
     stdout_of(&commit, "kin commit");
 
-    let recorded = settled_mcp_session(&repo, &home, port);
+    // Read the commit's effect from a live sample, not from whatever the settle
+    // was willing to answer with. Every assertion below is unchanged.
+    let recorded = wait_for_a_fresh_recorded_sample(&repo, &home, port);
     let status_after = payload(&recorded, 2, "kin_graph_status");
+    assert!(
+        sample_is_live(&status_after),
+        "the counts below are only about this commit if the sample is a live one: {status_after}"
+    );
     let locate_after = payload(&recorded, 3, "semantic_locate");
 
     let status_after_durability = durability(&status_after);
