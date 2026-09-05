@@ -1820,6 +1820,22 @@ impl CachedAuthorityRefusal {
     }
 }
 
+/// What the authority proof this process already holds says about serving one
+/// read, before any durable refresh is considered.
+enum CachedReadAuthority<'a> {
+    /// The proof still binds to durable identity. Serve from it, with no
+    /// hydration and no graph load.
+    Proved(&'a dyn kin_spine::SpineBackend),
+    /// Refuse now. A lost admission, an active rollout or evidence this reader
+    /// cannot read are conditions in the control plane rather than heads that
+    /// moved, so a full pass reaches the same refusal one process-wide
+    /// hydration later.
+    Refuse,
+    /// Nothing usable is cached, or durable identity moved under what was. Take
+    /// the full pass once and answer from what it establishes.
+    Reprove,
+}
+
 fn hosted_spine_authority_vector_is_stable(
     first: &BTreeMap<String, HostedSpineRepoAuthorityProof>,
     second: &BTreeMap<String, HostedSpineRepoAuthorityProof>,
@@ -6803,6 +6819,74 @@ impl DaemonState {
         Some(spine)
     }
 
+    /// Whether this read can be answered from the authority proof this process
+    /// already holds, without re-establishing it.
+    ///
+    /// Establishing authority costs one full durable cache hydration plus a
+    /// whole-fleet double-collect that loads every repository graph and
+    /// recomputes every root. Every `/spine/*` query took that pass on every
+    /// request. On the five-repo hosted fleet the hydration half alone measured
+    /// a 7.92 s median over 48 passes and a 10.15 s p90, and the whole pass the
+    /// 10.46 s median recorded on
+    /// [`Self::hosted_readiness_spine_authority`]. A control plane that gives
+    /// its org-graph read 6 s therefore never saw an answer: it aborted every
+    /// time and rendered the fleet with no links between its repositories while
+    /// this daemon held 1489 of them.
+    ///
+    /// So a query answers the way a readiness probe does, from the proof the
+    /// publication, rollout and background passes establish. The reuse is
+    /// conditional on identity and never on age:
+    /// [`Self::assert_cached_hosted_spine_authority`] re-proves every
+    /// repository's committed head and source cursor on every call, so a
+    /// superseded generation is refused here rather than served.
+    fn cached_spine_read_authority(&self) -> CachedReadAuthority<'_> {
+        #[cfg(test)]
+        if self.hosted_in_memory_spine_allowed.load(Ordering::SeqCst) {
+            return CachedReadAuthority::Reprove;
+        }
+        // Hosted, and only with publication control. A local daemon
+        // re-registers its primary against the live root instead, and
+        // `assert_cached_hosted_spine_authority` answers `Ok` when there is no
+        // control to read, which means "nothing to check against" rather than
+        // "checked". Reading that `Ok` as a proof is how a process holding no
+        // control record would begin certifying its own cache.
+        if self.storage_backend.is_none() || self.publication_control.is_none() {
+            return CachedReadAuthority::Reprove;
+        }
+        // An installed proof is required for the same reason. Without one the
+        // check has nothing to bind durable identity to, and its verdict says
+        // nothing about whether this cache may answer.
+        //
+        // Read under its own statement so the guard is dropped before the check
+        // below takes the same lock.
+        let proved = self
+            .hosted_spine_authority_proof
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        if !proved {
+            return CachedReadAuthority::Reprove;
+        }
+        let Ok(backend) = self.initialized_spine_backend() else {
+            return CachedReadAuthority::Reprove;
+        };
+        match self.assert_cached_hosted_spine_authority(backend) {
+            Ok(()) => CachedReadAuthority::Proved(backend),
+            Err(refusal) if refusal.superseded => CachedReadAuthority::Reprove,
+            Err(refusal) => {
+                // Record it for the same reason the admission branch below
+                // does: the caller renders `spine_unavailable_reason` into the
+                // 503, and a refusal with no reason names nothing.
+                *self
+                    .spine_initialization_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(refusal.into_reason());
+                CachedReadAuthority::Refuse
+            }
+        }
+    }
+
     /// Acquire one query authority that remains stable through the caller's
     /// read. Hosted and local writers use the same gate, so the proof cannot be
     /// invalidated in the gap between readiness and response construction.
@@ -6826,7 +6910,13 @@ impl DaemonState {
                 return None;
             }
         }
-        let backend = self.ensure_spine()?;
+        // The gate and the admission assert above are unchanged and still run
+        // first, so nothing below can answer for a reader that is not admitted.
+        let backend = match self.cached_spine_read_authority() {
+            CachedReadAuthority::Proved(backend) => backend,
+            CachedReadAuthority::Refuse => return None,
+            CachedReadAuthority::Reprove => self.ensure_spine()?,
+        };
         Some(SpineAuthorityReadGuard {
             backend,
             _publication_gate: publication_gate,
