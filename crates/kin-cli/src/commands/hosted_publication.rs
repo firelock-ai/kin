@@ -1024,16 +1024,22 @@ pub fn install_no_replace(path: &Path, bytes: &[u8], label: &str) -> Result<bool
     })();
     let _ = fs::remove_file(&staged);
     let installed = install?;
-    if installed {
-        #[cfg(unix)]
-        {
-            // A link the directory entry has not recorded is not durable.
-            // `File::open` on a directory is unavailable on Windows, where the
-            // guarantee is the file's own flush plus the atomic link.
-            fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .with_context(|| format!("flush {label} directory {}", parent.display()))?;
-        }
+    #[cfg(unix)]
+    {
+        // Unconditional, and the declined path is the reason. A writer that
+        // finds the link already there is about to treat that record as durable
+        // and move on to the irreversible compare-and-swap, while the writer
+        // that created the link may not have flushed the directory entry yet and
+        // may never get to. Flushing here means whoever ACCEPTS the record is
+        // the one who made sure it survives, rather than trusting a peer to
+        // finish a step it can crash before reaching.
+        //
+        // A link the directory entry has not recorded is not durable.
+        // `File::open` on a directory is unavailable on Windows, where the
+        // guarantee is the file's own flush plus the atomic link.
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("flush {label} directory {}", parent.display()))?;
     }
     Ok(installed)
 }

@@ -1353,3 +1353,52 @@ fn a_pinned_reading_never_mixes_in_a_later_authority() {
         "the pinned closure is the pinned authority's, and this one references no bodies"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_declined_install_still_flushes_the_directory_before_it_returns() {
+    // The declined path is where this matters. A writer that finds the link
+    // already there is about to treat that record as durable and move on to the
+    // irreversible compare-and-swap, while the writer that created the link may
+    // not have flushed the directory entry yet and may never get to. Whoever
+    // ACCEPTS the record has to be the one who made sure it survives.
+    //
+    // Observed by taking the flush's own ability to run away: with the parent
+    // unreadable, opening it fails, so an implementation that flushes on this
+    // path reports that failure and one that skips the flush returns a cheerful
+    // `false` having touched nothing.
+    use std::os::unix::fs::PermissionsExt;
+
+    let case = Case::new();
+    let home = case.path("declined");
+    fs::create_dir_all(&home).expect("create the install directory");
+    let target = home.join("intent.json");
+    assert!(
+        install_no_replace(&target, b"{\"first\":true}\n", "intent").expect("the first install"),
+        "the first writer installs"
+    );
+
+    let original = fs::metadata(&home)
+        .expect("read directory mode")
+        .permissions();
+    // Write and traverse, no read: the file is still reachable by name and the
+    // directory can no longer be opened.
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o300))
+        .expect("make the directory unreadable");
+    let declined = install_no_replace(&target, b"{\"second\":true}\n", "intent");
+    fs::set_permissions(&home, original).expect("restore the directory mode");
+
+    let error = declined.expect_err(
+        "a declined install must flush the directory it is about to let a caller trust",
+    );
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("flush intent directory"),
+        "the failure names the flush it could not perform: {rendered}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).expect("the installed record is untouched"),
+        "{\"first\":true}\n",
+        "a declined install changes nothing it found"
+    );
+}
