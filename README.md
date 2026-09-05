@@ -334,6 +334,194 @@ Admission derives the semantic entities, not their vectors. Run `kin embed` to
 add local vector similarity over them, and confirm coverage with
 `kin graph status`.
 
+## Version control without Git
+
+Kin keeps a full change history with no Git underneath it. In an empty
+directory with no `.git`, the same binary records changes, branches, merges,
+and history, and Git never runs. This is that loop, with the output it printed
+on one real run of a build of `main`. `kin init`, `kin status`, and `kin diff`
+say more than is shown here; the lines below are theirs, unedited, with the
+rest trimmed.
+
+Start an empty repository and record a first change:
+
+```sh
+mkdir kin-demo && cd kin-demo
+kin init
+```
+
+```
+  Authority: repository-v6 (graph-owned)
+  Default ref: refs/heads/main
+  History: unborn (no synthetic commit)
+  Workspace: empty exact tree
+  Store size: 17.4 KiB under .kin/ (no Git object store here to compare against)
+```
+
+```sh
+cat > retry.py <<'PY'
+def backoff(attempt):
+    return min(2 ** attempt, 30)
+PY
+kin commit -m "Add the retry backoff"
+```
+
+```
+  starting the kin daemon for this repository; the first query after a start waits for it to load the graph
+  kin daemon ready in 1.8s
+Created semantic change f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f on branch 'refs/heads/main' (2 entities, 0 relations, 1 artifacts)
+Recorded in Kin authority, not in git. `git status` stays dirty until you run `kin eject` or push this branch to a Kin remote.
+```
+
+The first commit starts the repository's daemon. Before that, right after
+`kin init`, `kin status` reports durable authority alone and says so on its
+`Tree:` line; once the daemon is up, every `kin status` measures the working
+copy. Who made the change comes from your Git identity when you have one, and
+otherwise from `default_author` in `.kin/config.toml`. Kin refuses to record a
+change attributed to nobody.
+
+Branch, change the function on the branch, and commit there:
+
+```sh
+kin branch create cap-backoff
+kin branch switch cap-backoff
+```
+
+```
+Created refs/heads/cap-backoff at change f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f (authority generation 3)
+Switched to refs/heads/cap-backoff at change f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f (1 projected entries, authority generation 4)
+```
+
+```sh
+cat > retry.py <<'PY'
+def backoff(attempt):
+    """Exponential backoff, capped at a minute."""
+    return min(2 ** attempt, 60)
+PY
+kin status
+```
+
+```
+Kin repository-v6 status
+Head: symbolic refs/heads/cap-backoff
+Tree: 198609d9406becdd1fb97f1f3d16d8d869dc382c38823f2b88aa75f72d927029 (1 artifacts, ahead of its base change as admitted 0s ago)
+Refs: 2, default refs/heads/main
+Durable semantic enrichment: present (2 entities, 0 relations, 1 changes at authority generation 5, workspace generation 3; completion not attested)
+Untracked host content: none, measured 0s ago
+```
+
+```sh
+kin commit -m "Raise the backoff cap to a minute"
+```
+
+```
+Created semantic change 64cce9085641a7eee86bd2b870567ac524835e2e80488f7e5444f7cf9b42c065 on branch 'refs/heads/cap-backoff' (2 entities, 0 relations, 1 artifacts)
+```
+
+Back on `main`, record a second change so the merge has two real parents, then
+merge the branch:
+
+```sh
+kin branch switch main
+cat > retry_test.py <<'PY'
+from retry import backoff
+
+def test_first_attempt_waits_one_second():
+    assert backoff(0) == 1
+PY
+kin commit -m "Add a first backoff test"
+kin merge cap-backoff
+```
+
+```
+Switched to refs/heads/main at change f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f (1 projected entries, authority generation 7)
+Created semantic change 18abd82f3a295696fa4938fc078613c0abe4a3214dd6ec0eb81f8a7c1f747105 on branch 'refs/heads/main' (2 entities, 3 relations, 1 artifacts)
+Merged refs/heads/cap-backoff into refs/heads/main as change 4137af4647e6b838771d5e4ce98d8a604304b9d0a66fdb4e0931e828d6b75c9c (2 projected entries, authority generation 9)
+```
+
+The merge composed both sides by entity identity against their common base,
+with no line-level text merge, and published one change carrying both parents.
+`kin log` walks that history and `kin diff` shows what the merge brought in,
+as artifacts, as entities, and as lines:
+
+```sh
+kin log
+```
+
+```
+change 4137af4647e6b838771d5e4ce98d8a604304b9d0a66fdb4e0931e828d6b75c9c
+Author: Kin Demo <demo@example.com>
+Date:   2026-09-05T01:15:32.635348+00:00
+Origin: native
+Parents: 18abd82f3a295696fa4938fc078613c0abe4a3214dd6ec0eb81f8a7c1f747105 64cce9085641a7eee86bd2b870567ac524835e2e80488f7e5444f7cf9b42c065
+Deltas: entities=2 relations=0 tree=1 policy=false
+    Merge refs/heads/cap-backoff into refs/heads/main
+
+change 18abd82f3a295696fa4938fc078613c0abe4a3214dd6ec0eb81f8a7c1f747105
+Author: Kin Demo <demo@example.com>
+Date:   2026-09-05T01:15:32.339226+00:00
+Origin: native
+Parents: f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f
+Deltas: entities=2 relations=3 tree=1 policy=false
+    Add a first backoff test
+
+change 64cce9085641a7eee86bd2b870567ac524835e2e80488f7e5444f7cf9b42c065
+Author: Kin Demo <demo@example.com>
+Date:   2026-09-05T01:15:31.791709+00:00
+Origin: native
+Parents: f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f
+Deltas: entities=2 relations=0 tree=1 policy=false
+    Raise the backoff cap to a minute
+
+change f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f
+Author: Kin Demo <demo@example.com>
+Date:   2026-09-05T01:15:30.609174+00:00
+Origin: native
+Deltas: entities=2 relations=0 tree=1 policy=true
+    Add the retry backoff
+```
+
+```sh
+kin diff HEAD~1 HEAD
+```
+
+```
+Kin repository-v6 diff
+Base: HEAD~1 (e5aa80af2498ad1d8f8c5a756f24467773a7f12c46039395deb691a0e09ff0bc)
+Head: HEAD 4137af4647e6b838771d5e4ce98d8a604304b9d0a66fdb4e0931e828d6b75c9c (f86d6f68558a54372da1c08cedd8549dd98733110e3f2db6193dc8314ba10c11)
+Artifacts: +0 ~1 -0
+Entities: +0 ~2 -0
+Relations: +0 ~0 -0
+M  retry.py -> retry.py [aab37f62-f986-4543-8187-4af2b8984e0a] blob 0ceda974a82e648bf6e6d40efccc9489eb4b73fa5ab3f0c5cfd35df4911cd524 mode=100644 -> blob c0b44cec88f49e73cc31f7f439ec1b10d9d73cfe1c414dc539106886d4747cce mode=100644
+E~ 0a69467a-63d6-5c34-ac35-632cefde30b7 retry -> retry
+E~ 6cd876cf-cc8a-50bd-94be-e0a2fde3208d backoff -> backoff
+   @@ -1,2 +1,3 @@
+    def backoff(attempt):
+   -    return min(2 ** attempt, 30)
+   +    """Exponential backoff, capped at a minute."""
+   +    return min(2 ** attempt, 60)
+```
+
+`HEAD~1` is the merge's first parent, the test commit, so the diff is exactly
+what `cap-backoff` contributed: one artifact, the two entities in it (the
+module and the function), and the lines. `kin checkout`, `kin stash`,
+`kin rollback`, `kin blame`, and `kin conflicts` with `kin resolve` round out
+the set, and `kin capabilities` prints where each one stands.
+[The CLI reference](docs/cli-reference.md#branches-merges-and-exact-trees) has
+every flag.
+
+Sharing a native repository between machines is still in progress, and public
+repository connection through KinLab is not a first-run flow yet. What the
+transfer commands do today: `kin clone` takes a KinLab locator or the HTTP
+endpoint of another machine's running Kin daemon, adopts that repository's
+identity into a fresh local workspace, and remembers the origin it came from.
+`kin push` sends your new changes to that saved origin one verified pack at a
+time, and refuses rather than forces when the remote has moved past you.
+`kin pull` admits what the origin has that you do not and moves your working
+tree onto it, and when uncommitted work stops the tree from following, it says
+so and keeps the history it received. Each of the three is exercised between two
+Kin daemons over HTTP by the test suite.
+
 ## Works with your agent
 
 Kin ships its own agent, and it is the path we recommend for agent work. `kin
@@ -568,6 +756,7 @@ live at [kinlab.ai/blog](https://kinlab.ai/blog) with a feed at
 ## Learn and contribute
 
 - [Quickstart and advanced configuration](docs/quickstart.md)
+- [CLI reference: every command, with its flags and defaults](docs/cli-reference.md)
 - [Store size and what drives it](docs/store-size.md)
 - [MCP tool reference](docs/mcp-tools.md)
 - [Language support and what each tier extracts](docs/language-support.md)
