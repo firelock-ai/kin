@@ -4543,6 +4543,7 @@ pub(crate) mod test_clock {
 
 #[cfg(test)]
 mod tests {
+    mod first_publication;
     #[cfg(feature = "gcs")]
     use std::collections::HashMap;
     #[cfg(feature = "gcs")]
