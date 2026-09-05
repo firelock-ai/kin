@@ -109,6 +109,10 @@ struct IndexedFile {
     entities: Vec<Entity>,
     same_file_relations: Vec<Relation>,
     artifact_id: ArtifactId,
+    /// This file's real content digest, carried so the tree entry admitting the
+    /// artifact names the same bytes the index was given. `kin_model::Hash256`
+    /// is a re-export of `kin_blobs::Hash256`, so one value serves both.
+    blob_hash: Hash256,
 }
 
 fn index_files(caller_source: &str) -> Vec<IndexedFile> {
@@ -119,7 +123,9 @@ fn index_files(caller_source: &str) -> Vec<IndexedFile> {
             // The file's real content digest, per file, not a shared zero hash.
             // The daemon checks that the digest matches the bytes it indexed, so
             // a placeholder here is a fixture that stops resembling the product
-            // the moment that check tightens.
+            // the moment that check tightens. The same value goes into the tree
+            // entry below, so the fixture names one digest for one file's bytes
+            // rather than two unrelated stand-ins.
             let blob_hash = kin_blobs::digest(source.as_bytes());
             let indexed = pipeline
                 .index_file_content_with_tests(&FilePathId::new(path), source.as_bytes(), blob_hash)
@@ -135,6 +141,7 @@ fn index_files(caller_source: &str) -> Vec<IndexedFile> {
                 entities: indexed.entities,
                 same_file_relations: indexed.relations,
                 artifact_id: ArtifactId::new(),
+                blob_hash,
             }
         })
         .collect()
@@ -159,17 +166,16 @@ fn link(files: &[IndexedFile]) -> Vec<Relation> {
 fn graph_with(files: &[IndexedFile], linked: &[Relation]) -> InMemoryGraph {
     let graph = InMemoryGraph::new();
     for file in files {
-        let mut seed = [0u8; 32];
-        for (slot, byte) in seed.iter_mut().zip(file.parse.file_path.as_bytes()) {
-            *slot = *byte;
-        }
         graph
             .apply_transaction_delta(&TransactionDelta {
                 tree_deltas: vec![TreeDelta::Added {
                     artifact_id: file.artifact_id,
                     new: LocatedEntry::new(
                         RepoPath::from_utf8(&file.parse.file_path).expect("fixture path is utf-8"),
-                        TreeEntry::blob(Hash256::from_bytes(seed), false),
+                        // The file's own content digest, the same one the index
+                        // was given. It was the path bytes padded with zeros,
+                        // which is a value no blob store would ever hold.
+                        TreeEntry::blob(file.blob_hash, false),
                     ),
                 }],
                 ..TransactionDelta::default()
