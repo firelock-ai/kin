@@ -93,7 +93,7 @@ toml_edit = "0.25"
 tempfile = { workspace = true }
 unicode-normalization = "0.1"
 unicode-ident = "1"
-kin-spine = { version = "0.7.0", path = "../kin-spine" }
+kin-spine = { version = "0.7.1", path = "../kin-spine" }
 
 [dev-dependencies]
 kin-core = { workspace = true, features = ["test-support"] }
