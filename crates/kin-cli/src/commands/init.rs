@@ -544,6 +544,29 @@ fn first_embed_pass_standing(
     if embed.embeddings_pending == 0 {
         return FirstEmbedPassStanding::Settled;
     }
+    // A machine that has not got the model yet cannot index anything until
+    // several hundred megabytes have arrived, and holding `kin init` for that
+    // helps nobody: the fetch continues in the daemon the next command starts,
+    // and the pass begins there.
+    //
+    // This arm is not a nicety, it is the whole cost of this wait on a cold
+    // machine. Without it the first version of this change turned four kin CI
+    // tests red on 2026-09-05: the shard log carries eight of this wait's own
+    // `first embedding pass: 0 of 18 indexed` lines, which is the full budget
+    // with the counter never moving, and the runner then killed the daemon this
+    // command was holding open for it.
+    //
+    // `no_fetch_reason` is checked because it is what says a fetch applies at
+    // all. A remote embedding provider and a model id that already names a
+    // local directory both report `present: false` and owe no download, and
+    // treating those as a missing model would refuse to wait on exactly the
+    // stores where the pass runs fine.
+    if !embed.model_fetch.present && embed.model_fetch.no_fetch_reason.is_none() {
+        return FirstEmbedPassStanding::Stalled(
+            "the embedding model is not on this machine yet, so this pass cannot index anything \
+             until that fetch finishes; it continues in the daemon your next command starts",
+        );
+    }
     FirstEmbedPassStanding::Filling
 }
 
@@ -2054,6 +2077,10 @@ mod tests {
             embeddings_indexed: 12,
             embeddings_pending: 80,
             embeddings_total: 92,
+            model_fetch: crate::embed_model::EmbedModelFetch {
+                present: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(
@@ -2116,6 +2143,10 @@ mod tests {
                             embeddings_indexed: *seen * 10,
                             embeddings_pending: 40 - *seen * 10,
                             embeddings_total: 40,
+                            model_fetch: crate::embed_model::EmbedModelFetch {
+                                present: true,
+                                ..Default::default()
+                            },
                             ..Default::default()
                         }
                     } else {
@@ -2162,6 +2193,10 @@ mod tests {
                     embeddings_pending: 33,
                     embeddings_total: 40,
                     embedding_work_busy: true,
+                    model_fetch: crate::embed_model::EmbedModelFetch {
+                        present: true,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 })
             },
@@ -2207,6 +2242,10 @@ mod tests {
                     embeddings_pending: 40,
                     embeddings_total: 40,
                     embedding_work_busy: false,
+                    model_fetch: crate::embed_model::EmbedModelFetch {
+                        present: true,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 })
             },
@@ -2218,14 +2257,22 @@ mod tests {
         }
     }
 
-    /// The control for the arm above: the same shape with the model still
-    /// arriving is a pass, and must NOT be cut off.
+    /// A machine that has not got the model yet is not waited on at all.
     ///
-    /// Without this, a stall guard that fired on any zero-progress reading
-    /// would look correct and would abandon every first `kin init` on a machine
-    /// that has to download the 522 MiB model before it can index anything.
+    /// This is the arm that decides what this whole change costs a cold
+    /// machine, and the first version got it backwards: it treated a download
+    /// in progress as progress, so `kin init` held its daemon for the full
+    /// budget while the counter stayed at zero. Four kin CI tests went red on
+    /// 2026-09-05 with `init must succeed` and a killed daemon, and the shard
+    /// log carries eight of this wait's own `0 of 18 indexed` lines above them.
+    ///
+    /// The wait must return on the FIRST reading here, which is why the elapsed
+    /// clock is asserted as well as the outcome: a version that stalled only
+    /// after the twenty-second window would still hold a cold `kin init` for
+    /// twenty seconds it has no reason to take.
     #[tokio::test(start_paused = true)]
-    async fn a_queue_waiting_on_the_model_download_is_still_a_pass() {
+    async fn a_machine_that_has_not_fetched_the_model_is_not_waited_on() {
+        let began = tokio::time::Instant::now();
         let outcome = settle_first_embed_pass_within(
             std::time::Duration::from_secs(120),
             std::time::Duration::from_secs(2),
@@ -2235,8 +2282,9 @@ mod tests {
                     embeddings_indexed: 0,
                     embeddings_pending: 40,
                     embeddings_total: 40,
-                    embedding_work_busy: false,
+                    embedding_work_busy: true,
                     model_fetch: crate::embed_model::EmbedModelFetch {
+                        present: false,
                         fetching: true,
                         fetched_bytes: 1,
                         ..Default::default()
@@ -2246,10 +2294,49 @@ mod tests {
             },
         )
         .await;
+        match &outcome {
+            FirstEmbedPassOutcome::Stalled { reason, .. } => assert!(
+                reason.contains("not on this machine yet"),
+                "the reader has to learn the model is what is missing: {reason}"
+            ),
+            other => panic!("a machine with no model must not be waited on: {other:?}"),
+        }
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(2),
+            "and it must not be waited on for even one poll: {:?}",
+            began.elapsed()
+        );
+    }
+
+    /// The control for the arm above: the same shape with the model in place is
+    /// a pass, and must be waited on.
+    ///
+    /// Without this control the model arm would pass over a wait that refused
+    /// every store, which is the same defect from the other side.
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_on_a_machine_that_has_the_model_is_still_a_pass() {
+        let outcome = settle_first_embed_pass_within(
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(20),
+            || async {
+                Some(crate::commands::resources::EmbedRuntimeState {
+                    embeddings_indexed: 0,
+                    embeddings_pending: 40,
+                    embeddings_total: 40,
+                    embedding_work_busy: true,
+                    model_fetch: crate::embed_model::EmbedModelFetch {
+                        present: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            },
+        )
+        .await;
         assert!(
             matches!(outcome, FirstEmbedPassOutcome::BudgetSpent { .. }),
-            "a download in progress is progress; this wait must run to its budget, not stall: \
-             {outcome:?}"
+            "a pass with its model in place and the embed mutex held is a pass: {outcome:?}"
         );
     }
 
