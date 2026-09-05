@@ -489,6 +489,15 @@ impl ProjectionAuthorityCache {
         lock_recover(&self.writer).is_some()
     }
 
+    /// Cold the admission values slot, which [`Self::invalidate`] leaves alone.
+    /// A test whose act must pay the admission pair's own open, and so install
+    /// the writer that open serves, takes this first; a slot a reader warmed at
+    /// the current label would otherwise satisfy the act and install nothing.
+    #[cfg(test)]
+    pub(crate) fn forget_admission(&self) {
+        *lock_recover(&self.admission) = None;
+    }
+
     fn invalidate(&self) {
         *lock_recover(&self.held) = None;
         *lock_recover(&self.query) = None;
@@ -38864,22 +38873,36 @@ mod tests {
             response.report.unwrap().outcome,
             kin_cli::commands::merge::MergeOutcome::Conflicted
         ));
-        assert!(
-            cached_authority_has_open_merge(&state).unwrap(),
-            "the fixture must hold a durable open merge"
-        );
+        // Nothing reads the admission pair between here and the act. A reader
+        // here would install the pair at the current label, the tick would then
+        // take the pair from the slot and install no writer, and the guard would
+        // have nothing to forget: a deleted guard passed this test exactly that
+        // way. The slot is colded outright, since a commit and a merge ran above,
+        // and the open the act pays is asserted as the proof that it installed.
+        state.projection_authority.forget_admission();
         std::fs::write(&path, b"services:\n  api:\n    image: hand-authored\n").unwrap();
         let observation =
             std::iter::once(RepoPath::from_utf8("selected/compose.yaml").unwrap()).collect();
+        let opens_before = kin_core::authority_opens();
         let yielded = crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap();
         assert!(
             yielded,
             "the tick must yield to the open merge, or this proves nothing"
         );
+        assert_eq!(
+            kin_core::authority_opens() - opens_before,
+            1,
+            "the tick's pair read must be the one open that installs the writer, or the guard \
+             below is untested"
+        );
         assert!(
             !state.projection_authority.holds_writer(),
             "a tick that yielded to an open merge must not keep the manager its admission pair \
              installed"
+        );
+        assert!(
+            cached_authority_has_open_merge(&state).unwrap(),
+            "the fixture must hold a durable open merge"
         );
         drop(app);
     }
@@ -44155,6 +44178,12 @@ mod tests {
     /// follow; when nothing moved, no publication follows and no drop runs, so
     /// the tick's own scope has to forget it. The yield-to-open-merge and
     /// yield-to-commit returns share this scope.
+    ///
+    /// The publication above this tick re-installs the admission values at the
+    /// label it produced, so a second tick would read the pair from the slot and
+    /// install no writer, and a deleted guard passed this test exactly that way.
+    /// The slot is colded first, and the one open the tick then pays is asserted
+    /// as the proof that it installed.
     #[cfg(unix)]
     #[test]
     fn a_publishing_tick_that_moves_nothing_holds_nothing_after() {
@@ -44171,15 +44200,18 @@ mod tests {
         assert!(!state.projection_authority.holds_writer());
         // The same bytes again: the tick plans, finds nothing to move, and
         // returns before any publication.
+        state.projection_authority.forget_admission();
         let opens_before = kin_core::authority_opens();
         assert!(!crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
+        assert_eq!(
+            kin_core::authority_opens() - opens_before,
+            1,
+            "the tick's pair read must be the one open that installs the writer, or the guard \
+             below is untested"
+        );
         assert!(
             !state.projection_authority.holds_writer(),
             "a tick that published nothing must not keep the manager its admission pair opened"
-        );
-        assert!(
-            kin_core::authority_opens() - opens_before <= 1,
-            "a no-op tick costs at most the admission pair's own open"
         );
     }
 
