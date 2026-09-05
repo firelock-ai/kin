@@ -29,10 +29,6 @@ use kin_model::{
     TransactionDelta, TreeDelta, TreeEntry,
 };
 
-fn zero() -> Hash256 {
-    Hash256::from_bytes([0; 32])
-}
-
 /// Admit `path` into the repository tree.
 ///
 /// `apply_to_graph` refuses semantic enrichment for a path repository authority
@@ -85,7 +81,11 @@ fn ingest_batch(graph: &InMemoryGraph, path: &str, source: &str) {
     let pipeline = IndexPipeline::new();
     let file_id = FilePathId::new(path.to_string());
     let indexed = pipeline
-        .index_file_content_with_tests(&file_id, source.as_bytes(), zero())
+        .index_file_content_with_tests(
+            &file_id,
+            source.as_bytes(),
+            kin_blobs::digest(source.as_bytes()),
+        )
         .expect("indexing succeeds")
         .indexed_file;
     admit(graph, &indexed.file_id.0);

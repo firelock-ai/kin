@@ -78,6 +78,7 @@ fn run_kin_without_enrichment(
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_EMBED_BACKEND", "cpu")
         .current_dir(repo)
         .output()
         .expect("run kin")
@@ -1685,28 +1686,11 @@ fn entity_named(state: &kin_model::graph::ResolvedGraphState, name: &str) -> kin
     found.pop().expect("checked immediately above")
 }
 
-/// An entity NEITHER branch edited still differs between the branches, and the
-/// measurement says on which field.
-///
-/// Measured rather than assumed, and the measurement corrected the guess that
-/// produced it. `beta` is untouched by both sides, so provenance looked like the
-/// likely difference; `created_in` is in fact EQUAL, because nothing re-minted
-/// the record. The one field that differs is `span`, and the reason is that the
-/// two edits to `alpha` above it are different LENGTHS, so every byte offset
-/// below shifts by a different amount on each side.
-///
-/// That is why one changed function reports three entity conflicts here and
-/// nine in the rc062j stranger run. A byte offset is a projection of whichever
-/// bytes the merge publishes, not an independent decision, so the operator is
-/// being asked a question whose answer is already determined by another answer.
-/// Removing that question is the derived-conflict design, which is FIR-2960 and
-/// not this change: this test records the premise, and the count it explains.
-///
-/// The assertion is an equality against the exact measured set rather than a
-/// subset check, so an entity that starts differing on a SEMANTIC field fails
-/// here rather than being quietly folded into the same explanation.
+/// Different-length edits to `alpha` shift the untouched `beta` span and change
+/// the complete source blob on each branch. Both digests must bind their exact
+/// admitted trees. Every other metadata and entity field must remain equal.
 #[test]
-fn an_untouched_entity_differs_between_branches_only_in_its_span() {
+fn an_untouched_entity_differs_between_branches_only_in_its_span_and_source_digest() {
     let root = tempdir().expect("temp root");
     let repo = container_settle_repository(root.path());
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
@@ -1717,12 +1701,35 @@ fn an_untouched_entity_differs_between_branches_only_in_its_span() {
     let ours = graph_at(&layout, &branch_change(&layout, "main"));
     let theirs = graph_at(&layout, &branch_change(&layout, "feature"));
 
-    let untouched =
-        entity_field_differences(&entity_named(&ours, "beta"), &entity_named(&theirs, "beta"));
+    let mut ours_beta = entity_named(&ours, "beta");
+    let mut theirs_beta = entity_named(&theirs, "beta");
+    for (state, entity) in [(&ours, &ours_beta), (&theirs, &theirs_beta)] {
+        let span = entity.span.as_ref().expect("untouched function has a span");
+        let artifact = state
+            .tree
+            .artifact_at_path(&kin_model::RepoPath::from_utf8(&span.file.0).unwrap())
+            .expect("span source belongs to the exact branch tree");
+        let digest = artifact.entry.blob_identity().expect("source is a blob");
+        assert_eq!(
+            entity.metadata.extra.get("blob_hash"),
+            Some(&Value::String(digest.to_string())),
+            "untouched entity must bind the exact source blob in its branch tree"
+        );
+    }
+    assert_eq!(
+        entity_field_differences(&ours_beta, &theirs_beta),
+        vec!["span", "metadata"],
+        "different branch source bytes must change both the span and its provenance"
+    );
+    // Remove only the independently verified source digest before comparing.
+    // Every other metadata field remains part of the strict entity comparison.
+    ours_beta.metadata.extra.remove("blob_hash");
+    theirs_beta.metadata.extra.remove("blob_hash");
+    let untouched = entity_field_differences(&ours_beta, &theirs_beta);
     assert_eq!(
         untouched,
         vec!["span"],
-        "an entity neither side edited differs only in its byte offsets; it actually differed on {untouched:?}"
+        "apart from its exact source digest, an untouched entity differs only in its byte offsets; it actually differed on {untouched:?}"
     );
 
     // The control that keeps the reading honest: the entity both sides DID edit

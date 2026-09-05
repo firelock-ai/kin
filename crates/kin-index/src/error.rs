@@ -20,6 +20,13 @@ pub enum IndexError {
         source: std::io::Error,
     },
 
+    #[error("source bytes for {path} have digest {actual}, not supplied blob digest {expected}")]
+    SourceDigestMismatch {
+        path: String,
+        expected: kin_blobs::Hash256,
+        actual: kin_blobs::Hash256,
+    },
+
     #[error("unsupported file: {0}")]
     UnsupportedFile(String),
 

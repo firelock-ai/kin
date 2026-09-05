@@ -90,7 +90,7 @@ fn parse(path: &str, source: &str) -> (FileParseData, Vec<Entity>) {
         .index_file_content_with_tests(
             &FilePathId::new(path),
             source.as_bytes(),
-            kin_blobs::Hash256::from_bytes([5; 32]),
+            kin_blobs::digest(source.as_bytes()),
         )
         .unwrap_or_else(|error| panic!("indexing {path} failed: {error}"))
         .indexed_file;

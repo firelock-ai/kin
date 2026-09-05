@@ -112,7 +112,6 @@ struct IndexedFixtureFile {
 
 fn index_files(fixture: &Fixture) -> Vec<IndexedFixtureFile> {
     let pipeline = IndexPipeline::new();
-    let blob_hash = kin_blobs::Hash256::from_bytes([0u8; 32]);
     [
         (fixture.defs_path, fixture.defs_source),
         (fixture.caller_path, fixture.caller_source),
@@ -120,7 +119,11 @@ fn index_files(fixture: &Fixture) -> Vec<IndexedFixtureFile> {
     .into_iter()
     .map(|(path, source)| {
         let indexed = pipeline
-            .index_file_content_with_tests(&FilePathId::new(path), source.as_bytes(), blob_hash)
+            .index_file_content_with_tests(
+                &FilePathId::new(path),
+                source.as_bytes(),
+                kin_blobs::digest(source.as_bytes()),
+            )
             .unwrap_or_else(|error| panic!("{} index {path}: {error}", fixture.language))
             .indexed_file;
         IndexedFixtureFile {
