@@ -1562,6 +1562,12 @@ fn prior_bound(payload: &Value) -> Option<usize> {
 /// is the one that holds.
 fn disclose_residual(payload: &mut Value, budget: &ResponseBudget) {
     let max_chars = budget.max_chars;
+    // What survives the ladder, measured before this note lands on it. Every
+    // list is already at its one-entry floor and every sheddable field is
+    // gone, so this is a lower bound on what the whole answer needs, and
+    // when even it exceeds the largest budget this server builds, the clause
+    // below says so instead of pointing at `max_chars`.
+    let needed = measure(payload);
     let entry = json!({
         "component": "response_budget",
         "reason": OVER_BUDGET_REASON,
@@ -1575,7 +1581,7 @@ fn disclose_residual(payload: &mut Value, budget: &ResponseBudget) {
             crate::remediation::response_budget_clause(
                 "max_chars",
                 max_chars + budget.envelope_reserve,
-                None,
+                Some(needed),
             )
         ),
         "max_chars": max_chars,
@@ -3431,6 +3437,88 @@ mod tests {
                 "max_chars is already at the {RESPONSE_MAX_MAX_CHARS} this server will build"
             )),
             "a caller at the ceiling must be told the knob is spent: {remediation}"
+        );
+    }
+
+    /// The residual note, over the ceiling. Every list is at its one-entry
+    /// floor and the response still measures more than the largest budget this
+    /// server builds, so the note must not send the caller to `max_chars`.
+    ///
+    /// Row 4 of the inventory: the note used to append the shipped "or raise
+    /// max_chars, up to the 60000" without measuring, in exactly the state where
+    /// the answer could not be cut to fit.
+    #[test]
+    fn a_residual_over_the_ceiling_is_not_told_to_raise_max_chars() {
+        let mut row = impact_row(0);
+        row["name"] = json!("x".repeat(RESPONSE_MAX_MAX_CHARS + 10_000));
+        let mut payload = json!({
+            "affected_callers": [row],
+            "entity_impacts": [{ "entity_id": "9b9f577c-2cb3-43fd-a59b-ced5821a4887", "consumer_count": 1 }],
+        });
+        let budget = ResponseBudget {
+            max_chars: 18_000,
+            compact: true,
+            explicit_max_chars: true,
+            envelope_reserve: 0,
+        };
+        let accounting = enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
+        assert!(
+            accounting.chars_after > RESPONSE_MAX_MAX_CHARS,
+            "the fixture's one-entry floor must exceed the ceiling: {}",
+            accounting.chars_after
+        );
+        let residual = payload["degradations"]
+            .as_array()
+            .expect("a response still over its ceiling says so")
+            .iter()
+            .find(|entry| entry["reason"] == json!(OVER_BUDGET_REASON))
+            .cloned()
+            .expect("the residual note");
+        let remediation = residual["remediation"].as_str().unwrap_or_default();
+        assert!(
+            !remediation.contains("or raise max_chars"),
+            "a residual no budget can carry still points at the knob: {remediation}"
+        );
+        assert!(
+            remediation.contains("no budget this call accepts returns them"),
+            "a residual over the ceiling must say so: {remediation}"
+        );
+        assert!(
+            remediation.contains("narrow the request"),
+            "and still hand over the alternative: {remediation}"
+        );
+    }
+
+    /// The control for the residual note: twelve lists at their floor do not
+    /// fit 2,000 characters but fit under the ceiling with room to spare, so a
+    /// larger budget really would carry them and the note still says to raise it.
+    #[test]
+    fn a_residual_under_the_ceiling_is_still_told_to_raise_max_chars() {
+        let mut payload = impact_payload_bulk_outside_the_buckets(60);
+        let budget = ResponseBudget {
+            max_chars: RESPONSE_MIN_MAX_CHARS,
+            ..ResponseBudget::default()
+        };
+        let accounting = enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
+        assert!(
+            accounting.chars_after > budget.max_chars
+                && accounting.chars_after <= RESPONSE_MAX_MAX_CHARS,
+            "the fixture must overflow its floor budget and fit under the ceiling: {}",
+            accounting.chars_after
+        );
+        let residual = payload["degradations"]
+            .as_array()
+            .expect("a response still over its ceiling says so")
+            .iter()
+            .find(|entry| entry["reason"] == json!(OVER_BUDGET_REASON))
+            .cloned()
+            .expect("the residual note");
+        let remediation = residual["remediation"].as_str().unwrap_or_default();
+        assert!(
+            remediation.contains(&format!(
+                "or raise max_chars, up to the {RESPONSE_MAX_MAX_CHARS} this server will build"
+            )),
+            "a residual a larger budget carries must still be told to raise it: {remediation}"
         );
     }
 

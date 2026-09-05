@@ -774,7 +774,7 @@ fn registered_tools() -> ToolsListResult {
                         "to": { "type": "string", "description": "Target end, in the same forms." },
                         "from_file": { "type": "string", "description": "Pin `from` to the entity of that name in the file this path or path suffix names. Same request as the name@file spelling." },
                         "to_file": { "type": "string", "description": "Pin `to` the same way." },
-                        "max_depth": { "type": "integer", "description": "Hops walked between the two ends (default 6, ceiling 12). Containment hops joining a class to its members are not counted.", "default": 6, "minimum": 1, "maximum": 12 },
+                        "max_depth": { "type": "integer", "description": "Hops walked between the two ends (default 6, ceiling 12). Containment hops joining a class to its members are not counted.", "default": 6, "minimum": 1, "maximum": crate::remediation::PATH_MAX_MAX_DEPTH },
                         "limit": { "type": "integer", "description": "Routes returned, shortest first (default 3, ceiling 25). `routes_total` says how many shortest routes exist.", "default": 3, "minimum": 1, "maximum": 25 },
                         "direction": {
                             "type": "string",
@@ -1939,6 +1939,32 @@ mod tests {
                 crate::remediation::TRACE_MAX_LIMIT_PER_STEP
             )),
             "the description names a different cap from the one enforced: {description}"
+        );
+    }
+
+    /// The same pin for `trace_path`'s `max_depth`, which the gap quotes as
+    /// "ceiling 12" and the handler clamps to.
+    #[test]
+    fn the_path_depth_ceiling_the_schema_declares_is_the_one_the_gap_quotes() {
+        let tools = tool_definitions();
+        let path = tools
+            .tools
+            .iter()
+            .find(|tool| tool.name == crate::handlers::path::TOOL_NAME)
+            .expect("trace_path is registered");
+        let property = &path.input_schema["properties"]["max_depth"];
+        assert_eq!(
+            property["maximum"].as_u64(),
+            Some(crate::remediation::PATH_MAX_MAX_DEPTH as u64),
+            "the schema ceiling and the gap's ceiling have drifted apart: {property}"
+        );
+        let description = property["description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains(&format!(
+                "ceiling {}",
+                crate::remediation::PATH_MAX_MAX_DEPTH
+            )),
+            "the description names a different ceiling from the one enforced: {description}"
         );
     }
 

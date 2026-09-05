@@ -36,6 +36,14 @@ use crate::budget::RESPONSE_MAX_MAX_CHARS;
 /// [`spine_clipped`] first recommended a value past it.
 pub const TRACE_MAX_LIMIT_PER_STEP: usize = 25;
 
+/// The largest `max_depth` a `trace_path` call accepts.
+///
+/// Read by the MCP schema (`crate::tools`), by the handler's clamp
+/// (`crate::handlers::path`) and by [`raise_bounded_knob`]'s caller there, for
+/// the same reason as the constant above: the number the gap quotes and the
+/// number the call refuses past were two literals in two files.
+pub const PATH_MAX_MAX_DEPTH: usize = 12;
+
 /// Advice for one bounded integer knob, or the reason raising it cannot help.
 ///
 /// `in_force` is the value that produced this answer and `ceiling` is the
@@ -96,8 +104,11 @@ pub fn spine_clipped(
 /// caller's point of view: the number they passed, or the published default that
 /// the envelope reserve was taken out of. `needed` is what the answer measures
 /// with every diagnostic, roll-up and inline body the ladder can shed already
-/// gone and every entry still present, or `None` where no entry was at risk and
-/// the question does not arise.
+/// gone: with every entry still present on the ladder's own disclosure, or
+/// cut to the one-entry floor and still over budget on the residual one. Both
+/// are lower bounds on what the whole answer needs, which is what makes the
+/// sentence safe. `None` where no entry was at risk and the question does not
+/// arise.
 ///
 /// A `needed` over the ceiling is the case the stranger hit twice. It is a
 /// measured lower bound rather than an estimate, so the sentence it produces is
@@ -107,9 +118,9 @@ pub fn response_budget_clause(param: &str, in_force: usize, needed: Option<usize
         if needed > RESPONSE_MAX_MAX_CHARS {
             return format!(
                 "raising {param} cannot reach the withheld entries: with every diagnostic, \
-                 roll-up and inline body this budget can shed already dropped, they measure \
-                 {needed} characters against the {RESPONSE_MAX_MAX_CHARS} this server will \
-                 build, so no budget this call accepts returns them"
+                 roll-up and inline body this budget can shed already dropped, the answer \
+                 still measures {needed} characters against the {RESPONSE_MAX_MAX_CHARS} this \
+                 server will build, so no budget this call accepts returns them"
             );
         }
     }

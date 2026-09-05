@@ -65,7 +65,8 @@ stopped the walk and how much of the graph it explored, and the same-name twin c
 each end, so read `_kin.verdict` before concluding that A never reaches B.";
 
 const DEFAULT_MAX_DEPTH: usize = 6;
-const MAX_MAX_DEPTH: usize = 12;
+// The one number the schema declares and the gap's advice quotes.
+const MAX_MAX_DEPTH: usize = crate::remediation::PATH_MAX_MAX_DEPTH;
 const DEFAULT_LIMIT: usize = 3;
 const MAX_LIMIT: usize = 25;
 /// Relations examined before the walk stops regardless of the clock, so a
