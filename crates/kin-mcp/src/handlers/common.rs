@@ -1857,7 +1857,7 @@ fn committed_introducing_change<G: GraphStore>(
 ///
 /// `None` means the entity carries no such stamp, which is an ordinary state and
 /// must never be escalated into a read failure.
-fn recorded_span_source_digest(entity: &Entity) -> Option<kin_blobs::Hash256> {
+pub(crate) fn recorded_span_source_digest(entity: &Entity) -> Option<kin_blobs::Hash256> {
     let serde_json::Value::String(hex) = entity.metadata.extra.get("blob_hash")? else {
         return None;
     };
