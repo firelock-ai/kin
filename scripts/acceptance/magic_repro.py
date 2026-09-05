@@ -219,30 +219,40 @@ class Suite(object):
                 path = os.path.join(self.workdir,
                                     "%s-%s-%d" % (name, self.run_id, attempt))
             os.makedirs(path)
-            getattr(self, "_build_" + name)(path)
             self.fixtures[name] = path
+            getattr(self, "_build_" + name)(path)
         return self.fixtures[name]
 
     def shutdown(self):
-        """Stop the per-fixture daemons this run started.
-
-        Each fixture is a fresh repository, so its daemon has nothing to serve
-        once the run ends; leaving them alive leaks one process per fixture per
-        run and holds the fixture's files against removal.
-        """
-        stopped = []
+        """Ask the product to stop and retire each fixture's current worker."""
+        res = Result("cleanup", "CLEANUP", "fixture workers stopped and endpoints retired")
+        if not self.fixtures:
+            res.ok("no fixtures were created")
         for path in self.fixtures.values():
-            pid_file = os.path.join(path, ".kin", "daemon.pid")
-            if not os.path.exists(pid_file):
+            # Without this boundary, repo discovery could select a parent repo.
+            if not os.path.isfile(os.path.join(path, ".kin", "manifest.json")):
+                res.bad("%s: fixture manifest missing; stop was not attempted" % path)
                 continue
             try:
-                with open(pid_file) as handle:
-                    pid = int(handle.read().strip())
-                os.kill(pid, 15)
-                stopped.append(pid)
-            except (ValueError, OSError):
-                continue
-        return stopped
+                rc, out, err = self.kin_run(["daemon", "stop", "--json"], path, timeout=60)
+                report = json.loads(out) if rc == 0 else {}
+                stopped = report.get("stopped") if isinstance(report, dict) else None
+                succeeded = (rc == 0 and isinstance(stopped, list)
+                             and report.get("schema") == "kin.daemon-stop.v1"
+                             and report.get("scope") == "current-repo"
+                             and report.get("all_stopped") is True
+                             and report.get("endpoints_retired", not stopped) is True
+                             and all(isinstance(row, dict)
+                                     and row.get("result") in ("stopped", "not-running")
+                                     and "preserved_endpoint" not in row for row in stopped))
+                detail = "%s: kin daemon stop --json rc=%s; %s %s" % (path, rc, out.strip(), err.strip())
+                if succeeded:
+                    res.ok(detail)
+                else:
+                    res.bad(detail)
+            except Exception as exc:
+                res.bad("%s: cooperative stop failed: %s: %s" % (path, type(exc).__name__, exc))
+        return res
 
     def _write(self, repo, rel, text):
         full = os.path.join(repo, rel)
@@ -3910,44 +3920,50 @@ def main(argv):
             print("kin-magic-repro: tips file unreadable (%s): %s" % (opts.tips, exc))
 
     results = []
-    for check_id, fn in CHECKS:
-        if wanted and check_id not in wanted:
-            continue
-        try:
-            res = fn(suite)
-        except Exception as exc:
-            res = Result(check_id, "?", "harness failure")
-            res.unknown("%s: %s" % (type(exc).__name__, str(exc)[:200]))
-        # A check that falls off the end returns None, which is legal Python and
-        # survives every syntax check, then dies four lines down dereferencing
-        # `res.id` with an AttributeError that names neither the check nor the
-        # cause. It happened here: a conflict resolution truncated one check's
-        # tail, the file still parsed, and the suite crashed after fourteen
-        # green checks. Name it as this check's own UNREADABLE instead, so the
-        # run reports which check is broken and still grades the rest.
-        if res is None:
-            res = Result(check_id, "?", "harness failure")
-            res.unknown("check %s returned no Result, so it falls off the end of its "
-                        "own body; a check that returns None cannot be graded"
-                        % check_id)
-        results.append(res)
-        res.prior = None if prior is None else prior.get(res.id)
-        res.trend = trend_of(res.status, res.prior)
-        marker = res.status
-        if res.trend == "regression":
-            marker = "%s REGRESSION-from-%s-in-%s" % (res.status, res.prior, prior_label)
-        elif res.trend == "fixed":
-            marker = "%s fixed-since-%s" % (res.status, prior_label)
-        elif res.trend == "unknown":
-            marker = "%s trend-unknown" % res.status
-        print("CHECK %s %s %s %s" % (res.id, res.ticket, marker, res.detail))
-        if opts.verbose:
-            for a in res.asserts:
-                print("      %-11s %s" % (a["status"], a["detail"]))
+    try:
+        for check_id, fn in CHECKS:
+            if wanted and check_id not in wanted:
+                continue
+            try:
+                res = fn(suite)
+            except Exception as exc:
+                res = Result(check_id, "?", "harness failure")
+                res.unknown("%s: %s" % (type(exc).__name__, str(exc)[:200]))
+            # A check that falls off the end returns None, which is legal Python and
+            # survives every syntax check, then dies four lines down dereferencing
+            # `res.id` with an AttributeError that names neither the check nor the
+            # cause. It happened here: a conflict resolution truncated one check's
+            # tail, the file still parsed, and the suite crashed after fourteen
+            # green checks. Name it as this check's own UNREADABLE instead, so the
+            # run reports which check is broken and still grades the rest.
+            if res is None:
+                res = Result(check_id, "?", "harness failure")
+                res.unknown("check %s returned no Result, so it falls off the end of its "
+                            "own body; a check that returns None cannot be graded"
+                            % check_id)
+            results.append(res)
+            res.prior = None if prior is None else prior.get(res.id)
+            res.trend = trend_of(res.status, res.prior)
+            marker = res.status
+            if res.trend == "regression":
+                marker = "%s REGRESSION-from-%s-in-%s" % (res.status, res.prior, prior_label)
+            elif res.trend == "fixed":
+                marker = "%s fixed-since-%s" % (res.status, prior_label)
+            elif res.trend == "unknown":
+                marker = "%s trend-unknown" % res.status
+            print("CHECK %s %s %s %s" % (res.id, res.ticket, marker, res.detail))
+            if opts.verbose:
+                for a in res.asserts:
+                    print("      %-11s %s" % (a["status"], a["detail"]))
 
-    stopped = suite.shutdown()
-    if stopped:
-        print("kin-magic-repro: stopped %d fixture daemon(s)" % len(stopped))
+    finally:
+        cleanup = suite.shutdown()
+        if not results:
+            selection = Result("selection", "HARNESS", "no acceptance check ran")
+            selection.bad("the check selection produced no results")
+            results.append(selection)
+        results.append(cleanup)
+        print("CHECK %s %s %s %s" % (cleanup.id, cleanup.ticket, cleanup.status, cleanup.detail))
 
     failed = [r for r in results if r.status == FAIL]
     unread = [r for r in results if r.status == UNREADABLE]
@@ -3971,8 +3987,10 @@ def main(argv):
                       handle, indent=2)
         print("kin-magic-repro: json %s" % opts.json_out)
 
-    if not opts.keep and not opts.workdir:
+    if cleanup.status == PASS and not opts.keep and not opts.workdir:
         shutil.rmtree(workdir, ignore_errors=True)
+    elif cleanup.status != PASS:
+        print("kin-magic-repro: cleanup failed; run root kept at %s" % workdir)
 
     if failed:
         return 1
