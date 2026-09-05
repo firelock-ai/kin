@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! `GET /repos/{repo_id}/compare` — what changed between two refs, from the graph.
+//! `GET /repos/{repo_id}/compare`: what changed between two refs, from the graph.
 //!
 //! The daemon could answer for one file's bytes and for one ref's whole tree. It
 //! could not answer the question a reader asks before either: what is different
@@ -170,7 +170,7 @@ pub struct RepoCompareResponse {
     pub conflicts: Vec<serde_json::Value>,
 }
 
-/// GET /repos/{repo_id}/compare — the changed-file list and the distance.
+/// GET /repos/{repo_id}/compare, answering the changed-file list and the distance.
 pub async fn repo_compare(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
@@ -347,6 +347,13 @@ where
     // walked has already been struck, so a second visit could add nothing.
     // Starting at parents rather than at the candidates themselves is what
     // keeps a candidate from striking itself.
+    //
+    // This walk carries no budget of its own and does not need one, but the
+    // reason lives in `ancestors` rather than here: every candidate is a member
+    // of both ancestor sets, and `ancestors` records a change before queueing
+    // its parents, so everything reachable from a candidate's parents is
+    // already inside a set the budget bounded. A change to how `ancestors`
+    // enumerates would make this loop unbounded, and nothing here would say so.
     let mut superseded = std::collections::HashSet::new();
     let mut walked = std::collections::HashSet::new();
     let mut queue = Vec::new();
@@ -556,9 +563,9 @@ mod tests {
 
     #[test]
     fn two_identical_tips_are_zero_apart_and_their_own_merge_base() {
-        // Zero and zero is the truthful answer here, and only here. It is the
-        // reading a fabricated compare used to give for reads that never
-        // happened, so the case that legitimately produces it is pinned.
+        // Zero and zero is the truthful answer here, and only here. It is also
+        // the answer a comparison that never ran would give, so the one shape
+        // a correct route and a broken one share is pinned by a test.
         let mut parents = dag(&[(2, &[1]), (1, &[])]);
         let distance = measure_distance_with(&id(2), &id(2), &mut parents).unwrap();
         assert_eq!(distance.merge_base, id(2));
