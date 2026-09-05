@@ -45445,6 +45445,13 @@ mod tests {
     /// The hosted fixture publishes this many repositories, which is also how
     /// many source cursor probes one bundle observation issues at once.
     const HOSTED_FIXTURE_FLEET_SIZE: usize = 5;
+    /// The one published cross-repo relationship this fixture's fleet carries.
+    /// The importing repo's graph references the imported repo's symbol, so the
+    /// rollout's edge phase resolves it and a read of `/spine/edges` over this
+    /// fixture has something to be non-empty about.
+    const HOSTED_FIXTURE_IMPORTING_REPO: &str = "kin-db";
+    const HOSTED_FIXTURE_IMPORTED_REPO: &str = "kin";
+    const HOSTED_FIXTURE_IMPORTED_SYMBOL: &str = "kin_entity";
 
     fn hosted_test_state_over(
         spine_store: Arc<dyn kin_spine::SpineStore>,
@@ -45479,12 +45486,49 @@ mod tests {
         let backend_root = tempfile::tempdir().unwrap();
         for repo_id in &fleet {
             let graph = kin_db::InMemoryGraph::new();
-            graph
-                .upsert_entity(&test_entity(
-                    &format!("{}_entity", repo_id.replace('-', "_")),
-                    "src/lib.rs",
-                ))
-                .unwrap();
+            let owned = test_entity(
+                &format!("{}_entity", repo_id.replace('-', "_")),
+                "src/lib.rs",
+            );
+            graph.upsert_entity(&owned).unwrap();
+            // One real cross-repo import, so this fleet publishes a non-empty
+            // edge set. Without it every fixture repo is an island, and a test
+            // reading `/spine/edges` cannot tell a served snapshot from an
+            // empty one: `complete` and the repo list read identically either
+            // way. The importing repo references the imported repo's symbol by
+            // name, carrying the `import_source` and the evidence token the
+            // resolver binds on, which is the shape admission enrichment writes.
+            if repo_id == HOSTED_FIXTURE_IMPORTING_REPO {
+                // The endpoint the relation names has to exist, because
+                // serializing a snapshot refuses a relation whose destination is
+                // unadmitted. It is an EXTERNAL entity with no file of its own,
+                // which is what admission enrichment writes for a symbol another
+                // repository owns, and what makes the import read as unresolved
+                // here rather than as a local definition.
+                let mut imported = test_entity(HOSTED_FIXTURE_IMPORTED_SYMBOL, "src/lib.rs");
+                imported.role = kin_model::EntityRole::External;
+                imported.file_origin = None;
+                imported.span = None;
+                graph.upsert_entity(&imported).unwrap();
+                graph
+                    .upsert_relation(&kin_model::Relation {
+                        id: kin_model::RelationId::new(),
+                        kind: kin_model::RelationKind::Calls,
+                        src: kin_model::GraphNodeId::Entity(owned.id),
+                        dst: kin_model::GraphNodeId::Entity(imported.id),
+                        confidence: 1.0,
+                        origin: kin_model::RelationOrigin::Parsed,
+                        created_in: None,
+                        import_source: Some(HOSTED_FIXTURE_IMPORTED_REPO.to_string()),
+                        evidence: vec![kin_model::RelationEvidence {
+                            token: Some(format!(
+                                "{HOSTED_FIXTURE_IMPORTED_REPO}::{HOSTED_FIXTURE_IMPORTED_SYMBOL}"
+                            )),
+                            ..Default::default()
+                        }],
+                    })
+                    .unwrap();
+            }
             kin_db::StorageBackend::save_snapshot(
                 &kin_db::LocalFileBackend::new(backend_root.path()),
                 repo_id,
@@ -45582,6 +45626,10 @@ mod tests {
         hydration_charge_ms: std::sync::atomic::AtomicU64,
         point_charge_ms: std::sync::atomic::AtomicU64,
         fail_next_hydration: std::sync::atomic::AtomicBool,
+        /// Fails the next active-fence read once. That read is the third thing
+        /// the cached-authority check makes and it maps to a BLOCKED refusal,
+        /// which is the one verdict a reader must not answer by re-proving.
+        fail_next_rollout_fence_load: std::sync::atomic::AtomicBool,
         /// Runs on every committed-head read, so a test can move durable state
         /// while a probe is between its two bundle observations.
         on_head_read: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -45596,6 +45644,7 @@ mod tests {
                 hydration_charge_ms: std::sync::atomic::AtomicU64::new(0),
                 point_charge_ms: std::sync::atomic::AtomicU64::new(0),
                 fail_next_hydration: std::sync::atomic::AtomicBool::new(false),
+                fail_next_rollout_fence_load: std::sync::atomic::AtomicBool::new(false),
                 on_head_read: std::sync::Mutex::new(None),
             }
         }
@@ -45619,6 +45668,15 @@ mod tests {
         /// this fleet publishes exactly where it is.
         fn fail_next_hydration(&self) {
             self.fail_next_hydration
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Fail the next active Firestore fence read once, leaving every durable
+        /// identity this fleet publishes exactly where it is. The cached
+        /// authority check reads that fence before it reads anything else, so
+        /// this is how a test reaches its blocked verdict without moving a head.
+        fn fail_next_rollout_fence_load(&self) {
+            self.fail_next_rollout_fence_load
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -45695,6 +45753,14 @@ mod tests {
         ) -> std::result::Result<Option<kin_spine::LoadedSpineRolloutFence>, kin_spine::SpineError>
         {
             self.charge_point_read();
+            if self
+                .fail_next_rollout_fence_load
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(kin_spine::SpineError::Backend(
+                    "injected active rollout fence read failure".to_string(),
+                ));
+            }
             self.inner.load_rollout_fence()
         }
 
@@ -46535,6 +46601,198 @@ mod tests {
         assert!(
             !proved,
             "the pass itself must fail, or the window under test never existed"
+        );
+    }
+
+    // -- A query answers from the proof rather than re-establishing it ------
+    //
+    // FIR-3269. Every `/spine/*` query took the full authority pass on every
+    // request: one durable cache hydration plus a whole-fleet double-collect
+    // that loads every repository graph and recomputes every root. On the
+    // five-repo hosted fleet on 2026-09-05 the hydration half alone measured a
+    // 7.92 s median over 48 passes and a 10.15 s p90, and the whole pass the
+    // 10.46 s median recorded above. The control plane gives its org-graph read
+    // 6 s, so every read aborted and the org graph rendered seventeen
+    // repositories with no links between them while the daemon held 1489 of
+    // them and had published them four minutes after start.
+    //
+    // These three are a set. The first fails if a query re-establishes the
+    // proof. The second fails if the cheap answer stopped being an honest one.
+    // The third fails if a refusal re-proving cannot fix starts paying for a
+    // pass anyway.
+
+    /// Read `/spine/edges` through the hosted router, exactly as the control
+    /// plane does: authenticated, over a state that carries publication
+    /// control, so the reader-admission middleware runs ahead of the handler.
+    async fn read_spine_edges(state: Arc<DaemonState>) -> (StatusCode, Option<serde_json::Value>) {
+        let response = router_with_publication_control_auth(
+            state,
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        )
+        .oneshot(
+            Request::get("/spine/edges")
+                .header("authorization", "Bearer daemon-test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).ok())
+    }
+
+    /// A hosted query must answer from the proof this process already holds.
+    #[tokio::test]
+    async fn spine_edges_answers_from_the_cached_authority_proof_without_rehydrating() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        // A hydration is charged what a real one costs, so a pass returning to
+        // the query path shows up as wall clock as well as a count.
+        store.charge_each_hydration(Duration::from_secs(10));
+        let hydrations_before = store.hydration_reads();
+
+        let started = Instant::now();
+        let (status, body) = read_spine_edges(Arc::clone(&state)).await;
+        let elapsed = started.elapsed();
+        let hydrations = store.hydration_reads() - hydrations_before;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an admitted hosted reader holding a current authority proof must serve its \
+             cross-repo snapshot"
+        );
+        assert_eq!(
+            hydrations, 0,
+            "the query hydrated the durable spine cache. Establishing authority is what the \
+             publication, rollout and background passes do; a query reads what they left."
+        );
+        let body = body.expect("the snapshot must be JSON");
+        assert_eq!(
+            body["complete"], true,
+            "an incomplete edge snapshot is a proof gap, and serving one from the cached \
+             path would hide exactly what this route exists to report"
+        );
+        let repos = body["repos"]
+            .as_array()
+            .expect("the snapshot names the fleet it was read from")
+            .len();
+        assert_eq!(
+            repos, HOSTED_FIXTURE_FLEET_SIZE,
+            "the snapshot covered {repos} repositories, not the fleet's \
+             {HOSTED_FIXTURE_FLEET_SIZE}"
+        );
+        // Everything above reads the same whether the cached path served the
+        // fleet's real edge set or an empty one, which is the exact shape of the
+        // production failure: seventeen repositories rendered with no links
+        // between them, under an answer that called itself complete. So the
+        // payload is asserted on its content, not only on its counters.
+        let edges = body["edges"]
+            .as_array()
+            .expect("the snapshot carries its edge set");
+        assert!(
+            !edges.is_empty(),
+            "the cached path served an empty edge set over a fleet that publishes one"
+        );
+        assert!(
+            edges.iter().any(|edge| {
+                edge["src_repo"] == HOSTED_FIXTURE_IMPORTING_REPO
+                    && edge["dst_repo"] == HOSTED_FIXTURE_IMPORTED_REPO
+            }),
+            "the fleet's published cross-repo edge, {HOSTED_FIXTURE_IMPORTING_REPO} to \
+             {HOSTED_FIXTURE_IMPORTED_REPO}, is not in the served snapshot: {edges:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the query took {elapsed:?}. A durable cache hydration is charged 10 s here, so \
+             this bound is what catches one coming back onto the query path."
+        );
+    }
+
+    /// A source publication that moves past the proof must re-prove once, and
+    /// answer from what that pass finds rather than from the proof it had.
+    #[tokio::test]
+    async fn spine_edges_reproves_when_a_repository_source_advanced_under_the_proof() {
+        let (state, store, backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        let (status, _) = read_spine_edges(Arc::clone(&state)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the fixture must serve first, or the refusal below proves nothing"
+        );
+
+        // Everything the cached path checks stays exactly where it is except
+        // one repository's source publication. An ordinary publication does not
+        // move the rollout fence, so nothing but durable identity catches this.
+        advance_repo_source_publication(&backend_root, "kin-db");
+        let hydrations_before = store.hydration_reads();
+
+        let (status, _) = read_spine_edges(Arc::clone(&state)).await;
+        let hydrations = store.hydration_reads() - hydrations_before;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a proof built against a superseded generation must not certify a query. \
+             Answering from it is the one thing the cheap path may never do."
+        );
+        assert_eq!(
+            hydrations, 1,
+            "a superseded proof must fall through to exactly one full pass, so the query \
+             answers from what is durably there now instead of refusing on a stale reading"
+        );
+        assert!(
+            state.ensure_spine().is_none(),
+            "and the full pass must agree: a repository whose source cursor is ahead of its \
+             committed spine head cannot be proved, so the refusal above is the cheap path \
+             reaching the verdict the expensive one reaches"
+        );
+    }
+
+    /// A refusal that re-proving cannot fix must not pay for a pass.
+    ///
+    /// A lost admission, an active rollout and an unreadable active fence are
+    /// blocked rather than superseded: the condition is in the control plane
+    /// this reader binds to, not in a head that moved, so a full pass reaches
+    /// the same refusal one process-wide hydration later. Readiness has carried
+    /// that distinction since FIR-3255, in
+    /// `a_hosted_readiness_probe_refuses_while_a_rollout_holds_the_fleet`; this
+    /// is the query route's half of the same contract.
+    #[tokio::test]
+    async fn spine_edges_refuses_without_reproving_when_the_cached_authority_is_blocked() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        let (status, _) = read_spine_edges(Arc::clone(&state)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the fixture must serve first, or the refusal below proves nothing"
+        );
+
+        // The active Firestore fence is the third read the cached check makes
+        // and the first that can fail while every durable identity stays put.
+        store.fail_next_rollout_fence_load();
+        let hydrations_before = store.hydration_reads();
+
+        let (status, _) = read_spine_edges(Arc::clone(&state)).await;
+        let hydrations = store.hydration_reads() - hydrations_before;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a reader that cannot read the authority its cached proof is bound to must \
+             refuse rather than serve"
+        );
+        assert_eq!(
+            hydrations, 0,
+            "the blocked refusal hydrated the durable cache. Re-proving cannot fix a control \
+             plane the reader cannot read, so the pass refuses a second time having taken \
+             the process-wide hydration lock to do it."
         );
     }
 
