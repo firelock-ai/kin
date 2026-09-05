@@ -164,6 +164,30 @@ pub trait SpineBackend: Send + Sync {
         ))
     }
 
+    /// Read every committed repository head from the DURABLE store, without
+    /// its entity rows, as one coherent whole-fleet observation.
+    ///
+    /// This is the cheap identity read. `source_cursor`, `root_hash` and
+    /// `registered_repo_ids` all answer from this process's cache and cannot
+    /// say whether durable authority moved underneath it;
+    /// `refresh_committed_publications` can say, but it loads every row to do
+    /// it. A caller that only needs to know whether an identity is still the
+    /// one it proved against takes this.
+    ///
+    /// This is ONE observation, deliberately. A caller proving that identity has
+    /// not moved must collect the complete bundle it cares about, these heads
+    /// and whatever else it reads, twice and compare, because stabilizing one
+    /// source alone still lets two instants mix.
+    ///
+    /// Backends must opt in explicitly, exactly as they do for publication.
+    fn committed_head_identities(
+        &self,
+    ) -> Result<BTreeMap<String, (RepoPublicationHead, String)>, SpineError> {
+        Err(SpineError::Backend(
+            "durable committed head identities are unsupported by this backend".to_string(),
+        ))
+    }
+
     /// Stage immutable rows for one cursor-bound repository publication.
     ///
     /// Backends must opt in explicitly. Hosted callers treat the default error

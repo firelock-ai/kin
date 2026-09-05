@@ -423,7 +423,7 @@ pub(crate) fn execute_resolve(
     // as a possible write.
     let authority = ActiveLocalRepositoryAuthority::open_bound(state)
         .map_err(|refusal| CommandRefusal::before_write(merge_bind_refusal(refusal)))?;
-    let execution = plan_resolution(state, &authority, request)
+    let mut execution = plan_resolution(state, &authority, request)
         .map_err(|error| CommandRefusal::before_write(classify_merge_error(error)))?;
     let finalization = state
         .finalize_local_repository_commit(
@@ -455,6 +455,21 @@ pub(crate) fn execute_resolve(
     if !finalization.graph_changed {
         state.invalidate_projection();
     }
+
+    // Settled after the finalization for the reason `repository_merge::execute`
+    // settles after its own: a merge published through `resolve --continue`
+    // reaches the live entity and relation table at exactly this call and not
+    // before it.
+    //
+    // A settlement and an abort reach here too, and neither composed a merged
+    // graph, so neither settles one.
+    if execution.published_merged_graph {
+        execution
+            .resolve_response
+            .lines
+            .extend(crate::repository_merge::settle_merged_graph(state));
+    }
+
     drop(persistence);
     drop(graph_mutation);
     Ok(execution.resolve_response)
@@ -463,6 +478,10 @@ pub(crate) fn execute_resolve(
 /// One resolution's outcome, carrying the merge execution the daemon finalizes.
 pub(crate) struct ResolveExecution {
     resolve_response: ResolveResponse,
+    /// Whether this execution published a merged graph. False for a settlement
+    /// and for an abort, which record decisions and restore a workspace without
+    /// composing one; see [`MergeExecution::published_merged_graph`].
+    published_merged_graph: bool,
     receipt: RepositoryCommitReceipt,
     authority_freeze: LocalRepositoryAuthorityFreeze,
     daemon_delta: TransactionDelta,
@@ -521,6 +540,7 @@ fn plan_resolution(
 
 fn into_resolve_execution(execution: MergeExecution) -> ResolveExecution {
     ResolveExecution {
+        published_merged_graph: execution.published_merged_graph,
         resolve_response: execution
             .resolve_response
             .expect("a merge execution reached through resolve carries its resolve response"),
@@ -1286,6 +1306,7 @@ fn record_execution(
     };
     let tree = workspace.tree;
     ResolveExecution {
+        published_merged_graph: false,
         resolve_response: ResolveResponse {
             lines,
             mutated: matches!(receipt.outcome, RepositoryCommitOutcome::Committed),

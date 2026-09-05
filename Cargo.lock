@@ -3052,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "kin-agent"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3081,14 +3081,14 @@ dependencies = [
 
 [[package]]
 name = "kin-buildinfo"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "sha2 0.11.0",
 ]
 
 [[package]]
 name = "kin-cli"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "age",
  "anyhow",
@@ -3169,7 +3169,7 @@ dependencies = [
 
 [[package]]
 name = "kin-context"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3185,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "kin-core"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -3220,7 +3220,7 @@ dependencies = [
 
 [[package]]
 name = "kin-daemon"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "kin-daemon-spawn"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "fs2",
  "libc",
@@ -3295,9 +3295,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.7.102"
+version = "0.7.104"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "a112df686bd7ba5433912c5dc9032a09dd915b387bde295196f1e17a73fc31b4"
+checksum = "cddb9f8689824e1884b1cbc234e105865571a1a266ec2c702983f6f61412e818"
 dependencies = [
  "bincode",
  "bstr",
@@ -3342,7 +3342,7 @@ dependencies = [
 
 [[package]]
 name = "kin-git"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "cap-std",
  "chrono",
@@ -3367,7 +3367,7 @@ dependencies = [
 
 [[package]]
 name = "kin-index"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "hex",
  "kin-blobs",
@@ -3419,7 +3419,7 @@ dependencies = [
 
 [[package]]
 name = "kin-integration-tests"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "kin-blobs",
  "kin-context",
@@ -3454,7 +3454,7 @@ dependencies = [
 
 [[package]]
 name = "kin-mcp"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "base64 0.23.0",
  "hex",
@@ -3485,7 +3485,7 @@ dependencies = [
 
 [[package]]
 name = "kin-migrate"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "chrono",
  "kin-blobs",
@@ -3535,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "kin-notifier-macos"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "block2",
  "objc2 0.6.4",
@@ -3547,7 +3547,7 @@ dependencies = [
 
 [[package]]
 name = "kin-notify"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3558,7 +3558,7 @@ dependencies = [
 
 [[package]]
 name = "kin-parser"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "kin-model",
  "pretty_assertions",
@@ -3588,7 +3588,7 @@ dependencies = [
 
 [[package]]
 name = "kin-projection"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3603,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "kin-ranking"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "kin-model",
  "serde",
@@ -3612,7 +3612,7 @@ dependencies = [
 
 [[package]]
 name = "kin-reconcile"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3632,7 +3632,7 @@ dependencies = [
 
 [[package]]
 name = "kin-registry"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "async-stream",
  "axum",
@@ -3665,7 +3665,7 @@ dependencies = [
 
 [[package]]
 name = "kin-remote"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "base64 0.23.0",
  "chrono",
@@ -3686,7 +3686,7 @@ dependencies = [
 
 [[package]]
 name = "kin-review"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "kin-blobs",
  "kin-db",
@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "kin-runtime"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "chrono",
  "kin-blobs",
@@ -3735,7 +3735,7 @@ dependencies = [
 
 [[package]]
 name = "kin-semantic-contracts"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "kin-db",
  "kin-model",
@@ -3750,7 +3750,7 @@ dependencies = [
 
 [[package]]
 name = "kin-spine"
-version = "0.7.0"
+version = "0.7.2"
 dependencies = [
  "chrono",
  "hashbrown 0.15.5",

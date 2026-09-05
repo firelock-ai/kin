@@ -1022,6 +1022,9 @@ jobs:
       - name: Check the flake quarantine
         run: python3 scripts/check-quarantine.py
 
+      - name: Test acceptance fixture cleanup safety
+        run: python3 scripts/acceptance/test_fixture_shutdown.py
+
       # Here rather than in `check`, for the reason the step above records: a
       # script step in `check` is a gate `bin/kin-precheck` enumerates and must
       # classify by name, and one wired there without the matching umbrella
@@ -1334,6 +1337,20 @@ jobs:
             echo "cargo cannot tell you which. Refusing rather than guessing." >&2
             exit 1
           fi
+          # kin-core hosts guards whose subject is every source file in the
+          # workspace, not just kin-core's own: test_env.rs's environment-write
+          # scan and env_registry.rs's environment-read completeness scan both
+          # walk the whole tree. The closure above only follows what depends ON
+          # a changed crate, so a change to a crate kin-core does not depend on
+          # never re-selects kin-core, and a guard whose subject is the whole
+          # tree goes unchecked on exactly the pull requests that could break
+          # it. kin#1534 is the case: its new test code broke the environment
+          # guard, its own pull request stayed scoped to kin-cli and read
+          # green, and main's next push, unscoped, read red. Append kin-core
+          # unconditionally so every pull request carries every
+          # workspace-scanning guard, present or future; repeating a package
+          # or combining `-p kin-core` with `--workspace` is a harmless no-op.
+          printf '%s\n' -p kin-core >> "$RUNNER_TEMP/scope.args"
           echo "scope: $(tr '\n' ' ' < "$RUNNER_TEMP/scope.args")"
 
       # A filter that matches nothing grades nothing and exits 0, printing the

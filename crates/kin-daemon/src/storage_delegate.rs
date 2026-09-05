@@ -62,7 +62,7 @@ use kin_db::{
 /// `storage_backend_surface_is_audited_against_the_pinned_kin_db` fails when
 /// the workspace pin moves past it, which is the only moment a method can have
 /// appeared.
-pub const AUDITED_KIN_DB_VERSION: &str = "0.7.102";
+pub const AUDITED_KIN_DB_VERSION: &str = "0.7.104";
 
 /// Wraps a [`StorageBackendDelegate`] so it can be handed anywhere a
 /// `Box<dyn StorageBackend>` is expected.
@@ -168,6 +168,11 @@ storage_backend_surface! {
         journal_sha256: &str,
         validator_version: u32,
     ) -> Result<bool, KinDbError>;
+    fn load_prepared_workspace_graph_binding(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<Vec<u8>>, KinDbError>;
     fn load_prepared_workspace_graph(
         &self,
         repo_id: &str,
@@ -311,8 +316,8 @@ mod tests {
         );
         assert_eq!(
             BRIDGED_STORAGE_BACKEND_METHODS.len(),
-            32,
-            "kin-db {AUDITED_KIN_DB_VERSION} declares 32 StorageBackend methods"
+            33,
+            "kin-db {AUDITED_KIN_DB_VERSION} declares 33 StorageBackend methods"
         );
     }
 }

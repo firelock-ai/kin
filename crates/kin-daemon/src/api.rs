@@ -4078,6 +4078,13 @@ async fn health(
     }))
 }
 
+/// An authority answer at least this slow is reported even when it succeeds.
+///
+/// The tightest probe timeout the hosted deployment configures is the readiness
+/// probe's `timeoutSeconds: 1`, so a probe answered more slowly than this was
+/// already a timeout on the prober's side whatever this daemon returned.
+const READINESS_SLOW_ANSWER: Duration = Duration::from_secs(1);
+
 /// GET /readiness — returns 200 when initialized, 503 otherwise.
 /// An initialized daemon has either loaded a snapshot or completed at least
 /// one reconciliation cycle. An empty but initialized workspace is ready.
@@ -4096,17 +4103,43 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     // Option keeps a branch that never consulted the gate from ever printing a
     // measured-looking zero for it.
     let mut authority_wait: Option<Duration> = None;
+    let mut authority_refusal: Option<String> = None;
     let hosted_spine_ready = if initialized && hosted {
+        // Start the pass that keeps the authority proof current, then read that
+        // proof. Establishing it here instead is what starved the kubelet on
+        // 2026-09-05; `DaemonState::hosted_readiness_spine_authority` carries
+        // the measurement and what the probe still refuses on.
+        state.start_hosted_spine_authority_refresh_cadence();
         let started = Instant::now();
-        let ready = state.acquire_spine_read_authority().await.is_some();
+        let answer = state.hosted_readiness_spine_authority().await;
         authority_wait = Some(started.elapsed());
-        ready
+        match answer {
+            Ok(()) => true,
+            Err(reason) => {
+                authority_refusal = Some(reason);
+                false
+            }
+        }
     } else {
         true
     };
     let warming = state.spine_warming() || (initialized && !hosted_spine_ready);
 
     if initialized && hosted_spine_ready {
+        // A success slower than the probe's own timeout is invisible to the
+        // prober: Kubernetes records a timeout and nothing else. On 2026-09-05 a
+        // hosted pod answered `{"ready":true,"warming":false}` after 175.7 s and
+        // its log said nothing about it, because only the refusal branch below
+        // reported its waits. So report them here too, and only here: an
+        // unconditional line would print on every probe for the life of the pod
+        // and bury the one case that matters.
+        if let Some(waited) = authority_wait.filter(|waited| *waited >= READINESS_SLOW_ANSWER) {
+            tracing::warn!(
+                authority_wait_ms = waited.as_millis() as u64,
+                spine_gate_wait_ms = state.last_spine_gate_read_wait().as_millis() as u64,
+                "readiness answered ready more slowly than a probe timeout"
+            );
+        }
         (
             StatusCode::OK,
             Json(ReadinessResponse {
@@ -4155,6 +4188,7 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
                     refused_on = "hosted spine authority",
                     authority_wait_ms = waited.as_millis() as u64,
                     spine_gate_wait_ms = state.last_spine_gate_read_wait().as_millis() as u64,
+                    reason = authority_refusal.as_deref().unwrap_or("unreported"),
                     "readiness refused"
                 ),
             }
@@ -33543,6 +33577,10 @@ mod tests {
         /// Wall-clock delay a source read holds for, used to prove the read is
         /// not running on the thread driving the request future.
         blob_read_delay: Option<Duration>,
+        /// Wall-clock cost every source publication cursor probe pays, so a
+        /// readiness probe's per-repository reads are measured rather than
+        /// assumed free.
+        cursor_probe_delay: Option<Duration>,
     }
 
     #[derive(Clone)]
@@ -33655,6 +33693,19 @@ mod tests {
                 .cursor_probes
                 .entry(repo_id.to_string())
                 .or_default() += 1;
+        }
+
+        fn charge_each_cursor_probe(&self, cost: Duration) {
+            self.0.lock().unwrap().cursor_probe_delay = Some(cost);
+        }
+
+        fn cursor_probe_delay(&self) -> Option<Duration> {
+            self.0.lock().unwrap().cursor_probe_delay
+        }
+
+        /// Every cursor probe this backend has served, across every repository.
+        fn total_cursor_probes(&self) -> usize {
+            self.0.lock().unwrap().cursor_probes.values().sum()
         }
 
         fn cursor_probes(&self, repo_id: &str) -> usize {
@@ -33862,6 +33913,9 @@ mod tests {
             // Count the probe before parking on any rendezvous, so a blocked
             // probe still shows up in `cursor_probes`.
             self.faulting.record_cursor_probe(repo_id);
+            if let Some(cost) = self.faulting.cursor_probe_delay() {
+                std::thread::sleep(cost);
+            }
             if let Some(block) = self.faulting.cursor_probe_block_for(repo_id) {
                 block.arrive_and_wait();
             }
@@ -45338,6 +45392,23 @@ mod tests {
     /// The environment guard is returned so it lives as long as the state;
     /// dropping it restores the variables.
     fn hosted_test_state() -> (Arc<DaemonState>, kin_core::test_env::EnvVarGuard) {
+        let (state, _backend_root, _meters, environment) =
+            hosted_test_state_over(Arc::new(kin_spine::test_support::FakeSpineStore::cold()));
+        (state, environment)
+    }
+
+    /// The same fixture over a caller-supplied durable store, so a test can
+    /// measure or charge what the store is asked for. The storage root comes
+    /// back too, so a test can advance a repository's source publication the
+    /// way a sibling writer does.
+    fn hosted_test_state_over(
+        spine_store: Arc<dyn kin_spine::SpineStore>,
+    ) -> (
+        Arc<DaemonState>,
+        std::path::PathBuf,
+        HostedProbeMeters,
+        kin_core::test_env::EnvVarGuard,
+    ) {
         const READER: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let fleet = vec![
@@ -45379,15 +45450,22 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let repo = Box::leak(Box::new(repo));
         let initialized = kin_core::init(repo.path()).unwrap();
-        let store = Arc::new(crate::publication_lease::InMemoryPublicationControlStore::default());
+        let control_store = Arc::new(MeasuredControlStore::new());
         let control = Arc::new(
-            crate::publication_lease::PublicationControl::new(scope, READER, fleet.clone(), store)
-                .unwrap(),
+            crate::publication_lease::PublicationControl::new(
+                scope,
+                READER,
+                fleet.clone(),
+                Arc::clone(&control_store)
+                    as Arc<dyn crate::publication_lease::PublicationControlStore>,
+            )
+            .unwrap(),
         );
+        let (counting_backend, cursor_probes) = RepoFaultBackend::new(backend_root.path());
         let state = Arc::new(
             DaemonState::open_with_backend_and_publication_control(
                 initialized.layout,
-                Box::new(kin_db::LocalFileBackend::new(backend_root.path())),
+                Box::new(counting_backend),
                 "kin",
                 Some(fleet.iter().cloned().collect()),
                 control,
@@ -45395,16 +45473,446 @@ mod tests {
             .unwrap(),
         );
         state.install_hosted_durable_spine_for_test(Arc::new(
-            kin_spine::FirestoreSpineBackend::with_store(Arc::new(
-                kin_spine::test_support::FakeSpineStore::cold(),
-            )),
+            kin_spine::FirestoreSpineBackend::with_store(spine_store),
         ));
         assert!(
             state.hosted_spine_readiness_required(),
             "the fixture must put readiness on the hosted half, or these tests \
              exercise nothing FIR-3179 is about"
         );
-        (state, environment)
+        (
+            state,
+            backend_root.path().to_path_buf(),
+            HostedProbeMeters {
+                control: control_store,
+                cursor_probes,
+            },
+            environment,
+        )
+    }
+
+    /// Everything a hosted probe reads, counted and chargeable: the durable
+    /// spine store, the publication-control record, and every repository's
+    /// source publication cursor.
+    struct HostedProbeMeters {
+        control: Arc<MeasuredControlStore>,
+        cursor_probes: FaultSwitch,
+    }
+
+    /// Publish a newer source snapshot for one repository, exactly as a sibling
+    /// writer does, and leave the committed spine head where it is.
+    fn advance_repo_source_publication(backend_root: &std::path::Path, repo_id: &str) {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity(
+                &format!("{}_advanced_entity", repo_id.replace('-', "_")),
+                "src/advanced.rs",
+            ))
+            .unwrap();
+        kin_db::StorageBackend::save_snapshot(
+            &kin_db::LocalFileBackend::new(backend_root),
+            repo_id,
+            &graph.to_snapshot().to_bytes().unwrap(),
+            kin_db::GENERATION_INIT + 1,
+        )
+        .unwrap();
+    }
+
+    /// A durable spine store that delegates every call and can be given the
+    /// cost a real durable read has.
+    ///
+    /// `load_repo_publications` is the read the cache hydration makes, exactly
+    /// one per hydration, so counting it counts hydrations and charging it
+    /// charges them. The charge starts at zero so the fixture can publish and
+    /// admit at full speed, and is armed only for the pass under test.
+    struct MeasuredSpineStore {
+        inner: Arc<kin_spine::test_support::FakeSpineStore>,
+        hydration_reads: std::sync::atomic::AtomicUsize,
+        point_reads: std::sync::atomic::AtomicUsize,
+        hydration_charge_ms: std::sync::atomic::AtomicU64,
+        point_charge_ms: std::sync::atomic::AtomicU64,
+        fail_next_hydration: std::sync::atomic::AtomicBool,
+        /// Runs on every committed-head read, so a test can move durable state
+        /// while a probe is between its two bundle observations.
+        on_head_read: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl MeasuredSpineStore {
+        fn cold() -> Self {
+            Self {
+                inner: Arc::new(kin_spine::test_support::FakeSpineStore::cold()),
+                hydration_reads: std::sync::atomic::AtomicUsize::new(0),
+                point_reads: std::sync::atomic::AtomicUsize::new(0),
+                hydration_charge_ms: std::sync::atomic::AtomicU64::new(0),
+                point_charge_ms: std::sync::atomic::AtomicU64::new(0),
+                fail_next_hydration: std::sync::atomic::AtomicBool::new(false),
+                on_head_read: std::sync::Mutex::new(None),
+            }
+        }
+
+        /// Reads that pull every entity row: the durable cache hydration.
+        fn hydration_reads(&self) -> usize {
+            self.hydration_reads
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Reads that pull one document or one small collection.
+        fn point_reads(&self) -> usize {
+            self.point_reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn on_head_read(&self, hook: Box<dyn Fn() + Send + Sync>) {
+            *self.on_head_read.lock().unwrap() = Some(hook);
+        }
+
+        /// Fail the next durable cache hydration once, leaving every identity
+        /// this fleet publishes exactly where it is.
+        fn fail_next_hydration(&self) {
+            self.fail_next_hydration
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn charge_each_hydration(&self, cost: Duration) {
+            self.hydration_charge_ms.store(
+                u64::try_from(cost.as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+
+        fn charge_each_point_read(&self, cost: Duration) {
+            self.point_charge_ms.store(
+                u64::try_from(cost.as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+
+        fn charge_hydration(&self) {
+            self.hydration_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self::sleep_for(&self.hydration_charge_ms);
+        }
+
+        fn charge_point_read(&self) {
+            self.point_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self::sleep_for(&self.point_charge_ms);
+        }
+
+        fn sleep_for(charge_ms: &std::sync::atomic::AtomicU64) {
+            let charge = charge_ms.load(std::sync::atomic::Ordering::SeqCst);
+            if charge > 0 {
+                std::thread::sleep(Duration::from_millis(charge));
+            }
+        }
+    }
+
+    impl kin_spine::SpineStore for MeasuredSpineStore {
+        fn load_repo_publications(
+            &self,
+        ) -> std::result::Result<Vec<kin_spine::LoadedRepoPublication>, kin_spine::SpineError>
+        {
+            self.charge_hydration();
+            if self
+                .fail_next_hydration
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(kin_spine::SpineError::Backend(
+                    "injected durable cache hydration failure".to_string(),
+                ));
+            }
+            self.inner.load_repo_publications()
+        }
+
+        fn load_repo_heads(
+            &self,
+        ) -> std::result::Result<
+            std::collections::BTreeMap<String, (kin_spine::RepoPublicationHead, String)>,
+            kin_spine::SpineError,
+        > {
+            self.charge_point_read();
+            // Clone the hook out before calling it, so a hook that touches this
+            // store does not deadlock on its own lock.
+            let hook = self.on_head_read.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+                *self.on_head_read.lock().unwrap() = Some(hook);
+            }
+            self.inner.load_repo_heads()
+        }
+
+        fn load_rollout_fence(
+            &self,
+        ) -> std::result::Result<Option<kin_spine::LoadedSpineRolloutFence>, kin_spine::SpineError>
+        {
+            self.charge_point_read();
+            self.inner.load_rollout_fence()
+        }
+
+        fn advance_rollout_fence(
+            &self,
+            fence: kin_spine::SpineRolloutFence,
+        ) -> std::result::Result<kin_spine::SpineRolloutFenceCommit, kin_spine::SpineError>
+        {
+            self.inner.advance_rollout_fence(fence)
+        }
+
+        fn legacy_migration_complete(&self) -> std::result::Result<bool, kin_spine::SpineError> {
+            self.inner.legacy_migration_complete()
+        }
+
+        fn complete_legacy_migration(
+            &self,
+            rollout_fence: &kin_spine::LoadedSpineRolloutFence,
+            writer_drain: &kin_spine::LegacySpineWriterDrainAttestation,
+        ) -> std::result::Result<(), kin_spine::SpineError> {
+            self.inner
+                .complete_legacy_migration(rollout_fence, writer_drain)
+        }
+
+        fn prepare_repo_publication(
+            &self,
+            publication: kin_spine::RepoSpinePublication,
+        ) -> std::result::Result<kin_spine::PreparedStorePublication, kin_spine::SpineError>
+        {
+            self.inner.prepare_repo_publication(publication)
+        }
+
+        fn prepare_repo_publication_bound(
+            &self,
+            publication: kin_spine::RepoSpinePublication,
+            expected_rollout_fence: &kin_spine::SpineRolloutFenceEvidence,
+        ) -> std::result::Result<kin_spine::PreparedStorePublication, kin_spine::SpineError>
+        {
+            self.inner
+                .prepare_repo_publication_bound(publication, expected_rollout_fence)
+        }
+
+        fn commit_repo_publication(
+            &self,
+            prepared: &kin_spine::PreparedStorePublication,
+        ) -> std::result::Result<kin_spine::RepoPublicationCommit, kin_spine::SpineError> {
+            self.inner.commit_repo_publication(prepared)
+        }
+
+        fn load_repo_publication(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<kin_spine::LoadedRepoPublication>, kin_spine::SpineError>
+        {
+            self.charge_hydration();
+            self.inner.load_repo_publication(repo_id)
+        }
+
+        fn cleanup_repo_publications(
+            &self,
+            active_head: &kin_spine::RepoPublicationHead,
+            max_rows: usize,
+        ) -> std::result::Result<kin_spine::RepoPublicationCleanupProgress, kin_spine::SpineError>
+        {
+            self.inner.cleanup_repo_publications(active_head, max_rows)
+        }
+
+        fn load_repos(
+            &self,
+        ) -> std::result::Result<Vec<kin_spine::LoadedRepo>, kin_spine::SpineError> {
+            self.inner.load_repos()
+        }
+
+        fn load_edges(
+            &self,
+        ) -> std::result::Result<Vec<kin_spine::CrossRepoEdge>, kin_spine::SpineError> {
+            self.inner.load_edges()
+        }
+
+        fn write_entity(
+            &self,
+            entry: &kin_spine::EntityEntry,
+            root_hash: &str,
+        ) -> std::result::Result<(), kin_spine::SpineError> {
+            self.inner.write_entity(entry, root_hash)
+        }
+
+        fn delete_repo_entities(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<(), kin_spine::SpineError> {
+            self.inner.delete_repo_entities(repo_id)
+        }
+
+        fn write_edge(
+            &self,
+            edge: &kin_spine::CrossRepoEdge,
+        ) -> std::result::Result<(), kin_spine::SpineError> {
+            self.inner.write_edge(edge)
+        }
+
+        fn delete_repo_edges(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<(), kin_spine::SpineError> {
+            self.inner.delete_repo_edges(repo_id)
+        }
+    }
+
+    /// A publication-control store that counts and charges every durable
+    /// record read, so a probe's control-plane cost is measured rather than
+    /// assumed.
+    struct MeasuredControlStore {
+        inner: crate::publication_lease::InMemoryPublicationControlStore,
+        record_reads: std::sync::atomic::AtomicUsize,
+        charge_ms: std::sync::atomic::AtomicU64,
+        /// Refuse every record read past this many, counted from the arming.
+        /// Zero means never.
+        refuse_reads_past: std::sync::atomic::AtomicUsize,
+        reads_since_arming: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MeasuredControlStore {
+        fn new() -> Self {
+            Self {
+                inner: crate::publication_lease::InMemoryPublicationControlStore::default(),
+                record_reads: std::sync::atomic::AtomicUsize::new(0),
+                charge_ms: std::sync::atomic::AtomicU64::new(0),
+                refuse_reads_past: std::sync::atomic::AtomicUsize::new(0),
+                reads_since_arming: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn record_reads(&self) -> usize {
+            self.record_reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Serve `allowed` more record reads, then refuse every one after
+        /// them, so a probe's pre-bundle reads succeed and its post-bundle
+        /// reads find the admission gone.
+        fn refuse_record_reads_past(&self, allowed: usize) {
+            self.reads_since_arming
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            self.refuse_reads_past
+                .store(allowed, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn charge_each_record_read(&self, cost: Duration) {
+            self.charge_ms.store(
+                u64::try_from(cost.as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
+
+    impl crate::publication_lease::PublicationControlStore for MeasuredControlStore {
+        fn load(
+            &self,
+        ) -> std::result::Result<
+            Option<crate::publication_lease::StoredPublicationControlRecord>,
+            crate::publication_lease::PublicationControlError,
+        > {
+            self.record_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let charge = self.charge_ms.load(std::sync::atomic::Ordering::SeqCst);
+            if charge > 0 {
+                std::thread::sleep(Duration::from_millis(charge));
+            }
+            let allowed = self
+                .refuse_reads_past
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if allowed > 0 {
+                let served = self
+                    .reads_since_arming
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                if served > allowed {
+                    return Err(crate::publication_lease::PublicationControlError::Missing(
+                        "injected publication-control record read failure".to_string(),
+                    ));
+                }
+            }
+            self.inner.load()
+        }
+
+        fn create(
+            &self,
+            record: &crate::publication_lease::PublicationControlRecord,
+        ) -> std::result::Result<
+            crate::publication_lease::PublicationRecordVersion,
+            crate::publication_lease::PublicationControlError,
+        > {
+            self.inner.create(record)
+        }
+
+        fn update(
+            &self,
+            expected: &crate::publication_lease::PublicationRecordVersion,
+            record: &crate::publication_lease::PublicationControlRecord,
+        ) -> std::result::Result<
+            crate::publication_lease::PublicationRecordVersion,
+            crate::publication_lease::PublicationControlError,
+        > {
+            self.inner.update(expected, record)
+        }
+
+        fn capture_authority(
+            &self,
+            repositories: &[String],
+        ) -> std::result::Result<
+            Vec<crate::publication_lease::RepositoryAuthorityCapture>,
+            crate::publication_lease::PublicationControlError,
+        > {
+            self.inner.capture_authority(repositories)
+        }
+
+        fn fence_authority(
+            &self,
+            capture: &crate::publication_lease::RepositoryAuthorityCapture,
+        ) -> std::result::Result<
+            crate::publication_lease::RepositoryAuthorityFence,
+            crate::publication_lease::PublicationControlError,
+        > {
+            self.inner.fence_authority(capture)
+        }
+
+        fn verify_authority_fence(
+            &self,
+            capture: &crate::publication_lease::RepositoryAuthorityCapture,
+            fence: &crate::publication_lease::RepositoryAuthorityFence,
+        ) -> std::result::Result<(), crate::publication_lease::PublicationControlError> {
+            self.inner.verify_authority_fence(capture, fence)
+        }
+    }
+
+    /// A hosted daemon that has completed its startup rollout: its reader is
+    /// admitted and its cursor/root authority proof is cached. That is the
+    /// state a production pod is in for every probe after the first, and the
+    /// only state in which the readiness handler's authority half runs at all.
+    async fn admitted_hosted_test_state() -> (
+        Arc<DaemonState>,
+        Arc<MeasuredSpineStore>,
+        std::path::PathBuf,
+        HostedProbeMeters,
+        kin_core::test_env::EnvVarGuard,
+    ) {
+        let store = Arc::new(MeasuredSpineStore::cold());
+        let (state, backend_root, meters, environment) =
+            hosted_test_state_over(Arc::clone(&store) as Arc<dyn kin_spine::SpineStore>);
+        let control = Arc::clone(
+            state
+                .publication_control
+                .as_ref()
+                .expect("the hosted fixture carries publication control"),
+        );
+        let pending = control
+            .bootstrap_runtime_if_absent()
+            .expect("bootstrap the fleet control record")
+            .expect("an absent control record leaves one pending startup rollout");
+        state
+            .complete_hosted_startup_rollout(
+                &control,
+                pending,
+                Some(format!("sha256:{}", "b".repeat(64))),
+            )
+            .await
+            .expect("the hosted startup rollout must complete");
+        (state, store, backend_root, meters, environment)
     }
 
     fn capturing_warnings() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
@@ -45604,6 +46112,354 @@ mod tests {
             "a ready daemon must not log a refusal. The probe runs every few \
              seconds for the life of the pod, so an unconditional line would \
              bury the one case that matters. Captured output was: {logged:?}"
+        );
+    }
+
+    // ── A probe is a report, not an authority transition ──────────────────
+    //
+    // FIR-3255. On 2026-09-05 a hosted pod ran the full spine authority proof
+    // on every readiness probe: one durable cache hydration plus a whole-fleet
+    // double-collect that loads every repository graph and recomputes every
+    // root. Fifty-one of those ran back to back between 12:16:22Z and
+    // 12:25:15Z, median 10.46 s, with a 92 microsecond median gap, because the
+    // hydration takes one process-wide lock and the probes queued behind one
+    // another. The kubelet allows 3 s on the startup probe and 1 s on the
+    // readiness probe. End-to-end answers took 141 s, 156 s and 175.7 s, every
+    // one of them `{"ready":true,"warming":false}`, and the pod never went
+    // Ready. The 0.6.1 daemon, whose readiness read two atomics, passed the
+    // same probes on the same fleet.
+    //
+    // These three are a set. The first fails if a probe re-establishes the
+    // proof. The second fails if the cheap answer stopped being an honest one.
+    // The third fails if taking the refresh off the probe path left nothing
+    // keeping the proof current.
+
+    /// The probe must answer from the proof this process already holds, at a
+    /// cost that is counted rather than assumed.
+    ///
+    /// Every read the probe makes is charged here, not just the hydration: the
+    /// publication-control record, the active Firestore fence, the committed
+    /// heads, and every repository's source publication cursor. The per-repo
+    /// cursor charge is deliberately the largest, because it is the one the
+    /// probe issues five at a time: served in series those ten reads alone
+    /// would cost two seconds, so a bound of 1.5 s fails a serial
+    /// implementation and passes a concurrent one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hosted_readiness_probe_answers_without_a_durable_spine_refresh() {
+        let (state, store, _backend_root, meters, _environment) =
+            admitted_hosted_test_state().await;
+        store.charge_each_hydration(Duration::from_secs(10));
+        store.charge_each_point_read(Duration::from_millis(20));
+        meters
+            .control
+            .charge_each_record_read(Duration::from_millis(20));
+        meters
+            .cursor_probes
+            .charge_each_cursor_probe(Duration::from_millis(200));
+        let hydrations_before = store.hydration_reads();
+        let point_reads_before = store.point_reads();
+        let record_reads_before = meters.control.record_reads();
+        let cursor_probes_before = meters.cursor_probes.total_cursor_probes();
+
+        let started = Instant::now();
+        let status = call_readiness_handler(Arc::clone(&state)).await;
+        let elapsed = started.elapsed();
+
+        let hydrations = store.hydration_reads() - hydrations_before;
+        let point_reads = store.point_reads() - point_reads_before;
+        let record_reads = meters.control.record_reads() - record_reads_before;
+        let cursor_probes = meters.cursor_probes.total_cursor_probes() - cursor_probes_before;
+        println!(
+            "readiness probe cost: {elapsed:?}, {hydrations} hydration(s), \
+             {point_reads} spine point read(s), {record_reads} control record read(s), \
+             {cursor_probes} source cursor probe(s)"
+        );
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an admitted hosted reader holding a current authority proof must report ready"
+        );
+        assert_eq!(
+            hydrations, 0,
+            "the probe hydrated the durable spine cache. Establishing authority is what \
+             the publication and rollout paths do; a probe reports it."
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "readiness took {elapsed:?} for {point_reads} spine point reads, {record_reads} \
+             control record reads and {cursor_probes} source cursor probes. The kubelet \
+             allows 3 s on the startup probe and 1 s on the readiness probe, and ten \
+             cursor probes served in series would cost 2 s of that on their own."
+        );
+        assert!(
+            point_reads <= 4 && record_reads <= 4 && cursor_probes <= 12,
+            "the probe made {point_reads} spine point reads, {record_reads} control record \
+             reads and {cursor_probes} source cursor probes. Two complete bundle \
+             observations of one heads read and one cursor read per repository, plus the \
+             admission, runtime-authority and active-fence reads taken on BOTH sides of \
+             that bundle, is the whole budget; anything past it is a read nobody \
+             accounted for."
+        );
+    }
+
+    /// Cheap is not the same as permissive: an active rollout still refuses.
+    #[tokio::test]
+    async fn a_hosted_readiness_probe_refuses_while_a_rollout_holds_the_fleet() {
+        let (state, _store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK,
+            "the fixture must be ready first, or the refusal below proves nothing"
+        );
+
+        let control = Arc::clone(
+            state
+                .publication_control
+                .as_ref()
+                .expect("the hosted fixture carries publication control"),
+        );
+        control
+            .acquire_rollout(crate::publication_lease::AcquireRolloutLeaseRequest {
+                scope: control.scope().to_string(),
+                repositories: control.fleet_repositories().to_vec(),
+                previous_repositories: None,
+                holder: "readiness-rollout-honesty".to_string(),
+                request_id: "readiness-rollout-honesty-1".to_string(),
+                ttl_seconds: crate::publication_lease::DEFAULT_ROLLOUT_LEASE_SECONDS,
+                bootstrap_reader: None,
+            })
+            .expect("acquire a rollout over the admitted fleet");
+
+        assert_eq!(
+            call_readiness_handler(state).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a pod whose fleet authority is being rolled must not report ready; the \
+             cached proof it holds is exactly the one the rollout is replacing"
+        );
+    }
+
+    /// Something has to keep the proof current once the probe stops doing it.
+    #[tokio::test]
+    async fn readiness_starts_the_background_hosted_spine_authority_refresh() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        // Production sleeps a minute between passes. A test cannot wait that
+        // long, and waiting would prove nothing the interval itself decides.
+        state.set_hosted_spine_refresh_interval_for_test(Duration::from_millis(50));
+        let hydrations_before = store.hydration_reads();
+
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while store.hydration_reads() == hydrations_before && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            store.hydration_reads() > hydrations_before,
+            "no background pass re-proved the hosted spine authority. Without one, a \
+             reader that nobody queries proves its authority once, at admission, and \
+             never learns that a sibling published."
+        );
+    }
+
+    // ── A cheap answer is still an exact one ──────────────────────────────
+    //
+    // FIR-3255, second round. An independent source review found that reusing a
+    // cached proof on the strength of the reader admission, the rollout fence
+    // and the fleet's NAMES is weaker than the baseline it replaced. An ordinary
+    // publication lease advances a committed head while the admitted rollout
+    // evidence stays exactly where it is, so a proof built against a superseded
+    // generation passes every one of those checks. And a failed revalidation
+    // left the previous proof installed, so a process that had already
+    // determined its authority was invalid went on certifying reads from it.
+    //
+    // These three are the review's three shapes.
+
+    /// A source publication that moves past the proof must refuse.
+    #[tokio::test]
+    async fn a_hosted_readiness_probe_refuses_a_repository_whose_source_advanced() {
+        let (state, _store, backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK,
+            "the fixture must be ready first, or the refusal below proves nothing"
+        );
+
+        // Everything the cheap path used to check stays exactly as it is: the
+        // reader admission, the rollout fence evidence, the active Firestore
+        // fence and the fleet's names. Only one repository's source publication
+        // moves, and its committed spine head stays at the old cursor.
+        advance_repo_source_publication(&backend_root, "kin-db");
+
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a proof built against a superseded generation must not certify readiness. \
+             The rollout fence does not move for an ordinary publication, so nothing \
+             but the repository's own durable identity can catch this."
+        );
+        assert!(
+            state.ensure_spine().is_none(),
+            "and the full pass must agree: a repository whose source cursor is ahead of \
+             its committed spine head cannot be proved, so the refusal above is the \
+             cheap path reaching the same verdict the expensive one does"
+        );
+    }
+
+    /// A failed authority pass must refuse until one succeeds.
+    ///
+    /// The failure is inside the pass itself and every durable identity stays
+    /// exactly where it is, so the identity binding above cannot catch this
+    /// one. Only invalidating the proof the failed pass was revalidating can.
+    #[tokio::test]
+    async fn a_hosted_readiness_probe_refuses_after_the_authority_proof_fails() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK
+        );
+
+        store.fail_next_hydration();
+        assert!(
+            state.ensure_spine().is_none(),
+            "the authority pass must fail, or this test proves nothing about what \
+             readiness does after it fails"
+        );
+
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a process that has already determined it cannot revalidate its authority \
+             must not answer ready from the proof that pass was revalidating"
+        );
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "and it must keep refusing, not recover by being asked twice"
+        );
+
+        // Repair. One successful pass installs a proof again and readiness
+        // comes back, which is what makes the refusal above a hold rather than
+        // a permanent fault.
+        assert!(
+            state.ensure_spine().is_some(),
+            "the pass must succeed once the injected failure is spent"
+        );
+        assert_eq!(
+            call_readiness_handler(state).await,
+            StatusCode::OK,
+            "readiness must return as soon as a pass succeeds"
+        );
+    }
+
+    /// A rollout that begins WHILE the bundle is read must refuse.
+    ///
+    /// The heads and the cursors do not move here, so both bundle observations
+    /// agree and the identity comparison passes. Only re-reading the control
+    /// authority after the bundle can catch it.
+    #[tokio::test]
+    async fn a_hosted_readiness_probe_refuses_a_fence_that_moves_during_the_bundle() {
+        let (state, store, _backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK,
+            "the fixture must be ready first, or the refusal below proves nothing"
+        );
+
+        let fake = Arc::clone(&store.inner);
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let armed = Arc::clone(&fired);
+        store.on_head_read(Box::new(move || {
+            if armed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            // Between the probe's two bundle observations: advance the durable
+            // rollout fence's revision and nothing else.
+            let mut fence = fake.rollout_fence_state.lock().unwrap();
+            if let Some((revision, _)) = fence.as_mut() {
+                *revision += 1;
+            }
+        }));
+
+        assert_eq!(
+            call_readiness_handler(state).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the control authority moved while the identity bundle was being read, and a \
+             probe that reads it only before the bundle answers through exactly that"
+        );
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the hook never ran, so nothing moved and this test proved nothing"
+        );
+    }
+
+    /// An admission that lapses WHILE the bundle is read must refuse.
+    #[tokio::test]
+    async fn a_hosted_readiness_probe_refuses_an_admission_lost_during_the_bundle() {
+        let (state, _store, _backend_root, meters, _environment) =
+            admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK,
+            "the fixture must be ready first, or the refusal below proves nothing"
+        );
+
+        // The probe reads the control record twice before the bundle, for the
+        // admission and the runtime authority. Serve exactly those two and
+        // refuse everything after, which is the post-bundle pair.
+        meters.control.refuse_record_reads_past(2);
+
+        assert_eq!(
+            call_readiness_handler(state).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a probe whose durable admission stopped answering while it read the identity \
+             bundle must not report ready on the strength of the read it made first"
+        );
+    }
+
+    /// A refresh in flight must not become a licence to certify.
+    ///
+    /// Hydration replaces the whole cached index before the proof that follows
+    /// it can fail, so between those two points the process holds a new cache
+    /// beside an old proof whose fleet names still match. A probe in that window
+    /// must answer from durable identity, not from the names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hosted_readiness_probe_refuses_while_a_failing_refresh_holds_the_cache() {
+        let (state, store, backend_root, _meters, _environment) =
+            admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK
+        );
+
+        advance_repo_source_publication(&backend_root, "kin-db");
+        // Long enough that the probe below lands inside the hydration rather
+        // than after the pass has finished and cleared the proof.
+        store.charge_each_hydration(Duration::from_secs(3));
+        let refreshing = Arc::clone(&state);
+        let pass = tokio::task::spawn_blocking(move || refreshing.ensure_spine().is_some());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let probed = call_readiness_handler(Arc::clone(&state)).await;
+        let proved = pass.await.expect("the authority pass must not panic");
+
+        assert_eq!(
+            probed,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the probe answered ready while a refresh held a replaced cache beside a \
+             proof for a generation that had already been superseded"
+        );
+        assert!(
+            !proved,
+            "the pass itself must fail, or the window under test never existed"
         );
     }
 

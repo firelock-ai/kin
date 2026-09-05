@@ -672,32 +672,42 @@ class Suite(object):
             else:
                 print("kin-brownfield-repro: fixture %s: no npm on PATH; "
                       "require() targets will not resolve" % name)
+        self.fixtures[name] = path
         rc, out, err = self.kin_run(["init", "."], path)
         if rc != 0:
             raise ProbeError("kin init failed in %s: %s" % (path, (err or out)[-300:]))
-        self.fixtures[name] = path
         return path
 
     def shutdown(self):
-        """Stop the per-fixture daemons this run started.
-
-        Each fixture is a throwaway repository, so its daemon has nothing to serve
-        once the run ends; leaving them alive leaks one process per fixture per run
-        and holds the fixture's files against removal.
-        """
-        stopped = []
+        """Ask the product to stop and retire each fixture's current worker."""
+        res = Result("cleanup", "CLEANUP", "fixture workers stopped and endpoints retired")
+        if not self.fixtures:
+            res.ok("no fixtures were created")
         for path in self.fixtures.values():
-            pid_file = os.path.join(path, ".kin", "daemon.pid")
-            if not os.path.exists(pid_file):
+            # Without this boundary, repo discovery could select a parent repo.
+            if not os.path.isfile(os.path.join(path, ".kin", "manifest.json")):
+                res.bad("%s: fixture manifest missing; stop was not attempted" % path)
                 continue
             try:
-                with open(pid_file) as handle:
-                    pid = int(handle.read().strip())
-                os.kill(pid, 15)
-                stopped.append(pid)
-            except (ValueError, OSError):
-                continue
-        return stopped
+                rc, out, err = self.kin_run(["daemon", "stop", "--json"], path, timeout=60)
+                report = json.loads(out) if rc == 0 else {}
+                stopped = report.get("stopped") if isinstance(report, dict) else None
+                succeeded = (rc == 0 and isinstance(stopped, list)
+                             and report.get("schema") == "kin.daemon-stop.v1"
+                             and report.get("scope") == "current-repo"
+                             and report.get("all_stopped") is True
+                             and report.get("endpoints_retired", not stopped) is True
+                             and all(isinstance(row, dict)
+                                     and row.get("result") in ("stopped", "not-running")
+                                     and "preserved_endpoint" not in row for row in stopped))
+                detail = "%s: kin daemon stop --json rc=%s; %s %s" % (path, rc, out.strip(), err.strip())
+                if succeeded:
+                    res.ok(detail)
+                else:
+                    res.bad(detail)
+            except Exception as exc:
+                res.bad("%s: cooperative stop failed: %s: %s" % (path, type(exc).__name__, exc))
+        return res
 
     # ------------------------------------------------------------ status probes
 
@@ -2374,46 +2384,52 @@ def main(argv):
             prior = None
 
     results = []
-    for check_id, fn in CHECKS:
-        if wanted and check_id not in wanted:
-            continue
-        try:
-            res = fn(suite)
-        except ProbeError as exc:
-            res = Result(check_id, "?", "probe failure")
-            res.unknown(str(exc)[:300])
-        except Exception as exc:
-            res = Result(check_id, "?", "harness failure")
-            res.unknown("%s: %s" % (type(exc).__name__, str(exc)[:300]))
-        # A check that falls off its own end returns None, and None then blows up
-        # three stages later on an attribute nobody can trace back to the check
-        # that caused it. Measured: a rebase moved one check's `return res` onto
-        # the next check's tail, `--only 10` ran the surviving one and stayed
-        # green, and the full run died in the reporter with a traceback naming
-        # the reporter. Name the check instead, and never report it as a pass.
-        if res is None:
-            res = Result(check_id, "?", "harness failure")
-            res.unknown("check_%s returned no Result, so it fell off its own "
-                        "end; a check that reports nothing is never a pass"
-                        % check_id)
-        results.append(res)
-        res.prior = None if prior is None else prior.get(res.id)
-        res.trend = trend_of(res.status, res.prior)
-        marker = res.status
-        if res.trend == "regression":
-            marker = "%s REGRESSION-from-%s-in-%s" % (res.status, res.prior, prior_label)
-        elif res.trend == "fixed":
-            marker = "%s fixed-since-%s" % (res.status, prior_label)
-        elif res.trend == "unknown":
-            marker = "%s trend-unknown" % res.status
-        print("CHECK %s %s %s %s" % (res.id, res.ticket, marker, res.detail))
-        if opts.verbose:
-            for a in res.asserts:
-                print("      %-11s %s" % (a["status"], a["detail"]))
+    try:
+        for check_id, fn in CHECKS:
+            if wanted and check_id not in wanted:
+                continue
+            try:
+                res = fn(suite)
+            except ProbeError as exc:
+                res = Result(check_id, "?", "probe failure")
+                res.unknown(str(exc)[:300])
+            except Exception as exc:
+                res = Result(check_id, "?", "harness failure")
+                res.unknown("%s: %s" % (type(exc).__name__, str(exc)[:300]))
+            # A check that falls off its own end returns None, and None then blows up
+            # three stages later on an attribute nobody can trace back to the check
+            # that caused it. Measured: a rebase moved one check's `return res` onto
+            # the next check's tail, `--only 10` ran the surviving one and stayed
+            # green, and the full run died in the reporter with a traceback naming
+            # the reporter. Name the check instead, and never report it as a pass.
+            if res is None:
+                res = Result(check_id, "?", "harness failure")
+                res.unknown("check_%s returned no Result, so it fell off its own "
+                            "end; a check that reports nothing is never a pass"
+                            % check_id)
+            results.append(res)
+            res.prior = None if prior is None else prior.get(res.id)
+            res.trend = trend_of(res.status, res.prior)
+            marker = res.status
+            if res.trend == "regression":
+                marker = "%s REGRESSION-from-%s-in-%s" % (res.status, res.prior, prior_label)
+            elif res.trend == "fixed":
+                marker = "%s fixed-since-%s" % (res.status, prior_label)
+            elif res.trend == "unknown":
+                marker = "%s trend-unknown" % res.status
+            print("CHECK %s %s %s %s" % (res.id, res.ticket, marker, res.detail))
+            if opts.verbose:
+                for a in res.asserts:
+                    print("      %-11s %s" % (a["status"], a["detail"]))
 
-    stopped = suite.shutdown()
-    if stopped:
-        print("kin-brownfield-repro: stopped %d fixture daemon(s)" % len(stopped))
+    finally:
+        cleanup = suite.shutdown()
+        if not results:
+            selection = Result("selection", "HARNESS", "no acceptance check ran")
+            selection.bad("the check selection produced no results")
+            results.append(selection)
+        results.append(cleanup)
+        print("CHECK %s %s %s %s" % (cleanup.id, cleanup.ticket, cleanup.status, cleanup.detail))
 
     failed = [r for r in results if r.status == FAIL]
     unread = [r for r in results if r.status == UNREADABLE]
@@ -2442,8 +2458,10 @@ def main(argv):
                       handle, indent=2)
         print("kin-brownfield-repro: json %s" % opts.json_out)
 
-    if not opts.keep and not opts.workdir:
+    if cleanup.status == PASS and not opts.keep and not opts.workdir:
         shutil.rmtree(workdir, ignore_errors=True)
+    elif cleanup.status != PASS:
+        print("kin-brownfield-repro: cleanup failed; run root kept at %s" % workdir)
 
     if failed:
         return 1

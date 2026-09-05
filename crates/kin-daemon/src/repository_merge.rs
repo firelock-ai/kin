@@ -95,9 +95,13 @@ fn merge_enrichment(
 /// Settle the graph a merge just published: record what its relation set now
 /// holds, and converge the enrichment the merged tree implies.
 ///
-/// Called from both publication paths, because a merge settled through
-/// `kin resolve --continue` publishes the same kind of graph as one that
-/// composed cleanly and was missing the same edges.
+/// Called from both top-level executors, `execute` and `execute_resolve`,
+/// because a merge settled through `kin resolve --continue` publishes the same
+/// kind of graph as one that composed cleanly and was missing the same edges.
+/// From the executors and not from the publication paths beneath them, because
+/// the merged entity and relation table is installed by
+/// `finalize_local_repository_commit`, which the executors call after the
+/// publication returns; see the comment at that call site.
 ///
 /// The census is recorded for the reason the commit path records one: the
 /// relation set just moved and this process knows it finished, which is what
@@ -112,21 +116,41 @@ fn merge_enrichment(
 /// variant, and a store stamped with one reads as unreadable to any build that
 /// predates it, which trades a labelling nicety for a window where no lost kind
 /// can be detected at all.
-fn settle_merged_graph(state: &DaemonState) -> Option<String> {
+pub(crate) fn settle_merged_graph(state: &DaemonState) -> Option<String> {
     crate::background_work::record_relation_census(
         &state.layout,
         &state.graph,
         kin_core::relation_census::CensusSource::Commit,
     );
-    match merge_enrichment(
+    let enrichment = merge_enrichment(
         state.filesystem_reconcile_disabled(),
         crate::api::enrichment_unavailable_reason_for(state),
-    ) {
+    );
+    if !matches!(enrichment, MergeEnrichment::Silent) {
+        // Retired before the sweep is asked for, so the pass that answers this
+        // merge sees the retirement rather than skipping the files it names.
+        // Retired on the announcing row too: the evidence is equally stale
+        // there, and the sweep the line tells a reader to run is the one that
+        // would otherwise skip everything and report full coverage.
+        crate::daemon::retire_enrichment_evidence_for_merge(state);
+    }
+    match enrichment {
         MergeEnrichment::Sweep => {
-            // `false` here means a sweep is already running, which covers this
-            // merge as well as one queued now would.
-            state.queue_lsp_sweep();
-            None
+            if state.request_lsp_sweep_after_merge() {
+                return None;
+            }
+            // Not "a sweep is already running", which is the answer
+            // `queue_lsp_sweep` gives and which this used to read as coverage.
+            // `request_lsp_sweep_after_merge` records that case as demand the
+            // worker drains, so a `false` here is a channel that can never
+            // deliver: nothing later converges this graph on its own.
+            Some(
+                "Cross-file enrichment could not be queued for this merge (this daemon's \
+                 enrichment worker is not accepting work), so the merged graph holds only the \
+                 edges the two branches already carried; restart the daemon and run \
+                 `kin daemon sweep`"
+                    .to_string(),
+            )
         }
         MergeEnrichment::Silent => None,
         MergeEnrichment::Announce(line) => Some(line),
@@ -144,6 +168,16 @@ const RENDERED_CONFLICT_LIMIT: usize = 25;
 
 pub(crate) struct MergeExecution {
     response: MergeResponse,
+    /// Whether this execution published a merged graph.
+    ///
+    /// False for a merge that parked its conflicts. A parked merge writes a
+    /// merge transaction record and finalizes like any other repository
+    /// transition, so it reaches the same executor, but it composed no merged
+    /// entity and relation table and there is nothing about it to settle: a
+    /// census recorded there would describe the unmerged graph, and retiring
+    /// every file's enrichment evidence would cost a full re-derivation for a
+    /// merge that published nothing.
+    pub(crate) published_merged_graph: bool,
     /// Present only when the merge was published by `kin resolve --continue`,
     /// whose caller answers on the resolve wire rather than the merge one.
     pub(crate) resolve_response: Option<kin_cli::commands::resolve::ResolveResponse>,
@@ -264,7 +298,7 @@ pub(crate) fn execute(
         .map_err(|refusal| CommandRefusal::before_write(merge_bind_refusal(refusal)))?;
     let outcome = plan_and_publish(state, &authority, request)
         .map_err(|error| CommandRefusal::before_write(classify_merge_error(error)))?;
-    let execution = match outcome {
+    let mut execution = match outcome {
         MergeCommandOutcome::Commit(execution) => execution,
         MergeCommandOutcome::ReadOnly(response) => {
             drop(persistence);
@@ -302,6 +336,27 @@ pub(crate) fn execute(
     }
     if !finalization.graph_changed {
         state.invalidate_projection();
+    }
+
+    // Settled HERE, not inside the publication path, and the difference is the
+    // whole of what the record means. `plan_and_publish` installs the merge's
+    // immutable changes into the live query graph, which is history and
+    // revision lineage; the merged entity and relation table arrives only when
+    // `finalize_local_repository_commit` above derives the live correction and
+    // applies it. A census taken before that call carries this merge's
+    // timestamp and source over a reading of the PREVIOUS relation set, so
+    // every later comparison is judged against a baseline that never held the
+    // merge, and a kind this merge introduced can disappear without the store
+    // ever having recorded that it existed. The sweep is queued from here for
+    // the same reason: the worker snapshots every entity once when it starts,
+    // so one queued against the pre-finalization graph can snapshot old
+    // entities. Still inside the persistence and graph-authority locks, so no
+    // other command moves the graph between the finalization and this reading.
+    //
+    // A parked merge reaches here too. It finalizes like any other repository
+    // transition, and it composed no merged graph, so it settles nothing.
+    if execution.published_merged_graph {
+        execution.response.lines.extend(settle_merged_graph(state));
     }
 
     drop(persistence);
@@ -1437,8 +1492,6 @@ pub(crate) fn publish_resolved_merge(
         })?;
     }
 
-    let settled = settle_merged_graph(state);
-
     let resolved_count = terminated.entries.len();
     let report = kin_cli::commands::resolve::ResolveReport {
         schema: kin_cli::commands::resolve::RESOLVE_REPORT_SCHEMA.to_string(),
@@ -1454,6 +1507,7 @@ pub(crate) fn publish_resolved_merge(
     };
     let previous_tree = workspace.tree.clone();
     Ok(MergeExecution {
+        published_merged_graph: true,
         response: MergeResponse::default(),
         resolve_response: Some(kin_cli::commands::resolve::ResolveResponse {
             lines: {
@@ -1468,7 +1522,6 @@ pub(crate) fn publish_resolved_merge(
                     receipt.generation
                 )];
                 lines.extend(projections);
-                lines.extend(settled);
                 lines
             },
             mutated: matches!(receipt.outcome, RepositoryCommitOutcome::Committed),
@@ -2686,7 +2739,6 @@ fn publish(
             bail!("a parked merge must not reach the workspace publication path")
         }
     };
-    let settled = settle_merged_graph(state);
     let report = MergeReport {
         schema: MERGE_REPORT_SCHEMA.to_string(),
         authority: "repository-v6".to_string(),
@@ -2705,8 +2757,7 @@ fn publish(
         relation_delta_count: 0,
         tree_delta_count: 0,
     };
-    let mut lines = vec![line];
-    lines.extend(settled);
+    let lines = vec![line];
     Ok(MergeExecution {
         resolve_response: None,
         response: MergeResponse {
@@ -2717,6 +2768,7 @@ fn publish(
             authority_generation: Some(receipt.generation),
             idempotent: matches!(receipt.outcome, RepositoryCommitOutcome::IdempotentReplay),
         },
+        published_merged_graph: true,
         receipt,
         authority_freeze,
         daemon_delta,
@@ -2835,6 +2887,7 @@ fn open_conflicted_merge(
             authority_generation: Some(receipt.generation),
             idempotent: matches!(receipt.outcome, RepositoryCommitOutcome::IdempotentReplay),
         },
+        published_merged_graph: false,
         receipt,
         authority_freeze,
         daemon_delta: TransactionDelta::default(),
@@ -4447,6 +4500,263 @@ mod tests {
             census_path.exists(),
             "a merge moves the relation set and knows it finished, so it records the baseline \
              the next comparison is judged against, exactly as a commit does"
+        );
+    }
+
+    /// FIR-3242. A merge admitted while a sweep is running still gets a sweep.
+    ///
+    /// `queue_lsp_sweep` returns false while one is running, and this helper
+    /// read that as "an existing sweep covers this merge as well as one queued
+    /// now would". It does not. The running pass lists every entity and builds
+    /// its file grouping and its target index once at the top of the `Sweep`
+    /// arm, before this merge existed, so it cannot visit a file or reach an
+    /// endpoint the merge introduced, and finishing only cleared the running
+    /// flag. One sweep at a time is still right: a caller waits on
+    /// `lsp_sweeps_completed`, so two passes queued over one graph let a waiter
+    /// see the first finish and return over a graph the second is still
+    /// mutating. What the merge needs is for its demand to outlive that pass.
+    #[test]
+    fn a_merge_admitted_while_a_sweep_runs_gets_one_after_that_sweep_ends() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let (state, mut rx) = enriching_state(init.layout.clone());
+        state
+            .lsp_sweep_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            settle_merged_graph(&state),
+            None,
+            "a daemon that can enrich converges silently, running pass or not"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "and one sweep at a time still holds: nothing is queued beside the pass already \
+             running, because a waiter would see the wrong one of the two finish"
+        );
+
+        crate::daemon::complete_lsp_sweep(&state, 0);
+
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::state::LspEnrichmentMessage::Sweep)),
+            "the running pass could not see this merge, so ending it has to hand the worker the \
+             merge's own sweep; before this the request was dropped on the floor and the merged \
+             tree waited for a command nobody knew"
+        );
+    }
+
+    /// FIR-3242. A merge whose enrichment worker is gone names the gap.
+    ///
+    /// `queue_lsp_sweep` matched only `TrySendError::Full`, so a channel whose
+    /// receiver a supervisor halt had already dropped fell through to `true`,
+    /// and the merge published the silent convergence that never happened.
+    /// `lsp_enrichment_tx.is_some()` cannot see this: it establishes that a
+    /// sender exists, not that anything is left to receive. A closed channel is
+    /// the case where no later pass repairs the gap on its own, which is
+    /// exactly the row that has to speak.
+    #[test]
+    fn a_merge_whose_enrichment_worker_is_gone_names_the_gap_rather_than_reporting_convergence() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let (state, rx) = enriching_state(init.layout.clone());
+        drop(rx);
+
+        let Some(line) = settle_merged_graph(&state) else {
+            panic!("a merge with nothing left to run its sweep must not publish that gap quietly");
+        };
+        assert!(
+            line.contains("kin daemon sweep"),
+            "and it names its own recovery, which is the whole value of the line: {line}"
+        );
+    }
+
+    /// FIR-3242. A merge retires the enrichment evidence its own sweep skips.
+    ///
+    /// The marker means "the enrichment for this file is durable", and the
+    /// sweep skips a marked file before it asks a language server anything.
+    /// A merge makes that claim false for files nothing edited: the shape the
+    /// measurement's round 4 drove is a caller on one branch and its callee on
+    /// the other, so the caller's file is unchanged by the merge, was
+    /// legitimately marked when it was swept, and gains through the merge an
+    /// edge no pass before it could derive. Only the two reconcile paths retire
+    /// a marker, and a merge is neither, so the sweep the merge queues skips
+    /// the file and reports full coverage over work it did not do.
+    ///
+    /// Retiring costs that sweep one re-derivation and is the cheap direction
+    /// to be wrong in, the same asymmetry `load_lsp_enriched_marker` and
+    /// `retire_enrichment_marker` are already built on: a wrong skip is silent
+    /// and loses the answers, a wrong re-sweep only costs time.
+    #[test]
+    fn a_merge_retires_the_enrichment_evidence_its_own_sweep_would_skip() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let (state, _rx) = enriching_state(init.layout.clone());
+        crate::daemon::mark_files_enriched(
+            &state,
+            &["ledger/printing.py".to_string()],
+            crate::daemon::current_marker_epoch(&state),
+        );
+        assert!(
+            crate::daemon::file_already_enriched(&state, "ledger/printing.py"),
+            "the fixture has to start marked, or the assertion below proves nothing"
+        );
+
+        settle_merged_graph(&state);
+
+        assert!(
+            !crate::daemon::file_already_enriched(&state, "ledger/printing.py"),
+            "a file the merge did not touch can still have gained a cross-file edge through it, \
+             and a sweep that skips the file cannot derive one; the evidence has to be retired so \
+             the merge's own sweep visits it"
+        );
+    }
+
+    /// FIR-3242. A merge's demand outlives a full channel at the pass tail.
+    ///
+    /// `complete_lsp_sweep` swapped the pending bit to false and then threw
+    /// away what `queue_lsp_sweep` answered, and `queue_lsp_sweep` answers
+    /// false for a FULL channel exactly as it does for a closed one. So a
+    /// bounded queue with anything in it at the moment a pass ends consumed the
+    /// merge's demand and queued nothing, and the merged tree went back to
+    /// waiting for a command nobody knows to type.
+    ///
+    /// The empty-channel row is
+    /// `a_merge_admitted_while_a_sweep_runs_gets_one_after_that_sweep_ends`,
+    /// and it is the control this one is set beside: there the tail queues the
+    /// sweep and clears the bit, and both rows have to hold.
+    #[test]
+    fn a_merge_demand_outlives_a_full_channel_at_the_pass_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let (state, mut rx) = enriching_state(init.layout.clone());
+        state
+            .lsp_sweep_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            state.request_lsp_sweep_after_merge(),
+            "a merge admitted under a running pass is told its sweep is coming, which is the \
+             promise the rest of this test holds the daemon to"
+        );
+
+        // What a busy incremental path leaves behind, and what the tail below
+        // has to send into.
+        let filled = {
+            let tx = state
+                .lsp_enrichment_tx
+                .as_ref()
+                .expect("the fixture's daemon can enrich");
+            let mut filled = 0usize;
+            // Incremental messages, deliberately: a queue full of SWEEPS would
+            // complete one and drain the bit at that tail, which is the path
+            // this test exists to prove is not the only one.
+            while tx
+                .try_send(crate::state::LspEnrichmentMessage::Incremental(
+                    crate::state::LspEnrichmentRequest {
+                        file_id: kin_model::FilePathId::new("ledger/model.py"),
+                        changed_entity_ids: Vec::new(),
+                    },
+                ))
+                .is_ok()
+            {
+                filled += 1;
+            }
+            filled
+        };
+        assert!(
+            filled > 0,
+            "the fixture has to actually fill the queue, or the tail below meets an empty one \
+             and this test is the control instead"
+        );
+
+        crate::daemon::complete_lsp_sweep(&state, 0);
+
+        assert!(
+            state
+                .lsp_sweep_pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the tail could not queue into a full channel, so the demand has to still be \
+             recorded; it was consumed and the failure to place it was thrown away"
+        );
+
+        // And the demand is live rather than merely remembered. The retry that
+        // matters is NOT another sweep completing: with the queue holding
+        // nothing but incremental work, no sweep ever completes, and a demand
+        // only a tail could drain would sit in the bit forever. So this drives
+        // the drain the worker runs at its receive boundary, after it takes a
+        // message and before it blocks again, with no completion at all.
+        state
+            .lsp_sweep_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        rx.try_recv().expect("the worker takes one message");
+        crate::daemon::drain_pending_lsp_sweep(&state);
+
+        let mut delivered = false;
+        while let Ok(message) = rx.try_recv() {
+            delivered |= matches!(message, crate::state::LspEnrichmentMessage::Sweep);
+        }
+        assert!(
+            delivered,
+            "the receive boundary has to hand the merge its sweep once the queue has room; a \
+             demand nothing can ever act on is the same defect wearing a bit"
+        );
+        assert!(
+            !state
+                .lsp_sweep_pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "and the bit clears once the sweep is actually placed, or the next boundary queues a \
+             second one"
+        );
+    }
+
+    /// FIR-3242. A pass that started before the merge cannot restore what the
+    /// merge retired.
+    ///
+    /// The worker lists every entity once when it starts, and marks the files
+    /// it finished durable at its tail, and only then completes. A merge that
+    /// lands between those two points retires the marker set, and then that old
+    /// pass's tail marks its own files again, using language-server answers
+    /// taken before the merge existed. The sweep the merge queued then skips
+    /// exactly the files whose cross-file answers the merge changed.
+    ///
+    /// The retirement test beside this one asserts immediately after the settle
+    /// and never reaches the old tail, which is why it stayed green over this.
+    #[test]
+    fn a_pass_that_started_before_the_merge_cannot_restore_what_the_merge_retired() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let (state, _rx) = enriching_state(init.layout.clone());
+        state
+            .lsp_sweep_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let enriched_this_sweep = vec!["ledger/printing.py".to_string()];
+        // What the pass carries from the moment it listed the graph.
+        let started_at = crate::daemon::current_marker_epoch(&state);
+
+        settle_merged_graph(&state);
+
+        // The old pass reaches its tail: it judges its writes durable, marks
+        // what it finished, and only then completes.
+        crate::daemon::mark_files_enriched(&state, &enriched_this_sweep, started_at);
+        crate::daemon::complete_lsp_sweep(&state, 0);
+
+        assert!(
+            !crate::daemon::file_already_enriched(&state, "ledger/printing.py"),
+            "this pass took its answers before the merge existed, so its mark cannot outrank the \
+             merge's retirement; the sweep the merge queued has to visit the file"
+        );
+
+        // The control, and it is the whole reason this rule is a comparison
+        // rather than a refusal: a pass that started AFTER the merge still
+        // records what it finished. Without it the rule above is satisfied by a
+        // marker that never marks anything, which would retire the skip
+        // entirely and re-sweep the store on every pass forever.
+        let after_the_merge = crate::daemon::current_marker_epoch(&state);
+        crate::daemon::mark_files_enriched(&state, &enriched_this_sweep, after_the_merge);
+        assert!(
+            crate::daemon::file_already_enriched(&state, "ledger/printing.py"),
+            "a pass whose answers postdate the merge records them, or the marker has stopped \
+             being a marker"
         );
     }
 

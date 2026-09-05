@@ -31,6 +31,13 @@ the fact; the product's own sentence is what a partner reads. A build that
 stopped emitting the sentence while still dying would pass the second alone,
 and a build that emitted it spuriously would pass the first alone.
 
+`capped_init_no_oom_kill` also requires init to have exited 0 and the cgroup's
+memory.max, read at the start and at the end, to equal the requested --cap.
+A crashed init with zero OOM kills is not a clean run, and a cap this run
+cannot confirm, whether it drifted or was never readable, is not a capped
+run; either fails this check rather than falling through on an unrelated
+oom_kill of 0.
+
 `memory.peak` is reported but NOT graded. On the arm that produced this suite it
 read 13.56 GiB against a 16.00 GiB cap, which is 2.44 GiB below the ceiling on a
 run that was nonetheless killed by the cgroup's own OOM killer, so peak equal to
@@ -121,6 +128,22 @@ def read_cgroup(name):
     if len(numbers) >= 2:
         read["memory.max"], read["memory.peak"] = numbers[0], numbers[1]
     return read
+
+
+MEM_UNITS = {"": 1, "b": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30}
+
+
+def parse_mem_bytes(spec):
+    """Parse a docker --memory value ("16g", "12884901888", ...) to bytes.
+
+    Returns None when the value cannot be parsed. The caller treats that the
+    same as a cap it could not confirm: unreadable, not skipped.
+    """
+    match = re.match(r"^(\d+)([bkmg]?)$", (spec or "").strip().lower())
+    if not match:
+        return None
+    digits, unit = match.groups()
+    return int(digits) * MEM_UNITS[unit]
 
 
 def main(argv):
@@ -216,16 +239,39 @@ def main(argv):
             print("memory.peak %d (%.2f GiB) against memory.max %d (%.2f GiB), reported not graded"
                   % (peak, peak / GIB, end.get("memory.max", 0), end.get("memory.max", 0) / GIB))
 
+        # The requested cap is compared against what the cgroup actually held,
+        # at both ends of the run, rather than trusted from the flag. A value
+        # missing at either read (an unparseable --cap, or a memory.max that
+        # came back unreadable, including cgroup v2's own "max" spelling for
+        # "no limit") makes cap_matches False exactly like a numeric mismatch:
+        # a cap this suite cannot confirm is not a capped run.
+        requested_bytes = parse_mem_bytes(args.cap)
+        cap_at_end = end.get("memory.max")
+        cap_matches = (requested_bytes is not None
+                       and cap["memory.max"] == requested_bytes
+                       and cap_at_end == requested_bytes)
+        result["cap_requested_bytes"] = requested_bytes
+        result["cap_matches_request"] = cap_matches
+
         if oom_kill is None:
             emit("capped_init_no_oom_kill", "UNREADABLE",
                  "memory.events carried no oom_kill field, so no kill count was read")
-        elif oom_kill == 0:
-            emit("capped_init_no_oom_kill", "PASS",
-                 "oom_kill 0 under a %.2f GiB cap read from the cgroup" % (end.get("memory.max", 0) / GIB))
-        else:
+        elif oom_kill != 0:
             emit("capped_init_no_oom_kill", "FAIL",
                  "oom_kill %d under a %.2f GiB cap read from the cgroup; peak %.2f GiB"
                  % (oom_kill, end.get("memory.max", 0) / GIB, (peak or 0) / GIB))
+        elif init.returncode != 0:
+            emit("capped_init_no_oom_kill", "FAIL",
+                 "init exited %d (expected 0) though oom_kill read 0; a failed init is not a pass"
+                 % init.returncode)
+        elif not cap_matches:
+            emit("capped_init_no_oom_kill", "FAIL",
+                 "cgroup memory.max read %r at start and %r at end, does not match the requested "
+                 "cap %s (%r bytes)" % (cap["memory.max"], cap_at_end, args.cap, requested_bytes))
+        else:
+            emit("capped_init_no_oom_kill", "PASS",
+                 "oom_kill 0 under a %.2f GiB cap read from the cgroup, matching the requested %s, "
+                 "init rc 0" % (end.get("memory.max", 0) / GIB, args.cap))
 
         text = init.stdout or ""
         if not text.strip():
