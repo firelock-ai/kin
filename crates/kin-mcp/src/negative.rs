@@ -1351,11 +1351,14 @@ fn locate_ranking_names_nothing(payload: &Value) -> bool {
 
 /// True when locate returned only fallback neighbours for a prose query.
 ///
-/// `all_fallback` is computed over the full retained ranking, so this reads the
-/// producer's observation rather than guessing from one page. A prose query
-/// does not name a symbol whose absence can be checked. The relevant fact is
-/// instead that the ranking has no calibrated floor saying any returned row
-/// answers the concept the caller described.
+/// Two triggers, and neither guesses. `all_fallback` is the producer's verdict
+/// over the full retained ranking, computed before the daemon windows a page.
+/// [`locate_returned_rows_are_all_fallback`] asks the same question of the rows
+/// this response actually returned, which is the only surface the caller can
+/// check, and it is what stops one name hit ranked off the page from certifying
+/// a page of neighbours. A prose query does not name a symbol whose absence can
+/// be checked. The relevant fact is instead that the ranking has no calibrated
+/// floor saying any returned row answers the concept the caller described.
 ///
 /// This gate replaced one that deliberately said the opposite, and that
 /// argument is answered rather than dropped. It held that `all_fallback` fires
@@ -1379,8 +1382,95 @@ fn locate_relevance_unverified(payload: &Value) -> bool {
     let Some(query) = payload.get("query").and_then(Value::as_str) else {
         return false;
     };
-    !query_names_a_symbol(query)
-        && payload.get("all_fallback").and_then(Value::as_bool) == Some(true)
+    if query_names_a_symbol(query) {
+        return false;
+    }
+    payload.get("all_fallback").and_then(Value::as_bool) == Some(true)
+        || locate_returned_rows_are_all_fallback(payload)
+}
+
+/// True when every row THIS RESPONSE returned is a fallback neighbour.
+///
+/// The second trigger, and it exists because `all_fallback` answers a different
+/// question than the one this gate asks. That flag is a verdict over the WHOLE
+/// retained ranking, which is right for [`locate_ranking_names_nothing`]: an
+/// exact name sitting on page two means the ranking did carry the symbol, so
+/// claiming it names nothing would be false. This gate asks how far the rows the
+/// caller RECEIVED can be trusted, and a row the caller never saw establishes
+/// nothing about them.
+///
+/// Measured on express at 798 of 798 embedded. "attach an encoding label to a
+/// media type string" returned eight rows, every one of them a lexical fallback
+/// neighbour scoring 52.05 down to 52.02, and `setCharset`, which does exactly
+/// what the query describes, was not in the ranking at limit 8 or limit 40. The
+/// response certified with a null limiting factor, because one row of the 31 the
+/// ranking held did carry `match_kind: name` (the kinds over that ranking were
+/// text_fallback 28, name 1, semantic 2), so the producer omitted `all_fallback`
+/// and both locate gates read `None`. In the same session a concept query whose
+/// rows were all VECTOR neighbours, scoring 96.28 down to 94.41, was correctly
+/// inconclusive. The answer with the higher scores was qualified and the
+/// 52-point lexical one was certified.
+///
+/// A strict widening: it adds a trigger and removes none, so nothing that fires
+/// today stops firing.
+///
+/// A name match is NOT discounted for resting on an ordinary English word, even
+/// though the row that silenced this gate on express was one. The tool's three
+/// best answers are that shape too: `app.render` for "render a view template
+/// with a layout" and `res.json` for "send a JSON response body to the client"
+/// are both name matches on a plain lowercase token, both first row, both right.
+/// A returned name row IS the calibrated floor a locate response publishes, and
+/// the defect is that a name row the caller cannot see was allowed to stand in
+/// for one. Telling `app.render` from a question's stray word is a ranking
+/// judgment and belongs where ranking is decided.
+fn locate_returned_rows_are_all_fallback(payload: &Value) -> bool {
+    let Some(primary) = crate::budget::primary_collection_for(payload, "semantic_locate") else {
+        return false;
+    };
+    let Some(rows) = payload.get(primary).and_then(Value::as_array) else {
+        return false;
+    };
+    // An empty page is not all-fallback: nothing was returned, so there is
+    // nothing to mistake for an answer, and the empty-window and no-ranked-match
+    // gates are what speak to it. Both `all_fallback` producers state the same
+    // rule, and stating it differently here is how two readings of one question
+    // start disagreeing.
+    !rows.is_empty()
+        && rows
+            .iter()
+            .all(|row| locate_row_names_the_query(row) == Some(false))
+}
+
+/// Whether one returned row carries a name the query used: `None` when the row
+/// reports nothing that answers the question.
+///
+/// Three spellings, one fact. `match_kind` is what the full fused surface and
+/// the cosine arm write, `matched` is what the compact projection writes, and
+/// the compact surface is the one an agent actually receives, so a rule reading
+/// only the first would be absent from every response that matters. Both carry
+/// `LocateMatchKind`'s own serialization, so the two spellings cannot disagree
+/// about a word. `match_evidence.name_match` is the cosine evidence object,
+/// which reports the same fact under its own name and whose `exact` is the value
+/// [`locate_ranking_names_nothing`] already reads.
+///
+/// `None` is a third answer and not a shade of either. A record from a daemon
+/// predating these fields, and a file-granularity row, which carries no match
+/// kind at all because `files[]` is a path roll-up, both land here, and the
+/// caller treats an unanswered row as reason to qualify nothing. That is the
+/// same refusal to guess the page inference above makes, and it is what keeps a
+/// successful file answer out of a gate about entity naming.
+fn locate_row_names_the_query(row: &Value) -> Option<bool> {
+    if let Some(kind) = row
+        .get("match_kind")
+        .or_else(|| row.get("matched"))
+        .and_then(Value::as_str)
+    {
+        return Some(kind == "name");
+    }
+    row.get("match_evidence")
+        .and_then(|evidence| evidence.get("name_match"))
+        .and_then(Value::as_str)
+        .map(|name_match| name_match == "exact")
 }
 
 /// The wire word for the one embedding verdict, so the absence object and the
@@ -2574,9 +2664,9 @@ pub fn negative_for(
                    this ranking publishes no measured relevance floor";
         trustworthy = false;
         trust_reason = format!(
-            "relevance_floor_unmeasured: every ranked row was a fallback neighbour and the \
-             response publishes no calibrated threshold establishing that any row answers the \
-             concept; observed substrate state: {trust_reason}"
+            "relevance_floor_unmeasured: every row this response returned was a fallback \
+             neighbour and the response publishes no calibrated threshold establishing that any \
+             of them answers the concept; observed substrate state: {trust_reason}"
         );
     }
     if tool == "graph_neighborhood" {
@@ -7030,6 +7120,254 @@ mod tests {
             advice.contains("Inspect the returned code")
                 && advice.contains("do not conclude the concept is absent"),
             "{advice}"
+        );
+    }
+    /// One compact fused page in the shape an agent actually receives:
+    /// `project_for_mcp` writes `matched` per row, omits `results` entirely, and
+    /// omits `all_fallback` unless the producer set it.
+    fn compact_fused_page(query: &str, entities: Value, total_ranked: u64) -> Value {
+        json!({
+            "query": query,
+            "granularity": "entity",
+            "routing": "fused-v1",
+            "page": 0,
+            "surface": "compact",
+            "entities": entities,
+            "files": ["lib/application.js", "lib/view.js"],
+            "total_ranked": total_ranked,
+            "next_cursor": "eyJrZXkiOiJsb2NhdGUtcmFua2luZyJ9",
+            "ranked_by": "vector, lexical and graph signals",
+            "semantic_coverage": {
+                "indexed": 798,
+                "total": 798,
+                "pending": 0,
+                "complete": true,
+            },
+        })
+    }
+
+    /// One row of that page. `matched` is `None` for a record from a daemon
+    /// predating the field, which is a state this module must not read as either
+    /// answer.
+    fn compact_locate_row(name: &str, file: &str, score: f64, matched: Option<&str>) -> Value {
+        let mut row = json!({
+            "id": "00000000-0000-0000-0000-0000000000ac",
+            "name": name,
+            "kind": "function",
+            "file": file,
+            "line": 190,
+            "score": score,
+        });
+        if let Some(matched) = matched {
+            row["matched"] = json!(matched);
+        }
+        row
+    }
+
+    /// The eight rows express returned for the concept query in GAP-F, kinds and
+    /// scores as measured.
+    fn gap_f_fallback_rows() -> Value {
+        json!([
+            compact_locate_row(
+                "app.use",
+                "lib/application.js",
+                52.05,
+                Some("text_fallback")
+            ),
+            compact_locate_row(
+                "app.render",
+                "lib/application.js",
+                52.05,
+                Some("text_fallback")
+            ),
+            compact_locate_row(
+                "app.defaultConfiguration",
+                "lib/application.js",
+                52.05,
+                Some("text_fallback"),
+            ),
+            compact_locate_row("View.render", "lib/view.js", 52.03, Some("text_fallback")),
+            compact_locate_row("View.lookup", "lib/view.js", 52.02, Some("text_fallback")),
+            compact_locate_row("View.resolve", "lib/view.js", 52.02, Some("text_fallback")),
+            compact_locate_row(
+                "app.listen",
+                "lib/application.js",
+                52.02,
+                Some("text_fallback")
+            ),
+            compact_locate_row(
+                "app.path",
+                "lib/application.js",
+                52.02,
+                Some("text_fallback")
+            ),
+        ])
+    }
+
+    #[test]
+    fn a_prose_page_of_lexical_neighbours_is_qualified_when_the_named_row_is_off_the_page() {
+        // journey072 GAP-F, on express with the vector index complete at 798 of
+        // 798. The caller asked "attach an encoding label to a media type
+        // string" and received eight lexical neighbours at scores 52.05 down to
+        // 52.02, none of them `setCharset`, which was not in the ranking at any
+        // limit. The response carried NO `all_fallback`, because one row of the
+        // 31 the ranking held did carry `matched: name` (the kinds at limit 40
+        // were text_fallback 28, name 1, semantic 2) and the producer computes
+        // that flag over the whole ranking. So the flag reported a name hit the
+        // caller never saw, both locate gates read `None`, and the answer
+        // certified.
+        //
+        // The rows the caller DID receive publish no calibrated threshold saying
+        // any of them answers the concept, which is the same sentence the
+        // vector-neighbour case below is qualified with.
+        let payload = compact_fused_page(
+            "attach an encoding label to a media type string",
+            gap_f_fallback_rows(),
+            31,
+        );
+        assert!(
+            payload.get("all_fallback").is_none(),
+            "the measured response carried no all_fallback: {payload}"
+        );
+        let negative = negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("a returned page of fallback neighbours may not certify a concept answer");
+        assert_eq!(negative["kind"], json!("relevance_unverified"));
+        assert_eq!(negative["interpretation"], json!("nearest_neighbors_only"));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("relevance_floor_unmeasured"), "{reason}");
+    }
+
+    #[test]
+    fn a_prose_page_whose_returned_rows_name_the_query_stays_unqualified() {
+        // The control that pins the repair's scope, and the reason this gate
+        // must not discount a plain-word name match. All three are prose queries
+        // measured on the same express store, all three answered first row, and
+        // all three name matches rest on an ordinary English token, so a rule
+        // that demanded a symbol-shaped one would refuse to certify the tool's
+        // three best answers.
+        for (query, name, file, score) in [
+            (
+                "render a view template with a layout",
+                "app.render",
+                "lib/application.js",
+                427.00,
+            ),
+            (
+                "send a JSON response body to the client",
+                "res.json",
+                "lib/response.js",
+                453.10,
+            ),
+            ("setCharset", "setCharset", "lib/utils.js", 480.00),
+        ] {
+            let payload = compact_fused_page(
+                query,
+                json!([
+                    compact_locate_row(name, file, score, Some("name")),
+                    compact_locate_row("View.render", "lib/view.js", 52.03, Some("text_fallback")),
+                ]),
+                31,
+            );
+            assert!(
+                negative_for(
+                    "semantic_locate",
+                    &payload,
+                    &semantic_authoritative_envelope()
+                )
+                .is_none(),
+                "a page whose first row carries the name the query used needs no relevance \
+                 caveat: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prose_page_of_vector_neighbours_stays_qualified() {
+        // The other half of GAP-F, measured in the same session: "decide which
+        // proxy addresses may be believed" returned eight rows all
+        // `matched: semantic` at 96.28 down to 94.41, with `all_fallback` set,
+        // and was correctly inconclusive. Widening the gate to read the returned
+        // page may not cost that case its qualifier.
+        let mut payload = compact_fused_page(
+            "decide which proxy addresses may be believed",
+            json!([
+                compact_locate_row("compileTrust", "lib/utils.js", 96.28, Some("semantic")),
+                compact_locate_row("proxyaddr", "lib/utils.js", 94.41, Some("semantic")),
+            ]),
+            2,
+        );
+        payload["all_fallback"] = json!(true);
+        let negative = negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("a vector-neighbour page keeps the qualifier it already had");
+        assert_eq!(negative["kind"], json!("relevance_unverified"));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+    }
+
+    #[test]
+    fn a_prose_page_whose_rows_report_no_match_kind_is_left_alone() {
+        // The refusal to guess, in the one shape that can still produce it: a
+        // daemon predating `matched` publishes rows carrying no kind at all, and
+        // its absent `all_fallback` is then the only statement the response
+        // makes about whether anything was named. Reading those rows as fallback
+        // would qualify an answer on evidence nobody produced, which is the same
+        // refusal the cosine page inference beside it already makes.
+        let payload = compact_fused_page(
+            "attach an encoding label to a media type string",
+            json!([
+                compact_locate_row("app.use", "lib/application.js", 52.05, None),
+                compact_locate_row("View.render", "lib/view.js", 52.03, None),
+            ]),
+            31,
+        );
+        assert!(
+            negative_for(
+                "semantic_locate",
+                &payload,
+                &semantic_authoritative_envelope()
+            )
+            .is_none(),
+            "rows that report no match kind answer nothing about naming: {payload}"
+        );
+    }
+
+    #[test]
+    fn a_prose_file_answer_is_not_qualified_by_the_relevance_gate() {
+        // The symmetry `fused_semantic_locate_payload` built deliberately, kept
+        // here by the refusal to guess rather than by a special case. A file
+        // answer IS the `files[]` roll-up, its rows carry no match kind at all,
+        // and labelling a successful file answer with an entity-naming caveat is
+        // exactly what clearing `all_fallback` at file granularity exists to
+        // prevent.
+        let payload = json!({
+            "query": "attach an encoding label to a media type string",
+            "granularity": "file",
+            "routing": "fused-v1",
+            "page": 0,
+            "total_ranked": 2,
+            "files": [
+                {"path": "lib/utils.js", "score": 52.05, "signals": ["lexical"]},
+                {"path": "lib/response.js", "score": 52.02, "signals": ["lexical"]},
+            ],
+        });
+        assert!(
+            negative_for(
+                "semantic_locate",
+                &payload,
+                &semantic_authoritative_envelope()
+            )
+            .is_none(),
+            "a file answer carries no entity match kinds and must not be read as fallback: \
+             {payload}"
         );
     }
 
