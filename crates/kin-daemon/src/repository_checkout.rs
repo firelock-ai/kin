@@ -841,6 +841,9 @@ fn classify_daemon_checkout_error(
 }
 
 fn checkout_error_for_status(status: StatusCode, error: anyhow::Error) -> CheckoutCommandError {
+    // Every checkout refusal funnels through here, so one call names the
+    // recovery for the whole command rather than four classifiers repeating it.
+    let error = crate::error::name_stranded_endpoint_recovery(error);
     match status {
         StatusCode::BAD_REQUEST => CheckoutCommandError::BadRequest(error),
         StatusCode::CONFLICT => CheckoutCommandError::Conflict(error),

@@ -114,7 +114,7 @@ pub use tree::{
 };
 pub use workspace_carry::{
     plan_workspace_carry, WorkspaceCarry, WorkspaceCarryConflict, WorkspaceCarryConflictKind,
-    WorkspaceCarryPlan,
+    WorkspaceCarryPlan, WorkspaceSemanticCarryRefusal,
 };
 pub use workspace_semantics::diff_workspace_semantics;
 

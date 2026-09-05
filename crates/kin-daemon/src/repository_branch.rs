@@ -1143,13 +1143,38 @@ fn plan_switch_carry(
         &target_state.entities,
         &target_state.relations,
     )
-    .context("plan pending workspace state against the branch being switched to")?
+    .with_context(|| format!("plan pending workspace state against {name}"))?
     {
         kin_core::WorkspaceCarry::Carried(plan) => Ok(Some(plan)),
         kin_core::WorkspaceCarry::Refused(conflicts) => {
             Err(pending_state_conflict(workspace, name, &conflicts, policy))
         }
+        kin_core::WorkspaceCarry::SemanticallyRefused(refusal) => Err(pending_semantics_conflict(
+            workspace, name, &refusal, policy,
+        )),
     }
+}
+
+/// Refuse a switch whose pending graph work the destination cannot take.
+///
+/// The tree-side twin above names each blocked path, because a path is what the
+/// caller edited. This one has no path to name: the pending work is entity and
+/// relation deltas a background pass derived, so it names how many there are and
+/// of what kind. It is a conflict rather than an internal error, which is what
+/// this refusal used to reach clients as, with the graph invariant in the body
+/// and no count anywhere.
+fn pending_semantics_conflict(
+    workspace: &kin_model::WorkspaceState,
+    name: &RefName,
+    refusal: &kin_core::WorkspaceSemanticCarryRefusal,
+    policy: TransitionPolicy,
+) -> anyhow::Error {
+    branch_conflict(format!(
+        "workspace {} cannot move onto {name}: {}, {}",
+        workspace.workspace_id,
+        refusal.reason(),
+        transition_remedy(policy)
+    ))
 }
 
 /// Refuse a switch that would lose pending work, naming every blocked path.
@@ -1183,6 +1208,12 @@ fn pending_state_conflict(
 /// came along, and needs the absorbed case named separately: those paths are
 /// tracked members of the branch now rather than pending work, which is a real
 /// change in what a later commit would publish.
+///
+/// Retired edges are reported for the same reason and are the one clause that is
+/// a loss rather than a move. An edge into a node the transition retired cannot
+/// be read by any query, so keeping it would only hand a dangling endpoint to
+/// the storage layer, but a graph that quietly holds fewer edges than it did is
+/// exactly the thing this product must never do without saying so.
 fn render_carried(plan: &kin_core::WorkspaceCarryPlan) -> String {
     let mut clauses = Vec::new();
     if !plan.carried.is_empty() {
@@ -1197,6 +1228,12 @@ fn render_carried(plan: &kin_core::WorkspaceCarryPlan) -> String {
             "{} pending path(s) already tracked at identical content on this branch: {}",
             plan.absorbed.len(),
             render_paths(&plan.absorbed)
+        ));
+    }
+    if !plan.retired_relations.is_empty() {
+        clauses.push(format!(
+            "{} relation(s) retired because this transition removed an endpoint they pointed at",
+            plan.retired_relations.len()
         ));
     }
     if clauses.is_empty() {
@@ -1380,9 +1417,11 @@ fn preflight_switch_delta(
         ));
     }
     let preflight = kin_db::InMemoryGraph::from_snapshot(state.graph.to_snapshot())
+        .map_err(|error| crate::error::name_stranded_endpoint_recovery(anyhow::Error::new(error)))
         .context("prepare branch-switch daemon graph preflight")?;
     preflight
         .apply_transaction_delta(delta)
+        .map_err(|error| crate::error::name_stranded_endpoint_recovery(anyhow::Error::new(error)))
         .context("apply branch-switch daemon graph preflight")?;
     let snapshot = preflight.to_snapshot();
     if snapshot.resolved_tree != *desired_tree
