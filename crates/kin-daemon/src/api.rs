@@ -236,6 +236,9 @@ pub(crate) struct ProjectionAuthorityCache {
     /// that function at one instant, serialized at 2.2 seconds per open
     /// because an open is O(store).
     admission: std::sync::Mutex<Option<HeldAdmission>>,
+    /// The refs routes' envelope, keyed on the same publication identity as
+    /// every slot above it.
+    ref_metadata: std::sync::Mutex<Option<HeldRefMetadata>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
     load_gate: std::sync::Mutex<()>,
@@ -268,6 +271,21 @@ struct HeldCommandAuthority {
     /// [`HeldProjectionAuthority::published`] and for the same reason.
     published: LocalPublicationIdentity,
     authority: Arc<kin_cli::commands::repository_authority::ActiveRepositoryAuthority>,
+}
+
+/// The repository authority envelope a refs read answers from.
+///
+/// Held as an `Arc` rather than rebuilt, because the envelope carries an
+/// operation log and a receipt per change, so cloning it is O(history) and
+/// paying that per request is the same defect one layer down from the open it
+/// replaces. The hosted arm already hands out `Arc<PersistedRepositoryAuthority>`
+/// out of its generation-bound cache entry; this is the local arm's equivalent.
+#[derive(Clone)]
+struct HeldRefMetadata {
+    /// Read strictly before the authority it came out of was loaded, exactly as
+    /// for [`HeldProjectionAuthority::published`] and for the same reason.
+    published: LocalPublicationIdentity,
+    metadata: Arc<kin_db::PersistedRepositoryAuthority>,
 }
 
 #[derive(Clone)]
@@ -370,10 +388,32 @@ impl ProjectionAuthorityCache {
         });
     }
 
+    fn reuse_ref_metadata(
+        &self,
+        published: &LocalPublicationIdentity,
+    ) -> Option<Arc<kin_db::PersistedRepositoryAuthority>> {
+        lock_recover(&self.ref_metadata)
+            .as_ref()
+            .filter(|held| &held.published == published)
+            .map(|held| Arc::clone(&held.metadata))
+    }
+
+    fn install_ref_metadata(
+        &self,
+        published: LocalPublicationIdentity,
+        metadata: Arc<kin_db::PersistedRepositoryAuthority>,
+    ) {
+        *lock_recover(&self.ref_metadata) = Some(HeldRefMetadata {
+            published,
+            metadata,
+        });
+    }
+
     fn invalidate(&self) {
         *lock_recover(&self.held) = None;
         *lock_recover(&self.query) = None;
         *lock_recover(&self.command) = None;
+        *lock_recover(&self.ref_metadata) = None;
     }
 }
 
@@ -444,6 +484,84 @@ fn projection_repository_authority(
         "projection repository authority loaded"
     );
     Ok(authority)
+}
+
+/// The repository authority envelope a local daemon's refs routes answer from.
+///
+/// Blocking: reads storage metadata and, on a publication change, loads the
+/// complete durable authority. Callers run it on a blocking thread.
+///
+/// This exists because `/repos/{repo_id}/refs` used to reach
+/// [`ActiveApiRepositoryAuthority::open`] directly on every request, and an
+/// open reads the durable publication in full, so the read was proportional to
+/// whole-repository size rather than to the ref set it returns. Measured on
+/// 2026-09-04 against a `kin init` store of firelock-ai/kin itself (2864
+/// changes, 111 refs, a 21685-byte response): ten cold reads had a median of
+/// 39.33 s and ten warm reads on the same daemon a median of 44.63 s, which is
+/// the same distribution because there was nothing to warm into. The hosted
+/// route in front of it refuses at 12 s.
+///
+/// The envelope is cached per durable publication rather than per request, in
+/// the same [`ProjectionAuthorityCache`] and against the same publication
+/// identity as the three authority wrappers beside it, so it inherits their
+/// invalidation contract instead of adding a second one. The label is read
+/// before the load it describes, which at worst costs one spurious reload and
+/// never serves a publication that has moved.
+fn local_repository_ref_metadata(
+    state: &DaemonState,
+) -> Result<Arc<kin_db::PersistedRepositoryAuthority>, (StatusCode, String)> {
+    let backend = state.local_repository_backend().ok_or_else(|| {
+        repository_authority_error("local daemon is missing its startup storage capability")
+    })?;
+    let repository_id = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?
+        .repository_id()
+        .clone();
+    // The pinned-namespace probe runs before the reuse check, exactly as the
+    // three sibling resolvers run it, so a `.kin/kindb` replaced under the
+    // daemon cannot keep being answered from the envelope of the store it
+    // replaced. It decodes no snapshot and takes no repository lock.
+    if let Err(error) = confirm_pinned_projection_namespace(&backend, &repository_id) {
+        state.projection_authority.invalidate();
+        return Err(error);
+    }
+
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(metadata) = state.projection_authority.reuse_ref_metadata(&published) {
+        return Ok(metadata);
+    }
+
+    // The authority open itself is already cached and gated one layer down, so
+    // this reaches a full open only when that slot misses too.
+    let authority = projection_repository_authority(state)?;
+    // Re-check after that open. A burst of concurrent cold requests is
+    // serialized by the gate inside `projection_repository_authority` and then
+    // released one at a time into the clone below, and the clone is O(history);
+    // whoever loses the race takes the envelope the winner installed instead of
+    // cloning a second copy of it.
+    if let Some(metadata) = state.projection_authority.reuse_ref_metadata(&published) {
+        return Ok(metadata);
+    }
+    let metadata = {
+        let lease = authority.manager.read_authority();
+        lease
+            .snapshot()
+            .repository_authority
+            .as_ref()
+            .ok_or_else(|| {
+                (
+                    StatusCode::FAILED_DEPENDENCY,
+                    "snapshot has no repository-v6 authority envelope".to_string(),
+                )
+            })?
+            .clone()
+    };
+    let metadata = Arc::new(metadata);
+    state
+        .projection_authority
+        .install_ref_metadata(published, Arc::clone(&metadata));
+    Ok(metadata)
 }
 
 /// Resolve the repository-v6 authority the MCP query tools read source from.
@@ -14855,6 +14973,19 @@ async fn repository_ref_metadata(
             });
     }
 
+    // The daemon's own repository answers from the publication-keyed cache. Any
+    // other id falls through to the snapshot path, which is where the refusal
+    // that names the served identity lives.
+    if repo_id == state.cached_repo_id {
+        // `block_in_place` rather than an inline call, because a publication
+        // change still pays a full open here and this route is reached from the
+        // async request path; the same wrapper the rest of the daemon uses to
+        // keep liveness answering through a blocking step.
+        return crate::lifecycle::without_blocking_runtime_worker(|| {
+            local_repository_ref_metadata(state)
+        });
+    }
+
     let snapshot = repository_authority_snapshot(state, repo_id).await?;
     Ok(Arc::new(repository_metadata(&snapshot)?.clone()))
 }
@@ -22788,6 +22919,104 @@ mod tests {
         assert!(
             detail.contains("authority envelope"),
             "the refusal must name the missing envelope, got: {detail}"
+        );
+    }
+
+    /// A refs read costs one durable-authority open per publication, not one
+    /// per request (FIR-3180).
+    ///
+    /// `/repos/{repo_id}/refs` reached [`ActiveApiRepositoryAuthority::open`]
+    /// on every request, and an open reads the durable publication in full, so
+    /// the read was proportional to whole-repository size rather than to the
+    /// ref set it returns. Measured on 2026-09-04 against a `kin init` store of
+    /// firelock-ai/kin itself, 2864 changes and 111 refs answering in 21685
+    /// bytes: ten cold reads had a median of 39.33 s and ten warm reads on the
+    /// same daemon a median of 44.63 s, the same distribution because there was
+    /// nothing to warm into. The hosted route in front of it refuses at 12 s.
+    ///
+    /// Two arms, because they fail differently. Reuse proves the slot is
+    /// consulted at all. Invalidation proves it is keyed on the publication
+    /// rather than pinned for the life of the process, which is how this kind
+    /// of cache turns a latency fix into a correctness bug: a refs read that
+    /// keeps answering from the publication before a commit is worse than a
+    /// slow one.
+    ///
+    /// Every response is asserted OK before any count is read. A count that did
+    /// not move reads the same whether reuse worked or every request failed
+    /// early, and only one of those is the property.
+    #[tokio::test]
+    async fn a_refs_read_costs_one_authority_open_per_publication() {
+        let state = test_state();
+        install_repository_file(&state, "src/lib.py", b"def handler():\n    return 1\n");
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let repo_id = state.cached_repo_id.clone();
+        let path = format!("/repos/{repo_id}/refs");
+        let app = router(Arc::clone(&state));
+
+        // Warm the publication once, so the count below measures reuse rather
+        // than the first load every path has to pay.
+        let (status, first) = repo_route(Arc::clone(&state), &path).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the fixture must answer a refs read: {}",
+            String::from_utf8_lossy(&first)
+        );
+        let before = state.projection_authority.loads();
+
+        for call in 1..=8 {
+            let (status, body) = repo_route(Arc::clone(&state), &path).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "reuse call {call} failed: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                body, first,
+                "reuse call {call} returned different bytes at one publication, so the reads \
+                 being counted are not the identical read this covers"
+            );
+        }
+        assert_eq!(
+            state.projection_authority.loads(),
+            before,
+            "eight refs reads at one publication must open the durable authority zero further \
+             times; each open reads the whole publication and re-verifies every CAS body"
+        );
+
+        // A publication moves the identity the slot is keyed on, so the next
+        // read must reload and must answer from the new publication.
+        install_repository_file(&state, "src/next.py", b"def added():\n    return 2\n");
+        commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "publish a second change so the refs slot must invalidate",
+        )
+        .await;
+        // Counted AFTER the commit, not before it. A commit opens authority for
+        // its own reasons, so a count taken before it is satisfied by the
+        // commit's open and says nothing about the read. This one moves only if
+        // the refs read itself reloaded.
+        let after_commit = state.projection_authority.loads();
+        let (status, after) = repo_route(Arc::clone(&state), &path).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the read after a publication must answer: {}",
+            String::from_utf8_lossy(&after)
+        );
+        assert_ne!(
+            after, first,
+            "the refs read after a publication still returns the pre-commit head, so the slot \
+             is pinned rather than keyed on the publication"
+        );
+        assert_eq!(
+            state.projection_authority.loads(),
+            after_commit + 1,
+            "the refs read after a publication must itself reload the authority exactly once"
         );
     }
 
