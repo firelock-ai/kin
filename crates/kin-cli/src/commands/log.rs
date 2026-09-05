@@ -307,7 +307,7 @@ pub async fn run(count: usize, json: bool) -> Result<()> {
                     &response.workspace_tip.unwrap_or(
                         crate::commands::workspace_tip::WorkspaceTip::Unknown {
                             reason: "the daemon that answered this log does not report it; \
-                                 `kin daemon restart` picks up this build"
+                                 `kin daemon stop` and re-run picks it up on this build"
                                 .to_string(),
                         }
                     )
