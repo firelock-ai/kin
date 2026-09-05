@@ -8752,39 +8752,44 @@ mod tests {
         );
     }
 
-    /// A carried path is never a removal, and this is the mechanism rather than
-    /// an assumption.
+    /// A vacated path takes its semantics with it, and this is the mechanism
+    /// rather than an assumption.
     ///
-    /// Ambient admission publishes the tree and no semantics, so vacating a path
-    /// that way would leave the entities that file derived standing over a tree
-    /// that no longer carries it. Repository authority refuses the transaction
-    /// outright, so `publish_workspace_tree` cannot create the state at all. The
-    /// seam that does vacate a path, `commit_session_workspace_admission`,
-    /// derives the retirement through `retire_semantics_on_vacated` and carries
-    /// it in the same transaction. Two independent mechanisms, one conclusion:
-    /// every carried tree delta the MCP commit planner sees is an addition or an
-    /// update, and the only removals that reach a plan are the ones a staged
-    /// `delete` authored, which are not carried.
+    /// Ambient admission publishes the workspace tree, and a tree that stops
+    /// carrying a path has to carry the removal of everything that path owned in
+    /// the same transaction: kin-db refuses a transition that leaves an entity on
+    /// a path the staged tree no longer holds, and it refuses the whole
+    /// transition rather than the one entity. `publish_workspace_tree` derives
+    /// that retirement through `retire_semantics_on_vacated` over authority's own
+    /// workspace snapshot, which is the same rule
+    /// `commit_session_workspace_admission` applies to its own vacated set.
     ///
-    /// That is why `derive_carried_pending_semantics` asserts the invariant
-    /// instead of implementing a retirement, and this is what makes the
-    /// assertion evidence rather than decoration: take either mechanism away and
-    /// a carried removal becomes reachable, so the arm it guards has something
-    /// to guard.
+    /// So a carried removal never reaches the MCP commit planner. By the time it
+    /// plans, the admission has already published the path's departure together
+    /// with its semantics, and every carried tree delta the planner sees is an
+    /// addition or an update; the only removals that reach a plan are the ones a
+    /// staged `delete` authored, which are not carried. That is why
+    /// `derive_carried_pending_semantics` asserts the invariant instead of
+    /// implementing a retirement, and this is what makes the assertion evidence
+    /// rather than decoration.
     ///
-    /// A surviving artifact can move through one `TreeDelta::Updated`. Session
-    /// admission carries its entity relocations in the same transaction; the
-    /// move tests below cover that path through an MCP commit and cold reopen.
+    /// A surviving artifact can move through one `TreeDelta::Updated`, which is
+    /// not a vacancy and is not retired as one; the move tests below cover that
+    /// path through an MCP commit and cold reopen.
+    ///
+    /// Falsify by publishing `WorkspaceSemanticDelta::default()` from
+    /// `publish_workspace_tree`: repository authority refuses the admission and
+    /// the first assertion below fails on that refusal.
     #[test]
-    fn ambient_admission_cannot_vacate_a_path_without_retiring_its_semantics() {
+    fn ambient_admission_vacates_a_path_by_retiring_its_semantics() {
         let (_dir, state) = test_state();
-        install_exact_source(
+        let (kept, _) = install_exact_source(
             &state,
             "src/lib.rs",
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
-        install_exact_source(
+        let (gone, _) = install_exact_source(
             &state,
             "src/other.rs",
             b"pub fn other() -> u8 { 1 }\n",
@@ -8792,26 +8797,38 @@ mod tests {
         );
         let before = load_native_commit_base(&state.layout).unwrap();
 
-        let refusal = admit_pending_working_tree_removal(&state, "src/other.rs")
-            .expect_err("authority must refuse a vacated path whose semantics still stand");
+        admit_pending_working_tree_removal(&state, "src/other.rs")
+            .expect("the admission carries the vacated path's retirement, so authority accepts it");
 
-        let message = refusal.to_string();
-        assert!(
-            message.contains("src/other.rs"),
-            "the refusal must name the path it will not vacate: {message}"
-        );
-        assert!(
-            message.contains("absent from the staged tree"),
-            "the refusal must say what is wrong with the transition: {message}"
-        );
-        assert!(
-            message.contains("carry its exact entity removal or relocation in the same delta"),
-            "the refusal must say what a caller has to carry instead: {message}"
-        );
-        assert_eq!(
+        assert_ne!(
             load_native_commit_base(&state.layout).unwrap().roots,
             before.roots,
-            "no repository authority may move behind a refused admission"
+            "the admission has to move repository authority, or it published nothing at all"
+        );
+
+        let published: Vec<Entity> = {
+            let context = authority_context(&state).unwrap();
+            let workspace_id = context.workspace_id();
+            let authority = context.open().unwrap();
+            let lease = authority.read_authority();
+            lease
+                .workspace_graph_snapshot(&workspace_id)
+                .unwrap()
+                .expect("repository authority holds a workspace graph snapshot")
+                .entities
+                .values()
+                .cloned()
+                .collect()
+        };
+        assert!(
+            !published.iter().any(|entity| entity.id == gone.id),
+            "the vacated path's entity still stands in repository authority, so it answers \
+             queries with nothing in the tree behind it"
+        );
+        assert!(
+            published.iter().any(|entity| entity.id == kept.id),
+            "an untouched sibling lost its entity, so the retirement took more than the path \
+             that vacated"
         );
     }
 

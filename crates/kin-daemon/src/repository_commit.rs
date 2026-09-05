@@ -497,7 +497,7 @@ pub(crate) struct SessionModuleRelocation {
 /// body at both locations and bind modules by exact kind, fingerprint and
 /// source span, never by a guessed basename. This lets the subsequent ordinary
 /// reconciliation retain their IDs even when their parser-owned names change.
-fn plan_session_module_relocations(
+pub(crate) fn plan_session_module_relocations(
     blobs: &kin_blobs::BlobStore,
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     deltas: &[kin_model::TreeDelta],
@@ -1017,6 +1017,57 @@ pub(crate) fn publish_workspace_tree(
     }
 
     let tree_deltas = kin_core::exact_tree_correction(&workspace.tree, desired_tree)?;
+    // An entity may not outlive the path that owns it, and this publication is
+    // the caller that owes the removal. kin-db refuses a transition that leaves
+    // one on a path the staged tree no longer carries, and it refuses the whole
+    // transition rather than the one entity, so a publication that retires a
+    // path repository authority holds entities for carries their removal in the
+    // same delta.
+    //
+    // The set is authority's own, read from authority's own workspace snapshot.
+    // Entities no commit ever published are not here to retire: they live in the
+    // daemon's derived graph, which the watch loop and the purge evict for
+    // themselves after this returns.
+    //
+    // A move is not a vacancy. `exact_tree` plans one as a single `Updated` with
+    // the artifact identity kept and the paths differing, so the entities on the
+    // old path move in this same delta, through the relocation planner the
+    // session admission uses rather than a second copy of the rule. kin-db
+    // refuses a relocation published as a later transaction exactly as it
+    // refuses a stranded entity.
+    let vacated = VacatedPaths::from_deltas(&tree_deltas);
+    let moves = session_artifact_moves(&tree_deltas);
+    let module_relocations = plan_session_module_relocations(blobs, &authority, &tree_deltas)?;
+    let semantic_delta = if vacated.is_empty() && moves.is_empty() {
+        WorkspaceSemanticDelta::default()
+    } else {
+        match lease.workspace_graph_snapshot(&workspace_id)? {
+            Some(snapshot) => {
+                let retirement = retire_semantics_on_vacated(&snapshot, &vacated)?;
+                let mut entities = retirement.entity_deltas().to_vec();
+                if !moves.is_empty() {
+                    let graph = kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)?;
+                    for (from, to) in &moves {
+                        entities.extend(plan_session_entity_relocations(&graph, from, to)?);
+                    }
+                    bind_session_module_relocations(&mut entities, &module_relocations)?;
+                }
+                WorkspaceSemanticDelta::new(entities, retirement.relation_deltas().to_vec())?
+            }
+            // A vacated set with no snapshot to retire from is nothing to carry.
+            // A MOVE with no snapshot is different: the identity is real, this
+            // publication cannot prove it survives, and publishing the tree
+            // anyway would strand it exactly as the missing retirement stranded
+            // a removal. Refusing leaves authority untouched.
+            None if !moves.is_empty() => {
+                return Err(invalid(
+                    "repository authority holds no workspace graph snapshot to relocate a moved \
+                     identity into, so publishing this tree would strand it",
+                ))
+            }
+            None => WorkspaceSemanticDelta::default(),
+        }
+    };
     let mut source_lengths = std::collections::BTreeMap::new();
     let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
         Some(&workspace.shared_admission_policy),
@@ -1089,7 +1140,7 @@ pub(crate) fn publish_workspace_tree(
             new_base_tree_hash: workspace.base_tree_hash,
             tree_deltas: tree_deltas.clone(),
             new_tree_hash: tree_hash,
-            semantic_delta: WorkspaceSemanticDelta::default(),
+            semantic_delta,
             new_shared_admission_policy: shared_policy.clone(),
             new_admission_policy: EffectiveAdmissionPolicyStamp {
                 shared: shared_policy.stamp(),
