@@ -518,6 +518,15 @@ fn local_repository_ref_metadata(
         .map_err(repository_authority_error)?
         .repository_id()
         .clone();
+    // The pinned-namespace probe runs before the reuse check, exactly as the
+    // three sibling resolvers run it, so a `.kin/kindb` replaced under the
+    // daemon cannot keep being answered from the envelope of the store it
+    // replaced. It decodes no snapshot and takes no repository lock.
+    if let Err(error) = confirm_pinned_projection_namespace(&backend, &repository_id) {
+        state.projection_authority.invalidate();
+        return Err(error);
+    }
+
     let published = read_local_publication_identity(&backend, &repository_id)?;
     if let Some(metadata) = state.projection_authority.reuse_ref_metadata(&published) {
         return Ok(metadata);
@@ -526,6 +535,14 @@ fn local_repository_ref_metadata(
     // The authority open itself is already cached and gated one layer down, so
     // this reaches a full open only when that slot misses too.
     let authority = projection_repository_authority(state)?;
+    // Re-check after that open. A burst of concurrent cold requests is
+    // serialized by the gate inside `projection_repository_authority` and then
+    // released one at a time into the clone below, and the clone is O(history);
+    // whoever loses the race takes the envelope the winner installed instead of
+    // cloning a second copy of it.
+    if let Some(metadata) = state.projection_authority.reuse_ref_metadata(&published) {
+        return Ok(metadata);
+    }
     let metadata = {
         let lease = authority.manager.read_authority();
         lease
@@ -22867,6 +22884,11 @@ mod tests {
             "publish a second change so the refs slot must invalidate",
         )
         .await;
+        // Counted AFTER the commit, not before it. A commit opens authority for
+        // its own reasons, so a count taken before it is satisfied by the
+        // commit's open and says nothing about the read. This one moves only if
+        // the refs read itself reloaded.
+        let after_commit = state.projection_authority.loads();
         let (status, after) = repo_route(Arc::clone(&state), &path).await;
         assert_eq!(
             status,
@@ -22874,15 +22896,15 @@ mod tests {
             "the read after a publication must answer: {}",
             String::from_utf8_lossy(&after)
         );
-        assert!(
-            state.projection_authority.loads() > before,
-            "a refs read after a publication must open the authority again rather than serve \
-             the publication before it"
-        );
         assert_ne!(
             after, first,
             "the refs read after a publication still returns the pre-commit head, so the slot \
              is pinned rather than keyed on the publication"
+        );
+        assert_eq!(
+            state.projection_authority.loads(),
+            after_commit + 1,
+            "the refs read after a publication must itself reload the authority exactly once"
         );
     }
 
