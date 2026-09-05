@@ -201,6 +201,8 @@ pub struct PreparedWorkspaceGraphStats {
 /// This exists so the published authority state can reach durable prepared
 /// bytes without carrying the backend's type parameter through every reader.
 trait PreparedWorkspaceGraphStore: Send + Sync {
+    fn load_binding(&self, workspace_id: &str) -> Result<Option<Vec<u8>>, KinDbError>;
+
     fn load(
         &self,
         workspace_id: &str,
@@ -221,6 +223,11 @@ struct BackendPreparedWorkspaceGraphStore<B: StorageBackend + ?Sized + 'static> 
 impl<B: StorageBackend + ?Sized + 'static> PreparedWorkspaceGraphStore
     for BackendPreparedWorkspaceGraphStore<B>
 {
+    fn load_binding(&self, workspace_id: &str) -> Result<Option<Vec<u8>>, KinDbError> {
+        self.backend
+            .load_prepared_workspace_graph_binding(self.repository_id.as_str(), workspace_id)
+    }
+
     fn load(
         &self,
         workspace_id: &str,
@@ -350,6 +357,28 @@ impl PreparedWorkspaceGraphCache {
             );
             return None;
         }
+        match self.store.load_binding(&workspace_id.to_string()) {
+            Ok(Some(bytes)) => {
+                let binding: PreparedWorkspaceGraphBinding = match serde_json::from_slice(&bytes) {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        self.refuse(workspace_id, "binding", &error.to_string());
+                        return None;
+                    }
+                };
+                // The claimed payload digest is not verified by this preflight.
+                // Only the complete pair loaded below can authorize a serve.
+                let expected = self.expected_binding(workspace_id, binding.payload_sha256.clone());
+                if !self.binding_matches(workspace_id, &expected, &binding) {
+                    return None;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.refuse(workspace_id, "artifact", &error.to_string());
+                return None;
+            }
+        }
         let artifact = match self.store.load(&workspace_id.to_string()) {
             Ok(Some(artifact)) => artifact,
             // No artifact yet is an ordinary first open, not a refusal.
@@ -369,6 +398,54 @@ impl PreparedWorkspaceGraphCache {
         };
         let expected =
             self.expected_binding(workspace_id, hex::encode(Sha256::digest(&artifact.payload)));
+        if !self.binding_matches(workspace_id, &expected, &binding) {
+            return None;
+        }
+        // The frame carries its own checksum over its own body, so this
+        // refuses bytes the binding record vouches for but the encoder never
+        // produced, and it revalidates storage admission over the payload.
+        let snapshot = match GraphSnapshot::from_bytes(&artifact.payload) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.refuse(workspace_id, "payload_frame", &error.to_string());
+                return None;
+            }
+        };
+        if snapshot.repository_authority.is_some() {
+            self.refuse(
+                workspace_id,
+                "repository_authority",
+                "prepared query state must not carry a second authority envelope",
+            );
+            return None;
+        }
+        // The invariant materialization asserts about its own output. A
+        // prepared serve has to clear the same bar or it is not the same
+        // answer.
+        if snapshot.resolved_tree != workspace.tree {
+            self.refuse(
+                workspace_id,
+                "resolved_tree",
+                "prepared state does not resolve the workspace's exact persisted tree",
+            );
+            return None;
+        }
+        self.serves.fetch_add(1, AtomicOrdering::SeqCst);
+        tracing::debug!(
+            repository = %self.repository_id,
+            workspace = %workspace_id,
+            generation,
+            "served workspace query state from validated durable bytes"
+        );
+        Some(snapshot)
+    }
+
+    fn binding_matches(
+        &self,
+        workspace_id: &WorkspaceId,
+        expected: &PreparedWorkspaceGraphBinding,
+        binding: &PreparedWorkspaceGraphBinding,
+    ) -> bool {
         // Named one at a time so a refusal is a diagnosis rather than a shrug.
         for (field, held, found) in [
             (
@@ -418,46 +495,10 @@ impl PreparedWorkspaceGraphCache {
                     field,
                     &format!("holding {held}, artifact names {found}"),
                 );
-                return None;
+                return false;
             }
         }
-        // The frame carries its own checksum over its own body, so this
-        // refuses bytes the binding record vouches for but the encoder never
-        // produced, and it revalidates storage admission over the payload.
-        let snapshot = match GraphSnapshot::from_bytes(&artifact.payload) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.refuse(workspace_id, "payload_frame", &error.to_string());
-                return None;
-            }
-        };
-        if snapshot.repository_authority.is_some() {
-            self.refuse(
-                workspace_id,
-                "repository_authority",
-                "prepared query state must not carry a second authority envelope",
-            );
-            return None;
-        }
-        // The invariant materialization asserts about its own output. A
-        // prepared serve has to clear the same bar or it is not the same
-        // answer.
-        if snapshot.resolved_tree != workspace.tree {
-            self.refuse(
-                workspace_id,
-                "resolved_tree",
-                "prepared state does not resolve the workspace's exact persisted tree",
-            );
-            return None;
-        }
-        self.serves.fetch_add(1, AtomicOrdering::SeqCst);
-        tracing::debug!(
-            repository = %self.repository_id,
-            workspace = %workspace_id,
-            generation,
-            "served workspace query state from validated durable bytes"
-        );
-        Some(snapshot)
+        true
     }
 
     /// Record what materialization just produced, best effort.
@@ -8603,6 +8644,10 @@ mod tests {
         snapshot: Mutex<Option<(Vec<u8>, Generation)>>,
         blobs: Mutex<HashMap<[u8; 32], Vec<u8>>>,
         prepared: Mutex<HashMap<String, PreparedWorkspaceGraphArtifact>>,
+        prepared_load_count: AtomicUsize,
+        prepared_payload_bytes_loaded: AtomicUsize,
+        prepared_preflight_unavailable: AtomicBool,
+        prepared_binding_load_hook: Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
         fail_next_snapshot: AtomicBool,
         source_load_count: AtomicUsize,
         verified_batch_behavior: AtomicUsize,
@@ -8946,12 +8991,38 @@ mod tests {
             Ok(())
         }
 
+        fn load_prepared_workspace_graph_binding(
+            &self,
+            _repo_id: &str,
+            workspace_id: &str,
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            if self.prepared_preflight_unavailable.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            let binding = self
+                .prepared
+                .lock()
+                .get(workspace_id)
+                .map(|artifact| artifact.binding.clone());
+            if let Some(hook) = self.prepared_binding_load_hook.lock().take() {
+                hook();
+            }
+            Ok(binding)
+        }
+
         fn load_prepared_workspace_graph(
             &self,
             _repo_id: &str,
             workspace_id: &str,
         ) -> Result<Option<PreparedWorkspaceGraphArtifact>, KinDbError> {
-            Ok(self.prepared.lock().get(workspace_id).cloned())
+            self.prepared_load_count.fetch_add(1, Ordering::SeqCst);
+            let artifacts = self.prepared.lock();
+            let artifact = artifacts.get(workspace_id);
+            if let Some(artifact) = artifact {
+                self.prepared_payload_bytes_loaded
+                    .fetch_add(artifact.payload.len(), Ordering::SeqCst);
+            }
+            Ok(artifact.cloned())
         }
 
         fn record_prepared_workspace_graph(
@@ -17841,8 +17912,14 @@ mod tests {
                 .backend
                 .corrupt_prepared_binding_field(&store.workspace_id, field, corruption);
 
+            store.backend.prepared_load_count.store(0, Ordering::SeqCst);
             let manager = reopen_synthetic(&store);
             let materialized = materialize_through(&manager, &store.workspace_id);
+            assert_eq!(
+                store.backend.prepared_load_count.load(Ordering::SeqCst),
+                usize::from(field == "payload_sha256"),
+                "{field} must be refused at the earliest boundary that can validate it"
+            );
             assert_eq!(
                 manager.prepared_workspace_graph_stats(),
                 PreparedWorkspaceGraphStats {
@@ -17879,8 +17956,14 @@ mod tests {
             .backend
             .install_prepared_artifact(&store.workspace_id, artifact);
 
+        store.backend.prepared_load_count.store(0, Ordering::SeqCst);
         let manager = reopen_synthetic(&store);
         let materialized = materialize_through(&manager, &store.workspace_id);
+        assert_eq!(
+            store.backend.prepared_load_count.load(Ordering::SeqCst),
+            1,
+            "eligible metadata must reach full payload validation"
+        );
         assert_eq!(
             manager.prepared_workspace_graph_stats(),
             PreparedWorkspaceGraphStats {
@@ -17892,6 +17975,80 @@ mod tests {
             "payload bytes the binding does not name are refused before they are decoded"
         );
         assert_workspace_snapshots_identical(&materialized, &fresh);
+    }
+
+    #[test]
+    fn prepared_workspace_state_rechecks_the_pair_after_a_matching_preflight() {
+        let (store, _staged) = build_overlaid_history_store(2, 8, 1, 3);
+        let fresh = materialize_synthetic(&store);
+        materialize_through(&reopen_synthetic(&store), &store.workspace_id);
+        let recorded = store.backend.prepared_artifact(&store.workspace_id);
+
+        for (field, corruption) in [
+            ("generation", serde_json::json!(4_242u64)),
+            (
+                "authority_snapshot_sha256",
+                serde_json::json!(hex::encode(Sha256::digest(b"later authority"))),
+            ),
+        ] {
+            store
+                .backend
+                .install_prepared_artifact(&store.workspace_id, recorded.clone());
+            let backend = Arc::clone(&store.backend);
+            let workspace_id = store.workspace_id;
+            *store.backend.prepared_binding_load_hook.lock() = Some(Box::new(move || {
+                backend.corrupt_prepared_binding_field(&workspace_id, field, corruption);
+            }));
+            store.backend.prepared_load_count.store(0, Ordering::SeqCst);
+            let manager = reopen_synthetic(&store);
+            let materialized = materialize_through(&manager, &store.workspace_id);
+            assert_eq!(
+                store.backend.prepared_load_count.load(Ordering::SeqCst),
+                1,
+                "the initially matching preflight must reach the full load"
+            );
+            assert_eq!(
+                manager.prepared_workspace_graph_stats(),
+                PreparedWorkspaceGraphStats {
+                    serves: 0,
+                    writes: 1,
+                    refusals: 1,
+                    last_refusal: Some(field.to_string()),
+                },
+                "the full pair's {field} must be checked after the binding changes"
+            );
+            assert_workspace_snapshots_identical(&materialized, &fresh);
+
+            let rewritten = reopen_synthetic(&store);
+            let served = materialize_through(&rewritten, &store.workspace_id);
+            assert_eq!(rewritten.prepared_workspace_graph_stats().serves, 1);
+            assert_workspace_snapshots_identical(&served, &fresh);
+        }
+    }
+
+    #[test]
+    fn prepared_workspace_state_uses_the_full_path_without_a_binding_preflight() {
+        let (store, _staged) = build_overlaid_history_store(2, 8, 1, 3);
+        let fresh = materialize_synthetic(&store);
+        materialize_through(&reopen_synthetic(&store), &store.workspace_id);
+        let default_backend = PreparedBlindBackend(Arc::clone(&store.backend));
+        assert!(default_backend
+            .load_prepared_workspace_graph_binding(
+                repository_id().as_str(),
+                &store.workspace_id.to_string()
+            )
+            .unwrap()
+            .is_none());
+        store
+            .backend
+            .prepared_preflight_unavailable
+            .store(true, Ordering::SeqCst);
+        store.backend.prepared_load_count.store(0, Ordering::SeqCst);
+        let manager = reopen_synthetic(&store);
+        let served = materialize_through(&manager, &store.workspace_id);
+        assert_eq!(manager.prepared_workspace_graph_stats().serves, 1);
+        assert_eq!(store.backend.prepared_load_count.load(Ordering::SeqCst), 1);
+        assert_workspace_snapshots_identical(&served, &fresh);
     }
 
     #[test]
@@ -17914,8 +18071,14 @@ mod tests {
             serde_json::json!(hex::encode(Sha256::digest(&artifact.payload))),
         );
 
+        store.backend.prepared_load_count.store(0, Ordering::SeqCst);
         let manager = reopen_synthetic(&store);
         let materialized = materialize_through(&manager, &store.workspace_id);
+        assert_eq!(
+            store.backend.prepared_load_count.load(Ordering::SeqCst),
+            1,
+            "a preflight match cannot skip the frame's own integrity check"
+        );
         assert_eq!(
             manager.prepared_workspace_graph_stats(),
             PreparedWorkspaceGraphStats {
@@ -17931,7 +18094,7 @@ mod tests {
 
     #[test]
     fn prepared_workspace_state_refuses_a_stale_artifact_after_a_workspace_mutation() {
-        let (store, first) = build_overlaid_history_store(2, 8, 1, 3);
+        let (store, first) = build_overlaid_history_store(2, 64, 1, 12);
         let before = materialize_synthetic(&store);
         let opened = reopen_synthetic(&store);
         materialize_through(&opened, &store.workspace_id);
@@ -17961,8 +18124,34 @@ mod tests {
             "the second overlay relation must actually change what the workspace resolves"
         );
 
+        let stale_payload_bytes = store
+            .backend
+            .prepared_artifact(&store.workspace_id)
+            .payload
+            .len();
+        assert!(
+            stale_payload_bytes > 65_536,
+            "the fixture must carry a substantial payload"
+        );
+        store.backend.prepared_load_count.store(0, Ordering::SeqCst);
+        store
+            .backend
+            .prepared_payload_bytes_loaded
+            .store(0, Ordering::SeqCst);
         let after_mutation = reopen_synthetic(&store);
         let materialized = materialize_through(&after_mutation, &store.workspace_id);
+        let loaded = store
+            .backend
+            .prepared_payload_bytes_loaded
+            .load(Ordering::SeqCst);
+        eprintln!(
+            "stale prepared payload: available_bytes={stale_payload_bytes} loaded_bytes={loaded}"
+        );
+        assert_eq!(
+            loaded, 0,
+            "a stale binding must be refused before the full payload is loaded"
+        );
+        assert_eq!(store.backend.prepared_load_count.load(Ordering::SeqCst), 0);
         // The mutation moved the logical generation too, and that is the
         // cheaper mismatch, so it is the one reported. The authority digest is
         // what makes the refusal sound rather than incidental, so assert it
@@ -17994,6 +18183,16 @@ mod tests {
             "the rewrite after the mutation must serve the new state"
         );
         assert_workspace_snapshots_identical(&served, &mutated);
+        let loaded = store
+            .backend
+            .prepared_payload_bytes_loaded
+            .load(Ordering::SeqCst);
+        eprintln!("eligible prepared positive control: loaded_bytes={loaded}");
+        assert!(
+            loaded > 65_536,
+            "an eligible artifact must actually load its payload"
+        );
+        assert_eq!(store.backend.prepared_load_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

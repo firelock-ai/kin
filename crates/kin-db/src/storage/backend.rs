@@ -2889,6 +2889,21 @@ pub trait StorageBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Read only a prepared artifact's binding for an optional refusal preflight.
+    ///
+    /// A binding can rule an artifact out, but cannot authorize its payload.
+    /// Callers must still load and validate the complete artifact after a
+    /// matching preflight. `Ok(None)` means no preflight is available and the
+    /// caller must use the ordinary complete-artifact path.
+    fn load_prepared_workspace_graph_binding(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        let _ = (repo_id, workspace_id);
+        Ok(None)
+    }
+
     /// Load the durable prepared query-graph artifact for one workspace.
     ///
     /// Storage never interprets the binding record and never decides whether
@@ -8836,6 +8851,26 @@ impl StorageBackend for LocalFileBackend {
     /// against a caller that materializes while holding a local authority
     /// freeze, since `flock` blocks a second acquisition from the same
     /// process.
+    fn load_prepared_workspace_graph_binding(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        let binding_leaf = Self::prepared_binding_leaf(workspace_id)?;
+        let Some(namespace) = self.repository_capability(repo_id, false)? else {
+            return Ok(None);
+        };
+        let Some(prepared) = namespace.surface(Self::prepared_surface_name(), false)? else {
+            return Ok(None);
+        };
+        if !prepared.exists(&binding_leaf)? {
+            return Ok(None);
+        }
+        let binding = prepared.read_regular(&binding_leaf, "local prepared workspace binding")?;
+        namespace.confirm_surface_visible(&prepared)?;
+        Ok(Some(binding))
+    }
+
     fn load_prepared_workspace_graph(
         &self,
         repo_id: &str,
@@ -12160,6 +12195,83 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_prepared_binding_does_not_load_the_payload() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let workspace = "0197f7a2-0000-7000-8000-00000000c0de";
+        assert!(backend
+            .load_prepared_workspace_graph_binding("missing", workspace)
+            .unwrap()
+            .is_none());
+        assert!(
+            !dir.path().join("missing").exists(),
+            "a read must not initialize a repository"
+        );
+        initialize_local_repository_namespace(&backend, "test-repo");
+        let artifact = prepared_fixture(br#"{"generation":7}"#, b"prepared payload");
+        backend
+            .record_prepared_workspace_graph("test-repo", workspace, &artifact)
+            .unwrap();
+        assert_eq!(
+            backend
+                .load_prepared_workspace_graph("test-repo", workspace)
+                .unwrap(),
+            Some(artifact.clone())
+        );
+
+        let payload = backend
+            .prepared_dir("test-repo")
+            .join(format!("{workspace}.kpqg"));
+        std::fs::remove_file(&payload).unwrap();
+        std::fs::create_dir(&payload).unwrap();
+        assert_eq!(
+            backend
+                .load_prepared_workspace_graph_binding("test-repo", workspace)
+                .unwrap(),
+            Some(artifact.binding),
+            "binding preflight must not try to read a non-file payload"
+        );
+        assert!(
+            backend
+                .load_prepared_workspace_graph("test-repo", workspace)
+                .is_err(),
+            "the ordinary full read must detect the unreadable payload"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_backend_prepared_binding_refuses_symlinks_and_invalid_names() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "test-repo");
+        let workspace = "0197f7a2-0000-7000-8000-00000000c0de";
+        let artifact = prepared_fixture(br#"{"generation":7}"#, b"prepared payload");
+        backend
+            .record_prepared_workspace_graph("test-repo", workspace, &artifact)
+            .unwrap();
+        let binding = backend
+            .prepared_dir("test-repo")
+            .join(format!("{workspace}.kpqg.json"));
+        let outside = dir.path().join("outside-binding");
+        std::fs::write(&outside, &artifact.binding).unwrap();
+        assert!(backend
+            .load_prepared_workspace_graph_binding("test-repo", workspace)
+            .unwrap()
+            .is_some());
+        std::fs::remove_file(&binding).unwrap();
+        std::os::unix::fs::symlink(&outside, &binding).unwrap();
+        assert!(backend
+            .load_prepared_workspace_graph_binding("test-repo", workspace)
+            .is_err());
+        for invalid in ["../outside-binding", "UPPERCASE", "a/b"] {
+            assert!(backend
+                .load_prepared_workspace_graph_binding("test-repo", invalid)
+                .is_err());
+        }
+    }
+
+    #[test]
     fn local_backend_prepared_workspace_graph_roundtrip() {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
@@ -12246,15 +12358,17 @@ mod tests {
             let artifact = prepared_fixture(br#"{"prepared_version":1}"#, b"KNDB prepared payload");
             let recorded =
                 worker.record_prepared_workspace_graph("test-repo", workspace, &artifact);
+            let binding = worker.load_prepared_workspace_graph_binding("test-repo", workspace);
             let loaded = worker.load_prepared_workspace_graph("test-repo", workspace);
-            let _ = sender.send((recorded, loaded));
+            let _ = sender.send((recorded, binding, loaded));
         });
-        let (recorded, loaded) = receiver
+        let (recorded, binding, loaded) = receiver
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("prepared state must not wait on the repository lock");
         drop(held);
 
         assert!(recorded.unwrap());
+        assert!(binding.unwrap().is_some());
         assert!(loaded.unwrap().is_some());
     }
 
