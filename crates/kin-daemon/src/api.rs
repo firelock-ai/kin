@@ -6555,7 +6555,7 @@ fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String
 /// how the placeholder author this endpoint used to stamp reached permanent
 /// history. A request that names nobody is refused by deserialization rather
 /// than completed by the daemon.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandCommitRequest {
     operation_id: kin_model::OperationId,
@@ -6571,6 +6571,26 @@ struct CommandCommitRequest {
     session_id: Option<String>,
 }
 
+/// Why one attempt at publishing a commit did not produce a change.
+///
+/// Two answers rather than one, because they ask for different next steps. A
+/// refusal is already worded for the caller and travels out as it is. Semantics
+/// that have not caught up with their bytes is not a refusal yet: the parse that
+/// settles it is one bounded pass away, and this route takes that pass before it
+/// decides. Recovering the difference from the worded refusal afterwards would
+/// mean matching on message text, and a classification inferred from a failure
+/// string stops holding the first time the wording moves.
+enum CommitAttempt {
+    Refused((StatusCode, String)),
+    SemanticsBehindTree(Vec<RepoPath>),
+}
+
+impl From<(StatusCode, String)> for CommitAttempt {
+    fn from(refusal: (StatusCode, String)) -> Self {
+        Self::Refused(refusal)
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct CommandCommitResponse {
     change_id: String,
@@ -6580,6 +6600,79 @@ struct CommandCommitResponse {
     entity_count: usize,
     relation_count: usize,
     file_count: usize,
+}
+
+/// Copy the bodies a bounded re-derivation is about to read back into ingestion
+/// staging, from the store that durably holds them.
+///
+/// The detector that names these paths reads each one's tree-named body through
+/// `source_cas::read_publishable_source`, which answers from ingestion staging
+/// first and from repository CAS second. `readmit_semantics_for_paths` reads
+/// staging alone. Staging is disposable and repository CAS is not, so a store
+/// that reopened after its staged copies were pruned reaches this with the
+/// detector able to read every body and the re-derivation able to read none: the
+/// readmission fails its read, the second plan refuses exactly as the first did,
+/// and every later commit repeats it. Nothing is lost and nothing repairs it.
+///
+/// So the exact bodies the refused paths name are re-ingested first. This is
+/// explicit ingestion of bytes the repository already published, bounded to the
+/// paths the planner refused, and it changes no identity: the body is written
+/// back under the content address the tree already names.
+///
+/// A path whose body neither store holds is left alone. That absence is the
+/// publication's own refusal to make by name, and the re-derivation reports it
+/// as unresolved exactly as it did before.
+fn stage_refused_bodies_from_repository_cas(
+    state: &DaemonState,
+    owed: &std::collections::BTreeSet<RepoPath>,
+) -> usize {
+    let Ok(context) =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+    else {
+        return 0;
+    };
+    let Ok(authority) = context.open() else {
+        return 0;
+    };
+    let tree = state.graph.resolved_tree();
+    let mut refilled = 0;
+    for path in owed {
+        let Some(artifact) = tree.artifact_at_path(path) else {
+            continue;
+        };
+        let kin_model::TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        let staged_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        if state.blobs.read(&staged_hash).is_ok() {
+            continue;
+        }
+        match crate::source_cas::read_publishable_source(&state.blobs, &authority, hash) {
+            Ok(source) => match state.blobs.write(source.body()) {
+                Ok(written) if written == staged_hash => refilled += 1,
+                Ok(written) => warn!(
+                    path = %path,
+                    expected = %staged_hash,
+                    written = %written,
+                    "re-ingesting a published body produced a different content address, so it \
+                     was not the body this path's tree entry names"
+                ),
+                Err(error) => warn!(
+                    path = %path,
+                    error = %error,
+                    "the body repository CAS holds for this path could not be re-ingested, so \
+                     its semantics cannot be re-derived"
+                ),
+            },
+            Err(error) => warn!(
+                path = %path,
+                error = %error,
+                "neither store holds the body this path's tree entry names, so its semantics \
+                 cannot be re-derived"
+            ),
+        }
+    }
+    refilled
 }
 
 async fn command_commit(
@@ -6671,7 +6764,57 @@ async fn command_commit(
     .await
     .map_err(commit_admission_error)?;
 
-    match command_commit_after_admission(&state, request, deferred_tree.as_ref()) {
+    // A commit plans its tree half and its entity half out of one live graph,
+    // and that graph is allowed to be behind itself: an exact-tree admission
+    // moves a path's bytes into authority on its own, and the parse that moves
+    // that path's spans onto them runs afterwards and does not survive the daemon
+    // that ran it. The drain above repairs the paths a writer recorded as owed.
+    // For anything it missed the planner refuses by name, and the answer is one
+    // bounded re-derivation of exactly those paths through the seam the drain
+    // uses, under the gate this commit already holds, before asking again.
+    //
+    // Once, not in a loop. The re-derivation is best effort and the planner is
+    // the guarantee: a second refusal is the store saying the parse will not
+    // settle from here, and asking again until it does would hold the gate for
+    // as long as the caller waits.
+    let attempt =
+        match command_commit_after_admission(&state, request.clone(), deferred_tree.as_ref()) {
+            Err(CommitAttempt::SemanticsBehindTree(paths)) => {
+                let owed: std::collections::BTreeSet<RepoPath> = paths.into_iter().collect();
+                let named = owed
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let waiting_since = Instant::now();
+                // The re-derivation reads ingestion staging and the detector
+                // reads staging plus repository CAS, so the bodies it is about
+                // to read are put back within reach first. On a store whose
+                // staged copies are gone this is the difference between one
+                // repair and a permanent refusal.
+                let refilled = stage_refused_bodies_from_repository_cas(&state, &owed);
+                // Its own commit phase, so what the wait cost is attributed on the
+                // phase table beside the planning it precedes rather than hiding
+                // inside it.
+                let readmitted = crate::mcp_commit::timed_commit_phase_async(
+                    "await_pending_reconcile",
+                    crate::loop_runner::readmit_semantics_for_paths(&state, &owed),
+                )
+                .await;
+                info!(
+                    paths = %named,
+                    refilled,
+                    enriched = readmitted.enriched,
+                    unresolved = readmitted.failed.len(),
+                    waited_ms = waiting_since.elapsed().as_millis(),
+                    "these paths held entities their own admitted bytes do not reproduce, so this \
+                     commit re-derived them before planning the change that seals those bytes"
+                );
+                command_commit_after_admission(&state, request, deferred_tree.as_ref())
+            }
+            attempted => attempted,
+        };
+    match attempt {
         Ok(response) => {
             // A transaction that reached authority carried the tree the graph
             // holds with it, which is the divergence an earlier unclosed
@@ -6718,11 +6861,21 @@ async fn command_commit(
             crate::semantic_debt::settle_all(&state);
             Ok(response)
         }
-        Err(error) => {
-            if let Some(admitted) = deferred_tree {
-                crate::loop_runner::publish_deferred_tree_after_failure(&state, &admitted);
+        Err(CommitAttempt::SemanticsBehindTree(paths)) => {
+            if let Some(admitted) = deferred_tree.as_ref() {
+                crate::loop_runner::publish_deferred_tree_after_failure(&state, admitted);
             }
-            Err(error)
+            Err(repository_commit_error(
+                crate::error::DaemonError::SemanticsBehindTree {
+                    paths: paths.iter().map(ToString::to_string).collect(),
+                },
+            ))
+        }
+        Err(CommitAttempt::Refused(refusal)) => {
+            if let Some(admitted) = deferred_tree.as_ref() {
+                crate::loop_runner::publish_deferred_tree_after_failure(&state, admitted);
+            }
+            Err(refusal)
         }
     }
 }
@@ -6738,12 +6891,12 @@ fn command_commit_after_admission(
     state: &Arc<DaemonState>,
     request: CommandCommitRequest,
     observed: Option<&crate::repository_commit::AdmittedWorkspaceTree>,
-) -> Result<Json<CommandCommitResponse>, (StatusCode, String)> {
+) -> Result<Json<CommandCommitResponse>, CommitAttempt> {
     let graph = &*state.graph;
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
             .map_err(repository_commit_error)?;
-    let plan = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
+    let planned = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
         if let Some(expected_head) = request.expected_head {
             crate::repository_commit::plan_native_amend(
                 graph,
@@ -6772,11 +6925,24 @@ fn command_commit_after_admission(
                 })?,
             )
         }
-    })
-    .map_err(repository_commit_error)?;
+    });
+    let plan = match planned {
+        Ok(plan) => plan,
+        // The one planning outcome this route can still do something about, so
+        // it keeps its paths instead of being flattened into a worded refusal.
+        Err(crate::error::DaemonError::SemanticsBehindTree { paths }) => {
+            return Err(CommitAttempt::SemanticsBehindTree(
+                paths
+                    .into_iter()
+                    .filter_map(|path| RepoPath::from_utf8(path).ok())
+                    .collect(),
+            ))
+        }
+        Err(error) => return Err(repository_commit_error(error).into()),
+    };
     if !request.amend {
         if let Some(refusal) = refuse_a_successor_that_records_nothing(&plan) {
-            return Err(refusal);
+            return Err(refusal.into());
         }
     }
     let change_id = plan.change.id;
@@ -6832,7 +6998,10 @@ fn command_commit_after_admission(
                             foreign_blocks.len()
                         ),
                     });
-                    return Err((StatusCode::CONFLICT, body.to_string()));
+                    return Err(CommitAttempt::Refused((
+                        StatusCode::CONFLICT,
+                        body.to_string(),
+                    )));
                 }
             }
         }
@@ -6986,6 +7155,18 @@ fn projection_blocked_refusal(error: &crate::error::DaemonError) -> Option<(Stat
 fn repository_commit_error(error: crate::error::DaemonError) -> (StatusCode, String) {
     if let Some(refusal) = projection_blocked_refusal(&error) {
         return refusal;
+    }
+    // Semantics that have not caught up with their bytes is a state of the store
+    // a caller can act on, not a fault in it: the files are intact, the bytes are
+    // authority, and one re-derivation settles it. Answering it as an internal
+    // error would send a reader to the daemon for files they can see.
+    if let crate::error::DaemonError::SemanticsBehindTree { paths } = &error {
+        let body = serde_json::json!({
+            "error": "semantics_behind_tree",
+            "message": error.to_string(),
+            "paths": paths,
+        });
+        return (StatusCode::CONFLICT, body.to_string());
     }
     let status = match &error {
         crate::error::DaemonError::Graph(kin_db::KinDbError::Model(
@@ -29670,6 +29851,31 @@ mod tests {
         );
     }
 
+    /// The entity an install derived for `path`, named and of the kind asked for.
+    ///
+    /// Fixtures take the entity the install produced rather than upserting a
+    /// hand-made one beside it. Installing a source file derives its entities the
+    /// way the daemon's admission does, so a second entity with the same name on
+    /// the same path is a graph the daemon never produces, and a query that then
+    /// names two entities resolves an ambiguity the fixture never meant to build.
+    fn derived_entity(
+        state: &Arc<DaemonState>,
+        path: &str,
+        name: &str,
+        kind: EntityKind,
+    ) -> Entity {
+        state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new(path)),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.name == name && candidate.kind == kind)
+            .unwrap_or_else(|| panic!("installing {path} must derive {kind:?} {name}"))
+    }
+
     fn test_entity(name: &str, path: &str) -> Entity {
         Entity {
             id: EntityId::new(),
@@ -29780,6 +29986,28 @@ mod tests {
                 external_reference_deltas: Vec::new(),
             })
             .unwrap();
+        // The admission that puts a source file's bytes in the tree derives its
+        // entities in the same pass. Seeding the bytes alone leaves the graph
+        // holding no semantics for a path it is about to seal, which is the
+        // defect the commit planner refuses, so a fixture that skips it is
+        // building that state rather than an ordinary installed file.
+        let file_id = kin_model::FilePathId::new(rel_path);
+        if let Ok(kin_index::IndexedAny::EntitySource(indexed)) =
+            kin_index::IndexPipeline::new().index_any_content(&file_id, content, blob_hash)
+        {
+            state
+                .graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    entity_deltas: indexed
+                        .entities
+                        .iter()
+                        .cloned()
+                        .map(|new| kin_model::EntityDelta::Added { new })
+                        .collect(),
+                    ..kin_model::TransactionDelta::default()
+                })
+                .unwrap();
+        }
         let plan = crate::repository_commit::plan_native_commit(
             &state.graph,
             &state.blobs,
@@ -35668,6 +35896,7 @@ mod tests {
             "a refused commit must record no change at all"
         );
     }
+
     /// FIR-3200. Read the published start line of the sole entity a path holds.
     #[cfg(unix)]
     fn published_start_line(state: &Arc<DaemonState>, path: &str) -> u32 {
@@ -36081,6 +36310,239 @@ mod tests {
             published_start_line(&reopened, "shifted.rs"),
             before,
             "an unparseable file keeps its last readable version's spans"
+        );
+    }
+
+    /// FIR-3208, the half a record cannot cover. A commit re-derives a stale
+    /// path no debt row ever named, then seals the bytes with the spans they
+    /// produce.
+    ///
+    /// The record the drain works from is written by the writers that know they
+    /// owe a parse. A path can reach the same state with no row at all: the
+    /// startup layout backfill finds the staleness by comparing the graph's
+    /// spans against a fresh parse of the tree's own bytes, publishes the layout
+    /// as partial, and enqueues an ordinary host event for the ambient loop,
+    /// recording nothing. A commit landing before that event is serviced plans
+    /// its tree half and its entity half out of a graph that does not agree with
+    /// itself, and seals the new bytes against the old spans. Removing the
+    /// record here is what leaves the planner's own check standing alone.
+    ///
+    /// Falsifies both halves of that check. Remove the barrier from
+    /// `plan_native_commit_inner` and the commit succeeds with the span still
+    /// where the pre-edit parse left it, so the assertion below fails. Remove
+    /// the one re-derivation from `command_commit` and the commit answers 409
+    /// `semantics_behind_tree`, so `commit_through_api` fails on the status.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_re_derives_a_stale_path_no_debt_row_ever_named() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = layout.root().join("runs/session-unrecorded-stale-path");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        reconcile_session_through_api(&app, &session_dir).await;
+
+        // The restart is what makes the graph stale: the publication's own
+        // re-derivation lives in the derived graph, and the next daemon rebuilds
+        // that from a history this publication deliberately did not write.
+        drop(app);
+        drop(state);
+        // And this is what makes it a path nothing recorded. The `expect` is the
+        // fixture's own guard: if the reconcile stopped writing the record, the
+        // removal proves nothing and this test has to say so rather than pass.
+        std::fs::remove_file(layout.root().join("semantic-debt.json")).expect(
+            "the session reconcile must have recorded what it owed, or removing the record \
+             proves nothing",
+        );
+
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before,
+            "the reopened graph has to answer at the pre-edit position, or there is nothing for \
+             the commit to re-derive"
+        );
+
+        let reopened_app = router(Arc::clone(&reopened));
+        commit_through_api(
+            &reopened_app,
+            kin_model::OperationId::new(),
+            "commit the session's edit",
+        )
+        .await;
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the commit had to re-derive a stale path nothing had recorded before it could seal \
+             the bytes that moved those spans"
+        );
+    }
+
+    /// The bounded repair has to reach a body only repository CAS still holds.
+    ///
+    /// The detector reads each refused path's tree-named body through
+    /// `source_cas::read_publishable_source`, which answers from ingestion
+    /// staging first and repository CAS second. `readmit_semantics_for_paths`
+    /// reads staging alone, and staging is disposable: a store that reopened
+    /// after its staged copies were pruned reaches the repair with every body
+    /// durable and none of them staged. The re-derivation then fails its read,
+    /// the second plan refuses exactly as the first did, and every later commit
+    /// repeats it, with no body lost and nothing that repairs it.
+    ///
+    /// The fixture removes ONLY the staged copy and asserts repository CAS still
+    /// holds the same body, so this is a missing staged copy rather than a
+    /// missing body. It then reopens a second time, cold, and asserts the
+    /// persisted entities reproduce a parse of the body the tree names, because a
+    /// repair that only moved the live graph would pass a check of that graph.
+    ///
+    /// Falsify by removing the refill from `command_commit`: the commit answers
+    /// 409 `semantics_behind_tree` and `commit_through_api` fails on the status.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_re_derives_a_stale_path_whose_body_only_repository_cas_holds() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = layout.root().join("runs/session-staging-pruned");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        reconcile_session_through_api(&app, &session_dir).await;
+
+        drop(app);
+        drop(state);
+        std::fs::remove_file(layout.root().join("semantic-debt.json")).expect(
+            "the session reconcile must have recorded what it owed, or removing the record \
+             proves nothing",
+        );
+
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before,
+            "the reopened graph has to answer at the pre-edit position, or there is nothing for \
+             the commit to re-derive"
+        );
+
+        // Prune the staged copy the way a reopen on a pruned ingestion CAS does,
+        // and prove the durable body is still there, or this fixture is about an
+        // absent body rather than an absent staged copy.
+        let repo_path = RepoPath::from_utf8("shifted.rs".to_string()).unwrap();
+        let tree = reopened.graph.resolved_tree();
+        let kin_model::TreeEntry::Blob { hash, .. } =
+            tree.artifact_at_path(&repo_path).unwrap().entry
+        else {
+            panic!("the fixture is a regular file");
+        };
+        drop(tree);
+        let staged_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        reopened.blobs.delete(&staged_hash).unwrap();
+        assert!(
+            reopened.blobs.read(&staged_hash).is_err(),
+            "the staged copy has to be gone, or the refill under test is never exercised"
+        );
+        let sealed_body = {
+            let context =
+                crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(
+                    &reopened,
+                )
+                .unwrap();
+            let authority = context.open().unwrap();
+            crate::source_cas::read_publishable_source(&reopened.blobs, &authority, hash)
+                .expect("repository CAS still holds the published body")
+                .body()
+                .to_vec()
+        };
+
+        let reopened_app = router(Arc::clone(&reopened));
+        commit_through_api(
+            &reopened_app,
+            kin_model::OperationId::new(),
+            "commit the session's edit with staging pruned",
+        )
+        .await;
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the commit had to re-derive from the body repository CAS holds before it could seal \
+             the bytes that moved those spans"
+        );
+
+        // A second cold reopen. The repair has to be in durable authority rather
+        // than only in the graph the committing process happened to hold.
+        drop(reopened_app);
+        drop(reopened);
+        let cold = Arc::new(DaemonState::open(layout).unwrap());
+        cold.is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            published_start_line(&cold, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the re-derived spans have to survive a cold reopen, or the commit sealed a repair \
+             nothing persisted"
+        );
+        let persisted = cold
+            .graph
+            .query_entities(&kin_model::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new("shifted.rs")),
+                ..Default::default()
+            })
+            .unwrap();
+        let fresh = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(
+                &kin_model::FilePathId::new("shifted.rs"),
+                &sealed_body,
+                staged_hash,
+            )
+            .unwrap()
+            .indexed_file
+            .entities;
+        assert!(
+            !persisted.is_empty() && !fresh.is_empty(),
+            "both sides of the comparison have to hold something, or it proves nothing"
+        );
+        assert!(
+            crate::repository_commit::semantics_follow_the_bytes(&persisted, &fresh),
+            "after a cold reopen the persisted entities have to reproduce a parse of the body \
+             the tree names, bodies and all, not merely sit at the right line"
         );
     }
 
@@ -38468,6 +38930,16 @@ mod tests {
     /// Untracking is not enough. Entities are what rank, so a purge that left
     /// them behind produced the worst reading of all: the artifact listing no
     /// longer names the file while search and locate still return it.
+    ///
+    /// The purged path reaches the graph the way an ambient admission leaves
+    /// one: its bytes in repository authority, its entities derived into the
+    /// live graph, and no commit publishing a semantic delta for them. That is
+    /// the state this eviction is about, and admitting through the daemon's own
+    /// `/commands/admit` is what produces it rather than a hand-placed entity
+    /// standing in for a parse. The committed shape, whose entities repository
+    /// authority holds too, is covered by
+    /// `purge_ignored_retires_the_entities_a_commit_published_for_a_vacated_path`
+    /// and is red for a reason of its own.
     #[tokio::test]
     async fn purge_ignored_evicts_the_entities_that_made_a_path_rank() {
         let state = test_state();
@@ -38475,27 +38947,33 @@ mod tests {
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        // The rule lands after the admission, which is the whole scenario: a
-        // repository that already carries a path is told to stop carrying it.
         for (path, content) in [
             (
                 "investor/deck/build_deck.py",
                 &b"def valuation(): pass\n"[..],
             ),
             ("src/lib.py", &b"def kept(): pass\n"[..]),
-            (".kinignore", &b"investor\n"[..]),
         ] {
             install_working_copy_file(&state, path, content, false);
-            install_repository_file(&state, path, content);
         }
+        let app = router(Arc::clone(&state));
+        admit_through_api(&app).await;
 
-        let private = test_entity("valuation", "investor/deck/build_deck.py");
-        let kept = test_entity("kept", "src/lib.py");
-        state.graph.upsert_entity(&private).unwrap();
-        state.graph.upsert_entity(&kept).unwrap();
+        // The rule lands after the admission, which is the whole scenario: a
+        // repository that already carries a path is told to stop carrying it.
+        // It stays untracked on purpose, because admitting it would retract the
+        // covered path on its own and leave this purge nothing to do.
+        install_working_copy_file(&state, ".kinignore", b"investor\n", false);
+
+        let private = derived_entity(
+            &state,
+            "investor/deck/build_deck.py",
+            "valuation",
+            EntityKind::Function,
+        );
+        let kept = derived_entity(&state, "src/lib.py", "kept", EntityKind::Function);
         assert!(state.graph.get_entity(&private.id).unwrap().is_some());
 
-        let app = router(Arc::clone(&state));
         let (_, applied) = purge_ignored_through_api(&app, true).await;
         assert_eq!(applied["report"]["purge_count"], json!(1));
 
@@ -38518,6 +38996,65 @@ mod tests {
         // entity, so the purge removed one path rather than clearing the graph.
         assert!(live.contains("src/lib.py"));
         assert_eq!(state.graph.get_entity(&kept.id).unwrap(), Some(kept));
+    }
+
+    /// The same purge over a path a COMMIT published entities for, which is what
+    /// a repository that has ever committed its source actually holds.
+    ///
+    /// Red today, and named here rather than left to be rediscovered.
+    /// `repository_commit::publish_workspace_tree` carries
+    /// `WorkspaceSemanticDelta::default()`, so the tree publication that retires
+    /// the path leaves repository authority holding entities on it and kin-db
+    /// refuses the whole transition with "transaction leaves entity ... absent
+    /// from the staged tree". The session admission in that same module already
+    /// carries `retire_semantics_on_vacated` over its vacated set; the tree
+    /// publication does not, and every caller of `publish_exact_workspace_tree`
+    /// inherits the gap, the watch loop's standalone admission included. That is
+    /// the FIR-2429 class surviving on the paths its fix did not reach, and it is
+    /// tracked as FIR-3274.
+    ///
+    /// Ignored so the suite stays green while the class stays written down where
+    /// the fix will find it. Run it by name with
+    /// `cargo test -p kin-daemon --lib -- --ignored
+    /// purge_ignored_retires_the_entities_a_commit_published_for_a_vacated_path`.
+    #[tokio::test]
+    #[ignore = "FIR-3274: publish_workspace_tree carries no retirement for a vacated path"]
+    async fn purge_ignored_retires_the_entities_a_commit_published_for_a_vacated_path() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Committed, not merely admitted: the install plans and commits a native
+        // change, so its entity deltas reach repository authority exactly as a
+        // person's `kin commit` would put them there.
+        for (path, content) in [
+            (
+                "investor/deck/build_deck.py",
+                &b"def valuation(): pass\n"[..],
+            ),
+            ("src/lib.py", &b"def kept(): pass\n"[..]),
+        ] {
+            install_working_copy_file(&state, path, content, false);
+            install_repository_file(&state, path, content);
+        }
+        install_working_copy_file(&state, ".kinignore", b"investor\n", false);
+        let app = router(Arc::clone(&state));
+
+        let private = derived_entity(
+            &state,
+            "investor/deck/build_deck.py",
+            "valuation",
+            EntityKind::Function,
+        );
+
+        let (_, applied) = purge_ignored_through_api(&app, true).await;
+        assert_eq!(applied["report"]["purge_count"], json!(1));
+        assert!(!tracked_paths(&state).contains("investor/deck/build_deck.py"));
+        assert!(
+            state.graph.get_entity(&private.id).unwrap().is_none(),
+            "a purged path's entity still resolves, so it still ranks"
+        );
     }
 
     fn branch_change(state: &DaemonState) -> SemanticChangeId {
@@ -41263,10 +41800,10 @@ mod tests {
             "def handler():\n    return 'checkout drift'\n",
         )
         .unwrap();
-        let mut entity = test_entity("handler", "src/lib.py");
-        entity.span.as_mut().unwrap().end_byte = source.len();
-        entity.span.as_mut().unwrap().end_line = 2;
-        state.graph.upsert_entity(&entity).unwrap();
+        // The entity under test is the one installing the file derived, which
+        // is what the daemon's admission leaves behind. A hand-made duplicate
+        // on the same path made this query name two entities and the endpoint
+        // return three records for a fixture that holds one definition.
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -41295,16 +41832,39 @@ mod tests {
             .unwrap();
         let result: kin_cli::commands::search::DaemonSearchResponse =
             serde_json::from_slice(&body).unwrap();
-        assert_eq!(result.records.len(), 1);
-        match result.records.first().unwrap() {
-            kin_cli::commands::search::DaemonSearchRecord::Entity(entity) => {
-                assert_eq!(entity.name, "handler");
-                assert_eq!(entity.file.as_deref(), Some("src/lib.py"));
-                assert_eq!(entity.body.as_deref(), Some("def handler():"));
-                assert_eq!(entity.body_omitted_line_count, 1);
-            }
-            other => panic!("expected entity record, got {other:?}"),
-        }
+        // Installing a real source file derives the file's own module beside its
+        // function, and a text search for the function's name matches the
+        // module's body as well, so the graph answers with two records where a
+        // single hand-made entity answered with one. Both are named here rather
+        // than counted, because the count on its own says nothing about which
+        // record the body assertions below are about.
+        let mut named: Vec<(&str, &str)> = result
+            .records
+            .iter()
+            .map(|record| match record {
+                kin_cli::commands::search::DaemonSearchRecord::Entity(entity) => {
+                    (entity.name.as_str(), entity.kind.as_str())
+                }
+                other => panic!("expected entity records, got {other:?}"),
+            })
+            .collect();
+        named.sort_unstable();
+        assert_eq!(named, [("handler", "Function"), ("lib", "Module")]);
+        let entity = result
+            .records
+            .iter()
+            .find_map(|record| match record {
+                kin_cli::commands::search::DaemonSearchRecord::Entity(entity)
+                    if entity.name == "handler" =>
+                {
+                    Some(entity)
+                }
+                _ => None,
+            })
+            .expect("the search must return the function the query names");
+        assert_eq!(entity.file.as_deref(), Some("src/lib.py"));
+        assert_eq!(entity.body.as_deref(), Some("def handler():"));
+        assert_eq!(entity.body_omitted_line_count, 1);
     }
 
     #[tokio::test]
@@ -44181,13 +44741,12 @@ mod tests {
         let state = test_state();
         // Coverage healthy on purpose, so the degradation is the only reason
         // left to refuse and the assertion cannot pass for the wrong cause.
-        let mut caller = test_entity("caller", "src/a.py");
-        let mut callee = test_entity("callee", "src/b.py");
-        let mut orphan = test_entity("orphan", "src/orphan.py");
-        for entity in [&mut caller, &mut callee, &mut orphan] {
-            install_trace_fixture_file(&state, entity);
-            state.graph.upsert_entity(entity).unwrap();
-        }
+        let caller = install_trace_fixture_file(&state, "caller", "src/a.py");
+        let callee = install_trace_fixture_file(&state, "callee", "src/b.py");
+        // The focal has to reach nothing AND hold no same-file neighbour, so it
+        // is the module of a file that declares nothing rather than a function
+        // sitting beside its own module.
+        install_lone_module_fixture_file(&state, "orphan");
         link_every_class(&state, &caller, &callee);
         state
             .is_initialized
@@ -44232,12 +44791,8 @@ mod tests {
     #[tokio::test]
     async fn a_trace_that_finds_dependencies_stays_unqualified_even_when_degraded() {
         let state = test_state();
-        let mut caller = test_entity("caller", "src/a.py");
-        let mut callee = test_entity("callee", "src/b.py");
-        for entity in [&mut caller, &mut callee] {
-            install_trace_fixture_file(&state, entity);
-            state.graph.upsert_entity(entity).unwrap();
-        }
+        let caller = install_trace_fixture_file(&state, "caller", "src/a.py");
+        let callee = install_trace_fixture_file(&state, "callee", "src/b.py");
         link_every_class(&state, &caller, &callee);
         state
             .is_initialized
@@ -44262,31 +44817,46 @@ mod tests {
         );
     }
 
-    /// Put an entity's file into repository authority and the working copy.
+    /// Install a source file that declares nothing, and hand back the module
+    /// entity that is then the file's ONLY entity.
     ///
-    /// `/trace` resolves a repository authority binding before it renders, so a
-    /// graph-only fixture answers 500 and the assertions below never run.
-    fn install_trace_fixture_file(state: &Arc<DaemonState>, entity: &mut Entity) {
-        let path = entity
-            .file_origin
-            .as_ref()
-            .expect("trace fixture entities carry a file")
-            .0
-            .clone();
-        let source = format!("def {}():\n    return 1\n", entity.name);
+    /// A trace focal that must reach nothing needs a file with no same-file
+    /// neighbour either. `kin_context::build_context_pack` fills an empty
+    /// dependency walk with same-file neighbours and the trace's absence
+    /// qualifier prints only while `dependency_signatures` is empty, so a focal
+    /// sitting in a file that also holds its own module never reaches that
+    /// branch. A Python file holding a function derives both, so the file here
+    /// declares nothing and its module is the focal.
+    fn install_lone_module_fixture_file(state: &Arc<DaemonState>, name: &str) -> Entity {
+        let path = format!("src/{name}.py");
+        let source =
+            format!("# {name} declares nothing, so its module is this file's one entity\n");
         install_repository_file(state, &path, source.as_bytes());
         let working = state.layout.working_dir().join(&path);
         std::fs::create_dir_all(working.parent().unwrap()).unwrap();
         std::fs::write(&working, source.as_bytes()).unwrap();
-        // `test_entity` spans 0..0, which the route rejects against a file that
-        // has bytes. Left unfixed the route answers 500 and every assertion
-        // below never runs.
-        let span = entity
-            .span
-            .as_mut()
-            .expect("trace fixture entities carry a span");
-        span.end_byte = source.len();
-        span.end_line = 2;
+        derived_entity(state, &path, name, EntityKind::Module)
+    }
+
+    /// Put a fixture's file into repository authority and the working copy, and
+    /// hand back the entity the install derived from its bytes.
+    ///
+    /// `/trace` resolves a repository authority binding before it renders, so a
+    /// graph-only fixture answers 500 and the assertions below never run.
+    ///
+    /// The entity comes from the install rather than from `test_entity` because
+    /// installing a source file derives one already, exactly as the daemon's
+    /// admission does. Upserting a second hand-made entity on the same path
+    /// builds a graph the daemon never produces: `orphan` named three entities
+    /// and `caller` two, and the trace then resolved an ambiguity these tests
+    /// never meant to exercise.
+    fn install_trace_fixture_file(state: &Arc<DaemonState>, name: &str, path: &str) -> Entity {
+        let source = format!("def {name}():\n    return 1\n");
+        install_repository_file(state, path, source.as_bytes());
+        let working = state.layout.working_dir().join(path);
+        std::fs::create_dir_all(working.parent().unwrap()).unwrap();
+        std::fs::write(&working, source.as_bytes()).unwrap();
+        derived_entity(state, path, name, EntityKind::Function)
     }
 
     /// Drive `/trace` in its DEFAULT rendering and return the lines it printed.
@@ -49607,12 +50177,8 @@ mod tests {
     /// behavior.
     fn reference_fixture() -> (Arc<DaemonState>, Entity) {
         let state = test_state();
-        let mut target = test_entity("sweep_target", "src/target.py");
-        let mut caller = test_entity("sweep_caller", "src/caller.py");
-        for entity in [&mut target, &mut caller] {
-            install_trace_fixture_file(&state, entity);
-            state.graph.upsert_entity(entity).unwrap();
-        }
+        let target = install_trace_fixture_file(&state, "sweep_target", "src/target.py");
+        let caller = install_trace_fixture_file(&state, "sweep_caller", "src/caller.py");
         link_every_class(&state, &caller, &target);
         (state, target)
     }
@@ -53239,28 +53805,23 @@ mod tests {
         let second =
             "\ndef parse_config_list(paths):\n    return [parse_config(p) for p in paths]\n";
         let source = format!("{first}{second}");
-        install_repository_file(&state, "src/config.py", source.as_bytes());
-        install_working_copy_file(&state, "src/config.py", source.as_bytes(), false);
+        // The module entity an install derives takes the file stem, so a path of
+        // `src/config.py` would put an entity named `config` in this graph and
+        // the descriptive query below would name it by name. Keeping the stem
+        // outside the query is what leaves `all_fallback` a statement about the
+        // query rather than about the fixture's file name.
+        install_repository_file(&state, "src/loader.py", source.as_bytes());
+        install_working_copy_file(&state, "src/loader.py", source.as_bytes(), false);
 
-        for (name, start_byte, end_byte, preview) in [
-            ("parse_config", 0, first.len(), "def parse_config(path):"),
-            (
-                "parse_config_list",
-                first.len(),
-                source.len(),
-                "def parse_config_list(paths):",
-            ),
+        // The two definitions are the ones the install derived from those bytes,
+        // carrying their real spans. Upserting hand-made entities beside them
+        // would leave the graph holding each definition twice, which is a shape
+        // the daemon never produces.
+        for (name, preview) in [
+            ("parse_config", "def parse_config(path):"),
+            ("parse_config_list", "def parse_config_list(paths):"),
         ] {
-            let mut entity = test_entity(name, "src/config.py");
-            entity.span = Some(SourceSpan {
-                file: kin_model::FilePathId::new("src/config.py"),
-                start_byte,
-                end_byte,
-                start_line: 0,
-                start_col: 0,
-                end_line: 1,
-                end_col: 24,
-            });
+            let mut entity = derived_entity(&state, "src/loader.py", name, EntityKind::Function);
             // The fused ranker reads this to call an entity a definition rather
             // than a bare reference, and only definitions are ranked.
             entity
@@ -54243,27 +54804,23 @@ mod tests {
         let valid_source = "def valid_func():\n    return 42\n";
         install_repository_file(&state, "src/good.py", valid_source.as_bytes());
         install_working_copy_file(&state, "src/good.py", valid_source.as_bytes(), false);
-        let mut valid_entity = test_entity("valid_func", "src/good.py");
-        valid_entity.span = Some(SourceSpan {
-            file: kin_model::FilePathId::new("src/good.py"),
-            start_byte: 0,
-            end_byte: valid_source.len(),
-            start_line: 0,
-            start_col: 0,
-            end_line: 1,
-            end_col: 15,
-        });
+        let mut valid_entity =
+            derived_entity(&state, "src/good.py", "valid_func", EntityKind::Function);
         valid_entity.metadata.extra.insert(
             "embedding_body_preview".to_string(),
             json!("def valid_func():"),
         );
         state.graph.upsert_entity(&valid_entity).unwrap();
 
-        // bad.py has valid source text but bad_entity has an out-of-bounds span (100..200 > 25)
+        // bad.py has valid source text; the entity the install derived for it is
+        // given an out-of-bounds span (100..200 > 25), which is the unreadable
+        // source under test. The derived entity is corrupted rather than joined
+        // by a hand-made twin, because a readable second `bad_func` outranks the
+        // unreadable one and the page then reports no degradation at all.
         let bad_source = "def bad_func():\n    pass\n";
         install_repository_file(&state, "src/bad.py", bad_source.as_bytes());
         install_working_copy_file(&state, "src/bad.py", bad_source.as_bytes(), false);
-        let mut bad_entity = test_entity("bad_func", "src/bad.py");
+        let mut bad_entity = derived_entity(&state, "src/bad.py", "bad_func", EntityKind::Function);
         bad_entity.span = Some(SourceSpan {
             file: kin_model::FilePathId::new("src/bad.py"),
             start_byte: 100,
@@ -54309,16 +54866,8 @@ mod tests {
         let valid_source = "def valid_func():\n    return 42\n";
         install_repository_file(&state, "src/good.py", valid_source.as_bytes());
         install_working_copy_file(&state, "src/good.py", valid_source.as_bytes(), false);
-        let mut valid_entity = test_entity("valid_func", "src/good.py");
-        valid_entity.span = Some(SourceSpan {
-            file: kin_model::FilePathId::new("src/good.py"),
-            start_byte: 0,
-            end_byte: valid_source.len(),
-            start_line: 0,
-            start_col: 0,
-            end_line: 1,
-            end_col: 15,
-        });
+        let mut valid_entity =
+            derived_entity(&state, "src/good.py", "valid_func", EntityKind::Function);
         valid_entity.metadata.extra.insert(
             "embedding_body_preview".to_string(),
             json!("def valid_func():"),
