@@ -1567,6 +1567,12 @@ fn workspace_state_phrase(
 /// production caller has one and goes through [`render_text_with_tip`]; the
 /// tests below are about other lines and would otherwise all have to state a
 /// tip they do not care about.
+///
+/// `#[cfg(test)]` because that is now the whole truth about it. Left compiled
+/// into the library it is dead code, and `-D warnings` in CI turns dead code
+/// into a red gate, so an attribute that says what it is beats a build that
+/// happens to include a test target.
+#[cfg(test)]
 fn render_text(
     report: &StatusReport,
     build: Option<&BuildStatus>,
