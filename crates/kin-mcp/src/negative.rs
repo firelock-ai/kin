@@ -101,6 +101,21 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(|detail| format!(" ({detail})"))
         .unwrap_or_default();
+    // Provenance first: a full parse of other bytes is a stronger disqualifier
+    // than any parse state, because every row it produced describes a file that
+    // is no longer at this path.
+    if coverage.get("span_provenance").and_then(Value::as_str) == Some("stale") {
+        let stale = coverage
+            .get("stale_spans")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        return Some(format!(
+            "file_spans_stale: {stale} entity span(s) in this file were derived from bytes the \
+             repository tree no longer holds at this path, so the enumeration describes an \
+             earlier state of the file; the graph has admitted the new source and not yet \
+             re-derived these entities"
+        ));
+    }
     match parsed {
         "full" => {}
         "absent" => {
