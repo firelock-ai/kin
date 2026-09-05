@@ -17610,13 +17610,25 @@ async fn lsp_sweep(
 /// rather than guessing, because an unfinished check is not evidence of a
 /// missing server.
 fn enrichment_unavailable(state: &DaemonState) -> Option<serde_json::Value> {
+    enrichment_unavailable_reason_for(state)
+        .map(|(reason, detail)| json!({ "reason": reason, "detail": detail }))
+}
+
+/// The same answer as the reason and detail this daemon holds, for callers that
+/// render it as prose rather than as a JSON field.
+///
+/// The state wiring lives here, once, so a second caller cannot come to read a
+/// different pair of fields than `/lsp/sweep` reads and report a different cause
+/// for the same daemon.
+pub(crate) fn enrichment_unavailable_reason_for(
+    state: &DaemonState,
+) -> Option<(&'static str, String)> {
     let readiness = kin_mcp::edge_coverage::published_language_server_readiness();
     enrichment_unavailable_reason(
         state.lsp_enrichment_tx.is_some(),
         state.lsp_enrichment_enabled,
         readiness.as_ref(),
     )
-    .map(|(reason, detail)| json!({ "reason": reason, "detail": detail }))
 }
 
 /// The decision behind [`enrichment_unavailable`], as a pure rule.

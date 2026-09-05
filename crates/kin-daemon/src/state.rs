@@ -5894,8 +5894,9 @@ impl DaemonState {
     /// Ordinary publication leases are intentionally unavailable while a
     /// rollout is active, so the rollout control plane owns this one bounded
     /// transition path. It reasserts the exact rollout proof before every
-    /// Firestore mutation, creates the legacy writer-drain seal when supplied,
-    /// and cold-hydrates the committed winner set before reader admission.
+    /// Firestore mutation, creates the legacy writer-drain seal when one is
+    /// supplied and the database does not already carry a valid seal, and
+    /// cold-hydrates the committed winner set before reader admission.
     #[doc(hidden)]
     pub async fn prepare_hosted_spine_rollout(
         &self,
@@ -5967,8 +5968,33 @@ impl DaemonState {
             .reassert_before_mutation()
             .map_err(|error| error.to_string())?;
         if let Some(writer_drain) = writer_drain {
-            without_blocking_runtime_worker(|| spine.complete_legacy_migration(writer_drain))
-                .map_err(|error| format!("complete hosted spine legacy migration: {error}"))?;
+            // The seal is created once per database, not once per deployment,
+            // and it binds both the rollout fence evidence and the image that
+            // wrote it. A later image's attestation can therefore never equal
+            // the stored seal, and the backend refuses an unequal seal rather
+            // than treating it as a replay. Sealing unconditionally whenever a
+            // drain proof was rendered failed every image hop after the first:
+            // the daemon served unready while holding its startup rollout
+            // lease, every readiness probe was refused on reader admission, and
+            // the promotion rolled back. So read the durable state first and
+            // seal only a database that is genuinely unsealed. A backend that
+            // cannot answer fails loudly here instead of falling through into
+            // that refusal.
+            let already_sealed =
+                without_blocking_runtime_worker(|| spine.legacy_migration_complete()).map_err(
+                    |error| format!("read hosted spine legacy migration state: {error}"),
+                )?;
+            if already_sealed {
+                info!(
+                    rollout_fence = evidence.rollout_fence,
+                    daemon_image_sha256 = %writer_drain.daemon_image_sha256,
+                    "hosted spine legacy migration is already sealed for this database; \
+                     keeping the existing seal and continuing the rollout"
+                );
+            } else {
+                without_blocking_runtime_worker(|| spine.complete_legacy_migration(writer_drain))
+                    .map_err(|error| format!("complete hosted spine legacy migration: {error}"))?;
+            }
         }
         publication
             .reassert_before_mutation()
@@ -18263,6 +18289,336 @@ mod tests {
         assert!(
             control.bound_mutation_lease_for_test().is_none(),
             "the startup sequence unbinds its proof when it is done"
+        );
+    }
+
+    /// One snapshot per fleet repository, which is what an image finds when it
+    /// opens a store the previous image published.
+    fn seed_hosted_fleet_snapshots(backend_root: &std::path::Path, fleet: &[String]) {
+        use kin_db::InMemoryGraph;
+
+        for repo_id in fleet {
+            let graph = InMemoryGraph::new();
+            graph
+                .upsert_entity(&test_entity(
+                    &format!("{}_entity", repo_id.replace('-', "_")),
+                    "src/lib.rs",
+                ))
+                .unwrap();
+            LocalFileBackend::new(backend_root)
+                .save_snapshot(
+                    repo_id,
+                    &graph.to_snapshot().to_bytes().unwrap(),
+                    kin_db::GENERATION_INIT,
+                )
+                .unwrap();
+        }
+    }
+
+    /// Rewrite every fleet snapshot with its own bytes, which is what a hosted
+    /// rollout does to the GCS objects before it advances the fleet fence.
+    ///
+    /// The hosted publication cursor IS the backend generation
+    /// (`snapshot_cursor_for_spine`). A fixture that leaves the generation
+    /// still has both images publishing the same cursor, and the second loses
+    /// the durable head compare-and-swap on the fixture rather than on anything
+    /// the rollout did, which would hide the behaviour under test behind an
+    /// artifact.
+    fn rewrite_hosted_fleet_snapshots(backend_root: &std::path::Path, fleet: &[String]) {
+        let backend = LocalFileBackend::new(backend_root);
+        for repo_id in fleet {
+            let (bytes, generation) = backend
+                .load_snapshot(repo_id)
+                .unwrap()
+                .expect("a seeded fleet repository has a snapshot");
+            let next = backend.save_snapshot(repo_id, &bytes, generation).unwrap();
+            assert!(
+                next > generation,
+                "a same-bytes rewrite must move {repo_id} past generation {generation}, or the \
+                 next image publishes the cursor this one already committed"
+            );
+        }
+    }
+
+    /// One hosted daemon image over shared durable fixtures.
+    ///
+    /// An image hop is two of these over one control record, one snapshot
+    /// backend and one spine store, which is the only shape that puts a second
+    /// image in front of the first image's durable seal. The spine backend is
+    /// rebuilt per image on purpose: a shared instance would share its caches
+    /// and answer from memory what the next pod has to read cold.
+    fn hosted_rollout_image(
+        reader: &str,
+        scope: &str,
+        fleet: &[String],
+        backend_root: &std::path::Path,
+        control_store: Arc<dyn crate::publication_lease::PublicationControlStore>,
+        clock: Arc<dyn crate::publication_lease::PublicationClock>,
+        spine_store: Arc<kin_spine::test_support::FakeSpineStore>,
+    ) -> (
+        Arc<crate::publication_lease::PublicationControl>,
+        DaemonState,
+        tempfile::TempDir,
+    ) {
+        let repo = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let control = Arc::new(
+            crate::publication_lease::PublicationControl::with_clock(
+                scope,
+                reader,
+                fleet.to_vec(),
+                control_store,
+                clock,
+            )
+            .unwrap(),
+        );
+        let state = DaemonState::open_with_backend_and_publication_control(
+            layout,
+            Box::new(LocalFileBackend::new(backend_root)),
+            "kin",
+            Some(fleet.iter().cloned().collect()),
+            Arc::clone(&control),
+        )
+        .unwrap();
+        state.install_hosted_durable_spine_for_test(Arc::new(
+            kin_spine::FirestoreSpineBackend::with_store(spine_store),
+        ));
+        assert!(
+            state.hosted_spine_readiness_required(),
+            "the composed rollout path is only under test with hosted readiness on"
+        );
+        (control, state, repo)
+    }
+
+    /// Production's own upgrade failure, over the durable fake.
+    ///
+    /// The legacy migration seal is created once per database. It binds the
+    /// rollout fence evidence and the image that wrote it, and the store
+    /// refuses any seal that is not byte-identical to the stored one. But the
+    /// hosted Deployment renders a writer-drain proof on every rollout, so this
+    /// path attempted the seal at every startup, and a second image's
+    /// attestation can never match: every hop off the running image died about
+    /// six minutes in, serving unready while holding its startup rollout lease
+    /// with every readiness probe refused on reader admission, until the
+    /// promotion rolled back.
+    ///
+    /// Two images over one durable store, run exactly as the promotion runs
+    /// them. The first seals an unsealed database, which is the arm that would
+    /// catch a skip that skipped everything. The second must finish its rollout
+    /// and leave the stored seal alone.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_promoted_image_rolls_out_over_the_seal_an_earlier_image_wrote() {
+        use crate::publication_lease::test_clock::ManualClock;
+        use crate::publication_lease::{
+            AuthorizeNextReaderRequest, InMemoryPublicationControlStore, PublicationClock,
+            PublicationControlStore,
+        };
+
+        let image_a = format!("sha256:{}", "a".repeat(64));
+        let image_b = format!("sha256:{}", "c".repeat(64));
+        let drain_proof = format!("sha256:{}", "b".repeat(64));
+        let scope = "gcs://fixture-bucket/fixture-prefix";
+        // The hosted spine contract admits exactly the five canonical
+        // repositories, so a shorter fixture fleet never reaches the rollout.
+        let fleet = ["kin", "kin-db", "kin-editor", "kin-vfs", "kinlab"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        environment.apply("GOOGLE_CLOUD_PROJECT", Some("fixture-project"));
+        environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
+        environment.apply("KIN_GCS_PREFIX", Some("fixture-prefix"));
+        environment.apply("KIN_REPO_IDS", Some(&fleet.join(",")));
+        environment.apply::<_, &str>("KIN_DISABLE_SPINE", None);
+
+        let backend_root = tempfile::tempdir().unwrap();
+        seed_hosted_fleet_snapshots(backend_root.path(), &fleet);
+        let control_store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let fake = Arc::new(kin_spine::test_support::FakeSpineStore::cold());
+
+        let (outgoing, outgoing_state, _outgoing_repo) = hosted_rollout_image(
+            &image_a,
+            scope,
+            &fleet,
+            backend_root.path(),
+            Arc::clone(&control_store) as Arc<dyn PublicationControlStore>,
+            Arc::clone(&clock) as Arc<dyn PublicationClock>,
+            Arc::clone(&fake),
+        );
+        assert!(
+            fake.legacy_migration_seal.lock().unwrap().is_none(),
+            "the fixture must start unsealed, or the first arm proves nothing"
+        );
+        let first = outgoing
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("an absent control record leaves one pending startup rollout");
+        outgoing_state
+            .complete_hosted_startup_rollout(&outgoing, first, Some(drain_proof.clone()))
+            .await
+            .expect("the first image seals an unsealed database and admits itself");
+
+        let sealed = fake
+            .legacy_migration_seal
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("an unsealed database is still sealed exactly once, by the first rollout");
+        assert_eq!(
+            sealed.1.daemon_image_sha256, image_a,
+            "the stored seal names the image that wrote it"
+        );
+
+        // The promotion names the successor on the record while the outgoing
+        // daemon is still healthy, and the successor admits itself at its own
+        // startup. Nothing else about the hop is simulated.
+        rewrite_hosted_fleet_snapshots(backend_root.path(), &fleet);
+        outgoing
+            .authorize_next_reader(AuthorizeNextReaderRequest {
+                scope: scope.to_string(),
+                identity: image_b.clone(),
+            })
+            .unwrap();
+
+        let (incoming, incoming_state, _incoming_repo) = hosted_rollout_image(
+            &image_b,
+            scope,
+            &fleet,
+            backend_root.path(),
+            Arc::clone(&control_store) as Arc<dyn PublicationControlStore>,
+            Arc::clone(&clock) as Arc<dyn PublicationClock>,
+            Arc::clone(&fake),
+        );
+        let second = incoming
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("an authorized successor bootstraps its own startup rollout");
+        incoming_state
+            .complete_hosted_startup_rollout(&incoming, second, Some(drain_proof))
+            .await
+            .expect(
+                "a promoted image must roll out over the seal an earlier image wrote \
+                 rather than die on it",
+            );
+
+        incoming
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .expect("the promoted image is the admitted reader once its rollout releases");
+        let after = fake
+            .legacy_migration_seal
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the seal survives the hop");
+        assert_eq!(
+            after.1, sealed.1,
+            "the seal is per database, so a later image leaves the stored attestation alone"
+        );
+        assert_eq!(
+            after.0.evidence(),
+            sealed.0.evidence(),
+            "and leaves the fence evidence it was sealed against alone"
+        );
+    }
+
+    /// A stored seal that does not answer for the active authority is a loud
+    /// failure, never a quiet skip.
+    ///
+    /// The skip above is gated on a durable `true`. A store that cannot decide
+    /// returns an error, and this path must surface it: swallowing it as
+    /// `false` would send the rollout straight into the seal refusal it exists
+    /// to avoid, and treating it as `true` would admit a reader over a boundary
+    /// nobody proved closed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_rollout_refuses_when_the_stored_legacy_seal_cannot_be_validated() {
+        use crate::publication_lease::test_clock::ManualClock;
+        use crate::publication_lease::{
+            AuthorizeNextReaderRequest, InMemoryPublicationControlStore, PublicationClock,
+            PublicationControlStore,
+        };
+
+        let image_a = format!("sha256:{}", "a".repeat(64));
+        let image_b = format!("sha256:{}", "c".repeat(64));
+        let drain_proof = format!("sha256:{}", "b".repeat(64));
+        let scope = "gcs://fixture-bucket/fixture-prefix";
+        // The hosted spine contract admits exactly the five canonical
+        // repositories, so a shorter fixture fleet never reaches the rollout.
+        let fleet = ["kin", "kin-db", "kin-editor", "kin-vfs", "kinlab"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        environment.apply("GOOGLE_CLOUD_PROJECT", Some("fixture-project"));
+        environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
+        environment.apply("KIN_GCS_PREFIX", Some("fixture-prefix"));
+        environment.apply("KIN_REPO_IDS", Some(&fleet.join(",")));
+        environment.apply::<_, &str>("KIN_DISABLE_SPINE", None);
+
+        let backend_root = tempfile::tempdir().unwrap();
+        seed_hosted_fleet_snapshots(backend_root.path(), &fleet);
+        let control_store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let fake = Arc::new(kin_spine::test_support::FakeSpineStore::cold());
+
+        let (outgoing, outgoing_state, _outgoing_repo) = hosted_rollout_image(
+            &image_a,
+            scope,
+            &fleet,
+            backend_root.path(),
+            Arc::clone(&control_store) as Arc<dyn PublicationControlStore>,
+            Arc::clone(&clock) as Arc<dyn PublicationClock>,
+            Arc::clone(&fake),
+        );
+        let first = outgoing
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("an absent control record leaves one pending startup rollout");
+        outgoing_state
+            .complete_hosted_startup_rollout(&outgoing, first, Some(drain_proof.clone()))
+            .await
+            .expect("the first image seals an unsealed database and admits itself");
+
+        // A seal whose attestation no longer binds the fence it is stored
+        // under: the shape a foreign or half-written seal has, which the store
+        // reports as an error rather than as a clean false.
+        {
+            let mut seal = fake.legacy_migration_seal.lock().unwrap();
+            let (fence, mut drain, heads) = seal.take().expect("the first rollout sealed");
+            drain.rollout_fence_evidence.payload_sha256 = format!("sha256:{}", "e".repeat(64));
+            *seal = Some((fence, drain, heads));
+        }
+
+        rewrite_hosted_fleet_snapshots(backend_root.path(), &fleet);
+        outgoing
+            .authorize_next_reader(AuthorizeNextReaderRequest {
+                scope: scope.to_string(),
+                identity: image_b.clone(),
+            })
+            .unwrap();
+        let (incoming, incoming_state, _incoming_repo) = hosted_rollout_image(
+            &image_b,
+            scope,
+            &fleet,
+            backend_root.path(),
+            Arc::clone(&control_store) as Arc<dyn PublicationControlStore>,
+            Arc::clone(&clock) as Arc<dyn PublicationClock>,
+            Arc::clone(&fake),
+        );
+        let second = incoming
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("an authorized successor bootstraps its own startup rollout");
+        let refusal = incoming_state
+            .complete_hosted_startup_rollout(&incoming, second, Some(drain_proof))
+            .await
+            .expect_err("an undecidable seal must stop the rollout");
+        assert!(
+            refusal.contains("read hosted spine legacy migration state"),
+            "the refusal must name the read that could not decide, not the seal write \
+             it would otherwise have attempted: {refusal}"
         );
     }
 

@@ -1075,6 +1075,48 @@ impl PublicationControl {
                     let mut record = stored.record;
                     record.revision = checked_revision(record.revision)?;
                     record.last_fence = fence;
+                    // Any lease still on the record here has lapsed; a live one
+                    // returned above. So this write discards its author, and an
+                    // abandoned checkpoint has to go with it. A rollout that
+                    // fenced, installed its Firestore evidence on the record and
+                    // then died leaves a pair nobody will ever release: this
+                    // rollout advances the fleet fence again and binds its own
+                    // evidence, so carrying the dead pair forward only leaves
+                    // the record declaring a fence that never completed.
+                    let abandoned_fence = record.active_lease.as_ref().map(|active| active.fence);
+                    if let Some(abandoned_fence) = abandoned_fence {
+                        let restored_payload_sha256 = record
+                            .last_completed_rollout
+                            .as_ref()
+                            .and_then(|completed| {
+                                completed.spine_rollout_fence_payload_sha256.clone()
+                            });
+                        let restored_update_time =
+                            record
+                                .last_completed_rollout
+                                .as_ref()
+                                .and_then(|completed| {
+                                    completed.spine_rollout_fence_update_time.clone()
+                                });
+                        if record.spine_rollout_fence_payload_sha256 != restored_payload_sha256
+                            || record.spine_rollout_fence_update_time != restored_update_time
+                        {
+                            tracing::info!(
+                                scope = %self.scope,
+                                abandoned_fence,
+                                fence,
+                                dropped_payload_sha256 =
+                                    ?record.spine_rollout_fence_payload_sha256,
+                                dropped_update_time = ?record.spine_rollout_fence_update_time,
+                                restored_payload_sha256 = ?restored_payload_sha256,
+                                restored_update_time = ?restored_update_time,
+                                "rollout takeover dropped the Firestore spine evidence an \
+                                 abandoned rollout checkpointed and never released"
+                            );
+                            record.spine_rollout_fence_payload_sha256 = restored_payload_sha256;
+                            record.spine_rollout_fence_update_time = restored_update_time;
+                        }
+                    }
                     record.active_lease = Some(lease.clone());
                     match self.store.update(&stored.version, &record) {
                         Ok(_) => return self.finish_rollout_acquisition(lease),
@@ -2442,10 +2484,24 @@ impl PublicationControl {
         }
         if let Some(latest) = record.last_completed_rollout.as_ref() {
             let latest_evidence = completed_spine_rollout_fence_evidence(latest)?;
-            let active_installs_newer = record.active_lease.as_ref().is_some_and(|active| {
-                active.kind == LeaseKind::Rollout && active.authority_fenced_at.is_some()
-            });
-            if !active_installs_newer && record_spine_evidence != latest_evidence {
+            // A rollout in flight owns this evidence, whether or not it has
+            // installed its own yet. Requiring the fence made the record's
+            // validity depend on which lease happened to be sitting on it: a
+            // rollout that fenced, installed its evidence and then died left
+            // that evidence justified only while its own lapsed lease remained,
+            // so the takeover that replaced the lease withdrew the
+            // justification and kept the evidence, and every load after that
+            // write refused. Nothing is admitted or served under an unfenced
+            // rollout either: `evaluate_runtime_admission` refuses on any
+            // active rollout lease, `admit_reader` and `release` both require
+            // `authority_fenced_at`, and `runtime_spine_authority` reports the
+            // rollout without reading this evidence. The strict equality
+            // returns the moment the rollout is released.
+            let rollout_owns_evidence = record
+                .active_lease
+                .as_ref()
+                .is_some_and(|active| active.kind == LeaseKind::Rollout);
+            if !rollout_owns_evidence && record_spine_evidence != latest_evidence {
                 return Err(PublicationControlError::Admission(
                     "publication-control Firestore evidence does not match its last completed rollout"
                         .to_string(),
@@ -5565,6 +5621,311 @@ mod tests {
             .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
             .unwrap_err();
         assert!(displaced.to_string().contains(READER_B), "{displaced}");
+    }
+
+    /// A rollout that fenced, installed its Firestore evidence on the record
+    /// and then died leaves that evidence justified only by its own lease. The
+    /// takeover that replaces the lease has to drop the evidence with it, in
+    /// the same write: the new rollout advances the fleet fence again and binds
+    /// its own, so a carried-forward pair only leaves the record declaring a
+    /// fence nobody will ever release.
+    #[test]
+    fn a_takeover_drops_the_evidence_an_abandoned_rollout_never_released() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+
+        // The rollout that completed and released. Its evidence is the
+        // record's last completed word.
+        let settled = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = settled
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&settled, &first);
+        let completed = settled.status().unwrap();
+        let completed_evidence = record_spine_rollout_fence_evidence(&completed)
+            .unwrap()
+            .expect("the released record must carry its completed evidence");
+
+        // The rollout that checkpointed and died. Completing its fencing
+        // installs its own evidence on the record; it never reaches reader
+        // admission or release.
+        authorize_next_reader_for(&settled, READER_B);
+        let dying = control(Arc::clone(&store), Arc::clone(&clock), READER_B);
+        let pending = dying
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("the authorized image must run its own startup rollout");
+        let fenced = checkpoint_rollout_for_test(&dying, &pending);
+        assert!(fenced.authority_fenced_at.is_some());
+        let checkpointed = dying.status().unwrap();
+        let checkpointed_evidence = record_spine_rollout_fence_evidence(&checkpointed)
+            .unwrap()
+            .expect("the checkpointed rollout must have installed its evidence");
+        assert_ne!(checkpointed_evidence, completed_evidence);
+        assert_eq!(
+            checkpointed.last_completed_rollout.as_ref().unwrap().fence,
+            first.fence,
+            "the checkpointed rollout must not have completed"
+        );
+        assert_eq!(checkpointed.reader.identity, READER_A);
+
+        // Nothing renews it, and the record still loads while the lapsed lease
+        // that installed that evidence is still the one sitting on it.
+        clock.advance(HOSTED_ROLLOUT_LEASE_SECONDS as i64 + 1);
+        dying.status().unwrap();
+
+        // The next image takes over the lapsed startup lease, and the record
+        // that takeover writes is loadable. Before the drop it was not: the
+        // fresh lease has fenced nothing, so the abandoned evidence lost the
+        // only thing that justified it and every later load was refused.
+        let replacement = control(Arc::clone(&store), Arc::clone(&clock), READER_C);
+        let resumed = replacement
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("an expired startup lease must be takeover-eligible");
+        assert!(
+            resumed.fence > fenced.fence,
+            "the takeover must raise the fence past {}",
+            fenced.fence
+        );
+        let taken = replacement.status().unwrap();
+        assert!(taken
+            .active_lease
+            .as_ref()
+            .unwrap()
+            .authority_fenced_at
+            .is_none());
+        assert_eq!(
+            record_spine_rollout_fence_evidence(&taken).unwrap(),
+            Some(completed_evidence.clone()),
+            "the takeover must leave the record declaring what last completed"
+        );
+
+        // Readiness reports the rollout it is waiting on rather than refusing
+        // on evidence nobody can act on.
+        let probing = replacement
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap_err();
+        assert!(probing.to_string().contains("is blocked by a"), "{probing}");
+
+        // And the rollout completes over it, ending with this image admitted
+        // under evidence of its own.
+        release(&replacement, &resumed);
+        let reopened = replacement.status().unwrap();
+        assert!(reopened.active_lease.is_none());
+        assert_eq!(reopened.reader.identity, READER_C);
+        assert_eq!(
+            reopened.last_completed_rollout.as_ref().unwrap().fence,
+            resumed.fence
+        );
+        let reopened_evidence = record_spine_rollout_fence_evidence(&reopened)
+            .unwrap()
+            .expect("the completed rollout must install its own evidence");
+        assert_ne!(reopened_evidence, completed_evidence);
+        assert_ne!(reopened_evidence, checkpointed_evidence);
+        assert_eq!(
+            reader_spine_rollout_fence_evidence(&reopened).unwrap(),
+            Some(reopened_evidence)
+        );
+        replacement
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap();
+    }
+
+    /// The drop above stops the record from being written that way again. It
+    /// does not help a record already carrying it, because both doors into the
+    /// takeover validate the record they loaded before they write: an
+    /// unreadable record is unreadable by the daemon that would repair it. So
+    /// an in-flight rollout owns this evidence whether or not it has installed
+    /// its own yet, and the record stays loadable until it settles.
+    #[test]
+    fn a_record_left_carrying_an_abandoned_checkpoint_still_resumes() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+
+        let settled = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = settled
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&settled, &first);
+        let completed_evidence = record_spine_rollout_fence_evidence(&settled.status().unwrap())
+            .unwrap()
+            .expect("the released record must carry its completed evidence");
+
+        authorize_next_reader_for(&settled, READER_B);
+        let dying = control(Arc::clone(&store), Arc::clone(&clock), READER_B);
+        let pending = dying
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("the authorized image must run its own startup rollout");
+        checkpoint_rollout_for_test(&dying, &pending);
+        let abandoned = dying.status().unwrap();
+        let abandoned_payload = abandoned.spine_rollout_fence_payload_sha256.clone();
+        let abandoned_update_time = abandoned.spine_rollout_fence_update_time.clone();
+        clock.advance(HOSTED_ROLLOUT_LEASE_SECONDS as i64 + 1);
+
+        let replacement = control(Arc::clone(&store), Arc::clone(&clock), READER_C);
+        let resumed = replacement
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("an expired startup lease must be takeover-eligible");
+
+        // Put the record back into the exact shape a daemon without the drop
+        // wrote: the fence raised, a fresh lease that has fenced nothing, and
+        // the abandoned pair still on top.
+        let stored = store
+            .load()
+            .unwrap()
+            .expect("the taken-over record must be readable");
+        let mut edited = stored.record.clone();
+        edited.revision += 1;
+        edited.spine_rollout_fence_payload_sha256 = abandoned_payload.clone();
+        edited.spine_rollout_fence_update_time = abandoned_update_time.clone();
+        store.update(&stored.version, &edited).unwrap();
+
+        let carried = replacement.status().unwrap();
+        assert_eq!(
+            carried.spine_rollout_fence_payload_sha256, abandoned_payload,
+            "the fixture must actually carry the abandoned pair"
+        );
+        assert_ne!(
+            record_spine_rollout_fence_evidence(&carried).unwrap(),
+            Some(completed_evidence),
+            "and it must not agree with the last completed rollout"
+        );
+        assert!(carried
+            .active_lease
+            .as_ref()
+            .unwrap()
+            .authority_fenced_at
+            .is_none());
+
+        // The rollout already in flight runs to completion over it, and the
+        // record ends declaring the fence that actually finished.
+        release(&replacement, &resumed);
+        let reopened = replacement.status().unwrap();
+        assert!(reopened.active_lease.is_none());
+        assert_eq!(reopened.reader.identity, READER_C);
+        assert_ne!(
+            reopened.spine_rollout_fence_payload_sha256,
+            abandoned_payload
+        );
+        assert_eq!(
+            record_spine_rollout_fence_evidence(&reopened).unwrap(),
+            reader_spine_rollout_fence_evidence(&reopened).unwrap()
+        );
+        replacement
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .unwrap();
+    }
+
+    /// A rollout that is legitimately mid-flight is not an abandoned one.
+    /// Nothing touches the evidence it installed while its lease is still
+    /// live, and no other image walks in behind it.
+    #[test]
+    fn a_live_fenced_rollout_keeps_the_evidence_it_installed() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+
+        let settled = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = settled
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&settled, &first);
+
+        authorize_next_reader_for(&settled, READER_B);
+        let running = control(Arc::clone(&store), Arc::clone(&clock), READER_B);
+        let pending = running
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("the authorized image must run its own startup rollout");
+        let fenced = checkpoint_rollout_for_test(&running, &pending);
+        assert!(fenced.authority_fenced_at.is_some());
+        let mid_flight = running.status().unwrap();
+
+        let other = control(Arc::clone(&store), Arc::clone(&clock), READER_C);
+        let conflict = other
+            .acquire_rollout(rollout_request("deploy", "operator-rollout", None))
+            .unwrap_err();
+        assert!(
+            conflict.to_string().contains("held by"),
+            "a live rollout must be refused, not taken over: {conflict}"
+        );
+        assert!(
+            other.bootstrap_runtime_if_absent().unwrap().is_none(),
+            "a live startup rollout is its own holder's to finish"
+        );
+        assert_eq!(
+            other.status().unwrap(),
+            mid_flight,
+            "nothing may touch a record whose rollout is still running"
+        );
+
+        // And the holder finishes it, so the evidence it installed is the
+        // evidence that gets released.
+        release(&running, &fenced);
+        let reopened = running.status().unwrap();
+        assert_eq!(
+            reopened.spine_rollout_fence_payload_sha256,
+            mid_flight.spine_rollout_fence_payload_sha256
+        );
+        assert_eq!(
+            reopened.last_completed_rollout.as_ref().unwrap().fence,
+            fenced.fence
+        );
+    }
+
+    /// Once the rollout is released the record has to agree with itself again.
+    /// Both halves of that still bite: the evidence must equal what last
+    /// completed, and the admitted reader must have been admitted under it.
+    #[test]
+    fn a_released_record_refuses_evidence_that_does_not_match_itself() {
+        let store = Arc::new(InMemoryPublicationControlStore::default());
+        let clock = Arc::new(ManualClock::new());
+        let daemon = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        let first = daemon
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&daemon, &first);
+        let settled = daemon.status().unwrap();
+        assert!(settled.active_lease.is_none());
+
+        // Evidence ahead of the last completed rollout, with no rollout in
+        // flight to own it.
+        let stored = store.load().unwrap().unwrap();
+        let mut ahead = stored.record.clone();
+        ahead.revision += 1;
+        ahead.spine_rollout_fence_update_time = Some("test-firestore-update-stranded".to_string());
+        store.update(&stored.version, &ahead).unwrap();
+        let refused = daemon.status().unwrap_err();
+        assert!(
+            refused.to_string().contains(
+                "publication-control Firestore evidence does not match its last completed rollout"
+            ),
+            "{refused}"
+        );
+
+        // And a reader admitted under different evidence than the record
+        // declares.
+        let stored = store.load().unwrap().unwrap();
+        let mut reader_drift = stored.record.clone();
+        reader_drift.revision += 1;
+        reader_drift.spine_rollout_fence_update_time =
+            settled.spine_rollout_fence_update_time.clone();
+        reader_drift.reader_spine_rollout_fence_update_time =
+            Some("test-firestore-update-reader-drift".to_string());
+        store.update(&stored.version, &reader_drift).unwrap();
+        let refused = daemon.status().unwrap_err();
+        assert!(
+            refused.to_string().contains(
+                "released publication-control record admits a reader under different Firestore spine evidence"
+            ),
+            "{refused}"
+        );
     }
 
     /// The read path and `acquire_rollout` must agree about what a live lease

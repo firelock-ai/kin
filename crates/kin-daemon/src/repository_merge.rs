@@ -37,6 +37,102 @@ use crate::local_repository_authority::{
 use crate::source_cas::read_publishable_source;
 use crate::state::{DaemonEvent, DaemonState};
 
+/// What a published merge should do about the cross-file enrichment its result
+/// needs.
+///
+/// A merge composes the three-way union of two committed graphs, and that union
+/// is exactly the edges the two branches already carried. It is not the graph
+/// the merged tree implies. An edge whose two ends arrive from different sides
+/// exists only once the merge exists, so no branch could ever have held it, and
+/// a branch committed before its own enrichment settled contributes less than
+/// its tree implies on top of that. Measured on the v0.7.0 bytes over a
+/// disjoint-file merge: the composer published the exact union every time, and
+/// a `kin daemon sweep` run straight after, over source nobody had touched,
+/// still added edges. Nothing queued that sweep. One is queued when the daemon
+/// starts and by `POST /lsp/sweep`, and a merge is neither, so the command that
+/// converges a merged graph was one a reader had no reason to know existed.
+///
+/// So the merge queues it, and the ordinary case is silent: converging without
+/// anybody typing the command is the whole point. The case that speaks is the
+/// one where the daemon cannot enrich at all, because there the merged graph
+/// holds only what the branches carried and no later pass repairs it on its
+/// own.
+#[derive(Debug, PartialEq, Eq)]
+enum MergeEnrichment {
+    /// Converge the merged tree in the background.
+    Sweep,
+    /// Nothing to converge from, and nothing to announce.
+    Silent,
+    /// Say the merged graph was not converged, and why.
+    Announce(String),
+}
+
+/// Decide from the two facts the daemon holds about its own enrichment.
+///
+/// Pure so every row is exercised without standing up a daemon, which is what
+/// the row that never speaks needs most: a rule that reported "enrichment did
+/// not run" on a graph-only store would be advice about a knob that store does
+/// not have.
+fn merge_enrichment(
+    reconcile_disabled: bool,
+    unavailable: Option<(&'static str, String)>,
+) -> MergeEnrichment {
+    if reconcile_disabled {
+        // Filesystem-derived relations cannot mutate graph-only authority, so
+        // there is no sweep to run and no gap a sweep would close.
+        return MergeEnrichment::Silent;
+    }
+    match unavailable {
+        Some((_, detail)) => MergeEnrichment::Announce(format!(
+            "Cross-file enrichment did not run for this merge ({detail}), so the merged graph \
+             holds only the edges the two branches already carried; run `kin daemon sweep` once \
+             a language server is available"
+        )),
+        None => MergeEnrichment::Sweep,
+    }
+}
+
+/// Settle the graph a merge just published: record what its relation set now
+/// holds, and converge the enrichment the merged tree implies.
+///
+/// Called from both publication paths, because a merge settled through
+/// `kin resolve --continue` publishes the same kind of graph as one that
+/// composed cleanly and was missing the same edges.
+///
+/// The census is recorded for the reason the commit path records one: the
+/// relation set just moved and this process knows it finished, which is what
+/// makes the record a baseline rather than a mid-flight sample.
+/// [`kin_core::relation_census::record`] refuses to advance a losing census, so
+/// a merge that lost ground leaves the older baseline standing rather than
+/// burying the loss under its own reading.
+///
+/// Recorded as [`CensusSource::Commit`](kin_core::relation_census::CensusSource)
+/// because that is what the source names: a change installed in the live graph,
+/// which is exactly what a published merge is. The alternative was a third
+/// variant, and a store stamped with one reads as unreadable to any build that
+/// predates it, which trades a labelling nicety for a window where no lost kind
+/// can be detected at all.
+fn settle_merged_graph(state: &DaemonState) -> Option<String> {
+    crate::background_work::record_relation_census(
+        &state.layout,
+        &state.graph,
+        kin_core::relation_census::CensusSource::Commit,
+    );
+    match merge_enrichment(
+        state.filesystem_reconcile_disabled(),
+        crate::api::enrichment_unavailable_reason_for(state),
+    ) {
+        MergeEnrichment::Sweep => {
+            // `false` here means a sweep is already running, which covers this
+            // merge as well as one queued now would.
+            state.queue_lsp_sweep();
+            None
+        }
+        MergeEnrichment::Silent => None,
+        MergeEnrichment::Announce(line) => Some(line),
+    }
+}
+
 const MERGE_REASON: &str = "publish exact repository-v6 semantic merge";
 const FAST_FORWARD_REASON: &str = "advance exact repository-v6 branch to a descendant";
 const OPEN_MERGE_REASON: &str = "open a durable repository-v6 merge transaction";
@@ -1341,6 +1437,8 @@ pub(crate) fn publish_resolved_merge(
         })?;
     }
 
+    let settled = settle_merged_graph(state);
+
     let resolved_count = terminated.entries.len();
     let report = kin_cli::commands::resolve::ResolveReport {
         schema: kin_cli::commands::resolve::RESOLVE_REPORT_SCHEMA.to_string(),
@@ -1370,6 +1468,7 @@ pub(crate) fn publish_resolved_merge(
                     receipt.generation
                 )];
                 lines.extend(projections);
+                lines.extend(settled);
                 lines
             },
             mutated: matches!(receipt.outcome, RepositoryCommitOutcome::Committed),
@@ -2587,6 +2686,7 @@ fn publish(
             bail!("a parked merge must not reach the workspace publication path")
         }
     };
+    let settled = settle_merged_graph(state);
     let report = MergeReport {
         schema: MERGE_REPORT_SCHEMA.to_string(),
         authority: "repository-v6".to_string(),
@@ -2605,10 +2705,12 @@ fn publish(
         relation_delta_count: 0,
         tree_delta_count: 0,
     };
+    let mut lines = vec![line];
+    lines.extend(settled);
     Ok(MergeExecution {
         resolve_response: None,
         response: MergeResponse {
-            lines: vec![line],
+            lines,
             mutated: matches!(receipt.outcome, RepositoryCommitOutcome::Committed),
             report: Some(report),
             operation_id: Some(receipt.operation_id),
@@ -4246,6 +4348,106 @@ mod tests {
         SharedAdmissionPolicy::derive_from_tree(None, &ResolvedTree::default(), |_| Ok(0))
             .unwrap()
             .0
+    }
+
+    /// A daemon that can enrich, with a channel a test can read the sweep off.
+    fn enriching_state(
+        layout: kin_core::KinLayout,
+    ) -> (
+        DaemonState,
+        tokio::sync::mpsc::Receiver<crate::state::LspEnrichmentMessage>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut state = DaemonState::open(layout).expect("open a repository-v6 daemon state");
+        state.lsp_enrichment_tx = Some(tx);
+        (state, rx)
+    }
+
+    // ── What a published merge does about the enrichment its result needs ──
+    //
+    // The composer publishes the three-way union of two committed graphs, and
+    // measured on the v0.7.0 bytes that union is exact. It is also not the graph
+    // the merged tree implies, and a `kin daemon sweep` run straight after a
+    // merge over untouched source added edges every time. Nothing queued that
+    // sweep, so the rows below are the whole of what a merge decides.
+
+    #[test]
+    fn a_merge_that_can_enrich_converges_its_result_without_saying_anything() {
+        assert_eq!(
+            merge_enrichment(false, None),
+            MergeEnrichment::Sweep,
+            "a daemon that can enrich converges the merged tree itself; the command that \
+             recovers those edges is one nobody should have to know"
+        );
+    }
+
+    #[test]
+    fn a_merge_that_cannot_enrich_says_so_and_names_the_cause() {
+        let MergeEnrichment::Announce(line) = merge_enrichment(
+            false,
+            Some((
+                "no_language_server",
+                "this daemon found no language server for any language it enriches".to_string(),
+            )),
+        ) else {
+            panic!("a daemon that cannot enrich must not publish the gap quietly");
+        };
+        assert!(
+            line.contains("this daemon found no language server for any language it enriches"),
+            "the cause the daemon holds is the whole value of the line: {line}"
+        );
+        assert!(
+            line.contains("kin daemon sweep"),
+            "a refusal names its own recovery, and this one did not exist in the product: {line}"
+        );
+    }
+
+    #[test]
+    fn a_graph_only_store_is_told_nothing_about_a_sweep_it_cannot_run() {
+        assert_eq!(
+            merge_enrichment(
+                true,
+                Some((
+                    "no_language_server",
+                    "this daemon found no language server".to_string(),
+                )),
+            ),
+            MergeEnrichment::Silent,
+            "filesystem-derived relations cannot mutate graph-only authority, so there is no \
+             gap here and advice about a knob this store does not have is noise"
+        );
+    }
+
+    /// The decision above is only worth anything if the publication path takes
+    /// it. This is the assertion the defect needed: after a merge settles its
+    /// graph, a sweep is on the enrichment channel with nobody having typed one.
+    #[test]
+    fn settling_a_merged_graph_queues_the_sweep_and_records_the_census() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let census_path = init.layout.kindb_relation_census_path();
+        assert!(
+            !census_path.exists(),
+            "the fixture has to start with no census, or the assertion below proves nothing"
+        );
+        let (state, mut rx) = enriching_state(init.layout.clone());
+
+        assert_eq!(
+            settle_merged_graph(&state),
+            None,
+            "a daemon that can enrich converges silently"
+        );
+
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::state::LspEnrichmentMessage::Sweep)),
+            "a published merge has to ask for the sweep its result needs; before this it asked \
+             for nothing and the edges waited for a command nobody knew"
+        );
+        assert!(
+            census_path.exists(),
+            "a merge moves the relation set and knows it finished, so it records the baseline \
+             the next comparison is judged against, exactly as a commit does"
+        );
     }
 
     fn authority(init: &kin_core::InitResult) -> RepositoryAuthorityManager<LocalFileBackend> {

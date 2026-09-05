@@ -125,6 +125,22 @@ pub trait SpineBackend: Send + Sync {
         ))
     }
 
+    /// Whether the one-way legacy boundary is already sealed and still valid
+    /// against the active rollout authority.
+    ///
+    /// The seal is created once per database, not once per deployment, and it
+    /// binds the fence evidence and the image that wrote it. So a caller that
+    /// holds a writer-drain proof must ask this before attempting to seal:
+    /// every later image carries a different attestation, and re-sealing over
+    /// an existing seal is refused rather than treated as a replay. A backend
+    /// without a durable answer fails loudly, because a silent `false` would
+    /// send exactly that caller into the refusal.
+    fn legacy_migration_complete(&self) -> Result<bool, SpineError> {
+        Err(SpineError::Backend(
+            "durable legacy spine migration state is unsupported".to_string(),
+        ))
+    }
+
     /// Persist the explicit one-way boundary that closes legacy cursorless
     /// collections after every repository has a committed v2 head and older
     /// writers have been removed from service.
