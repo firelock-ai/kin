@@ -1158,10 +1158,10 @@ pub(crate) enum SemanticCurrency {
 /// from, and the parse of it is compared against the entities the graph holds.
 /// Nothing here reads the working copy.
 ///
-/// Bounded to the tree delta, and inside it to the paths the change updates. A
-/// path this change adds carries no earlier parse to be stale against, so an
-/// import commit, whose delta is the whole tree, pays no parse at all; a path it
-/// removes seals no bytes.
+/// Bounded to the tree delta, and inside it to the paths [`SealedPathScope`]
+/// admits: a path the change removes seals no bytes and is never in scope, and a
+/// root change checks nothing at all, so an import commit whose delta is the
+/// whole tree pays no parse.
 pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
     graph: &kin_db::InMemoryGraph,
     blobs: &kin_blobs::BlobStore,

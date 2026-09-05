@@ -29771,6 +29771,31 @@ mod tests {
         );
     }
 
+    /// The entity an install derived for `path`, named and of the kind asked for.
+    ///
+    /// Fixtures take the entity the install produced rather than upserting a
+    /// hand-made one beside it. Installing a source file derives its entities the
+    /// way the daemon's admission does, so a second entity with the same name on
+    /// the same path is a graph the daemon never produces, and a query that then
+    /// names two entities resolves an ambiguity the fixture never meant to build.
+    fn derived_entity(
+        state: &Arc<DaemonState>,
+        path: &str,
+        name: &str,
+        kind: EntityKind,
+    ) -> Entity {
+        state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new(path)),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.name == name && candidate.kind == kind)
+            .unwrap_or_else(|| panic!("installing {path} must derive {kind:?} {name}"))
+    }
+
     fn test_entity(name: &str, path: &str) -> Entity {
         Entity {
             id: EntityId::new(),
@@ -38712,20 +38737,13 @@ mod tests {
         // covered path on its own and leave this purge nothing to do.
         install_working_copy_file(&state, ".kinignore", b"investor\n", false);
 
-        let derived = |path: &str, name: &str| {
-            state
-                .graph
-                .query_entities(&kin_db::EntityFilter {
-                    file_path: Some(kin_model::FilePathId::new(path)),
-                    ..Default::default()
-                })
-                .unwrap()
-                .into_iter()
-                .find(|candidate| candidate.name == name)
-                .unwrap_or_else(|| panic!("the admission must derive {name} for {path}"))
-        };
-        let private = derived("investor/deck/build_deck.py", "valuation");
-        let kept = derived("src/lib.py", "kept");
+        let private = derived_entity(
+            &state,
+            "investor/deck/build_deck.py",
+            "valuation",
+            EntityKind::Function,
+        );
+        let kept = derived_entity(&state, "src/lib.py", "kept", EntityKind::Function);
         assert!(state.graph.get_entity(&private.id).unwrap().is_some());
 
         let (_, applied) = purge_ignored_through_api(&app, true).await;
@@ -38795,16 +38813,12 @@ mod tests {
         install_working_copy_file(&state, ".kinignore", b"investor\n", false);
         let app = router(Arc::clone(&state));
 
-        let private = state
-            .graph
-            .query_entities(&kin_db::EntityFilter {
-                file_path: Some(kin_model::FilePathId::new("investor/deck/build_deck.py")),
-                ..Default::default()
-            })
-            .unwrap()
-            .into_iter()
-            .find(|candidate| candidate.name == "valuation")
-            .expect("the install must derive the entity the purge has to retire");
+        let private = derived_entity(
+            &state,
+            "investor/deck/build_deck.py",
+            "valuation",
+            EntityKind::Function,
+        );
 
         let (_, applied) = purge_ignored_through_api(&app, true).await;
         assert_eq!(applied["report"]["purge_count"], json!(1));
@@ -44593,16 +44607,7 @@ mod tests {
         let working = state.layout.working_dir().join(&path);
         std::fs::create_dir_all(working.parent().unwrap()).unwrap();
         std::fs::write(&working, source.as_bytes()).unwrap();
-        state
-            .graph
-            .query_entities(&kin_db::EntityFilter {
-                file_path: Some(kin_model::FilePathId::new(&path)),
-                ..Default::default()
-            })
-            .unwrap()
-            .into_iter()
-            .find(|candidate| candidate.name == name && candidate.kind == EntityKind::Module)
-            .unwrap_or_else(|| panic!("installing {path} must derive the module {name}"))
+        derived_entity(state, &path, name, EntityKind::Module)
     }
 
     /// Put a fixture's file into repository authority and the working copy, and
@@ -44623,16 +44628,7 @@ mod tests {
         let working = state.layout.working_dir().join(path);
         std::fs::create_dir_all(working.parent().unwrap()).unwrap();
         std::fs::write(&working, source.as_bytes()).unwrap();
-        state
-            .graph
-            .query_entities(&kin_db::EntityFilter {
-                file_path: Some(kin_model::FilePathId::new(path)),
-                ..Default::default()
-            })
-            .unwrap()
-            .into_iter()
-            .find(|candidate| candidate.name == name && candidate.kind == EntityKind::Function)
-            .unwrap_or_else(|| panic!("installing {path} must derive the function {name}"))
+        derived_entity(state, path, name, EntityKind::Function)
     }
 
     /// Drive `/trace` in its DEFAULT rendering and return the lines it printed.
@@ -53597,16 +53593,7 @@ mod tests {
             ("parse_config", "def parse_config(path):"),
             ("parse_config_list", "def parse_config_list(paths):"),
         ] {
-            let mut entity = state
-                .graph
-                .query_entities(&kin_db::EntityFilter {
-                    file_path: Some(kin_model::FilePathId::new("src/loader.py")),
-                    ..Default::default()
-                })
-                .unwrap()
-                .into_iter()
-                .find(|candidate| candidate.name == name && candidate.kind == EntityKind::Function)
-                .unwrap_or_else(|| panic!("installing src/loader.py must derive {name}"));
+            let mut entity = derived_entity(&state, "src/loader.py", name, EntityKind::Function);
             // The fused ranker reads this to call an entity a definition rather
             // than a bare reference, and only definitions are ranked.
             entity
@@ -54589,27 +54576,23 @@ mod tests {
         let valid_source = "def valid_func():\n    return 42\n";
         install_repository_file(&state, "src/good.py", valid_source.as_bytes());
         install_working_copy_file(&state, "src/good.py", valid_source.as_bytes(), false);
-        let mut valid_entity = test_entity("valid_func", "src/good.py");
-        valid_entity.span = Some(SourceSpan {
-            file: kin_model::FilePathId::new("src/good.py"),
-            start_byte: 0,
-            end_byte: valid_source.len(),
-            start_line: 0,
-            start_col: 0,
-            end_line: 1,
-            end_col: 15,
-        });
+        let mut valid_entity =
+            derived_entity(&state, "src/good.py", "valid_func", EntityKind::Function);
         valid_entity.metadata.extra.insert(
             "embedding_body_preview".to_string(),
             json!("def valid_func():"),
         );
         state.graph.upsert_entity(&valid_entity).unwrap();
 
-        // bad.py has valid source text but bad_entity has an out-of-bounds span (100..200 > 25)
+        // bad.py has valid source text; the entity the install derived for it is
+        // given an out-of-bounds span (100..200 > 25), which is the unreadable
+        // source under test. The derived entity is corrupted rather than joined
+        // by a hand-made twin, because a readable second `bad_func` outranks the
+        // unreadable one and the page then reports no degradation at all.
         let bad_source = "def bad_func():\n    pass\n";
         install_repository_file(&state, "src/bad.py", bad_source.as_bytes());
         install_working_copy_file(&state, "src/bad.py", bad_source.as_bytes(), false);
-        let mut bad_entity = test_entity("bad_func", "src/bad.py");
+        let mut bad_entity = derived_entity(&state, "src/bad.py", "bad_func", EntityKind::Function);
         bad_entity.span = Some(SourceSpan {
             file: kin_model::FilePathId::new("src/bad.py"),
             start_byte: 100,
@@ -54655,16 +54638,8 @@ mod tests {
         let valid_source = "def valid_func():\n    return 42\n";
         install_repository_file(&state, "src/good.py", valid_source.as_bytes());
         install_working_copy_file(&state, "src/good.py", valid_source.as_bytes(), false);
-        let mut valid_entity = test_entity("valid_func", "src/good.py");
-        valid_entity.span = Some(SourceSpan {
-            file: kin_model::FilePathId::new("src/good.py"),
-            start_byte: 0,
-            end_byte: valid_source.len(),
-            start_line: 0,
-            start_col: 0,
-            end_line: 1,
-            end_col: 15,
-        });
+        let mut valid_entity =
+            derived_entity(&state, "src/good.py", "valid_func", EntityKind::Function);
         valid_entity.metadata.extra.insert(
             "embedding_body_preview".to_string(),
             json!("def valid_func():"),
