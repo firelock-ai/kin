@@ -2188,6 +2188,86 @@ fn embed_batch_under_pressure(
     }
 }
 
+/// The batch size a REFUSED pass may use once its tree has been anchored.
+///
+/// A quarter of the elevated shrink, so a sixteenth of the configured size. The
+/// pass that reaches here is already past its budget, and the only thing it is
+/// asked to do is converge, so the step is picked to be the smallest one that
+/// still finishes rather than the largest one that still fits. On the measured
+/// container that is 32 entities against a configured 512, which drains a
+/// 1722-entity backlog in tens of minutes instead of never.
+///
+/// The floor of one is the same floor `embed_batch_under_pressure` keeps and
+/// for the same reason: a size knob allowed to reach zero is a silent refusal
+/// wearing an admission's name.
+fn refused_embed_batch(configured: usize) -> usize {
+    (configured / 16).max(1)
+}
+
+/// What one embed wake does, once the rule and the disclosure have answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmbedWakeDecision {
+    /// End the drain for this wake.
+    Hold,
+    /// Run a batch of this size.
+    Run(usize),
+}
+
+/// Compose the memory rule, the disclosure and the batch size into one answer.
+///
+/// Extracted from the worker because the composition is where the interesting
+/// mistake lives, and the worker is an async block inside a daemon that a test
+/// cannot drive. The pure rule can be right while the caller throws its answer
+/// away, which is exactly what happened here: a `Hold` was only honoured when
+/// the COMBINED verdict refused, so an anchored tree whose footprint sample
+/// failed on a nominal host produced `Proceed`, skipped the break, and ran a
+/// full-size batch. That is a daemon known to be over its budget spending the
+/// machine on the strength of a reading it did not get.
+///
+/// So the state after the rule is what governs, not the combined verdict.
+/// `refusal_state` reaches `Clear` only through a MEASURED recovery, so
+/// anything else means "known over budget, and this wake produced no licence".
+/// `Clear` keeps the behaviour it has always had, deliberately: it means no
+/// known over-budget condition, the ordinary verdict governs, and widening this
+/// change to touch that path would be new budget policy rather than a fix.
+fn embed_wake_decision(
+    refused_now: bool,
+    admission: kin_core::memory_pressure::RefusedEmbedAdmission,
+    state_after: kin_core::memory_pressure::RefusedEmbedState,
+    verdict: &kin_core::memory_pressure::Verdict,
+    configured: usize,
+) -> EmbedWakeDecision {
+    if admission == kin_core::memory_pressure::RefusedEmbedAdmission::AdmitFloorBatch {
+        return EmbedWakeDecision::Run(refused_embed_batch(configured));
+    }
+    if refused_now || state_after != kin_core::memory_pressure::RefusedEmbedState::Clear {
+        return EmbedWakeDecision::Hold;
+    }
+    EmbedWakeDecision::Run(embed_batch_under_pressure(configured, verdict))
+}
+
+/// What one consultation established about this daemon's own tree.
+///
+/// The BUDGET arm alone, never the combined rung, because only a refusal this
+/// daemon's own budget produced may be relaxed and the combined rung cannot say
+/// which arm produced it. A tree that could not be measured is `Unobserved`
+/// rather than recovered: reading a sampling gap as recovery is what lets an
+/// anchor be cleared without evidence and re-anchored higher on the next
+/// successful sample.
+fn budget_observation(call: &PressureCall) -> kin_core::memory_pressure::BudgetObservation {
+    match (call.budget_level, call.standing.as_ref()) {
+        (Some(level), Some(standing)) => {
+            let held_bytes = standing.footprint.total_bytes();
+            if level == kin_core::memory_pressure::PressureLevel::Critical {
+                kin_core::memory_pressure::BudgetObservation::Refused { held_bytes }
+            } else {
+                kin_core::memory_pressure::BudgetObservation::Recovered { held_bytes }
+            }
+        }
+        _ => kin_core::memory_pressure::BudgetObservation::Unobserved,
+    }
+}
+
 /// One row of the host's process table, in the four fields a footprint needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcessRow {
@@ -2459,6 +2539,10 @@ pub(crate) fn pressure_verdict(work: kin_core::memory_pressure::HeavyWork) -> Pr
     });
     PressureCall {
         level,
+        host_level,
+        budget_level: standing
+            .as_ref()
+            .map(|standing| standing.level_under(&thresholds)),
         verdict: kin_core::memory_pressure::Verdict::decide(
             work,
             &pressure,
@@ -2472,6 +2556,25 @@ pub(crate) fn pressure_verdict(work: kin_core::memory_pressure::HeavyWork) -> Pr
 /// One consultation: what was measured, and what that means for this work.
 pub(crate) struct PressureCall {
     pub(crate) level: kin_core::memory_pressure::PressureLevel,
+    /// The HOST or cgroup rung on its own, before this daemon's own budget was
+    /// folded in.
+    ///
+    /// Carried because the two axes answer different questions and one caller
+    /// needs them apart. `level` is the worse of the two, so it cannot say
+    /// whether a critical verdict came from this tree's budget or from the
+    /// machine, and `admit_refused_embed` may only relax a refusal that came
+    /// from the budget. Two repo daemons in one container each derive half the
+    /// same cgroup, so a settled tree is no evidence at all about what the
+    /// machine has left.
+    pub(crate) host_level: kin_core::memory_pressure::PressureLevel,
+    /// This daemon's own budget rung, when its tree could be measured at all.
+    ///
+    /// `None` is an unreadable tree, which is evidence of nothing and must never
+    /// be read as recovery. Carried apart from `level` for the same reason
+    /// `host_level` is: only a refusal that this daemon's OWN budget produced
+    /// may ever be relaxed, and the combined rung cannot say which arm produced
+    /// it.
+    pub(crate) budget_level: Option<kin_core::memory_pressure::PressureLevel>,
     pub(crate) verdict: kin_core::memory_pressure::Verdict,
     /// What this daemon's own tree was holding when the call was made, when it
     /// could be measured. Carried so a caller can publish the standing without
@@ -4686,6 +4789,13 @@ pub async fn run_with_authority_on(
         // wake: the record is a statement of the current state, and rewriting
         // it every few seconds would turn a disclosure into a log.
         let mut announced_pressure: Option<kin_core::memory_pressure::PressureLevel> = None;
+        // What a refusal for memory has measured so far, and whether this worker
+        // has ever finished a batch in this process. Together they are what lets
+        // a tree that has SETTLED above its budget keep converging while a tree
+        // that is still growing stays refused. See
+        // `kin_core::memory_pressure::admit_refused_embed`.
+        let mut refusal_state = kin_core::memory_pressure::RefusedEmbedState::default();
+        let mut completed_a_batch = false;
         'wake: loop {
             // Between wakes this worker is genuinely doing nothing, so the
             // working stretch ends here. A wedged drain never reaches this
@@ -4844,13 +4954,40 @@ pub async fn run_with_authority_on(
                 let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
                 publish_footprint_standing(&embed_state, &call);
                 let pressure_changed = announced_pressure != Some(call.level);
-                if disclose_embed_pressure_refusal_if_needed(
+                // A refusal is still disclosed exactly as before; what it no
+                // longer always does is stop the drain. A tree that has not
+                // grown since its refusal was anchored runs a floor-size batch,
+                // because refusing it for ever cannot reclaim the memory that
+                // put it over: that memory is the model the next batch reuses.
+                let observation = budget_observation(&call);
+                let (next_refusal_state, admission) =
+                    kin_core::memory_pressure::admit_refused_embed(
+                        refusal_state,
+                        observation,
+                        call.host_level,
+                        completed_a_batch,
+                        kin_core::memory_pressure::REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+                    );
+                refusal_state = next_refusal_state;
+                // Called for its record-publishing side effect before anything
+                // decides to stop, so a refusal is disclosed on the wake that
+                // produced it whatever this worker then does about it.
+                let refused_now = disclose_embed_pressure_refusal_if_needed(
                     &embed_state,
                     &mut announced_pressure,
                     &call,
-                ) {
-                    break;
-                }
+                );
+                let decision = embed_wake_decision(
+                    refused_now,
+                    admission,
+                    refusal_state,
+                    &call.verdict,
+                    embed_batch_size,
+                );
+                let batch = match decision {
+                    EmbedWakeDecision::Hold => break,
+                    EmbedWakeDecision::Run(batch) => batch,
+                };
                 if pressure_changed {
                     match &call.verdict {
                         kin_core::memory_pressure::Verdict::Shrink { reason } => {
@@ -4870,7 +5007,6 @@ pub async fn run_with_authority_on(
                 // machine. Latched, so a drain that never finishes keeps one
                 // stretch rather than restarting it every batch.
                 embed_pass.working(Instant::now());
-                let batch = embed_batch_under_pressure(embed_batch_size, &call.verdict);
                 let state_for_embed = Arc::clone(&embed_state);
                 let is_artifact = pending == 0;
                 let reset_on_index_error = !index_reset_triggered;
@@ -4910,6 +5046,10 @@ pub async fn run_with_authority_on(
                         // Progress makes the next coverage gap a new question,
                         // so a gap that once looked unclosable gets asked again.
                         backfilled_gap = None;
+                        // This worker has now established a settled footprint to
+                        // anchor against, which is what a later refusal for
+                        // memory needs before it may admit anything.
+                        completed_a_batch = true;
                         embed_pass.reset_retries();
                         info!(count, remaining = remaining.saturating_sub(count), label);
                         // Serialize successive flushes: the previous batch's
@@ -8271,10 +8411,12 @@ fn budget_no_test_can_fill() -> kin_core::test_env::EnvVarGuard {
 mod memory_pressure_tests {
     use super::{
         clear_pressure_refusal_for_work, decide_sweep_on_start, embed_batch_under_pressure,
-        embedding_coverage_is_complete, pressure_announcement_after_retirement,
-        pressure_refusal_matches_work, pressure_refusal_needs_disclosure, pressure_verdict,
-        queue_embedding_backfill_under_pressure, retire_embed_pressure_for_unavailable_persistence,
-        sample_tree_footprint, start_or_defer_background_embed, tree_footprint_from, ProcessRow,
+        embed_wake_decision, embedding_coverage_is_complete,
+        pressure_announcement_after_retirement, pressure_refusal_matches_work,
+        pressure_refusal_needs_disclosure, pressure_verdict,
+        queue_embedding_backfill_under_pressure, refused_embed_batch,
+        retire_embed_pressure_for_unavailable_persistence, sample_tree_footprint,
+        start_or_defer_background_embed, tree_footprint_from, EmbedWakeDecision, ProcessRow,
         SweepStartDecision,
     };
     // Gated exactly like its only caller, the walk test that spawns a real
@@ -8284,7 +8426,10 @@ mod memory_pressure_tests {
     #[cfg(unix)]
     use super::walk_process_table;
     use crate::state::DaemonState;
-    use kin_core::memory_pressure::{HeavyWork, PressureLevel, PressureRefusal, Verdict};
+    use kin_core::memory_pressure::{
+        admit_refused_embed, BudgetObservation, HeavyWork, PressureLevel, PressureRefusal,
+        RefusedEmbedAdmission, RefusedEmbedState, Verdict, REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+    };
     use kin_core::test_env::EnvVarGuard;
     use kin_model::EntityStore;
 
@@ -9424,6 +9569,185 @@ mod memory_pressure_tests {
              machine"
         );
         assert_eq!(embed_batch_under_pressure(512, &call.verdict), 128);
+    }
+
+    /// The wake sequence the pure rule cannot grade, driven through the caller.
+    ///
+    /// The rule returning `Hold` is worth nothing if the composition around it
+    /// runs a batch anyway, and that is the defect this pins: an anchored tree
+    /// whose footprint sample fails on a nominal host produces a combined
+    /// `Proceed`, so a break guarded on the disclosure alone never fires and the
+    /// worker spends a FULL batch with no measured recovery behind it.
+    ///
+    /// This drives the extracted composition, not a live daemon. It grades the
+    /// decision the worker makes from the rule's answer; it does not prove the
+    /// worker is wired to this function.
+    #[test]
+    fn an_anchored_worker_does_not_resume_full_batches_on_a_reading_it_did_not_get() {
+        const CONFIGURED: usize = 512;
+        const ANCHOR: u64 = 7_194_070_384;
+        let refuse = Verdict::Refuse {
+            reason: String::new(),
+        };
+
+        // Wake 1: the first refusal after a completed batch. Anchor and hold.
+        let (state, admission) = admit_refused_embed(
+            RefusedEmbedState::Clear,
+            BudgetObservation::Refused { held_bytes: ANCHOR },
+            PressureLevel::Elevated,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(state, RefusedEmbedState::Anchored(ANCHOR));
+        assert_eq!(
+            embed_wake_decision(true, admission, state, &refuse, CONFIGURED),
+            EmbedWakeDecision::Hold,
+            "the anchoring wake runs nothing"
+        );
+
+        // Wake 2: the reading fails. The combined verdict on a nominal host is
+        // Proceed, so nothing refuses and nothing is disclosed. The worker must
+        // still hold, because it is over its budget and just learned nothing.
+        let (state, admission) = admit_refused_embed(
+            state,
+            BudgetObservation::Unobserved,
+            PressureLevel::Nominal,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(
+            state,
+            RefusedEmbedState::Anchored(ANCHOR),
+            "an unobserved wake carries the anchor forward"
+        );
+        assert_eq!(
+            embed_wake_decision(false, admission, state, &Verdict::Proceed, CONFIGURED),
+            EmbedWakeDecision::Hold,
+            "a daemon known to be over its budget must not run a full batch because \
+             its own footprint sample failed"
+        );
+
+        // Wake 3: a sample lands above the ORIGINAL anchor. Latch, still hold.
+        let (state, admission) = admit_refused_embed(
+            state,
+            BudgetObservation::Refused {
+                held_bytes: ANCHOR + REFUSED_EMBED_GROWTH_TOLERANCE_BYTES + 1,
+            },
+            PressureLevel::Elevated,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(
+            state,
+            RefusedEmbedState::Latched,
+            "growth is measured against the original anchor, not a moved one"
+        );
+        assert_eq!(
+            embed_wake_decision(true, admission, state, &refuse, CONFIGURED),
+            EmbedWakeDecision::Hold
+        );
+
+        // Wake 4: latched, and the reading fails again on a nominal host. Still
+        // no batch.
+        let (state, admission) = admit_refused_embed(
+            state,
+            BudgetObservation::Unobserved,
+            PressureLevel::Nominal,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(state, RefusedEmbedState::Latched);
+        assert_eq!(
+            embed_wake_decision(false, admission, state, &Verdict::Proceed, CONFIGURED),
+            EmbedWakeDecision::Hold,
+            "a latched runaway is not released by a gap in sampling"
+        );
+    }
+
+    /// The two arms that must still run, or the test above passes by breaking
+    /// embedding outright.
+    #[test]
+    fn a_settled_tree_runs_a_floor_batch_and_an_unrefused_one_runs_a_full_batch() {
+        const CONFIGURED: usize = 512;
+        const ANCHOR: u64 = 7_194_070_384;
+        let refuse = Verdict::Refuse {
+            reason: String::new(),
+        };
+
+        // Settled and anchored on a machine with room: a floor batch.
+        let (state, admission) = admit_refused_embed(
+            RefusedEmbedState::Anchored(ANCHOR),
+            BudgetObservation::Refused { held_bytes: ANCHOR },
+            PressureLevel::Elevated,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(admission, RefusedEmbedAdmission::AdmitFloorBatch);
+        assert_eq!(
+            embed_wake_decision(true, admission, state, &refuse, CONFIGURED),
+            EmbedWakeDecision::Run(32),
+            "the whole point of the change: a settled tree keeps converging"
+        );
+
+        // Never refused, nothing anchored: the ordinary verdict governs and the
+        // batch is the configured size, exactly as before this change.
+        let (state, admission) = admit_refused_embed(
+            RefusedEmbedState::Clear,
+            BudgetObservation::Recovered {
+                held_bytes: 5_153_960_755,
+            },
+            PressureLevel::Nominal,
+            true,
+            REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+        );
+        assert_eq!(state, RefusedEmbedState::Clear);
+        assert_eq!(
+            embed_wake_decision(false, admission, state, &Verdict::Proceed, CONFIGURED),
+            EmbedWakeDecision::Run(CONFIGURED),
+            "an unrefused worker is untouched by any of this"
+        );
+    }
+
+    /// The step an anchored refusal is allowed, and why it is not the shrink.
+    ///
+    /// A pass that reaches this path is already past its budget, so it is asked
+    /// to converge rather than to go fast: a quarter of the elevated shrink, 32
+    /// against the configured 512 the measured container ran. The floor of one
+    /// is the same floor the shrink keeps, because a size knob that reaches zero
+    /// is a silent refusal wearing an admission's name.
+    #[test]
+    fn an_anchored_refusal_runs_a_smaller_batch_than_a_shrink() {
+        let refuse = Verdict::Refuse {
+            reason: String::new(),
+        };
+        // The trap this pins. `embed_batch_under_pressure` hands a refusal its
+        // configured size back unchanged, because before this path existed a
+        // refusal never reached a batch at all. An admitted refusal that took
+        // that number would run a FULL batch on a tree already past its budget,
+        // which is worse than the stall it replaces.
+        assert_eq!(embed_batch_under_pressure(512, &refuse), 512);
+        assert!(
+            refused_embed_batch(512) < embed_batch_under_pressure(512, &refuse),
+            "an admitted refusal must never take the unshrunk configured size"
+        );
+        assert_eq!(refused_embed_batch(512), 32);
+        assert!(
+            refused_embed_batch(512)
+                < embed_batch_under_pressure(
+                    512,
+                    &Verdict::Shrink {
+                        reason: String::new()
+                    }
+                ),
+            "and it must be smaller than the elevated shrink, which is 128 here"
+        );
+        assert_eq!(refused_embed_batch(8), 1);
+        assert_eq!(refused_embed_batch(1), 1);
+        assert_eq!(
+            refused_embed_batch(0),
+            1,
+            "a batch of zero embeds nothing for ever"
+        );
     }
 
     #[test]
