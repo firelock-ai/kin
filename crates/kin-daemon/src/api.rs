@@ -6602,6 +6602,79 @@ struct CommandCommitResponse {
     file_count: usize,
 }
 
+/// Copy the bodies a bounded re-derivation is about to read back into ingestion
+/// staging, from the store that durably holds them.
+///
+/// The detector that names these paths reads each one's tree-named body through
+/// `source_cas::read_publishable_source`, which answers from ingestion staging
+/// first and from repository CAS second. `readmit_semantics_for_paths` reads
+/// staging alone. Staging is disposable and repository CAS is not, so a store
+/// that reopened after its staged copies were pruned reaches this with the
+/// detector able to read every body and the re-derivation able to read none: the
+/// readmission fails its read, the second plan refuses exactly as the first did,
+/// and every later commit repeats it. Nothing is lost and nothing repairs it.
+///
+/// So the exact bodies the refused paths name are re-ingested first. This is
+/// explicit ingestion of bytes the repository already published, bounded to the
+/// paths the planner refused, and it changes no identity: the body is written
+/// back under the content address the tree already names.
+///
+/// A path whose body neither store holds is left alone. That absence is the
+/// publication's own refusal to make by name, and the re-derivation reports it
+/// as unresolved exactly as it did before.
+fn stage_refused_bodies_from_repository_cas(
+    state: &DaemonState,
+    owed: &std::collections::BTreeSet<RepoPath>,
+) -> usize {
+    let Ok(context) =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+    else {
+        return 0;
+    };
+    let Ok(authority) = context.open() else {
+        return 0;
+    };
+    let tree = state.graph.resolved_tree();
+    let mut refilled = 0;
+    for path in owed {
+        let Some(artifact) = tree.artifact_at_path(path) else {
+            continue;
+        };
+        let kin_model::TreeEntry::Blob { hash, .. } = artifact.entry else {
+            continue;
+        };
+        let staged_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        if state.blobs.read(&staged_hash).is_ok() {
+            continue;
+        }
+        match crate::source_cas::read_publishable_source(&state.blobs, &authority, hash) {
+            Ok(source) => match state.blobs.write(source.body()) {
+                Ok(written) if written == staged_hash => refilled += 1,
+                Ok(written) => warn!(
+                    path = %path,
+                    expected = %staged_hash,
+                    written = %written,
+                    "re-ingesting a published body produced a different content address, so it \
+                     was not the body this path's tree entry names"
+                ),
+                Err(error) => warn!(
+                    path = %path,
+                    error = %error,
+                    "the body repository CAS holds for this path could not be re-ingested, so \
+                     its semantics cannot be re-derived"
+                ),
+            },
+            Err(error) => warn!(
+                path = %path,
+                error = %error,
+                "neither store holds the body this path's tree entry names, so its semantics \
+                 cannot be re-derived"
+            ),
+        }
+    }
+    refilled
+}
+
 async fn command_commit(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<CommandCommitRequest>,
@@ -6714,6 +6787,12 @@ async fn command_commit(
                     .collect::<Vec<_>>()
                     .join(", ");
                 let waiting_since = Instant::now();
+                // The re-derivation reads ingestion staging and the detector
+                // reads staging plus repository CAS, so the bodies it is about
+                // to read are put back within reach first. On a store whose
+                // staged copies are gone this is the difference between one
+                // repair and a permanent refusal.
+                let refilled = stage_refused_bodies_from_repository_cas(&state, &owed);
                 // Its own commit phase, so what the wait cost is attributed on the
                 // phase table beside the planning it precedes rather than hiding
                 // inside it.
@@ -6724,6 +6803,7 @@ async fn command_commit(
                 .await;
                 info!(
                     paths = %named,
+                    refilled,
                     enriched = readmitted.enriched,
                     unresolved = readmitted.failed.len(),
                     waited_ms = waiting_since.elapsed().as_millis(),
@@ -36315,6 +36395,154 @@ mod tests {
             before + PREPENDED_LINES,
             "the commit had to re-derive a stale path nothing had recorded before it could seal \
              the bytes that moved those spans"
+        );
+    }
+
+    /// The bounded repair has to reach a body only repository CAS still holds.
+    ///
+    /// The detector reads each refused path's tree-named body through
+    /// `source_cas::read_publishable_source`, which answers from ingestion
+    /// staging first and repository CAS second. `readmit_semantics_for_paths`
+    /// reads staging alone, and staging is disposable: a store that reopened
+    /// after its staged copies were pruned reaches the repair with every body
+    /// durable and none of them staged. The re-derivation then fails its read,
+    /// the second plan refuses exactly as the first did, and every later commit
+    /// repeats it, with no body lost and nothing that repairs it.
+    ///
+    /// The fixture removes ONLY the staged copy and asserts repository CAS still
+    /// holds the same body, so this is a missing staged copy rather than a
+    /// missing body. It then reopens a second time, cold, and asserts the
+    /// persisted entities reproduce a parse of the body the tree names, because a
+    /// repair that only moved the live graph would pass a check of that graph.
+    ///
+    /// Falsify by removing the refill from `command_commit`: the commit answers
+    /// 409 `semantics_behind_tree` and `commit_through_api` fails on the status.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_re_derives_a_stale_path_whose_body_only_repository_cas_holds() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = layout.root().join("runs/session-staging-pruned");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        reconcile_session_through_api(&app, &session_dir).await;
+
+        drop(app);
+        drop(state);
+        std::fs::remove_file(layout.root().join("semantic-debt.json")).expect(
+            "the session reconcile must have recorded what it owed, or removing the record \
+             proves nothing",
+        );
+
+        let reopened = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before,
+            "the reopened graph has to answer at the pre-edit position, or there is nothing for \
+             the commit to re-derive"
+        );
+
+        // Prune the staged copy the way a reopen on a pruned ingestion CAS does,
+        // and prove the durable body is still there, or this fixture is about an
+        // absent body rather than an absent staged copy.
+        let repo_path = RepoPath::from_utf8("shifted.rs".to_string()).unwrap();
+        let tree = reopened.graph.resolved_tree();
+        let kin_model::TreeEntry::Blob { hash, .. } =
+            tree.artifact_at_path(&repo_path).unwrap().entry
+        else {
+            panic!("the fixture is a regular file");
+        };
+        drop(tree);
+        let staged_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        reopened.blobs.delete(&staged_hash).unwrap();
+        assert!(
+            reopened.blobs.read(&staged_hash).is_err(),
+            "the staged copy has to be gone, or the refill under test is never exercised"
+        );
+        let sealed_body = {
+            let context =
+                crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(
+                    &reopened,
+                )
+                .unwrap();
+            let authority = context.open().unwrap();
+            crate::source_cas::read_publishable_source(&reopened.blobs, &authority, hash)
+                .expect("repository CAS still holds the published body")
+                .body()
+                .to_vec()
+        };
+
+        let reopened_app = router(Arc::clone(&reopened));
+        commit_through_api(
+            &reopened_app,
+            kin_model::OperationId::new(),
+            "commit the session's edit with staging pruned",
+        )
+        .await;
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the commit had to re-derive from the body repository CAS holds before it could seal \
+             the bytes that moved those spans"
+        );
+
+        // A second cold reopen. The repair has to be in durable authority rather
+        // than only in the graph the committing process happened to hold.
+        drop(reopened_app);
+        drop(reopened);
+        let cold = Arc::new(DaemonState::open(layout).unwrap());
+        cold.is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            published_start_line(&cold, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the re-derived spans have to survive a cold reopen, or the commit sealed a repair \
+             nothing persisted"
+        );
+        let persisted = cold
+            .graph
+            .query_entities(&kin_model::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new("shifted.rs")),
+                ..Default::default()
+            })
+            .unwrap();
+        let fresh = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(
+                &kin_model::FilePathId::new("shifted.rs"),
+                &sealed_body,
+                staged_hash,
+            )
+            .unwrap()
+            .indexed_file
+            .entities;
+        assert!(
+            !persisted.is_empty() && !fresh.is_empty(),
+            "both sides of the comparison have to hold something, or it proves nothing"
+        );
+        assert!(
+            crate::repository_commit::semantics_follow_the_bytes(&persisted, &fresh),
+            "after a cold reopen the persisted entities have to reproduce a parse of the body \
+             the tree names, bodies and all, not merely sit at the right line"
         );
     }
 

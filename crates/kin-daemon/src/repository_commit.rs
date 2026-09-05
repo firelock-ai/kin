@@ -1056,14 +1056,24 @@ pub(crate) fn carried_pending_paths(
 /// exactly where it was and changes the token stream, so `behavior_hash`, the
 /// hash of the entity's own source text, is the only field that moves. A
 /// comparison on spans alone would seal the second one.
+///
+/// Every entity carrying a span is keyed, whatever role it holds, because the
+/// role is the parser's verdict about the PATH rather than about whether the
+/// repository owns the entity: `kin_index::classify_file_role` stamps `Test` on
+/// everything parsed out of a test path, and `Vendored`, `Generated`, `Docs` and
+/// `External` on their own trees. Keeping only `EntityRole::Source` compared an
+/// empty key set against an empty key set for every one of those paths, so a
+/// stale test file passed whatever its bytes did. The role is part of the key
+/// too, so a file that moves into a test tree and re-parses under a new role
+/// does not read as unchanged.
 fn semantic_keys(entities: &[kin_model::Entity]) -> Vec<String> {
     let mut keys = entities
         .iter()
-        .filter(|entity| entity.role == kin_model::EntityRole::Source)
         .filter_map(|entity| {
             let span = entity.span.as_ref()?;
             Some(format!(
-                "{:?}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                "{:?}\u{1f}{:?}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                entity.role,
                 entity.kind,
                 entity.name,
                 span.start_byte,
@@ -1084,7 +1094,10 @@ fn semantic_keys(entities: &[kin_model::Entity]) -> Vec<String> {
 /// graph already held exactly where it was, with the same bytes, so a
 /// held-to-fresh scan finds all of them and reports nothing while the graph is
 /// missing an entity the change is about to seal bytes for.
-fn semantics_follow_the_bytes(held: &[kin_model::Entity], fresh: &[kin_model::Entity]) -> bool {
+pub(crate) fn semantics_follow_the_bytes(
+    held: &[kin_model::Entity],
+    fresh: &[kin_model::Entity],
+) -> bool {
     semantic_keys(held) == semantic_keys(fresh)
 }
 
@@ -1097,12 +1110,13 @@ fn semantics_follow_the_bytes(held: &[kin_model::Entity], fresh: &[kin_model::En
 /// leaves every declaration in it unanswerable. Both are the same defect seen
 /// from different sides, so both are checked.
 ///
-/// The exception is the ROOT change, which has no parent. Its delta is the whole
-/// tree, every path in it is added, and checking them would parse the entire
-/// repository at the one moment nothing has had a chance to go stale: the
-/// admission that derived those entities ran inside the same command. So an
-/// import pays no parse at all, and every commit after it stays bounded to its
-/// own changed paths rather than to the repository.
+/// The exception is the FIRST admission into a repository with no head at all.
+/// Its delta is the whole tree, every path in it is added, and checking them
+/// would parse the entire repository at the one moment nothing has had a chance
+/// to go stale: the admission that derived those entities ran inside the same
+/// command. So an import pays no parse at all, and every commit after it stays
+/// bounded to its own changed paths rather than to the repository. An amend of
+/// the root is not that case, however few parents it carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SealedPathScope {
     /// Every path this change seals bytes for.
@@ -1367,7 +1381,13 @@ fn plan_native_commit_inner(
                     blobs,
                     &authority,
                     &deltas.tree_deltas,
-                    if parent.is_some() {
+                    // The EXISTING head, not this change's parentage. An
+                    // amend keeps its target's parents, so amending the root
+                    // produces a change with none while the repository has a
+                    // head, a published tree and every chance to have gone
+                    // stale. Reading parentage as proof of first admission let
+                    // a root amend seal whatever the graph held.
+                    if head.is_some() {
                         SealedPathScope::AddedAndUpdated
                     } else {
                         SealedPathScope::UpdatedOnly
@@ -4195,10 +4215,22 @@ mod tests {
         blobs: &kin_blobs::BlobStore,
         after: &[u8],
     ) -> Vec<kin_model::Entity> {
-        let artifact = add_artifact(graph, blobs, b"sessions.py", SESSIONS_BEFORE, |hash| {
+        commit_then_move_bytes_without_reparsing_at(init, graph, blobs, "sessions.py", after)
+    }
+
+    /// The same fixture at a path the caller names, so a test tree can be
+    /// exercised beside a production one.
+    fn commit_then_move_bytes_without_reparsing_at(
+        init: &kin_core::InitResult,
+        graph: &kin_db::InMemoryGraph,
+        blobs: &kin_blobs::BlobStore,
+        path: &str,
+        after: &[u8],
+    ) -> Vec<kin_model::Entity> {
+        let artifact = add_artifact(graph, blobs, path.as_bytes(), SESSIONS_BEFORE, |hash| {
             TreeEntry::blob(hash, false)
         });
-        let held = derive_entities_into_graph(graph, blobs, "sessions.py", SESSIONS_BEFORE);
+        let held = derive_entities_into_graph(graph, blobs, path, SESSIONS_BEFORE);
         let plan = plan_native_commit(
             &init.layout,
             graph,
@@ -4450,6 +4482,210 @@ mod tests {
     /// The positive control for the test above. Without it a barrier that
     /// refused every commit would pass, and the refusal has to clear itself the
     /// moment the graph agrees with its own tree.
+    /// A path the repository classifies as TEST is checked like any other.
+    ///
+    /// `kin_index::classify_file_role` gives every entity parsed out of a test
+    /// path the `Test` role, and a comparison that kept only `EntityRole::Source`
+    /// compared an empty key set against an empty key set for all of them, so a
+    /// test file passed the barrier whatever its bytes did. Those entities are
+    /// the repository's own, derived by the same parse from the same tree-named
+    /// body, and a test file sealed against semantics that describe older bytes
+    /// answers questions about declarations that are not there exactly as a
+    /// production file does.
+    ///
+    /// Falsify by restoring the `EntityRole::Source` filter in `semantic_keys`:
+    /// the plan comes back `Ok` and this assertion fails.
+    #[test]
+    fn a_commit_refuses_a_test_path_whose_semantics_the_sealed_bytes_do_not_reproduce() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+
+        let held = commit_then_move_bytes_without_reparsing_at(
+            &init,
+            &graph,
+            &blobs,
+            "tests/test_sessions.py",
+            SESSIONS_SAME_LENGTH,
+        );
+        // The premise, asserted rather than assumed: this path really does parse
+        // to Test-role entities, so the arm below exercises the roles the old
+        // filter dropped rather than passing for the ordinary reason.
+        assert!(
+            !held.is_empty()
+                && held
+                    .iter()
+                    .all(|entity| entity.role == kin_model::EntityRole::Test),
+            "the fixture must parse to Test-role entities: {:?}",
+            held.iter().map(|entity| entity.role).collect::<Vec<_>>()
+        );
+
+        let refusal = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("commitrace"),
+            "publish the test file's edit".to_string(),
+        );
+        let Some(error) = refusal.err() else {
+            panic!(
+                "the commit sealed a test path's new bytes against entities derived from the old \
+                 ones; every declaration in it now answers from spans and bodies that describe \
+                 the previous version"
+            );
+        };
+        assert!(
+            error.to_string().contains("tests/test_sessions.py"),
+            "the refusal has to name the path: {error}"
+        );
+
+        // The positive control on the same path: once the re-derivation lands,
+        // the same commit plans, so the roles are not simply refused.
+        replace_entities_in_graph(
+            &graph,
+            &blobs,
+            "tests/test_sessions.py",
+            &held,
+            SESSIONS_SAME_LENGTH,
+        );
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("commitrace"),
+            "publish the test file's edit".to_string(),
+        )
+        .expect("the same commit plans once the test path's semantics have caught up");
+        assert!(
+            !plan.change.entity_deltas.is_empty(),
+            "the re-derived commit has to carry the entity delta the refused one was missing"
+        );
+    }
+
+    /// A test path this change ADDS with no semantics at all is caught too.
+    ///
+    /// The Source-only filter dropped the fresh Test entities as well as the held
+    /// ones, so an added test file whose enrichment never landed compared empty
+    /// against empty and was sealed with nothing answering for it.
+    ///
+    /// Falsify by restoring the `EntityRole::Source` filter in `semantic_keys`:
+    /// the plan comes back `Ok` and this assertion fails.
+    #[test]
+    fn a_commit_refuses_a_new_test_path_the_graph_holds_no_semantics_for() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+
+        // One published file, so the change under test has a parent and is not
+        // the first admission, whose delta is the whole tree.
+        add_artifact(&graph, &blobs, b"sessions.py", SESSIONS_BEFORE, |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        derive_entities_into_graph(&graph, &blobs, "sessions.py", SESSIONS_BEFORE);
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("commitrace"),
+            "publish the first file".to_string(),
+        )
+        .expect("the first commit plans, so the refusal below is about the added path");
+        commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+
+        // The bytes reach the tree and the enrichment does not, which is the
+        // state a lost derived-graph pass leaves behind.
+        add_artifact(
+            &graph,
+            &blobs,
+            b"tests/test_sessions.py",
+            SESSIONS_BEFORE,
+            |hash| TreeEntry::blob(hash, false),
+        );
+
+        let refusal = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("commitrace"),
+            "publish the new test file".to_string(),
+        );
+        let Some(error) = refusal.err() else {
+            panic!(
+                "the commit sealed a new test file the graph holds no entity for, so every \
+                 declaration in it answers as though it is not there"
+            );
+        };
+        assert!(
+            error.to_string().contains("tests/test_sessions.py"),
+            "the refusal has to name the path: {error}"
+        );
+    }
+
+    /// Amending the ROOT change is not a first admission.
+    ///
+    /// An amend keeps its target's parents, so amending the root produces a
+    /// change with none while the repository has a head, a published tree and
+    /// every chance to have gone stale since. A scope keyed on the change's own
+    /// parentage read that as the import case and checked nothing, so this exact
+    /// one-commit repository could seal the replacement root over stale spans.
+    ///
+    /// Falsify by restoring the `parent.is_some()` discriminator in
+    /// `plan_native_commit_inner`: the plan comes back `Ok` and this assertion
+    /// fails.
+    #[test]
+    fn an_amend_of_the_root_refuses_a_path_whose_semantics_the_sealed_bytes_do_not_reproduce() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+
+        let artifact = add_artifact(&graph, &blobs, b"sessions.py", SESSIONS_BEFORE, |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        derive_entities_into_graph(&graph, &blobs, "sessions.py", SESSIONS_BEFORE);
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("commitrace"),
+            "publish the root".to_string(),
+        )
+        .expect("the root commit plans, so the refusal below is about the amend");
+        let root_change = commit_native_plan_with_projection(&init.layout, &blobs, plan)
+            .unwrap()
+            .change
+            .id;
+
+        // The same lost-enrichment window as the ordinary commit case: the bytes
+        // move in the tree and no parse follows them.
+        update_artifact_bytes(&graph, &blobs, &artifact, SESSIONS_AFTER);
+
+        let refusal = plan_amend_for_test(&init, &blobs, &graph, root_change, None);
+        let Some(error) = refusal.err() else {
+            panic!(
+                "the amend sealed the replacement root over entities derived from the pre-edit \
+                 bytes, because its own parentage is empty by design and that was read as proof \
+                 nothing had gone stale yet"
+            );
+        };
+        assert!(
+            error.to_string().contains("sessions.py"),
+            "the refusal has to name the path: {error}"
+        );
+    }
+
     #[test]
     fn a_commit_plans_the_edit_once_its_semantics_have_been_re_derived() {
         let root = tempfile::tempdir().unwrap();
