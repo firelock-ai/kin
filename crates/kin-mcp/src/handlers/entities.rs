@@ -4057,7 +4057,10 @@ fn record_trace_spine_clipping(result: &mut serde_json::Value) {
         .unwrap_or_default();
     let mut spine_steps = 0usize;
     let mut spine_crossing = 0usize;
-    let mut widest: Option<(String, u64, u64)> = None;
+    // Carries the clipped node's id as well as its name. The remediation at the
+    // cap sends the caller to `graph_neighborhood`, which addresses by id, and a
+    // name is not an address there.
+    let mut widest: Option<(String, String, u64, u64)> = None;
     if let Some(clips) = result["clipped_steps"].as_array_mut() {
         for clip in clips.iter_mut() {
             let on_spine = clip["step"]
@@ -4071,8 +4074,12 @@ fn record_trace_spine_clipping(result: &mut serde_json::Value) {
             spine_crossing += clip["dropped_crossing_file"].as_u64().unwrap_or(0) as usize;
             let dropped = clip["dropped_callees"].as_u64().unwrap_or(0)
                 + clip["dropped_callers"].as_u64().unwrap_or(0);
-            if widest.as_ref().is_none_or(|(_, most, _)| dropped > *most) {
+            if widest
+                .as_ref()
+                .is_none_or(|(_, _, most, _)| dropped > *most)
+            {
                 widest = Some((
+                    clip["entity_id"].as_str().unwrap_or_default().to_string(),
                     clip["entity_name"].as_str().unwrap_or_default().to_string(),
                     dropped,
                     clip["limit_per_step"].as_u64().unwrap_or(0),
@@ -4087,7 +4094,7 @@ fn record_trace_spine_clipping(result: &mut serde_json::Value) {
     if spine_crossing > 0 {
         result["spine_dropped_crossing_file"] = serde_json::Value::from(spine_crossing);
     }
-    let Some((name, dropped, limit)) = widest else {
+    let Some((id, name, dropped, limit)) = widest else {
         return;
     };
     let crossing = if spine_crossing > 0 {
@@ -4107,10 +4114,10 @@ fn record_trace_spine_clipping(result: &mut serde_json::Value) {
                  chain is one route among the ones the cap left, so a hop it does not contain \
                  was not looked for and its absence proves nothing"
             ),
-            "remediation": format!(
-                "name the symbol you are looking for as `target` so the cap ranks toward it, or \
-                 re-query '{name}' with limit_per_step above {limit}"
-            ),
+            // Built from the ceiling the schema declares rather than from the
+            // cap that clipped, so the sentence cannot name a value the call
+            // refuses. See `crate::remediation::spine_clipped`.
+            "remediation": crate::remediation::spine_clipped(&name, &id, limit as usize, dropped as usize),
         }),
     );
 }
@@ -4315,9 +4322,10 @@ fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
              dropped from the end of the chain; this arm inlines no bodies, so steps are all it \
              can shed"
         ),
-        "remediation": "narrow the walk with a smaller depth or limit_per_step, or raise \
-                        max_response_chars if the caller's own result limit accepts a larger \
-                        payload",
+        "remediation": format!(
+            "narrow the walk with a smaller depth or limit_per_step; {}",
+            crate::remediation::response_budget_clause("max_response_chars", max_chars, None)
+        ),
     });
     // Appended rather than assigned: another producer may already have disclosed
     // something about this same answer.
@@ -10115,6 +10123,75 @@ mod tests {
     /// one of them is a rule that reads as fixed on both while only one is. So
     /// this fixture is the CLI walker's `requests_send_graph` again, at the
     /// same tiers, asserted through the GraphStore handler.
+    /// A focal with more callees than the widest cap the call accepts. The
+    /// stranger's node had 28 against a ceiling of 25.
+    fn wide_fanout_store(callees: usize) -> (InMemoryGraph, EntityId) {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("HTTPAdapter.send", "src/requests/adapters.py");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+        for index in 0..callees {
+            let callee = make_entity(&format!("helper_{index:02}"), "src/requests/adapters.py");
+            store.upsert_entity(&callee).unwrap();
+            store
+                .upsert_relation(&make_relation(focal_id, callee.id, RelationKind::Calls))
+                .unwrap();
+        }
+        (store, focal_id)
+    }
+
+    /// The stranger's exact call on this arm: a 28-callee node clipped at the
+    /// 25 ceiling, and the disclosure that used to say "re-query with
+    /// limit_per_step above 25".
+    #[test]
+    fn trace_data_flow_offline_clip_at_the_cap_never_recommends_a_rejected_value() {
+        let (store, focal_id) = wide_fanout_store(28);
+        let cap = crate::remediation::TRACE_MAX_LIMIT_PER_STEP;
+        let payload = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(cap)),
+            ],
+        );
+        assert_eq!(
+            traced_step_names(&payload).len(),
+            cap,
+            "the cap keeps exactly the ceiling: {payload}"
+        );
+        assert_eq!(
+            payload["clipped_steps"][0]["dropped_callees"], 3,
+            "and drops the three past it: {payload}"
+        );
+        let disclosure = payload["degradations"]
+            .as_array()
+            .expect("the spine clip is disclosed")
+            .iter()
+            .find(|degradation| degradation["reason"] == "spine_clipped")
+            .cloned()
+            .expect("a clip the walk continued beneath");
+        let remediation = disclosure["remediation"].as_str().unwrap_or_default();
+        assert!(
+            !remediation.contains(&format!("above {cap}")),
+            "the advice names a value the schema rejects: {remediation}"
+        );
+        assert!(
+            remediation.contains(&format!("already at its {cap} ceiling")),
+            "a clip at the cap must say the cap is the ceiling: {remediation}"
+        );
+        assert!(
+            remediation.contains("3 neighbor(s)"),
+            "and say what was dropped: {remediation}"
+        );
+        assert!(
+            remediation.contains("graph_neighborhood")
+                && remediation.contains(&focal_id.to_string()),
+            "and name the alternative by the id it takes: {remediation}"
+        );
+    }
+
     fn requests_send_store() -> (InMemoryGraph, EntityId) {
         let store = InMemoryGraph::new();
         let focal = make_entity("Session.send", "src/requests/sessions.py");

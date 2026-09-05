@@ -176,6 +176,34 @@ pub enum RepositoryTransferError {
     Conflict(String),
     #[error("repository transfer storage failed: {0}")]
     Storage(String),
+    /// The peer answered HTTP 401: it serves the repository and refused the
+    /// call for want of a bearer token it accepts.
+    ///
+    /// Its own variant rather than a `Storage` message, because the next step
+    /// is a credential and nothing about storage, and a caller keying on the
+    /// variant (the daemon that relays it, a test that pins it) must not have
+    /// to parse prose to tell the two apart.
+    #[error("repository transfer refused for want of a bearer token: {0}")]
+    Unauthenticated(String),
+}
+
+/// What a caller refused with HTTP 401 does next, for the remote at
+/// `base_url`.
+///
+/// One sentence for every surface that meets the refusal: `kin clone`
+/// straight through this transport, `kin pull` and `kin push` through the
+/// local daemon that relays it, and the CLI's own pre-flight on a remote
+/// whose token it cannot find. A stranger cloning from a peer daemon on the
+/// same machine met the bare `{"error":"Authentication required"}` three
+/// times with no next step; the token that peer accepts was in its
+/// repository's `.kin/daemon.token` the whole time, and this names it.
+pub fn bearer_token_next_step(base_url: &str) -> String {
+    format!(
+        "send a bearer token the remote at {base_url} accepts: for a peer daemon on this \
+         machine, set KIN_REMOTE_BEARER_TOKEN=$(cat <peer>/.kin/daemon.token) where <peer> is \
+         that repository's working directory; for KinLab, run `kin auth login --base-url \
+         {base_url}` or set KIN_REMOTE_BEARER_TOKEN to a KinLab token"
+    )
 }
 
 pub type Result<T> = std::result::Result<T, RepositoryTransferError>;

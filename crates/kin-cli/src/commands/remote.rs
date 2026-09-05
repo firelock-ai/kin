@@ -597,9 +597,9 @@ pub async fn lease(
     )?;
     if native_remote_bearer_token(&target.base_url).is_none() {
         anyhow::bail!(
-            "no KinLab auth token available for {}. Run `kin auth login --base-url {}` or set KIN_REMOTE_BEARER_TOKEN.",
+            "no auth token available for {}; {}",
             target.base_url,
-            target.base_url
+            kin_remote::repository_transfer::bearer_token_next_step(&target.base_url)
         );
     }
 
@@ -975,9 +975,9 @@ pub async fn sessions(remote: Option<String>, json: bool) -> Result<()> {
     )?;
     if native_remote_bearer_token(&target.base_url).is_none() {
         anyhow::bail!(
-            "no KinLab auth token available for {}. Run `kin auth login --base-url {}` or set KIN_REMOTE_BEARER_TOKEN.",
+            "no auth token available for {}; {}",
             target.base_url,
-            target.base_url
+            kin_remote::repository_transfer::bearer_token_next_step(&target.base_url)
         );
     }
 

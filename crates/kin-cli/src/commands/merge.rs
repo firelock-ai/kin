@@ -162,13 +162,41 @@ pub async fn run(source: String, json: bool) -> Result<i32> {
             // because the exit code is the CLI's to name and the daemon has no
             // business knowing it. A reader meets the number where it fires,
             // which is the only place they can act on it.
-            println!(
-                "Exit {EXIT_MERGE_CONFLICTED}: the merge is parked with conflicts; \
-                 `kin conflicts` lists them"
-            );
+            println!("{}", merge_parked_exit_line());
         }
     }
     Ok(if conflicted { EXIT_MERGE_CONFLICTED } else { 0 })
+}
+
+/// The line a parked merge ends on, naming its exit code and every way out.
+///
+/// The leading sentence is what `scripts/acceptance/merge_precedence_repro.py`
+/// keys its exit-code grader on, so it stays verbatim and the next steps
+/// follow it.
+pub(crate) fn merge_parked_exit_line() -> String {
+    format!(
+        "Exit {EXIT_MERGE_CONFLICTED}: the merge is parked with conflicts; `kin conflicts` lists \
+         them. {}",
+        crate::commands::resolve::RESOLVE_NEXT_STEPS
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_parked_exit_line_keeps_its_graded_sentence_and_names_the_file_form() {
+        let line = super::merge_parked_exit_line();
+        assert!(
+            line.starts_with(
+                "Exit 8: the merge is parked with conflicts; `kin conflicts` lists them"
+            ),
+            "the acceptance grader keys on this sentence: {line}"
+        );
+        assert!(
+            line.contains("kin resolve --file <PATH> <FILE>"),
+            "a hand-merged file needs its form named here: {line}"
+        );
+    }
 }
 
 /// Discover the repository every merge-transaction command is bound to.

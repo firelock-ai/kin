@@ -1160,7 +1160,7 @@ fn run_ladder(
             ));
         }
         if measure(payload) <= target {
-            disclose(payload, budget, started_at, &cuts, &remediations);
+            disclose(payload, budget, started_at, &cuts, &remediations, None);
             return;
         }
     }
@@ -1181,7 +1181,7 @@ fn run_ladder(
             ));
         }
         if measure(payload) <= target {
-            disclose(payload, budget, started_at, &cuts, &remediations);
+            disclose(payload, budget, started_at, &cuts, &remediations, None);
             return;
         }
     }
@@ -1203,7 +1203,7 @@ fn run_ladder(
             record_elision(payload, "body", carrying.saturating_sub(stripped), stripped);
         }
         if measure(payload) <= target {
-            disclose(payload, budget, started_at, &cuts, &remediations);
+            disclose(payload, budget, started_at, &cuts, &remediations, None);
             return;
         }
     }
@@ -1237,6 +1237,15 @@ fn run_ladder(
                 .next_offset
                 .is_some_and(|offset| offset >= primary_found)
         });
+    // What the whole answer measures with everything sheddable already shed
+    // and every entry still present. Every rung above either returned or ran,
+    // so this is the floor a response carrying every entry needs, and it is the
+    // number that decides whether a larger budget can return the rows the loop
+    // below withholds. A caller told to raise `max_chars` on a response whose
+    // floor is 294,086 characters was sent to a lever that could not move it.
+    let answer_floor = measure(payload);
+    let budget_lever_helps = budget.max_chars + budget.envelope_reserve < RESPONSE_MAX_MAX_CHARS
+        && answer_floor <= RESPONSE_MAX_MAX_CHARS;
     let mut withheld_any = false;
     let mut primary_withheld = 0usize;
     let mut cursor_rebased = false;
@@ -1335,9 +1344,18 @@ fn run_ladder(
             // Naming a cursor here would be a recovery the response cannot
             // provide. The two things that do reach the withheld rows are a
             // larger ceiling and a narrower question, and the caller owns both.
+            //
+            // The budget knob is named only while it can still move: a caller
+            // already at the ceiling, or one whose answer does not fit under
+            // it, is told that in the closing clause instead.
             remediations.push(format!(
-                "raise `max_chars`, or narrow the request with `{}`; this page has no \
-                 `next_cursor`, so the withheld entries cannot be reached by paging",
+                "{}narrow the request with `{}`; this page has no `next_cursor`, so the \
+                 withheld entries cannot be reached by paging",
+                if budget_lever_helps {
+                    "raise `max_chars`, or "
+                } else {
+                    ""
+                },
                 shape.narrow_param
             ));
         } else {
@@ -1345,7 +1363,14 @@ fn run_ladder(
         }
     }
 
-    disclose(payload, budget, started_at, &cuts, &remediations);
+    disclose(
+        payload,
+        budget,
+        started_at,
+        &cuts,
+        &remediations,
+        Some(answer_floor),
+    );
 }
 
 /// The join every restatement of the limiting factor is built with.
@@ -1545,8 +1570,14 @@ fn disclose_residual(payload: &mut Value, budget: &ResponseBudget) {
              cuts keeps at least one entry, and what survived does not fit. Read the size it \
              ships at from `_kin.response.chars_after_budget`, or from the bytes received"
         ),
-        "remediation": "narrow the request, or raise max_chars if the caller's own result \
-                        limit accepts a larger payload",
+        "remediation": format!(
+            "narrow the request; {}",
+            crate::remediation::response_budget_clause(
+                "max_chars",
+                max_chars + budget.envelope_reserve,
+                None,
+            )
+        ),
         "max_chars": max_chars,
     });
     // One note per response. Both arms can reach this, and two copies of the
@@ -1934,12 +1965,20 @@ fn trim_collection(
 /// number leaves the response reporting two budgets with no arithmetic between
 /// them. So the default case names all three: what was enforced, what was
 /// reserved, and the published number both come from.
+///
+/// `answer_floor` is what the answer measured with every sheddable diagnostic
+/// gone and every entry still present, when entries were at risk. It decides
+/// the closing clause: a floor over [`RESPONSE_MAX_MAX_CHARS`] means no budget
+/// this call accepts returns the withheld entries, and the clause says so
+/// instead of pointing at `max_chars`. It is published beside the clause as
+/// `chars_before_withholding` so the claim can be checked against a number.
 fn disclose(
     payload: &mut Value,
     budget: &ResponseBudget,
     chars_before: usize,
     cuts: &[String],
     remediations: &[String],
+    answer_floor: Option<usize>,
 ) {
     if cuts.is_empty() {
         return;
@@ -1959,11 +1998,16 @@ fn disclose(
     if !remediation.is_empty() {
         remediation.push_str("; ");
     }
-    remediation.push_str(&format!(
-        "or raise max_chars, up to the {RESPONSE_MAX_MAX_CHARS} this server will build, if the \
-         caller's own result limit accepts a larger payload"
+    // The ceiling from the caller's side: the number they passed, or the
+    // published default the envelope reserve came out of. That is the value
+    // they would be raising, so it is the one compared against the largest
+    // this server accepts.
+    remediation.push_str(&crate::remediation::response_budget_clause(
+        "max_chars",
+        max_chars + budget.envelope_reserve,
+        answer_floor,
     ));
-    let entry = json!({
+    let mut entry = json!({
         "component": "response_budget",
         "reason": BOUNDED_REASON,
         "detail": format!("the response exceeded its {ceiling}, so {}", cuts.join("; ")),
@@ -1973,6 +2017,11 @@ fn disclose(
         // what the answer was built at rather than what it inherited.
         "chars_before_budget": chars_before,
     });
+    if let Some(floor) = answer_floor {
+        // The number the closing clause rests on, so "no budget returns them"
+        // is a claim a reader can check rather than take on trust.
+        entry["chars_before_withholding"] = Value::from(floor);
+    }
     match payload
         .get_mut("degradations")
         .and_then(Value::as_array_mut)
@@ -3245,6 +3294,144 @@ mod tests {
         );
         // The answer survives the cut.
         assert_eq!(payload["entity_impacts"][0]["consumer_count"], json!(2));
+    }
+
+    /// The stranger's `impact_analysis`: an answer that measured 294,086 and
+    /// 1,630,149 characters against an 18,000 budget, told both times to raise
+    /// `max_chars` "up to the 60000 this server will build". The whole 60,000
+    /// closes neither gap, so the clause has to say no budget returns the rows
+    /// and name the alternative that does exist.
+    ///
+    /// Asserted on the published `chars_before_withholding` rather than on the
+    /// fixture's row count, so the premise (the floor is over the ceiling) is
+    /// checked by the same number the sentence rests on.
+    #[test]
+    fn an_answer_that_cannot_fit_under_the_ceiling_is_not_told_to_raise_max_chars() {
+        let mut payload = impact_payload(400);
+        let budget = ResponseBudget {
+            max_chars: 18_000,
+            compact: true,
+            explicit_max_chars: true,
+            envelope_reserve: 0,
+        };
+        enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
+        let bounded = payload["degradations"]
+            .as_array()
+            .expect("a cut response discloses it")
+            .iter()
+            .find(|entry| entry["reason"] == BOUNDED_REASON)
+            .cloned()
+            .expect("the ladder's own disclosure");
+        let floor = bounded["chars_before_withholding"]
+            .as_u64()
+            .expect("a response that withheld entries publishes the floor they need")
+            as usize;
+        assert!(
+            floor > RESPONSE_MAX_MAX_CHARS,
+            "fixture must need more than the ceiling with everything shed: {floor}"
+        );
+        let remediation = bounded["remediation"].as_str().unwrap_or_default();
+        assert!(
+            !remediation.contains("or raise max_chars"),
+            "an unreachable answer still points at the budget knob: {remediation}"
+        );
+        assert!(
+            remediation.contains("no budget this call accepts returns them"),
+            "an unreachable answer must say so: {remediation}"
+        );
+        assert!(
+            remediation.contains(&floor.to_string()),
+            "and carry the number it rests on: {remediation}"
+        );
+        assert!(
+            remediation.contains("narrow the request with `depth`"),
+            "and still name the alternative that exists: {remediation}"
+        );
+    }
+
+    /// The positive control the brief names: the same tool, the same budget, an
+    /// answer whose floor sits under the ceiling. Raising `max_chars` recovers
+    /// it, and the advice says so in the words it always used.
+    ///
+    /// Without this, the test above is satisfied by a producer that never
+    /// mentions `max_chars` again, which would delete a working lever.
+    #[test]
+    fn an_answer_that_fits_under_the_ceiling_is_still_told_to_raise_max_chars() {
+        let mut payload = impact_payload(60);
+        let budget = ResponseBudget {
+            max_chars: 18_000,
+            compact: true,
+            explicit_max_chars: true,
+            envelope_reserve: 0,
+        };
+        enforce(&mut payload, "impact_analysis", &budget).expect("budgeted");
+        let bounded = payload["degradations"]
+            .as_array()
+            .expect("a cut response discloses it")
+            .iter()
+            .find(|entry| entry["reason"] == BOUNDED_REASON)
+            .cloned()
+            .expect("the ladder's own disclosure");
+        let floor = bounded["chars_before_withholding"]
+            .as_u64()
+            .expect("a response that withheld entries publishes the floor they need")
+            as usize;
+        assert!(
+            floor > budget.max_chars && floor <= RESPONSE_MAX_MAX_CHARS,
+            "fixture must overflow its budget and fit under the ceiling: {floor}"
+        );
+        let remediation = bounded["remediation"].as_str().unwrap_or_default();
+        assert!(
+            remediation.contains(&format!(
+                "or raise max_chars, up to the {RESPONSE_MAX_MAX_CHARS} this server will build"
+            )),
+            "an answer a larger budget recovers must still be told to raise it: {remediation}"
+        );
+        assert!(
+            !remediation.contains("no budget this call accepts"),
+            "and must not be told the knob is dead: {remediation}"
+        );
+    }
+
+    /// A caller already at the ceiling whose bodies were shed to fit. Nothing
+    /// was withheld, so the question of a floor does not arise, and the only
+    /// wrong sentence is the one that tells them to set the value they hold.
+    #[test]
+    fn a_caller_at_the_ceiling_is_told_the_budget_knob_is_spent() {
+        let mut payload = locate_payload(3, 30_000);
+        let budget = ResponseBudget {
+            max_chars: RESPONSE_MAX_MAX_CHARS,
+            compact: true,
+            explicit_max_chars: true,
+            envelope_reserve: 0,
+        };
+        let accounting = enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
+        assert!(
+            accounting.bounded,
+            "three 30,000-character bodies do not fit"
+        );
+        let bounded = payload["degradations"]
+            .as_array()
+            .expect("a cut response discloses it")
+            .iter()
+            .find(|entry| entry["reason"] == BOUNDED_REASON)
+            .cloned()
+            .expect("the ladder's own disclosure");
+        assert!(
+            bounded.get("chars_before_withholding").is_none(),
+            "no entry was at risk, so no floor is published: {bounded}"
+        );
+        let remediation = bounded["remediation"].as_str().unwrap_or_default();
+        assert!(
+            !remediation.contains("or raise max_chars"),
+            "a caller at the ceiling was told to raise past it: {remediation}"
+        );
+        assert!(
+            remediation.contains(&format!(
+                "max_chars is already at the {RESPONSE_MAX_MAX_CHARS} this server will build"
+            )),
+            "a caller at the ceiling must be told the knob is spent: {remediation}"
+        );
     }
 
     /// Compact mode is the default, and on this tool it is what sheds the bulk.
