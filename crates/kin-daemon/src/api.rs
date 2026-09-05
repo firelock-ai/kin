@@ -39683,24 +39683,19 @@ mod tests {
     /// The same purge over a path a COMMIT published entities for, which is what
     /// a repository that has ever committed its source actually holds.
     ///
-    /// Red today, and named here rather than left to be rediscovered.
-    /// `repository_commit::publish_workspace_tree` carries
+    /// `repository_commit::publish_workspace_tree` used to carry
     /// `WorkspaceSemanticDelta::default()`, so the tree publication that retires
-    /// the path leaves repository authority holding entities on it and kin-db
-    /// refuses the whole transition with "transaction leaves entity ... absent
-    /// from the staged tree". The session admission in that same module already
-    /// carries `retire_semantics_on_vacated` over its vacated set; the tree
-    /// publication does not, and every caller of `publish_exact_workspace_tree`
-    /// inherits the gap, the watch loop's standalone admission included. That is
-    /// the FIR-2429 class surviving on the paths its fix did not reach, and it is
-    /// tracked as FIR-3274.
+    /// the path left repository authority holding entities on it and kin-db
+    /// refused the whole transition with "transaction leaves entity ... absent
+    /// from the staged tree". The session admission in that same module carries
+    /// `retire_semantics_on_vacated` over its vacated set; the tree publication
+    /// did not, and every caller of `publish_exact_workspace_tree` inherited the
+    /// gap, the watch loop's standalone admission included.
     ///
-    /// Ignored so the suite stays green while the class stays written down where
-    /// the fix will find it. Run it by name with
-    /// `cargo test -p kin-daemon --lib -- --ignored
-    /// purge_ignored_retires_the_entities_a_commit_published_for_a_vacated_path`.
+    /// Falsify by restoring `WorkspaceSemanticDelta::default()` in
+    /// `publish_workspace_tree`: the purge answers 409 and this fails on the
+    /// status.
     #[tokio::test]
-    #[ignore = "FIR-3274: publish_workspace_tree carries no retirement for a vacated path"]
     async fn purge_ignored_retires_the_entities_a_commit_published_for_a_vacated_path() {
         let state = test_state();
         state
@@ -39737,6 +39732,257 @@ mod tests {
             state.graph.get_entity(&private.id).unwrap().is_none(),
             "a purged path's entity still resolves, so it still ranks"
         );
+    }
+
+    /// Deleting a committed entity-owning file has to reconcile.
+    ///
+    /// The watch loop's standalone admission publishes its exact tree through
+    /// `publish_exact_workspace_tree`, the same seam the purge uses, so the same
+    /// missing retirement refused it: a removal of a path repository authority
+    /// holds entities for strands them and kin-db refuses the whole transition
+    /// rather than the one entity. `rm` of a plain file reconciled and `rm` of an
+    /// entity-owning file did not.
+    ///
+    /// The path is COMMITTED on purpose. A merely admitted file's entities live
+    /// in the live graph, which the loop evicts on its own; only a commit puts
+    /// them in repository authority, where the publication has to carry their
+    /// removal in the same delta.
+    ///
+    /// Falsify by restoring `WorkspaceSemanticDelta::default()` in
+    /// `publish_workspace_tree`: the admission answers 409 and
+    /// `admit_through_api` fails on the status.
+    #[tokio::test]
+    async fn admitting_a_deleted_entity_owning_file_retires_its_semantics() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        for (path, content) in [
+            ("src/kept.py", &b"def kept(): pass\n"[..]),
+            ("src/gone.py", &b"def gone(): pass\n"[..]),
+        ] {
+            install_working_copy_file(&state, path, content, false);
+            install_repository_file(&state, path, content);
+        }
+        let doomed = derived_entity(&state, "src/gone.py", "gone", EntityKind::Function);
+        let kept = derived_entity(&state, "src/kept.py", "kept", EntityKind::Function);
+        assert!(
+            state.graph.get_entity(&doomed.id).unwrap().is_some(),
+            "the deleted path has to own an entity, or this admission has nothing to retire"
+        );
+
+        std::fs::remove_file(state.layout.working_dir().join("src/gone.py")).unwrap();
+        let app = router(Arc::clone(&state));
+        admit_through_api(&app).await;
+
+        let live = tracked_paths(&state);
+        assert!(
+            !live.contains("src/gone.py"),
+            "the admission has to retire the deleted path: {live:?}"
+        );
+        assert!(
+            state.graph.get_entity(&doomed.id).unwrap().is_none(),
+            "a deleted path's entity still resolves, so it still answers queries with nothing \
+             on disk behind it"
+        );
+        assert!(state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new("src/gone.py")),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+
+        // The two-sided arm: an untouched sibling keeps both its artifact and
+        // its entity, so the admission retired one path rather than the tree.
+        assert!(live.contains("src/kept.py"));
+        assert_eq!(state.graph.get_entity(&kept.id).unwrap(), Some(kept));
+    }
+
+    /// A move across BASENAMES keeps every identity it carries, at three points.
+    ///
+    /// `kin_core::exact_tree` plans a move as ONE `TreeDelta::Updated` with the
+    /// artifact identity kept and the paths differing, never as a removal beside
+    /// an arrival, because that pair would mint new entity ids and orphan every
+    /// incoming reference. So the publication that records the move relocates
+    /// what the old path owned in the same delta.
+    ///
+    /// The module entity is the hard half and the basename is why. A file's
+    /// module takes its NAME and its SIGNATURE from the path it sits on, so
+    /// `src/old.py` moving to `lib/new.py` has to keep one id while its name
+    /// goes from `old` to `new`. A move that keeps the basename cannot exercise
+    /// that at all, which is what makes this fixture rename the file rather than
+    /// only move it.
+    ///
+    /// Graded at three points, because each one can pass while the next fails.
+    /// Live, straight after the admission. Then after an edit and a commit,
+    /// which re-parses the body at its new path: a later parse mints the id the
+    /// NEW path implies, so an id that survives here is one the relocation bound
+    /// rather than one the parse happened to agree on. Then after a cold reopen,
+    /// which rebuilds the graph from repository authority alone and is the only
+    /// one of the three that grades what was durably published.
+    ///
+    /// An incoming edge is carried through all three, because relocating an
+    /// entity while its references drop is the orphaning the single `Updated`
+    /// exists to prevent.
+    #[tokio::test]
+    async fn admitting_a_moved_entity_owning_file_keeps_its_semantics() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let layout = state.layout.clone();
+
+        install_working_copy_file(&state, "src/old.py", b"def moved(): pass\n", false);
+        install_repository_file(&state, "src/old.py", b"def moved(): pass\n");
+        install_working_copy_file(&state, "src/caller.py", b"def caller(): pass\n", false);
+        install_repository_file(&state, "src/caller.py", b"def caller(): pass\n");
+        let function = derived_entity(&state, "src/old.py", "moved", EntityKind::Function);
+        let module = derived_entity(&state, "src/old.py", "old", EntityKind::Module);
+        let caller = derived_entity(&state, "src/caller.py", "caller", EntityKind::Function);
+        link_every_class(&state, &caller, &function);
+        let incoming = inbound_relation_count(&state, function.id);
+        assert!(
+            incoming > 0,
+            "the fixture must hold an incoming edge, or the orphaning arm asserts nothing"
+        );
+
+        std::fs::create_dir_all(layout.working_dir().join("lib")).unwrap();
+        std::fs::rename(
+            layout.working_dir().join("src/old.py"),
+            layout.working_dir().join("lib/new.py"),
+        )
+        .unwrap();
+        let app = router(Arc::clone(&state));
+        admit_through_api(&app).await;
+
+        let live = tracked_paths(&state);
+        assert!(
+            live.contains("lib/new.py") && !live.contains("src/old.py"),
+            "the admission has to record the move: {live:?}"
+        );
+
+        // Point one: live, straight after the admission. The bytes have not
+        // changed, so the offsets may not either.
+        assert_moved_identity(&state, &module, "new", true, "live");
+        assert_moved_identity(&state, &function, "moved", true, "live");
+        assert_eq!(
+            inbound_relation_count(&state, function.id),
+            incoming,
+            "live: the move dropped an incoming edge"
+        );
+
+        // Point two: after an edit and a commit, so the body is parsed again at
+        // its new path and the ids that parse would mint are the new path's.
+        std::fs::write(
+            layout.working_dir().join("lib/new.py"),
+            b"def moved(): pass\n\n\ndef later(): pass\n",
+        )
+        .unwrap();
+        commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "commit an edit at the path the file moved to",
+        )
+        .await;
+        assert_moved_identity(&state, &module, "new", false, "after the edit and commit");
+        assert_moved_identity(
+            &state,
+            &function,
+            "moved",
+            false,
+            "after the edit and commit",
+        );
+        assert_eq!(
+            inbound_relation_count(&state, function.id),
+            incoming,
+            "after the edit and commit: an incoming edge was dropped"
+        );
+
+        // Point three: a cold reopen, which rebuilds from repository authority.
+        drop(app);
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        assert_moved_identity(&reopened, &module, "new", false, "after a cold reopen");
+        assert_moved_identity(&reopened, &function, "moved", false, "after a cold reopen");
+        assert_eq!(
+            inbound_relation_count(&reopened, function.id),
+            incoming,
+            "after a cold reopen: an incoming edge was dropped"
+        );
+    }
+
+    /// Every relation with this entity at either end, which is what a relocation
+    /// has to leave standing.
+    fn inbound_relation_count(state: &Arc<DaemonState>, entity: kin_model::EntityId) -> usize {
+        state
+            .graph
+            .get_all_relations_for_node(&kin_model::GraphNodeId::Entity(entity))
+            .unwrap()
+            .len()
+    }
+
+    /// One moved identity, graded on the fields a relocation has to preserve or
+    /// carry forward.
+    ///
+    /// The id is the identity itself and never moves. The name and the signature
+    /// follow the path, which is the module case: `src/old.py` becoming
+    /// `lib/new.py` renames its module. The span names the new path, and its byte
+    /// offsets hold only while the bytes have not changed.
+    fn assert_moved_identity(
+        state: &Arc<DaemonState>,
+        before: &Entity,
+        name: &str,
+        bytes_unchanged: bool,
+        at: &str,
+    ) {
+        let after = state
+            .graph
+            .get_entity(&before.id)
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{at}: the moved file's {name} entity lost its identity {}",
+                    before.id
+                )
+            });
+        assert_eq!(
+            after.name, name,
+            "{at}: the moved entity carries the wrong name"
+        );
+        assert_eq!(
+            after.file_origin.as_ref().map(|origin| origin.0.as_str()),
+            Some("lib/new.py"),
+            "{at}: the moved entity still answers at its old path"
+        );
+        if after.kind == EntityKind::Module {
+            assert!(
+                after.signature.contains("lib/new.py"),
+                "{at}: the module's signature still names the path it moved off: {}",
+                after.signature
+            );
+        }
+        let span = after
+            .span
+            .as_ref()
+            .unwrap_or_else(|| panic!("{at}: the moved entity lost its span"));
+        assert_eq!(
+            span.file.0, "lib/new.py",
+            "{at}: the span still names the path the file moved off"
+        );
+        if bytes_unchanged {
+            let before_span = before
+                .span
+                .as_ref()
+                .expect("the fixture entity carries a span");
+            assert_eq!(
+                (span.start_byte, span.end_byte),
+                (before_span.start_byte, before_span.end_byte),
+                "{at}: the bytes did not change, so the offsets may not either"
+            );
+        }
     }
 
     fn branch_change(state: &DaemonState) -> SemanticChangeId {

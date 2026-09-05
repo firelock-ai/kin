@@ -962,15 +962,42 @@ fn exact_tree_admission(
         // the entities on the old path have to move instead. They move in THIS
         // transaction, beside the tree delta that carries them, because kin-db
         // refuses a transition that leaves an entity on a path the staged tree
-        // no longer holds, and a relocation published as a second transaction
-        // is refused exactly as a stranded entity is (FIR-2429).
+        // no longer holds, and a relocation published as a second transaction is
+        // refused exactly as a stranded entity is.
+        //
+        // Through the same planner and binder the session admission uses, not a
+        // shorter local rule. A file's module takes its name, its signature and
+        // its id from the path it sits on, so relocating only `file_origin`
+        // leaves the derived graph holding a module named for a path nothing
+        // carries, and the next parse at the new path mints a different id for
+        // it: the old identity is dropped and every reference to it with it. The
+        // binder is what keeps one id across that rename.
         let relocations = path_relocations_in(&deltas);
         let mut relocated_entities = Vec::new();
-        for (from_id, to_id) in &relocations {
-            relocated_entities.extend(
-                crate::mcp_commit::plan_entity_relocations(state.graph.as_ref(), from_id, to_id)
-                    .map_err(DaemonError::Graph)?,
-            );
+        if !relocations.is_empty() {
+            let authority_context =
+                crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(
+                    state,
+                )?;
+            let authority = authority_context.open().map_err(DaemonError::Graph)?;
+            let module_relocations = crate::repository_commit::plan_session_module_relocations(
+                state.blobs.as_ref(),
+                &authority,
+                &deltas,
+            )?;
+            for (from_id, to_id) in &relocations {
+                relocated_entities.extend(
+                    crate::repository_commit::plan_session_entity_relocations(
+                        state.graph.as_ref(),
+                        from_id,
+                        to_id,
+                    )?,
+                );
+            }
+            crate::repository_commit::bind_session_module_relocations(
+                &mut relocated_entities,
+                &module_relocations,
+            )?;
         }
         state
             .graph
