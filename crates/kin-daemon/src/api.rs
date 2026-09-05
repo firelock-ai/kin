@@ -937,6 +937,43 @@ fn command_repository_authority(
 fn cached_authority_admission_entry(
     state: &DaemonState,
 ) -> Result<HeldAdmission, (StatusCode, String)> {
+    admission_entry(state, InstallWriter::No)
+}
+
+/// Whether an admission-pair load may leave its manager installed as the held
+/// writer. Only the publishing tick may, because only the publishing tick has a
+/// drop for it; a reader that installed one would leave a decoded change map
+/// resident with nothing to forget it, which is the held design's floor by the
+/// back door (found by the reviewer at `62220167e`: the untracked-refresh probe,
+/// the catch-up planner and the open-merge checks all read the pair and none
+/// publishes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallWriter {
+    No,
+    Yes,
+}
+
+/// The admission pair for the publishing tick. The one entry that installs the
+/// writer, so the publication that follows in the same tick reuses the open;
+/// `exact_tree_admission` forgets it on every return that does not publish and
+/// the publication drops it itself.
+pub(crate) fn cached_authority_admission_for_publication(
+    state: &DaemonState,
+) -> Result<
+    (
+        kin_model::RootBundle,
+        Option<kin_index::ResolvedAdmissionMatcher>,
+    ),
+    (StatusCode, String),
+> {
+    let admission = admission_entry(state, InstallWriter::Yes)?;
+    Ok((admission.roots, admission.policy))
+}
+
+fn admission_entry(
+    state: &DaemonState,
+    install: InstallWriter,
+) -> Result<HeldAdmission, (StatusCode, String)> {
     let backend = state.local_repository_backend().ok_or_else(|| {
         repository_authority_error("local daemon is missing its startup storage capability")
     })?;
@@ -959,11 +996,10 @@ fn cached_authority_admission_entry(
         return Ok(admission);
     }
 
-    // The writer slot is consulted before anything opens: after a publication
-    // the daemon performed itself, the manager it published through is already
-    // at this publication, and reading the admission pair out of it costs no
-    // open. A daemon that has published nothing yet pays one open here, which
-    // then serves the publication that follows.
+    // An installed writer at this label costs nothing to read through. Otherwise
+    // one local open serves this load, and whether it outlives this function is
+    // the caller's kind: the publishing tick keeps it for the publication that
+    // follows and drops it itself; every reader lets it go here.
     let manager = match state.projection_authority.reuse_writer(&published) {
         Some(manager) => manager,
         None => {
@@ -978,13 +1014,16 @@ fn cached_authority_admission_entry(
                     .map_err(|error| repository_authority_error(error.to_string()))?,
             );
             state.projection_authority.record_load();
-            state
-                .projection_authority
-                .install_writer(published.clone(), Arc::clone(&manager));
+            if install == InstallWriter::Yes {
+                state
+                    .projection_authority
+                    .install_writer(published.clone(), Arc::clone(&manager));
+            }
             manager
         }
     };
     let admission = admission_values_from(state, &manager, published)?;
+    drop(manager);
     state
         .projection_authority
         .install_admission(admission.clone());
@@ -38788,6 +38827,63 @@ mod tests {
         (bare, roots)
     }
 
+    /// The publishing tick's yield to an open merge returns before any
+    /// publication, after its admission pair has installed the writer. That
+    /// return must forget the writer: a merge stays open for as long as a person
+    /// takes to resolve it, and a manager left installed there is a decoded
+    /// change map resident for the whole of that time.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn a_tick_that_yields_to_an_open_merge_holds_no_writer() {
+        let (state, _layout, repository, _, _) = universal_branch_test_state("yield-open-merge");
+        let path = repository.join("selected/compose.yaml");
+        std::fs::write(&path, b"services:\n  api:\n    image: main-conflict\n").unwrap();
+        let app = router(Arc::clone(&state));
+        commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "create a real conflict",
+        )
+        .await;
+        let response = crate::repository_merge::execute(
+            &state,
+            &kin_cli::commands::merge::MergeRequest {
+                source: kin_model::RefName::branch(b"feature").unwrap(),
+                operation_id: kin_model::OperationId::new(),
+                actor: AuthorId::new("yield-merge-test"),
+            },
+        )
+        .unwrap_or_else(|refusal| {
+            panic!(
+                "fixture merge refused: {}",
+                axum::response::IntoResponse::into_response(refusal).status()
+            )
+        });
+        assert!(matches!(
+            response.report.unwrap().outcome,
+            kin_cli::commands::merge::MergeOutcome::Conflicted
+        ));
+        assert!(
+            cached_authority_has_open_merge(&state).unwrap(),
+            "the fixture must hold a durable open merge"
+        );
+        std::fs::write(&path, b"services:\n  api:\n    image: hand-authored\n").unwrap();
+        let observation =
+            std::iter::once(RepoPath::from_utf8("selected/compose.yaml").unwrap()).collect();
+        let yielded = crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap();
+        assert!(
+            yielded,
+            "the tick must yield to the open merge, or this proves nothing"
+        );
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "a tick that yielded to an open merge must not keep the manager its admission pair \
+             installed"
+        );
+        drop(app);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(repository_commit)]
@@ -43921,20 +44017,26 @@ mod tests {
             opens
         };
         // What the persist flush does after a publication: the enrichment
-        // publish and the read-index finalization read the held manager, and
-        // the finalization forgets it.
+        // publish resolves the write authority (one open, since the publication
+        // dropped its own), the read-index finalization reads that same manager,
+        // and the finalization forgets it. One open for the flush's two
+        // consumers, not one each.
         let finalize = |state: &Arc<DaemonState>| {
             let generation = state
                 .snapshot_generation
                 .load(std::sync::atomic::Ordering::SeqCst);
             let before = kin_core::authority_opens();
+            let for_enrichment =
+                held_write_authority(state).expect("the enrichment publish resolves the writer");
+            drop(for_enrichment);
             state
                 .load_committed_authority_graph(generation)
                 .expect("the finalization reads the committed graph");
             assert_eq!(
                 kin_core::authority_opens() - before,
                 1,
-                "the flush opens once for its own scope, after the publication's manager is gone"
+                "the flush's enrichment publish and finalization must share one open, after the \
+                 publication's manager is gone"
             );
             assert!(
                 !state.projection_authority.holds_writer(),
@@ -44009,6 +44111,75 @@ mod tests {
         assert!(
             !state.projection_authority.holds_writer(),
             "a publication that moved nothing must not keep its manager either"
+        );
+    }
+
+    /// Readers of the admission pair install nothing. Five call sites read the
+    /// pair and never publish (the untracked-refresh probe, the catch-up planner,
+    /// the open-merge checks); if any of them left the manager it opened in the
+    /// writer slot, an idle daemon would carry a decoded change map that nothing
+    /// forgets, which is the held design's floor by the back door.
+    #[cfg(unix)]
+    #[test]
+    fn readers_of_the_admission_pair_install_no_writer() {
+        let state = test_state();
+        install_repository_file(&state, "src/lib.py", b"def handler():\n    return 1\n");
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let loads_before = state.projection_authority.loads();
+
+        cached_authority_admission(&state).expect("the pair resolves");
+        assert!(
+            state.projection_authority.loads() > loads_before,
+            "the fixture's first read must load, or the assertions below prove nothing"
+        );
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "cached_authority_admission must not install the writer"
+        );
+        cached_authority_has_open_merge(&state).expect("the merge check resolves");
+        assert!(!state.projection_authority.holds_writer());
+        refuse_commit_during_open_merge(&state).expect("no merge is open");
+        assert!(!state.projection_authority.holds_writer());
+        crate::loop_runner::current_authority_admission(&state)
+            .expect("the loop's reader resolves");
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "the loop's plain reader must not install the writer"
+        );
+    }
+
+    /// A publishing tick that returns without publishing holds nothing either.
+    /// The admission pair's open is installed for the publication that would
+    /// follow; when nothing moved, no publication follows and no drop runs, so
+    /// the tick's own scope has to forget it. The yield-to-open-merge and
+    /// yield-to-commit returns share this scope.
+    #[cfg(unix)]
+    #[test]
+    fn a_publishing_tick_that_moves_nothing_holds_nothing_after() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let working = state.layout.working_dir().to_path_buf();
+        std::fs::create_dir_all(working.join("src")).unwrap();
+        std::fs::write(working.join("src/lib.py"), "def a():\n    return 1\n").unwrap();
+        let observation =
+            std::collections::BTreeSet::from([RepoPath::from_utf8("src/lib.py").unwrap()]);
+        assert!(!crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
+        assert!(!state.projection_authority.holds_writer());
+        // The same bytes again: the tick plans, finds nothing to move, and
+        // returns before any publication.
+        let opens_before = kin_core::authority_opens();
+        assert!(!crate::loop_runner::ambient_admission_for_test(&state, &observation).unwrap());
+        assert!(
+            !state.projection_authority.holds_writer(),
+            "a tick that published nothing must not keep the manager its admission pair opened"
+        );
+        assert!(
+            kin_core::authority_opens() - opens_before <= 1,
+            "a no-op tick costs at most the admission pair's own open"
         );
     }
 

@@ -616,6 +616,34 @@ pub(crate) fn current_authority_admission(
         .map_err(|(_status, message)| DaemonError::Io(std::io::Error::other(message)))
 }
 
+/// [`current_authority_admission`] for the one caller that goes on to publish:
+/// the open this pays is kept as the held writer for the publication in the same
+/// tick. Every other reader takes the plain form, which keeps nothing.
+fn current_authority_admission_for_publication(
+    state: &DaemonState,
+) -> Result<(
+    kin_model::RootBundle,
+    Option<kin_index::ResolvedAdmissionMatcher>,
+)> {
+    crate::api::cached_authority_admission_for_publication(state)
+        .map_err(|(_status, message)| DaemonError::Io(std::io::Error::other(message)))
+}
+
+/// Forgets the held writer when it goes out of scope, so a publishing tick that
+/// returns without publishing (yielded to an open merge or a waiting commit,
+/// nothing to move, a refused mass deletion, any error) cannot leave the
+/// manager its admission pair installed resident. The publication drops the
+/// manager itself; a second forget is a no-op.
+struct HeldWriterScope<'a> {
+    state: &'a DaemonState,
+}
+
+impl Drop for HeldWriterScope<'_> {
+    fn drop(&mut self) {
+        self.state.projection_authority.forget_writer();
+    }
+}
+
 /// Measure host content graph truth does not carry, right now.
 ///
 /// The reconcile loop records this set as a side effect of a pass, and an
@@ -771,7 +799,12 @@ fn exact_tree_admission(
     // Publication compare-and-swaps on this bundle, so a repository that moves
     // while the host walk is running fails the whole admission instead of
     // having its desired tree replanned onto the newer authority.
-    let (expected_roots, policy) = current_authority_admission(state)?;
+    // Held for this tick only, whatever path it returns by. Bound before the
+    // read, because the read itself can fail after it installed the writer
+    // (deriving the admission values reaches the backend), and an error out of
+    // it must not leave the manager resident either.
+    let _writer_scope = HeldWriterScope { state };
+    let (expected_roots, policy) = current_authority_admission_for_publication(state)?;
     if publication == TreePublication::StandaloneUnlessACommitIsWaiting
         && crate::api::cached_authority_has_open_merge(state)
             .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?
