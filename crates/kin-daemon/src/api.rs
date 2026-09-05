@@ -6555,7 +6555,7 @@ fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String
 /// how the placeholder author this endpoint used to stamp reached permanent
 /// history. A request that names nobody is refused by deserialization rather
 /// than completed by the daemon.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandCommitRequest {
     operation_id: kin_model::OperationId,
@@ -6569,6 +6569,26 @@ struct CommandCommitRequest {
     author: kin_model::AuthorId,
     #[serde(default)]
     session_id: Option<String>,
+}
+
+/// Why one attempt at publishing a commit did not produce a change.
+///
+/// Two answers rather than one, because they ask for different next steps. A
+/// refusal is already worded for the caller and travels out as it is. Semantics
+/// that have not caught up with their bytes is not a refusal yet: the parse that
+/// settles it is one bounded pass away, and this route takes that pass before it
+/// decides. Recovering the difference from the worded refusal afterwards would
+/// mean matching on message text, and a classification inferred from a failure
+/// string stops holding the first time the wording moves.
+enum CommitAttempt {
+    Refused((StatusCode, String)),
+    SemanticsBehindTree(Vec<RepoPath>),
+}
+
+impl From<(StatusCode, String)> for CommitAttempt {
+    fn from(refusal: (StatusCode, String)) -> Self {
+        Self::Refused(refusal)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -6671,7 +6691,50 @@ async fn command_commit(
     .await
     .map_err(commit_admission_error)?;
 
-    match command_commit_after_admission(&state, request, deferred_tree.as_ref()) {
+    // A commit plans its tree half and its entity half out of one live graph,
+    // and that graph is allowed to be behind itself: an exact-tree admission
+    // moves a path's bytes into authority on its own, and the parse that moves
+    // that path's spans onto them runs afterwards and does not survive the daemon
+    // that ran it. The drain above repairs the paths a writer recorded as owed.
+    // For anything it missed the planner refuses by name, and the answer is one
+    // bounded re-derivation of exactly those paths through the seam the drain
+    // uses, under the gate this commit already holds, before asking again.
+    //
+    // Once, not in a loop. The re-derivation is best effort and the planner is
+    // the guarantee: a second refusal is the store saying the parse will not
+    // settle from here, and asking again until it does would hold the gate for
+    // as long as the caller waits.
+    let attempt =
+        match command_commit_after_admission(&state, request.clone(), deferred_tree.as_ref()) {
+            Err(CommitAttempt::SemanticsBehindTree(paths)) => {
+                let owed: std::collections::BTreeSet<RepoPath> = paths.into_iter().collect();
+                let named = owed
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let waiting_since = Instant::now();
+                // Its own commit phase, so what the wait cost is attributed on the
+                // phase table beside the planning it precedes rather than hiding
+                // inside it.
+                let readmitted = crate::mcp_commit::timed_commit_phase_async(
+                    "await_pending_reconcile",
+                    crate::loop_runner::readmit_semantics_for_paths(&state, &owed),
+                )
+                .await;
+                info!(
+                    paths = %named,
+                    enriched = readmitted.enriched,
+                    unresolved = readmitted.failed.len(),
+                    waited_ms = waiting_since.elapsed().as_millis(),
+                    "these paths held entities their own admitted bytes do not reproduce, so this \
+                     commit re-derived them before planning the change that seals those bytes"
+                );
+                command_commit_after_admission(&state, request, deferred_tree.as_ref())
+            }
+            attempted => attempted,
+        };
+    match attempt {
         Ok(response) => {
             // A transaction that reached authority carried the tree the graph
             // holds with it, which is the divergence an earlier unclosed
@@ -6718,11 +6781,21 @@ async fn command_commit(
             crate::semantic_debt::settle_all(&state);
             Ok(response)
         }
-        Err(error) => {
-            if let Some(admitted) = deferred_tree {
-                crate::loop_runner::publish_deferred_tree_after_failure(&state, &admitted);
+        Err(CommitAttempt::SemanticsBehindTree(paths)) => {
+            if let Some(admitted) = deferred_tree.as_ref() {
+                crate::loop_runner::publish_deferred_tree_after_failure(&state, admitted);
             }
-            Err(error)
+            Err(repository_commit_error(
+                crate::error::DaemonError::SemanticsBehindTree {
+                    paths: paths.iter().map(ToString::to_string).collect(),
+                },
+            ))
+        }
+        Err(CommitAttempt::Refused(refusal)) => {
+            if let Some(admitted) = deferred_tree.as_ref() {
+                crate::loop_runner::publish_deferred_tree_after_failure(&state, admitted);
+            }
+            Err(refusal)
         }
     }
 }
@@ -6738,12 +6811,12 @@ fn command_commit_after_admission(
     state: &Arc<DaemonState>,
     request: CommandCommitRequest,
     observed: Option<&crate::repository_commit::AdmittedWorkspaceTree>,
-) -> Result<Json<CommandCommitResponse>, (StatusCode, String)> {
+) -> Result<Json<CommandCommitResponse>, CommitAttempt> {
     let graph = &*state.graph;
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
             .map_err(repository_commit_error)?;
-    let plan = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
+    let planned = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
         if let Some(expected_head) = request.expected_head {
             crate::repository_commit::plan_native_amend(
                 graph,
@@ -6772,11 +6845,24 @@ fn command_commit_after_admission(
                 })?,
             )
         }
-    })
-    .map_err(repository_commit_error)?;
+    });
+    let plan = match planned {
+        Ok(plan) => plan,
+        // The one planning outcome this route can still do something about, so
+        // it keeps its paths instead of being flattened into a worded refusal.
+        Err(crate::error::DaemonError::SemanticsBehindTree { paths }) => {
+            return Err(CommitAttempt::SemanticsBehindTree(
+                paths
+                    .into_iter()
+                    .filter_map(|path| RepoPath::from_utf8(path).ok())
+                    .collect(),
+            ))
+        }
+        Err(error) => return Err(repository_commit_error(error).into()),
+    };
     if !request.amend {
         if let Some(refusal) = refuse_a_successor_that_records_nothing(&plan) {
-            return Err(refusal);
+            return Err(refusal.into());
         }
     }
     let change_id = plan.change.id;
@@ -6832,7 +6918,10 @@ fn command_commit_after_admission(
                             foreign_blocks.len()
                         ),
                     });
-                    return Err((StatusCode::CONFLICT, body.to_string()));
+                    return Err(CommitAttempt::Refused((
+                        StatusCode::CONFLICT,
+                        body.to_string(),
+                    )));
                 }
             }
         }
@@ -6986,6 +7075,18 @@ fn projection_blocked_refusal(error: &crate::error::DaemonError) -> Option<(Stat
 fn repository_commit_error(error: crate::error::DaemonError) -> (StatusCode, String) {
     if let Some(refusal) = projection_blocked_refusal(&error) {
         return refusal;
+    }
+    // Semantics that have not caught up with their bytes is a state of the store
+    // a caller can act on, not a fault in it: the files are intact, the bytes are
+    // authority, and one re-derivation settles it. Answering it as an internal
+    // error would send a reader to the daemon for files they can see.
+    if let crate::error::DaemonError::SemanticsBehindTree { paths } = &error {
+        let body = serde_json::json!({
+            "error": "semantics_behind_tree",
+            "message": error.to_string(),
+            "paths": paths,
+        });
+        return (StatusCode::CONFLICT, body.to_string());
     }
     let status = match &error {
         crate::error::DaemonError::Graph(kin_db::KinDbError::Model(
@@ -29780,6 +29881,28 @@ mod tests {
                 external_reference_deltas: Vec::new(),
             })
             .unwrap();
+        // The admission that puts a source file's bytes in the tree derives its
+        // entities in the same pass. Seeding the bytes alone leaves the graph
+        // holding no semantics for a path it is about to seal, which is the
+        // defect the commit planner refuses, so a fixture that skips it is
+        // building that state rather than an ordinary installed file.
+        let file_id = kin_model::FilePathId::new(rel_path);
+        if let Ok(kin_index::IndexedAny::EntitySource(indexed)) =
+            kin_index::IndexPipeline::new().index_any_content(&file_id, content, blob_hash)
+        {
+            state
+                .graph
+                .apply_transaction_delta(&kin_model::TransactionDelta {
+                    entity_deltas: indexed
+                        .entities
+                        .iter()
+                        .cloned()
+                        .map(|new| kin_model::EntityDelta::Added { new })
+                        .collect(),
+                    ..kin_model::TransactionDelta::default()
+                })
+                .unwrap();
+        }
         let plan = crate::repository_commit::plan_native_commit(
             &state.graph,
             &state.blobs,
@@ -35668,6 +35791,7 @@ mod tests {
             "a refused commit must record no change at all"
         );
     }
+
     /// FIR-3200. Read the published start line of the sole entity a path holds.
     #[cfg(unix)]
     fn published_start_line(state: &Arc<DaemonState>, path: &str) -> u32 {
@@ -36081,6 +36205,91 @@ mod tests {
             published_start_line(&reopened, "shifted.rs"),
             before,
             "an unparseable file keeps its last readable version's spans"
+        );
+    }
+
+    /// FIR-3208, the half a record cannot cover. A commit re-derives a stale
+    /// path no debt row ever named, then seals the bytes with the spans they
+    /// produce.
+    ///
+    /// The record the drain works from is written by the writers that know they
+    /// owe a parse. A path can reach the same state with no row at all: the
+    /// startup layout backfill finds the staleness by comparing the graph's
+    /// spans against a fresh parse of the tree's own bytes, publishes the layout
+    /// as partial, and enqueues an ordinary host event for the ambient loop,
+    /// recording nothing. A commit landing before that event is serviced plans
+    /// its tree half and its entity half out of a graph that does not agree with
+    /// itself, and seals the new bytes against the old spans. Removing the
+    /// record here is what leaves the planner's own check standing alone.
+    ///
+    /// Falsifies both halves of that check. Remove the barrier from
+    /// `plan_native_commit_inner` and the commit succeeds with the span still
+    /// where the pre-edit parse left it, so the assertion below fails. Remove
+    /// the one re-derivation from `command_commit` and the commit answers 409
+    /// `semantics_behind_tree`, so `commit_through_api` fails on the status.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_re_derives_a_stale_path_no_debt_row_ever_named() {
+        const PREPENDED_LINES: u32 = 17;
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let layout = initialized.layout.clone();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("shifted.rs"),
+            b"pub fn shifted() -> u32 { 7 }\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(&app, kin_model::OperationId::new(), "publish the fixture").await;
+        let before = published_start_line(&state, "shifted.rs");
+
+        let session_dir = layout.root().join("runs/session-unrecorded-stale-path");
+        materialize_session_through_api(&app, &session_dir).await;
+        prepend_session_lines(&session_dir.join("shifted.rs"), PREPENDED_LINES);
+        reconcile_session_through_api(&app, &session_dir).await;
+
+        // The restart is what makes the graph stale: the publication's own
+        // re-derivation lives in the derived graph, and the next daemon rebuilds
+        // that from a history this publication deliberately did not write.
+        drop(app);
+        drop(state);
+        // And this is what makes it a path nothing recorded. The `expect` is the
+        // fixture's own guard: if the reconcile stopped writing the record, the
+        // removal proves nothing and this test has to say so rather than pass.
+        std::fs::remove_file(layout.root().join("semantic-debt.json")).expect(
+            "the session reconcile must have recorded what it owed, or removing the record \
+             proves nothing",
+        );
+
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before,
+            "the reopened graph has to answer at the pre-edit position, or there is nothing for \
+             the commit to re-derive"
+        );
+
+        let reopened_app = router(Arc::clone(&reopened));
+        commit_through_api(
+            &reopened_app,
+            kin_model::OperationId::new(),
+            "commit the session's edit",
+        )
+        .await;
+        assert_eq!(
+            published_start_line(&reopened, "shifted.rs"),
+            before + PREPENDED_LINES,
+            "the commit had to re-derive a stale path nothing had recorded before it could seal \
+             the bytes that moved those spans"
         );
     }
 
