@@ -113,10 +113,14 @@ struct IndexedFile {
 
 fn index_files(caller_source: &str) -> Vec<IndexedFile> {
     let pipeline = IndexPipeline::new();
-    let blob_hash = kin_blobs::Hash256::from_bytes([0u8; 32]);
     [(DEFS_PATH, DEFS), (CALLER_PATH, caller_source)]
         .into_iter()
         .map(|(path, source)| {
+            // The file's real content digest, per file, not a shared zero hash.
+            // The daemon checks that the digest matches the bytes it indexed, so
+            // a placeholder here is a fixture that stops resembling the product
+            // the moment that check tightens.
+            let blob_hash = kin_blobs::digest(source.as_bytes());
             let indexed = pipeline
                 .index_file_content_with_tests(&FilePathId::new(path), source.as_bytes(), blob_hash)
                 .unwrap_or_else(|error| panic!("index {path}: {error}"))
