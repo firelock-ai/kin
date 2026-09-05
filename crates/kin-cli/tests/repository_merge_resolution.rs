@@ -404,6 +404,25 @@ fn path_colliding_repository(root: &Path) -> std::path::PathBuf {
     repo
 }
 
+/// Two branches touching disjoint files, so the merge composes cleanly and
+/// publishes rather than parking.
+fn disjoint_repository(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    initialize_git_repo(&repo);
+
+    run_git(&repo, &["switch", "-c", "feature"]);
+    fs::write(repo.join("src/feature.rs"), b"pub fn feature() {}\n")
+        .expect("add a feature source file");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "feature work"]);
+
+    run_git(&repo, &["switch", "main"]);
+    fs::write(repo.join("src/trunk.rs"), b"pub fn trunk() {}\n").expect("add a trunk source file");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "main work"]);
+    repo
+}
+
 /// Every artifact identity claiming one path in the graph a change resolves to.
 fn artifacts_at_path(
     layout: &kin_core::KinLayout,
@@ -899,6 +918,42 @@ fn a_second_merge_while_one_is_in_progress_is_refused() {
     );
     let record = persisted_record(&layout).expect("the merge is still parked");
     assert!(record.state.is_in_progress());
+}
+
+/// A merge composes the union of two committed graphs, which is the edges the
+/// two branches already carried and not the graph the merged tree implies. A
+/// daemon that can enrich now converges that itself and says nothing, because
+/// having to know `kin daemon sweep` was the defect. A daemon that cannot
+/// enrich has nothing that will repair the gap later, so it has to say so, and
+/// this is the arm that runs with no language server on the host.
+#[test]
+fn a_merge_that_cannot_enrich_says_the_merged_graph_was_not_converged() {
+    let root = tempdir().expect("temp root");
+    let repo = disjoint_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    // The daemon serving every call below is the one this init starts, and it
+    // captures the enrichment lever at process start, so the lever goes here.
+    ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
+        "kin init",
+    );
+
+    let merged = ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+    assert!(
+        merged.contains("Merged refs/heads/feature into refs/heads/main"),
+        "the fixture has to publish rather than park, or the line below proves nothing: {merged}"
+    );
+    assert!(
+        merged.contains("Cross-file enrichment did not run for this merge"),
+        "a merge that could not converge its own graph has to say so: {merged}"
+    );
+    assert!(
+        merged.contains("kin daemon sweep"),
+        "and it names the recovery, which nothing in the product used to: {merged}"
+    );
 }
 
 /// A commit cannot publish around a parked merge. Forced admission advances
