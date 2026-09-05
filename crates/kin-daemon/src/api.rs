@@ -1212,6 +1212,14 @@ const REPO_SCOPED_SEMANTIC_CAPABILITY: &str = "repo_scoped_semantic_tools_v1";
 /// them means "ask an older daemon a different question". Advertising it is
 /// what lets that caller keep a truthful fallback instead of a heuristic.
 const REPO_SCOPED_BLOB_CAPABILITY: &str = "repo_scoped_blob_v1";
+/// This daemon answers what changed between two refs of a repository.
+///
+/// Advertised for the same reason the blob capability is, and with a sharper
+/// edge: a caller that cannot tell a daemon without this route from one with it
+/// has to decide what an unanswered comparison means, and the tempting answer
+/// is a comparison of zero files, which is indistinguishable from two refs that
+/// really are identical. A caller reading this string never has to guess.
+const REPO_SCOPED_COMPARE_CAPABILITY: &str = "repo_scoped_compare_v1";
 /// Retained continuations per repository, not per daemon.
 ///
 /// A per-daemon cap is a shared resource across tenants, and the eviction that
@@ -2222,6 +2230,10 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/repos/{repo_id}/entities", get(repo_entities))
         .route("/repos/{repo_id}/files", get(repo_files))
         .route("/repos/{repo_id}/blob", get(crate::repo_blob::repo_blob))
+        .route(
+            "/repos/{repo_id}/compare",
+            get(crate::repo_compare::repo_compare),
+        )
         .route("/repos/{repo_id}/refs", get(repo_refs))
         .route("/repos/{repo_id}/history", get(repo_history))
         .route(
@@ -15391,7 +15403,7 @@ impl RepositoryReadView {
     }
 
     /// One change out of this generation's history.
-    fn change(
+    pub(crate) fn change(
         &self,
         change_id: &kin_model::SemanticChangeId,
     ) -> Result<Option<kin_model::SemanticChange>, (StatusCode, String)> {
@@ -16428,6 +16440,7 @@ async fn repo_health(
                 vec![
                     REPO_SCOPED_SEMANTIC_CAPABILITY.to_string(),
                     REPO_SCOPED_BLOB_CAPABILITY.to_string(),
+                    REPO_SCOPED_COMPARE_CAPABILITY.to_string(),
                 ]
             })
             .unwrap_or_default(),
@@ -24225,6 +24238,309 @@ mod tests {
         );
     }
 
+    /// A compare read over the router, keeping the refusal header.
+    async fn repo_compare_route(
+        state: Arc<DaemonState>,
+        path: &str,
+    ) -> (StatusCode, Option<String>, Vec<u8>) {
+        let response = router(state)
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let refusal = response
+            .headers()
+            .get(crate::repo_compare::REPO_COMPARE_REFUSAL_HEADER)
+            .map(|value| value.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, refusal, body.to_vec())
+    }
+
+    /// Two published generations, compared in both directions over the router.
+    ///
+    /// Every arm here is one a comparison that answers without reading would
+    /// get wrong. Zero ahead, zero behind and no files is what two identical
+    /// refs look like, so the identical case is read beside the two real ones:
+    /// the zero answer has to be earned rather than assumed. The reverse
+    /// direction is here because a route that returned the same body for both
+    /// orders would still pass the forward arm.
+    #[tokio::test]
+    async fn the_compare_route_answers_a_real_difference_in_both_directions() {
+        let repo_id = format!("hostedcompare-diff-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+
+        let (first_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3279_0001,
+            "publish the first generation",
+            &[(
+                "only_in_first",
+                "src/only_in_first.rs",
+                "fn only_in_first() {}\n",
+            )],
+        );
+        let (second_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first_change),
+            0x3279_0002,
+            "publish the second generation",
+            &[(
+                "only_in_second",
+                "src/only_in_second.rs",
+                "fn only_in_second() {}\n",
+            )],
+        );
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3279_0003,
+            kin_model::RefName::branch(b"legacy").unwrap(),
+            first_change,
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let (status, refusal, body) = repo_compare_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/compare?base=legacy&head=main"),
+        )
+        .await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::OK, "{message}");
+        assert_eq!(
+            refusal, None,
+            "an answered comparison carries no refusal header: {message}"
+        );
+        let forward: crate::repo_compare::RepoCompareResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(forward.repo_id, repo_id);
+        assert_eq!(
+            forward.base_ref,
+            first_change.to_string(),
+            "each side reports the change it resolved to"
+        );
+        assert_eq!(forward.head_ref, second_change.to_string());
+        assert_eq!(
+            forward.merge_base_ref,
+            first_change.to_string(),
+            "the base is an ancestor of the head, so it is the merge base"
+        );
+        assert_eq!(
+            forward.ahead, 1,
+            "the head carries one change the base lacks"
+        );
+        assert_eq!(forward.behind, 0);
+        assert_eq!(
+            forward.files.len(),
+            1,
+            "one file was added between the two: {:?}",
+            forward.files
+        );
+        assert_eq!(forward.files[0].path, "src/only_in_second.rs");
+        assert_eq!(forward.files[0].status, "added");
+        assert!(
+            forward.conflicts.is_empty(),
+            "this route establishes no conflicts and must claim none"
+        );
+
+        // The same pair the other way round. A file added going forward is a
+        // file deleted coming back, and the distance swaps sides.
+        let (status, _refusal, body) = repo_compare_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/compare?base=main&head=legacy"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let reverse: crate::repo_compare::RepoCompareResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(reverse.ahead, 0);
+        assert_eq!(reverse.behind, 1);
+        assert_eq!(reverse.merge_base_ref, first_change.to_string());
+        assert_eq!(reverse.files.len(), 1, "{:?}", reverse.files);
+        assert_eq!(reverse.files[0].path, "src/only_in_second.rs");
+        assert_eq!(reverse.files[0].status, "deleted");
+
+        // And a ref against itself, which is the only shape that earns zero.
+        let (status, _refusal, body) = repo_compare_route(
+            Arc::clone(&state),
+            &format!("/repos/{repo_id}/compare?base=main&head=main"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let identical: crate::repo_compare::RepoCompareResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(identical.ahead, 0);
+        assert_eq!(identical.behind, 0);
+        assert!(identical.files.is_empty(), "{:?}", identical.files);
+        assert_eq!(
+            identical.merge_base_ref,
+            second_change.to_string(),
+            "a change is its own merge base with itself"
+        );
+    }
+
+    /// The compare route publishes its refusal kind on every refusal.
+    ///
+    /// The header is what a hosted caller branches on, and the branch that
+    /// matters most is the one between "this daemon cannot answer" and "these
+    /// refs really are identical". An arm that forgot the header would look to
+    /// that caller like a route that had never heard of the question.
+    #[tokio::test]
+    async fn every_compare_refusal_the_router_can_produce_carries_its_kind() {
+        let repo_id = format!("hostedcompare-kinds-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+
+        let (first_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3279_0011,
+            "publish the first generation",
+            &[(
+                "only_in_first",
+                "src/only_in_first.rs",
+                "fn only_in_first() {}\n",
+            )],
+        );
+        let (second_change, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first_change),
+            0x3279_0012,
+            "publish the second generation",
+            &[(
+                "only_in_second",
+                "src/only_in_second.rs",
+                "fn only_in_second() {}\n",
+            )],
+        );
+        // A branch and a tag that shorten to the same alias and point at
+        // different changes, so a comparison against `v2` cannot be answered
+        // without picking one of them.
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3279_0013,
+            kin_model::RefName::branch(b"v2").unwrap(),
+            first_change,
+        );
+        add_hosted_ref(
+            storage.path(),
+            &repository_id,
+            0x3279_0014,
+            kin_model::RefName::tag(b"v2").unwrap(),
+            second_change,
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let cases = [
+            (
+                "base=no-such-ref&head=main",
+                StatusCode::NOT_FOUND,
+                "unknown-ref",
+                "base",
+            ),
+            (
+                "base=main&head=no-such-ref",
+                StatusCode::NOT_FOUND,
+                "unknown-ref",
+                "head",
+            ),
+            (
+                "base=v2&head=main",
+                StatusCode::CONFLICT,
+                "ambiguous-ref",
+                "refs/tags/v2",
+            ),
+            ("base=main", StatusCode::BAD_REQUEST, "bad-request", "head"),
+            ("head=main", StatusCode::BAD_REQUEST, "bad-request", "base"),
+        ];
+        for (query, expected_status, expected_kind, expected_text) in cases {
+            let (status, refusal, body) = repo_compare_route(
+                Arc::clone(&state),
+                &format!("/repos/{repo_id}/compare?{query}"),
+            )
+            .await;
+            let message = String::from_utf8_lossy(&body);
+            assert_eq!(status, expected_status, "{query}: {message}");
+            assert_eq!(
+                refusal.as_deref(),
+                Some(expected_kind),
+                "{query} must be refused BY NAME: {message}"
+            );
+            assert!(
+                message.contains(expected_text),
+                "{query}: the refusal must say {expected_text:?}: {message}"
+            );
+        }
+
+        // A repository this daemon does not serve, which shares its status with
+        // the unknown-ref arms and is a different kind.
+        let (status, refusal, body) = repo_compare_route(
+            Arc::clone(&state),
+            "/repos/not-served-here/compare?base=main&head=main",
+        )
+        .await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::NOT_FOUND, "{message}");
+        assert_eq!(refusal.as_deref(), Some("unknown-repository"), "{message}");
+
+        // The control: the same repository answers a well-formed comparison, so
+        // every refusal above is refused for its own shape rather than because
+        // this fixture cannot answer anything.
+        let (status, refusal, body) = repo_compare_route(
+            Arc::clone(&state),
+            &format!(
+                "/repos/{repo_id}/compare?base={first_change}&head={}",
+                second_change
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(refusal, None, "an answered comparison carries no refusal");
+    }
+
+    /// A daemon carrying the compare route says so on its health endpoint.
+    ///
+    /// A hosted control plane keys its fallback on this string, and the
+    /// fallback available without it is inventing an empty comparison, so an
+    /// image with the route that does not advertise it is the same outage as
+    /// one without the route.
+    #[tokio::test]
+    async fn a_hosted_daemon_advertises_the_repo_scoped_compare_capability() {
+        let repo_id = format!("hostedcompare-capability-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+        let repository_id = RepositoryId::new(&repo_id).unwrap();
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x3279_0021,
+            "publish a generation to compare",
+            &[("first_symbol", "src/first.rs", "fn first_symbol() {}\n")],
+        );
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/health")).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let health: RepoHealthResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            health
+                .semantic_capabilities
+                .iter()
+                .any(|capability| capability == REPO_SCOPED_COMPARE_CAPABILITY),
+            "a daemon carrying the compare route must advertise it: {:?}",
+            health.semantic_capabilities
+        );
+    }
+
     /// A publication that moves the generation is not answered from the tree
     /// resolved before it (FIR-2924).
     ///
@@ -24811,6 +25127,7 @@ mod tests {
             vec![
                 REPO_SCOPED_SEMANTIC_CAPABILITY.to_string(),
                 REPO_SCOPED_BLOB_CAPABILITY.to_string(),
+                REPO_SCOPED_COMPARE_CAPABILITY.to_string(),
             ]
         );
 

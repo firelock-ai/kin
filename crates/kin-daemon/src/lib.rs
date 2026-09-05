@@ -138,6 +138,7 @@ mod pending_commits;
 pub mod publication_lease;
 pub mod replica_adoption;
 pub mod repo_blob;
+pub mod repo_compare;
 mod repository_admit;
 mod repository_branch;
 mod repository_checkout;
