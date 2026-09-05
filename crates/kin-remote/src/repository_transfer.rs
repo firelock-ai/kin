@@ -2689,7 +2689,17 @@ mod tests {
     /// A transfer's receive no longer needs one: it is admitted as a transfer
     /// and held to the shared policy instead (FIR-2959).
     fn seed_native_line(manager: &TestManager, main: &RefName) {
-        let change = native_change(Vec::new(), "native root", Vec::new());
+        let mut change = native_change(Vec::new(), "native root", Vec::new());
+        // A real native root carries a shared admission policy, and a fixture
+        // without one cannot bootstrap a replica: `prepare_replica_bootstrap`
+        // walks the first-parent line for it and refuses a head that has none
+        // ("replica head has no shared admission policy"). Seeding it here
+        // rather than in one test keeps the two publishers this helper builds
+        // describing the same kind of store.
+        change.admission_policy_delta = Some(kin_model::AdmissionPolicyDelta::initialize(
+            kin_model::SharedAdmissionPolicy::empty(0),
+        ));
+        change.id = compute_semantic_change_id(&change).unwrap();
         let lease = manager.read_authority();
         let transaction = RepositoryTransaction {
             schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
