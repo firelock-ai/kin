@@ -9229,6 +9229,15 @@ mod tests {
     /// and then shows the consequence: the old path is vacated with its entities
     /// still standing, which is the transition repository authority refuses,
     /// exactly as it refuses a pending deletion.
+    /// One half of this is durable and one half is not, and the difference
+    /// matters for FIR-3278. That a move is a single `Updated` delta keeping its
+    /// artifact identity is a fact about the model and stays true. That the old
+    /// path is left with its entities standing, which is what forces the refusal
+    /// below, is the state FIR-3278 removes by relocating those entities instead
+    /// of retiring them. The refusal itself should survive that repair, because
+    /// `publish_workspace_tree` always sends an empty semantic delta and so can
+    /// never carry a relocation either; if FIR-3278 makes this arm fail, the
+    /// refusal moved and this test is the place to record where.
     #[test]
     fn a_pending_move_is_one_updated_delta_and_ambient_admission_refuses_it() {
         let (_dir, state) = test_state();
@@ -9304,6 +9313,16 @@ mod tests {
     /// Driven through the product's own `VacatedPaths::from_deltas` and
     /// `retire_semantics_on_vacated`, which is what `plan_session_workspace_
     /// admission` calls, rather than through a hand-built delta.
+    ///
+    /// **This test asserts the CURRENT behaviour, and that behaviour is the
+    /// defect (FIR-3278).** It is here so the mechanism is pinned with output
+    /// rather than argued in prose, and so the repair has evidence to work
+    /// against. When FIR-3278 lands, every assertion below inverts: the moved
+    /// entity is expected as `EntityDelta::Modified` carrying its original id at
+    /// the new path, its incident relations are expected to survive with both
+    /// endpoints intact, and the "nothing relocates it" assertion is expected to
+    /// be the one that fails. Replace them then. Do not read this test's green
+    /// as a reason to leave the retirement alone.
     #[test]
     fn session_admission_retires_a_moved_path_identity_and_its_incoming_edges() {
         let (_dir, state) = test_state();
