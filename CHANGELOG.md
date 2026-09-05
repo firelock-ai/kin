@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Carry relation-only pending enrichment across a branch switch (#1521)
 - Drop the spine evidence an abandoned rollout never released (#1522)
 - Converge a merged graph's enrichment and let graph validate see a census gap (#1523)
+- Read the commit's effect from a live status sample (#1524)
 
 
 ## [0.7.0] - 2026-09-05
