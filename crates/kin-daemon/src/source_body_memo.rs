@@ -459,6 +459,15 @@ impl StorageBackend for SourceBodyMemoBackend {
         )
     }
 
+    fn load_prepared_workspace_graph_binding(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<Vec<u8>>, KinDbError> {
+        self.inner
+            .load_prepared_workspace_graph_binding(repo_id, workspace_id)
+    }
+
     fn load_prepared_workspace_graph(
         &self,
         repo_id: &str,
@@ -562,6 +571,8 @@ mod tests {
         cursor_reads: std::sync::Arc<AtomicU64>,
         snapshot_reads: std::sync::Arc<AtomicU64>,
         recovery_reads: std::sync::Arc<AtomicU64>,
+        prepared_bindings: std::sync::Arc<Mutex<HashMap<(String, String), Vec<u8>>>>,
+        prepared_binding_reads: std::sync::Arc<AtomicU64>,
     }
 
     impl CountingBackend {
@@ -574,6 +585,20 @@ mod tests {
     }
 
     impl StorageBackend for CountingBackend {
+        fn load_prepared_workspace_graph_binding(
+            &self,
+            repo_id: &str,
+            workspace_id: &str,
+        ) -> Result<Option<Vec<u8>>, KinDbError> {
+            self.prepared_binding_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .prepared_bindings
+                .lock()
+                .unwrap()
+                .get(&(repo_id.to_string(), workspace_id.to_string()))
+                .cloned())
+        }
+
         fn load_snapshot(
             &self,
             _repo_id: &str,
@@ -875,6 +900,63 @@ mod tests {
         assert_eq!(backend.body_reads.load(Ordering::SeqCst), 5);
         memo.load_source_blob("kin", digest(3)).unwrap().unwrap();
         assert_eq!(backend.body_reads.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn prepared_binding_reads_cross_both_decorators_without_becoming_body_cache_entries() {
+        use crate::storage_delegate::{DelegatingBackend, StorageBackendDelegate};
+
+        struct PassThrough(SourceBodyMemoBackend);
+        impl StorageBackendDelegate for PassThrough {
+            fn delegate(&self) -> &dyn StorageBackend {
+                &self.0
+            }
+        }
+
+        let (backend, memo) = fixture();
+        let key = ("repo-a".to_string(), "workspace-a".to_string());
+        backend
+            .prepared_bindings
+            .lock()
+            .unwrap()
+            .insert(key.clone(), b"first-binding".to_vec());
+        assert_eq!(
+            memo.load_prepared_workspace_graph_binding("repo-a", "workspace-a")
+                .unwrap(),
+            Some(b"first-binding".to_vec())
+        );
+
+        let decorated = DelegatingBackend::new(PassThrough(memo));
+        assert_eq!(
+            decorated
+                .load_prepared_workspace_graph_binding("repo-a", "workspace-a")
+                .unwrap(),
+            Some(b"first-binding".to_vec())
+        );
+        backend
+            .prepared_bindings
+            .lock()
+            .unwrap()
+            .insert(key, b"replacement-binding".to_vec());
+        assert_eq!(
+            decorated
+                .load_prepared_workspace_graph_binding("repo-a", "workspace-a")
+                .unwrap(),
+            Some(b"replacement-binding".to_vec())
+        );
+        for (repo, workspace) in [("repo-b", "workspace-a"), ("repo-a", "workspace-b")] {
+            assert_eq!(
+                decorated
+                    .load_prepared_workspace_graph_binding(repo, workspace)
+                    .unwrap(),
+                None
+            );
+        }
+        assert_eq!(decorated.decorator().0.resident_bytes(), 0);
+        assert_eq!(backend.prepared_binding_reads.load(Ordering::SeqCst), 5);
+        assert_eq!(backend.body_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.snapshot_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.recovery_reads.load(Ordering::SeqCst), 0);
     }
 
     /// The regression that started this work, pinned on the new decorator.
