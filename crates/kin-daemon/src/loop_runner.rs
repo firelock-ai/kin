@@ -1259,6 +1259,48 @@ pub(crate) fn admit_one_ambient_host_event(state: &DaemonState, path: PathBuf) -
     Ok(())
 }
 
+/// A successful parse can carry no transaction at all. Keep that result out
+/// of graph application, which validates prospective state across the graph.
+fn apply_reconcile_delta(
+    delta: &TransactionDelta,
+    apply: impl FnOnce(&TransactionDelta) -> std::result::Result<(), kin_db::KinDbError>,
+) -> std::result::Result<bool, kin_db::KinDbError> {
+    if *delta == TransactionDelta::default() {
+        return Ok(false);
+    }
+    apply(delta)?;
+    Ok(true)
+}
+
+/// Semantic equality does not prove layout equality: a startup repair may
+/// restore a missing or stale layout without changing any entity or relation.
+fn reconcile_layout_changed(
+    state: &DaemonState,
+    reconciler: &kin_reconcile::Reconciler,
+    outcome: &kin_reconcile::ReconcileOutcome,
+) -> bool {
+    match outcome {
+        kin_reconcile::ReconcileOutcome::Updated { file_id, .. } => {
+            let Ok(Some(previous)) = state.graph.get_file_layout(file_id) else {
+                return true;
+            };
+            let Some(next) = reconciler.projection().get_layout(file_id) else {
+                return true;
+            };
+            // FileLayout has no PartialEq. Compare its complete persisted
+            // representation rather than an incomplete selection of fields.
+            match (serde_json::to_value(previous), serde_json::to_value(next)) {
+                (Ok(previous), Ok(next)) => previous != next,
+                _ => true,
+            }
+        }
+        kin_reconcile::ReconcileOutcome::FileRemoved { file_id, .. } => {
+            !matches!(state.graph.get_file_layout(file_id), Ok(None))
+        }
+        _ => false,
+    }
+}
+
 fn clear_incompatible_facets(
     state: &DaemonState,
     file_id: &FilePathId,
@@ -3475,6 +3517,7 @@ pub async fn run_loop_armed(
                         &outcome,
                         ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. }
                     );
+                    let mut reconciled_graph_changed = false;
                     if should_apply {
                         match host_entry_matches_graph(&state, path, &semantic_repo_path) {
                             Ok(true) => {}
@@ -3507,13 +3550,20 @@ pub async fn run_loop_armed(
                             }
                         }
                         let derived_entities = !delta.entity_deltas.is_empty();
-                        if let Err(e) = state.graph.apply_transaction_delta(&delta) {
-                            warn!(error = %e, "failed to apply reconciled transaction into primary graph");
-                            if tree_changed {
-                                state.bump_version();
+                        let applied = match apply_reconcile_delta(&delta, |delta| {
+                            state.graph.apply_transaction_delta(delta)
+                        }) {
+                            Ok(applied) => applied,
+                            Err(e) => {
+                                warn!(error = %e, "failed to apply reconciled transaction into primary graph");
+                                if tree_changed {
+                                    state.bump_version();
+                                }
+                                continue;
                             }
-                            continue;
-                        }
+                        };
+                        let layout_changed =
+                            reconcile_layout_changed(&state, &reconciler, &outcome);
                         // Recorded after the apply, so what is marked is
                         // enrichment the graph holds. Nothing publishes it to
                         // durable authority outside a commit, so if this daemon
@@ -3529,7 +3579,8 @@ pub async fn run_loop_armed(
                         {
                             warn!(error = %e, "failed to persist projection truth after reconcile");
                         }
-                        graph_changed = true;
+                        reconciled_graph_changed = applied || layout_changed;
+                        graph_changed |= reconciled_graph_changed;
                     }
 
                     if let ReconcileOutcome::Updated {
@@ -3583,7 +3634,7 @@ pub async fn run_loop_armed(
                                 session_id: None,
                             });
                         }
-                        if should_apply || tree_changed {
+                        if reconciled_graph_changed || tree_changed {
                             state.bump_version();
                         }
 
@@ -3651,7 +3702,7 @@ pub async fn run_loop_armed(
                             }
                         }
 
-                        if should_apply || tree_changed {
+                        if reconciled_graph_changed || tree_changed {
                             state.bump_version();
                         }
                     } else if tree_changed {
@@ -3893,6 +3944,214 @@ mod tests {
         state
             .persist_projection_truth_from_reconcile(&reconciler, &outcome)
             .unwrap();
+    }
+
+    #[test]
+    fn reconcile_empty_delta_non_entity_domains_still_reach_graph_validation() {
+        let graph = kin_db::InMemoryGraph::new();
+        let path = test_repo_path("tracked.rs");
+        let entry = TreeEntry::blob(Hash256::from_bytes([7; 32]), false);
+        let tree = TransactionDelta {
+            tree_deltas: vec![TreeDelta::Added {
+                artifact_id: kin_model::ArtifactId::new(),
+                new: kin_model::LocatedEntry::new(path.clone(), entry),
+            }],
+            ..TransactionDelta::default()
+        };
+        assert!(
+            apply_reconcile_delta(&tree, |delta| graph.apply_transaction_delta(delta)).unwrap()
+        );
+        assert_eq!(
+            graph.resolved_tree().artifact_at_path(&path).unwrap().entry,
+            entry
+        );
+        let reference = kin_model::ExternalReference::new_resolved(
+            "rust-v1",
+            "crates.io/serde@1.0.0",
+            "Serialize",
+        )
+        .unwrap();
+        let external = TransactionDelta {
+            external_reference_deltas: vec![kin_model::ExternalReferenceDelta::Added {
+                new: reference.clone(),
+            }],
+            ..TransactionDelta::default()
+        };
+        assert!(
+            apply_reconcile_delta(&external, |delta| graph.apply_transaction_delta(delta)).unwrap()
+        );
+        assert_eq!(graph.get_external_reference(&reference.id), Some(reference));
+        let policy = TransactionDelta {
+            admission_policy_delta: Some(kin_model::AdmissionPolicyDelta::initialize(
+                kin_model::SharedAdmissionPolicy::empty(0),
+            )),
+            ..TransactionDelta::default()
+        };
+        let error = apply_reconcile_delta(&policy, |delta| graph.apply_transaction_delta(delta))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("admission policy is repository authority"),
+            "a policy-only delta must reach the real authority refusal: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn check_reconcile_dirty_work(edit: bool, repair_layout: u8, already_dirty: bool) {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let original = "pub fn stable() -> u32 { 7 }\n";
+        admit_and_derive(&state, "stable.rs", original);
+        let file_id = FilePathId::new("stable.rs");
+        let expected_layout = state.graph.get_file_layout(&file_id).unwrap().unwrap();
+        let host = repo.path().join("stable.rs");
+        let mut probe = kin_reconcile::Reconciler::new(repo.path().to_path_buf());
+        let result = probe
+            .reconcile_file_change(
+                &FileEvent::Changed(host.clone()),
+                &state.blobs,
+                state.graph.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.delta,
+            TransactionDelta::default(),
+            "the settled fixture must produce an actual empty semantic delta"
+        );
+        let mut applications = 0;
+        let applied = apply_reconcile_delta(&result.delta, |delta| {
+            applications += 1;
+            state.graph.apply_transaction_delta(delta)
+        })
+        .unwrap();
+        assert!(!applied);
+        assert_eq!(
+            applications, 0,
+            "an actual empty semantic delta must not enter graph application"
+        );
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let runner = tokio::spawn(run_loop_armed(
+            Arc::clone(&state),
+            LoopConfig {
+                poll_interval_ms: 10,
+                batch_size: 64,
+            },
+            cancel_rx,
+            Some(WatchArmed::new(armed_tx)),
+        ));
+        assert_eq!(
+            crate::daemon::await_watch_armed(armed_rx, Duration::from_secs(5)).await,
+            crate::daemon::WatchArming::Armed
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (!state.is_initialized.load(Ordering::Relaxed)
+            || state.reconciliation_status.load(Ordering::Relaxed) != RECON_IDLE)
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state.is_initialized.load(Ordering::Relaxed),
+            "the real loop must finish startup"
+        );
+        assert_eq!(
+            state.reconciliation_status.load(Ordering::Relaxed),
+            RECON_IDLE,
+            "the bounded startup wait must reach idle before the controlled observation"
+        );
+        // Settle fixture work through the normal persistence boundary before
+        // attributing anything to the controlled notification.
+        state.save_snapshot().unwrap();
+        state.mark_clean();
+        assert!(
+            !state.is_dirty(),
+            "the fixture must start the observation clean"
+        );
+        match repair_layout {
+            0 => {}
+            1 => state.graph.delete_file_layout(&file_id).unwrap(),
+            2 => {
+                let mut stale = expected_layout.clone();
+                stale.parse_completeness =
+                    kin_model::ParseCompleteness::Partial("stale parse observation".into());
+                state.graph.upsert_file_layout(&stale).unwrap();
+            }
+            _ => panic!("unknown layout damage"),
+        }
+        if already_dirty {
+            state.mark_dirty();
+        }
+        let pass = state
+            .background_work
+            .registered(crate::background_work::PASS_RECONCILE)
+            .unwrap();
+        let before = pass.progress();
+        let content = if edit {
+            "pub fn changed() -> u32 { 8 }\n"
+        } else {
+            original
+        };
+        std::fs::write(&host, content).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pass.progress() <= before && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cancel_tx.send(true).unwrap();
+        runner.await.unwrap().unwrap();
+        assert!(
+            pass.progress() > before,
+            "the real watcher must process the controlled write"
+        );
+        assert_eq!(state.is_dirty(), edit || repair_layout != 0 || already_dirty,
+            "an identical settled notification must not create dirty work; edits, layout repairs and existing dirty work must remain dirty");
+        if edit {
+            assert!(
+                state
+                    .graph
+                    .query_entities(&EntityFilter {
+                        file_path: Some(file_id),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .iter()
+                    .any(|entity| entity.name == "changed"),
+                "a real edit must reach graph truth"
+            );
+        } else {
+            assert_eq!(
+                serde_json::to_value(state.graph.get_file_layout(&file_id).unwrap()).unwrap(),
+                serde_json::to_value(Some(expected_layout)).unwrap(),
+                "an identical-byte notification must still restore the real projection layout"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_empty_delta_does_not_dirty_a_settled_graph() {
+        check_reconcile_dirty_work(false, 0, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_empty_delta_preserves_pending_dirty_work() {
+        check_reconcile_dirty_work(false, 0, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_empty_delta_still_repairs_a_missing_or_stale_layout() {
+        check_reconcile_dirty_work(false, 1, false).await;
+        check_reconcile_dirty_work(false, 2, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_empty_delta_real_edit_control() {
+        check_reconcile_dirty_work(true, 0, false).await;
     }
 
     #[cfg(unix)]
