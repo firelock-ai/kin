@@ -38,14 +38,19 @@ use crate::error::{DaemonError, Result};
 use crate::hosted_start;
 use crate::session_registry::SessionCoordinator;
 
-/// Borrowed immutable history used to materialize a hosted repository ref.
+/// Borrowed immutable history for resolving a change out of persisted
+/// authority without building a graph to throw away.
 ///
 /// Repository-v6 snapshots intentionally leave their top-level graph domains
 /// empty. `ChangeStore::resolve_graph_at` needs only `get_change`, so borrowing
 /// the admitted change map avoids cloning the payload-heavy history into a
 /// throwaway graph before every hosted load.
-struct HostedAuthorityHistory<'a> {
-    changes: &'a HashMap<SemanticChangeId, SemanticChange>,
+///
+/// `pub(crate)` for the second caller with that same shape: the native commit
+/// planner resolves its baseline at the parent change and reads nothing else
+/// from the graph it was building for it (`commit_deltas.rs`).
+pub(crate) struct HostedAuthorityHistory<'a> {
+    pub(crate) changes: &'a HashMap<SemanticChangeId, SemanticChange>,
 }
 
 impl HostedAuthorityHistory<'_> {

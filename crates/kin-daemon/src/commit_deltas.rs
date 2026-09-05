@@ -57,6 +57,95 @@ pub fn compute_deltas_vs_last_commit(
     compute_deltas_from_resolved_state(graph, committed)
 }
 
+/// Resolve the graph at one change out of persisted authority, without
+/// building a graph to throw away.
+///
+/// The commit planner needs the parent's entities, relations and tree so it can
+/// diff the live graph against them. It used to get them by cloning the
+/// authority snapshot, constructing a whole `InMemoryGraph` from it, calling
+/// `resolve_graph_at` once, and dropping the graph. Constructing it was not
+/// free. `from_snapshot` rebuilds a lexical index over every entity, which
+/// nothing here searches, and an authority snapshot always arrives with
+/// `entity_revisions` cleared (kin-db clears them on purpose, because a
+/// repository with multiple refs has no single revision view), which selects
+/// the branch that derives entity revisions across the entire history. Neither
+/// result reaches the delta this returns.
+///
+/// Measured on one repository at two history depths, six files and twenty-five
+/// entities either way: at 5 changes the commit took 0.43 s and 52.2 MiB of
+/// daemon resident set, and at 2000 changes the same edit produced the same 6
+/// entities and 143 relations while taking 7.57 s and 166.2 MiB. The 1995 extra
+/// changes changed no output.
+///
+/// Two arms, in cost order, and the second is not a degraded mode. The
+/// materialized section is authority's own memo of this exact resolution and is
+/// refreshed at the change that becomes the next commit's parent, by
+/// `refresh_workspace_base_graph_section` after every native commit and by
+/// `kin init`. When it answers, nothing decodes the change map at all. When it
+/// does not, folding the history is always available beside it and is always
+/// correct; a refusal can only ever cost time. Amend is the recurring miss and
+/// misses correctly, because it resolves at the amended change's own parent
+/// rather than at the workspace base the section names.
+///
+/// Public so the heap-ceiling guard can measure both arms against the
+/// graph-building path in the same process, which is the only way its ceiling is
+/// evidence rather than an arbitrary constant.
+pub fn resolve_authority_baseline(
+    authority_snapshot: &GraphSnapshot,
+    parent: &SemanticChangeId,
+) -> Result<ResolvedGraphState> {
+    match baseline_from_materialized_section(authority_snapshot, parent) {
+        Ok(state) => Ok(state),
+        Err(refusal) => {
+            tracing::debug!(
+                %parent,
+                %refusal,
+                "the materialized graph section did not answer for this commit's parent, so the \
+                 baseline folds from history instead"
+            );
+            baseline_from_history(authority_snapshot, parent)
+        }
+    }
+}
+
+/// Authority's own memo of `resolve_graph_at` at exactly this change.
+///
+/// Deliberately no re-derivation to check the memo. Recomputing the resolution
+/// to decide whether to trust a memo of the resolution would pay the whole cost
+/// this avoids and conclude what the change id already proves: a change id
+/// hashes every immutable field including `parents`, so naming the change names
+/// its complete ancestry and therefore the graph. This mirrors kin-db's own
+/// provider for the same section rather than inventing a second policy.
+fn baseline_from_materialized_section(
+    authority_snapshot: &GraphSnapshot,
+    parent: &SemanticChangeId,
+) -> std::result::Result<ResolvedGraphState, kin_db::MaterializedGraphRefusal> {
+    let section = authority_snapshot
+        .materialized_graph
+        .as_ref()
+        .ok_or(kin_db::MaterializedGraphRefusal::Absent)?;
+    section.validate_for(parent)?;
+    Ok(section.state.clone())
+}
+
+/// Fold the parent out of persisted history, borrowing the change map.
+///
+/// `resolve_graph_at` reaches its store through `get_change` and nothing else
+/// (`kin_model::graph::collect_changes_first_parent`), so the graph this used to
+/// construct served one lookup loop. Borrowing does still decode the change map,
+/// because `ChangeMap` derefs through `force()`; what it drops is the throwaway
+/// graph, its lexical index, and the whole-history entity-revision derivation.
+fn baseline_from_history(
+    authority_snapshot: &GraphSnapshot,
+    parent: &SemanticChangeId,
+) -> Result<ResolvedGraphState> {
+    crate::state::HostedAuthorityHistory {
+        changes: &authority_snapshot.changes,
+    }
+    .resolve_graph_at(parent)
+    .map_err(DaemonError::Graph)
+}
+
 /// Diff the live admitted graph against one repository-v6 authority lease.
 ///
 /// The baseline comes exclusively from the persisted semantic history. The
@@ -69,14 +158,7 @@ pub fn compute_deltas_vs_repository_authority(
     parent: Option<&SemanticChangeId>,
 ) -> Result<CommitDeltas> {
     let committed = match parent {
-        Some(parent) => {
-            let mut snapshot = authority_snapshot.clone();
-            snapshot.repository_authority = None;
-            InMemoryGraph::from_snapshot(snapshot)
-                .map_err(DaemonError::Graph)?
-                .resolve_graph_at(parent)
-                .map_err(DaemonError::Graph)?
-        }
+        Some(parent) => resolve_authority_baseline(authority_snapshot, parent)?,
         None => ResolvedGraphState {
             entities: Default::default(),
             relations: Default::default(),
@@ -2404,6 +2486,188 @@ mod tests {
                 new: reprovenanced,
             }],
             "a moved payload must reach the published change, not the workspace overlay"
+        );
+    }
+
+    // ── The commit baseline: which arm answered, and do they agree ──
+    //
+    // `resolve_authority_baseline` has two arms and they must return the same
+    // graph. These fixtures make WHICH arm answered observable, because an
+    // equality assertion alone cannot tell a section hit from a fallback that
+    // happened to agree. The section here is given a state history cannot
+    // reproduce, purely so the test can read the answer's provenance off its
+    // content; a real section is authority's own memo of the same fold.
+
+    fn baseline_entity(name: &str) -> Entity {
+        Entity {
+            id: kin_model::EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: Hash256::from_bytes([2; 32]),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("src/lib.rs")),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn baseline_change(
+        parent: Option<SemanticChangeId>,
+        entity_deltas: Vec<EntityDelta>,
+    ) -> kin_model::SemanticChange {
+        let mut change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: kin_model::ChangeOrigin::Native,
+            parents: parent.into_iter().collect(),
+            timestamp: Timestamp::from(
+                chrono::DateTime::parse_from_rfc3339("2026-09-05T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            author: AuthorId::new("relchurn"),
+            message: "baseline fixture".to_string(),
+            entity_deltas,
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            external_reference_deltas: Vec::new(),
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    /// A snapshot shaped like the one a commit holds: several linear changes
+    /// carrying entity deltas, and `entity_revisions` cleared, which is what
+    /// repository authority always does to them.
+    fn authority_like_snapshot(depth: usize) -> (GraphSnapshot, SemanticChangeId) {
+        let graph = InMemoryGraph::new();
+        let mut head = None;
+        let mut carried: Option<Entity> = None;
+        for index in 0..depth {
+            let deltas = match carried.take() {
+                None => {
+                    let entity = baseline_entity(&format!("seed_{index}"));
+                    carried = Some(entity.clone());
+                    vec![EntityDelta::Added { new: entity }]
+                }
+                Some(previous) => {
+                    let mut next = previous.clone();
+                    next.signature = format!("fn seed_{index}()");
+                    carried = Some(next.clone());
+                    vec![EntityDelta::Modified {
+                        old: previous,
+                        new: next,
+                    }]
+                }
+            };
+            let change = baseline_change(head, deltas);
+            graph.create_change(&change).unwrap();
+            head = Some(change.id);
+        }
+        if let Some(entity) = carried {
+            graph.upsert_entity(&entity).unwrap();
+        }
+        let mut snapshot = graph.to_snapshot();
+        snapshot.repository_authority = None;
+        snapshot.entity_revisions.clear();
+        (snapshot, head.expect("depth is at least one change"))
+    }
+
+    /// The pre-change baseline path, kept here as the reference the two arms
+    /// are measured against rather than as production code.
+    fn baseline_by_building_a_graph(
+        snapshot: &GraphSnapshot,
+        head: &SemanticChangeId,
+    ) -> ResolvedGraphState {
+        let mut owned = snapshot.clone();
+        owned.repository_authority = None;
+        InMemoryGraph::from_snapshot(owned)
+            .unwrap()
+            .resolve_graph_at(head)
+            .unwrap()
+    }
+
+    fn marked_section(
+        resolved_at: SemanticChangeId,
+        mut state: ResolvedGraphState,
+    ) -> kin_db::MaterializedGraphSection {
+        let marker = baseline_entity("only_a_section_can_answer_with_this");
+        state.entities.insert(marker.id, marker);
+        kin_db::MaterializedGraphSection {
+            schema_version: kin_db::MATERIALIZED_GRAPH_SCHEMA_VERSION,
+            resolved_at,
+            state,
+        }
+    }
+
+    #[test]
+    fn folding_history_returns_what_building_a_graph_returned() {
+        let (snapshot, head) = authority_like_snapshot(6);
+        let expected = baseline_by_building_a_graph(&snapshot, &head);
+
+        let folded = baseline_from_history(&snapshot, &head).unwrap();
+
+        assert_eq!(folded.entities, expected.entities);
+        assert_eq!(folded.relations, expected.relations);
+        assert_eq!(folded.tree, expected.tree);
+        // The reference is not vacuous: this fixture resolves real entities.
+        assert!(
+            !expected.entities.is_empty(),
+            "a fixture that resolves to nothing would let any implementation pass"
+        );
+    }
+
+    #[test]
+    fn a_section_at_the_parent_answers_without_folding_history() {
+        let (mut snapshot, head) = authority_like_snapshot(6);
+        let folded = baseline_from_history(&snapshot, &head).unwrap();
+        snapshot.materialized_graph = Some(Arc::new(marked_section(head, folded.clone())));
+
+        let resolved = resolve_authority_baseline(&snapshot, &head).unwrap();
+
+        assert_eq!(
+            resolved.entities.len(),
+            folded.entities.len() + 1,
+            "the section arm must have answered; a fallback would have dropped its marker"
+        );
+    }
+
+    #[test]
+    fn a_section_at_another_change_falls_back_and_still_answers() {
+        let (mut snapshot, head) = authority_like_snapshot(6);
+        let folded = baseline_from_history(&snapshot, &head).unwrap();
+        let stale = SemanticChangeId::from_hash(Hash256::from_bytes([0x5a; 32]));
+        assert_ne!(stale, head, "the stale target must not be the parent");
+        snapshot.materialized_graph = Some(Arc::new(marked_section(stale, folded.clone())));
+
+        let resolved = resolve_authority_baseline(&snapshot, &head).unwrap();
+
+        assert_eq!(
+            resolved.entities, folded.entities,
+            "a section naming another change must be refused, not trusted"
+        );
+        assert_eq!(
+            resolved.entities.len(),
+            folded.entities.len(),
+            "the marker proves the refused section did not answer"
         );
     }
 }
