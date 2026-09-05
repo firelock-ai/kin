@@ -251,11 +251,9 @@ impl EncodedChanges {
 /// the snapshot named rather than serving an empty history. Callers that can
 /// carry an error use [`ChangeMap::decoded`] instead.
 pub struct ChangeMap {
-    decoded: OnceLock<ChangeMapInner>,
-    encoded: Option<Arc<EncodedChanges>>,
-    /// Serializes concurrent first uses so two readers do not both decode a
-    /// gigabyte to keep one.
-    decode_gate: Mutex<()>,
+    /// Clones share both first-use decoding and its result. Mutable access
+    /// detaches the entries before handing them to the caller.
+    body: Arc<ChangeMapBody>,
     /// Memoized history-root leaf digests, keyed by change identity.
     ///
     /// `history_root` folds this map through `canonical_leaf_hash`, which
@@ -291,6 +289,25 @@ pub struct ChangeMap {
     leaf_digests: Arc<Mutex<LeafDigestMemo>>,
 }
 
+/// One immutable history shared by every snapshot cloned from it.
+struct ChangeMapBody {
+    decoded: OnceLock<ChangeMapInner>,
+    encoded: Option<EncodedChanges>,
+    /// First uses across all clones take this gate before decoding, so they
+    /// never allocate competing copies of the same history.
+    decode_gate: Mutex<()>,
+}
+
+impl From<ChangeMapInner> for ChangeMapBody {
+    fn from(inner: ChangeMapInner) -> Self {
+        Self {
+            decoded: OnceLock::from(inner),
+            encoded: None,
+            decode_gate: Mutex::new(()),
+        }
+    }
+}
+
 /// Memoized leaf digests and the domain they were computed under.
 ///
 /// The domain is part of the hash (`canonical_leaf_hash` writes it before the
@@ -313,9 +330,11 @@ impl ChangeMap {
     /// A map that stays on disk until a reader asks for an entry.
     pub(crate) fn encoded(encoded: EncodedChanges) -> Self {
         Self {
-            decoded: OnceLock::new(),
-            encoded: Some(Arc::new(encoded)),
-            decode_gate: Mutex::new(()),
+            body: Arc::new(ChangeMapBody {
+                decoded: OnceLock::new(),
+                encoded: Some(encoded),
+                decode_gate: Mutex::new(()),
+            }),
             leaf_digests: Arc::default(),
         }
     }
@@ -325,7 +344,7 @@ impl ChangeMap {
     /// `false` is the state an open leaves a converted store's history in, and
     /// the state the served graph never has to leave.
     pub fn is_decoded(&self) -> bool {
-        self.decoded.get().is_some()
+        self.body.decoded.get().is_some()
     }
 
     /// The entries if they are already in memory, and `None` if they are
@@ -335,12 +354,12 @@ impl ChangeMap {
     /// this is for the one caller that has to compare map identity without
     /// paying the decode the comparison exists to avoid.
     pub(crate) fn decoded_if_present(&self) -> Option<&ChangeMapInner> {
-        self.decoded.get()
+        self.body.decoded.get()
     }
 
     /// Number of changes, read from the map header when the map is encoded.
     pub fn len(&self) -> usize {
-        match (self.decoded.get(), &self.encoded) {
+        match (self.body.decoded.get(), &self.body.encoded) {
             (Some(decoded), _) => decoded.len(),
             (None, Some(encoded)) => encoded.len,
             (None, None) => 0,
@@ -353,14 +372,14 @@ impl ChangeMap {
 
     /// The entries, decoding them first if they are still on disk.
     pub fn decoded(&self) -> Result<&ChangeMapInner, KinDbError> {
-        if let Some(decoded) = self.decoded.get() {
+        if let Some(decoded) = self.body.decoded.get() {
             return Ok(decoded);
         }
-        let _gate = self.decode_gate.lock();
-        if let Some(decoded) = self.decoded.get() {
+        let _gate = self.body.decode_gate.lock();
+        if let Some(decoded) = self.body.decoded.get() {
             return Ok(decoded);
         }
-        let decoded = match &self.encoded {
+        let decoded = match &self.body.encoded {
             Some(encoded) => encoded.decode()?,
             None => ChangeMapInner::new(),
         };
@@ -368,8 +387,9 @@ impl ChangeMap {
         // would mean a second decoder ran anyway, which the gate exists to
         // prevent, and dropping the loser keeps the map a reader already
         // borrowed.
-        let _ = self.decoded.set(decoded);
+        let _ = self.body.decoded.set(decoded);
         Ok(self
+            .body
             .decoded
             .get()
             .expect("the change map was set under the decode gate"))
@@ -436,12 +456,21 @@ impl ChangeMap {
         }
     }
 
-    /// Take the entries out, decoding them first if needed.
+    /// Take the entries out, decoding them first if needed. A unique map
+    /// moves its allocation; a map another snapshot still shares is copied.
     pub fn into_inner(self) -> ChangeMapInner {
         self.force();
-        self.decoded
-            .into_inner()
-            .expect("the change map was decoded on the line above")
+        match Arc::try_unwrap(self.body) {
+            Ok(body) => body
+                .decoded
+                .into_inner()
+                .expect("the change map was decoded on the line above"),
+            Err(body) => body
+                .decoded
+                .get()
+                .expect("the change map was decoded on the line above")
+                .clone(),
+        }
     }
 }
 
@@ -454,9 +483,7 @@ impl Default for ChangeMap {
 impl From<ChangeMapInner> for ChangeMap {
     fn from(inner: ChangeMapInner) -> Self {
         Self {
-            decoded: OnceLock::from(inner),
-            encoded: None,
-            decode_gate: Mutex::new(()),
+            body: Arc::new(ChangeMapBody::from(inner)),
             leaf_digests: Arc::default(),
         }
     }
@@ -491,47 +518,38 @@ impl Deref for ChangeMap {
 impl DerefMut for ChangeMap {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.force();
-        self.decoded
+        if Arc::get_mut(&mut self.body).is_none() {
+            self.body = Arc::new(ChangeMapBody::from(self.force().clone()));
+        }
+        let body = Arc::get_mut(&mut self.body)
+            .expect("mutable access detached the shared change map on the lines above");
+        body.encoded = None;
+        body.decoded
             .get_mut()
             .expect("the change map was decoded on the line above")
     }
 }
 
 impl Clone for ChangeMap {
-    /// A decoded map clones its entries, exactly as the plain map did. An
-    /// encoded map shares its source, so a workspace base cloned from a
-    /// converted store's authority costs a pointer rather than a history.
+    /// Share the history before or after first decode. Only mutable access
+    /// needs a separate copy of the entries.
     fn clone(&self) -> Self {
-        match (self.decoded.get(), &self.encoded) {
-            (Some(decoded), _) => Self {
-                decoded: OnceLock::from(decoded.clone()),
-                encoded: None,
-                decode_gate: Mutex::new(()),
-                // Shared, for the reason on the field: a successor is a clone
-                // of its base, so a fresh memo here would be empty at every
-                // commit and the memo would never save anything.
-                leaf_digests: Arc::clone(&self.leaf_digests),
-            },
-            (None, Some(encoded)) => Self {
-                decoded: OnceLock::new(),
-                encoded: Some(Arc::clone(encoded)),
-                decode_gate: Mutex::new(()),
-                leaf_digests: Arc::clone(&self.leaf_digests),
-            },
-            (None, None) => Self::new(),
+        Self {
+            body: Arc::clone(&self.body),
+            leaf_digests: Arc::clone(&self.leaf_digests),
         }
     }
 }
 
 impl fmt::Debug for ChangeMap {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.decoded.get() {
+        match self.body.decoded.get() {
             Some(decoded) => decoded.fmt(formatter),
             None => formatter
                 .debug_struct("ChangeMap")
                 .field("len", &self.len())
                 .field("decoded", &false)
-                .field("encoded", &self.encoded)
+                .field("encoded", &self.body.encoded)
                 .finish(),
         }
     }

@@ -182,7 +182,7 @@ mod admitted_change_map_tests {
     #[test]
     fn an_equal_but_distinct_map_is_not_the_admitted_one() {
         let admitted_map = ChangeMap::new();
-        let twin = admitted_map.clone();
+        let twin = ChangeMap::from(admitted_map.decoded().unwrap().clone());
         assert_eq!(
             *admitted_map, *twin,
             "the two maps must be equal for this test to mean anything"
@@ -197,6 +197,25 @@ mod admitted_change_map_tests {
             !witness.describes(&twin),
             "an equal but distinct map must not be treated as the admitted one"
         );
+    }
+
+    #[test]
+    fn a_shared_history_witness_stops_at_mutable_access() {
+        let admitted_map = ChangeMap::new();
+        let mut shared = admitted_map.clone();
+        let witness = AdmittedChangeMap::admit(&admitted_map, "admitted")
+            .expect("an empty map is admissible");
+        assert!(
+            witness.describes(&shared),
+            "both readers hold the admitted history"
+        );
+
+        // Even a mutable operation that leaves the contents equal detaches
+        // the map. A later write cannot borrow the original map's admission.
+        shared.reserve(1);
+        assert_eq!(*admitted_map, *shared);
+        assert!(witness.describes(&admitted_map));
+        assert!(!witness.describes(&shared));
     }
 
     /// A map in memory carries no record of where it came from, so it must not

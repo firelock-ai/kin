@@ -2673,8 +2673,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         // scale it is minutes of work to re-derive a conclusion already
         // reached about these exact bytes.
         if reopen_proof.is_none() {
-            let all_changes: Vec<_> = snapshot.changes.values().cloned().collect();
-            validate_history_replay(&snapshot, &all_changes)?;
+            validate_history_replay(&snapshot, snapshot.changes.values())?;
         }
         let replay_at = started.elapsed();
 
@@ -3312,8 +3311,7 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
             )));
         }
         snapshot.validate_storage_admission()?;
-        let all_changes: Vec<_> = snapshot.changes.values().cloned().collect();
-        validate_history_replay(&snapshot, &all_changes)?;
+        validate_history_replay(&snapshot, snapshot.changes.values())?;
         let body_backend = FrozenLocalBodyBackend {
             backend: self.backend.as_ref(),
             freeze: &locked,
@@ -6093,17 +6091,17 @@ fn verified_history_validation(
     matches.then_some(recovered.generation)
 }
 
-fn validate_history_replay(
+fn validate_history_replay<'a>(
     snapshot: &GraphSnapshot,
-    new_changes: &[kin_model::SemanticChange],
+    new_changes: impl IntoIterator<Item = &'a kin_model::SemanticChange>,
 ) -> Result<(), KinDbError> {
     validate_history_replay_with(&SharedReplayGraph::new(snapshot), snapshot, new_changes)
 }
 
-fn validate_history_replay_with(
+fn validate_history_replay_with<'a>(
     replay: &SharedReplayGraph<'_>,
     snapshot: &GraphSnapshot,
-    new_changes: &[kin_model::SemanticChange],
+    new_changes: impl IntoIterator<Item = &'a kin_model::SemanticChange>,
 ) -> Result<(), KinDbError> {
     // One Kahn pass over the whole change map proves the DAG is acyclic and
     // that every declared parent is persisted. Resolving each change's reachable
@@ -6126,8 +6124,11 @@ fn validate_history_replay_with(
     // reachable histories cover every persisted change, including unreachable
     // history that is not currently named by a ref. This is graph replay only:
     // an invalid history never falls back to Git or the filesystem.
-    let mut validation_targets: Vec<_> = if new_changes.is_empty() {
-        snapshot
+    // Reopen and freeze borrow the complete map; transaction preparation
+    // borrows only incoming changes. Replay needs identities, not owned payloads.
+    let mut validation_targets: Vec<_> = new_changes.into_iter().map(|change| change.id).collect();
+    if validation_targets.is_empty() {
+        validation_targets = snapshot
             .changes
             .keys()
             .filter(|change_id| {
@@ -6137,10 +6138,8 @@ fn validate_history_replay_with(
                     .is_none_or(Vec::is_empty)
             })
             .copied()
-            .collect()
-    } else {
-        new_changes.iter().map(|change| change.id).collect()
-    };
+            .collect();
+    }
     validation_targets.sort_unstable();
     validation_targets.dedup();
     validate_first_parent_history(&snapshot.changes, &validation_targets)
@@ -15691,35 +15690,29 @@ mod tests {
             RepositoryAuthorityManager::open(repository_id(), Arc::clone(&competing_backend))
                 .unwrap();
         let transaction = unborn_workspace_transaction(&competing, 0x5402, 0x5403, b"release");
+        assert!(!competing_backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
         let freeze = manager
             .freeze_current_authority(&expected_roots)
             .expect("current persisted authority must freeze");
         assert_eq!(freeze.roots(), &expected_roots);
         assert_eq!(freeze.authority().roots(), &expected_roots);
 
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
-        let writer = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let result = competing.commit_repository_transaction(transaction);
-            finished_tx.send(result).unwrap();
-        });
-        started_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
         assert!(
-            finished_rx
-                .recv_timeout(std::time::Duration::from_millis(200))
-                .is_err(),
+            competing_backend
+                .repository_writer_would_block(repository_id().as_str())
+                .unwrap(),
             "a competing repository writer must remain blocked while the freeze guard lives"
         );
 
         drop(freeze);
-        finished_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("writer must resume after freeze release")
+        assert!(!competing_backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+        competing
+            .commit_repository_transaction(transaction)
             .expect("writer must commit against the unchanged frozen parent");
-        writer.join().unwrap();
 
         let reopened = RepositoryAuthorityManager::open(
             repository_id(),

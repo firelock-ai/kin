@@ -6062,12 +6062,17 @@ impl LocalFileBackend {
         })
     }
 
-    /// Whether taking the repository authority lock at `access` would block
+    /// Whether taking the exclusive repository authority lock would block
     /// right now, against the same lock target a real acquisition uses.
     ///
     /// This is how the exclusion property is asserted without a stopwatch:
     /// a blocking acquisition can only be observed by waiting for it, and a
     /// wait that is long enough to mean something is long enough to be flaky.
+    #[cfg(test)]
+    pub(crate) fn repository_writer_would_block(&self, repo_id: &str) -> Result<bool, KinDbError> {
+        self.repository_lock_would_block(repo_id, LocalRepositoryLockAccess::Exclusive)
+    }
+
     #[cfg(test)]
     fn repository_lock_would_block(
         &self,

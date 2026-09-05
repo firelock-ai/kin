@@ -5018,29 +5018,69 @@ mod tests {
     }
 
     #[test]
-    fn an_encoded_clone_shares_its_source_and_a_decoded_clone_copies() {
+    fn snapshot_clones_share_one_lazy_decode_and_detach_on_mutation() {
         let frame = encode_snapshot_without_admission_validation(&a_snapshot_with_history(3));
         let (lazy, visited) = decode_lazily(&frame, memory_source(&frame));
-        let twin = lazy.changes.clone();
+        let twin = lazy.clone();
         assert!(
-            !twin.is_decoded(),
-            "cloning an encoded map costs a pointer, not a history"
+            !twin.changes.is_decoded(),
+            "cloning an encoded snapshot does not decode its history"
         );
 
         let decodes_before = decoded_on_this_thread();
         assert!(lazy.changes.contains_key(&visited[0]));
         assert!(lazy.changes.is_decoded());
-        assert!(!twin.is_decoded(), "the twin decodes on its own first use");
-        let copy = lazy.changes.clone();
         assert!(
-            copy.is_decoded(),
-            "cloning a decoded map copies its entries"
+            twin.changes.is_decoded(),
+            "a clone made before first use shares that decode"
         );
+        let mut copy = lazy.clone();
+        assert!(copy.changes.is_decoded());
+        assert_eq!(copy.changes, twin.changes);
+        assert!(std::ptr::eq(&*lazy.changes, &*twin.changes));
+        assert!(std::ptr::eq(&*lazy.changes, &*copy.changes));
+        assert_eq!(decoded_on_this_thread(), decodes_before + 1);
         assert_eq!(
-            copy, twin,
-            "the twin decodes from the shared source to the same map"
+            rmp_serde::to_vec(&copy.changes).unwrap(),
+            rmp_serde::to_vec(&*lazy.changes).unwrap(),
+            "sharing preserves the plain map's serialized representation"
         );
-        assert!(twin.is_decoded());
-        assert_eq!(decoded_on_this_thread(), decodes_before + 2);
+
+        assert!(copy.changes.remove(&visited[0]).is_some());
+        assert!(!std::ptr::eq(&*lazy.changes, &*copy.changes));
+        assert!(lazy.changes.contains_key(&visited[0]));
+        assert!(twin.changes.contains_key(&visited[0]));
+        assert!(!copy.changes.contains_key(&visited[0]));
+        assert_eq!(copy.changes.len(), 2);
+        let encoded = rmp_serde::to_vec(&copy.changes).unwrap();
+        let round_trip: ChangeMapInner = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(round_trip, copy.changes);
+        assert_eq!(decoded_on_this_thread(), decodes_before + 1);
+
+        // Readers racing on clones made before first use must also decode
+        // once. Each reports its own thread-local count after the barrier.
+        let (concurrent, _) = decode_lazily(&frame, memory_source(&frame));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let snapshot = concurrent.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let before = decoded_on_this_thread();
+                    barrier.wait();
+                    assert_eq!(snapshot.changes.iter().count(), 3);
+                    decoded_on_this_thread() - before
+                })
+            })
+            .collect();
+        assert_eq!(
+            readers
+                .into_iter()
+                .map(|reader| reader.join().expect("history reader completes"))
+                .sum::<usize>(),
+            1,
+            "the decode gate is shared across snapshot clones"
+        );
+        assert!(concurrent.changes.is_decoded());
     }
 }

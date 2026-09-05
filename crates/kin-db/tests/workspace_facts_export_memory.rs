@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! What exporting the compared domains costs against exporting the whole graph.
+//! Workspace comparisons must not copy unrelated graph stores.
 //!
-//! FIR-2782: a 1.5 KB docstring commit was OOM-killed planning against a
-//! converted psf/requests store, the daemon reaching 10 GiB resident in
-//! `plan_transaction`. The planner's semantic diff reads entities and relations
-//! and nothing else, and its only way to get them out of a borrowed graph was
-//! [`InMemoryGraph::to_snapshot`], which clones all seven sub-stores. Measured
-//! on that repository, 1058 entities, 2213 relations and 6733 changes, the
-//! export grew live heap 1375.5 MiB to produce the 3.5 MiB the diff reads, and
-//! the change map alone was 1191.7 MiB of it.
-//!
-//! `workspace_graph_facts` is the borrowing export that fixes it. This prices
-//! the two against each other on a fixture shaped like that repository.
+//! The fixture includes decoded history and annotation payloads. Snapshot
+//! exports share immutable history, so the annotations keep a real whole-store
+//! copy measurable without requiring the history to become expensive again.
 //!
 //! Live heap, not resident set: resident set keeps counting memory the
 //! allocator has freed and not returned, so it moves with the allocator and the
@@ -28,10 +20,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kin_db::{GraphSnapshot, InMemoryGraph};
 use kin_model::{
-    compute_semantic_change_id, AuthorId, ChangeOrigin, Entity, EntityId, EntityKind,
-    EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId,
-    Relation, RelationId, RelationKind, RelationOrigin, SemanticChange, SemanticChangeId,
-    SemanticFingerprint, Timestamp, Visibility,
+    compute_semantic_change_id, Annotation, AnnotationId, AnnotationKind, AuthorId, ChangeOrigin,
+    Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
+    GraphNodeId, Hash256, IdentityRef, LanguageId, Relation, RelationId, RelationKind,
+    RelationOrigin, SemanticChange, SemanticChangeId, SemanticFingerprint, StalenessState,
+    Timestamp, Visibility, WorkScope,
 };
 
 // --- the instrument -------------------------------------------------------
@@ -106,6 +99,8 @@ const RELATIONS: usize = 2_213;
 const CHANGES: usize = 6_733;
 /// Payload per change, so the change map is a real cost and not a map of stubs.
 const CHANGE_MESSAGE_BYTES: usize = 512;
+const ANNOTATIONS: usize = 32;
+const ANNOTATION_BODY_BYTES: usize = 512 * 1024;
 
 fn entity(index: usize) -> Entity {
     let path = format!("src/module_{index}.rs");
@@ -209,6 +204,22 @@ fn fixture() -> GraphSnapshot {
         let (id, change) = change(index);
         snapshot.changes.insert(id, change);
     }
+    for index in 0..ANNOTATIONS {
+        let annotation_id = AnnotationId::new();
+        snapshot.annotations.insert(
+            annotation_id,
+            Annotation {
+                annotation_id,
+                kind: AnnotationKind::Comment,
+                body: "annotation payload ".repeat(ANNOTATION_BODY_BYTES / 19 + 1),
+                scopes: vec![WorkScope::Entity(entity(index % ENTITIES).id)],
+                anchored_fingerprint: None,
+                authored_by: IdentityRef::human("fixture-author"),
+                created_at: fixed_timestamp(),
+                staleness: StalenessState::default(),
+            },
+        );
+    }
     // A fixture that silently collapsed to one change would make the whole
     // export cheap and the ratio below meaningless.
     assert_eq!(
@@ -228,16 +239,15 @@ fn fixture() -> GraphSnapshot {
         RELATIONS,
         "every synthetic relation must be distinct or the survival check grades nothing"
     );
+    assert_eq!(snapshot.annotations.len(), ANNOTATIONS);
     snapshot
 }
 
 /// The narrow export must stay a small fraction of the whole one.
 ///
 /// Not a tight bound, deliberately. What it has to separate is a narrow export
-/// from one that quietly starts carrying the history again, and those are not
-/// close: on psf/requests the compared domains were 0.25 percent of the whole
-/// export. Anything under this line is a narrow export; a regression that
-/// reintroduces the change map lands near 100 percent.
+/// from one that quietly copies unrelated stores. A regression through the
+/// whole snapshot pays for the annotation payloads and lands near 100 percent.
 const MAX_FACTS_SHARE_OF_SNAPSHOT: f64 = 0.25;
 
 #[test]
@@ -257,7 +267,7 @@ fn exporting_the_compared_domains_does_not_pay_for_the_change_map() {
     // make any ratio below it pass, and that is the shape where this check
     // grades an instrument rather than the code.
     assert!(
-        whole > 8 * 1024 * 1024,
+        whole > ANNOTATIONS * ANNOTATION_BODY_BYTES,
         "the whole export must cost something measurable or this check grades \
          nothing: whole={whole} bytes"
     );
@@ -305,6 +315,11 @@ fn exporting_the_compared_domains_does_not_pay_for_the_change_map() {
     // it is exporting a different graph rather than a cheaper view of the same
     // one. Counts alone cannot see a wrong-but-same-sized map.
     let whole_snapshot = graph.to_snapshot();
+    assert_eq!(whole_snapshot.annotations.len(), ANNOTATIONS);
+    assert!(whole_snapshot
+        .annotations
+        .values()
+        .all(|annotation| annotation.body.len() >= ANNOTATION_BODY_BYTES));
     assert_eq!(
         facts.entities, whole_snapshot.entities,
         "the narrow export must agree with the whole export on entities"
