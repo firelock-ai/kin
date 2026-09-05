@@ -1672,6 +1672,17 @@ const SPINE_GRAPH_CAPTURE_ATTEMPTS: usize = 3;
 /// constant while still allowing unrelated repositories to reload in parallel.
 const HOSTED_REPO_RELOAD_GATE_SHARDS: usize = 64;
 const HOSTED_REPO_RELOAD_ATTEMPTS: usize = 3;
+
+/// How often a hosted reader re-proves its spine authority in the background.
+///
+/// One pass hydrates the whole durable cache and then double-collects the fleet,
+/// loading every repository graph and recomputing every root. A five-repo
+/// production fleet measured a 10.46 s median for one of them on 2026-09-05, so
+/// this interval has to be long enough that the pod is mostly idle between
+/// passes and short enough that a reader nobody queries still tracks its
+/// siblings. It is never on a request path; the readiness probe reads the proof
+/// this pass maintains and never waits for it.
+const HOSTED_SPINE_AUTHORITY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const HOSTED_SPINE_FLEET_SIZE: usize = 5;
 const HOSTED_SPINE_CURSOR_CAS_REQUIRED: &str =
     "hosted persistent spine is unavailable until its durable backend can stage rows and compare-and-swap a head bound to the exact source publication cursor";
@@ -2931,6 +2942,15 @@ pub struct DaemonState {
     #[cfg(test)]
     #[cfg_attr(not(feature = "firestore"), allow(dead_code))]
     spine_backend_hydrations: AtomicUsize,
+    /// Shortens the background refresh interval so a test can watch the pass
+    /// actually run. `None`, and every production build, uses
+    /// [`HOSTED_SPINE_AUTHORITY_REFRESH_INTERVAL`].
+    #[cfg(test)]
+    hosted_spine_refresh_interval_for_test: Mutex<Option<Duration>>,
+    /// Whether the background pass that keeps the hosted spine authority proof
+    /// current has been started. It is started once, by whichever hosted
+    /// request route runs first, and never again.
+    hosted_spine_refresh_cadence_started: AtomicBool,
     /// Test-only escape hatch for process-local spine behavior. Production
     /// hosted states have no corresponding field or bypass: they remain held
     /// until the durable backend owns cursor-bound publication CAS.
@@ -5271,6 +5291,9 @@ impl DaemonState {
             #[cfg(test)]
             spine_backend_hydrations: AtomicUsize::new(0),
             #[cfg(test)]
+            hosted_spine_refresh_interval_for_test: Mutex::new(None),
+            hosted_spine_refresh_cadence_started: AtomicBool::new(false),
+            #[cfg(test)]
             hosted_in_memory_spine_allowed: AtomicBool::new(false),
             #[cfg(test)]
             hosted_durable_spine_for_test: Mutex::new(None),
@@ -5640,6 +5663,9 @@ impl DaemonState {
             spine_backend_constructions: AtomicUsize::new(0),
             #[cfg(test)]
             spine_backend_hydrations: AtomicUsize::new(0),
+            #[cfg(test)]
+            hosted_spine_refresh_interval_for_test: Mutex::new(None),
+            hosted_spine_refresh_cadence_started: AtomicBool::new(false),
             #[cfg(test)]
             hosted_in_memory_spine_allowed: AtomicBool::new(false),
             #[cfg(test)]
@@ -6584,6 +6610,95 @@ impl DaemonState {
         })
     }
 
+    /// The already-initialized backend, or the reason it cannot be read.
+    ///
+    /// A recovery-only process opened its primary graph before the GCS
+    /// generation fence completed, so it must never serve a cached view as
+    /// current authority even though a backend exists.
+    fn initialized_spine_backend(
+        &self,
+    ) -> std::result::Result<&dyn kin_spine::SpineBackend, String> {
+        if self.hosted_restart_required() {
+            return Err(self.spine_unavailable_reason());
+        }
+        self.spine
+            .get()
+            .map(AsRef::as_ref)
+            .ok_or_else(|| "spine is disabled or has not been initialized".to_string())
+    }
+
+    /// Prove the cached hosted authority against durable identity, with no
+    /// hydration and no graph load.
+    ///
+    /// The reuse is conditional on identity, never on age: the durable reader
+    /// admission, the runtime spine authority, the admitted fence evidence, the
+    /// active Firestore fence and the registered fleet must all still be the
+    /// ones the cached proof was built under. Any drift, and any error reading
+    /// them, refuses. What it does NOT re-establish is the per-repository
+    /// cursor and root equality that `validate_hosted_spine_authority` proves
+    /// by loading every repo graph twice; that pass stays exactly as it is, on
+    /// the paths that establish authority rather than on the paths that report
+    /// it.
+    ///
+    /// Callers hold the publication read gate, so a writer cannot install a new
+    /// committed generation between this proof and the answer it authorizes.
+    fn assert_cached_hosted_spine_authority(
+        &self,
+        backend: &dyn kin_spine::SpineBackend,
+    ) -> std::result::Result<(), String> {
+        let Some(control) = self.publication_control.as_ref() else {
+            return Ok(());
+        };
+        control
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .map_err(|error| format!("hosted spine reader is not durably admitted: {error}"))?;
+        let durable = match control
+            .runtime_spine_authority()
+            .map_err(|error| format!("load hosted spine runtime authority: {error}"))?
+        {
+            crate::publication_lease::RuntimeSpineAuthority::Completed(evidence) => evidence,
+            crate::publication_lease::RuntimeSpineAuthority::RolloutActive(blocking) => {
+                return Err(format!(
+                    "hosted spine {blocking}; cached authority is not readable"
+                ))
+            }
+        };
+        let expected = self.expected_hosted_spine_rollout_fence()?;
+        if expected != durable {
+            return Err(
+                "cached hosted spine evidence differs from the GCS publication-control record"
+                    .to_string(),
+            );
+        }
+        let cached = self
+            .hosted_spine_authority_proof
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                "hosted spine has no completed cursor/root authority proof".to_string()
+            })?;
+        let active = without_blocking_runtime_worker(|| backend.active_rollout_fence())
+            .map_err(|error| format!("load active Firestore spine fence: {error}"))?;
+        if active != cached.rollout_fence || active.evidence() != durable {
+            return Err(
+                "cached hosted spine proof differs from active Firestore authority".to_string(),
+            );
+        }
+        let registered = backend.registered_repo_ids();
+        if cached.repositories.len() != registered.len()
+            || cached
+                .repositories
+                .keys()
+                .any(|repo_id| !registered.contains(repo_id))
+        {
+            return Err(
+                "cached hosted spine proof does not cover the exact registered fleet".to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Guard an already-initialized spine for side-effect-free diagnostics.
     /// Hosted health must never warm, hydrate, or publish, but it also must not
     /// report an unadmitted cached generation as healthy. The durable reader
@@ -6593,73 +6708,115 @@ impl DaemonState {
         &self,
     ) -> std::result::Result<SpineAuthorityReadGuard<'_>, String> {
         let publication_gate = self.spine_refresh_gate.read().await;
-        // Health reads the already-constructed backend rather than entering
-        // `ensure_spine_initialized`, so it needs the recovery-only refusal of
-        // its own. Without it a recovery process that repaired durable state
-        // would report a cached view as current authority over a primary graph
-        // that predates the fence.
-        if self.hosted_restart_required() {
-            return Err(self.spine_unavailable_reason());
-        }
-        let backend = self
-            .spine
-            .get()
-            .map(AsRef::as_ref)
-            .ok_or_else(|| "spine is disabled or has not been initialized".to_string())?;
-        if let Some(control) = self.publication_control.as_ref() {
-            control
-                .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
-                .map_err(|error| format!("hosted spine reader is not durably admitted: {error}"))?;
-            let durable = match control
-                .runtime_spine_authority()
-                .map_err(|error| format!("load hosted spine runtime authority: {error}"))?
-            {
-                crate::publication_lease::RuntimeSpineAuthority::Completed(evidence) => evidence,
-                crate::publication_lease::RuntimeSpineAuthority::RolloutActive(blocking) => {
-                    return Err(format!(
-                        "hosted spine {blocking}; cached authority is not readable"
-                    ))
-                }
-            };
-            let expected = self.expected_hosted_spine_rollout_fence()?;
-            if expected != durable {
-                return Err(
-                    "cached hosted spine evidence differs from the GCS publication-control record"
-                        .to_string(),
-                );
-            }
-            let cached = self
-                .hosted_spine_authority_proof
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-                .ok_or_else(|| {
-                    "hosted spine has no completed cursor/root authority proof".to_string()
-                })?;
-            let active = without_blocking_runtime_worker(|| backend.active_rollout_fence())
-                .map_err(|error| format!("load active Firestore spine fence: {error}"))?;
-            if active != cached.rollout_fence || active.evidence() != durable {
-                return Err(
-                    "cached hosted spine proof differs from active Firestore authority".to_string(),
-                );
-            }
-            let registered = backend.registered_repo_ids();
-            if cached.repositories.len() != registered.len()
-                || cached
-                    .repositories
-                    .keys()
-                    .any(|repo_id| !registered.contains(repo_id))
-            {
-                return Err(
-                    "cached hosted spine proof does not cover the exact registered fleet"
-                        .to_string(),
-                );
-            }
-        }
+        let backend = self.initialized_spine_backend()?;
+        self.assert_cached_hosted_spine_authority(backend)?;
         Ok(SpineAuthorityReadGuard {
             backend,
             _publication_gate: publication_gate,
         })
+    }
+
+    /// Answer one hosted readiness probe. Nothing here hydrates the durable
+    /// cache or loads a repository graph.
+    ///
+    /// A probe is a report, not an authority transition. Establishing authority
+    /// costs one full durable cache hydration plus a whole-fleet double-collect
+    /// that loads every repository graph and recomputes every root; on a
+    /// five-repo production fleet on 2026-09-05 that measured a 10.46 s median,
+    /// against a 3 s startup-probe timeout and a 1 s readiness-probe timeout.
+    /// Worse, the hydration takes one process-wide lock, so probes did not even
+    /// overlap: they queued, and end-to-end readiness answers took 141 s, 156 s
+    /// and 175.7 s while the answer itself was `ready: true`. The pod never went
+    /// Ready and the rollout was reverted.
+    ///
+    /// So the probe reads the proof that the authority transitions establish and
+    /// [`Self::start_hosted_spine_authority_refresh_cadence`] keeps current, and
+    /// it re-proves durable identity every time so a lost admission, an active
+    /// rollout or drifted evidence still refuses.
+    pub(crate) async fn hosted_readiness_spine_authority(&self) -> std::result::Result<(), String> {
+        let gate_started = Instant::now();
+        let _publication_gate = self.spine_refresh_gate.read().await;
+        self.spine_gate_read_wait_micros.store(
+            u64::try_from(gate_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        // The refusal `ensure_spine_initialized` would have reached first. A
+        // build or configuration that cannot construct the hosted backend must
+        // not report ready on the strength of a proof cached before it broke.
+        if self.hosted_persistent_spine_blocked() {
+            return Err(self.spine_unavailable_reason());
+        }
+        let backend = self.initialized_spine_backend()?;
+        self.assert_cached_hosted_spine_authority(backend)
+    }
+
+    /// How long the background authority refresh sleeps between passes.
+    fn hosted_spine_authority_refresh_interval(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(interval) = *self
+            .hosted_spine_refresh_interval_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return interval;
+        }
+        HOSTED_SPINE_AUTHORITY_REFRESH_INTERVAL
+    }
+
+    /// Start the one background pass that keeps the hosted spine authority
+    /// proof current, if it is not already running.
+    ///
+    /// Idempotent, so a request route may call it unconditionally. It exists
+    /// because the readiness probe used to be what refreshed this proof: taking
+    /// that off the probe path without putting it anywhere would leave a reader
+    /// that nobody queries proving its authority once, at admission, and never
+    /// again.
+    ///
+    /// A failed pass does not by itself make this daemon unready. The three
+    /// conditions a probe must refuse on, a lost durable admission, an active
+    /// rollout and drifted evidence, are re-read on every probe and decide the
+    /// answer; flapping a serving pod out of the fleet over one transient
+    /// durable read would take out the whole pool on a blip.
+    pub(crate) fn start_hosted_spine_authority_refresh_cadence(self: &Arc<Self>) {
+        if !self.hosted_spine_readiness_required() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            // Nothing to spawn on. Leave the flag clear so a later caller that
+            // does have a runtime still starts the pass.
+            return;
+        };
+        if self
+            .hosted_spine_refresh_cadence_started
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let state = Arc::clone(self);
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(state.hosted_spine_authority_refresh_interval()).await;
+                let started = Instant::now();
+                let refreshed = {
+                    let _publication_gate = state.spine_refresh_gate.read().await;
+                    state.ensure_spine().is_some()
+                };
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if refreshed {
+                    debug!(
+                        elapsed_ms,
+                        "hosted spine authority refreshed on the background cadence"
+                    );
+                } else {
+                    warn!(
+                        elapsed_ms,
+                        reason = %state.spine_unavailable_reason(),
+                        "background hosted spine authority refresh failed; the probe answer \
+                         still follows the durable admission, rollout and evidence checks"
+                    );
+                }
+            }
+        });
     }
 
     /// Refuse hosted operation unless the deployed bytes and configuration can
@@ -7198,6 +7355,16 @@ impl DaemonState {
             .spine_initialization_test_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    /// Shorten the background authority refresh interval for a test that has
+    /// to watch the pass run. Production has no such override.
+    #[cfg(test)]
+    pub(crate) fn set_hosted_spine_refresh_interval_for_test(&self, interval: Duration) {
+        *self
+            .hosted_spine_refresh_interval_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(interval);
     }
 
     #[cfg(all(test, feature = "embeddings"))]

@@ -4078,6 +4078,13 @@ async fn health(
     }))
 }
 
+/// An authority answer at least this slow is reported even when it succeeds.
+///
+/// The tightest probe timeout the hosted deployment configures is the readiness
+/// probe's `timeoutSeconds: 1`, so a probe answered more slowly than this was
+/// already a timeout on the prober's side whatever this daemon returned.
+const READINESS_SLOW_ANSWER: Duration = Duration::from_secs(1);
+
 /// GET /readiness — returns 200 when initialized, 503 otherwise.
 /// An initialized daemon has either loaded a snapshot or completed at least
 /// one reconciliation cycle. An empty but initialized workspace is ready.
@@ -4096,17 +4103,43 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     // Option keeps a branch that never consulted the gate from ever printing a
     // measured-looking zero for it.
     let mut authority_wait: Option<Duration> = None;
+    let mut authority_refusal: Option<String> = None;
     let hosted_spine_ready = if initialized && hosted {
+        // Start the pass that keeps the authority proof current, then read that
+        // proof. Establishing it here instead is what starved the kubelet on
+        // 2026-09-05; `DaemonState::hosted_readiness_spine_authority` carries
+        // the measurement and what the probe still refuses on.
+        state.start_hosted_spine_authority_refresh_cadence();
         let started = Instant::now();
-        let ready = state.acquire_spine_read_authority().await.is_some();
+        let answer = state.hosted_readiness_spine_authority().await;
         authority_wait = Some(started.elapsed());
-        ready
+        match answer {
+            Ok(()) => true,
+            Err(reason) => {
+                authority_refusal = Some(reason);
+                false
+            }
+        }
     } else {
         true
     };
     let warming = state.spine_warming() || (initialized && !hosted_spine_ready);
 
     if initialized && hosted_spine_ready {
+        // A success slower than the probe's own timeout is invisible to the
+        // prober: Kubernetes records a timeout and nothing else. On 2026-09-05 a
+        // hosted pod answered `{"ready":true,"warming":false}` after 175.7 s and
+        // its log said nothing about it, because only the refusal branch below
+        // reported its waits. So report them here too, and only here: an
+        // unconditional line would print on every probe for the life of the pod
+        // and bury the one case that matters.
+        if let Some(waited) = authority_wait.filter(|waited| *waited >= READINESS_SLOW_ANSWER) {
+            tracing::warn!(
+                authority_wait_ms = waited.as_millis() as u64,
+                spine_gate_wait_ms = state.last_spine_gate_read_wait().as_millis() as u64,
+                "readiness answered ready more slowly than a probe timeout"
+            );
+        }
         (
             StatusCode::OK,
             Json(ReadinessResponse {
@@ -4155,6 +4188,7 @@ async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
                     refused_on = "hosted spine authority",
                     authority_wait_ms = waited.as_millis() as u64,
                     spine_gate_wait_ms = state.last_spine_gate_read_wait().as_millis() as u64,
+                    reason = authority_refusal.as_deref().unwrap_or("unreported"),
                     "readiness refused"
                 ),
             }
@@ -45338,6 +45372,14 @@ mod tests {
     /// The environment guard is returned so it lives as long as the state;
     /// dropping it restores the variables.
     fn hosted_test_state() -> (Arc<DaemonState>, kin_core::test_env::EnvVarGuard) {
+        hosted_test_state_over(Arc::new(kin_spine::test_support::FakeSpineStore::cold()))
+    }
+
+    /// The same fixture over a caller-supplied durable store, so a test can
+    /// measure or charge what the store is asked for.
+    fn hosted_test_state_over(
+        spine_store: Arc<dyn kin_spine::SpineStore>,
+    ) -> (Arc<DaemonState>, kin_core::test_env::EnvVarGuard) {
         const READER: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let fleet = vec![
@@ -45395,9 +45437,7 @@ mod tests {
             .unwrap(),
         );
         state.install_hosted_durable_spine_for_test(Arc::new(
-            kin_spine::FirestoreSpineBackend::with_store(Arc::new(
-                kin_spine::test_support::FakeSpineStore::cold(),
-            )),
+            kin_spine::FirestoreSpineBackend::with_store(spine_store),
         ));
         assert!(
             state.hosted_spine_readiness_required(),
@@ -45405,6 +45445,203 @@ mod tests {
              exercise nothing FIR-3179 is about"
         );
         (state, environment)
+    }
+
+    /// A durable spine store that delegates every call and can be given the
+    /// cost a real durable read has.
+    ///
+    /// `load_repo_publications` is the read the cache hydration makes, exactly
+    /// one per hydration, so counting it counts hydrations and charging it
+    /// charges them. The charge starts at zero so the fixture can publish and
+    /// admit at full speed, and is armed only for the pass under test.
+    struct MeasuredSpineStore {
+        inner: Arc<kin_spine::test_support::FakeSpineStore>,
+        durable_reads: std::sync::atomic::AtomicUsize,
+        charge_ms: std::sync::atomic::AtomicU64,
+    }
+
+    impl MeasuredSpineStore {
+        fn cold() -> Self {
+            Self {
+                inner: Arc::new(kin_spine::test_support::FakeSpineStore::cold()),
+                durable_reads: std::sync::atomic::AtomicUsize::new(0),
+                charge_ms: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        fn durable_reads(&self) -> usize {
+            self.durable_reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn charge_each_durable_read(&self, cost: Duration) {
+            self.charge_ms.store(
+                u64::try_from(cost.as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+
+        fn charge(&self) {
+            self.durable_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let charge = self.charge_ms.load(std::sync::atomic::Ordering::SeqCst);
+            if charge > 0 {
+                std::thread::sleep(Duration::from_millis(charge));
+            }
+        }
+    }
+
+    impl kin_spine::SpineStore for MeasuredSpineStore {
+        fn load_repo_publications(
+            &self,
+        ) -> std::result::Result<Vec<kin_spine::LoadedRepoPublication>, kin_spine::SpineError>
+        {
+            self.charge();
+            self.inner.load_repo_publications()
+        }
+
+        fn load_rollout_fence(
+            &self,
+        ) -> std::result::Result<Option<kin_spine::LoadedSpineRolloutFence>, kin_spine::SpineError>
+        {
+            self.inner.load_rollout_fence()
+        }
+
+        fn advance_rollout_fence(
+            &self,
+            fence: kin_spine::SpineRolloutFence,
+        ) -> std::result::Result<kin_spine::SpineRolloutFenceCommit, kin_spine::SpineError>
+        {
+            self.inner.advance_rollout_fence(fence)
+        }
+
+        fn legacy_migration_complete(&self) -> std::result::Result<bool, kin_spine::SpineError> {
+            self.inner.legacy_migration_complete()
+        }
+
+        fn complete_legacy_migration(
+            &self,
+            rollout_fence: &kin_spine::LoadedSpineRolloutFence,
+            writer_drain: &kin_spine::LegacySpineWriterDrainAttestation,
+        ) -> std::result::Result<(), kin_spine::SpineError> {
+            self.inner
+                .complete_legacy_migration(rollout_fence, writer_drain)
+        }
+
+        fn prepare_repo_publication(
+            &self,
+            publication: kin_spine::RepoSpinePublication,
+        ) -> std::result::Result<kin_spine::PreparedStorePublication, kin_spine::SpineError>
+        {
+            self.inner.prepare_repo_publication(publication)
+        }
+
+        fn prepare_repo_publication_bound(
+            &self,
+            publication: kin_spine::RepoSpinePublication,
+            expected_rollout_fence: &kin_spine::SpineRolloutFenceEvidence,
+        ) -> std::result::Result<kin_spine::PreparedStorePublication, kin_spine::SpineError>
+        {
+            self.inner
+                .prepare_repo_publication_bound(publication, expected_rollout_fence)
+        }
+
+        fn commit_repo_publication(
+            &self,
+            prepared: &kin_spine::PreparedStorePublication,
+        ) -> std::result::Result<kin_spine::RepoPublicationCommit, kin_spine::SpineError> {
+            self.inner.commit_repo_publication(prepared)
+        }
+
+        fn load_repo_publication(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<kin_spine::LoadedRepoPublication>, kin_spine::SpineError>
+        {
+            self.inner.load_repo_publication(repo_id)
+        }
+
+        fn cleanup_repo_publications(
+            &self,
+            active_head: &kin_spine::RepoPublicationHead,
+            max_rows: usize,
+        ) -> std::result::Result<kin_spine::RepoPublicationCleanupProgress, kin_spine::SpineError>
+        {
+            self.inner.cleanup_repo_publications(active_head, max_rows)
+        }
+
+        fn load_repos(
+            &self,
+        ) -> std::result::Result<Vec<kin_spine::LoadedRepo>, kin_spine::SpineError> {
+            self.inner.load_repos()
+        }
+
+        fn load_edges(
+            &self,
+        ) -> std::result::Result<Vec<kin_spine::CrossRepoEdge>, kin_spine::SpineError> {
+            self.inner.load_edges()
+        }
+
+        fn write_entity(
+            &self,
+            entry: &kin_spine::EntityEntry,
+            root_hash: &str,
+        ) -> std::result::Result<(), kin_spine::SpineError> {
+            self.inner.write_entity(entry, root_hash)
+        }
+
+        fn delete_repo_entities(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<(), kin_spine::SpineError> {
+            self.inner.delete_repo_entities(repo_id)
+        }
+
+        fn write_edge(
+            &self,
+            edge: &kin_spine::CrossRepoEdge,
+        ) -> std::result::Result<(), kin_spine::SpineError> {
+            self.inner.write_edge(edge)
+        }
+
+        fn delete_repo_edges(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<(), kin_spine::SpineError> {
+            self.inner.delete_repo_edges(repo_id)
+        }
+    }
+
+    /// A hosted daemon that has completed its startup rollout: its reader is
+    /// admitted and its cursor/root authority proof is cached. That is the
+    /// state a production pod is in for every probe after the first, and the
+    /// only state in which the readiness handler's authority half runs at all.
+    async fn admitted_hosted_test_state() -> (
+        Arc<DaemonState>,
+        Arc<MeasuredSpineStore>,
+        kin_core::test_env::EnvVarGuard,
+    ) {
+        let store = Arc::new(MeasuredSpineStore::cold());
+        let (state, environment) =
+            hosted_test_state_over(Arc::clone(&store) as Arc<dyn kin_spine::SpineStore>);
+        let control = Arc::clone(
+            state
+                .publication_control
+                .as_ref()
+                .expect("the hosted fixture carries publication control"),
+        );
+        let pending = control
+            .bootstrap_runtime_if_absent()
+            .expect("bootstrap the fleet control record")
+            .expect("an absent control record leaves one pending startup rollout");
+        state
+            .complete_hosted_startup_rollout(
+                &control,
+                pending,
+                Some(format!("sha256:{}", "b".repeat(64))),
+            )
+            .await
+            .expect("the hosted startup rollout must complete");
+        (state, store, environment)
     }
 
     fn capturing_warnings() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
@@ -45604,6 +45841,122 @@ mod tests {
             "a ready daemon must not log a refusal. The probe runs every few \
              seconds for the life of the pod, so an unconditional line would \
              bury the one case that matters. Captured output was: {logged:?}"
+        );
+    }
+
+    // ── A probe is a report, not an authority transition ──────────────────
+    //
+    // FIR-3255. On 2026-09-05 a hosted pod ran the full spine authority proof
+    // on every readiness probe: one durable cache hydration plus a whole-fleet
+    // double-collect that loads every repository graph and recomputes every
+    // root. Fifty-one of those ran back to back between 12:16:22Z and
+    // 12:25:15Z, median 10.46 s, with a 92 microsecond median gap, because the
+    // hydration takes one process-wide lock and the probes queued behind one
+    // another. The kubelet allows 3 s on the startup probe and 1 s on the
+    // readiness probe. End-to-end answers took 141 s, 156 s and 175.7 s, every
+    // one of them `{"ready":true,"warming":false}`, and the pod never went
+    // Ready. The 0.6.1 daemon, whose readiness read two atomics, passed the
+    // same probes on the same fleet.
+    //
+    // These three are a set. The first fails if a probe re-establishes the
+    // proof. The second fails if the cheap answer stopped being an honest one.
+    // The third fails if taking the refresh off the probe path left nothing
+    // keeping the proof current.
+
+    /// The probe must answer from the proof this process already holds.
+    ///
+    /// The bound is 2 s: under the looser of the two probe timeouts with room
+    /// for a loaded CI box, and five times under the cost charged below, so it
+    /// cannot pass on timing luck.
+    #[tokio::test]
+    async fn a_hosted_readiness_probe_answers_without_a_durable_spine_refresh() {
+        let (state, store, _environment) = admitted_hosted_test_state().await;
+        store.charge_each_durable_read(Duration::from_secs(10));
+        let durable_reads_before = store.durable_reads();
+
+        let started = Instant::now();
+        let status = call_readiness_handler(Arc::clone(&state)).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an admitted hosted reader holding a current authority proof must report ready"
+        );
+        // Timing first, because the timing is what the kubelet sees.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "readiness took {elapsed:?}. The kubelet allows 3 s on the startup probe and \
+             1 s on the readiness probe, so a probe that pays the authority proof times \
+             out on every one of them and the pod never becomes Ready."
+        );
+        assert_eq!(
+            store.durable_reads(),
+            durable_reads_before,
+            "the probe hydrated the durable spine cache. Establishing authority is what \
+             the publication and rollout paths do; a probe reports it."
+        );
+    }
+
+    /// Cheap is not the same as permissive: an active rollout still refuses.
+    #[tokio::test]
+    async fn a_hosted_readiness_probe_refuses_while_a_rollout_holds_the_fleet() {
+        let (state, _store, _environment) = admitted_hosted_test_state().await;
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK,
+            "the fixture must be ready first, or the refusal below proves nothing"
+        );
+
+        let control = Arc::clone(
+            state
+                .publication_control
+                .as_ref()
+                .expect("the hosted fixture carries publication control"),
+        );
+        control
+            .acquire_rollout(crate::publication_lease::AcquireRolloutLeaseRequest {
+                scope: control.scope().to_string(),
+                repositories: control.fleet_repositories().to_vec(),
+                previous_repositories: None,
+                holder: "readiness-rollout-honesty".to_string(),
+                request_id: "readiness-rollout-honesty-1".to_string(),
+                ttl_seconds: crate::publication_lease::DEFAULT_ROLLOUT_LEASE_SECONDS,
+                bootstrap_reader: None,
+            })
+            .expect("acquire a rollout over the admitted fleet");
+
+        assert_eq!(
+            call_readiness_handler(state).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a pod whose fleet authority is being rolled must not report ready; the \
+             cached proof it holds is exactly the one the rollout is replacing"
+        );
+    }
+
+    /// Something has to keep the proof current once the probe stops doing it.
+    #[tokio::test]
+    async fn readiness_starts_the_background_hosted_spine_authority_refresh() {
+        let (state, store, _environment) = admitted_hosted_test_state().await;
+        // Production sleeps a minute between passes. A test cannot wait that
+        // long, and waiting would prove nothing the interval itself decides.
+        state.set_hosted_spine_refresh_interval_for_test(Duration::from_millis(50));
+        let durable_reads_before = store.durable_reads();
+
+        assert_eq!(
+            call_readiness_handler(Arc::clone(&state)).await,
+            StatusCode::OK
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while store.durable_reads() == durable_reads_before && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            store.durable_reads() > durable_reads_before,
+            "no background pass re-proved the hosted spine authority. Without one, a \
+             reader that nobody queries proves its authority once, at admission, and \
+             never learns that a sibling published."
         );
     }
 
