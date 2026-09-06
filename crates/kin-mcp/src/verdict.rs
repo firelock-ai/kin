@@ -253,6 +253,7 @@ impl Verdict {
             ("withheld_candidates", withheld_candidates_reading(payload)),
             ("degradations", degradations_reading(payload)),
             ("cross_repo", cross_repo_reading(tool, payload)),
+            ("outside_graph", outside_graph_reading(payload)),
             ("completeness", completeness_reading(envelope)),
             ("graph_freshness", graph_freshness_reading(envelope)),
         ];
@@ -743,6 +744,35 @@ fn cross_repo_reading(tool: &str, payload: &Value) -> Reading {
         Some(CrossRepoQualifier::Complete) => Reading::Certified,
         Some(CrossRepoQualifier::Note(_)) => Reading::Silent,
         Some(CrossRepoQualifier::Gap(reason)) => Reading::Inconclusive(vec![reason]),
+    }
+}
+
+/// Whether the question names a dependency this graph holds no definitions for,
+/// or could not be shown not to.
+///
+/// Silent on every response that does not carry the block, which is nearly all
+/// of them: the block is published only when there is something to report, so
+/// its presence is already the finding. There is no certified state here on
+/// purpose. A response with no block did not establish that the question stays
+/// inside the graph, it establishes that nobody looked, and an input that
+/// certifies on no evidence is how a verdict comes to say yes about something it
+/// never measured.
+///
+/// Three shapes refuse, not one. A matched symbol is the finding this exists
+/// for. A scan that hit its budget, and a store that could not answer the query
+/// at all, are the same finding at the boundary: an empty answer from an
+/// observation that never completed is not evidence of absence, and dropping it
+/// would rebuild the false certification one level down.
+///
+/// The clause is [`crate::outside_graph::limiting_clause`]'s, so the block and
+/// the sentence a reader acts on cannot drift apart.
+fn outside_graph_reading(payload: &Value) -> Reading {
+    let Some(block) = payload.get(crate::outside_graph::OUTSIDE_GRAPH_KEY) else {
+        return Reading::Silent;
+    };
+    match crate::outside_graph::limiting_clause(block) {
+        Some(clause) => Reading::Inconclusive(vec![clause]),
+        None => Reading::Silent,
     }
 }
 
@@ -2651,6 +2681,109 @@ mod tests {
                 .count(),
             1,
             "the absence reason is idempotent too"
+        );
+    }
+
+    /// , the reported shape. A `semantic_locate` for "where
+    /// `router.param` callbacks are registered and stored, and how a request is
+    /// dispatched through the middleware stack" on express 5.2.1 came back
+    /// `state: "certified"`, `limiting_factor: null`, `bound: "exact"`,
+    /// `status: "complete"`. Express's router is the external `router` package,
+    /// which that graph never admitted, so every word of the verdict was true
+    /// about the graph and silent about the question.
+    ///
+    /// The block is the evidence and this is the verdict read off it: one
+    /// inconclusive input is enough, and the module is named in the sentence a
+    /// reader acts on rather than left to be inferred from a count.
+    #[test]
+    fn a_question_naming_an_unadmitted_package_is_never_certified() {
+        let mut payload = populated_reference_payload("present");
+        payload["outside_graph"] = json!({
+            "asked_about": ["router"],
+            "symbols": [{ "symbol": "Router", "modules": ["router"] }],
+            "targets_examined": 19,
+            "budget_exhausted": false,
+        });
+        let verdict = Verdict::compute(
+            "semantic_locate",
+            &payload,
+            &Envelope::daemon(),
+            Some(&json!({ "interpretation": "qualified_answer" })),
+        )
+        .expect("a retrieval payload carries a verdict");
+        let rendered = verdict.to_value();
+
+        assert_eq!(
+            rendered["state"],
+            json!(INCONCLUSIVE),
+            "a question whose answer may live outside this graph cannot be certified: {rendered}"
+        );
+        assert_eq!(
+            rendered["inputs"]["outside_graph"],
+            json!(INCONCLUSIVE),
+            "the new input is the one that refused: {rendered}"
+        );
+        let factor = rendered["limiting_factor"]
+            .as_str()
+            .expect("an inconclusive verdict names its limiting factor");
+        assert!(
+            factor.contains("dependency_outside_graph"),
+            "the clause carries its own label: {factor}"
+        );
+        assert!(
+            factor.contains("`Router` from `router`"),
+            "and it names the module, which is what a reader acts on: {factor}"
+        );
+
+        // The same verdict takes `complete` and `exact` off the completeness
+        // block, so the two halves of the response cannot disagree.
+        let mut completeness = Some(crate::envelope::Completeness {
+            status: "complete".to_string(),
+            bound: "exact".to_string(),
+            substrate: "edges".to_string(),
+            classes: Map::new(),
+            decided_by: Vec::new(),
+            counted: Some(json!({ "exact": true })),
+            reference_resolution: None,
+            limits: Vec::new(),
+            note: "Every input that could qualify this answer agreed.".to_string(),
+        });
+        verdict.project_onto_completeness(&mut completeness);
+        let completeness = completeness.expect("the block survives projection");
+        assert_ne!(
+            completeness.status, "complete",
+            "a response inconclusive about the question may not call its counts whole"
+        );
+        assert_eq!(completeness.bound, "at_least");
+    }
+
+    /// The control the case above is worth nothing without: the same question on
+    /// the same tool, with no unadmitted module named, still certifies. A gate
+    /// that answers "uncertain" to everything has stopped being a gate.
+    #[test]
+    fn a_question_naming_nothing_outside_the_graph_still_certifies() {
+        let payload = populated_reference_payload("present");
+        assert!(
+            payload.get("outside_graph").is_none(),
+            "the control carries no block, which is the ordinary case"
+        );
+        let verdict = Verdict::compute(
+            "semantic_locate",
+            &payload,
+            &Envelope::daemon(),
+            Some(&json!({ "interpretation": "qualified_answer" })),
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+        assert_eq!(
+            verdict["state"],
+            json!(CERTIFIED),
+            "the verdict must keep its ability to say yes: {verdict}"
+        );
+        assert_eq!(
+            verdict["inputs"]["outside_graph"],
+            json!(NOT_APPLICABLE),
+            "an input with nothing to say stays silent rather than certifying: {verdict}"
         );
     }
 }

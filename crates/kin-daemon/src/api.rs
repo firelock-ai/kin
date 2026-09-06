@@ -13729,6 +13729,13 @@ async fn repo_mcp_tools_call(
         }
     }
     let result = bound_mcp_tool_result(result, &request.name, &budget);
+    // The hosted route is NOT disclosed here, deliberately, and the reason is
+    // ordering rather than scope. Its handlers finalize their own envelope
+    // before this line, so a block inserted here would sit beside a verdict
+    // computed without it: a response carrying the evidence and a verdict that
+    // ignores the evidence, which is the two-verdicts-in-one-response shape
+    // `kin_mcp::verdict` exists to end. Disclosing it needs the verdict
+    // recomputed on this route, which is its own change.
     repo_scoped_mcp_success(view.as_ref(), request.name, result)
 }
 
@@ -14265,9 +14272,97 @@ async fn mcp_tools_call(
     let budget =
         kin_mcp::budget::ResponseBudget::from_arguments(&request.arguments).less_envelope_reserve();
     let tool = request.name.clone();
+    // Taken before the call, because the dispatcher consumes the request.
+    let question =
+        kin_mcp::outside_graph::question_argument(&request.arguments).map(str::to_string);
+    let disclosing_state = Arc::clone(&state);
+    let disclosing_headers = headers.clone();
     let Json(result) = mcp_tools_call_inner(headers, State(state), Json(request)).await?;
     let bounded = bound_mcp_tool_result(result, &tool, &budget);
-    Ok(Json(disclose_mcp_local_clamps(bounded, &tool, &clamps)))
+    let disclosed = disclose_mcp_local_clamps(bounded, &tool, &clamps);
+    let graph = match question {
+        // The same header the dispatcher read, resolved the same way. A
+        // malformed one is not this line's error to raise: the dispatcher
+        // already refused the call on it, and a disclosure pass may only add.
+        Some(_) => Some(
+            disclosing_state
+                .graph_for_request_with_authority(
+                    extract_session_id_from_headers(&disclosing_headers)
+                        .ok()
+                        .flatten()
+                        .as_ref(),
+                )
+                .await
+                .0,
+        ),
+        None => None,
+    };
+    Ok(Json(disclose_outside_graph(
+        graph.as_deref(),
+        question.as_deref(),
+        disclosed,
+    )))
+}
+
+/// Disclose an identifier the question named that this graph holds no
+/// definition for, on whichever tool was asked.
+///
+/// Here rather than in the dispatcher because the dispatcher does not have one
+/// exit. `semantic_locate` returns straight out of the fused pipeline and
+/// `find_references` out of its stable-authority path, both without reaching
+/// `kin_mcp::handlers::handle_tool_call` where the offline route attaches the
+/// same block, and those two are exactly the tools the express case was found
+/// on. This function sits on the one line every daemon tool result does pass
+/// through.
+///
+/// The caller resolves the graph a second time, and that is cheap on purpose:
+/// `graph_for_request_with_authority` is a read lock and an `Arc` clone, no
+/// work. Threading the dispatcher's own handle out instead would mean either a
+/// changed return type across three dozen `return` sites or wrapping seven
+/// hundred lines in an async block, and neither buys anything a lock acquisition
+/// costs. Taking the graph as a parameter rather than the state is also what
+/// makes this testable: the composed behaviour is a function of a store, a
+/// question and a payload, and the tests below drive exactly that.
+///
+/// Additive and failure-quiet by construction. A call with no question, a
+/// payload that is not a JSON object, and a question naming nothing outside the
+/// graph all leave the result byte-identical.
+fn disclose_outside_graph(
+    graph: Option<&kin_db::InMemoryGraph>,
+    question: Option<&str>,
+    result: kin_mcp::ToolCallResult,
+) -> kin_mcp::ToolCallResult {
+    let (Some(graph), Some(question)) = (graph, question) else {
+        return result;
+    };
+    let Some(block) = kin_mcp::outside_graph::observe_for_question(graph, question) else {
+        return result;
+    };
+    let content = result
+        .content
+        .into_iter()
+        .map(|block_content| {
+            let kin_mcp::ContentBlock::Text { text } = block_content;
+            let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return kin_mcp::ContentBlock::Text { text };
+            };
+            let Some(object) = payload.as_object_mut() else {
+                return kin_mcp::ContentBlock::Text { text };
+            };
+            object.insert(
+                kin_mcp::outside_graph::OUTSIDE_GRAPH_KEY.to_string(),
+                block.clone(),
+            );
+            match serde_json::to_string_pretty(&payload) {
+                Ok(rendered) => kin_mcp::ContentBlock::Text { text: rendered },
+                Err(_) => kin_mcp::ContentBlock::Text { text },
+            }
+        })
+        .collect();
+    kin_mcp::ToolCallResult {
+        content,
+        is_error: result.is_error,
+    }
 }
 
 /// Apply the response budget to one tool result's payload text.
@@ -19357,6 +19452,7 @@ fn bind_std_listener(
 
 #[cfg(test)]
 mod tests {
+    mod outside_graph_disclosure;
     mod session_identity;
     mod session_move_identity;
     /// THE WIRING SPINE (FIR-2524, captain's rider). The envelope the impact

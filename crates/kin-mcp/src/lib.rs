@@ -10,6 +10,7 @@ pub mod envelope;
 pub mod error;
 pub mod handlers;
 pub mod negative;
+pub mod outside_graph;
 pub mod remediation;
 pub mod server;
 pub mod session;
@@ -36,6 +37,7 @@ pub use envelope::{
 pub use error::{McpError, Result};
 pub use handlers::LocalRepositoryAuthorityBinding;
 pub use negative::NEGATIVE_KEY;
+pub use outside_graph::OUTSIDE_GRAPH_KEY;
 pub use server::{
     process_daemon_message, process_message, run_stdio, run_stdio_daemon, BoundRepo,
     McpServerConfig, RepoBinder, SessionAuthorityMode, WorkspaceBinding,
