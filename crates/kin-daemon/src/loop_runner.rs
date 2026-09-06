@@ -676,6 +676,75 @@ fn observation_covers_path(observed: &BTreeSet<RepoPath>, path: &RepoPath) -> bo
     })
 }
 
+/// The arrival paths a bounded observation would drop although the complete scan
+/// behind it holds them, for the tracked artifacts that observation is about to
+/// leave with no destination.
+///
+/// `observed` at the call site holds the complete scan plus every tracked path
+/// the observation did not cover, so an artifact of `base` whose path it no
+/// longer carries is one this pass is about to remove. When exactly one such
+/// artifact carries an entry, and exactly one observed path that `base` does not
+/// track carries the same entry, the pair is a move by the rule
+/// [`kin_core::plan_observed_tree_deltas`] itself applies, and admitting the
+/// arrival is what lets the transition plan as one move.
+///
+/// Anything short of that evidence yields nothing. A copy and a
+/// move-plus-replacement both keep the vacated path observed, so nothing
+/// departs and neither is touched. A departure with exactly one untracked
+/// byte-identical arrival is read as a move, which is the planner's own rule
+/// and what the unbounded commit seam would plan for the same tree; the
+/// retired graph-only member guard below is the one place that rule is
+/// refused.
+///
+/// Counted through maps rather than a scan per departure, because this runs on
+/// every bounded pass and a branch switch or a large deletion departs many
+/// paths at once.
+fn unobserved_move_destinations(
+    base: &kin_model::ResolvedTree,
+    observed: &crate::commit_deltas::CompleteWorkspaceObservation,
+    retired: &BTreeSet<RepoPath>,
+) -> BTreeSet<RepoPath> {
+    // One pass over the base: how many artifacts carry each entry, and which
+    // entries are departing. An entry two base artifacts share names no single
+    // origin, so it is dropped below rather than guessed at.
+    let mut base_entry_counts: HashMap<TreeEntry, usize> = HashMap::new();
+    let mut departing: Vec<TreeEntry> = Vec::new();
+    for artifact in base.artifacts_by_path() {
+        *base_entry_counts.entry(artifact.entry).or_default() += 1;
+        if !observed.entries().contains_key(&artifact.path) {
+            departing.push(artifact.entry);
+        }
+    }
+    // The quiet case still pays the base pass above, one traversal and one map
+    // build; what it skips is the pass over the observation.
+    if departing.is_empty() {
+        return BTreeSet::new();
+    }
+    // One pass over the observation: the arrival each entry reached, or `None`
+    // when it reached more than one, which names no single destination. A path
+    // under a retired graph-only member is not a candidate at all, because it
+    // was written while the member still stood and was never an observation of
+    // this projection, which is the same reason `admissible` refuses it.
+    let mut arrivals: HashMap<TreeEntry, Option<&RepoPath>> = HashMap::new();
+    for (path, entry) in observed.entries() {
+        if base.artifact_id_at_path(path).is_some()
+            || crate::graph_only_members::covered_by(retired, path)
+        {
+            continue;
+        }
+        arrivals
+            .entry(*entry)
+            .and_modify(|arrival| *arrival = None)
+            .or_insert(Some(path));
+    }
+    departing
+        .into_iter()
+        .filter(|entry| base_entry_counts.get(entry) == Some(&1))
+        .filter_map(|entry| arrivals.get(&entry).copied().flatten())
+        .cloned()
+        .collect()
+}
+
 /// Derive one complete exact-tree transition from the working copy.
 ///
 /// `observation` bounds what may be admitted. `None` is an explicit admission
@@ -688,7 +757,9 @@ fn observation_covers_path(observed: &BTreeSet<RepoPath>, path: &RepoPath) -> bo
 /// in and a single `touch` never costs a complete import. Within that bound an
 /// observed path moves whether or not the workspace already tracks it: a file
 /// becomes queryable because someone wrote it, not because someone remembered
-/// to run a command afterwards.
+/// to run a command afterwards. The one content-addressed exception is the
+/// arrival half of a move, which [`unobserved_move_destinations`] keeps when
+/// an observed departure has exactly one untracked byte-identical destination.
 ///
 /// What this enlarges is the workspace tree, and only the workspace tree. The
 /// publication underneath advances the workspace generation while leaving its
@@ -824,16 +895,38 @@ fn exact_tree_admission(
             observation_covers_path(observation, path)
                 && !crate::graph_only_members::covered_by(&retired, path)
         };
+        // One exception to the drop above, and it is the half of a move. A bare
+        // `mv` reaches the watcher as two events and nothing makes them one
+        // batch, so an observation can carry the path a file left without the
+        // path it arrived on. Dropping the arrival leaves the departure to plan
+        // as a whole deletion, and a deletion retires the artifact node with
+        // every relation bound to it and the entities that path carried. The
+        // arrival is then admitted by a later pass as a fresh artifact with
+        // fresh entity ids, so the file is at its new path, ranked, queryable,
+        // and every reference into the code inside it is gone. Nothing later
+        // rebuilds those edges, because nothing re-derives the files that held
+        // them.
+        //
+        // The scan behind this pass is complete, so the arrival is already in
+        // hand and keeping it costs no extra read. It is kept only on the
+        // evidence a move needs, which is why the bound is otherwise unchanged.
+        let move_destinations = unobserved_move_destinations(&planning_base, &observed, &retired);
         state
             .background_work
             .reconcile()
             .record_untracked_observation(
                 observed.entries().keys().filter(|path| {
-                    previous.artifact_id_at_path(path).is_none() && !admissible(path)
+                    previous.artifact_id_at_path(path).is_none()
+                        && !admissible(path)
+                        && !move_destinations.contains(*path)
                 }),
                 excluded_host_content(&scan),
             );
-        observed.retain(|path, _| previous.artifact_id_at_path(path).is_some() || admissible(path));
+        observed.retain(|path, _| {
+            previous.artifact_id_at_path(path).is_some()
+                || admissible(path)
+                || move_destinations.contains(path)
+        });
     }
     // A bounded tick re-inserts every tracked path its observation did not
     // cover, which would restore the paths the rules just retracted. Editing
@@ -4421,6 +4514,347 @@ mod tests {
         assert_eq!(coverage["parsed"], serde_json::json!("full"), "{coverage}");
         assert_eq!(coverage["certifies_enumeration"], serde_json::json!(true));
         assert!(census_counts_file(&state, stale_path));
+    }
+
+    #[cfg(unix)]
+    const MOVED_PATH: &str = "src/moved.py";
+    #[cfg(unix)]
+    const RELOCATED_PATH: &str = "src/renamed.py";
+    #[cfg(unix)]
+    const CALLER_PATH: &str = "src/caller.py";
+    #[cfg(unix)]
+    const MOVED_TARGET: &str = "def moved_target():\n    return 1\n";
+    #[cfg(unix)]
+    const MOVED_CALLER: &str =
+        "from moved import moved_target\n\ndef moved_caller():\n    return moved_target()\n";
+
+    /// The entity of one name on one path, which the fixtures below hold exactly
+    /// one of.
+    #[cfg(unix)]
+    fn sole_entity_named(
+        state: &Arc<DaemonState>,
+        rel_path: &str,
+        name: &str,
+    ) -> kin_model::Entity {
+        let matching = state
+            .graph
+            .query_entities(&EntityFilter {
+                file_path: Some(FilePathId::new(rel_path)),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .filter(|entity| entity.name == name)
+            .collect::<Vec<_>>();
+        let [entity] = matching.as_slice() else {
+            panic!("one entity named {name} at {rel_path}: {matching:?}");
+        };
+        entity.clone()
+    }
+
+    /// [`derive_semantics`] with the cross-file linker seeded from the graph,
+    /// the way `DaemonState::open` and every commit seam seed it.
+    ///
+    /// The plain helper builds a bare `Reconciler`, whose linker knows only the
+    /// file in front of it, so a fixture built with it carries no cross-file
+    /// edge at all and an assertion about losing one would pass over an empty
+    /// set. Seeding is what makes the caller's edge exist to be lost.
+    #[cfg(unix)]
+    fn derive_semantics_linked(state: &Arc<DaemonState>, rel_path: &str) {
+        let host_path = state.layout.working_dir().join(rel_path);
+        let mut reconciler =
+            kin_reconcile::Reconciler::new(state.layout.working_dir().to_path_buf());
+        reconciler.seed_cross_file_linker_from_graph(state.graph.as_ref());
+        let result = reconciler
+            .reconcile_file_change(
+                &FileEvent::Changed(host_path),
+                &state.blobs,
+                state.graph.as_ref(),
+            )
+            .expect("the reconciler derives the file");
+        let (outcome, delta) = result.into_parts();
+        assert!(
+            matches!(outcome, kin_reconcile::ReconcileOutcome::Updated { .. }),
+            "the fixture file must reconcile cleanly: {outcome:?}"
+        );
+        state.graph.apply_transaction_delta(&delta).unwrap();
+        state
+            .persist_projection_truth_from_reconcile(&reconciler, &outcome)
+            .unwrap();
+    }
+
+    /// The relation ids that point AT `entity`, sorted, which is what a caller
+    /// keeps or loses across a move.
+    #[cfg(unix)]
+    fn incoming_relations(
+        state: &Arc<DaemonState>,
+        entity: kin_model::EntityId,
+    ) -> Vec<kin_model::RelationId> {
+        let node = kin_model::GraphNodeId::Entity(entity);
+        let mut incoming = state
+            .graph
+            .get_all_relations_for_node(&node)
+            .unwrap()
+            .into_iter()
+            .filter(|relation| relation.dst == node)
+            .map(|relation| relation.id)
+            .collect::<Vec<_>>();
+        incoming.sort();
+        incoming
+    }
+
+    /// A move whose arrival half the observation did not carry.
+    ///
+    /// A bare `mv` reaches the watcher as two events and nothing makes them one
+    /// batch. When the vacated path arrives first, the bounded observation names
+    /// it alone: the complete scan behind the pass holds the file at its new
+    /// path, the bound drops that entry as an unrelated untracked addition, and
+    /// what is left to plan is one whole deletion. That retires the artifact
+    /// node with every relation bound to it and removes the entities the path
+    /// carried, so the arrival lands afterwards as a fresh artifact with fresh
+    /// entity ids and every reference into the moved code is gone.
+    ///
+    /// The observation here is the vacated path alone, which composes that order
+    /// instead of waiting for the watcher to produce it. Falsify by restoring
+    /// the plain `previous.artifact_id_at_path(path).is_some() ||
+    /// admissible(path)` retain in `exact_tree_admission`, which drops the
+    /// arrival again.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_observation_of_a_moves_vacated_half_relocates_rather_than_orphaning_it() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        state.is_initialized.store(true, Ordering::Relaxed);
+        admit_and_derive(&state, MOVED_PATH, MOVED_TARGET);
+        admit_and_derive(&state, CALLER_PATH, MOVED_CALLER);
+        derive_semantics_linked(&state, CALLER_PATH);
+
+        let target = sole_entity_named(&state, MOVED_PATH, "moved_target");
+        let incoming = incoming_relations(&state, target.id);
+        // The module's `Imports` and the function's `Calls`, which is what
+        // `kin refs moved_target` renders as two referencing entities.
+        assert_eq!(
+            incoming.len(),
+            2,
+            "the fixture never produced the incoming edges this test is about: {incoming:?}"
+        );
+        let artifact = state
+            .graph
+            .resolved_tree()
+            .artifact_at_path(&RepoPath::from_utf8(MOVED_PATH).unwrap())
+            .expect("the fixture admitted the moved path")
+            .artifact_id;
+
+        let working = state.layout.working_dir();
+        std::fs::rename(working.join(MOVED_PATH), working.join(RELOCATED_PATH)).unwrap();
+        // The losing order: the watcher delivered the vacated path and not the
+        // arrival, so this pass is bounded by the half that is gone.
+        let observation = BTreeSet::from([RepoPath::from_utf8(MOVED_PATH).unwrap()]);
+        assert!(!ambient_admission_for_test(&state, &observation).unwrap());
+
+        let moved = state
+            .graph
+            .get_entity(&target.id)
+            .unwrap()
+            .expect("a move must keep the entity it moved rather than mint a new one");
+        assert_eq!(
+            moved.file_origin,
+            Some(FilePathId::new(RELOCATED_PATH)),
+            "the moved entity must sit at the path it arrived on"
+        );
+        assert_eq!(
+            incoming_relations(&state, target.id),
+            incoming,
+            "the caller lost its edge into the moved function, which is what a removal plus an \
+             addition does and what relocating in one delta exists to prevent"
+        );
+        let tree = state.graph.resolved_tree();
+        assert!(
+            tree.artifact_at_path(&RepoPath::from_utf8(MOVED_PATH).unwrap())
+                .is_none(),
+            "the tree must not still carry the path the file left"
+        );
+        assert_eq!(
+            tree.artifact_at_path(&RepoPath::from_utf8(RELOCATED_PATH).unwrap())
+                .expect("the tree carries the arrival path")
+                .artifact_id,
+            artifact,
+            "the move must preserve artifact identity"
+        );
+    }
+
+    /// A twin under a retired graph-only member is not a destination.
+    ///
+    /// Host content beneath a removed Gitlink was written while the member
+    /// still stood, so it was never an observation of this projection and
+    /// `admissible` refuses it. Reading it as the arrival half of a move would
+    /// walk straight around that refusal: a deleted file whose bytes happen to
+    /// match something in the retired subtree would relocate into it, put the
+    /// workspace ahead of the base a switch just made it level with, and hand
+    /// the subtree to the tree the retirement exists to keep it out of.
+    ///
+    /// Falsify by dropping the `covered_by` clause from the arrival scan in
+    /// `unobserved_move_destinations`: the deletion then plans as a move and
+    /// the entity survives at the retired path.
+    #[cfg(unix)]
+    #[test]
+    fn a_twin_under_a_retired_graph_only_member_is_not_a_move_destination() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        state.is_initialized.store(true, Ordering::Relaxed);
+        admit_and_derive(&state, MOVED_PATH, MOVED_TARGET);
+        let target = sole_entity_named(&state, MOVED_PATH, "moved_target");
+
+        // Byte-identical content beneath a member the workspace has retired,
+        // which is the only thing the scan will still hold once the tracked
+        // file is gone.
+        let working = state.layout.working_dir();
+        std::fs::create_dir_all(working.join("submodule/src")).unwrap();
+        std::fs::write(working.join("submodule/src/twin.py"), MOVED_TARGET).unwrap();
+        state
+            .retired_graph_only_members
+            .retire([&test_repo_path("submodule")]);
+
+        std::fs::remove_file(working.join(MOVED_PATH)).unwrap();
+        let observation = BTreeSet::from([RepoPath::from_utf8(MOVED_PATH).unwrap()]);
+        assert!(!ambient_admission_for_test(&state, &observation).unwrap());
+
+        assert!(
+            state.graph.get_entity(&target.id).unwrap().is_none(),
+            "a deletion beside a retired-subtree twin must still be a deletion"
+        );
+        let tree = state.graph.resolved_tree();
+        assert!(
+            tree.artifact_at_path(&RepoPath::from_utf8(MOVED_PATH).unwrap())
+                .is_none(),
+            "the deleted path must leave the tree"
+        );
+        assert!(
+            tree.artifact_at_path(&test_repo_path("submodule/src/twin.py"))
+                .is_none(),
+            "a removed member must not hand its host subtree to the workspace through a move"
+        );
+    }
+
+    /// Two untracked paths carry the departing entry, so nothing names one
+    /// destination and the departure stays a deletion.
+    #[cfg(unix)]
+    #[test]
+    fn a_departure_with_two_equally_good_destinations_is_not_a_move() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        state.is_initialized.store(true, Ordering::Relaxed);
+        admit_and_derive(&state, MOVED_PATH, MOVED_TARGET);
+        let target = sole_entity_named(&state, MOVED_PATH, "moved_target");
+
+        let working = state.layout.working_dir();
+        std::fs::write(working.join("src/aaa_twin.py"), MOVED_TARGET).unwrap();
+        std::fs::write(working.join("src/bbb_twin.py"), MOVED_TARGET).unwrap();
+
+        std::fs::remove_file(working.join(MOVED_PATH)).unwrap();
+        let observation = BTreeSet::from([RepoPath::from_utf8(MOVED_PATH).unwrap()]);
+        assert!(!ambient_admission_for_test(&state, &observation).unwrap());
+
+        assert!(
+            state.graph.get_entity(&target.id).unwrap().is_none(),
+            "two equally good destinations name none, so this must stay a deletion"
+        );
+        let tree = state.graph.resolved_tree();
+        assert!(
+            tree.artifact_at_path(&test_repo_path("src/aaa_twin.py"))
+                .is_none(),
+            "an ambiguous arrival must not be admitted by a pass that never observed it"
+        );
+        assert!(
+            tree.artifact_at_path(&test_repo_path("src/bbb_twin.py"))
+                .is_none(),
+            "an ambiguous arrival must not be admitted by a pass that never observed it"
+        );
+    }
+
+    /// A second tracked path carries the departing entry, so no single base
+    /// artifact owns it and the departure stays a deletion.
+    #[cfg(unix)]
+    #[test]
+    fn a_departure_whose_entry_a_second_tracked_path_shares_is_not_a_move() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        state.is_initialized.store(true, Ordering::Relaxed);
+
+        // Both in ONE observation. Admitting the twin in a second pass refuses,
+        // because a path-stable entry plus an identical observed entry is the
+        // planner's identity-underdetermined case.
+        let working = state.layout.working_dir();
+        std::fs::create_dir_all(working.join("src")).unwrap();
+        std::fs::write(working.join(MOVED_PATH), MOVED_TARGET).unwrap();
+        std::fs::write(working.join("src/duplicate.py"), MOVED_TARGET).unwrap();
+        let admission = BTreeSet::from([
+            RepoPath::from_utf8(MOVED_PATH).unwrap(),
+            test_repo_path("src/duplicate.py"),
+        ]);
+        assert!(!ambient_admission_for_test(&state, &admission).unwrap());
+        derive_semantics(&state, MOVED_PATH);
+        derive_semantics(&state, "src/duplicate.py");
+        let target = sole_entity_named(&state, MOVED_PATH, "moved_target");
+
+        std::fs::rename(working.join(MOVED_PATH), working.join(RELOCATED_PATH)).unwrap();
+        let observation = BTreeSet::from([RepoPath::from_utf8(MOVED_PATH).unwrap()]);
+        assert!(!ambient_admission_for_test(&state, &observation).unwrap());
+
+        assert!(
+            state.graph.get_entity(&target.id).unwrap().is_none(),
+            "an entry two tracked paths share names no single origin, so this must stay a deletion"
+        );
+        let tree = state.graph.resolved_tree();
+        assert!(
+            tree.artifact_at_path(&RepoPath::from_utf8(RELOCATED_PATH).unwrap())
+                .is_none(),
+            "an arrival whose origin is undetermined must not be admitted"
+        );
+        assert!(
+            tree.artifact_at_path(&test_repo_path("src/duplicate.py"))
+                .is_some(),
+            "the untouched duplicate must stay in the tree"
+        );
+    }
+
+    /// The control the arm above needs. An ordinary deletion still retires the
+    /// entities its path carried and the edges into them, so a retain that
+    /// simply kept every scanned path would fail here rather than pass both.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_observation_of_a_real_deletion_still_retires_its_entities() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        state.is_initialized.store(true, Ordering::Relaxed);
+        admit_and_derive(&state, MOVED_PATH, MOVED_TARGET);
+        admit_and_derive(&state, CALLER_PATH, MOVED_CALLER);
+        derive_semantics_linked(&state, CALLER_PATH);
+
+        let target = sole_entity_named(&state, MOVED_PATH, "moved_target");
+        assert_eq!(
+            incoming_relations(&state, target.id).len(),
+            2,
+            "the fixture never produced the edges whose retirement this control checks"
+        );
+
+        let working = state.layout.working_dir();
+        std::fs::remove_file(working.join(MOVED_PATH)).unwrap();
+        let observation = BTreeSet::from([RepoPath::from_utf8(MOVED_PATH).unwrap()]);
+        assert!(!ambient_admission_for_test(&state, &observation).unwrap());
+
+        assert!(
+            state.graph.get_entity(&target.id).unwrap().is_none(),
+            "a real deletion must still retire the entities its path carried"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&RepoPath::from_utf8(MOVED_PATH).unwrap())
+                .is_none(),
+            "a real deletion must still leave the tree"
+        );
     }
 
     /// FIR-2442. A dropped host event is disclosed through the reconcile health
