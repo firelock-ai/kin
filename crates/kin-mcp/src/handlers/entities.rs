@@ -1382,7 +1382,7 @@ fn multi_focal_pack_result<G: GraphStore>(
         resolutions,
         coverage: get_optional_string_param(args, "coverage"),
     };
-    let (pack, report) = kin_context::build_multi_focal_pack(store, &ids, &opts)
+    let (pack, mut report) = kin_context::build_multi_focal_pack(store, &ids, &opts)
         .map_err(|error| McpError::Context(error.to_string()))?;
 
     // Bodies come from graph-owned repository authority, exactly as the
@@ -1489,6 +1489,33 @@ fn multi_focal_pack_result<G: GraphStore>(
         entities.push(row(entry, kin_context::group::CONTRACTS)?);
     }
 
+    // `focals[]` is the PACK's account of what it rendered, which is a header
+    // either way, so it went on saying `header_and_signature` about a focal
+    // this response had just served a real body for. One focal described two
+    // ways that disagree is the same class of defect as the label this change
+    // exists to fix, one level up.
+    //
+    // Read back off the rows rather than tracked in parallel while building
+    // them: the correction is then derived from the value that was actually
+    // published, and cannot drift from it.
+    let served_bodies: std::collections::HashSet<String> = entities
+        .iter()
+        .filter(|row| {
+            row.get("section").and_then(serde_json::Value::as_str) == Some("focal")
+                && row.get("body").is_some_and(|body| !body.is_null())
+        })
+        .filter_map(|row| {
+            row.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    for contribution in report.focals.iter_mut() {
+        if served_bodies.contains(&contribution.entity_id) {
+            contribution.projection = kin_context::SERVED_BODY_PROJECTION_NAME.to_string();
+        }
+    }
+
     let mut result = serde_json::json!({
         "method": report.method,
         "focals": serde_json::to_value(&report.focals).map_err(McpError::Json)?,
@@ -1503,6 +1530,17 @@ fn multi_focal_pack_result<G: GraphStore>(
         "measured_tokens": report.measured_tokens,
         "entities": entities,
         "lines": kin_context::render_multi_focal_lines(&pack, &report),
+        // The rendered pack, and what `measured_tokens` counts. It is the
+        // header projection throughout, because kin-context cannot read source;
+        // a focal that served a real body carries it on its own `entities[]`
+        // row and not here. Said out loud, because a reader who finds a header
+        // in `lines` beside a body on the row is otherwise left to guess which
+        // one the response means.
+        "lines_note": format!(
+            "rendered pack at the {} projection kin-context can build; served bodies are on \
+             the entities[] rows",
+            kin_context::FULL_BODY_PROJECTION_NAME
+        ),
         "tokens_used": 0,
     });
     if !unresolved.is_empty() {

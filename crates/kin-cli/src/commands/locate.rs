@@ -734,29 +734,75 @@ fn query_names_entity_symbolically(query: &str, name: &str) -> bool {
     named_by_token
         || query_qualified_paths(query).any(|path| {
             let lowered = path.to_ascii_lowercase();
-            lowered == target || qualified_name_tail(&lowered) == tail
+            lowered == target || qualified_path_names_entity(&lowered, &target)
         })
+}
+
+/// Whether a qualified path a query spelled out names THIS entity, rather than
+/// merely ending in the same word.
+///
+/// The whole path is compared, not just its tail. Matching on the tail alone
+/// is how one dotted run in a prose question lifts FIR-3079's demotion off
+/// every entity that happens to share that word: `Session.get` in a sentence
+/// would spare `RequestsCookieJar.get`, and a bare filename like
+/// `package.json` would spare anything whose own name tail is `json`. Because
+/// [`order_locate_entities`] reads the exact-name tier BEFORE the score, a row
+/// spared that way sorts above rows carrying real evidence whatever it scored,
+/// so the over-match is not a small mispricing, it is a promotion.
+///
+/// So the qualifier has to agree too. `entity_name` is already lowercased by
+/// the caller, and both sides are compared by their own segments: the path
+/// names the entity when the entity's qualified name ENDS with it on a
+/// separator boundary (`Session.get` names `requests.Session.get`), or when the
+/// path ends with the entity's qualified name the same way (`kin.Session.get`
+/// names `Session.get`). A tail that agrees while the container does not is
+/// exactly the case this refuses.
+fn qualified_path_names_entity(path: &str, entity_name: &str) -> bool {
+    fn is_qualified(name: &str) -> bool {
+        name.contains('.') || name.contains("::")
+    }
+    fn ends_on_boundary(longer: &str, shorter: &str) -> bool {
+        if longer.len() <= shorter.len() {
+            return false;
+        }
+        let Some(prefix) = longer.strip_suffix(shorter) else {
+            return false;
+        };
+        prefix.ends_with('.') || prefix.ends_with("::")
+    }
+    // BOTH sides have to be qualified, or the shorter one is a bare tail and
+    // this collapses back into the tail match it exists to refuse. `Session.get`
+    // in a sentence would otherwise name a free function called `get`, because
+    // the path does end with that word on a separator. `path` is always
+    // qualified, since [`query_qualified_paths`] yields nothing else, so the
+    // check that does work is the one on the entity.
+    if !is_qualified(path) || !is_qualified(entity_name) {
+        return path == entity_name;
+    }
+    path == entity_name
+        || ends_on_boundary(entity_name, path)
+        || ends_on_boundary(path, entity_name)
 }
 
 /// The QUALIFIED symbol paths a query spells out, whole, in their original
 /// case.
 ///
 /// [`query_tokens`] splits on every character that is not alphanumeric or an
-/// underscore, so a dotted path is gone before any rule can read it as one.
-/// A question that wrote `router.param` reaches [`is_symbolic_search_term`] as
-/// the two bare words `router` and `param`, and a bare `param` is a plain
-/// English word, so the query that named the symbol in its most explicit form
-/// was judged not to have named it symbolically at all.
+/// underscore, so a dotted path is gone before any rule can read it as one. A
+/// question that wrote `Session.merge_environment_settings` reaches
+/// [`is_symbolic_search_term`] as two bare words, and a rule asking whether a
+/// SYMBOL-SHAPED token named the entity therefore answers no about a query that
+/// named it in the most explicit form there is.
 ///
-/// Measured on expressjs/express at v0.7.2, store fully embedded (798 of 798):
-/// "where router.param callbacks are registered and stored, and how a request
-/// is dispatched through the middleware stack" classified `app.param` as a
-/// prose-word collision, which took it out of [`locate_exact_name_tier`] and
-/// left it at rank 3 behind two file anchors from `lib/utils.js`.
+/// This yields the run whole so [`qualified_path_names_entity`] can compare it
+/// as a path. Only runs carrying a separator are yielded, because a single bare
+/// word is what [`query_tokens`] already offers and the shape the tokenizer
+/// destroys is the only thing this exists to recover.
 ///
-/// Yields only runs that actually carry a separator, because a single bare
-/// word is what [`query_tokens`] already offers and the whole point here is
-/// the shape the tokenizer destroys.
+/// It is deliberately NOT enough on its own. Yielding the run is half the rule;
+/// the other half is that the run has to name the entity by its qualifier as
+/// well as its tail, or one dotted token in a sentence spares every entity that
+/// shares a word with it.
 fn query_qualified_paths(query: &str) -> impl Iterator<Item = &str> {
     query
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':'))
@@ -18318,12 +18364,18 @@ pub fn build_entity_view(
     // and `a_prose_question_gets_the_top_ranked_files_own_anchor` both say can
     // never happen.
     //
-    // Moving it changes no corroboration count. The count already skips every
-    // `FILE_ANCHOR_ORIGIN` row, so no anchor corroborated anything from the
-    // later position either, and the rows that do corroborate are all here.
-    // What it does change is an anchor that is ITSELF a prose-word collision:
-    // it is now demoted against the anchors alone, which corroborate nothing,
-    // so it takes the full floor. That is the conservative direction for a row
+    // Two things move with it, and neither is the corroboration COUNT. That
+    // loop already skips every `FILE_ANCHOR_ORIGIN` row, so no anchor
+    // corroborated anything from the later position either, and every row that
+    // does corroborate is present here.
+    //
+    // What moves is the pair of judgments that read anchors. The
+    // `collision_scores` map does NOT skip them, so an anchor that is itself a
+    // collision used to set its file's threshold and can no longer do so; the
+    // threshold is now the retrieval collision's own score, which is the score
+    // the sibling share was written to be a share OF. And an anchor collision
+    // is now demoted against the anchors alone, which corroborate nothing, so
+    // it takes the full floor. Both are the conservative direction for a row
     // whose whole claim is that it is a second opinion.
     apply_collision_corroboration_penalty(&mut ranked, query, collision_floor, collision_target);
 
@@ -22828,55 +22880,105 @@ mod tests {
         );
     }
 
-    /// A query that SPELLS the symbol has named it, dot and all.
+    /// A query that SPELLS the symbol has named it, qualifier and all.
     ///
-    /// Measured on expressjs/express at v0.7.2, store fully embedded (798 of
-    /// 798). "where router.param callbacks are registered and stored, and how a
-    /// request is dispatched through the middleware stack" put `app.param` at
-    /// rank 3, behind two file anchors from `lib/utils.js` at 395.24, because
-    /// the row was classified a prose-word collision and lost
-    /// [`locate_exact_name_tier`].
+    /// FIR-3079 takes the exact-name tier away from a name match resting on
+    /// nothing but a plain English word in a sentence, by asking whether a
+    /// SYMBOL-SHAPED token named the entity. [`query_tokens`] splits on the
+    /// dot, so a query that wrote the symbol as a qualified path was answered
+    /// with two bare words and judged to have named nothing symbolically.
     ///
-    /// The cause is [`query_tokens`], which splits on the dot, so the only
-    /// tokens the symbolic rule ever saw were `router` and `param`, and a bare
-    /// `param` is a plain English word.
+    /// Every case here turns on a tail that is NOT symbol-shaped on its own,
+    /// because a snake_case tail like `merge_environment_settings` is already
+    /// accepted by the token arm above and would prove nothing about this rule.
+    /// `get` and `json` are the shapes that reach it.
     #[test]
-    fn a_dotted_query_path_names_its_symbol_symbolically() {
-        let query = "where router.param callbacks are registered and stored, and how a \
-                     request is dispatched through the middleware stack";
+    fn a_qualified_query_path_names_its_own_symbol_and_no_other() {
+        let query = "where Session.get reads a stored cookie and how the jar \
+                     resolves it across domains";
 
-        // Control: the shape the rule is about is really present. The query IS
-        // prose, and the bare token on its own is NOT symbolic, so nothing here
-        // passes because the preconditions quietly stopped holding.
+        // Controls: the preconditions this rule needs are really present, so
+        // nothing below passes because one of them quietly stopped holding.
         assert!(
             query_is_prose(query),
-            "control: this query has to read as prose or the rule never fires"
+            "control: this query has to read as prose or FIR-3079 never fires"
         );
         assert!(
-            !is_symbolic_search_term("param"),
-            "control: the bare token is what made this a collision"
+            !is_symbolic_search_term("get"),
+            "control: the tail must not be symbol-shaped, or the token arm \
+             above would accept it and this rule would not be under test"
         );
 
         assert!(
-            query_names_entity_symbolically(query, "app.param"),
-            "the query wrote `router.param`, which is a symbol, not an English word"
+            query_names_entity_symbolically(query, "Session.get"),
+            "the query wrote the qualified path, which is naming it symbolically"
         );
         assert!(
-            !is_prose_word_collision(query, "app.param"),
+            !is_prose_word_collision(query, "Session.get"),
             "so the row is not a prose-word collision"
         );
-
-        // And the tier it lost is the tier it keeps.
-        let mut named = mk_locate_entity("app.param", 360.0, true);
+        let mut named = mk_locate_entity("Session.get", 283.2, true);
         named.match_kind = Some(LocateMatchKind::Name);
         assert_eq!(
             locate_exact_name_tier(&named, query),
             1,
-            "a hit the query named by a qualified path stays unbeatable by fallback"
+            "and it keeps the tier a query that named it is supposed to earn"
         );
 
-        // The rule stays a rule about SYMBOLS. A prose question that merely
-        // uses a word keeps its demotion, which is what FIR-3079 exists for.
+        // The defect this rule must not have: one dotted run in a sentence
+        // sparing every entity that shares its last word. `RequestsCookieJar.get`
+        // is a real requests symbol and this query never asked for it.
+        for other in ["RequestsCookieJar.get", "LookupDict.get", "get"] {
+            assert!(
+                !query_names_entity_symbolically(query, other),
+                "a different container is a different symbol, however the tail \
+                 reads, but {other} was claimed"
+            );
+            assert!(
+                is_prose_word_collision(query, other),
+                "so {other} keeps its demotion"
+            );
+        }
+
+        // A bare filename is a qualified run too, and it names no symbol.
+        let filename_query = "the build reads package.json before it resolves anything else";
+        assert!(query_is_prose(filename_query), "control: still prose");
+        assert!(
+            query_qualified_paths(filename_query).any(|path| path == "package.json"),
+            "control: the filename really is yielded as a run, so the guard below does work"
+        );
+        for name in ["json", "config.json", "Config.json"] {
+            assert!(
+                !query_names_entity_symbolically(filename_query, name),
+                "a filename in a sentence names no symbol, but it claimed {name}"
+            );
+        }
+
+        // Qualification runs both ways: a query may spell more of the path than
+        // the graph stores, or less, as long as it agrees on a separator.
+        assert!(
+            query_names_entity_symbolically(
+                "does requests.Session.get read the stored cookie for this domain",
+                "Session.get"
+            ),
+            "a query that over-qualifies still names it"
+        );
+        assert!(
+            query_names_entity_symbolically(
+                "does Session.get read the stored cookie for this domain",
+                "requests.Session.get"
+            ),
+            "and so does one that under-qualifies, on a separator boundary"
+        );
+        assert!(
+            !query_names_entity_symbolically(
+                "does xSession.get read the stored cookie for this domain",
+                "Session.get"
+            ),
+            "but a suffix that is not on a separator boundary is a different name"
+        );
+
+        // The case FIR-3079 was written for is untouched.
         let prose = "when I send a command, how does it reach the socket";
         assert!(
             !query_names_entity_symbolically(prose, "send"),
@@ -22980,8 +23082,14 @@ mod tests {
         let question = "where HTTP redirects are resolved and followed after a response";
         let mut result = LocateResult {
             files: vec![
-                // 100.0 is under 0.25 x 465.42, so the band is the leader alone
-                // and the band rule cannot be what saves this ranking.
+                // Chosen so the BAND rule cannot be what saves this ranking,
+                // and only the ordering can. Under the mutant, where the
+                // demotion runs after the anchors, the band floor is
+                // 0.25 x 465.42 = 116.35, this row is beneath it, the band is
+                // the leader alone and the anchor is priced at 418.88, above
+                // the 349.06 the leader keeps. Under the fix the floor is
+                // 0.25 x 349.06 = 87.27, this row clears it, the band ends here
+                // and the anchor is priced at 90.0.
                 file(
                     "src/requests/models.py",
                     0.20,

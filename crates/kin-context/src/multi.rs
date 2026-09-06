@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use crate::builder::{
     build_context_pack_with_provenance, group, is_dependency_edge, project_full_body,
     project_name_and_kind, project_signature_only, AssistantHint, ContextOptions,
-    DependencyRelation,
+    DependencyRelation, FULL_BODY_PROJECTION_NAME,
 };
 use crate::error::{ContextError, Result};
 use crate::tokens::estimate_tokens;
@@ -1272,7 +1272,7 @@ fn bump_elision(elisions: &mut BTreeMap<String, PackElision>, group_name: &str, 
 /// word this surface publishes about it changes, to one that is true.
 fn projection_name(level: ProjectionLevel) -> &'static str {
     match level {
-        ProjectionLevel::FullBody => "header_and_signature",
+        ProjectionLevel::FullBody => FULL_BODY_PROJECTION_NAME,
         ProjectionLevel::SignatureOnly => "signature_only",
         ProjectionLevel::NameAndKind => "name_and_kind",
     }
