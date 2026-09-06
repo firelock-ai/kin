@@ -20,6 +20,21 @@ use super::repository_authority::ActiveRepositoryAuthority;
 
 pub const LOG_SCHEMA: &str = "kin.log.v1";
 
+/// Which fields of the report the answering build knew how to fill.
+///
+/// A different question from the schema, and it needs its own answer. The schema
+/// names what the fields MEAN, and it must not move for a shape change, because
+/// it is what a machine reader pins. This names which fields a build fills.
+///
+/// The distinction is not hypothetical: `LogEntry::entity_deltas_unchanged` was
+/// added under `#[serde(default)]` and `kin.log.v1` deliberately stayed put, so
+/// a caller trusting schema equality alone would print a peer's report with a
+/// real unchanged-entity count silently replaced by zero. Nothing would say so.
+///
+/// Bump it whenever a field is added to [`LogReport`] or [`LogEntry`].
+/// `adding_a_report_field_must_move_the_report_revision` goes red if you forget.
+pub const LOG_REPORT_REVISION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogRequest {
     pub count: usize,
@@ -39,6 +54,14 @@ pub struct LogResponse {
     /// changes, because it has already decoded the change DAG to answer at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_tip: Option<crate::commands::workspace_tip::WorkspaceTip>,
+    /// The report revision the answering build filled, or 0 from a peer too old
+    /// to name one.
+    ///
+    /// `#[serde(default)]` makes an older peer's silence read as "cannot say",
+    /// and a caller that cannot say falls back to its own authority open and
+    /// answers exactly as it did before this field existed.
+    #[serde(default)]
+    pub report_revision: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -285,59 +308,135 @@ fn local_log(
     Ok((report, tip))
 }
 
+/// The daemon's own report, when this build may print it as its own.
+///
+/// `kin log --json` is a contract with a machine reader: what it prints must be
+/// what THIS build serializes, never whatever bytes a peer happened to send.
+/// Two things hold that here. The value is deserialized into this build's own
+/// [`LogReport`] and serialized by this build's own serde, so the bytes printed
+/// are this build's. And the peer must name the same [`LOG_REPORT_REVISION`], so
+/// no field this build knows about was quietly filled in by `#[serde(default)]`
+/// on behalf of a peer that never had it.
+///
+/// A peer at a different revision, or one too old to name one, is not refused
+/// and is not an error. The caller falls back to its own authority open, which
+/// is exactly what every `--json` did before this route existed.
+fn daemon_report_this_build_may_print(response: &LogResponse) -> Option<&LogReport> {
+    if response.report_revision != LOG_REPORT_REVISION {
+        return None;
+    }
+    response.report.as_ref()
+}
+
+/// The JSON `kin log --json` prints: the daemon's report when this build may
+/// print it, and one local authority open otherwise.
+///
+/// The whole decision lives here, fallback included, so what it costs is
+/// assertable without a daemon and without a process. The honest bound is the
+/// OPEN COUNT rather than the wall clock, for the reason [`local_log`] gives: an
+/// open re-verifies every persisted body, so it costs whatever the store is
+/// worth, and a fixture small enough to run in CI answers in milliseconds
+/// whether it opens or not.
+///
+/// Measured on the converted psf/requests store of 2026-09-05, that open was the
+/// whole of an 11.04 second `kin log --json --count 2`: one whole-store open in
+/// the CLI process, 3,491,976 KiB of peak resident set, to print two entries the
+/// daemon already had decoded.
+///
+/// One arm is slower than before and it is the right trade. A daemon whose
+/// report this build may not print costs the round trip AND the local open,
+/// where the old command paid only the open. That is the price of asking before
+/// deciding, and asking before deciding is what keeps the `json` condition out
+/// of `run`'s call to the daemon, so the decision lives here in one place that a
+/// test can drive. Against a whole-store open the round trip is not close, and
+/// the arm it costs is the mixed-build one rather than the ordinary one.
+fn json_log(
+    layout: &kin_core::KinLayout,
+    count: usize,
+    answered: Option<&LogResponse>,
+) -> Result<String> {
+    if let Some(report) = answered.and_then(daemon_report_this_build_may_print) {
+        return Ok(serde_json::to_string_pretty(report)?);
+    }
+    if let Some(response) = answered {
+        // A daemon answered and this build declined its report, so this command
+        // is about to pay a whole-store open that a matching pair would not have
+        // paid. Said on stderr rather than in the report, because the report is
+        // the machine contract and must stay byte-identical on both branches.
+        //
+        // At `info`, the same level as the authority-open attribution line that
+        // follows it, deliberately: those two lines together are the whole
+        // reading, and it was the open line at exactly this level that attributed
+        // the 11.04 second log in the first place. A level nobody turns on is a
+        // line nobody reads, and a slow `--json` with no signal at all is what
+        // this route otherwise leaves behind.
+        tracing::info!(
+            daemon_report_revision = response.report_revision,
+            this_build_report_revision = LOG_REPORT_REVISION,
+            daemon_carried_a_report = response.report.is_some(),
+            "a daemon answered this log and this build may not print its report, so this command \
+             opens the whole store itself"
+        );
+    }
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
+    let (report, _tip) = local_log(&binding, count)?;
+    Ok(serde_json::to_string_pretty(&report)?)
+}
+
 pub async fn run(count: usize, json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
-    // The daemon first, and only for the text path. `--json` is a contract with
-    // a machine reader and must publish the exact report this build serializes,
-    // so it stays on the local read rather than re-serializing a peer's payload.
+    // Asked once, ahead of either rendering, and deliberately not under a `json`
+    // condition. Both renderings answer from the same durable authority and only
+    // the daemon can answer from one it already holds open. What `--json` may not
+    // do is print a peer's bytes as its own, and that is decided in `json_log`
+    // rather than by declining to ask.
     //
-    // A daemon too old to carry the tip reading costs this command a named gap
+    // A daemon too old to carry the tip reading costs the text path a named gap
     // and nothing else, so it does not fall back the way `kin status` does. The
     // difference is what silence would mean: a status with no merge reading
     // prints a clean tree over a workspace holding a merge open, and this prints
     // a line saying the reading was not taken.
-    if !json {
-        if let Some(response) = daemon_log(&layout, count).await {
-            for line in response.lines {
-                println!("{line}");
-            }
-            println!(
-                "{}",
-                crate::commands::workspace_tip::line(
-                    &response.workspace_tip.unwrap_or(
-                        crate::commands::workspace_tip::WorkspaceTip::Unknown {
-                            reason: "the daemon that answered this log does not report it; \
-                                 `kin daemon stop` and re-run picks it up on this build"
-                                .to_string(),
-                        }
-                    )
-                )
-            );
-            println!(
-                "{}",
-                crate::commands::repository_authority::answered_by_line(
-                    crate::commands::repository_authority::AuthoritySource::RunningDaemon
-                )
-            );
-            return Ok(());
-        }
-    }
-    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
-    let (report, tip) = local_log(&binding, count)?;
+    let answered = daemon_log(&layout, count).await;
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        for line in render_lines(&report) {
+        println!("{}", json_log(&layout, count, answered.as_ref())?);
+        return Ok(());
+    }
+    if let Some(response) = answered {
+        for line in response.lines {
             println!("{line}");
         }
-        println!("{}", crate::commands::workspace_tip::line(&tip));
+        println!(
+            "{}",
+            crate::commands::workspace_tip::line(
+                &response.workspace_tip.unwrap_or(
+                    crate::commands::workspace_tip::WorkspaceTip::Unknown {
+                        reason: "the daemon that answered this log does not report it; \
+                                 `kin daemon stop` and re-run picks it up on this build"
+                            .to_string(),
+                    }
+                )
+            )
+        );
         println!(
             "{}",
             crate::commands::repository_authority::answered_by_line(
-                crate::commands::repository_authority::AuthoritySource::OwnAuthorityOpen
+                crate::commands::repository_authority::AuthoritySource::RunningDaemon
             )
         );
+        return Ok(());
     }
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
+    let (report, tip) = local_log(&binding, count)?;
+    for line in render_lines(&report) {
+        println!("{line}");
+    }
+    println!("{}", crate::commands::workspace_tip::line(&tip));
+    println!(
+        "{}",
+        crate::commands::repository_authority::answered_by_line(
+            crate::commands::repository_authority::AuthoritySource::OwnAuthorityOpen
+        )
+    );
     Ok(())
 }
 
@@ -360,6 +459,7 @@ pub fn build_log_response_at(
         lines: render_lines(&report),
         report: Some(report),
         workspace_tip: Some(workspace_tip_at(authority)),
+        report_revision: LOG_REPORT_REVISION,
     })
 }
 
@@ -493,6 +593,296 @@ mod tests {
             opens, 1,
             "one `kin log` must open repository authority once and ask that open for both the \
              history and the workspace-tip reading; opening per reading is GAP-6"
+        );
+    }
+
+    /// A fixture store, its binding, and the JSON one local open prints from it.
+    ///
+    /// The reference every `--json` case below compares against: it is what this
+    /// command printed before a daemon could answer it, and the only thing it is
+    /// allowed to print now.
+    fn fixture_store() -> (
+        tempfile::TempDir,
+        kin_core::KinLayout,
+        kin_core::LocalRepositoryAuthorityBinding,
+        String,
+    ) {
+        let root = tempfile::tempdir().expect("a temporary directory for the fixture store");
+        let init = kin_core::init(root.path()).expect("kin_core::init builds a real store");
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout)
+            .expect("the fixture store binds");
+        let (report, _tip) = local_log(&binding, 5).expect("a fresh store answers a log");
+        assert_eq!(
+            report.schema, LOG_SCHEMA,
+            "the reference report must be a real one, or every comparison below is vacuous"
+        );
+        let expected = serde_json::to_string_pretty(&report).expect("a report serializes");
+        (root, init.layout, binding, expected)
+    }
+
+    /// What a daemon on THIS build answers, built through the daemon's own
+    /// helper rather than by hand, so the fixture cannot drift from the wire.
+    fn daemon_answer(
+        binding: &kin_core::LocalRepositoryAuthorityBinding,
+        count: usize,
+    ) -> LogResponse {
+        let authority =
+            ActiveRepositoryAuthority::open(binding).expect("the fixture store opens once more");
+        build_log_response_at(&authority, &LogRequest { count })
+            .expect("the daemon route builds a response")
+    }
+
+    /// `kin log --json` answered by a daemon at this revision must open nothing.
+    ///
+    /// The cost this command was paying: on the converted psf/requests store of
+    /// 2026-09-05 the CLI's own open was the whole of an 11.04 second two-entry
+    /// log, while the daemon that could have answered held one open per
+    /// publication. The count is the bound rather than the clock, because a
+    /// CI-sized fixture answers in milliseconds either way.
+    ///
+    /// Breaking it: make `json_log` ignore what the daemon answered, which is
+    /// what the shipped code did by gating the daemon route on `!json`. The
+    /// count goes to 1.
+    #[test]
+    fn a_json_log_answered_at_this_report_revision_opens_no_authority() {
+        let _daemon = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
+        let (_root, layout, binding, expected) = fixture_store();
+        let answered = daemon_answer(&binding, 5);
+
+        let before = kin_core::authority_opens();
+        let printed = json_log(&layout, 5, Some(&answered)).expect("the daemon answer prints");
+        let opens = kin_core::authority_opens() - before;
+
+        assert_eq!(
+            printed, expected,
+            "a `--json` log routed through the daemon must print exactly what this build prints \
+             from its own open"
+        );
+        assert_eq!(
+            opens, 0,
+            "a `--json` log the daemon already answered must not open the whole store again"
+        );
+    }
+
+    /// The control for the count above, and the refusal it names.
+    ///
+    /// A peer at another report revision may hold a report whose fields this
+    /// build would fill differently, so its bytes are not this build's answer.
+    /// This is also what proves the assertion above is looking at something: the
+    /// same measurement, on the same fixture, must read 1 here.
+    #[test]
+    fn a_json_log_answered_at_another_report_revision_opens_and_answers_the_same() {
+        let _daemon = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
+        let (_root, layout, binding, expected) = fixture_store();
+        let mut answered = daemon_answer(&binding, 5);
+        answered.report_revision = LOG_REPORT_REVISION + 1;
+
+        let before = kin_core::authority_opens();
+        let printed = json_log(&layout, 5, Some(&answered)).expect("the local open prints");
+        let opens = kin_core::authority_opens() - before;
+
+        assert_eq!(
+            printed, expected,
+            "falling back must answer exactly as it always did"
+        );
+        assert_eq!(
+            opens, 1,
+            "a report from another revision must be refused and answered by one local open"
+        );
+    }
+
+    /// The same answer as it would arrive from a daemon built before
+    /// `report_revision` existed: serialized, the key removed, deserialized.
+    ///
+    /// Built by REMOVING the key rather than by setting the field to 0, because
+    /// those are different fixtures. Setting the field asserts what this build
+    /// thinks an absent key deserializes to; removing it asks. And the removal
+    /// is checked, so a rename of the field turns this into a failure rather
+    /// than into a case that quietly stops building the peer it names.
+    fn older_peer_answer(response: &LogResponse) -> LogResponse {
+        let mut value = serde_json::to_value(response).expect("a response serializes");
+        let object = value
+            .as_object_mut()
+            .expect("a response serializes as an object");
+        assert!(
+            object.remove("report_revision").is_some(),
+            "this fixture is the wire shape MINUS the revision key, so the key has to be there to \
+             remove; if it is gone or renamed, this case no longer builds an older peer"
+        );
+        serde_json::from_value(value).expect("an older peer's envelope still deserializes")
+    }
+
+    /// A peer too old to name a revision reads as "cannot say", not as agreement.
+    ///
+    /// `report_revision` is `#[serde(default)]`, so an older daemon's silence
+    /// arrives as 0. Treating 0 as a match would print that peer's report with
+    /// every field this build has added since silently defaulted in.
+    ///
+    /// The fixture carries a COMPLETE report, which is what makes this a guard
+    /// rather than a restatement. `build_log_response_at` has always filled
+    /// `report`, so a genuinely old peer sends a filled report and no revision
+    /// key; and a fixture whose report is absent is refused by the
+    /// `report.as_ref()` at the end of the gate whichever way the revision
+    /// comparison goes, so it would stay green with that comparison deleted.
+    /// This arm is the one that goes red for it.
+    #[test]
+    fn a_json_log_answered_by_a_peer_that_names_no_revision_opens_locally() {
+        let _daemon = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
+        let (_root, layout, binding, expected) = fixture_store();
+        let older_peer = older_peer_answer(&daemon_answer(&binding, 5));
+        assert_eq!(
+            older_peer.report_revision, 0,
+            "silence must read as revision 0, or this case proves nothing"
+        );
+        assert!(
+            older_peer.report.is_some(),
+            "the peer must carry a report, or the gate refuses it on the report alone and the \
+             revision comparison this case exists for is never reached"
+        );
+
+        let before = kin_core::authority_opens();
+        let printed = json_log(&layout, 5, Some(&older_peer)).expect("the local open prints");
+        let opens = kin_core::authority_opens() - before;
+
+        assert_eq!(printed, expected, "falling back answers exactly as it did");
+        assert_eq!(
+            opens, 1,
+            "an older peer names no revision, so its report must not be printed as ours"
+        );
+    }
+
+    /// A peer that carries no report at all is refused on the report itself.
+    ///
+    /// The other half of the refusal, kept separate from the revision arm above
+    /// so that neither can stand in for the other: a daemon that answered
+    /// without a report, and a daemon whose report this build may not print, are
+    /// different facts and each needs its own case.
+    #[test]
+    fn a_json_log_answered_by_a_peer_that_carries_no_report_opens_locally() {
+        let _daemon = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
+        let (_root, layout, _binding, expected) = fixture_store();
+        let no_report: LogResponse = serde_json::from_value(serde_json::json!({
+            "lines": ["change ..."],
+            "report": null,
+            "report_revision": LOG_REPORT_REVISION,
+        }))
+        .expect("an envelope with no report still deserializes");
+
+        let before = kin_core::authority_opens();
+        let printed = json_log(&layout, 5, Some(&no_report)).expect("the local open prints");
+        let opens = kin_core::authority_opens() - before;
+
+        assert_eq!(printed, expected, "falling back answers exactly as it did");
+        assert_eq!(
+            opens, 1,
+            "an answer carrying no report must be answered by one local open"
+        );
+    }
+
+    /// Every field of the report, populated, so the shape pin below sees all of
+    /// them.
+    ///
+    /// `start_target` and `start_change` carry `skip_serializing_if`, and a fresh
+    /// store has no entries, so a report taken straight off the fixture would pin
+    /// a shape smaller than the real one and the guard would miss exactly the
+    /// fields most likely to move.
+    fn fully_populated_report(mut report: LogReport) -> LogReport {
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([7; 32]));
+        report.start_target = Some(RefTarget::Change { change_id });
+        report.start_change = Some(change_id);
+        report.entries = vec![LogEntry {
+            change_id,
+            depth: 0,
+            origin: ChangeOrigin::Native,
+            parents: vec![SemanticChangeId::from_hash(Hash256::from_bytes([8; 32]))],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("ada"),
+            message: "Right-align report amounts".to_string(),
+            entity_delta_count: 2,
+            entity_deltas_unchanged: 10,
+            relation_delta_count: 3,
+            tree_delta_count: 1,
+            admission_policy_changed: false,
+        }];
+        report
+    }
+
+    fn sorted_field_names(value: &serde_json::Value) -> String {
+        let mut names: Vec<&str> = value
+            .as_object()
+            .expect("a report and its entries serialize as objects")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        names.sort_unstable();
+        names.join(",")
+    }
+
+    /// A field added to the report must move [`LOG_REPORT_REVISION`] with it.
+    ///
+    /// The revision is what lets `kin log --json` print a peer's report as its
+    /// own, and it is only true while it tracks the shape. A field added under
+    /// `#[serde(default)]` without moving it would let a peer that never had
+    /// that field supply a default this build then prints as a measurement.
+    /// Nothing else in the suite can see that, because both sides deserialize
+    /// happily and the number is simply wrong.
+    #[test]
+    fn adding_a_report_field_must_move_the_report_revision() {
+        let _daemon = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
+        let root = tempfile::tempdir().expect("a temporary directory for the fixture store");
+        let init = kin_core::init(root.path()).expect("kin_core::init builds a real store");
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout)
+            .expect("the fixture store binds");
+        let (report, _tip) = local_log(&binding, 5).expect("a fresh store answers a log");
+        let report = fully_populated_report(report);
+        let value = serde_json::to_value(&report).expect("a report serializes");
+
+        assert_eq!(
+            (
+                LOG_REPORT_REVISION,
+                sorted_field_names(&value).as_str(),
+                sorted_field_names(&value["entries"][0]).as_str(),
+            ),
+            (
+                1,
+                "authority,authority_generation,entries,repository_id,requested_count,roots,\
+                 schema,start_change,start_target,truncated,workspace_generation,workspace_head,\
+                 workspace_id",
+                "admission_policy_changed,author,change_id,depth,entity_delta_count,\
+                 entity_deltas_unchanged,message,origin,parents,relation_delta_count,timestamp,\
+                 tree_delta_count",
+            ),
+            "the log report or its entries changed shape. A peer at an older revision cannot fill \
+             a field it never had, so `LOG_REPORT_REVISION` must move in the same change as the \
+             field, and this pin must move with it"
+        );
+    }
+
+    /// A report that crosses the wire and comes back serializes to the same
+    /// bytes.
+    ///
+    /// `kin log --json` prints a value it deserialized from a peer, so every
+    /// type in the report has to round-trip. One that does not would change the
+    /// contract silently for exactly the readers that pin it.
+    #[test]
+    fn a_report_that_crosses_the_wire_serializes_to_the_same_bytes() {
+        let _daemon = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
+        let root = tempfile::tempdir().expect("a temporary directory for the fixture store");
+        let init = kin_core::init(root.path()).expect("kin_core::init builds a real store");
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout)
+            .expect("the fixture store binds");
+        let (report, _tip) = local_log(&binding, 5).expect("a fresh store answers a log");
+        let report = fully_populated_report(report);
+
+        let sent = serde_json::to_string(&report).expect("a report serializes onto the wire");
+        let received: LogReport =
+            serde_json::from_str(&sent).expect("a report deserializes off the wire");
+
+        assert_eq!(
+            serde_json::to_string_pretty(&received).expect("the received report serializes"),
+            serde_json::to_string_pretty(&report).expect("the local report serializes"),
+            "a report must survive the wire byte for byte, or `--json` prints something this \
+             build would not have printed"
         );
     }
 

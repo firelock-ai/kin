@@ -1244,6 +1244,12 @@
       "expiration": "2027-04-23"
     },
     {
+      "file": "crates/kin-cli/src/commands/hosted_publication.rs",
+      "reason": "Operator boundary for the first publication of a reserved hosted repository, end to end. Every filesystem touch here is an explicit input or output of that boundary and none of them is a semantic answer: reading the operation-bound manifest, making the intended publication durable before the irreversible compare-and-swap and reading an earlier one back to refuse replacing it, and writing the evidence record. The reads that decide anything are graph reads: the published authority is opened through RepositoryAuthorityManager and its body closure measured through kin-remote's own validation view, never by walking destination files. The existence and symlink probes are safety checks on those same operator-supplied paths, because following a link would let whoever can create one decide what this process reads or overwrites. This module resolves no locate, search, context, trace, review or xref result, and any future answer logic belongs elsewhere and requires narrowing or removing this exemption. Whole-file rather than expression pins because the module is dedicated to the boundary; narrowing to pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-23"
+    },
+    {
       "file": "crates/kin-cli/src/commands/publish.rs",
       "reason": "Release publication transport. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
       "owner": "kin-cli",

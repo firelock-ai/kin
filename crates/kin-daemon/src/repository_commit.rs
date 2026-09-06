@@ -1612,7 +1612,29 @@ fn plan_native_commit_inner(
 ) -> Result<NativeCommitPlan> {
     let repository_id = authority_context.repository_id().clone();
     let workspace_id = authority_context.workspace_id();
-    let authority = authority_context.open().map_err(DaemonError::Graph)?;
+    // Named, because the phase around it is the largest of the commit and almost
+    // none of it is measured. On the converted psf/requests store of 2026-09-05
+    // `plan_transaction` took 29,081 ms while every sub-phase this function
+    // already times stayed under the 500 ms `timed_commit_phase` reports at, so
+    // not one of them appears in the daemon log and at least 26.5 seconds of a
+    // 77 second commit carries no name at all. This open and the workspace-graph
+    // materialization below are the two O(store) operations inside that gap: an
+    // open decodes the whole persisted authority and then re-verifies every body
+    // in repository CAS against its content address. Naming them costs nothing
+    // and is what makes the next measurement an attribution rather than another
+    // hypothesis.
+    //
+    // What a name buys is the LOGGED `elapsed_ms`, which each closure bounds
+    // exactly. The live phase label is looser and always has been: `enter_phase`
+    // overwrites a single slot and nothing restores the enclosing phase on exit,
+    // so the roots check and the workspace lookup below are reported by the
+    // liveness ticker as still inside this phase until the next one is entered.
+    // That shape is shared with every phase already named in this function and
+    // is not changed here; it is written down so a reader of a live trace does
+    // not read the label as tightly as the durations.
+    let authority = crate::mcp_commit::timed_commit_phase("plan_open_authority", || {
+        authority_context.open().map_err(DaemonError::Graph)
+    })?;
     let lease = authority.read_authority();
     if expected_roots.is_some_and(|expected| expected != lease.roots()) {
         return Err(invalid(
@@ -1638,7 +1660,9 @@ fn plan_native_commit_inner(
     }
 
     let (commit_target, current_ref_target, head) =
-        resolve_commit_base(metadata, &workspace.head, workspace.base_target.as_ref())?;
+        crate::mcp_commit::timed_commit_phase("plan_resolve_base", || {
+            resolve_commit_base(metadata, &workspace.head, workspace.base_target.as_ref())
+        })?;
     let previous_change = if let Some(amend) = amend {
         require_amend_head(head, amend.expected_head)?;
         Some(
@@ -1683,14 +1707,21 @@ fn plan_native_commit_inner(
     // whole authority publication after it. It has nothing to contribute to
     // either.
     let workspace_semantic_delta = {
+        // The authority half of the diff, and the other O(store) operation in
+        // this function. It reads the workspace's graph out of authority, and on
+        // a store whose materialized base section does not resolve at the change
+        // being asked about, kin-db folds that base out of history instead. It
+        // sat untimed between two timed phases, so whatever it costs was
+        // invisible in every commit profile taken so far.
         let authority_workspace_graph =
-            lease
-                .workspace_graph_snapshot(&workspace_id)?
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "repository authority has no graph snapshot for workspace {workspace_id}"
-                    ))
-                })?;
+            crate::mcp_commit::timed_commit_phase("plan_authority_workspace_graph", || {
+                lease.workspace_graph_snapshot(&workspace_id)
+            })?
+            .ok_or_else(|| {
+                invalid(format!(
+                    "repository authority has no graph snapshot for workspace {workspace_id}"
+                ))
+            })?;
         let desired_workspace_graph =
             crate::mcp_commit::timed_commit_phase("plan_snapshot_clone", || graph.to_snapshot());
         crate::mcp_commit::timed_commit_phase("plan_diff_semantics", || {
@@ -2139,10 +2170,21 @@ pub(crate) fn commit_native_plan(
 /// transaction above is durable and the change is committed; a memoization that
 /// did not persist is a slower next open, not a failed commit, and turning one
 /// into the other would be a strictly worse product than the row this fixes.
-fn refresh_workspace_base_graph_section(
+/// `transition` names the local repository operation that moved the base, so a
+/// log line says which one paid for the refresh. A commit is not the only such
+/// operation: a branch switch, a pull's follow of a moved ref and a merge all
+/// move the workspace base without committing through this module, and every
+/// one of them left a section behind that kin-db then refuses. Journey GAP-4
+/// read that refusal on an origin right after it received a push, which is the
+/// one transfer that does NOT move a base: a received pack carries
+/// `workspace_mutation: None` (`kin-remote`'s `transfer_transaction`), so the
+/// staleness the journey saw came from the branch switches and the merge that
+/// preceded it.
+pub(crate) fn refresh_workspace_base_graph_section(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     repository_id: &kin_model::RepositoryId,
     workspace_id: WorkspaceId,
+    transition: &'static str,
 ) {
     let changes_in_store = authority.read_authority().snapshot().changes.len();
     let started = std::time::Instant::now();
@@ -2154,22 +2196,25 @@ fn refresh_workspace_base_graph_section(
         Ok(Some(outcome)) => tracing::info!(
             repository = %repository_id,
             workspace = %workspace_id,
+            transition,
             changes_in_store,
             elapsed_ms,
             outcome = ?outcome,
-            "refreshed the workspace base graph section after a native commit"
+            "refreshed the workspace base graph section after a local repository transition"
         ),
         Ok(None) => tracing::info!(
             repository = %repository_id,
             workspace = %workspace_id,
+            transition,
             "no workspace to refresh a graph section for"
         ),
         Err(error) => tracing::warn!(
             repository = %repository_id,
             workspace = %workspace_id,
+            transition,
             elapsed_ms,
             %error,
-            "the workspace base graph section did not persist after this commit, so the next \
+            "the workspace base graph section did not persist after this transition, so the next \
              open folds this base out of history; `kin graph materialize` writes one"
         ),
     }
@@ -2375,6 +2420,7 @@ fn commit_native_plan_with_working_copy_proof(
         &authority,
         &repository_id,
         authority_context.workspace_id(),
+        "native commit",
     );
     Ok(NativeCommitResult {
         change: plan.change,

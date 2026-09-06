@@ -340,7 +340,7 @@ pub async fn repo_blob(
 /// report, because none was involved. Anything else is `unknown-ref`, which is a
 /// 404 about the read point and never about the path, since no tree was resolved
 /// and nothing was looked up in one.
-fn resolve_read_point(
+pub(crate) fn resolve_read_point(
     view: &crate::api::RepositoryReadView,
     reference: Option<&str>,
     repo_id: &str,

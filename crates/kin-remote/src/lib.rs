@@ -5,6 +5,8 @@ pub mod connection;
 pub mod delta_bridge;
 pub mod delta_pull;
 pub mod federated;
+pub mod first_publication;
+pub mod first_publication_gcs;
 #[cfg(feature = "http")]
 pub mod http_transport;
 pub mod invalidation;

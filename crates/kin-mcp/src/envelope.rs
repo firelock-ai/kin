@@ -4907,6 +4907,117 @@ mod tests {
             "a ranking that named the query's symbol needs no relevance caveat: {named}"
         );
     }
+    /// The surface an agent reads: the compact page this tool returns when the
+    /// whole-ranking flag is ABSENT because one row the caller never saw carried
+    /// the query's word.
+    ///
+    /// Measured on express at 798 of 798 embedded. "attach an encoding label to
+    /// a media type string" returned eight rows all `matched: text_fallback` at
+    /// scores 52.05 down to 52.02, `setCharset` was not in the ranking at limit
+    /// 8 or limit 40, and `_kin.verdict` read `certified` with a null limiting
+    /// factor and the note that every qualifying input agreed. The kinds over
+    /// the whole 31-row ranking were text_fallback 28, name 1, semantic 2, so
+    /// `all_fallback` was false and the gate above could not see this page at
+    /// all. An agent that reads `verdict.state` first, exactly as the server
+    /// instructions tell it to, was told the answer is the whole set.
+    #[test]
+    fn a_prose_locate_page_of_lexical_neighbours_never_certifies_on_the_compact_surface() {
+        let page = |named_first: bool| {
+            let first = if named_first {
+                json!({
+                    "id": "00000000-0000-0000-0000-0000000000ad",
+                    "name": "app.render",
+                    "kind": "function",
+                    "file": "lib/application.js",
+                    "line": 522,
+                    "score": 427.00,
+                    "matched": "name"
+                })
+            } else {
+                json!({
+                    "id": "00000000-0000-0000-0000-0000000000ae",
+                    "name": "app.use",
+                    "kind": "function",
+                    "file": "lib/application.js",
+                    "line": 190,
+                    "score": 52.05,
+                    "matched": "text_fallback"
+                })
+            };
+            let payload = json!({
+                "query": "attach an encoding label to a media type string",
+                "granularity": "entity",
+                "routing": "fused-v1",
+                "page": 0,
+                "surface": "compact",
+                "entities": [
+                    first,
+                    {
+                        "id": "00000000-0000-0000-0000-0000000000af",
+                        "name": "View.render",
+                        "kind": "method",
+                        "file": "lib/view.js",
+                        "line": 133,
+                        "score": 52.03,
+                        "matched": "text_fallback"
+                    }
+                ],
+                "files": ["lib/application.js", "lib/view.js"],
+                "total_ranked": 31,
+                "ranked_by": "vector, lexical and graph signals",
+                "semantic_coverage": {
+                    "indexed": 798,
+                    "total": 798,
+                    "pending": 0,
+                    "complete": true
+                }
+            });
+            annotated_value(&finalize(
+                ToolCallResult::text(payload.to_string()),
+                ready_daemon_envelope(),
+                "semantic_locate",
+            ))
+        };
+
+        let neighbours = page(false);
+        let verdict = &neighbours[ENVELOPE_KEY]["verdict"];
+        assert_eq!(verdict["state"], "inconclusive", "{neighbours}");
+        assert_eq!(verdict["safe_to_conclude_absent"], false, "{neighbours}");
+        let factor = verdict["limiting_factor"]
+            .as_str()
+            .expect("an inconclusive verdict names what limited it");
+        assert!(factor.contains("relevance_floor_unmeasured"), "{factor}");
+        assert_eq!(
+            neighbours[crate::negative::NEGATIVE_KEY]["kind"],
+            "relevance_unverified",
+            "{neighbours}"
+        );
+        assert!(
+            crate::verdict::disagreements(&neighbours).is_empty(),
+            "a response may not contradict its own verdict: {neighbours}"
+        );
+
+        // The control, and the positive one this repair is scoped by: the same
+        // page whose FIRST returned row carries the name the query used keeps
+        // its certified verdict and its target at rank 1. `app.render` answers
+        // "render a view template with a layout" on this store at score 427.00,
+        // and that name match rests on the ordinary word "render", so a rule
+        // that asked for a symbol-shaped token would have taken this answer's
+        // verdict away too.
+        let named = page(true);
+        assert_eq!(
+            named[ENVELOPE_KEY]["verdict"]["state"], "certified",
+            "{named}"
+        );
+        assert!(
+            named.get(crate::negative::NEGATIVE_KEY).is_none(),
+            "a page whose returned rows name what the query used needs no relevance caveat: {named}"
+        );
+        assert_eq!(
+            named["entities"][0]["name"], "app.render",
+            "the control's target must still be first: {named}"
+        );
+    }
 
     /// One shape, but not one substrate. A ranked answer depends on embeddings
     /// and never traverses an edge, so its classes name embeddings and an

@@ -451,6 +451,41 @@ where
         state.invalidate_projection();
     }
 
+    // The freeze this transition committed under is an EXCLUSIVE cross-process
+    // lease over the repository's storage lock, held until it is dropped, and
+    // the graph-section writer takes that same lock. Refreshing while it is
+    // alive is a command waiting on itself: measured, `kin branch switch` and a
+    // pull's workspace follow both hung for the harness's full 180 second
+    // budget. Everything above has already read what it needs from the freeze,
+    // so it is released here rather than at the end of the function.
+    drop(execution.authority_freeze);
+
+    // A switch and a follow both move this workspace's base, and until now
+    // nothing refreshed the graph section afterwards, so every later open of the
+    // store folded the new base out of history until somebody ran
+    // `kin graph materialize`. That is where journey GAP-4's surviving
+    // `resolved_at` refusal actually came from: a pull's follow of a moved ref
+    // reaches here, and so does the branch switch the product itself prints as
+    // the remedy for a workspace behind its ref.
+    //
+    // Runs for a create and a delete too. Neither moves a base, so the writer
+    // finds the section already valid and returns `AlreadyCurrent` without a
+    // durable write; a rule per request kind would cost a reader more than it
+    // saves. Still under the persistence and graph-authority gates the
+    // transition ran under, so nothing moves the base between the two.
+    //
+    // Never fatal, for the reason the commit path gives: the transition is
+    // durable and receipted, and a memoization that did not persist is a slower
+    // next open rather than a failed command. What the surface reports is read
+    // from the store by `kin_core::graph_section::read`, never from this call,
+    // so a refresh that failed is disclosed as the refusal it left behind.
+    crate::repository_commit::refresh_workspace_base_graph_section(
+        &authority.manager,
+        &authority.repository_id,
+        authority.workspace_id,
+        "workspace transition",
+    );
+
     drop(persistence);
     drop(graph_mutation);
     Ok(execution.response)

@@ -576,6 +576,16 @@ enum Command {
         #[command(subcommand)]
         action: Option<ReviewAction>,
     },
+    /// Publish a reserved hosted repository's first graph authority.
+    ///
+    /// Hidden because it is an operator boundary rather than a Kin verb: it is
+    /// driven by a trusted orchestrator that has already reserved an identity
+    /// and materialized a source, and it is meaningless without both.
+    #[command(hide = true)]
+    HostedPublication {
+        #[command(subcommand)]
+        action: HostedPublicationAction,
+    },
     /// Show entity history
     History {
         /// Entity name or ID
@@ -1403,6 +1413,49 @@ enum Command {
     Resources {
         #[command(subcommand)]
         action: ResourcesAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum HostedPublicationAction {
+    /// Build the reserved repository's durable authority and report what landed
+    Publish {
+        /// Operation-bound manifest naming the reservation, source and destination
+        #[arg(long, value_name = "PATH")]
+        manifest: PathBuf,
+        /// Trusted materialized source, as it exists on this machine
+        #[arg(long, value_name = "DIR")]
+        source: PathBuf,
+        /// Where the intended publication is made durable before it is permanent
+        #[arg(long, value_name = "PATH")]
+        intent_out: PathBuf,
+        /// Where the evidence record is written
+        #[arg(long, value_name = "PATH")]
+        evidence_out: PathBuf,
+        /// The reserved identity the caller believes the manifest holds
+        #[arg(long, value_name = "ID")]
+        expect_repository_id: String,
+        /// native-empty or exact-git, refused when it disagrees with the manifest
+        #[arg(long, value_name = "MODE")]
+        expect_mode: String,
+    },
+    /// Read a destination against a durable intent, writing nothing
+    Verify {
+        /// Operation-bound manifest naming the reservation and destination
+        #[arg(long, value_name = "PATH")]
+        manifest: PathBuf,
+        /// The durable intent to verify against, when it is not in the manifest
+        #[arg(long, value_name = "PATH")]
+        intent: Option<PathBuf>,
+        /// Where the evidence record is written
+        #[arg(long, value_name = "PATH")]
+        evidence_out: PathBuf,
+        /// The reserved identity the caller believes the manifest holds
+        #[arg(long, value_name = "ID")]
+        expect_repository_id: String,
+        /// native-empty or exact-git, refused when it disagrees with the manifest
+        #[arg(long, value_name = "MODE")]
+        expect_mode: String,
     },
 }
 
@@ -3409,6 +3462,52 @@ fn run() -> Result<()> {
                     reference,
                     all_revisions,
                 } => commands::history::run(entity, reference, all_revisions).await,
+                Command::HostedPublication { action } => {
+                    // The exit status carries the outcome a caller branches on,
+                    // the way `kin init` reports an unattested conversion: a
+                    // destination that holds nothing, one that holds somebody
+                    // else's publication and one that cannot be read either way
+                    // are three different answers, and the evidence record on
+                    // stdout names which one it was.
+                    let code = match action {
+                        HostedPublicationAction::Publish {
+                            manifest,
+                            source,
+                            intent_out,
+                            evidence_out,
+                            expect_repository_id,
+                            expect_mode,
+                        } => commands::hosted_publication::run_publish(
+                            commands::hosted_publication::PublishArgs {
+                                manifest,
+                                source,
+                                intent_out,
+                                evidence_out,
+                                expect_repository_id,
+                                expect_mode,
+                            },
+                        )?,
+                        HostedPublicationAction::Verify {
+                            manifest,
+                            intent,
+                            evidence_out,
+                            expect_repository_id,
+                            expect_mode,
+                        } => commands::hosted_publication::run_verify(
+                            commands::hosted_publication::VerifyArgs {
+                                manifest,
+                                intent,
+                                evidence_out,
+                                expect_repository_id,
+                                expect_mode,
+                            },
+                        )?,
+                    };
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
+                }
                 Command::DeadCode {
                     seed,
                     limit,

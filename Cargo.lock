@@ -3667,10 +3667,13 @@ dependencies = [
 name = "kin-remote"
 version = "0.7.2"
 dependencies = [
+ "async-trait",
  "base64 0.23.0",
  "chrono",
+ "futures-util",
  "kin-db",
  "kin-model",
+ "object_store",
  "pretty_assertions",
  "serde",
  "serde_json",

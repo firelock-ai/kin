@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+#![cfg(unix)]
+
 use super::*;
 
 fn sole_entity(state: &DaemonState, path: &str) -> Entity {

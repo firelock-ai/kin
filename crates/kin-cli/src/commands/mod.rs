@@ -40,6 +40,7 @@ pub mod graph_health;
 pub mod graph_viz;
 pub mod health;
 pub mod history;
+pub mod hosted_publication;
 pub mod impact;
 pub mod init;
 pub mod intent;
