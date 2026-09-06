@@ -12,10 +12,10 @@
 //! `kin resolve --continue` reaches through
 //! `repository_merge_state::execute_resolve`. The second carried no refresh.
 //!
-//! Measured on b1837fa59 by a journey walking this repository the way a
-//! stranger would: after the first commit, after each branch switch, after a
-//! fast-forward merge and after a merge that parked with conflicts, the section
-//! read present and current; after `kin resolve --all-ours` and
+//! Measured by a journey walking this repository the way a stranger would:
+//! after the first commit, after each branch switch, after a fast-forward merge
+//! and after a merge that parked with conflicts, the section read present and
+//! current; after `kin resolve --all-ours` and
 //! `kin resolve --continue` it read present but refused (`resolved_at`) until
 //! `kin graph materialize` was run by hand. So the one way a merge can end that
 //! needs a person's attention is also the one way that left the store folding

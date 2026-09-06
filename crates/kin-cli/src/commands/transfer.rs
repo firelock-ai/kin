@@ -287,7 +287,11 @@ pub(crate) fn resolve_peer(
 /// echoing the password onto the terminal and into whatever captured it. The
 /// three sites kin#1561 fixed already call
 /// `kin_remote::repository_transfer::redacted_remote_address`; this is the
-/// fourth, and it was the only remaining verbatim base URL in this module.
+/// fourth, and the last of this module's REFUSALS to name the base URL
+/// verbatim. It is not the last verbatim base URL here: `kin remote plan-push`
+/// still prints the configured address unredacted, both in its `--json` dump of
+/// the plan and in its `Remote:` line. Those are a reporting surface rather than
+/// a refusal, they leak the same credential, and they are their own change.
 ///
 /// A function rather than an inline `format!`, for the reason
 /// `remote::missing_bearer_token_message` is one: the address half has a `None`
