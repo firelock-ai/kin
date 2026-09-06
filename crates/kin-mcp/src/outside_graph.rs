@@ -58,7 +58,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use kin_model::entity::EntityRole;
+use kin_model::entity::{EntityKind, EntityRole};
 use kin_model::graph::{EntityFilter, EntityStore};
 
 /// Reserved, additive payload key carrying the unadmitted-dependency
@@ -126,7 +126,15 @@ pub fn observe<S: EntityStore>(store: &S, question: &str) -> OutsideGraphObserva
     if tokens.is_empty() {
         return observed;
     }
+    // The kind is in the filter as well as the role, and it is there for cost.
+    // A single-kind filter is served by the store's kind index, where a
+    // role-only filter falls through to a scan of every entity, and this
+    // observation runs on every retrieval call that carries a question. The
+    // linker builds every external reference target as a `Module`, and the
+    // linker-driven test below would find nothing if that ever stopped being
+    // true, so the narrowing cannot silently start hiding targets.
     let Ok(candidates) = store.query_entities(&EntityFilter {
+        kinds: Some(vec![EntityKind::Module]),
         roles: Some(vec![EntityRole::External]),
         ..EntityFilter::default()
     }) else {
@@ -256,7 +264,7 @@ mod tests {
     use kin_db::InMemoryGraph;
     use kin_index::linker::{ArtifactIdentityMap, FileParseData};
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
+        Entity, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
     };
     use kin_model::ids::{EntityId, FilePathId, Hash256, LanguageId};
     use kin_model::relation::RelationKind;
