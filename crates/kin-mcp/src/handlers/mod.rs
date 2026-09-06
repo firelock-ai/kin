@@ -67,7 +67,7 @@ pub async fn handle_tool_call<G: GraphStore>(
 }
 
 /// Disclose an identifier the question named that this graph holds no
-/// definition for, on whichever tool was asked (FIR-3306).
+/// definition for, on whichever tool was asked.
 ///
 /// Here rather than in each handler because this is the one place on THIS route
 /// holding both the arguments and the store, and because the gap is not one

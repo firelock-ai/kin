@@ -15,7 +15,7 @@
 //! `completeness.bound: "exact"`, `status: "complete"`. Every word of that is
 //! true about the graph and silent about the question, and nothing in it
 //! distinguishes "I searched everything and found it" from "I searched
-//! everything I have and the answer is elsewhere" (FIR-3306).
+//! everything I have and the answer is elsewhere".
 //!
 //! The fact was already in the graph, which is why this reads no files. The
 //! linker models an import it could not resolve locally as a placeholder
@@ -181,6 +181,11 @@ pub struct OutsideGraphObservation {
     pub asked_about: BTreeSet<String>,
     /// The symbols they matched, each a definition this graph does not hold.
     pub symbols: Vec<OutsideSymbol>,
+    /// Symbols the question named that come from an unadmitted module AND are
+    /// defined in this repository. Reported so a reader can see the collision,
+    /// and kept out of [`Self::symbols`] so the verdict does not refuse on a
+    /// question the graph can answer.
+    pub also_defined_locally: Vec<OutsideSymbol>,
     /// How many rows of the store's external-entity page were examined.
     pub targets_examined: usize,
     /// How many rows that query matched in total, which is larger than
@@ -194,6 +199,7 @@ impl Default for OutsideGraphObservation {
             scan: ScanState::Complete,
             asked_about: BTreeSet::new(),
             symbols: Vec::new(),
+            also_defined_locally: Vec::new(),
             targets_examined: 0,
             targets_matching: 0,
         }
@@ -209,14 +215,14 @@ impl OutsideGraphObservation {
     /// that is the whole point of this method existing rather than a bare
     /// `symbols.is_empty()`.
     pub fn is_reportable(&self) -> bool {
-        !self.symbols.is_empty() || self.scan != ScanState::Complete
+        !self.symbols.is_empty()
+            || !self.also_defined_locally.is_empty()
+            || self.scan != ScanState::Complete
     }
 }
 
 /// The question this call asked, from whichever argument the tool carries it in.
-pub fn question_argument<'a>(
-    arguments: &'a std::collections::HashMap<String, Value>,
-) -> Option<&'a str> {
+pub fn question_argument(arguments: &std::collections::HashMap<String, Value>) -> Option<&str> {
     QUESTION_ARGUMENTS.iter().find_map(|name| {
         arguments
             .get(*name)
@@ -241,7 +247,10 @@ pub fn question_argument<'a>(
 /// and the local-definition check beside it, run only for a target the question
 /// already named, so a question about code this repository owns costs one
 /// filtered entity page and nothing else.
-pub fn observe<S: OutsideGraphReads + ?Sized>(store: &S, question: &str) -> OutsideGraphObservation {
+pub fn observe<S: OutsideGraphReads + ?Sized>(
+    store: &S,
+    question: &str,
+) -> OutsideGraphObservation {
     let mut observed = OutsideGraphObservation::default();
     let tokens = question_tokens(question);
     if tokens.is_empty() {
@@ -252,34 +261,37 @@ pub fn observe<S: OutsideGraphReads + ?Sized>(store: &S, question: &str) -> Outs
         observed.scan = ScanState::ReadFailed;
         return observed;
     };
-    observed.targets_matching = page.total_matching;
-
-    // Counted off the page rather than off the predicate below, because that is
-    // what `total_matching` is comparable to. Counting only the rows that pass
-    // `is_external_reference_target` would read a page holding one locally
-    // defined `third_party/` entity as a truncated scan forever.
-    observed.targets_examined = page.entities.len();
+    observed.targets_matching = page.total;
+    observed.targets_examined = page.examined_rows;
+    if page.stopped_short {
+        observed.scan = ScanState::BudgetExhausted;
+    }
 
     let mut by_symbol: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut also_local: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for entity in page.entities {
-        if !kin_index::is_external_reference_target(&entity) {
+        if !question_names(&tokens, question, &entity.name) {
             continue;
         }
-
-        let folded = entity.name.to_ascii_lowercase();
-        if !tokens.contains(&folded) {
-            continue;
-        }
-        // The second guard. A symbol this repository also defines is answerable
-        // from the graph whatever else imports something by that name, and
-        // refusing there would put a floor under every question about a common
-        // word. On express, `send`, `path`, `resolve` and `parse` are all bound
-        // from unadmitted modules AND defined locally.
-        if defines_locally(store, &entity.name) {
-            continue;
-        }
-        observed.asked_about.insert(folded);
-        let modules = by_symbol.entry(entity.name.clone()).or_default();
+        observed
+            .asked_about
+            .insert(entity.name.to_ascii_lowercase());
+        // The second guard, and the second bucket rather than a silent drop. A
+        // symbol this repository also defines is answerable from the graph
+        // whatever else imports something by that name, so refusing there would
+        // put a floor under every question about a common word: express binds
+        // `send`, `path`, `resolve` and `parse` from unadmitted modules and
+        // defines the methods a reader means by them in its own source. But
+        // "answerable" is not "answered", and dropping the fact left a reader
+        // with no way to learn that the name they asked about ALSO comes from a
+        // package this graph cannot see. So it is reported under its own key,
+        // which the verdict does not refuse on.
+        let bucket = if defines_locally(store, &entity.name) {
+            &mut also_local
+        } else {
+            &mut by_symbol
+        };
+        let modules = bucket.entry(entity.name.clone()).or_default();
         if let Some(relations) = store.relations(&entity.id) {
             for relation in relations {
                 if relation.dst.as_entity() != Some(entity.id) {
@@ -295,14 +307,50 @@ pub fn observe<S: OutsideGraphReads + ?Sized>(store: &S, question: &str) -> Outs
         }
     }
 
-    if observed.targets_matching > observed.targets_examined {
-        observed.scan = ScanState::BudgetExhausted;
-    }
     observed.symbols = by_symbol
         .into_iter()
         .map(|(symbol, modules)| OutsideSymbol { symbol, modules })
         .collect();
+    observed.also_defined_locally = also_local
+        .into_iter()
+        .map(|(symbol, modules)| OutsideSymbol { symbol, modules })
+        .collect();
     observed
+}
+
+/// Whether the question named this symbol in a way that means the symbol.
+///
+/// A bare lowercase token is not enough on its own, and the reason is a package
+/// list rather than a principle: an unadmitted dependency named `error`,
+/// `request`, `path` or `send` would otherwise match every question containing
+/// that ordinary English word, and a disclosure that fires on the word "error"
+/// is a floor under the whole surface.
+///
+/// Two forms qualify, and both mean the asker was naming an identifier rather
+/// than using a word. The question wrote it qualified, with a dot on either side
+/// (`router.param`, `express.Router`), which is what a caller describing an API
+/// does. Or the question spelled it exactly as the graph records it AND that
+/// spelling is not a bare lowercase word: `Router` and `parse_url` are spellings
+/// a caller only produces by naming the symbol, where `error` is a spelling
+/// every English sentence produces by accident.
+fn question_names(tokens: &BTreeSet<String>, question: &str, symbol: &str) -> bool {
+    if !tokens.contains(&symbol.to_ascii_lowercase()) {
+        return false;
+    }
+    let looks_like_an_identifier = symbol
+        .chars()
+        .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if looks_like_an_identifier && question.contains(symbol) {
+        return true;
+    }
+    let folded = question.to_ascii_lowercase();
+    let needle = symbol.to_ascii_lowercase();
+    folded.match_indices(&needle).any(|(at, _)| {
+        let before = folded[..at].chars().next_back();
+        let after = folded[at + needle.len()..].chars().next();
+        let bounded = |c: Option<char>| !c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        bounded(before) && bounded(after) && (before == Some('.') || after == Some('.'))
+    })
 }
 
 /// One bounded page of this store's external reference targets, or `None` when
@@ -320,26 +368,82 @@ pub fn observe<S: OutsideGraphReads + ?Sized>(store: &S, question: &str) -> Outs
 /// nothing: exactly the false "you are fine" this module exists to stop. So an
 /// empty narrow answer is re-asked by role alone, and only an empty answer to
 /// THAT means there are no targets.
-fn external_targets<S: OutsideGraphReads + ?Sized>(store: &S) -> Option<EntityPageResult> {
-    let page = EntityPage::first(TARGET_BUDGET);
-    let narrow = store.page(
+fn external_targets<S: OutsideGraphReads + ?Sized>(store: &S) -> Option<ExternalTargets> {
+    let narrow = paged(
+        store,
         &EntityFilter {
             kinds: Some(vec![EntityKind::Module]),
             roles: Some(vec![EntityRole::External]),
             ..EntityFilter::default()
         },
-        &page,
     )?;
-    if narrow.total_matching > 0 {
+    if narrow.total > 0 {
         return Some(narrow);
     }
-    store.page(
+    paged(
+        store,
         &EntityFilter {
             roles: Some(vec![EntityRole::External]),
             ..EntityFilter::default()
         },
-        &page,
     )
+}
+
+/// Every external reference target the filter matches, followed page by page up
+/// to [`TARGET_BUDGET`].
+///
+/// One page was not paging. A repository with more external targets than one
+/// page holds read `budget_exhausted` on every call forever, which is a
+/// permanent floor under every question that store is ever asked, and the
+/// budget is supposed to bound a scan rather than end it.
+///
+/// The budget counts EXTERNAL REFERENCE TARGETS, not rows. A row that is
+/// `EntityRole::External` because it lives under `third_party/` owns its source
+/// and is not what this scans for, so counting it would spend the budget on
+/// entities the answer never considers.
+fn paged<S: OutsideGraphReads + ?Sized>(
+    store: &S,
+    filter: &EntityFilter,
+) -> Option<ExternalTargets> {
+    let mut collected = ExternalTargets::default();
+    let mut offset = 0usize;
+    loop {
+        let window = TARGET_BUDGET.saturating_sub(collected.entities.len());
+        if window == 0 {
+            collected.stopped_short = collected.examined_rows < collected.total;
+            return Some(collected);
+        }
+        let page = store.page(filter, &EntityPage::new(offset, window))?;
+        collected.total = page.total_matching;
+        collected.examined_rows += page.entities.len();
+        collected.entities.extend(
+            page.entities
+                .into_iter()
+                .filter(kin_index::is_external_reference_target),
+        );
+        match page.next_offset {
+            Some(next) if next > offset && collected.examined_rows < collected.total => {
+                offset = next;
+            }
+            _ => {
+                collected.stopped_short = collected.examined_rows < collected.total;
+                return Some(collected);
+            }
+        }
+    }
+}
+
+/// The external reference targets one scan collected, and whether it finished.
+#[derive(Debug, Default)]
+struct ExternalTargets {
+    /// The targets themselves, at most [`TARGET_BUDGET`] of them.
+    entities: Vec<Entity>,
+    /// Rows the store handed over, including ones that were not targets.
+    examined_rows: usize,
+    /// How many rows the filter matched in total.
+    total: usize,
+    /// Whether the budget stopped the walk with rows left unread.
+    stopped_short: bool,
 }
 
 /// Whether this repository defines something a question asking for `name` would
@@ -361,7 +465,8 @@ fn defines_locally<S: OutsideGraphReads + ?Sized>(store: &S, name: &str) -> bool
         .named(name)
         .map(|entities| {
             entities.iter().any(|entity| {
-                !kin_index::is_external_reference_target(entity) && names_the_same(&entity.name, name)
+                !kin_index::is_external_reference_target(entity)
+                    && names_the_same(&entity.name, name)
             })
         })
         .unwrap_or(false)
@@ -393,13 +498,24 @@ pub fn block(observed: &OutsideGraphObservation) -> Option<Value> {
                 "modules": entry.modules.iter().cloned().collect::<Vec<_>>(),
             }))
             .collect::<Vec<_>>(),
+        "also_defined_locally": observed
+            .also_defined_locally
+            .iter()
+            .map(|entry| json!({
+                "symbol": entry.symbol,
+                "modules": entry.modules.iter().cloned().collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
         "targets_examined": observed.targets_examined,
         "targets_matching": observed.targets_matching,
     }))
 }
 
 /// Observe and render in one call, for a caller holding a store and a question.
-pub fn observe_for_question<S: OutsideGraphReads + ?Sized>(store: &S, question: &str) -> Option<Value> {
+pub fn observe_for_question<S: OutsideGraphReads + ?Sized>(
+    store: &S,
+    question: &str,
+) -> Option<Value> {
     block(&observe(store, question))
 }
 
@@ -489,7 +605,6 @@ mod tests {
     use kin_model::entity::{
         EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
     };
-    use kin_model::graph::EntityStore as _;
     use kin_model::ids::{FilePathId, Hash256, LanguageId};
     use kin_model::relation::RelationKind;
     use kin_model::ArtifactId;
@@ -694,15 +809,32 @@ mod tests {
             .upsert_entity(&local("res.send", "lib/response.js"))
             .expect("the local definition admits");
 
+        let observed = observe(&graph, "where does res.send set the content length");
         assert!(
-            observe(&graph, "where does res.send set the content length")
-                .symbols
-                .is_empty(),
+            observed.symbols.is_empty(),
             "`res.send` is defined in this repository, so this question is answerable from it"
         );
+        assert_eq!(
+            observed.also_defined_locally.len(),
+            1,
+            "and the collision is reported rather than dropped, so a reader can see that the \
+             name also comes from a package this graph cannot look into"
+        );
+        assert_eq!(observed.also_defined_locally[0].symbol, "send");
+
+        let block = block(&observed).expect("the collision is worth publishing");
+        assert_eq!(
+            block["symbols"],
+            serde_json::json!([]),
+            "nothing in the refusing bucket: {block}"
+        );
+        assert_eq!(
+            block["also_defined_locally"][0]["symbol"],
+            serde_json::json!("send")
+        );
         assert!(
-            observe_for_question(&graph, "where does res.send set the content length").is_none(),
-            "and nothing is published, so the answer stays certifiable"
+            limiting_clause(&block).is_none(),
+            "and the verdict does not refuse on a question the graph can answer"
         );
 
         // The control on the control: the same store, the same shape, a symbol
@@ -773,18 +905,20 @@ mod tests {
     /// A store holding more external targets than the budget examines, with the
     /// asked-for symbol deliberately outside the examined prefix.
     struct OverBudgetStore {
-        page: Vec<Entity>,
-        total: usize,
+        rows: Vec<Entity>,
+        /// The most rows one window may hold, so the walk has to follow
+        /// `next_offset` to see them all rather than taking one page.
+        window: usize,
     }
 
     impl OutsideGraphReads for OverBudgetStore {
         fn page(&self, _filter: &EntityFilter, page: &EntityPage) -> Option<EntityPageResult> {
-            let mut entities = self.page.clone();
-            entities.truncate(page.limit);
+            let start = page.offset.min(self.rows.len());
+            let end = (start + page.limit.min(self.window)).min(self.rows.len());
             Some(EntityPageResult {
-                entities,
-                total_matching: self.total,
-                next_offset: Some(page.limit),
+                entities: self.rows[start..end].to_vec(),
+                total_matching: self.rows.len(),
+                next_offset: (end < self.rows.len()).then_some(end),
             })
         }
         fn named(&self, _name: &str) -> Option<Vec<Entity>> {
@@ -805,14 +939,14 @@ mod tests {
     /// rebuilt one level down at its own boundary.
     #[test]
     fn a_scan_that_hit_its_budget_says_so_even_with_nothing_matched() {
-        let store = OverBudgetStore {
-            // 512 targets none of which the question names, and one more the
-            // store counts but never hands over.
-            page: (0..TARGET_BUDGET)
-                .map(|index| external_target(&format!("unrelated_{index}")))
-                .collect(),
-            total: TARGET_BUDGET + 1,
-        };
+        let mut rows: Vec<Entity> = (0..TARGET_BUDGET)
+            .map(|index| external_target(&format!("Unrelated{index}")))
+            .collect();
+        // The symbol the question names sits one past the budget, so only a
+        // walk that ran to the end would find it, and only a walk that reports
+        // stopping early is honest about not having.
+        rows.push(external_target("Router"));
+        let store = OverBudgetStore { rows, window: 64 };
         let observed = observe(&store, "where does Router dispatch a request");
         assert!(
             observed.symbols.is_empty(),
@@ -826,7 +960,12 @@ mod tests {
 
         let block = block(&observed).expect("an incomplete scan publishes its reason");
         assert_eq!(block["scan"], json!("budget_exhausted"));
-        assert_eq!(block["targets_examined"], json!(TARGET_BUDGET));
+        assert_eq!(
+            block["targets_examined"],
+            json!(TARGET_BUDGET),
+            "the walk followed its pages to the budget rather than stopping at the first \
+             window, which a 64-row window makes visible: {block}"
+        );
         assert_eq!(block["targets_matching"], json!(TARGET_BUDGET + 1));
         let clause = limiting_clause(&block).expect("and the verdict gets a reason to refuse on");
         assert!(
@@ -836,6 +975,69 @@ mod tests {
         assert!(
             clause.contains("512 of this repository's 513"),
             "and says how much of the scan ran: {clause}"
+        );
+    }
+
+    /// The same store, one target fewer, so the whole set fits inside the
+    /// budget: the walk must find a symbol that lives past the first window.
+    ///
+    /// Without following `next_offset` this comes back empty and complete,
+    /// which is a certified answer over a scan that read an eighth of the
+    /// targets.
+    #[test]
+    fn the_walk_follows_its_pages_to_find_a_target_past_the_first_window() {
+        let mut rows: Vec<Entity> = (0..200)
+            .map(|index| external_target(&format!("Unrelated{index}")))
+            .collect();
+        rows.push(external_target("Router"));
+        let store = OverBudgetStore { rows, window: 64 };
+
+        let observed = observe(&store, "where does Router dispatch a request");
+        assert_eq!(observed.scan, ScanState::Complete, "the whole set fits");
+        assert_eq!(observed.targets_examined, 201);
+        assert_eq!(
+            observed.symbols.len(),
+            1,
+            "the target sits at row 201 of a 64-row window, so only a walk that paged finds it"
+        );
+        assert_eq!(observed.symbols[0].symbol, "Router");
+    }
+
+    /// A question that merely contains an ordinary word does not refuse.
+    ///
+    /// An unadmitted dependency named `error`, `request` or `path` would
+    /// otherwise match every question containing that English word, and a
+    /// disclosure that fires on the word "error" is a floor under the whole
+    /// surface. The symbol has to be named as an identifier: spelled the way the
+    /// graph records it, or written qualified with a dot.
+    #[test]
+    fn an_ordinary_word_that_happens_to_name_a_package_does_not_refuse() {
+        let store = OverBudgetStore {
+            rows: vec![external_target("error")],
+            window: 64,
+        };
+        assert!(
+            observe(&store, "what happens on an error in the response path")
+                .symbols
+                .is_empty(),
+            "a question using the word is not a question naming the symbol"
+        );
+
+        // The two forms that DO name it, without which the arm above would pass
+        // on a rule that had stopped matching anything.
+        assert_eq!(
+            observe(&store, "who calls error.format").symbols.len(),
+            1,
+            "a qualified mention names the identifier"
+        );
+        let store = OverBudgetStore {
+            rows: vec![external_target("Router")],
+            window: 64,
+        };
+        assert_eq!(
+            observe(&store, "where is Router built").symbols.len(),
+            1,
+            "and so does spelling it the way the graph records it"
         );
     }
 

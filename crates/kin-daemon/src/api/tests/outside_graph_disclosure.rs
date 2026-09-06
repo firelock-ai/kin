@@ -237,10 +237,8 @@ fn a_non_json_result_is_returned_verbatim() {
         Some(EXPRESS_QUESTION),
         kin_mcp::ToolCallResult::error(message),
     );
-    let kin_mcp::ContentBlock::Text { text } = disclosed
-        .content
-        .first()
-        .expect("the error text survives");
+    let kin_mcp::ContentBlock::Text { text } =
+        disclosed.content.first().expect("the error text survives");
     assert_eq!(text, message);
     assert_eq!(disclosed.is_error, Some(true));
 }

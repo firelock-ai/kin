@@ -2684,7 +2684,7 @@ mod tests {
         );
     }
 
-    /// FIR-3306, the reported shape. A `semantic_locate` for "where
+    /// , the reported shape. A `semantic_locate` for "where
     /// `router.param` callbacks are registered and stored, and how a request is
     /// dispatched through the middleware stack" on express 5.2.1 came back
     /// `state: "certified"`, `limiting_factor: null`, `bound: "exact"`,

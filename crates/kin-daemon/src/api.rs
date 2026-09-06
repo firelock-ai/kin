@@ -13729,15 +13729,13 @@ async fn repo_mcp_tools_call(
         }
     }
     let result = bound_mcp_tool_result(result, &request.name, &budget);
-    // The hosted route serves `semantic_locate`, `get_context_pack` and
-    // `trace_data_flow` from its own view and never reaches the local route's
-    // chokepoint, so the same disclosure is attached here. Two routes, one
-    // observation.
-    let result = disclose_outside_graph(
-        Some(view.graph.as_ref()),
-        kin_mcp::outside_graph::question_argument(&arguments),
-        result,
-    );
+    // The hosted route is NOT disclosed here, deliberately, and the reason is
+    // ordering rather than scope. Its handlers finalize their own envelope
+    // before this line, so a block inserted here would sit beside a verdict
+    // computed without it: a response carrying the evidence and a verdict that
+    // ignores the evidence, which is the two-verdicts-in-one-response shape
+    // `kin_mcp::verdict` exists to end. Disclosing it needs the verdict
+    // recomputed on this route, which is its own change.
     repo_scoped_mcp_success(view.as_ref(), request.name, result)
 }
 
@@ -14275,8 +14273,8 @@ async fn mcp_tools_call(
         kin_mcp::budget::ResponseBudget::from_arguments(&request.arguments).less_envelope_reserve();
     let tool = request.name.clone();
     // Taken before the call, because the dispatcher consumes the request.
-    let question = kin_mcp::outside_graph::question_argument(&request.arguments)
-        .map(str::to_string);
+    let question =
+        kin_mcp::outside_graph::question_argument(&request.arguments).map(str::to_string);
     let disclosing_state = Arc::clone(&state);
     let disclosing_headers = headers.clone();
     let Json(result) = mcp_tools_call_inner(headers, State(state), Json(request)).await?;
@@ -14307,7 +14305,7 @@ async fn mcp_tools_call(
 }
 
 /// Disclose an identifier the question named that this graph holds no
-/// definition for, on whichever tool was asked (FIR-3306).
+/// definition for, on whichever tool was asked.
 ///
 /// Here rather than in the dispatcher because the dispatcher does not have one
 /// exit. `semantic_locate` returns straight out of the fused pipeline and
