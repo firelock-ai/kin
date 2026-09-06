@@ -28,6 +28,7 @@
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 mod common;
@@ -201,6 +202,53 @@ fn references_text(runtime: &common::IsolatedDaemonRuntime, repo: &Path, entity:
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+/// Bound on how long the relocation commit's caller edge may take to reach
+/// `kin refs`, and how often to ask again while waiting.
+///
+/// The daemon's live query graph catches up to a commit asynchronously, and a
+/// read taken right after `kin commit` returns can measure that catch-up
+/// instead of the relocation. CI run 34000661616 (kin main 75ffe8933, `Check &
+/// Test ubuntu shard (1)`, panicked at entity_file_retirement.rs:277 on
+/// 2026-09-06T00:26:01Z after a 7.306s test) read `kin refs moved_target`
+/// immediately after this same relocation commit and got "No incoming Calls,
+/// Imports, References relations", qualified with "Kin cannot rule out
+/// references it did not see: this build produced no entity-level call edge
+/// for Python although the source carries call sites". That is not a
+/// permanent absence: the identical query is asserted to hold both before this
+/// commit (`references_before`, above) and on ordinary runs after it, so the
+/// qualifier was disclosing a graph still mid-catch-up rather than a real gap.
+///
+/// How long that catch-up takes is itself load-sensitive: this test passed in
+/// 4.95s run alone, and with a 30s bound it still timed out when run alongside
+/// three sibling tests in this file (each spinning up its own daemon) plus an
+/// unrelated build sharing the machine. Ninety seconds covers that kind of
+/// shared-box contention and stays well short of `COMMAND_TIMEOUT`.
+const RELOCATED_CALLER_EDGE_TIMEOUT: Duration = Duration::from_secs(90);
+const RELOCATED_CALLER_EDGE_POLL: Duration = Duration::from_millis(100);
+
+/// Poll `kin refs entity` until its text contains `needle`, bounded by
+/// [`RELOCATED_CALLER_EDGE_TIMEOUT`].
+///
+/// This retries the exact command and the exact fact the test asserts on,
+/// never a side channel, so a caller edge that is genuinely gone still fails
+/// below, just after the catch-up window instead of on whichever read the
+/// daemon's scheduler happened to win.
+fn wait_for_reference(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    entity: &str,
+    needle: &str,
+) -> String {
+    let deadline = Instant::now() + RELOCATED_CALLER_EDGE_TIMEOUT;
+    loop {
+        let text = references_text(runtime, repo, entity);
+        if text.contains(needle) || Instant::now() >= deadline {
+            return text;
+        }
+        std::thread::sleep(RELOCATED_CALLER_EDGE_POLL);
+    }
+}
+
 /// Renaming a committed entity-owning file with a bare `mv`, then committing.
 ///
 /// The incoming-edge assertion is the point of this test, not decoration. A
@@ -273,11 +321,13 @@ fn renaming_a_committed_entity_owning_file_relocates_it_rather_than_stranding_it
         "the moved entity is not ranked at the path it arrived on: {after:?}"
     );
 
-    let references_after = references_text(&runtime, &repo, "moved_target");
+    let references_after = wait_for_reference(&runtime, &repo, "moved_target", "src/caller.py");
     assert!(
         references_after.contains("src/caller.py"),
         "the caller lost its edge into the moved function, which is what a removal plus an \
-         addition does and what relocating in one delta exists to prevent: {references_after}"
+         addition does and what relocating in one delta exists to prevent, even after waiting up \
+         to {RELOCATED_CALLER_EDGE_TIMEOUT:?} for the daemon's derived reference graph to catch up \
+         with the relocation commit: {references_after}"
     );
 
     // The repository still accepts work. This is the half that made the defect
