@@ -470,6 +470,37 @@ pub(crate) fn execute_resolve(
             .extend(crate::repository_merge::settle_merged_graph(state));
     }
 
+    // The freeze this resolution committed under is an EXCLUSIVE cross-process
+    // lease over the repository's storage lock, and the graph-section writer
+    // takes that same lock, so it is released before the refresh rather than at
+    // the end of the function. Holding it across the refresh is a command
+    // waiting on itself.
+    //
+    // This is also why `publish_resolved_merge` cannot make the call itself the
+    // way `repository_merge::execute` does: it hands the freeze back inside its
+    // `MergeExecution` for the finalization above, so at every point inside it
+    // the lease is still alive.
+    drop(execution.authority_freeze);
+
+    // A merge published through `resolve --continue` moves this workspace's
+    // base exactly as a plain merge does, and it publishes through
+    // `publish_resolved_merge` rather than through the `execute` path that
+    // refreshes the section, so before this a resolved merge left every later
+    // open folding the merged base out of history. Same rule as the commit, the
+    // workspace transition and the plain merge: idempotent, run under the gates
+    // this resolution already holds, and never fatal, because the merge is
+    // durable and a memoization that did not persist is a slower next open.
+    //
+    // A settlement and an abort reach here too. Neither moves this workspace's
+    // base, so the writer finds the section valid and returns `AlreadyCurrent`
+    // with no durable write.
+    crate::repository_commit::refresh_workspace_base_graph_section(
+        &authority.manager,
+        &authority.repository_id,
+        authority.workspace_id,
+        "resolved merge",
+    );
+
     drop(persistence);
     drop(graph_mutation);
     Ok(execution.resolve_response)

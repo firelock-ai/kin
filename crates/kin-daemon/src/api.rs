@@ -38088,16 +38088,26 @@ mod tests {
         assert!(change.admission_policy_delta.is_none());
     }
 
+    /// Read this store's graph-section state the way every reporting surface
+    /// does, off a fresh authority open.
+    ///
+    /// The whole record rather than only the standing, because a caller that
+    /// goes red wants kin-db's own refusal word in the message; `absent` and
+    /// `resolved_at` are different defects wearing the same standing.
+    fn graph_section_state(state: &Arc<DaemonState>) -> kin_core::graph_section::GraphSectionState {
+        let authority =
+            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(state)
+                .expect("open the pinned local repository authority");
+        let lease = authority.manager.read_authority();
+        kin_core::graph_section::read(&lease, &authority.workspace_id)
+    }
+
     /// Read this store's graph-section standing the way every reporting surface
     /// does, off a fresh authority open.
     fn graph_section_standing(
         state: &Arc<DaemonState>,
     ) -> kin_core::graph_section::GraphSectionStanding {
-        let authority =
-            crate::local_repository_authority::ActiveLocalRepositoryAuthority::open(state)
-                .expect("open the pinned local repository authority");
-        let lease = authority.manager.read_authority();
-        kin_core::graph_section::read(&lease, &authority.workspace_id).standing
+        graph_section_state(state).standing
     }
 
     /// A commit leaves this workspace's base graph section written, so the
@@ -40829,6 +40839,189 @@ mod tests {
         assert!(
             identity_before != identity_after,
             "the publication identity did not move across a resolved-merge publication"
+        );
+    }
+
+    /// A merge published through `resolve --continue` must leave this
+    /// workspace's base graph section written, and the plain-merge arm cannot
+    /// cover it.
+    ///
+    /// kin#1561 refreshes the section after every transition that moves the
+    /// base, and installed that call at four sites. One of them is
+    /// `repository_merge::execute`, the PLAIN-merge publication. That module
+    /// holds two publications: `execute` publishes a clean merge, and
+    /// `publish_resolved_merge` publishes one whose conflicts were settled,
+    /// which `kin resolve --continue` reaches through
+    /// `repository_merge_state::execute_resolve`. The second carried no
+    /// refresh, so a merge that parked and was then resolved left a section
+    /// kin-db refuses with `resolved_at`, and every later open of that store
+    /// folded the merged base out of history until `kin graph materialize` ran.
+    ///
+    /// Its own arm rather than a second assertion inside
+    /// `a_merge_published_through_resolve_reaches_the_live_graph_without_a_restart`
+    /// above, for the same reason that arm is separate from the plain-merge
+    /// one: its live-graph assertions run first, so a regression in kin#1287's
+    /// install would stop it before this property was reached and this class
+    /// would go back to being invisible.
+    ///
+    /// The fixture is deliberately the same one that arm drives, settled from
+    /// the same side, so a red run here cannot be blamed on a fixture that
+    /// never reached `publish_resolved_merge`. Both sides must edit the SAME
+    /// artifact or the merge is clean, `publish` runs, and this grades a path
+    /// the plain-merge arm already covers.
+    ///
+    /// Two controls rather than one assertion. The section must already be
+    /// serving before the resolution, because the commit path refreshes it, or
+    /// a red run below says nothing about the resolve path. And the base must
+    /// actually MOVE across the resolution, or a section left untouched at an
+    /// unmoved base still reads `Serving` and this passes on a tree with no fix
+    /// in it.
+    ///
+    /// The refresh is synchronous inside the command, so the section is read
+    /// straight after the response rather than polled: it is on disk by the
+    /// time `resolve --continue` answers or it never will be.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn a_merge_published_through_resolve_leaves_the_graph_section_written() {
+        let (state, _layout, repository, _base_change, _feature_change) =
+            universal_branch_test_state("resolve-graph-section");
+        let app = router(Arc::clone(&state));
+
+        // Conflict on purpose: the feature branch rewrote this same file.
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: active-branch-after-the-split\n",
+        )
+        .unwrap();
+        commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "edit the file the other side also changed",
+        )
+        .await;
+
+        // CONTROL: the commit path already refreshes, so the section serves
+        // before the merge. A failure here is this assertion breaking rather
+        // than the resolve path regressing.
+        let before = graph_section_state(&state);
+        assert_eq!(
+            before.standing,
+            kin_core::graph_section::GraphSectionStanding::Serving,
+            "NOT RUN, precondition unmet rather than property refuted: the section does not serve \
+             this workspace's base before the merge, so nothing below is evidence about the \
+             resolve path: {before:?}"
+        );
+
+        let post = |path: &'static str, body: Vec<u8>| {
+            let app = router(Arc::clone(&state));
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::post(path)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
+                    .await
+                    .unwrap();
+                (status, bytes.to_vec())
+            }
+        };
+
+        let merge = kin_cli::commands::merge::MergeRequest {
+            source: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("resolve-graph-section-test"),
+        };
+        let (_merge_status, merge_body) =
+            post("/commands/merge", serde_json::to_vec(&merge).unwrap()).await;
+        let merge_response: kin_cli::commands::merge::MergeResponse =
+            serde_json::from_slice(&merge_body).unwrap();
+        // The merge must have CONFLICTED, or this arm drove `publish` and
+        // grades the path the plain-merge arm already covers.
+        let outcome = merge_response
+            .report
+            .as_ref()
+            .map(|report| report.outcome)
+            .expect("the merge response must carry a report to read its outcome from");
+        assert!(
+            matches!(outcome, kin_cli::commands::merge::MergeOutcome::Conflicted),
+            "NOT RUN, precondition unmet: the merge reported {outcome:?} rather than Conflicted, \
+             so this arm drove `publish` rather than `publish_resolved_merge`: {}",
+            String::from_utf8_lossy(&merge_body)
+        );
+
+        // A parked merge moves no base, so the section must still serve here.
+        // This is where the four sites kin#1561 installed already hold, and
+        // saying so keeps the reading below attributable to the publication
+        // rather than to the parking.
+        let parked = graph_section_state(&state);
+        assert_eq!(
+            parked.standing,
+            kin_core::graph_section::GraphSectionStanding::Serving,
+            "a parked merge moves no base, so the section it found valid must still serve: \
+             {parked:?}"
+        );
+
+        let settle = kin_cli::commands::resolve::ResolveRequest {
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("resolve-graph-section-test"),
+            action: kin_cli::commands::resolve::ResolveAction::Settle {
+                directives: Vec::new(),
+                all: Some(kin_model::MergeSide::Theirs),
+            },
+            expected_record: None,
+        };
+        let (settle_status, settle_body) =
+            post("/commands/resolve", serde_json::to_vec(&settle).unwrap()).await;
+        assert_eq!(
+            settle_status,
+            StatusCode::OK,
+            "settling every conflict from one side must succeed: {}",
+            String::from_utf8_lossy(&settle_body)
+        );
+
+        let continue_request = kin_cli::commands::resolve::ResolveRequest {
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("resolve-graph-section-test"),
+            action: kin_cli::commands::resolve::ResolveAction::Continue,
+            expected_record: None,
+        };
+        let (continue_status, continue_body) = post(
+            "/commands/resolve",
+            serde_json::to_vec(&continue_request).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            continue_status,
+            StatusCode::OK,
+            "the resolved merge must publish for this arm to grade anything: {}",
+            String::from_utf8_lossy(&continue_body)
+        );
+
+        let after = graph_section_state(&state);
+        // CONTROL: the publication moved this workspace's base. Without this a
+        // section nobody touched still reads `Serving`, and the property below
+        // passes on a tree carrying no refresh at all.
+        assert_ne!(
+            after.base_target, before.base_target,
+            "NOT RUN, precondition unmet: `resolve --continue` did not move this workspace's \
+             base, so a section left untouched would read as serving and prove nothing: \
+             before={before:?} after={after:?}"
+        );
+
+        // THE PROPERTY.
+        assert_eq!(
+            after.standing,
+            kin_core::graph_section::GraphSectionStanding::Serving,
+            "`resolve --continue` moved this workspace's base and left the section behind, so \
+             every open of this store folds that base out of history until `kin graph \
+             materialize` runs: {after:?}"
         );
     }
 
