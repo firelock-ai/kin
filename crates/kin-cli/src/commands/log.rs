@@ -342,6 +342,14 @@ fn daemon_report_this_build_may_print(response: &LogResponse) -> Option<&LogRepo
 /// whole of an 11.04 second `kin log --json --count 2`: one whole-store open in
 /// the CLI process, 3,491,976 KiB of peak resident set, to print two entries the
 /// daemon already had decoded.
+///
+/// One arm is slower than before and it is the right trade. A daemon whose
+/// report this build may not print costs the round trip AND the local open,
+/// where the old command paid only the open. That is the price of asking before
+/// deciding, and asking before deciding is what keeps the `json` condition out
+/// of `run`'s call to the daemon, so the decision lives here in one place that a
+/// test can drive. Against a whole-store open the round trip is not close, and
+/// the arm it costs is the mixed-build one rather than the ordinary one.
 fn json_log(
     layout: &kin_core::KinLayout,
     count: usize,
@@ -349,6 +357,26 @@ fn json_log(
 ) -> Result<String> {
     if let Some(report) = answered.and_then(daemon_report_this_build_may_print) {
         return Ok(serde_json::to_string_pretty(report)?);
+    }
+    if let Some(response) = answered {
+        // A daemon answered and this build declined its report, so this command
+        // is about to pay a whole-store open that a matching pair would not have
+        // paid. Said on stderr rather than in the report, because the report is
+        // the machine contract and must stay byte-identical on both branches.
+        //
+        // At `info`, the same level as the authority-open attribution line that
+        // follows it, deliberately: those two lines together are the whole
+        // reading, and it was the open line at exactly this level that attributed
+        // the 11.04 second log in the first place. A level nobody turns on is a
+        // line nobody reads, and a slow `--json` with no signal at all is what
+        // this route otherwise leaves behind.
+        tracing::info!(
+            daemon_report_revision = response.report_revision,
+            this_build_report_revision = LOG_REPORT_REVISION,
+            daemon_carried_a_report = response.report.is_some(),
+            "a daemon answered this log and this build may not print its report, so this command \
+             opens the whole store itself"
+        );
     }
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
     let (report, _tip) = local_log(&binding, count)?;
@@ -663,23 +691,54 @@ mod tests {
         );
     }
 
+    /// The same answer as it would arrive from a daemon built before
+    /// `report_revision` existed: serialized, the key removed, deserialized.
+    ///
+    /// Built by REMOVING the key rather than by setting the field to 0, because
+    /// those are different fixtures. Setting the field asserts what this build
+    /// thinks an absent key deserializes to; removing it asks. And the removal
+    /// is checked, so a rename of the field turns this into a failure rather
+    /// than into a case that quietly stops building the peer it names.
+    fn older_peer_answer(response: &LogResponse) -> LogResponse {
+        let mut value = serde_json::to_value(response).expect("a response serializes");
+        let object = value
+            .as_object_mut()
+            .expect("a response serializes as an object");
+        assert!(
+            object.remove("report_revision").is_some(),
+            "this fixture is the wire shape MINUS the revision key, so the key has to be there to \
+             remove; if it is gone or renamed, this case no longer builds an older peer"
+        );
+        serde_json::from_value(value).expect("an older peer's envelope still deserializes")
+    }
+
     /// A peer too old to name a revision reads as "cannot say", not as agreement.
     ///
     /// `report_revision` is `#[serde(default)]`, so an older daemon's silence
     /// arrives as 0. Treating 0 as a match would print that peer's report with
-    /// every field this build added since silently defaulted in.
+    /// every field this build has added since silently defaulted in.
+    ///
+    /// The fixture carries a COMPLETE report, which is what makes this a guard
+    /// rather than a restatement. `build_log_response_at` has always filled
+    /// `report`, so a genuinely old peer sends a filled report and no revision
+    /// key; and a fixture whose report is absent is refused by the
+    /// `report.as_ref()` at the end of the gate whichever way the revision
+    /// comparison goes, so it would stay green with that comparison deleted.
+    /// This arm is the one that goes red for it.
     #[test]
     fn a_json_log_answered_by_a_peer_that_names_no_revision_opens_locally() {
         let _daemon = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
         let (_root, layout, binding, expected) = fixture_store();
-        let older_peer: LogResponse =
-            serde_json::from_value(serde_json::json!({ "lines": ["change ..."], "report": null }))
-                .expect("an older peer's envelope still deserializes");
+        let older_peer = older_peer_answer(&daemon_answer(&binding, 5));
         assert_eq!(
             older_peer.report_revision, 0,
             "silence must read as revision 0, or this case proves nothing"
         );
-        let _ = binding;
+        assert!(
+            older_peer.report.is_some(),
+            "the peer must carry a report, or the gate refuses it on the report alone and the \
+             revision comparison this case exists for is never reached"
+        );
 
         let before = kin_core::authority_opens();
         let printed = json_log(&layout, 5, Some(&older_peer)).expect("the local open prints");
@@ -688,7 +747,35 @@ mod tests {
         assert_eq!(printed, expected, "falling back answers exactly as it did");
         assert_eq!(
             opens, 1,
-            "an older peer's answer must not be printed as ours"
+            "an older peer names no revision, so its report must not be printed as ours"
+        );
+    }
+
+    /// A peer that carries no report at all is refused on the report itself.
+    ///
+    /// The other half of the refusal, kept separate from the revision arm above
+    /// so that neither can stand in for the other: a daemon that answered
+    /// without a report, and a daemon whose report this build may not print, are
+    /// different facts and each needs its own case.
+    #[test]
+    fn a_json_log_answered_by_a_peer_that_carries_no_report_opens_locally() {
+        let _daemon = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
+        let (_root, layout, _binding, expected) = fixture_store();
+        let no_report: LogResponse = serde_json::from_value(serde_json::json!({
+            "lines": ["change ..."],
+            "report": null,
+            "report_revision": LOG_REPORT_REVISION,
+        }))
+        .expect("an envelope with no report still deserializes");
+
+        let before = kin_core::authority_opens();
+        let printed = json_log(&layout, 5, Some(&no_report)).expect("the local open prints");
+        let opens = kin_core::authority_opens() - before;
+
+        assert_eq!(printed, expected, "falling back answers exactly as it did");
+        assert_eq!(
+            opens, 1,
+            "an answer carrying no report must be answered by one local open"
         );
     }
 

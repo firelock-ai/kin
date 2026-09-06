@@ -1623,6 +1623,15 @@ fn plan_native_commit_inner(
     // in repository CAS against its content address. Naming them costs nothing
     // and is what makes the next measurement an attribution rather than another
     // hypothesis.
+    //
+    // What a name buys is the LOGGED `elapsed_ms`, which each closure bounds
+    // exactly. The live phase label is looser and always has been: `enter_phase`
+    // overwrites a single slot and nothing restores the enclosing phase on exit,
+    // so the roots check and the workspace lookup below are reported by the
+    // liveness ticker as still inside this phase until the next one is entered.
+    // That shape is shared with every phase already named in this function and
+    // is not changed here; it is written down so a reader of a live trace does
+    // not read the label as tightly as the durations.
     let authority = crate::mcp_commit::timed_commit_phase("plan_open_authority", || {
         authority_context.open().map_err(DaemonError::Graph)
     })?;
