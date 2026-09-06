@@ -399,7 +399,17 @@ impl EntityImpact {
     ///
     /// Built from the exclusive classes rather than from
     /// [`Self::consumer_count`], because `covering_tests` already holds every
-    /// direct test consumer and adding the two would count those twice.
+    /// direct test consumer and adding the two would count most of them twice.
+    ///
+    /// "Most", not "none", and the difference is worth stating rather than
+    /// rounding off. `covering_tests` is deliberately not deduplicated against
+    /// the external set: an entity that both calls this one and tests it is a
+    /// consumer AND a covering test, and both readings are true. So this total
+    /// counts that one entity twice, exactly as it did before the classes
+    /// existed. It is a bound on the audience rather than a census of it, which
+    /// is all the gate reading it needs, and narrowing `covering_tests` to fix
+    /// the arithmetic would change a published number whose own documented
+    /// meaning is the wider one.
     pub fn inbound_total(&self) -> usize {
         self.external_consumers() + self.covering_tests
     }
@@ -1317,7 +1327,7 @@ mod tests {
         assert_eq!(with_external.inbound_total(), 1);
     }
 
-    /// FIR-3305, the reported shape, reduced to one export and one test.    /// FIR-3305, the reported shape, reduced to one export and one test.
+    /// FIR-3305, the reported shape, reduced to one export and one test.
     ///
     /// `impact_analysis(files: ["lib/express.js"])` on express 5.2.1 at
     /// `023767fe` returned `consumer_count: 0` and `consumer_files: []` for
