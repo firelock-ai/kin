@@ -258,7 +258,7 @@ pub struct EntityImpact {
     /// every derived copy: on express 5.2.1 that reported `consumer_count: 0`
     /// for seven live exports of `lib/express.js` whose only consumers are test
     /// files, beside a `find_references` that found all seven and certified them
-    /// (FIR-3305). A count a reader deletes code on may not exclude a class
+    /// A count a reader deletes code on may not exclude a class
     /// without naming it, so every exclusion below is published beside this
     /// total and `consumer_count == external_consumer_count +
     /// test_consumer_count + derived_consumer_count` holds on every row.
@@ -278,8 +278,8 @@ pub struct EntityImpact {
     /// This is what the review layer reads. A test breaking is a signal, not a
     /// stranded external break, and a derived copy regenerates from its source,
     /// so neither belongs in the count that decides whether a signature change
-    /// is breaking. It carries the meaning `consumer_count` had before FIR-3305
-    /// widened that field, and every gate that read `consumer_count` reads this.
+    /// is breaking. It carries the meaning `consumer_count` had before that
+    /// field widened, and every gate that read `consumer_count` reads this.
     #[serde(default)]
     pub external_consumer_count: usize,
     /// Direct inbound consumers left out of [`Self::external_consumer_count`]
@@ -294,9 +294,9 @@ pub struct EntityImpact {
     /// because the consumer is a derived copy (an amalgamated bundle, a
     /// vendored snapshot) that regenerates from its source.
     ///
-    /// Before FIR-3305 this class was counted nowhere at all: it was dropped
-    /// from the consumer counts, from the files, and from every total, so a
-    /// vendored consumer left no trace in the response.
+    /// Before this class existed it was counted nowhere at all: a derived
+    /// consumer was dropped from the consumer counts, from the files, and from
+    /// every total, so it left no trace in the response.
     #[serde(default)]
     pub derived_consumer_count: usize,
     /// Subset of [`Self::external_consumer_count`] whose inbound edge
@@ -667,7 +667,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 // radius for navigation but cannot be "broken" consumers,
                 // so they never feed the external count or breaking findings.
                 // They are still consumers, and this set is why the row can say
-                // so by name rather than dropping them (FIR-3305).
+                // so by name rather than dropping them.
                 ent_derived.insert(affected_id);
             } else {
                 ent_consumers.insert(affected_id);
@@ -1327,7 +1327,7 @@ mod tests {
         assert_eq!(with_external.inbound_total(), 1);
     }
 
-    /// FIR-3305, the reported shape, reduced to one export and one test.
+    /// The reported shape, reduced to one export and one test.
     ///
     /// `impact_analysis(files: ["lib/express.js"])` on express 5.2.1 at
     /// `023767fe` returned `consumer_count: 0` and `consumer_files: []` for
@@ -1386,8 +1386,9 @@ mod tests {
     ///
     /// The row's own arithmetic is the guarantee: `consumer_count` equals the
     /// three named classes summed, so a class cannot be dropped in future
-    /// without the sum going wrong. Before FIR-3305 a derived consumer was
-    /// counted in none of them and left no trace in the response at all.
+    /// without the sum going wrong. Before these classes existed a derived
+    /// consumer was counted in none of them and left no trace in the response
+    /// at all.
     #[test]
     fn every_excluded_consumer_is_counted_under_its_own_name() {
         let export = entity_in_file("Router", "lib/express.js", 71);
@@ -1544,8 +1545,8 @@ mod tests {
             "the break-relevant file list must not include the generated single-header bundle"
         );
         // Excluded from the break count, and named rather than dropped. Before
-        // FIR-3305 the bundle appeared in no count and no list at all, so a
-        // reader had no way to learn it existed.
+        // the derived class existed the bundle appeared in no count and no
+        // list at all, so a reader had no way to learn it existed.
         assert_eq!(
             impact.derived_consumer_count, 1,
             "the bundle is still a consumer, and the row says which class excluded it"
