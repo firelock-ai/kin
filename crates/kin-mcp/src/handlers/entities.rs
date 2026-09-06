@@ -10057,7 +10057,11 @@ mod tests {
         args.insert("token_budget".to_string(), serde_json::json!(8000));
         args.insert("depth".to_string(), serde_json::json!(1));
 
-        let sessions = SessionRegistry::new();
+        // Through the handler rather than straight into the builder, because
+        // the defect WAS the handler: `multi_focal_pack_result` short-circuits
+        // at the top of `handle_get_context_pack` and used to return before the
+        // body read the single-focal path below it performs.
+        let sessions = SessionRegistry::empty_for_test();
         let result = handle_get_context_pack(&args, &store, &sessions, None).unwrap();
         let value = parsed_response(&result);
         let rows = value["entities"].as_array().expect("entities is an array");
