@@ -2785,12 +2785,9 @@ fn version_lines(version: &str) -> Vec<String> {
     ];
     // The commit sha gets its own line, and the branch and build time the next.
     // Together they are seventy columns on a release build, whose branch reads
-    // `detached`, and ninety on a working branch whose name is long: the first
-    // build of this change printed
-    // `5372dc8c2299f86d7cfaedfd0b0108a9a177f8b8 chore/lane-clilook-kin
-    // 2026-09-06T16:52:11Z`, which wraps at eighty. Splitting them is what makes
-    // the bound hold for every branch name rather than for the ones a release
-    // happens to have.
+    // `detached`, and ninety when the branch name is long, which wraps at
+    // eighty. Splitting them is what makes the bound hold for every branch
+    // name rather than for the ones a release happens to have.
     match build.split_once(' ') {
         Some((commit, rest)) => {
             lines.push(commit.to_string());
@@ -5352,12 +5349,12 @@ mod tests {
         assert_eq!(lines[4], "detached 2026-09-06T08:24:29Z");
 
         // Both a release build, whose branch reads `detached`, and a working
-        // branch with a long name. The second is not hypothetical: the first
-        // build of this change reported `chore/lane-clilook-kin` and its
-        // version line was ninety columns, which the release-shaped input alone
-        // could never have caught.
-        let working = "0.7.3 (5372dc8c2299f86d7cfaedfd0b0108a9a177f8b8 \
-                       chore/lane-clilook-kin 2026-09-06T16:52:11Z)";
+        // branch with a long name. The second is not hypothetical: a build off
+        // a branch named like this one reported a version line of ninety
+        // columns, which the release-shaped input alone could never have
+        // caught.
+        let working = "0.7.3 (0123456789abcdef0123456789abcdef01234567 \
+                       a-working-branch-with-a-long-name 2026-01-02T03:04:05Z)";
         for version in [composed, working] {
             for paint in [
                 kin_cli::mark::Paint::Truecolor,

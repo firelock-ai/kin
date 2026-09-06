@@ -13200,9 +13200,10 @@ fn labelled_lines(label: &str, text: &str, width: Option<usize>) -> Vec<String> 
 /// into captured output and every piped `kin doctor` gained a first line it
 /// never had, while the mark correctly did not.
 ///
-/// `None` for the title means the report has already announced itself:
-/// `--fix` prints the table twice, once before the repairs and once after, and
-/// the mark belongs to the first of them.
+/// `None` for the title is for a caller that has already announced itself.
+/// `kin doctor --fix` is not one: the un-fixed path prints its table and
+/// returns, so `--fix` reaches only the table after the repairs, and passing
+/// `None` there left that command with no mark at all.
 fn report_header(
     title: Option<&str>,
     platform: &str,
@@ -14379,7 +14380,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     }
     println!("Re-running checks...");
     println!();
-    print_human_report(&after, None);
+    print_human_report(&after, Some("Kin doctor"));
 
     let still_manual = manual_attention_checks(&after);
     if !still_manual.is_empty() {
@@ -15952,6 +15953,42 @@ mod tests {
                 drawn[1].ends_with(name),
                 "the header must carry {name:?}, got {:?}",
                 drawn[1]
+            );
+        }
+    }
+
+    /// Every command that prints this report names itself in it.
+    ///
+    /// Read from the source rather than asserted from memory, because the
+    /// mistake this catches was made by reading two call sites and missing the
+    /// `if !fix { ... return }` between them: `kin doctor --fix` reaches only
+    /// the table printed after its repairs, so passing no title there left that
+    /// one command with no mark at all.
+    ///
+    /// The scan checks its own reading first, since one that found no call
+    /// sites would pass.
+    #[test]
+    fn no_call_site_prints_this_report_without_naming_its_command() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/commands/setup.rs"
+        ))
+        .expect("this file is readable from its own test");
+
+        let calls: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("print_human_report(&"))
+            .collect();
+        assert!(
+            calls.len() >= 4,
+            "the scan found {} call sites, too few to be reading this file",
+            calls.len()
+        );
+        for call in &calls {
+            assert!(
+                call.contains("Some(\""),
+                "this call prints the report without naming its command: {call}"
             );
         }
     }
