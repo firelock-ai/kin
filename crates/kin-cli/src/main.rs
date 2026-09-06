@@ -4626,9 +4626,17 @@ where
                 .with_ansi(ansi)
                 .with_filter(EnvFilter::new(directives).and(
                     tracing_subscriber::filter::filter_fn(move |metadata| {
+                        // Two separate reasons a record does not belong on the
+                        // fmt layer, named, then one negation over them. The
+                        // reasons are what a reader of this filter needs, and
+                        // `!a && !b` spelled out inline is the same expression
+                        // clippy's nonminimal_bool refuses either way, so the
+                        // names carry the meaning and the shape stays minimal.
                         let target = metadata.target();
-                        !is_periodic_admission_progress(target)
-                            && !(quiet_admission_records && is_terminal_admission_record(target))
+                        let scribbles_on_the_ladder = is_periodic_admission_progress(target);
+                        let restated_by_the_command =
+                            quiet_admission_records && is_terminal_admission_record(target);
+                        !(scribbles_on_the_ladder || restated_by_the_command)
                     }),
                 )),
         )
