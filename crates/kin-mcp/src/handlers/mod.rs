@@ -52,6 +52,78 @@ pub async fn handle_tool_call<G: GraphStore>(
     repository_authority: Option<&RequestRepositoryAuthority>,
     host: Option<&WorkingCopyProbe>,
 ) -> Result<ToolCallResult> {
+    let mut result = dispatch_tool_call(
+        tool_name,
+        arguments,
+        store,
+        sessions,
+        session_authority_mode,
+        repository_authority,
+        host,
+    )
+    .await?;
+    attach_outside_graph(&mut result, arguments, store);
+    Ok(result)
+}
+
+/// Disclose an identifier the question named that this graph holds no
+/// definition for, on whichever tool was asked (FIR-3306).
+///
+/// Here rather than in each handler because this is the one place holding both
+/// the arguments and the store, and because the gap is not one tool's: a
+/// `certified`, `complete` answer about a package the graph never admitted reads
+/// the same whichever surface produced it. Every retrieval tool that takes a
+/// question takes it as `query`, so one rule covers them all and a tool added
+/// later is covered the day it is added rather than the day someone remembers.
+///
+/// Additive and failure-quiet by construction. A call with no `query`, a payload
+/// that is not a JSON object, and a question naming nothing outside the graph
+/// all leave the result byte-identical, so nothing here can turn a good answer
+/// into a worse one.
+fn attach_outside_graph<G: GraphStore>(
+    result: &mut ToolCallResult,
+    arguments: &HashMap<String, serde_json::Value>,
+    store: &G,
+) {
+    let Some(question) = arguments
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
+    else {
+        return;
+    };
+    let Some(block) = crate::outside_graph::observe_for_question(store, question) else {
+        return;
+    };
+    for content in &mut result.content {
+        let crate::types::ContentBlock::Text { text } = content;
+        let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(text) else {
+            continue;
+        };
+        let Some(object) = payload.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            crate::outside_graph::OUTSIDE_GRAPH_KEY.to_string(),
+            block.clone(),
+        );
+        if let Ok(rendered) = serde_json::to_string_pretty(&payload) {
+            *text = rendered;
+        }
+    }
+}
+
+/// The tool dispatch itself, wrapped by [`handle_tool_call`].
+async fn dispatch_tool_call<G: GraphStore>(
+    tool_name: &str,
+    arguments: &HashMap<String, serde_json::Value>,
+    store: &G,
+    sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    host: Option<&WorkingCopyProbe>,
+) -> Result<ToolCallResult> {
     match tool_name {
         // Exact repository membership and bytes
         "kin_artifact_list" => {
