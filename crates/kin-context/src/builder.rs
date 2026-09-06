@@ -1413,6 +1413,24 @@ fn format_traffic_entry(intent: &IntentSummary, proximity: TrafficProximity) -> 
 /// implementation. The MCP context-pack handlers therefore read the real body
 /// through the graph-owned projection and report a gap when it is unavailable,
 /// rather than falling back to this string.
+/// What [`project_full_body`] actually renders, named beside the renderer so
+/// the word a surface publishes cannot drift from the bytes it describes.
+///
+/// `ProjectionLevel::FullBody` is the budget ladder's name for this rung and it
+/// stays that; this is the name for the CONTENT, which is a header, a doc
+/// summary and a signature. Anything reporting a projection for a row rendered
+/// by the function below reads this rather than spelling a word of its own.
+pub const FULL_BODY_PROJECTION_NAME: &str = "header_and_signature";
+
+/// What a row carrying the entity's REAL body reports, for the one consumer
+/// that can produce one.
+///
+/// This crate never serves it. The MCP context-pack handler reads bodies
+/// through graph-owned repository authority, and when it does it corrects the
+/// pack's own account of that focal, so the word it writes there is this one
+/// rather than a literal of its own.
+pub const SERVED_BODY_PROJECTION_NAME: &str = "full_body";
+
 pub(crate) fn project_full_body(entity: &Entity) -> String {
     let mut content = String::new();
     content.push_str(&format!(

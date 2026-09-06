@@ -2679,6 +2679,113 @@ mod tests {
         );
     }
 
+    /// The MULTI-focal path serves the same body the single-focal one does.
+    ///
+    /// `context_pack_focal_body_matches_the_direct_entity_source_read` above
+    /// pins that for one focal. This is its twin for the branch that returns
+    /// before it: `multi_focal_pack_result` short-circuits at the top of
+    /// `handle_get_context_pack`, and on v0.7.2 it took no repository authority
+    /// at all, so it published the pack's own header under
+    /// `projection: "FullBody"` and never asked for bytes.
+    ///
+    /// It is the SUCCESS path on purpose. A test that only passes `None` for
+    /// authority proves the gap arm and nothing else, and would stay green if
+    /// the handler stopped threading the caller's authority through, which is
+    /// the whole of the fix.
+    #[test]
+    fn a_multi_focal_focal_serves_the_body_the_single_focal_path_serves() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+
+        // The pre-resolved form the daemon hands this handler, which is the
+        // only form the multi-focal branch accepts.
+        let args = HashMap::from([
+            (
+                "question_focals".to_string(),
+                serde_json::json!([{
+                    "entity_id": entity.id.to_string(),
+                    "route": "name",
+                    "query": entity.name,
+                }]),
+            ),
+            ("token_budget".to_string(), serde_json::json!(8000)),
+            ("depth".to_string(), serde_json::json!(1)),
+        ]);
+        let sessions = SessionRegistry::empty_for_test();
+        let value = tool_result_json(
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap(),
+        );
+
+        let focal = value["entities"]
+            .as_array()
+            .expect("entities is an array")
+            .iter()
+            .find(|row| row["section"] == "focal")
+            .expect("the focal is in the pack")
+            .clone();
+
+        // The sibling surface an agent falls back to, so this asserts one body
+        // rather than two independently plausible ones.
+        let direct = tool_result_json(
+            entities::handle_get_entity_source(
+                &HashMap::from([("entity_id".into(), serde_json::json!(entity.id.to_string()))]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        let direct_body = direct["body"].as_str().expect("direct read serves a body");
+        let focal_body = focal["body"]
+            .as_str()
+            .expect("the multi-focal focal must serve a body, not null, when the graph has one");
+
+        assert_eq!(
+            focal_body, direct_body,
+            "the multi-focal pack and the direct read must serve one body"
+        );
+        assert!(focal_body.contains("return value <= maxVal;"));
+        assert_eq!(focal["source"], "graph");
+        assert!(
+            focal.get("body_unavailable").is_none(),
+            "no gap is reported when the body was served: {focal}"
+        );
+        // The regression this pins: the pack's own token-accounting header must
+        // never surface as the body.
+        assert!(
+            !focal_body.starts_with("// validate_probe_range_1d8f8275 (Function"),
+            "a synthesized comment header is not a body: {focal_body}"
+        );
+
+        // And the two accounts of this focal agree that it carries one.
+        assert_eq!(
+            focal["projection"], "FullBody",
+            "a row that served a body claims one: {focal}"
+        );
+        assert!(
+            focal.get("projection_downgraded_from").is_none(),
+            "nothing was downgraded, so nothing says it was: {focal}"
+        );
+        assert_eq!(
+            value["focals"][0]["projection"],
+            serde_json::json!(kin_context::SERVED_BODY_PROJECTION_NAME),
+            "the pack's own account of the focal is corrected to what was served: {}",
+            value["focals"]
+        );
+    }
+
     /// After a committed transaction moves an entity, the read surfaces must
     /// report where it is NOW. Serving the pre-commit position made agents
     /// "correct" right line numbers into wrong ones.
