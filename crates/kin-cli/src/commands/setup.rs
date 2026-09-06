@@ -12256,7 +12256,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     println!("=== Health checklist ===");
     println!();
     let report = crate::commands::health::run_health_checks().await;
-    print_human_report(&report);
+    print_human_report(&report, Some("Kin setup"));
 
     print_next_steps(intent, plan.install_shell_hook, &configured_assistants);
 
@@ -13064,7 +13064,7 @@ pub async fn status(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    print_human_report(&report);
+    print_human_report(&report, Some("Kin setup status"));
     Ok(())
 }
 
@@ -13187,6 +13187,34 @@ fn labelled_lines(label: &str, text: &str, width: Option<usize>) -> Vec<String> 
     lines
 }
 
+/// The lines this report opens with.
+///
+/// Pure, and separate from the printing, because the gating is the whole point
+/// and a function that prints as it goes cannot be reached by a test. Written
+/// inline the first time, a mutation that ungated the title left every test
+/// green: the only test that could reach it asserted on `beside_or_plain`
+/// beside it, which is not where the decision lives. That is the second time
+/// in this change that a test named a helper rather than the code under test.
+///
+/// The title and the mark are one unit. Gated separately, the title survived
+/// into captured output and every piped `kin doctor` gained a first line it
+/// never had, while the mark correctly did not.
+///
+/// `None` for the title means the report has already announced itself:
+/// `--fix` prints the table twice, once before the repairs and once after, and
+/// the mark belongs to the first of them.
+fn report_header(
+    title: Option<&str>,
+    platform: &str,
+    style: Option<crate::mark::MarkStyle>,
+) -> Vec<String> {
+    let platform = format!("Platform: {platform}");
+    match (title, style) {
+        (Some(title), Some(style)) => crate::mark::beside(style, &["", title, &platform, ""]),
+        _ => vec![platform],
+    }
+}
+
 /// The width to lay a report out at, or `None` when nothing is watching.
 fn report_width() -> Option<usize> {
     if !io::stdout().is_terminal() {
@@ -13199,19 +13227,23 @@ fn report_width() -> Option<usize> {
 
 /// Render a [`HealthReport`] as the human-readable table used by
 /// `kin setup status` and `kin doctor`.
-fn print_human_report(report: &crate::commands::health::HealthReport) {
+fn print_human_report(report: &crate::commands::health::HealthReport, title: Option<&str>) {
     use crate::commands::health::HealthStatus;
     let width = report_width();
-    // `kin doctor` is the command the archive's own INSTALL.md tells a reader
-    // to run before anything else, so it is one of the three surfaces that
-    // carry the mark. Off a terminal this is the `Platform:` line alone, which
-    // is what every capture of this report has always started with.
-    for line in crate::mark::beside_for_stdout(&[
-        "",
-        "Kin doctor",
-        &format!("Platform: {}", report.platform),
-        "",
-    ]) {
+    // The title and the mark are one unit, and both are terminal-only. Written
+    // through `beside_for_stdout`, whose no-style arm keeps every non-empty
+    // line, the title survived into captured output and every piped
+    // `kin doctor` gained a first line it never had. The mark was gated and the
+    // title beside it was not, which is the whole of that defect.
+    //
+    // The title is a parameter because this renderer serves four commands.
+    // Hardcoded, `kin setup` and `kin setup status` announced themselves as
+    // Kin doctor.
+    for line in report_header(
+        title,
+        &report.platform,
+        crate::mark::MarkStyle::for_stdout(),
+    ) {
         println!("{line}");
     }
     println!();
@@ -14065,7 +14097,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
         if json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            print_human_report(&report);
+            print_human_report(&report, Some("Kin doctor"));
         }
         // Printed last, so a human reads it under the report rather than above
         // it. Before this, the flag was dead on this path: bound at the
@@ -14347,7 +14379,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     }
     println!("Re-running checks...");
     println!();
-    print_human_report(&after);
+    print_human_report(&after, None);
 
     let still_manual = manual_attention_checks(&after);
     if !still_manual.is_empty() {
@@ -15860,6 +15892,68 @@ mod tests {
             matches!(detail_layout(&long, None), DetailLayout::Beside),
             "with no width to lay out at, the detail must be printed as it always was"
         );
+    }
+
+    /// A captured report gains nothing, not even a title.
+    ///
+    /// The mark was gated on a terminal and the title beside it was not, so
+    /// every piped `kin doctor` gained a first line reading `Kin doctor` that
+    /// it never had, while the pull request claimed nothing new could reach a
+    /// script.
+    ///
+    /// This calls `report_header`, which is where the gating decision lives.
+    /// The first version of this test called `beside_or_plain` beside it, and
+    /// a mutation that ungated the title left it green, because it never
+    /// reached the code the claim was about.
+    #[test]
+    fn a_captured_report_gains_no_title_and_no_mark() {
+        use super::report_header;
+        use crate::mark::{Glyphs, MarkStyle, Paint};
+
+        // No terminal: the platform line alone, whatever title is passed.
+        assert_eq!(
+            report_header(Some("Kin doctor"), "macos", None),
+            vec!["Platform: macos".to_string()],
+            "a captured report must gain nothing, and a title is something"
+        );
+        assert_eq!(
+            report_header(None, "macos", None),
+            vec!["Platform: macos".to_string()]
+        );
+
+        // A terminal, but no title: the report already announced itself, so the
+        // mark is not drawn a second time.
+        let style = MarkStyle::new(Glyphs::Unicode, Paint::None);
+        assert_eq!(
+            report_header(None, "macos", Some(style)),
+            vec!["Platform: macos".to_string()],
+            "`--fix` prints this table twice and the mark belongs to the first"
+        );
+
+        // A terminal and a title: both.
+        let drawn = report_header(Some("Kin doctor"), "macos", Some(style));
+        assert_eq!(drawn.len(), 4);
+        assert!(drawn[1].ends_with("Kin doctor"));
+        assert!(drawn[2].ends_with("Platform: macos"));
+    }
+
+    /// Each command announces itself by its own name.
+    ///
+    /// One hardcoded title on a renderer four commands share had `kin setup`
+    /// and `kin setup status` calling themselves Kin doctor.
+    #[test]
+    fn each_command_names_itself_in_the_header() {
+        use super::report_header;
+        use crate::mark::{Glyphs, MarkStyle, Paint};
+        let style = MarkStyle::new(Glyphs::Unicode, Paint::None);
+        for name in ["Kin setup", "Kin setup status", "Kin doctor"] {
+            let drawn = report_header(Some(name), "macos", Some(style));
+            assert!(
+                drawn[1].ends_with(name),
+                "the header must carry {name:?}, got {:?}",
+                drawn[1]
+            );
+        }
     }
 
     /// A `fix:` line that does not fit is wrapped under its own label.

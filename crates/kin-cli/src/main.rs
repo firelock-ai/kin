@@ -4453,8 +4453,31 @@ fn is_periodic_admission_progress(target: &str) -> bool {
 /// place.
 const ADMISSION_TERMINAL_TARGETS: [&str; 2] = ["kin_core::init", "kin_core::git_init"];
 
-fn is_terminal_admission_record(target: &str) -> bool {
-    ADMISSION_TERMINAL_TARGETS.contains(&target)
+/// Whether one event is an admission record the command restates itself.
+///
+/// Keyed on the event, never on its target. Those two targets carry five
+/// callsites between them, not two: the two admission records, an
+/// `initialized`/`recovered`/`reclaimed` trio about staging, and a `warn` about
+/// a stage whose owner lock could not be attempted. One of the trio is the
+/// notice telling a reader that `kin init` kept earlier staging directories and
+/// that they cost disk, and it has no other sink at all. A target-keyed
+/// suppression takes every one of them, so the reader loses a warning and a
+/// disk notice to make a log line quieter.
+///
+/// The two records are the only events on these targets that carry both a
+/// `repository` and a `workspace` field at `INFO`, which is what identifies
+/// them: the staging trio carries `count` and `parent`, and the refusal is a
+/// `warn` with `path` and `error`. The level is part of the test so a future
+/// `warn` carrying the same fields is not swallowed by this.
+fn is_terminal_admission_record(metadata: &tracing::Metadata<'_>) -> bool {
+    if !ADMISSION_TERMINAL_TARGETS.contains(&metadata.target()) {
+        return false;
+    }
+    if *metadata.level() != tracing::Level::INFO {
+        return false;
+    }
+    let fields = metadata.fields();
+    fields.field("repository").is_some() && fields.field("workspace").is_some()
 }
 
 /// Render an admission progress event onto the live phase line.
@@ -4632,10 +4655,10 @@ where
                         // `!a && !b` spelled out inline is the same expression
                         // clippy's nonminimal_bool refuses either way, so the
                         // names carry the meaning and the shape stays minimal.
-                        let target = metadata.target();
-                        let scribbles_on_the_ladder = is_periodic_admission_progress(target);
+                        let scribbles_on_the_ladder =
+                            is_periodic_admission_progress(metadata.target());
                         let restated_by_the_command =
-                            quiet_admission_records && is_terminal_admission_record(target);
+                            quiet_admission_records && is_terminal_admission_record(metadata);
                         !(scribbles_on_the_ladder || restated_by_the_command)
                     }),
                 )),
@@ -5191,6 +5214,49 @@ mod tests {
         );
     }
 
+    /// Only the two admission records are quietened, and nothing else on
+    /// those targets.
+    ///
+    /// The first shape of this keyed on the target, and those two targets carry
+    /// five callsites, not two. It swallowed a `warn` about a stage whose owner
+    /// lock could not be attempted, and the notice telling a reader that
+    /// `kin init` kept earlier staging directories and that they cost disk,
+    /// which has no other sink at all. A reader lost a warning and a disk
+    /// notice so that a log line could be quieter.
+    ///
+    /// Every one of the five shapes is exercised here, because the ones that
+    /// must survive are the point.
+    #[test]
+    fn the_suppression_takes_the_records_and_leaves_the_notices() {
+        let quiet = captured_with_quiet_admission(true);
+
+        assert!(
+            !quiet.contains("admitted exact Git repository"),
+            "the git admission record must be quiet by default: {quiet:?}"
+        );
+        assert!(
+            !quiet.contains("initialized unborn kin repository authority"),
+            "the native admission record must be quiet by default: {quiet:?}"
+        );
+        assert!(
+            quiet.contains("could not prove"),
+            "the retained-staging disk notice has no other sink and must still print: {quiet:?}"
+        );
+        assert!(
+            quiet.contains("owner lock could not be attempted"),
+            "a warn on these targets must never be swallowed: {quiet:?}"
+        );
+        assert!(
+            quiet.contains("reclaimed stranded repository initialization stages"),
+            "the staging trio must still print: {quiet:?}"
+        );
+        assert!(
+            quiet.contains("a warning that happens to name a repository"),
+            "only INFO records are quietened, so a warn carrying the same fields must still \
+             print: {quiet:?}"
+        );
+    }
+
     /// The phase ladder's own progress is untouched by the suppression.
     ///
     /// The two live on the same directives, so a fix that quietened the record
@@ -5200,7 +5266,7 @@ mod tests {
     #[test]
     fn quieting_the_admission_record_leaves_the_periodic_progress_alone() {
         assert!(
-            !is_terminal_admission_record("kin_db::storage::history_replay"),
+            !ADMISSION_TERMINAL_TARGETS.contains(&"kin_db::storage::history_replay"),
             "the periodic progress target must not be swept up in the suppression"
         );
         assert!(
@@ -5227,10 +5293,39 @@ mod tests {
             quiet,
         );
         tracing::subscriber::with_default(subscriber, || {
+            // The five shapes these two targets actually carry. The two
+            // records name a repository and a workspace at info; the staging
+            // trio names a count; the refusal is a warn.
             tracing::info!(
                 target: "kin_core::git_init",
-                seal = "cca6fdfb",
+                repository = "r", workspace = "w", seal = "cca6fdfb",
                 "admitted exact Git repository as graph-owned Kin authority"
+            );
+            tracing::info!(
+                target: "kin_core::init",
+                repository = "r", workspace = "w", head = "h",
+                "initialized unborn kin repository authority"
+            );
+            tracing::info!(
+                target: "kin_core::init", count = 2, parent = "/tmp",
+                "kin init kept 2 earlier stages because it could not prove them unused"
+            );
+            tracing::warn!(
+                target: "kin_core::init", path = "/tmp/x", error = "denied",
+                "retaining repository stage whose owner lock could not be attempted"
+            );
+            // A warn carrying the record's own fields. This is what the level
+            // test is for, and without this case removing that check changed
+            // nothing observable: the mutation survived, and the check read as
+            // guarded when it was not.
+            tracing::warn!(
+                target: "kin_core::init",
+                repository = "r", workspace = "w",
+                "a warning that happens to name a repository and a workspace"
+            );
+            tracing::info!(
+                target: "kin_core::init", count = 1, bytes = 10, parent = "/tmp",
+                "reclaimed stranded repository initialization stages"
             );
         });
         let captured = buffer.lock().expect("log buffer poisoned").clone();
