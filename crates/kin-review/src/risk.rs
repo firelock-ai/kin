@@ -38,17 +38,7 @@ fn per_entity(impact: &ImpactReport, entity_id: &EntityId) -> EntityImpact {
     impact
         .entity_impact(entity_id)
         .cloned()
-        .unwrap_or_else(|| EntityImpact {
-            entity_id: *entity_id,
-            consumer_count: 0,
-            strong_consumer_count: 0,
-            proven_consumer_count: 0,
-            contract_consumer_count: 0,
-            consumer_files: Vec::new(),
-            covering_tests: 0,
-            consumers_migrated_in_diff: 0,
-            call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
-        })
+        .unwrap_or_else(|| EntityImpact::empty(*entity_id))
 }
 
 /// `name (Kind) at file:line` for a removed entity, so a finding reads as code.
@@ -204,7 +194,9 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
                 // Signature changed?
                 if old.signature != new.signature {
                     let entity = per_entity(impact, &change.entity_id);
-                    if entity.consumer_count > 0 || entity.contract_consumer_count > 0 {
+                    // External consumers only: a signature change its own tests
+                    // cover is not a break somebody else has to absorb.
+                    if entity.external_consumers() > 0 || entity.contract_consumer_count > 0 {
                         breaking_changes.push(format!(
                             "Signature change on `{}`: `{}` -> `{}`",
                             new.name, old.signature, new.signature,
@@ -266,7 +258,12 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
                 // both answer for THIS entity.
                 let (dependents, total) =
                     removed_entity_dependents(diff, impact, &change.entity_id);
-                let recorded_consumers = per_entity(impact, &change.entity_id).consumer_count;
+                // The EXTERNAL count, like every other policy read here. This
+                // is the surviving-consumer half of the breaking-removal rule,
+                // and after the row widened to count tests and derived copies a
+                // bare `consumer_count` made a deletion whose only consumers are
+                // its own tests emit a breaking-change finding.
+                let recorded_consumers = per_entity(impact, &change.entity_id).external_consumers();
                 if total > 0 || recorded_consumers > 0 {
                     let subject = match old {
                         Some(entity) => describe_entity(entity),
@@ -484,15 +481,13 @@ mod tests {
         covering_tests: usize,
     ) -> crate::impact::EntityImpact {
         crate::impact::EntityImpact {
-            entity_id,
             consumer_count,
+            external_consumer_count: consumer_count,
             strong_consumer_count: consumer_count,
             proven_consumer_count: consumer_count,
             contract_consumer_count,
-            consumer_files: Vec::new(),
             covering_tests,
-            consumers_migrated_in_diff: 0,
-            call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
+            ..crate::impact::EntityImpact::empty(entity_id)
         }
     }
 
@@ -514,6 +509,101 @@ mod tests {
     /// to say what was deleted and who still calls it, in words a reviewer can
     /// act on. This mirrors the `utils.super_len` case from the reviewprobe
     /// assessment, where the finding named a bare id and nothing else.
+    /// The base-side overlay half of the breaking-removal rule reads the count
+    /// a break is measured against, not the widened total.
+    ///
+    /// `shadow.rs` hands this function an impact row recovered from base state
+    /// for a removed entity, because the live graph no longer holds one. Once
+    /// the row started counting tests and derived copies, a bare
+    /// `consumer_count` read there turned a deletion whose only consumers are
+    /// its own tests into a breaking-change finding, with no relation change in
+    /// the diff to name a dependent from. Both arms run with no relation
+    /// changes at all, so the recorded count is the only thing that can speak.
+    #[test]
+    fn a_removal_whose_recorded_consumers_are_all_tests_is_not_a_breaking_change() {
+        let removed = placed_entity("json", "lib/express.js", 77);
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: removed.id,
+                kind: EntityChangeKind::Removed {
+                    old: Some(removed.clone()),
+                },
+            }],
+            ..Default::default()
+        };
+        let test_only = crate::impact::EntityImpact {
+            consumer_count: 3,
+            test_consumer_count: 3,
+            covering_tests: 3,
+            ..crate::impact::EntityImpact::empty(removed.id)
+        };
+        let summary = assess_risk(
+            &diff,
+            &ImpactReport {
+                entity_impacts: vec![test_only],
+                ..Default::default()
+            },
+        );
+        assert!(
+            summary
+                .breaking_changes
+                .iter()
+                .all(|finding| !finding.contains("json")),
+            "a removal consumed only by its own tests strands nobody: {:?}",
+            summary.breaking_changes
+        );
+
+        // The other excluded class, on the same shape. A vendored copy
+        // regenerates from its source, so a removal it is the only consumer of
+        // strands nobody either.
+        let derived_only = crate::impact::EntityImpact {
+            consumer_count: 2,
+            derived_consumer_count: 2,
+            ..crate::impact::EntityImpact::empty(removed.id)
+        };
+        let summary = assess_risk(
+            &diff,
+            &ImpactReport {
+                entity_impacts: vec![derived_only],
+                ..Default::default()
+            },
+        );
+        assert!(
+            summary
+                .breaking_changes
+                .iter()
+                .all(|finding| !finding.contains("json")),
+            "a removal consumed only by a regenerated copy strands nobody: {:?}",
+            summary.breaking_changes
+        );
+
+        // The positive control, without which the arms above pass on a rule
+        // that has stopped firing at all. One real external consumer on the
+        // same shape, and the finding comes back.
+        let with_external = crate::impact::EntityImpact {
+            consumer_count: 4,
+            external_consumer_count: 1,
+            test_consumer_count: 3,
+            covering_tests: 3,
+            ..crate::impact::EntityImpact::empty(removed.id)
+        };
+        let summary = assess_risk(
+            &diff,
+            &ImpactReport {
+                entity_impacts: vec![with_external],
+                ..Default::default()
+            },
+        );
+        assert!(
+            summary
+                .breaking_changes
+                .iter()
+                .any(|finding| finding.contains("json")),
+            "one stranded external consumer is still a breaking removal: {:?}",
+            summary.breaking_changes
+        );
+    }
+
     #[test]
     fn removed_entity_finding_names_the_entity_and_its_dependents() {
         use crate::diff::{RelationChange, RelationChangeKind};
