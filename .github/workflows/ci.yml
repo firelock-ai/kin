@@ -1151,6 +1151,69 @@ jobs:
               -- --exact --nocapture --test-threads=1
           done
 
+      # kin-remote's hosted object-store destination is behind a non-default
+      # `gcs` feature, and until this step nothing in any workflow ran its
+      # tests. Clippy's `--all-targets --all-features` above compiles them, which
+      # is a build and not a run; nextest below runs a changed-crate scope with
+      # default features; and `Feature permutation tests` covers neither, because
+      # its pull-request leg runs no tests at all and its real leg is scoped to
+      # `-p kin-daemon`. So every test in that module was compiled by this
+      # repository and executed by nothing, on any event, on any branch.
+      #
+      # They belong in this required context rather than beside the other
+      # permutations on the push-to-main job, because they guard how a hosted
+      # publication's destination is composed: a prefix that names a different
+      # object than it appears to, an identifier a hosted record will refuse
+      # after the publication has already committed, and an emulator recorded as
+      # the real service. A class answered only after landing is rediscovered by
+      # the next person.
+      #
+      # Two assertions, and the second is the one that keeps this step honest.
+      #
+      # Per name: `cargo test <name> -- --exact` matches the whole test path, so
+      # a renamed or moved test filters everything out, runs nothing and exits 0,
+      # which reads exactly like a pass. This is the same assertion the Firestore
+      # step above makes, for the same reason.
+      #
+      # Over the set: the list below is hand maintained, so a test added to
+      # `gcs_tests` and not added here would be graded by nothing while this step
+      # stayed green, which is the same silent-allowlist shape the per-name
+      # assertion exists to stop, one level up. It drifted inside an hour on the
+      # pull request that introduced it. So the listing's total for that module
+      # must equal the number of names enumerated here, and the count comes from
+      # the array itself rather than from a second literal that could disagree
+      # with it.
+      - name: Test hosted object-store destination composition
+        shell: bash
+        run: |
+          set -euo pipefail
+          listing="$(cargo test -p kin-remote --features gcs --locked --lib -- --list | tr -d '\r')"
+          tests=(
+            first_publication_gcs::gcs_tests::a_publication_is_found_at_the_key_this_destination_names
+            first_publication_gcs::gcs_tests::a_destination_under_a_different_prefix_sees_nothing
+            first_publication_gcs::gcs_tests::an_independently_opened_destination_reads_the_same_publication
+            first_publication_gcs::gcs_tests::the_ordinary_memory_store_cannot_stand_in_for_a_bucket
+            first_publication_gcs::gcs_tests::the_endpoint_class_travels_with_the_opened_destination
+            first_publication_gcs::gcs_tests::a_destination_that_cannot_compose_an_identifier_never_yields_a_backend
+            first_publication_gcs::gcs_tests::opening_a_real_client_derives_the_class_from_the_endpoint_it_was_given
+            first_publication_gcs::gcs_tests::a_real_client_is_never_built_for_a_destination_over_budget
+          )
+          listed="$(printf '%s\n' "$listing" | awk '/^first_publication_gcs::gcs_tests::[A-Za-z0-9_]+: test$/ { count += 1 } END { print count + 0 }')"
+          if [ "$listed" -ne "${#tests[@]}" ]; then
+            echo "::error title=Ungraded object-store destination test::the module lists $listed gated test(s) and this step enumerates ${#tests[@]}; add the new one here or this step grades it by nothing"
+            exit 1
+          fi
+          for test_name in "${tests[@]}"
+          do
+            matches="$(printf '%s\n' "$listing" | awk -v expected="$test_name: test" '$0 == expected { count += 1 } END { print count + 0 }')"
+            if [ "$matches" -ne 1 ]; then
+              echo "::error title=Missing object-store destination test::$test_name listed $matches time(s)"
+              exit 1
+            fi
+            cargo test -p kin-remote --features gcs --locked --lib "$test_name" \
+              -- --exact --nocapture --test-threads=1
+          done
+
       # Nine of the window's 64 failures were release ordering and npm
       # provenance policy and eight more were this gate, so a fifth of what a
       # pull request used to learn in thirty minutes is learned here in under
