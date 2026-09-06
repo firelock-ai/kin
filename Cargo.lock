@@ -1915,7 +1915,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19753d40da53d0ec41604750eeb969097a90fb2d7f7992730d904541c04e2c19"
 dependencies = [
  "bstr",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -3162,7 +3162,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
- "which 8.0.4",
+ "which 8.0.6",
  "windows-sys 0.61.2",
  "zip",
 ]
@@ -3213,7 +3213,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "uuid",
- "which 8.0.4",
+ "which 8.0.6",
  "winapi-util",
  "windows-sys 0.61.2",
 ]
@@ -3273,7 +3273,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "which 8.0.4",
+ "which 8.0.6",
  "windows-sys 0.61.2",
  "zip",
 ]
@@ -3361,7 +3361,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
- "which 8.0.4",
+ "which 8.0.6",
  "windows-sys 0.61.2",
 ]
 
@@ -3508,7 +3508,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
- "which 8.0.4",
+ "which 8.0.6",
  "windows-sys 0.61.2",
 ]
 
@@ -6653,9 +6653,9 @@ dependencies = [
 
 [[package]]
 name = "which"
-version = "8.0.4"
+version = "8.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48d7cd18d4acb58fb3cdfe9ea54e6cd96a4e7d4cc45c56338b236e82dad47248"
+checksum = "bae2f2b2b816647a1cab1acc91f5bd20812d53cb344382635ec2181940c8034f"
 dependencies = [
  "libc",
 ]
