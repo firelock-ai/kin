@@ -105,6 +105,7 @@ pub const GENERATED_KNOBS: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_EXPLICIT_PHASE_MISMATCH_PENALTY", kind: Kind::NonNegF32, default: "0.22", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: explicit phase mismatch penalty" },
     EnvVarSpec { name: "KIN_LOCATE_FALLBACK_TERM_LIMIT", kind: Kind::Usize, default: "6", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: fallback term limit" },
     EnvVarSpec { name: "KIN_LOCATE_FILE_ANCHORS", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: file anchors" },
+    EnvVarSpec { name: "KIN_LOCATE_FILE_ANCHOR_BAND_SHARE", kind: Kind::NonNegF32, default: "0.25", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: file anchor band share" },
     EnvVarSpec { name: "KIN_LOCATE_FILE_ANCHOR_BUDGET", kind: Kind::Usize, default: "8", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: file anchor budget" },
     EnvVarSpec { name: "KIN_LOCATE_FILE_ANCHOR_FILES", kind: Kind::Usize, default: "5", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: file anchor files" },
     EnvVarSpec { name: "KIN_LOCATE_FILE_ANCHOR_MASS_WEIGHT", kind: Kind::NonNegF32, default: "0.0", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: file anchor mass weight" },
