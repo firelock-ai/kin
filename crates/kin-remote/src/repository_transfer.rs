@@ -259,7 +259,16 @@ pub fn bearer_token_next_step(base_url: &str) -> String {
 /// character. A redactor cannot tell them apart, so it must not guess. An `@`
 /// at or after the authority's end means this is not a well-formed URL, and
 /// this returns `None` rather than vouch for a host that may be a password
-/// fragment. Callers say so instead of printing an address.
+/// fragment. Callers say so instead of printing an address. An authority that
+/// ends up empty, which is every degenerate string down to `""`, is withheld by
+/// the same rule: an empty host is not an address, and rendering one would put
+/// nothing where the remote's name belongs.
+///
+/// That cost is wider than a path. `https://kinlab.ai/org?redirect=a@b` and the
+/// same `@` in a fragment are withheld too, because the rule reads the whole
+/// string past the authority and cannot tell those from a userinfo either.
+/// Three URL parts rather than one, and still the right trade, because none of
+/// them is part of the endpoint a remote base URL actually is.
 ///
 /// Hand-written rather than parsed, and that is not a shortcut: a lenient
 /// parser resolves `https://alice:pa/ss@kinlab.ai/org` to host `pa`, which is
@@ -286,6 +295,12 @@ pub fn redacted_remote_address(base_url: &str) -> Option<String> {
         Some(at) => authority_start + at + 1,
         None => authority_start,
     };
+    // Nothing left to name. `""`, `"@"`, `"://"` and `"://@"` all land here and
+    // would otherwise render as `Some("")` or `Some("://")`, which reads in a
+    // refusal as "the remote at  accepts".
+    if trimmed[host_start..authority_end].is_empty() {
+        return None;
+    }
     let kept = format!("{}{}", &trimmed[..authority_start], &trimmed[host_start..]);
     // Query and fragment last, over a string that no longer carries a userinfo.
     Some(match kept.find(['?', '#']) {
@@ -5151,8 +5166,8 @@ mod bearer_token_next_step_tests {
     fn the_next_step_keeps_the_address_a_reader_has_to_act_on() {
         let message = bearer_token_next_step(CREDENTIAL_BEARING);
         assert!(
-            message.contains("https://kinlab.example"),
-            "the remedy must still name which remote refused: {message}"
+            message.contains("https://kinlab.example/base"),
+            "the remedy must still name which remote refused, path included: {message}"
         );
     }
 
@@ -5252,6 +5267,30 @@ mod redacted_remote_address_tests {
         );
     }
 
+    /// A string with nothing where a host belongs takes the `None` arm too.
+    ///
+    /// These reached the end of the function and rendered as `Some("")` and
+    /// `Some("://")`, so a refusal built from one read "the remote at  accepts"
+    /// or "the remote at :// accepts". Neither is an address, and this
+    /// function's own rule is that what it cannot vouch for is withheld rather
+    /// than rendered.
+    #[test]
+    fn a_string_with_no_host_is_withheld_rather_than_rendered_as_an_empty_address() {
+        for input in ["", "   ", "@", "://", "://@", "https://", "https://@/org"] {
+            assert_eq!(
+                redacted_remote_address(input),
+                None,
+                "{input:?} names no host, so it must be withheld"
+            );
+        }
+        // The positive control: the shortest real address still resolves, so
+        // the rule above cannot be satisfied by withholding everything.
+        assert_eq!(
+            redacted_remote_address("https://a").as_deref(),
+            Some("https://a")
+        );
+    }
+
     /// The property, stated once over every shape above: nothing a caller could
     /// have put a secret in survives.
     #[test]
@@ -5269,6 +5308,14 @@ mod redacted_remote_address_tests {
                 "userinfo and a fragment with no scheme",
                 "alice:s3cr3t@kinlab.ai#t0ken",
             ),
+            (
+                "a userinfo carrying an unencoded slash",
+                "https://alice:s3cr3t/pw@kinlab.ai/org",
+            ),
+            (
+                "a userinfo carrying an unencoded question mark",
+                "https://alice:s3cr3t?pw@kinlab.ai/org",
+            ),
         ] {
             // Withholding is a pass here and the reason is the point: for the
             // two unencoded-delimiter shapes there is no host this can name
@@ -5280,7 +5327,6 @@ mod redacted_remote_address_tests {
             assert!(
                 !redacted.contains("s3cr3t")
                     && !redacted.contains("t0ken")
-                    && !redacted.contains("pa/ss")
                     && !redacted.contains("alice"),
                 "{case}: a credential survived redaction"
             );
