@@ -22,12 +22,30 @@ kin_buildinfo::embed_update_build_identity!(
     kin_db::GraphSnapshot::CURRENT_VERSION
 );
 
-/// Orientation for the flat subcommand list. The command surface is wide
-/// because it spans version control, semantic query, sessions, and operations,
-/// and clap renders subcommands as one undifferentiated block with no grouping
-/// primitive. Naming the everyday path here is what separates it from the
-/// benchmarking, hosted-release, and diagnostic commands beside it.
-const AFTER_HELP: &str = "\
+/// What `kin` says about itself, and the everyday path, above the command list.
+///
+/// The command surface is wide because it spans version control, semantic
+/// query, sessions, and operations, and clap renders subcommands as one
+/// undifferentiated block with no grouping primitive. Naming the everyday path
+/// is what separates it from the benchmarking, hosted-release, and diagnostic
+/// commands beside it.
+///
+/// This is `before_help` rather than `after_help`, which is where it used to
+/// be, because position was hiding it. The subcommand list runs to eighty
+/// entries, so on an eighty-column, fifty-row terminal a reader who typed
+/// `kin` saw commands from the fifth line to the ninety-second and never
+/// reached the orientation below them without scrolling back. The lines a
+/// first-time reader needs now come first, and the wide list follows.
+///
+/// The first line is the brand canon's Category line, taken verbatim. The line
+/// it replaces, "Kin semantic VCS", is the "semantic version control"
+/// construction the canon lists under "Retired - do not ship", and it was the
+/// first thing `kin --help` printed. A surface needing a headline takes a
+/// locked line rather than getting a new one, so this is that line and not a
+/// rewrite of it.
+const ORIENTATION: &str = "\
+The system of record for AI-written software.
+
 Start here:
   kin init            admit an existing or new repository
   kin clone <source>  admit a repository from elsewhere
@@ -36,8 +54,10 @@ Start here:
   kin log / kin diff  read the immutable change log and exact changes
 
 Ask the graph:
-  kin locate / search / trace / impact / refs / context
+  kin locate / search / trace / impact / refs / context";
 
+/// What follows the command list: where to read the rest.
+const AFTER_HELP: &str = "\
 `kin capabilities` prints the full readiness matrix, `--json` for machines.";
 
 /// The `[OPEN GATE]` legend, which is only true while something carries the
@@ -75,7 +95,7 @@ fn after_help() -> String {
 #[command(
     name = "kin",
     version = kin_buildinfo::version(),
-    about = "Kin semantic VCS",
+    before_help = ORIENTATION,
     after_help = after_help(),
 )]
 struct Cli {
@@ -2744,10 +2764,83 @@ fn retired_command_signpost(args: &[String]) -> Option<(String, &'static str)> {
 /// Anything clap reports that is not a retired path, including `--help` and
 /// `--version`, is handed back to clap so its exit codes and rendering stay
 /// exactly as they were.
+/// The version text, split into the lines the mark is set beside.
+///
+/// `kin_buildinfo::version()` composes `0.7.2 (<sha> <branch> <time>)`, one
+/// line and eighty-two columns wide, so on an eighty-column terminal the one
+/// thing `kin --version` has to say wrapped. Split, it reads at both widths the
+/// walk measured, and every fact the single line carried is still here.
+///
+/// The empty first element leaves the mark's top row to the mark, which is what
+/// sets the version number against the arm rather than above it.
+fn version_lines(version: &str) -> Vec<String> {
+    let (number, build) = match version.split_once(" (") {
+        Some((number, rest)) => (number, rest.trim_end_matches(')')),
+        None => (version, ""),
+    };
+    let mut lines = vec![
+        String::new(),
+        format!("kin {number}"),
+        CATEGORY_LINE.to_string(),
+    ];
+    // The commit sha gets its own line, and the branch and build time the next.
+    // Together they are seventy columns on a release build, whose branch reads
+    // `detached`, and ninety when the branch name is long, which wraps at
+    // eighty. Splitting them is what makes the bound hold for every branch
+    // name rather than for the ones a release happens to have.
+    match build.split_once(' ') {
+        Some((commit, rest)) => {
+            lines.push(commit.to_string());
+            lines.push(rest.to_string());
+        }
+        None => lines.push(build.to_string()),
+    }
+    lines
+}
+
+/// The canon Category line, shared by `--help` and `--version`.
+const CATEGORY_LINE: &str = "The system of record for AI-written software.";
+
+/// What `kin --version` prints.
+///
+/// A terminal gets the mark and the split lines. Anything else gets the exact
+/// single line it got before, because a redirected `kin --version` is being
+/// read by something: the README tells a reader to confirm an install with it
+/// on every install path, and the Homebrew tap, the npm launcher, and every
+/// install script parse it. Four rows of art in that stream would break them
+/// all, so the decision is made once, here, by whether stdout is a terminal.
+fn rendered_version(version: &str, style: Option<kin_cli::mark::MarkStyle>) -> String {
+    match style {
+        Some(style) => kin_cli::mark::beside(
+            style,
+            &version_lines(version)
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        )
+        .join("\n"),
+        None => format!("kin {version}"),
+    }
+}
+
 fn parse_cli_or_report_retired_command() -> Cli {
     match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
+            // clap reports `--version` as an error of its own kind and would
+            // print the bare line itself. Taken here so the mark reaches the
+            // one surface a reader hits before anything else, while clap keeps
+            // deciding what counts as asking for the version.
+            if err.kind() == clap::error::ErrorKind::DisplayVersion {
+                println!(
+                    "{}",
+                    rendered_version(
+                        kin_buildinfo::version(),
+                        kin_cli::mark::MarkStyle::for_stdout()
+                    )
+                );
+                std::process::exit(0);
+            }
             if err.kind() == clap::error::ErrorKind::InvalidSubcommand {
                 let args: Vec<String> = std::env::args().skip(1).collect();
                 if let Some((path, guidance)) = retired_command_signpost(&args) {
@@ -2842,6 +2935,8 @@ fn run() -> Result<()> {
         // The fmt layer does not sniff for a terminal, so without this it
         // writes colour escapes into a redirected log or a captured transcript.
         std::io::stderr().is_terminal(),
+        // An operator who set RUST_LOG asked for the records; nobody else did.
+        std::env::var_os("RUST_LOG").is_none(),
     )
     .init();
 
@@ -4329,6 +4424,59 @@ fn is_periodic_admission_progress(target: &str) -> bool {
     target == "kin_db::storage::history_replay"
 }
 
+/// The admission targets whose one event a command's own result restates.
+///
+/// Both carry terminal records: an admission that finished, and a recovered
+/// stale staging. They are raised to `info` for `init` and `clone` because
+/// [`AdmissionProgressLayer`] reads them, and until now the fmt layer rendered
+/// them too. On `kin init` that put a line like
+///
+/// ```text
+/// 2026-09-06T15:58:17Z  INFO kin_core::git_init: admitted exact Git repository as
+/// graph-owned Kin authority path=... repository=... workspace=... generation=1
+/// observed_trees=932 observed_entries=35028 sealed_bodies=1195 ...
+/// seal=cca6fdfb47522ce9...
+/// ```
+///
+/// between the phase ladder and the human result, eight machine fields and a
+/// sixty-four-character seal, on the first command a new reader ever runs. Both
+/// commands already print the path, the repository id, the workspace id and the
+/// generation in their own result blocks, in that reader's own terms, so the
+/// record restates what the next twelve lines say properly.
+///
+/// Only the fmt layer drops them. The progress layer still sees them, `RUST_LOG`
+/// still brings them back in full, and nothing changes for any other command,
+/// because no other command raises these targets above `warn` in the first
+/// place.
+const ADMISSION_TERMINAL_TARGETS: [&str; 2] = ["kin_core::init", "kin_core::git_init"];
+
+/// Whether one event is an admission record the command restates itself.
+///
+/// Keyed on the event, never on its target. Those two targets carry five
+/// callsites between them, not two: the two admission records, an
+/// `initialized`/`recovered`/`reclaimed` trio about staging, and a `warn` about
+/// a stage whose owner lock could not be attempted. One of the trio is the
+/// notice telling a reader that `kin init` kept earlier staging directories and
+/// that they cost disk, and it has no other sink at all. A target-keyed
+/// suppression takes every one of them, so the reader loses a warning and a
+/// disk notice to make a log line quieter.
+///
+/// The two records are the only events on these targets that carry both a
+/// `repository` and a `workspace` field at `INFO`, which is what identifies
+/// them: the staging trio carries `count` and `parent`, and the refusal is a
+/// `warn` with `path` and `error`. The level is part of the test so a future
+/// `warn` carrying the same fields is not swallowed by this.
+fn is_terminal_admission_record(metadata: &tracing::Metadata<'_>) -> bool {
+    if !ADMISSION_TERMINAL_TARGETS.contains(&metadata.target()) {
+        return false;
+    }
+    if *metadata.level() != tracing::Level::INFO {
+        return false;
+    }
+    let fields = metadata.fields();
+    fields.field("repository").is_some() && fields.field("workspace").is_some()
+}
+
 /// Render an admission progress event onto the live phase line.
 ///
 /// The event's own message is not reused. `history_replay` reports elapsed
@@ -4484,6 +4632,7 @@ fn tracing_stack<W>(
     profile_session: Option<kin_cli::profile::ProfileSession>,
     writer: W,
     ansi: bool,
+    quiet_admission_records: bool,
 ) -> impl tracing::Subscriber + Send + Sync + 'static
 where
     W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
@@ -4496,8 +4645,18 @@ where
                 .with_writer(writer)
                 .with_ansi(ansi)
                 .with_filter(EnvFilter::new(directives).and(
-                    tracing_subscriber::filter::filter_fn(|metadata| {
-                        !is_periodic_admission_progress(metadata.target())
+                    tracing_subscriber::filter::filter_fn(move |metadata| {
+                        // Two separate reasons a record does not belong on the
+                        // fmt layer, named, then one negation over them. The
+                        // reasons are what a reader of this filter needs, and
+                        // `!a && !b` spelled out inline is the same expression
+                        // clippy's nonminimal_bool refuses either way, so the
+                        // names carry the meaning and the shape stays minimal.
+                        let scribbles_on_the_ladder =
+                            is_periodic_admission_progress(metadata.target());
+                        let restated_by_the_command =
+                            quiet_admission_records && is_terminal_admission_record(metadata);
+                        !(scribbles_on_the_ladder || restated_by_the_command)
                     }),
                 )),
         )
@@ -4987,6 +5146,10 @@ mod tests {
             Some(session.clone()),
             CapturedLog(buffer.clone()),
             false,
+            // Composition is what is under test here, so the admission record
+            // this asserts on is left reaching the fmt layer. The suppression
+            // has its own test beside this one.
+            false,
         );
 
         tracing::subscriber::with_default(subscriber, || {
@@ -5020,6 +5183,245 @@ mod tests {
                 .map(|span| span.name.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// `kin init` no longer prints its own admission record at the reader.
+    ///
+    /// The record is a terminal one, so it landed between the phase ladder and
+    /// the human result with eight machine fields and a sixty-four-character
+    /// seal on it. The result block that follows already names the path, the
+    /// repository, the workspace and the generation, so the record restated
+    /// them in a shape nobody reading a first `kin init` can use.
+    ///
+    /// Both arms, because dropping the record everywhere would take it from the
+    /// operator who asked for it, and that failure is invisible until someone
+    /// needs the log.
+    #[test]
+    fn the_admission_record_is_quiet_by_default_and_returns_under_rust_log() {
+        let quiet = captured_with_quiet_admission(true);
+        assert!(
+            !quiet.contains("admitted exact Git repository"),
+            "the default `kin init` still prints its own admission record; captured {quiet:?}"
+        );
+
+        let asked_for = captured_with_quiet_admission(false);
+        assert!(
+            asked_for.contains("admitted exact Git repository"),
+            "RUST_LOG must still deliver the record; captured {asked_for:?}"
+        );
+    }
+
+    /// Only the two admission records are quietened, and nothing else on
+    /// those targets.
+    ///
+    /// The first shape of this keyed on the target, and those two targets carry
+    /// five callsites, not two. It swallowed a `warn` about a stage whose owner
+    /// lock could not be attempted, and the notice telling a reader that
+    /// `kin init` kept earlier staging directories and that they cost disk,
+    /// which has no other sink at all. A reader lost a warning and a disk
+    /// notice so that a log line could be quieter.
+    ///
+    /// Every one of the five shapes is exercised here, because the ones that
+    /// must survive are the point.
+    #[test]
+    fn the_suppression_takes_the_records_and_leaves_the_notices() {
+        let quiet = captured_with_quiet_admission(true);
+
+        assert!(
+            !quiet.contains("admitted exact Git repository"),
+            "the git admission record must be quiet by default: {quiet:?}"
+        );
+        assert!(
+            !quiet.contains("initialized unborn kin repository authority"),
+            "the native admission record must be quiet by default: {quiet:?}"
+        );
+        assert!(
+            quiet.contains("could not prove"),
+            "the retained-staging disk notice has no other sink and must still print: {quiet:?}"
+        );
+        assert!(
+            quiet.contains("owner lock could not be attempted"),
+            "a warn on these targets must never be swallowed: {quiet:?}"
+        );
+        assert!(
+            quiet.contains("reclaimed stranded repository initialization stages"),
+            "the staging trio must still print: {quiet:?}"
+        );
+        assert!(
+            quiet.contains("a warning that happens to name a repository"),
+            "only INFO records are quietened, so a warn carrying the same fields must still \
+             print: {quiet:?}"
+        );
+    }
+
+    /// The phase ladder's own progress is untouched by the suppression.
+    ///
+    /// The two live on the same directives, so a fix that quietened the record
+    /// by lowering `kin_core::git_init` out of the filter would take the
+    /// ladder's input with it, and the symptom would be a `kin init` that shows
+    /// no phases at all.
+    #[test]
+    fn quieting_the_admission_record_leaves_the_periodic_progress_alone() {
+        assert!(
+            !ADMISSION_TERMINAL_TARGETS.contains(&"kin_db::storage::history_replay"),
+            "the periodic progress target must not be swept up in the suppression"
+        );
+        assert!(
+            is_periodic_admission_progress("kin_db::storage::history_replay"),
+            "the periodic target must still be the one the ladder reads"
+        );
+        for target in ADMISSION_TERMINAL_TARGETS {
+            assert!(
+                ADMISSION_PROGRESS_TARGETS.contains(&target),
+                "{target} is suppressed on the fmt layer but never raised to info, so the \
+                 suppression is describing a record that was never emitted"
+            );
+        }
+    }
+
+    /// Run one admission record through the stack and return what was written.
+    fn captured_with_quiet_admission(quiet: bool) -> String {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_stack(
+            &default_filter_directives("init"),
+            None,
+            CapturedLog(buffer.clone()),
+            false,
+            quiet,
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            // The five shapes these two targets actually carry. The two
+            // records name a repository and a workspace at info; the staging
+            // trio names a count; the refusal is a warn.
+            tracing::info!(
+                target: "kin_core::git_init",
+                repository = "r", workspace = "w", seal = "cca6fdfb",
+                "admitted exact Git repository as graph-owned Kin authority"
+            );
+            tracing::info!(
+                target: "kin_core::init",
+                repository = "r", workspace = "w", head = "h",
+                "initialized unborn kin repository authority"
+            );
+            tracing::info!(
+                target: "kin_core::init", count = 2, parent = "/tmp",
+                "kin init kept 2 earlier stages because it could not prove them unused"
+            );
+            tracing::warn!(
+                target: "kin_core::init", path = "/tmp/x", error = "denied",
+                "retaining repository stage whose owner lock could not be attempted"
+            );
+            // A warn carrying the record's own fields. This is what the level
+            // test is for, and without this case removing that check changed
+            // nothing observable: the mutation survived, and the check read as
+            // guarded when it was not.
+            tracing::warn!(
+                target: "kin_core::init",
+                repository = "r", workspace = "w",
+                "a warning that happens to name a repository and a workspace"
+            );
+            tracing::info!(
+                target: "kin_core::init", count = 1, bytes = 10, parent = "/tmp",
+                "reclaimed stranded repository initialization stages"
+            );
+        });
+        let captured = buffer.lock().expect("log buffer poisoned").clone();
+        String::from_utf8(captured).expect("captured log is utf-8")
+    }
+
+    /// `kin --version` splits into lines that fit the terminal it is read on.
+    ///
+    /// The composed single line is eighty-two columns, so the one thing this
+    /// command has to say wrapped on an eighty-column terminal. Every fact it
+    /// carried is still here, on lines that fit.
+    #[test]
+    fn the_version_block_keeps_every_fact_and_fits_eighty_columns() {
+        let composed = "0.7.2 (dca8e950e99f6a1cb9afe4359611e2da288004f2 detached \
+                        2026-09-06T08:24:29Z)";
+        let lines = version_lines(composed);
+        assert_eq!(lines[0], "", "the mark keeps its top row");
+        assert_eq!(lines[1], "kin 0.7.2");
+        // The literal, not the constant. Comparing the constant against itself
+        // is an assertion that cannot fail, and it would sit here looking like
+        // one that could.
+        assert_eq!(lines[2], "The system of record for AI-written software.");
+        assert_eq!(lines[3], "dca8e950e99f6a1cb9afe4359611e2da288004f2");
+        assert_eq!(lines[4], "detached 2026-09-06T08:24:29Z");
+
+        // Both a release build, whose branch reads `detached`, and a working
+        // branch with a long name. The second is not hypothetical: a build off
+        // a branch named like this one reported a version line of ninety
+        // columns, which the release-shaped input alone could never have
+        // caught.
+        let working = "0.7.3 (0123456789abcdef0123456789abcdef01234567 \
+                       a-working-branch-with-a-long-name 2026-01-02T03:04:05Z)";
+        for version in [composed, working] {
+            for paint in [
+                kin_cli::mark::Paint::Truecolor,
+                kin_cli::mark::Paint::Indexed,
+                kin_cli::mark::Paint::None,
+            ] {
+                let style = kin_cli::mark::MarkStyle::new(kin_cli::mark::Glyphs::Unicode, paint);
+                for line in rendered_version(version, Some(style)).lines() {
+                    let width = console::measure_text_width(line);
+                    assert!(
+                        width <= 80,
+                        "the version line {line:?} is {width} columns wide, so it wraps at 80"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `--help` and `--version` lead with the same line.
+    ///
+    /// The canon line is written twice, once inside [`ORIENTATION`] where a
+    /// clap attribute needs a `const`, and once as [`CATEGORY_LINE`] where
+    /// `--version` needs it. `concat!` takes literals rather than constants, so
+    /// the two cannot be built from one another without a dependency this crate
+    /// does not carry. This is what keeps them from drifting apart, which is
+    /// the failure a reader would meet as two different taglines on two
+    /// commands.
+    #[test]
+    fn the_help_and_the_version_lead_with_the_same_line() {
+        assert!(
+            ORIENTATION.starts_with(CATEGORY_LINE),
+            "help opens with {:?} and --version with {CATEGORY_LINE:?}",
+            ORIENTATION.lines().next().unwrap_or_default()
+        );
+    }
+
+    /// A version string with no build detail still renders.
+    ///
+    /// `kin_buildinfo::version()` composes the parenthesised half from build
+    /// environment variables, and a build that set none of them hands back a
+    /// bare number. Splitting on a separator that is not there must not panic
+    /// on the one command an install script runs to check the install.
+    #[test]
+    fn a_version_with_no_build_detail_still_splits() {
+        let lines = version_lines("0.7.2");
+        assert_eq!(lines[1], "kin 0.7.2");
+        assert_eq!(lines[3], "");
+        assert_eq!(lines.len(), 4, "an absent build detail adds no second line");
+    }
+
+    /// With no terminal, `--version` is the exact line it has always been.
+    ///
+    /// The README tells a reader to confirm every install path with this
+    /// command, and the Homebrew tap, the npm launcher and every install script
+    /// parse what it prints. `MarkStyle::for_stdout` answers `None` off a
+    /// terminal; this pins what that answer produces, byte for byte, without
+    /// depending on whether the harness running it happens to hold one.
+    #[test]
+    fn a_redirected_version_stays_the_single_line_callers_parse() {
+        let composed = "0.7.2 (dca8e950 detached 2026-09-06T08:24:29Z)";
+        let rendered = rendered_version(composed, None);
+        assert_eq!(
+            rendered, "kin 0.7.2 (dca8e950 detached 2026-09-06T08:24:29Z)",
+            "a redirected --version must be the line every install path already parses"
+        );
+        assert_eq!(rendered.lines().count(), 1);
+        assert!(!rendered.contains('\u{1b}'), "no escapes reach a pipe");
     }
 
     /// With no admission ladder open, a progress event is printed rather than
@@ -5644,6 +6046,60 @@ mod tests {
         });
     }
 
+    /// The orientation has to come before the command list, not merely exist.
+    ///
+    /// It existed for as long as the list did, at the bottom, under eighty
+    /// subcommand lines. On the eighty-column terminal the walk was measured
+    /// on, `kin` printed commands from line five to line ninety-two and the
+    /// orientation at line ninety-four, so the only lines that tell a reader
+    /// what to type first were the ones a fifty-row terminal had already
+    /// scrolled away. Containment alone passes on both layouts, which is why
+    /// this asserts the order.
+    #[test]
+    fn the_orientation_precedes_the_command_list() {
+        on_cli_test_stack(|| {
+            let mut command = Cli::command();
+            let help = command.render_long_help().to_string();
+            let orientation = help
+                .find("Start here:")
+                .expect("help carries the orientation");
+            let commands = help
+                .find("Commands:")
+                .expect("help carries the command list");
+            assert!(
+                orientation < commands,
+                "the orientation is at byte {orientation} and the command list at {commands}, so \
+                 a reader meets eighty subcommands before the five lines that orient them"
+            );
+        });
+    }
+
+    /// Help leads with a locked line, not with a retired construction.
+    ///
+    /// `about = "Kin semantic VCS"` was the first line `kin --help` printed.
+    /// The brand book's canon page lists "semantic version control" under
+    /// "Retired - do not ship", and carries the Category line asserted here for
+    /// exactly this job. A surface needing a headline takes a locked line; it
+    /// does not get a new one.
+    #[test]
+    fn help_leads_with_the_canon_category_line() {
+        on_cli_test_stack(|| {
+            let mut command = Cli::command();
+            let help = command.render_long_help().to_string();
+            assert!(
+                help.starts_with("The system of record for AI-written software."),
+                "help opens with {:?}",
+                help.lines().next().unwrap_or_default()
+            );
+            for retired in ["semantic VCS", "semantic version control"] {
+                assert!(
+                    !help.contains(retired),
+                    "help carries the retired construction {retired:?}"
+                );
+            }
+        });
+    }
+
     /// The legend teaches a marker, so it may only appear while a marker does.
     ///
     /// Asserting the bare string was what let it outlive the thing it
@@ -5668,7 +6124,7 @@ mod tests {
 
             // The conditional is what is under test, so exercise both arms
             // rather than only the one this inventory happens to select.
-            assert!(after_help().contains("Start here:"));
+            assert!(after_help().contains("kin capabilities"));
             assert!(!AFTER_HELP.contains(OPEN_GATE_MARKER));
             assert!(OPEN_GATE_LEGEND.contains(OPEN_GATE_MARKER));
             assert!(

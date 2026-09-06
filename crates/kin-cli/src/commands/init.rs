@@ -1637,11 +1637,35 @@ fn render_human_result(
 ) -> Result<String> {
     let default_ref = initialized_default_ref(result);
     let mut out = String::new();
-    writeln!(
-        out,
-        "Initialized Kin repository authority at {}",
-        result.layout.root().display()
-    )?;
+    // The mark goes beside the headline, and only on a terminal. `kin init` is
+    // parsed: the acceptance suites read this block, and every one of them
+    // captures stdout, so off a terminal this is the headline alone and every
+    // reader of it sees what it always saw.
+    let root = result.layout.root().display().to_string();
+    let header = match crate::mark::MarkStyle::for_stdout() {
+        // On a terminal the path takes its own row beside the mark. On one
+        // line with the mark's seven columns in front of it, an ordinary path
+        // made this ninety-two columns and it wrapped, and the mark is not
+        // what a reader should pay for.
+        Some(style) => crate::mark::beside(
+            style,
+            &["", "Initialized Kin repository authority", &root, ""],
+        ),
+        // Off a terminal, the one line every reader of this block already
+        // parses, unchanged.
+        None => vec![format!("Initialized Kin repository authority at {root}")],
+    };
+    // More than the headline means the mark drew, and its lower rows would
+    // otherwise sit directly on top of the detail lines below, which are
+    // indented two rather than seven. The blank line is part of the mark, so it
+    // appears exactly when the mark does and a capture keeps its shape.
+    let marked = header.len() > 1;
+    for line in header {
+        writeln!(out, "{line}")?;
+    }
+    if marked {
+        writeln!(out)?;
+    }
     writeln!(out, "  Authority: repository-v6 (graph-owned)")?;
     writeln!(out, "  Repository: {}", result.repository_id)?;
     writeln!(out, "  Workspace: {}", result.workspace_id)?;
@@ -1661,8 +1685,8 @@ fn render_human_result(
     )?;
     writeln!(
         out,
-        "  Workspace head: {}",
-        serde_json::to_string(&result.authority.workspace.workspace_head)?
+        "{}",
+        workspace_head_line(&result.authority.workspace.workspace_head)
     )?;
     writeln!(
         out,
@@ -1718,7 +1742,60 @@ fn render_human_result(
     for line in uncommitted_worktree_disclosure(&result.workspace_divergence) {
         writeln!(out, "{line}")?;
     }
+    for line in next_step_lines() {
+        writeln!(out, "{line}")?;
+    }
     Ok(out)
+}
+
+/// The workspace head, rendered rather than serialized.
+///
+/// This line used to be
+/// `{"type":"symbolic","target":{"bytes_hex":"726566732f68656164732f6d6173746572"}}`,
+/// and that hex decodes to `refs/heads/master`, which is the ref name printed
+/// four lines above it. So the one machine-shaped line in a first-time reader's
+/// result carried nothing the block had not already said in words, and said it
+/// as a byte array.
+///
+/// `kin status` has rendered the same value as `symbolic refs/heads/master` all
+/// along. This is that renderer, and pulling the line into its own function is
+/// what lets a test hold it to a ref name.
+fn workspace_head_line(head: &kin_model::WorkspaceHead) -> String {
+    format!("  Workspace head: {}", super::status::render_head(head))
+}
+
+/// What to do with the graph this command just spent its time building.
+///
+/// `kin init` is the slow step and the one that earns the rest: the README's
+/// five-command path spends four of them getting here and the fifth is the
+/// answer. The result block ended on store size and a pointer to a document
+/// about store size, so the command that had just run for ninety-three seconds
+/// on a small repository said nothing about what the graph is now for. Every
+/// other first-run surface already ends this way; `kin setup` prints a Next
+/// steps block and `kin doctor` puts a fix on every row that needs one.
+///
+/// Two commands, not a menu. `locate` is the one the README leads with, and
+/// `status` is the one that answers what just happened to this repository.
+fn next_step_lines() -> Vec<String> {
+    // Padded from the commands themselves rather than by hand. Written out, the
+    // two descriptions landed a column apart, and the kind of drift nobody
+    // notices in a diff is exactly the kind a reader sees straight away.
+    let steps = [
+        ("kin locate \"<what you are looking for>\"", "ask the graph"),
+        ("kin status", "what this repository holds now"),
+    ];
+    let widest = steps
+        .iter()
+        .map(|(command, _)| command.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![String::new(), "Next:".to_string()];
+    lines.extend(
+        steps
+            .iter()
+            .map(|(command, description)| format!("  {command:<widest$}  {description}")),
+    );
+    lines
 }
 
 /// Keep language-server and cross-file guidance before the embedding notice.
@@ -2064,6 +2141,78 @@ fn initialized_raw_git_head(result: &kin_core::InitResult) -> Option<&kin_model:
 mod tests {
     use super::*;
     use crate::commands::status::SemanticEnrichmentView;
+
+    /// The workspace head reaches a reader as a ref name, not as a byte array.
+    ///
+    /// v0.7.2 serialized the model here, so the line read
+    /// `{"type":"symbolic","target":{"bytes_hex":"726566732f68656164732f6d6173746572"}}`
+    /// and the hex was the ref name spelled out four lines above it. The
+    /// assertions are on what a reader can and cannot see: the ref name has to
+    /// be there, and none of the shapes a serialized model brings with it may
+    /// be.
+    #[test]
+    fn the_workspace_head_line_names_the_ref_rather_than_serializing_it() {
+        let head = kin_model::WorkspaceHead::Symbolic {
+            target: kin_model::RefName::from_bytes(b"refs/heads/master".to_vec())
+                .expect("a valid ref name"),
+        };
+        let line = workspace_head_line(&head);
+        assert_eq!(line, "  Workspace head: symbolic refs/heads/master");
+        for shape in ["bytes_hex", "{", "\"type\"", "726566732f"] {
+            assert!(
+                !line.contains(shape),
+                "the head line carries {shape:?}, so it is a serialized model: {line}"
+            );
+        }
+    }
+
+    /// `kin init` ends by saying what the graph it just built is for.
+    ///
+    /// It used to end on store size and a pointer to a document about store
+    /// size, after ninety-three seconds of work on a small repository. The
+    /// README's five-command path spends four commands getting here and the
+    /// fifth is the answer, so the command that earns the graph names it.
+    #[test]
+    fn the_result_ends_by_naming_the_next_command() {
+        let lines = next_step_lines();
+        assert_eq!(lines[0], "", "a blank line separates it from the detail");
+        assert_eq!(lines[1], "Next:");
+        let body = lines[2..].join("\n");
+        assert!(
+            body.contains("kin locate"),
+            "the next step must name the command the README leads with: {body}"
+        );
+        assert!(
+            body.contains("kin status"),
+            "the next step must name what answers what just happened: {body}"
+        );
+        for line in &lines {
+            assert!(
+                !line.contains('\u{2014}'),
+                "the next step must not put an em dash in front of a reader: {line}"
+            );
+        }
+
+        // Every description starts in the same column. Written out by hand the
+        // two landed a column apart, which a diff hides and a reader sees.
+        let columns: Vec<usize> = lines[2..]
+            .iter()
+            .map(|line| {
+                let gap = line
+                    .find("  ")
+                    .and_then(|_| line[2..].find("  ").map(|at| at + 2))
+                    .expect("each step separates its command from its description");
+                line[gap..]
+                    .find(|c: char| !c.is_whitespace())
+                    .expect("each step carries a description")
+                    + gap
+            })
+            .collect();
+        assert!(
+            columns.windows(2).all(|pair| pair[0] == pair[1]),
+            "the descriptions start at columns {columns:?}, so the block is ragged"
+        );
+    }
 
     /// A queue nobody is draining is not work in flight.
     ///

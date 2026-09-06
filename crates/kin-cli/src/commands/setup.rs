@@ -12256,7 +12256,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     println!("=== Health checklist ===");
     println!();
     let report = crate::commands::health::run_health_checks().await;
-    print_human_report(&report);
+    print_human_report(&report, Some("Kin setup"));
 
     print_next_steps(intent, plan.install_shell_hook, &configured_assistants);
 
@@ -13064,7 +13064,7 @@ pub async fn status(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    print_human_report(&report);
+    print_human_report(&report, Some("Kin setup status"));
     Ok(())
 }
 
@@ -13082,11 +13082,172 @@ fn status_label(status: &crate::commands::health::HealthStatus) -> &'static str 
     }
 }
 
+/// Where the detail column starts, from the row format below.
+///
+/// Two leading spaces, the status glyph, a space, a twenty-six column label, a
+/// space, a fourteen column status word, and a space.
+const DETAIL_COLUMN: usize = 46;
+
+/// Indent for a detail that moved off its row.
+///
+/// Six rather than forty-six. A detail wrapped into the thirty-four columns
+/// left of an eighty-column terminal would be twenty-three lines of ribbon; the
+/// same text at this indent is six lines that read like a paragraph, and it
+/// lines up with the `fix:` and `note:` lines already printed under a row.
+const DETAIL_CONTINUATION_INDENT: usize = 6;
+
+/// A detail short enough to sit on its row, or the lines it becomes.
+enum DetailLayout {
+    Beside,
+    Below(Vec<String>),
+}
+
+/// Decide how one row's detail is laid out at a known width.
+///
+/// `None` is "nothing is watching": no terminal, or a width that could not be
+/// read. That arm prints exactly what this report has always printed, which is
+/// what keeps every capture of it, and every acceptance suite reading one,
+/// seeing the same bytes.
+///
+/// The measured case is `kin doctor` on an eighty-column terminal, where
+/// thirty-three of forty-seven lines ran past the margin and the longest was
+/// seven hundred and seventy-eight characters inside a row whose columns are
+/// aligned for a short value. A terminal reflows that to the left margin with
+/// no hanging indent, so the table's alignment is destroyed by its own content.
+fn detail_layout(detail: &str, width: Option<usize>) -> DetailLayout {
+    let Some(width) = width else {
+        return DetailLayout::Beside;
+    };
+    if DETAIL_COLUMN + console::measure_text_width(detail) <= width {
+        return DetailLayout::Beside;
+    }
+    DetailLayout::Below(wrap_words(
+        detail,
+        width.saturating_sub(DETAIL_CONTINUATION_INDENT).max(20),
+    ))
+}
+
+/// Greedy word wrap. A word longer than the width gets its own line rather than
+/// being broken, because the long words here are paths and hashes and half of
+/// one is worse than an overhanging one.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if console::measure_text_width(&current) + 1 + console::measure_text_width(word)
+            <= width
+        {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Print a `note:` or `fix:` line under a row, wrapped when it does not fit.
+///
+/// These carry the remedy, so they are the lines a reader most needs to be able
+/// to read. Wrapped, the continuation lines align under the text rather than
+/// under the label, so the label keeps marking where one remedy starts. Off a
+/// terminal, `width` is `None` and the line is printed exactly as it always was.
+fn print_labelled_line(label: &str, text: &str, width: Option<usize>) {
+    for line in labelled_lines(label, text, width) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_labelled_line`] would print.
+///
+/// Split from the printing so the decision can be tested. Written as one
+/// function that printed as it went, the only test that could reach it was a
+/// test of `wrap_words` beside it, and a mutation that made this always take
+/// the fits arm left that test green: it never called this code at all.
+fn labelled_lines(label: &str, text: &str, width: Option<usize>) -> Vec<String> {
+    let indent = DETAIL_CONTINUATION_INDENT;
+    let hanging = indent + label.chars().count();
+    let fits = width.is_none_or(|width| hanging + console::measure_text_width(text) <= width);
+    if fits {
+        return vec![format!("{}{label}{text}", " ".repeat(indent))];
+    }
+    let width = width.unwrap_or_default();
+    let mut wrapped = wrap_words(text, width.saturating_sub(hanging).max(20)).into_iter();
+    let Some(first) = wrapped.next() else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!("{}{label}{first}", " ".repeat(indent))];
+    lines.extend(wrapped.map(|line| format!("{}{line}", " ".repeat(hanging))));
+    lines
+}
+
+/// The lines this report opens with.
+///
+/// Pure, and separate from the printing, because the gating is the whole point
+/// and a function that prints as it goes cannot be reached by a test. Written
+/// inline the first time, a mutation that ungated the title left every test
+/// green: the only test that could reach it asserted on `beside_or_plain`
+/// beside it, which is not where the decision lives. That is the second time
+/// in this change that a test named a helper rather than the code under test.
+///
+/// The title and the mark are one unit. Gated separately, the title survived
+/// into captured output and every piped `kin doctor` gained a first line it
+/// never had, while the mark correctly did not.
+///
+/// `None` for the title is for a caller that has already announced itself. No
+/// shipping caller is one. `kin doctor --fix` was given `None` on the belief
+/// that it prints two tables; the un-fixed path prints its table and returns,
+/// so `--fix` reaches only the table after the repairs and that left the
+/// command with no mark at all.
+fn report_header(
+    title: Option<&str>,
+    platform: &str,
+    style: Option<crate::mark::MarkStyle>,
+) -> Vec<String> {
+    let platform = format!("Platform: {platform}");
+    match (title, style) {
+        (Some(title), Some(style)) => crate::mark::beside(style, &["", title, &platform, ""]),
+        _ => vec![platform],
+    }
+}
+
+/// The width to lay a report out at, or `None` when nothing is watching.
+fn report_width() -> Option<usize> {
+    if !io::stdout().is_terminal() {
+        return None;
+    }
+    console::Term::stdout()
+        .size_checked()
+        .map(|(_, columns)| usize::from(columns))
+}
+
 /// Render a [`HealthReport`] as the human-readable table used by
 /// `kin setup status` and `kin doctor`.
-fn print_human_report(report: &crate::commands::health::HealthReport) {
+fn print_human_report(report: &crate::commands::health::HealthReport, title: Option<&str>) {
     use crate::commands::health::HealthStatus;
-    println!("Platform: {}", report.platform);
+    let width = report_width();
+    // The title and the mark are one unit, and both are terminal-only. Written
+    // through `beside_or_plain`, whose no-style arm keeps every non-empty
+    // line, the title survived into captured output and every piped
+    // `kin doctor` gained a first line it never had. The mark was gated and the
+    // title beside it was not, which is the whole of that defect.
+    //
+    // The title is a parameter because this renderer serves four commands.
+    // Hardcoded, `kin setup` and `kin setup status` announced themselves as
+    // Kin doctor.
+    for line in report_header(
+        title,
+        &report.platform,
+        crate::mark::MarkStyle::for_stdout(),
+    ) {
+        println!("{line}");
+    }
     println!();
     for check in &report.checks {
         let mark = match check.status {
@@ -13098,18 +13259,30 @@ fn print_human_report(report: &crate::commands::health::HealthReport) {
             HealthStatus::Pending => style("…").yellow(),
             HealthStatus::Unsupported => style("→").cyan(),
         };
-        println!(
-            "  {mark} {:<26} {:<14} {}",
-            check.label,
-            status_label(&check.status),
-            check.detail
-        );
+        match detail_layout(&check.detail, width) {
+            DetailLayout::Beside => println!(
+                "  {mark} {:<26} {:<14} {}",
+                check.label,
+                status_label(&check.status),
+                check.detail
+            ),
+            DetailLayout::Below(lines) => {
+                println!(
+                    "  {mark} {:<26} {}",
+                    check.label,
+                    status_label(&check.status)
+                );
+                for line in lines {
+                    println!("{}{line}", " ".repeat(DETAIL_CONTINUATION_INDENT));
+                }
+            }
+        }
         if let Some(note) = &check.platform_note {
-            println!("      note: {note}");
+            print_labelled_line("note: ", note, width);
         }
         if !matches!(check.status, HealthStatus::Healthy) {
             if let Some(fix) = &check.manual_fix {
-                println!("      fix:  {fix}");
+                print_labelled_line("fix:  ", fix, width);
             }
         }
     }
@@ -13926,7 +14099,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
         if json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            print_human_report(&report);
+            print_human_report(&report, Some("Kin doctor"));
         }
         // Printed last, so a human reads it under the report rather than above
         // it. Before this, the flag was dead on this path: bound at the
@@ -14208,7 +14381,7 @@ pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Re
     }
     println!("Re-running checks...");
     println!();
-    print_human_report(&after);
+    print_human_report(&after, Some("Kin doctor"));
 
     let still_manual = manual_attention_checks(&after);
     if !still_manual.is_empty() {
@@ -15674,6 +15847,228 @@ mod tests {
     use super::{fix_verdict, readiness_line, UnfinishedRepair};
     use crate::commands::health::{HealthCheck, HealthReport, HealthStatus, HealthVerdict};
     use kin_model::LanguageId;
+
+    /// A row's detail stays on its row while it fits, and moves under it when
+    /// it does not.
+    ///
+    /// The measurement this is written from: on the released v0.7.2 bytes at
+    /// eighty columns, thirty-three of `kin doctor`'s forty-seven lines ran
+    /// past the margin, and the `Memory floor` row's detail was seven hundred
+    /// and seventy-eight characters on one line.
+    #[test]
+    fn a_detail_that_does_not_fit_its_row_moves_under_it() {
+        use super::{detail_layout, DetailLayout, DETAIL_COLUMN};
+
+        let short = "ok";
+        assert!(
+            matches!(detail_layout(short, Some(80)), DetailLayout::Beside),
+            "a short detail must stay on its row"
+        );
+
+        let long = "x ".repeat(400);
+        let DetailLayout::Below(lines) = detail_layout(&long, Some(80)) else {
+            panic!("a {}-character detail must not stay on a row that starts at column {DETAIL_COLUMN} of 80", long.len());
+        };
+        assert!(lines.len() > 1, "the detail must actually be wrapped");
+        for line in &lines {
+            let width = console::measure_text_width(line) + super::DETAIL_CONTINUATION_INDENT;
+            assert!(
+                width <= 80,
+                "the wrapped line {line:?} is {width} columns wide once indented"
+            );
+        }
+    }
+
+    /// Off a terminal the report is byte-identical to what it always printed.
+    ///
+    /// The acceptance suites capture this report and read substrings out of it,
+    /// and a substring that spans a wrap point is a substring that stops
+    /// matching. Nothing is watching a captured stream, so nothing is wrapped
+    /// in one.
+    #[test]
+    fn a_captured_report_is_never_rewrapped() {
+        use super::{detail_layout, DetailLayout};
+
+        let long = "x ".repeat(400);
+        assert!(
+            matches!(detail_layout(&long, None), DetailLayout::Beside),
+            "with no width to lay out at, the detail must be printed as it always was"
+        );
+    }
+
+    /// A captured report gains nothing, not even a title.
+    ///
+    /// The mark was gated on a terminal and the title beside it was not, so
+    /// every piped `kin doctor` gained a first line reading `Kin doctor` that
+    /// it never had, while the pull request claimed nothing new could reach a
+    /// script.
+    ///
+    /// This calls `report_header`, which is where the gating decision lives.
+    /// The first version of this test called `beside_or_plain` beside it, and
+    /// a mutation that ungated the title left it green, because it never
+    /// reached the code the claim was about.
+    #[test]
+    fn a_captured_report_gains_no_title_and_no_mark() {
+        use super::report_header;
+        use crate::mark::{Glyphs, MarkStyle, Paint};
+
+        // No terminal: the platform line alone, whatever title is passed.
+        assert_eq!(
+            report_header(Some("Kin doctor"), "macos", None),
+            vec!["Platform: macos".to_string()],
+            "a captured report must gain nothing, and a title is something"
+        );
+        assert_eq!(
+            report_header(None, "macos", None),
+            vec!["Platform: macos".to_string()]
+        );
+
+        // A terminal but no title: the platform line alone. No shipping caller
+        // passes None today. It is kept because the two arguments are
+        // independent and a caller that has already announced itself is a
+        // reasonable thing to have; the message says that rather than naming
+        // `--fix`, which prints one table and not two, and believing otherwise
+        // is what left that command with no mark at all.
+        let style = MarkStyle::new(Glyphs::Unicode, Paint::None);
+        assert_eq!(
+            report_header(None, "macos", Some(style)),
+            vec!["Platform: macos".to_string()],
+            "with no title there is nothing for the mark to sit beside"
+        );
+
+        // A terminal and a title: both.
+        let drawn = report_header(Some("Kin doctor"), "macos", Some(style));
+        assert_eq!(drawn.len(), 4);
+        assert!(drawn[1].ends_with("Kin doctor"));
+        assert!(drawn[2].ends_with("Platform: macos"));
+    }
+
+    /// Each command announces itself by its own name.
+    ///
+    /// One hardcoded title on a renderer four commands share had `kin setup`
+    /// and `kin setup status` calling themselves Kin doctor.
+    #[test]
+    fn each_command_names_itself_in_the_header() {
+        use super::report_header;
+        use crate::mark::{Glyphs, MarkStyle, Paint};
+        let style = MarkStyle::new(Glyphs::Unicode, Paint::None);
+        for name in ["Kin setup", "Kin setup status", "Kin doctor"] {
+            let drawn = report_header(Some(name), "macos", Some(style));
+            assert!(
+                drawn[1].ends_with(name),
+                "the header must carry {name:?}, got {:?}",
+                drawn[1]
+            );
+        }
+    }
+
+    /// Every command that prints this report names itself in it.
+    ///
+    /// Read from the source rather than asserted from memory, because the
+    /// mistake this catches was made by reading two call sites and missing the
+    /// `if !fix { ... return }` between them: `kin doctor --fix` reaches only
+    /// the table printed after its repairs, so passing no title there left that
+    /// one command with no mark at all.
+    ///
+    /// The scan checks its own reading first, since one that found no call
+    /// sites would pass.
+    #[test]
+    fn no_call_site_prints_this_report_without_naming_its_command() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/commands/setup.rs"
+        ))
+        .expect("this file is readable from its own test");
+
+        let calls: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("print_human_report(&"))
+            .collect();
+        assert!(
+            calls.len() >= 4,
+            "the scan found {} call sites, too few to be reading this file",
+            calls.len()
+        );
+        for call in &calls {
+            assert!(
+                call.contains("Some(\""),
+                "this call prints the report without naming its command: {call}"
+            );
+        }
+    }
+
+    /// A `fix:` line that does not fit is wrapped under its own label.
+    ///
+    /// These carry the remedy, so they are the lines a reader most needs whole.
+    /// After the row wrap landed, seven of `kin doctor`'s lines were still past
+    /// an eighty-column margin at 80 and four at 120, and every one of them was
+    /// a `fix:`. The continuation lines align under the text rather than under
+    /// the label, so the label keeps marking where one remedy starts.
+    #[test]
+    fn a_fix_line_that_does_not_fit_wraps_under_its_label() {
+        use super::{labelled_lines, DETAIL_CONTINUATION_INDENT};
+
+        let fix = "run `kin vfs on` to engage a projection and record it, or `kin vfs status` \
+                   for what each mode would need here";
+        let hanging = DETAIL_CONTINUATION_INDENT + "fix:  ".len();
+        assert!(
+            hanging + console::measure_text_width(fix) > 80,
+            "this fixture must be a line that does not fit, or the test proves nothing"
+        );
+
+        let lines = labelled_lines("fix:  ", fix, Some(80));
+        assert!(
+            lines.len() > 1,
+            "a line this long must be wrapped: {lines:?}"
+        );
+        assert!(
+            lines[0].starts_with(&format!("{}fix:  ", " ".repeat(DETAIL_CONTINUATION_INDENT))),
+            "the label stays on the first line: {:?}",
+            lines[0]
+        );
+        for line in &lines {
+            let width = console::measure_text_width(line);
+            assert!(width <= 80, "the wrapped line {line:?} is {width} columns");
+        }
+        for line in &lines[1..] {
+            assert!(
+                line.starts_with(&" ".repeat(hanging)),
+                "continuation lines align under the text, not under the label: {line:?}"
+            );
+        }
+
+        // Off a terminal it is one line, exactly as this report always printed.
+        let plain = labelled_lines("fix:  ", fix, None);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0], format!("      fix:  {fix}"));
+    }
+
+    /// Wrapping never loses or reorders a word, and never splits one.
+    ///
+    /// The long details here are paths, hashes and daemon ids. Half of a hash
+    /// is worse than an overhanging one, so a word past the width takes its own
+    /// line whole.
+    #[test]
+    fn wrapping_preserves_every_word_and_splits_none() {
+        use super::wrap_words;
+
+        let text = "128.0 GiB of memory here (this host's RAM); one repository daemon is allowed \
+                    8.0 GiB of that";
+        let wrapped = wrap_words(text, 30);
+        assert_eq!(
+            wrapped.join(" ").split_whitespace().collect::<Vec<_>>(),
+            text.split_whitespace().collect::<Vec<_>>(),
+            "wrapping changed the words"
+        );
+
+        let hash = "a".repeat(64);
+        let wrapped = wrap_words(&format!("seal {hash} sealed"), 20);
+        assert!(
+            wrapped.iter().any(|line| line == &hash),
+            "a word past the width must survive whole; got {wrapped:?}"
+        );
+    }
 
     #[tokio::test]
     async fn post_install_refresh_requires_an_available_enrichment_channel() {
