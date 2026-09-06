@@ -688,12 +688,17 @@ fn observation_covers_path(observed: &BTreeSet<RepoPath>, path: &RepoPath) -> bo
 /// [`kin_core::plan_observed_tree_deltas`] itself applies, and admitting the
 /// arrival is what lets the transition plan as one move.
 ///
-/// Anything short of that evidence yields nothing, so a copy, a
-/// move-plus-replacement and a plain deletion keep the behaviour they have.
+/// Anything short of that evidence yields nothing. A copy and a
+/// move-plus-replacement both keep the vacated path observed, so nothing
+/// departs and neither is touched. A departure with exactly one untracked
+/// byte-identical arrival is read as a move, which is the planner's own rule
+/// and what the unbounded commit seam would plan for the same tree; the
+/// retired graph-only member guard below is the one place that rule is
+/// refused.
 ///
 /// Counted through maps rather than a scan per departure, because this runs on
-/// every bounded pass and a branch switch or a large deletion departs thousands
-/// of paths at once.
+/// every bounded pass and a branch switch or a large deletion departs many
+/// paths at once.
 fn unobserved_move_destinations(
     base: &kin_model::ResolvedTree,
     observed: &crate::commit_deltas::CompleteWorkspaceObservation,
@@ -710,6 +715,8 @@ fn unobserved_move_destinations(
             departing.push(artifact.entry);
         }
     }
+    // The quiet case still pays the base pass above, one traversal and one map
+    // build; what it skips is the pass over the observation.
     if departing.is_empty() {
         return BTreeSet::new();
     }
@@ -750,7 +757,9 @@ fn unobserved_move_destinations(
 /// in and a single `touch` never costs a complete import. Within that bound an
 /// observed path moves whether or not the workspace already tracks it: a file
 /// becomes queryable because someone wrote it, not because someone remembered
-/// to run a command afterwards.
+/// to run a command afterwards. The one content-addressed exception is the
+/// arrival half of a move, which [`unobserved_move_destinations`] keeps when
+/// an observed departure has exactly one untracked byte-identical destination.
 ///
 /// What this enlarges is the workspace tree, and only the workspace tree. The
 /// publication underneath advances the workspace generation while leaving its
@@ -4724,6 +4733,88 @@ mod tests {
             tree.artifact_at_path(&test_repo_path("submodule/src/twin.py"))
                 .is_none(),
             "a removed member must not hand its host subtree to the workspace through a move"
+        );
+    }
+
+    /// Two untracked paths carry the departing entry, so nothing names one
+    /// destination and the departure stays a deletion.
+    #[cfg(unix)]
+    #[test]
+    fn a_departure_with_two_equally_good_destinations_is_not_a_move() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        state.is_initialized.store(true, Ordering::Relaxed);
+        admit_and_derive(&state, MOVED_PATH, MOVED_TARGET);
+        let target = sole_entity_named(&state, MOVED_PATH, "moved_target");
+
+        let working = state.layout.working_dir();
+        std::fs::write(working.join("src/aaa_twin.py"), MOVED_TARGET).unwrap();
+        std::fs::write(working.join("src/bbb_twin.py"), MOVED_TARGET).unwrap();
+
+        std::fs::remove_file(working.join(MOVED_PATH)).unwrap();
+        let observation = BTreeSet::from([RepoPath::from_utf8(MOVED_PATH).unwrap()]);
+        assert!(!ambient_admission_for_test(&state, &observation).unwrap());
+
+        assert!(
+            state.graph.get_entity(&target.id).unwrap().is_none(),
+            "two equally good destinations name none, so this must stay a deletion"
+        );
+        let tree = state.graph.resolved_tree();
+        assert!(
+            tree.artifact_at_path(&test_repo_path("src/aaa_twin.py"))
+                .is_none(),
+            "an ambiguous arrival must not be admitted by a pass that never observed it"
+        );
+        assert!(
+            tree.artifact_at_path(&test_repo_path("src/bbb_twin.py"))
+                .is_none(),
+            "an ambiguous arrival must not be admitted by a pass that never observed it"
+        );
+    }
+
+    /// A second tracked path carries the departing entry, so no single base
+    /// artifact owns it and the departure stays a deletion.
+    #[cfg(unix)]
+    #[test]
+    fn a_departure_whose_entry_a_second_tracked_path_shares_is_not_a_move() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        state.is_initialized.store(true, Ordering::Relaxed);
+
+        // Both in ONE observation. Admitting the twin in a second pass refuses,
+        // because a path-stable entry plus an identical observed entry is the
+        // planner's identity-underdetermined case.
+        let working = state.layout.working_dir();
+        std::fs::create_dir_all(working.join("src")).unwrap();
+        std::fs::write(working.join(MOVED_PATH), MOVED_TARGET).unwrap();
+        std::fs::write(working.join("src/duplicate.py"), MOVED_TARGET).unwrap();
+        let admission = BTreeSet::from([
+            RepoPath::from_utf8(MOVED_PATH).unwrap(),
+            test_repo_path("src/duplicate.py"),
+        ]);
+        assert!(!ambient_admission_for_test(&state, &admission).unwrap());
+        derive_semantics(&state, MOVED_PATH);
+        derive_semantics(&state, "src/duplicate.py");
+        let target = sole_entity_named(&state, MOVED_PATH, "moved_target");
+
+        std::fs::rename(working.join(MOVED_PATH), working.join(RELOCATED_PATH)).unwrap();
+        let observation = BTreeSet::from([RepoPath::from_utf8(MOVED_PATH).unwrap()]);
+        assert!(!ambient_admission_for_test(&state, &observation).unwrap());
+
+        assert!(
+            state.graph.get_entity(&target.id).unwrap().is_none(),
+            "an entry two tracked paths share names no single origin, so this must stay a deletion"
+        );
+        let tree = state.graph.resolved_tree();
+        assert!(
+            tree.artifact_at_path(&RepoPath::from_utf8(RELOCATED_PATH).unwrap())
+                .is_none(),
+            "an arrival whose origin is undetermined must not be admitted"
+        );
+        assert!(
+            tree.artifact_at_path(&test_repo_path("src/duplicate.py"))
+                .is_some(),
+            "the untouched duplicate must stay in the tree"
         );
     }
 
