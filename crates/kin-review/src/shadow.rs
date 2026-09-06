@@ -1283,7 +1283,7 @@ fn derive_policy(
             let entity_consumers = review
                 .impact
                 .entity_impact(&change.entity_id)
-                .map_or(0, |entry| entry.external_consumer_count);
+                .map_or(0, crate::impact::EntityImpact::external_consumers);
             if entity_consumers == 0 {
                 continue;
             }

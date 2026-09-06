@@ -946,10 +946,10 @@ fn collect_modified_comments(
     // narrower one a break is read off, and swapping them would turn every
     // test-covered signature edit into a breaking finding.
     let per_entity = impact.entity_impact(&new.id);
-    let consumer_count = per_entity.map_or(0, |e| e.external_consumer_count);
+    let consumer_count = per_entity.map_or(0, crate::impact::EntityImpact::external_consumers);
     let strong_consumer_count = per_entity.map_or(0, |e| e.strong_consumer_count);
     let contract_consumer_count = per_entity.map_or(0, |e| e.contract_consumer_count);
-    let consumer_file_count = per_entity.map_or(0, |e| e.external_consumer_files.len());
+    let consumer_file_count = per_entity.map_or(0, |e| e.external_consumer_file_paths().len());
     let entity_covering_tests = per_entity.map_or(0, |e| e.covering_tests);
     // Consumers that were themselves modified in the reviewed range. When a
     // surface change has NO external consumer left but did have consumers that

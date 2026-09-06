@@ -42,10 +42,13 @@ who else is working nearby. Reach for it before merging or refactoring to gauge 
 radius, answering \"if I change this, what else might break?\", from the graph in one \
 call instead of hand-tracing callers. Pair it with semantic_diff (what changed) or use \
 semantic_review when you want diff + impact + risk together in a single report. \
-Per-entity, `consumer_count` is every direct inbound consumer, the same set \
-`find_references` reports for that entity id, and it is never narrowed without saying so: \
-`external_consumer_count`, `test_consumer_count` and `derived_consumer_count` name each \
-class beside it and sum to it, so a zero is a zero and an exclusion has a name. Read a \
+Per-entity, `consumer_count` is every direct inbound consumer, and it is never narrowed \
+without saying so: `external_consumer_count`, `test_consumer_count` and \
+`derived_consumer_count` name each class beside it and sum to it, so a zero is a zero and \
+an exclusion has a name. One set sits outside it and is reported rather than dropped: a \
+consumer changed in this same diff is counted in `consumers_migrated_in_diff`, which is \
+why this count matches what `find_references` reports for the same entity id except where \
+a consumer co-changed, and the migrated count is exactly that difference. Read a \
 break against `external_consumer_count`, since a test that breaks with the code it tests \
 was never stranded, and read a used/unused claim against `consumer_count`. \
 `proven_consumer_count` narrows the external count to edges resolved above `name_only`. \

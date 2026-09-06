@@ -252,9 +252,8 @@ pub struct EntityImpact {
     /// edge to this one: production consumers, tests and derived copies
     /// together.
     ///
-    /// This is the count `find_references` reports for the same entity id, and
-    /// it is deliberately the widest one, because it is the field shaped like
-    /// the answer to "is anything using this". It used to be
+    /// It is deliberately the widest count on the row, because it is the field
+    /// shaped like the answer to "is anything using this". It used to be
     /// [`Self::external_consumer_count`], which silently dropped every test and
     /// every derived copy: on express 5.2.1 that reported `consumer_count: 0`
     /// for seven live exports of `lib/express.js` whose only consumers are test
@@ -263,6 +262,15 @@ pub struct EntityImpact {
     /// without naming it, so every exclusion below is published beside this
     /// total and `consumer_count == external_consumer_count +
     /// test_consumer_count + derived_consumer_count` holds on every row.
+    ///
+    /// One class is still outside it, and it is not an unnamed exclusion: a
+    /// consumer that was itself changed in the reviewed range is counted in
+    /// [`Self::consumers_migrated_in_diff`] instead. That is a property of the
+    /// diff rather than of the entity, and it is why this count is not
+    /// identical to what `find_references` reports on a graph where something
+    /// in the same diff also consumes the entity. Where no consumer co-changed,
+    /// which is the express case above, the two sets agree; where they differ,
+    /// the migrated count is the difference and sits on the same row.
     pub consumer_count: usize,
     /// The subset of [`Self::consumer_count`] a contract change strands: a
     /// consumer that is neither a test nor a derived copy.
@@ -376,23 +384,81 @@ impl EntityImpact {
     }
 
     /// Total distinct inbound entities: the consumers a contract change
-    /// strands, the derived copies it regenerates, and the tests covering it.
-    /// Zero means the graph connects nothing to this entity.
+    /// strands, plus the tests covering it. Zero means the graph connects this
+    /// entity to nothing a reviewer is asked to weigh.
+    ///
+    /// Derived copies are deliberately NOT added here even though the row now
+    /// counts them, and the reason is what this number is used for rather than
+    /// what it is called. `shadow.rs` feeds it a gate: a surface finding on an
+    /// entity with zero inbound edges is reported but cannot justify an
+    /// attention verdict on its own, because there is no proven audience for
+    /// the change. A vendored copy regenerates from its source and is not an
+    /// audience, so folding it in would turn a derived-only consumer into a
+    /// reason to raise a verdict, which is a behaviour change nothing asked
+    /// for. The class is still published on the row under its own name.
     ///
     /// Built from the exclusive classes rather than from
     /// [`Self::consumer_count`], because `covering_tests` already holds every
     /// direct test consumer and adding the two would count those twice.
     pub fn inbound_total(&self) -> usize {
-        self.external_consumer_count + self.derived_consumer_count + self.covering_tests
+        self.external_consumers() + self.covering_tests
     }
 
     /// True when this entity has graph-known consumers and EVERY one was
     /// itself modified in the reviewed range: a self-contained migration with
-    /// no stranded external consumer. [`Self::external_consumer_count`] counts
-    /// only external (non-migrated) consumers, so zero external plus at least
-    /// one migrated consumer is a fully coherent in-diff migration.
+    /// no stranded external consumer. [`Self::external_consumers`] counts only
+    /// external (non-migrated) consumers, so zero external plus at least one
+    /// migrated consumer is a fully coherent in-diff migration.
+    ///
+    /// It reads through [`Self::external_consumers`] rather than the field, so
+    /// a row that predates the new class fields cannot flip this true. Such a
+    /// row deserializes with `external_consumer_count: 0` under
+    /// `#[serde(default)]`, and a bare field read would call every one of them
+    /// a fully coherent migration with no stranded consumer, which is the
+    /// downgrade this gate hands out.
     pub fn all_consumers_migrated(&self) -> bool {
-        self.external_consumer_count == 0 && self.consumers_migrated_in_diff > 0
+        self.external_consumers() == 0 && self.consumers_migrated_in_diff > 0
+    }
+
+    /// The consumers a contract change strands, read so that a row written
+    /// before the class fields existed still answers correctly.
+    ///
+    /// Every gate reads this rather than the field. `#[serde(default)]` on the
+    /// new fields is what keeps an older payload deserializable, and it is also
+    /// what would make that payload claim zero stranded consumers on an entity
+    /// with several: the numbers are not missing there, they are recorded under
+    /// the one name the old shape had. [`Self::classes_account_for_total`] is
+    /// how the two shapes are told apart, and on an old row `consumer_count` IS
+    /// the external count, so the fallback reproduces the old behaviour exactly
+    /// rather than approximating it.
+    pub fn external_consumers(&self) -> usize {
+        if self.classes_account_for_total() {
+            self.external_consumer_count
+        } else {
+            self.consumer_count
+        }
+    }
+
+    /// The files of the consumers a contract change strands, with the same
+    /// fallback [`Self::external_consumers`] applies, for the same reason.
+    pub fn external_consumer_file_paths(&self) -> &[String] {
+        if self.classes_account_for_total() {
+            &self.external_consumer_files
+        } else {
+            &self.consumer_files
+        }
+    }
+
+    /// Whether this row's named classes account for its total.
+    ///
+    /// True on every row this build produces, by construction. False on a row
+    /// deserialized from a payload written before the classes existed, which is
+    /// the one case a gate has to notice: there the class fields are defaults
+    /// rather than measurements, and reading a default as a measurement is how
+    /// a missing field becomes a licence.
+    pub fn classes_account_for_total(&self) -> bool {
+        self.external_consumer_count + self.test_consumer_count + self.derived_consumer_count
+            == self.consumer_count
     }
 }
 
@@ -1159,7 +1225,99 @@ mod tests {
         }
     }
 
-    /// FIR-3305, the reported shape, reduced to one export and one test.
+    /// A row written before the class fields existed must not read as a row
+    /// with no stranded consumers.
+    ///
+    /// The new fields carry `#[serde(default)]`, which is what keeps an older
+    /// payload deserializable and is also the hazard: the numbers are not
+    /// missing in such a payload, they are recorded under the one name the old
+    /// shape had. Read as defaults, every old row claims zero external
+    /// consumers, which flips `all_consumers_migrated` true and hands out a
+    /// downgrade from breaking to visible evidence on a surface that really did
+    /// strand somebody.
+    #[test]
+    fn a_row_written_before_the_class_fields_still_reports_its_external_consumers() {
+        let legacy: EntityImpact = serde_json::from_str(
+            r#"{
+                "entity_id": "1336476d-26b4-4190-89d3-11bb70d25d54",
+                "consumer_count": 3,
+                "strong_consumer_count": 3,
+                "proven_consumer_count": 3,
+                "contract_consumer_count": 0,
+                "consumer_files": ["src/caller.rs"],
+                "covering_tests": 0,
+                "consumers_migrated_in_diff": 2
+            }"#,
+        )
+        .expect("the old payload shape still deserializes");
+
+        assert!(
+            !legacy.classes_account_for_total(),
+            "the classes are defaults here rather than measurements, and the row says so"
+        );
+        assert_eq!(
+            legacy.external_consumers(),
+            3,
+            "an old row's `consumer_count` IS its external count, so the fallback is exact"
+        );
+        assert_eq!(
+            legacy.external_consumer_file_paths(),
+            ["src/caller.rs".to_string()],
+            "and its file list is the external one"
+        );
+        assert!(
+            !legacy.all_consumers_migrated(),
+            "three stranded consumers is not a fully coherent in-diff migration"
+        );
+
+        // The control: a row this build produced, where the classes ARE
+        // measurements, still answers from them.
+        let current = EntityImpact {
+            consumer_count: 3,
+            external_consumer_count: 0,
+            test_consumer_count: 3,
+            consumers_migrated_in_diff: 2,
+            ..EntityImpact::empty(EntityId::new())
+        };
+        assert!(current.classes_account_for_total());
+        assert_eq!(current.external_consumers(), 0);
+        assert!(
+            current.all_consumers_migrated(),
+            "a measured zero external count still earns the downgrade"
+        );
+    }
+
+    /// The attention gate `shadow.rs` feeds from `inbound_total` must not start
+    /// firing because the row learned to count derived copies.
+    ///
+    /// A surface finding on an entity the graph connects to nothing is reported
+    /// but cannot justify an attention verdict on its own, since there is no
+    /// proven audience. A regenerated copy is not an audience.
+    #[test]
+    fn a_derived_only_consumer_does_not_give_a_surface_change_an_audience() {
+        let derived_only = EntityImpact {
+            consumer_count: 2,
+            derived_consumer_count: 2,
+            ..EntityImpact::empty(EntityId::new())
+        };
+        assert_eq!(
+            derived_only.inbound_total(),
+            0,
+            "a vendored copy is blast radius to navigate, not an audience to gate on"
+        );
+
+        // The control: a real consumer, and the same entity does have an
+        // audience.
+        let with_external = EntityImpact {
+            consumer_count: 3,
+            external_consumer_count: 1,
+            derived_consumer_count: 2,
+            ..EntityImpact::empty(EntityId::new())
+        };
+        assert_eq!(with_external.inbound_total(), 1);
+    }
+
+    /// FIR-3305, the reported shape, reduced to one export and one test.    /// FIR-3305, the reported shape, reduced to one export and one test.
     ///
     /// `impact_analysis(files: ["lib/express.js"])` on express 5.2.1 at
     /// `023767fe` returned `consumer_count: 0` and `consumer_files: []` for
