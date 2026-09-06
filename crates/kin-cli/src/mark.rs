@@ -189,21 +189,18 @@ pub fn beside(style: MarkStyle, text: &[&str]) -> Vec<String> {
     out
 }
 
-/// The mark beside `text` when this stdout takes one, and `text` alone when it
-/// does not.
-///
-/// This is what a command calls. It is the only place the decision and the
-/// drawing meet, so a caller cannot draw the mark into a pipe by forgetting to
-/// ask whether it should.
-pub fn beside_for_stdout(text: &[&str]) -> Vec<String> {
-    beside_or_plain(MarkStyle::for_stdout(), text)
-}
-
 /// [`beside`] under a style, and the text alone under none.
 ///
-/// Split from [`beside_for_stdout`] so both arms can be exercised without a
+/// Split from the terminal check so both arms can be exercised without a
 /// terminal. A test that asks for the no-style arm by reimplementing the filter
 /// inline is a test that passes whatever this function does.
+///
+/// This deliberately keeps every non-empty line, which is right for a version
+/// block whose lines are all content and wrong for a header whose title is
+/// decoration. A caller with something that should vanish along with the mark
+/// has to decide that before calling here; `report_header` in `commands/setup`
+/// is what that looks like, and getting it wrong is what put a title into every
+/// piped `kin doctor`.
 ///
 /// The empty lines a caller used to place text against the mark's rows are
 /// dropped here rather than printed as blanks: without the mark there is

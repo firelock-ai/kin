@@ -13200,10 +13200,11 @@ fn labelled_lines(label: &str, text: &str, width: Option<usize>) -> Vec<String> 
 /// into captured output and every piped `kin doctor` gained a first line it
 /// never had, while the mark correctly did not.
 ///
-/// `None` for the title is for a caller that has already announced itself.
-/// `kin doctor --fix` is not one: the un-fixed path prints its table and
-/// returns, so `--fix` reaches only the table after the repairs, and passing
-/// `None` there left that command with no mark at all.
+/// `None` for the title is for a caller that has already announced itself. No
+/// shipping caller is one. `kin doctor --fix` was given `None` on the belief
+/// that it prints two tables; the un-fixed path prints its table and returns,
+/// so `--fix` reaches only the table after the repairs and that left the
+/// command with no mark at all.
 fn report_header(
     title: Option<&str>,
     platform: &str,
@@ -13232,7 +13233,7 @@ fn print_human_report(report: &crate::commands::health::HealthReport, title: Opt
     use crate::commands::health::HealthStatus;
     let width = report_width();
     // The title and the mark are one unit, and both are terminal-only. Written
-    // through `beside_for_stdout`, whose no-style arm keeps every non-empty
+    // through `beside_or_plain`, whose no-style arm keeps every non-empty
     // line, the title survived into captured output and every piped
     // `kin doctor` gained a first line it never had. The mark was gated and the
     // title beside it was not, which is the whole of that defect.
@@ -15922,13 +15923,17 @@ mod tests {
             vec!["Platform: macos".to_string()]
         );
 
-        // A terminal, but no title: the report already announced itself, so the
-        // mark is not drawn a second time.
+        // A terminal but no title: the platform line alone. No shipping caller
+        // passes None today. It is kept because the two arguments are
+        // independent and a caller that has already announced itself is a
+        // reasonable thing to have; the message says that rather than naming
+        // `--fix`, which prints one table and not two, and believing otherwise
+        // is what left that command with no mark at all.
         let style = MarkStyle::new(Glyphs::Unicode, Paint::None);
         assert_eq!(
             report_header(None, "macos", Some(style)),
             vec!["Platform: macos".to_string()],
-            "`--fix` prints this table twice and the mark belongs to the first"
+            "with no title there is nothing for the mark to sit beside"
         );
 
         // A terminal and a title: both.
