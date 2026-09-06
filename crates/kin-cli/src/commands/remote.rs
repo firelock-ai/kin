@@ -134,6 +134,25 @@ pub(crate) fn native_remote_bearer_token(base_url: &str) -> Option<String> {
         .or_else(|| auth::load_saved_bearer_token(base_url))
 }
 
+/// The refusal both `kin remote` session pre-flights print when no bearer token
+/// is configured for a remote.
+///
+/// A function rather than two `format!` calls, because the address half has a
+/// `None` arm and inlining it put that arm where no test could reach it.
+/// `redacted_remote_address` withholds a URL it cannot parse, and the obvious
+/// way to spend that `Option` at a call site is
+/// `unwrap_or_else(|| base_url.to_string())`, which hands the whole
+/// credential-bearing URL back and restores exactly the leak the redaction
+/// exists to close. Here one test grades that arm directly.
+pub(crate) fn missing_bearer_token_message(base_url: &str) -> String {
+    let address = kin_remote::repository_transfer::redacted_remote_address(base_url)
+        .unwrap_or_else(|| "that remote".to_string());
+    format!(
+        "no auth token available for {address}; {}",
+        kin_remote::repository_transfer::bearer_token_next_step(base_url)
+    )
+}
+
 pub(crate) fn attach_native_remote_auth(
     builder: reqwest::RequestBuilder,
     base_url: &str,
@@ -596,11 +615,7 @@ pub async fn lease(
         &plan.repo_id,
     )?;
     if native_remote_bearer_token(&target.base_url).is_none() {
-        anyhow::bail!(
-            "no auth token available for {}; {}",
-            target.base_url,
-            kin_remote::repository_transfer::bearer_token_next_step(&target.base_url)
-        );
+        anyhow::bail!("{}", missing_bearer_token_message(&target.base_url));
     }
 
     let actor_id = actor_id.unwrap_or_else(|| default_cli_actor_id(&target.base_url));
@@ -974,11 +989,7 @@ pub async fn sessions(remote: Option<String>, json: bool) -> Result<()> {
         &plan.repo_id,
     )?;
     if native_remote_bearer_token(&target.base_url).is_none() {
-        anyhow::bail!(
-            "no auth token available for {}; {}",
-            target.base_url,
-            kin_remote::repository_transfer::bearer_token_next_step(&target.base_url)
-        );
+        anyhow::bail!("{}", missing_bearer_token_message(&target.base_url));
     }
 
     let response = attach_native_remote_auth(
@@ -1020,9 +1031,9 @@ mod tests {
     use super::upsert_remote_config;
     use super::{
         ensure_git_remote, evaluate_push_plan, explicit_native_remote_target, format_push_decision,
-        map_to_remote_ref, native_remote_endpoint, resolve_native_remote_bearer_token_with,
-        resolve_native_remote_target, resolve_remote, workspace_branch_short_name,
-        NativeRemoteTarget, PushPlanContext,
+        map_to_remote_ref, missing_bearer_token_message, native_remote_endpoint,
+        resolve_native_remote_bearer_token_with, resolve_native_remote_target, resolve_remote,
+        workspace_branch_short_name, NativeRemoteTarget, PushPlanContext,
     };
     use kin_core::{
         GitBranchTrackingConfig, GitRemoteTransportConfig, KinConfig, RemoteHostKind,
@@ -1558,6 +1569,55 @@ mod tests {
         assert_eq!(
             target.repo_locator(),
             "https://kinlab.ai/api/orgs/demo/repos/kin"
+        );
+    }
+
+    /// The `None` arm of the redaction, graded where the two `kin remote`
+    /// pre-flights actually spend it.
+    ///
+    /// `redacted_remote_address` withholds a URL whose `@` sits outside the
+    /// authority, because it cannot tell a smuggled userinfo from an ordinary
+    /// path character. What this refusal does with that withholding is a CLI
+    /// decision, and it has exactly one wrong answer: printing the URL back.
+    #[test]
+    fn a_url_the_redaction_withholds_is_never_named_in_the_refusal() {
+        // The unencoded `/` ends the authority before the `@`, so this is the
+        // shape no redactor can parse and every one of these is a credential.
+        let message = missing_bearer_token_message("https://alice:s3cr3t/pw@kinlab.ai/org");
+        for (named, carried) in [
+            ("the password", "s3cr3t"),
+            ("the username", "alice"),
+            ("a host it could not vouch for", "kinlab.ai"),
+        ] {
+            assert!(
+                !message.contains(carried),
+                "the pre-flight refusal named {named} out of a URL the redaction withheld: \
+                 {message}"
+            );
+        }
+        assert!(
+            message.contains("no auth token available for that remote"),
+            "it must still say a remote refused, without naming one: {message}"
+        );
+    }
+
+    /// The positive control for the assertions above, in both directions: a
+    /// refusal that named nothing would pass every one of them, and a remote
+    /// whose URL parses must still be named in full.
+    #[test]
+    fn a_remote_the_redaction_can_parse_is_named_without_its_credentials() {
+        let message = missing_bearer_token_message("https://alice:s3cr3t@kinlab.ai/org?t=v#f");
+        assert!(
+            message.contains("no auth token available for https://kinlab.ai/org;"),
+            "a parseable remote must be named, path included: {message}"
+        );
+        assert!(
+            !message.contains("s3cr3t") && !message.contains("alice") && !message.contains("t=v"),
+            "and named without the credentials it carried: {message}"
+        );
+        assert!(
+            message.contains("KIN_REMOTE_BEARER_TOKEN=$(cat <peer>/.kin/daemon.token)"),
+            "the refusal must still carry the recipe that fixes it: {message}"
         );
     }
 

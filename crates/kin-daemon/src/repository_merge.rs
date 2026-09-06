@@ -359,6 +359,30 @@ pub(crate) fn execute(
         execution.response.lines.extend(settle_merged_graph(state));
     }
 
+    // The freeze this merge committed under is an EXCLUSIVE cross-process lease
+    // over the repository's storage lock, and the graph-section writer takes
+    // that same lock, so it is released before the refresh rather than at the
+    // end of the function. Holding it across the refresh is a command waiting on
+    // itself.
+    drop(execution.authority_freeze);
+
+    // A merge moves this workspace's base exactly as a commit does, and it
+    // publishes through this module rather than through the commit path that
+    // refreshes the section, so before this a fast-forward or a settled merge
+    // left every later open folding the new base out of history. Same rule as
+    // the commit and the workspace transition: idempotent, run under the gates
+    // the merge already holds, and never fatal, because the merge is durable and
+    // a memoization that did not persist is a slower next open.
+    //
+    // A parked merge reaches here too and moves no base, so the writer finds the
+    // section valid and returns `AlreadyCurrent` with no durable write.
+    crate::repository_commit::refresh_workspace_base_graph_section(
+        &authority.manager,
+        &authority.repository_id,
+        authority.workspace_id,
+        "merge",
+    );
+
     drop(persistence);
     drop(graph_mutation);
     Ok(execution.response)
