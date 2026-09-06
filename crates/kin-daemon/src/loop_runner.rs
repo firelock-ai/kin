@@ -4184,9 +4184,14 @@ mod tests {
     #[cfg(unix)]
     fn file_coverage(state: &Arc<DaemonState>, rel_path: &str) -> serde_json::Value {
         let args = HashMap::from([("path".to_string(), serde_json::json!(rel_path))]);
+        // No working-copy probe: these arms grade what the LAYOUT and the
+        // re-derivation do to the coverage object, and offering a host reading
+        // here would let a fixture's own disk state decide a certification these
+        // tests are asserting about the graph.
         let result = kin_mcp::handlers::file_entities::handle_list_file_entities(
             &args,
             state.graph.as_ref(),
+            None,
         )
         .expect("the enumeration answers");
         let kin_mcp::types::ContentBlock::Text { text } = &result.content[0];

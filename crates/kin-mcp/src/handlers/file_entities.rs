@@ -46,6 +46,7 @@ use crate::handlers::common::{
     entity_presentation_end_line, entity_presentation_start_line, recorded_span_source_digest,
 };
 use crate::types::ToolCallResult;
+use crate::working_copy::{HostEntryReading, WorkingCopyProbe};
 
 /// The tool's registered name, spelled once so the registry, the dispatcher,
 /// the budget table and the negative registry cannot drift from each other.
@@ -485,9 +486,14 @@ fn sort_key(entity: &Entity) -> (usize, String, String) {
 }
 
 /// Enumerate the entities the graph holds for one file.
+///
+/// `host` is the working copy this repository's graph is supposed to be level
+/// with, when the caller has one to offer. It qualifies the answer and never
+/// produces any part of it: see [`crate::working_copy`].
 pub fn handle_list_file_entities<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+    host: Option<&WorkingCopyProbe>,
 ) -> Result<ToolCallResult> {
     let cursor = match args.get("cursor").and_then(serde_json::Value::as_str) {
         Some(token) if !token.trim().is_empty() => {
@@ -597,10 +603,10 @@ pub fn handle_list_file_entities<G: GraphStore>(
     // The spans against the bytes. A layout certifies the parse that produced
     // these spans; this certifies that the parse was of the bytes the tree holds
     // now. Both have to hold before the enumeration is read as the file.
-    let tree_blob = store
-        .get_tree_entry(&file_id)
-        .map_err(McpError::graph)?
-        .and_then(|entry| entry.blob_identity());
+    let tree_entry = store.get_tree_entry(&file_id).map_err(McpError::graph)?;
+    let tree_blob = tree_entry
+        .as_ref()
+        .and_then(kin_model::TreeEntry::blob_identity);
     let provenance = span_provenance(&entities, tree_blob.as_ref());
 
     let tier = tracking_tier(store, &file_id)?;
@@ -624,6 +630,19 @@ pub fn handle_list_file_entities<G: GraphStore>(
              spelling against `kin_artifact_list`, or run a reconcile if the file is new."
         )));
     }
+
+    // The tree against the host. `provenance` above certifies that these spans
+    // were derived from the blob the tree holds; this certifies that the tree
+    // holds the bytes that are at the path. Both are needed and neither implies
+    // the other: before any admission has run, the entity digest and the tree
+    // blob agree because both describe the same pre-edit bytes, so `provenance`
+    // reads `digest_verified` over spans into a file that has since moved.
+    //
+    // Taken after the graph-gap refusal above, so a path this graph has never
+    // seen costs no host read at all.
+    let host_entry = host
+        .map(|probe| probe.observe(&repo_path, tree_entry.as_ref()))
+        .unwrap_or(HostEntryReading::Unobserved);
 
     let enriched = language_server_edges(store, &entities)?;
 
@@ -703,9 +722,16 @@ pub fn handle_list_file_entities<G: GraphStore>(
             // converted store and does not.
             "span_provenance": provenance.wire(),
             "stale_spans": provenance.stale_entities(),
+            // Whether the host still holds the bytes graph truth carries for
+            // this path. `diverged` is a provable mismatch between two content
+            // addresses and refuses certification below; `unobserved` is the
+            // honest state wherever the working copy is not evidence about graph
+            // truth, and does not.
+            "host_bytes": host_entry.wire(),
             "whole_file_in_response": whole_file_in_response,
             "certifies_enumeration": parsed.certifies_enumeration()
                 && provenance.permits_certification()
+                && host_entry.permits_certification()
                 && whole_file_in_response
                 && !enumeration_shifted,
         },
@@ -835,11 +861,21 @@ mod tests {
         store: &InMemoryGraph,
         args: &[(&str, serde_json::Value)],
     ) -> Result<serde_json::Value> {
+        call_over_host(store, args, None)
+    }
+
+    /// The same call with a working copy offered, for the arms that grade what
+    /// the host holds.
+    fn call_over_host(
+        store: &InMemoryGraph,
+        args: &[(&str, serde_json::Value)],
+        host: Option<&WorkingCopyProbe>,
+    ) -> Result<serde_json::Value> {
         let args: HashMap<String, serde_json::Value> = args
             .iter()
             .map(|(key, value)| (key.to_string(), value.clone()))
             .collect();
-        let result = handle_list_file_entities(&args, store)?;
+        let result = handle_list_file_entities(&args, store, host)?;
         let crate::types::ContentBlock::Text { text } = &result.content[0];
         Ok(serde_json::from_str(text).expect("payload is JSON"))
     }
@@ -1018,7 +1054,7 @@ mod tests {
     fn finalized_limits(store: &InMemoryGraph, path: &str) -> String {
         let args = HashMap::from([("path".to_string(), serde_json::json!(path))]);
         let finalized = crate::finalize_with_envelope(
-            handle_list_file_entities(&args, store).expect("the tool answers"),
+            handle_list_file_entities(&args, store, None).expect("the tool answers"),
             structural_authoritative_envelope(),
             TOOL_NAME,
         );
@@ -1647,6 +1683,215 @@ mod tests {
             value["_kin"]["verdict"]["state"],
             serde_json::json!("certified"),
             "a stale enumeration must not be certified: {value}"
+        );
+    }
+
+    /// A working copy holding `on_disk` at [`FILE`], over a store that admitted
+    /// `admitted` there with every entity stamped as derived from `admitted`.
+    ///
+    /// The stamping matters: it puts the FIR-3201 reading in its agreeing state,
+    /// so any refusal these arms produce comes from the host comparison and
+    /// cannot be the span check firing for its own reasons.
+    fn store_over_working_copy(
+        admitted: &[u8],
+        on_disk: &[u8],
+    ) -> (InMemoryGraph, tempfile::TempDir, WorkingCopyProbe) {
+        let digest = Hash256::from_bytes(kin_blobs::digest_bytes(admitted));
+        let store = InMemoryGraph::new();
+        let repo_path = RepoPath::from_utf8(FILE.to_string()).expect("valid test path");
+        store
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(repo_path, TreeEntry::blob(digest, false)),
+                }],
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+            })
+            .expect("test admission goes through the repository tree transaction");
+        store
+            .upsert_entity(&stamped(entity_at("setCharset", FILE, 0), digest.0))
+            .unwrap();
+        store
+            .upsert_file_layout(&layout_for(FILE, ParseCompleteness::Full, 1))
+            .unwrap();
+
+        let root = tempfile::tempdir().expect("a scratch working copy");
+        let host = root.path().join(FILE);
+        std::fs::create_dir_all(host.parent().expect("the file has a parent"))
+            .expect("the working copy directory exists");
+        std::fs::write(&host, on_disk).expect("the host entry is written");
+        let probe = WorkingCopyProbe::new(root.path());
+        (store, root, probe)
+    }
+
+    /// GAP-I, the defect this arm exists for. An agent edits a file and asks
+    /// what is in it before any admission has taken the edit. Both graph-internal
+    /// readings agree in that state, because the entity digest and the tree blob
+    /// describe the same pre-edit bytes, so the enumeration certified spans into
+    /// a file that had moved underneath it.
+    ///
+    /// Measured on the sealed 0.7.2 candidate against an imported
+    /// `expressjs/express`: an edit at 02:44:12.971642Z was followed 0.589 ms
+    /// later by a call returning `setCharset` at lines 225 to 238 against a file
+    /// holding 225 to 241, under `verdict: certified`, `limiting_factor: null`
+    /// and `span_provenance: digest_verified`.
+    #[test]
+    fn a_file_whose_host_bytes_the_graph_has_not_taken_cannot_certify_the_enumeration() {
+        let (store, _root, probe) = store_over_working_copy(
+            b"exports.setCharset = function () {};\n",
+            b"// edited\nexports.setCharset = function () {};\n",
+        );
+
+        let payload =
+            call_over_host(&store, &[("path", serde_json::json!(FILE))], Some(&probe)).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+
+        // The two readings that already existed both agree, which is the whole
+        // reason this arm is needed. If either of these ever fails, this test is
+        // passing for the wrong reason and the assertion below proves nothing.
+        assert_eq!(coverage["parsed"], serde_json::json!("full"), "{payload}");
+        assert_eq!(
+            coverage["span_provenance"],
+            serde_json::json!("digest_verified"),
+            "the FIR-3201 reading must AGREE here, or this arm is not testing the \
+             host comparison: {payload}"
+        );
+        assert_eq!(coverage["stale_spans"], serde_json::json!(0), "{payload}");
+
+        assert_eq!(
+            coverage["host_bytes"],
+            serde_json::json!("diverged"),
+            "{payload}"
+        );
+        assert_eq!(
+            coverage["certifies_enumeration"],
+            serde_json::json!(false),
+            "an enumeration over bytes the graph has not taken must not certify: {payload}"
+        );
+
+        let annotated = crate::envelope::finalize(
+            ToolCallResult::text(serde_json::to_string(&payload).unwrap()),
+            structural_authoritative_envelope(),
+            TOOL_NAME,
+        );
+        let crate::types::ContentBlock::Text { text } = &annotated.content[0];
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_ne!(
+            value["_kin"]["verdict"]["state"],
+            serde_json::json!("certified"),
+            "the one verdict a reader acts on must not certify: {value}"
+        );
+        let limiting = value["_kin"]["verdict"]["limiting_factor"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            limiting.contains("file_bytes_unadmitted"),
+            "the verdict must name the unadmitted edit rather than a generic floor: {limiting:?}"
+        );
+        assert!(
+            limiting.contains("kin reconcile"),
+            "and must name the remedy the caller can act on: {limiting:?}"
+        );
+        assert_eq!(
+            value["_kin"]["completeness"]["classes"]["file_parsed"],
+            serde_json::json!("absent"),
+            "{value}"
+        );
+        assert_eq!(
+            value["_kin"]["completeness"]["counted"]["floor_reason"],
+            serde_json::json!("file_bytes_unadmitted"),
+            "{value}"
+        );
+        assert_eq!(
+            value["_kin"]["completeness"]["counted"]["exact"],
+            serde_json::json!(false),
+            "{value}"
+        );
+    }
+
+    /// The control, and the half that keeps this from being a floor on
+    /// everything: the same store and the same probe once the host holds the
+    /// admitted bytes, which is what a reconcile leaves behind. It must certify.
+    #[test]
+    fn the_same_enumeration_certifies_once_the_host_holds_the_admitted_bytes() {
+        let body = b"exports.setCharset = function () {};\n";
+        let (store, _root, probe) = store_over_working_copy(body, body);
+
+        let payload =
+            call_over_host(&store, &[("path", serde_json::json!(FILE))], Some(&probe)).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(
+            coverage["host_bytes"],
+            serde_json::json!("admitted"),
+            "{payload}"
+        );
+        assert_eq!(
+            coverage["certifies_enumeration"],
+            serde_json::json!(true),
+            "{payload}"
+        );
+
+        let annotated = crate::envelope::finalize(
+            ToolCallResult::text(serde_json::to_string(&payload).unwrap()),
+            structural_authoritative_envelope(),
+            TOOL_NAME,
+        );
+        let crate::types::ContentBlock::Text { text } = &annotated.content[0];
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            value["_kin"]["verdict"]["state"],
+            serde_json::json!("certified"),
+            "a level working copy must still certify: {value}"
+        );
+        assert_eq!(
+            value["_kin"]["completeness"]["classes"]["file_parsed"],
+            serde_json::json!("present"),
+            "{value}"
+        );
+    }
+
+    /// A caller with no working copy to offer is unchanged, which is what keeps
+    /// every offline and hosted answer off a floor it has no evidence for.
+    #[test]
+    fn an_answer_with_no_working_copy_offered_reports_unobserved_and_certifies() {
+        let body = b"exports.setCharset = function () {};\n";
+        // The host holds other bytes, and nobody offered the probe that would
+        // see them. The reading must be the absence of evidence rather than the
+        // divergence a probe would have found.
+        let (store, _root, _probe) = store_over_working_copy(body, b"// edited\n");
+
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        let coverage = &payload[FILE_COVERAGE_KEY];
+        assert_eq!(
+            coverage["host_bytes"],
+            serde_json::json!("unobserved"),
+            "{payload}"
+        );
+        assert_eq!(
+            coverage["certifies_enumeration"],
+            serde_json::json!(true),
+            "{payload}"
+        );
+    }
+
+    /// The host reading is published on every answer, not only on the refusing
+    /// one. Without this a consumer could not tell a probe that ran and agreed
+    /// from a field that was omitted, which is the field-versus-prose split
+    /// FIR-2820 was about one object over.
+    #[test]
+    fn every_enumeration_publishes_the_host_reading() {
+        let store = store_with(2, Some(ParseCompleteness::Full));
+        let payload = call(&store, &[("path", serde_json::json!(FILE))]).unwrap();
+        assert!(
+            payload[FILE_COVERAGE_KEY]
+                .get("host_bytes")
+                .and_then(serde_json::Value::as_str)
+                .is_some(),
+            "the reading rides every answer: {payload}"
         );
     }
 }

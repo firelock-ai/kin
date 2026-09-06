@@ -3761,6 +3761,28 @@ fn mcp_repository_authority_source(
     Ok(mcp_local_repository_binding(state)?.map(|binding| shared_authority_source(state, binding)))
 }
 
+/// The working copy this daemon's graph is supposed to be level with, offered to
+/// a handler so it can refuse to certify an answer over bytes no admission has
+/// taken.
+///
+/// A disclosure input and never an answer authority: what a handler may do with
+/// it is read one host entry, at a path the caller already named, and weaken its
+/// own verdict ([`kin_mcp::working_copy`]). No row of any response comes from it.
+///
+/// `None` on a daemon whose filesystem-to-graph ingestion is off, for the same
+/// reason its untracked measurement records itself as not applicable there:
+/// nothing on that projected checkout is content an admission failed to take, so
+/// comparing it to graph truth would manufacture a divergence out of the
+/// projection.
+fn mcp_working_copy_probe(state: &DaemonState) -> Option<kin_mcp::WorkingCopyProbe> {
+    if state.filesystem_reconcile_disabled() {
+        return None;
+    }
+    Some(kin_mcp::WorkingCopyProbe::new(
+        state.layout.working_dir().to_path_buf(),
+    ))
+}
+
 /// Bind a request's authority to this daemon's shared per-publication load.
 ///
 /// The resolver runs at most once per request, and only if a handler reaches a
@@ -14928,6 +14950,9 @@ async fn mcp_tools_call_inner(
         ))
     } else {
         let repository_authority = mcp_repository_authority_source(&state);
+        // Resolved once for the whole dispatch, so the two `handle_tool_call`
+        // arms below cannot offer different working copies for one request.
+        let host = mcp_working_copy_probe(&state);
         let handled = if request.name == "get_context_pack"
             && (request
                 .arguments
@@ -14956,6 +14981,7 @@ async fn mcp_tools_call_inner(
                         &sessions,
                         kin_mcp::SessionAuthorityMode::OfflineFallback,
                         repository_authority.as_ref(),
+                        host.as_ref(),
                     )
                     .await
                 }
@@ -15017,6 +15043,7 @@ async fn mcp_tools_call_inner(
                         &sessions,
                         kin_mcp::SessionAuthorityMode::OfflineFallback,
                         repository_authority.as_ref(),
+                        host.as_ref(),
                     )
                     .await
                 }

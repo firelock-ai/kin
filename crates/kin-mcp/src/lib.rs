@@ -17,6 +17,7 @@ pub mod startup_binding;
 pub mod tools;
 pub mod types;
 pub mod verdict;
+pub mod working_copy;
 
 pub use agent_belt::{
     apply_belt_defaults, canonicalize_tool_name, compact_for_agent_default,
@@ -55,3 +56,4 @@ pub use types::{
     ContentBlock, JsonRpcRequest, JsonRpcResponse, ToolCallParams, ToolCallResult, ToolDefinition,
 };
 pub use verdict::{disagreements as verdict_disagreements, Verdict, VERDICT_KEY};
+pub use working_copy::{HostEntryReading, WorkingCopyProbe};
