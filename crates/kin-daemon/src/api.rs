@@ -38974,9 +38974,21 @@ mod tests {
             "scan_working_copy",
             "observe_tree_and_stage_blobs",
             "plan_transaction",
+            // The three that used to be unnamed. `plan_transaction` was the
+            // largest phase of a 77 second commit on a converted psf/requests
+            // store and every sub-phase already timed inside it stayed under the
+            // 500 ms reporting threshold, so 26.5 seconds of it had no name.
+            // These are the O(store) operations that were in that gap.
+            "plan_open_authority",
+            "plan_resolve_base",
+            "plan_authority_workspace_graph",
             "plan_snapshot_clone",
             "plan_diff_semantics",
             "plan_compute_deltas",
+            // Spent by this path and captured by this test, but never asserted
+            // until now. A phase nothing asserts is a phase that can quietly
+            // stop being named.
+            "plan_verify_semantics_follow_bytes",
             "plan_derive_admission_policy",
             "install_live_graph",
         ] {
