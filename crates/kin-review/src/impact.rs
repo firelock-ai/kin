@@ -248,25 +248,74 @@ pub const STRONG_CONSUMER_CONFIDENCE: f32 = 0.6;
 pub struct EntityImpact {
     /// The directly changed entity these counts belong to.
     pub entity_id: EntityId,
-    /// Distinct non-test entities that consume this entity.
+    /// Every distinct entity outside the changed set holding a direct inbound
+    /// edge to this one: production consumers, tests and derived copies
+    /// together.
+    ///
+    /// This is the count `find_references` reports for the same entity id, and
+    /// it is deliberately the widest one, because it is the field shaped like
+    /// the answer to "is anything using this". It used to be
+    /// [`Self::external_consumer_count`], which silently dropped every test and
+    /// every derived copy: on express 5.2.1 that reported `consumer_count: 0`
+    /// for seven live exports of `lib/express.js` whose only consumers are test
+    /// files, beside a `find_references` that found all seven and certified them
+    /// (FIR-3305). A count a reader deletes code on may not exclude a class
+    /// without naming it, so every exclusion below is published beside this
+    /// total and `consumer_count == external_consumer_count +
+    /// test_consumer_count + derived_consumer_count` holds on every row.
     pub consumer_count: usize,
-    /// Subset of `consumer_count` whose inbound edge confidence is at least
-    /// [`STRONG_CONSUMER_CONFIDENCE`] — the count verdict gates key on.
+    /// The subset of [`Self::consumer_count`] a contract change strands: a
+    /// consumer that is neither a test nor a derived copy.
+    ///
+    /// This is what the review layer reads. A test breaking is a signal, not a
+    /// stranded external break, and a derived copy regenerates from its source,
+    /// so neither belongs in the count that decides whether a signature change
+    /// is breaking. It carries the meaning `consumer_count` had before FIR-3305
+    /// widened that field, and every gate that read `consumer_count` reads this.
+    #[serde(default)]
+    pub external_consumer_count: usize,
+    /// Direct inbound consumers left out of [`Self::external_consumer_count`]
+    /// because the consumer is a test entity or reaches this one by a `Tests`
+    /// edge.
+    ///
+    /// Distinct from [`Self::covering_tests`], which also counts tests reached
+    /// two hops out and so cannot be subtracted from anything.
+    #[serde(default)]
+    pub test_consumer_count: usize,
+    /// Direct inbound consumers left out of [`Self::external_consumer_count`]
+    /// because the consumer is a derived copy (an amalgamated bundle, a
+    /// vendored snapshot) that regenerates from its source.
+    ///
+    /// Before FIR-3305 this class was counted nowhere at all: it was dropped
+    /// from the consumer counts, from the files, and from every total, so a
+    /// vendored consumer left no trace in the response.
+    #[serde(default)]
+    pub derived_consumer_count: usize,
+    /// Subset of [`Self::external_consumer_count`] whose inbound edge
+    /// confidence is at least [`STRONG_CONSUMER_CONFIDENCE`] — the count
+    /// verdict gates key on.
     #[serde(default)]
     pub strong_consumer_count: usize,
-    /// Subset of `consumer_count` whose inbound edge was resolved above
-    /// `name_only` — a proven consumer rather than a same-name candidate.
+    /// Subset of [`Self::external_consumer_count`] whose inbound edge was
+    /// resolved above `name_only` — a proven consumer rather than a same-name
+    /// candidate.
     ///
-    /// `consumer_count` counts every inbound edge, and a call edge matched by
-    /// bare method name is a candidate: a same-named method on an unrelated
-    /// type or a test double matches equally well. Any claim that an entity is
-    /// used, or unused, must be read against this count rather than the total.
+    /// The external count counts every such inbound edge, and a call edge
+    /// matched by bare method name is a candidate: a same-named method on an
+    /// unrelated type or a test double matches equally well. Any claim that an
+    /// entity is used, or unused, must be read against this count rather than
+    /// the total.
     #[serde(default)]
     pub proven_consumer_count: usize,
     /// Distinct non-test entities consuming this entity as a contract.
     pub contract_consumer_count: usize,
-    /// Sorted distinct source files of the non-test consumers above.
+    /// Sorted distinct source files of every consumer counted in
+    /// [`Self::consumer_count`], tests and derived copies included.
     pub consumer_files: Vec<String>,
+    /// Sorted distinct source files of the
+    /// [`Self::external_consumer_count`] consumers alone.
+    #[serde(default)]
+    pub external_consumer_files: Vec<String>,
     /// Distinct test entities covering this entity (test-kind edges plus
     /// test-role inbound entities).
     pub covering_tests: usize,
@@ -304,19 +353,46 @@ pub struct ConsumerCallShapeSummary {
 }
 
 impl EntityImpact {
-    /// Total distinct inbound entities (consumers plus covering tests).
+    /// A row for `entity_id` with no inbound impact recorded.
+    ///
+    /// The all-zero shape every caller that cannot compute one needs, written
+    /// once so a field added to the struct reaches them without an edit each.
+    pub fn empty(entity_id: EntityId) -> Self {
+        Self {
+            entity_id,
+            consumer_count: 0,
+            external_consumer_count: 0,
+            test_consumer_count: 0,
+            derived_consumer_count: 0,
+            strong_consumer_count: 0,
+            proven_consumer_count: 0,
+            contract_consumer_count: 0,
+            consumer_files: Vec::new(),
+            external_consumer_files: Vec::new(),
+            covering_tests: 0,
+            consumers_migrated_in_diff: 0,
+            call_shapes: ConsumerCallShapeSummary::default(),
+        }
+    }
+
+    /// Total distinct inbound entities: the consumers a contract change
+    /// strands, the derived copies it regenerates, and the tests covering it.
     /// Zero means the graph connects nothing to this entity.
+    ///
+    /// Built from the exclusive classes rather than from
+    /// [`Self::consumer_count`], because `covering_tests` already holds every
+    /// direct test consumer and adding the two would count those twice.
     pub fn inbound_total(&self) -> usize {
-        self.consumer_count + self.covering_tests
+        self.external_consumer_count + self.derived_consumer_count + self.covering_tests
     }
 
     /// True when this entity has graph-known consumers and EVERY one was
     /// itself modified in the reviewed range: a self-contained migration with
-    /// no stranded external consumer. `consumer_count` counts only external
-    /// (non-migrated) consumers, so zero external plus at least one migrated
-    /// consumer is a fully coherent in-diff migration.
+    /// no stranded external consumer. [`Self::external_consumer_count`] counts
+    /// only external (non-migrated) consumers, so zero external plus at least
+    /// one migrated consumer is a fully coherent in-diff migration.
     pub fn all_consumers_migrated(&self) -> bool {
-        self.consumer_count == 0 && self.consumers_migrated_in_diff > 0
+        self.external_consumer_count == 0 && self.consumers_migrated_in_diff > 0
     }
 }
 
@@ -427,6 +503,17 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         // decision input: a consumer that happens to share the changed entity's
         // file is still a distinct consumer entity with a real inbound edge.
         let mut ent_consumer_files: BTreeSet<String> = BTreeSet::new();
+        // The two classes the external count leaves out, kept as their own sets
+        // so each is published under its own name instead of vanishing. A test
+        // consumer also lands in `ent_tests`, which additionally holds tests
+        // reached two hops out; this set is the direct inbound half alone, so
+        // the row's classes sum to its total.
+        let mut ent_direct_tests: HashSet<EntityId> = HashSet::new();
+        let mut ent_derived: HashSet<EntityId> = HashSet::new();
+        // Files of every direct inbound consumer, whichever class it fell in.
+        // `ent_consumer_files` above stays the external-only projection the
+        // review layer reads.
+        let mut ent_all_consumer_files: BTreeSet<String> = BTreeSet::new();
         // Argument-shape distillation over the SAME counted-consumer set: the
         // union of keyword names any inbound call site uses, whether any caller
         // forwards `**kwargs` (keyword set then unknown), and whether every
@@ -492,13 +579,20 @@ pub fn analyze_impact_at<I: ImpactGraph>(
             }
 
             let is_test = entity.role == EntityRole::Test || rel.kind == RelationKind::Tests;
+            if let Some(file) = entity_file(&entity) {
+                ent_all_consumer_files.insert(file);
+            }
             if is_test {
                 ent_tests.insert(affected_id);
+                ent_direct_tests.insert(affected_id);
             } else if consumer_is_derived(&entity) {
                 // Derived copies (amalgamated bundles, vendored snapshots)
                 // regenerate from their sources; they appear in the blast
                 // radius for navigation but cannot be "broken" consumers,
-                // so they never feed consumer counts or breaking findings.
+                // so they never feed the external count or breaking findings.
+                // They are still consumers, and this set is why the row can say
+                // so by name rather than dropping them (FIR-3305).
+                ent_derived.insert(affected_id);
             } else {
                 ent_consumers.insert(affected_id);
                 if rel.confidence >= STRONG_CONSUMER_CONFIDENCE {
@@ -598,13 +692,26 @@ pub fn analyze_impact_at<I: ImpactGraph>(
             }
         }
 
+        // One consumer, one class. An entity reaching this one on two edges of
+        // different kinds (a `Tests` edge and a `Calls` edge, say) landed in two
+        // sets above, and a row whose classes overlap cannot sum to its total.
+        // A consumer that can be stranded is external whatever else it also is,
+        // and a test outranks a derived copy, so the wider class wins and each
+        // consumer is counted exactly once.
+        ent_direct_tests.retain(|id| !ent_consumers.contains(id));
+        ent_derived.retain(|id| !ent_consumers.contains(id) && !ent_direct_tests.contains(id));
+
         entity_impacts.push(EntityImpact {
             entity_id,
-            consumer_count: ent_consumers.len(),
+            consumer_count: ent_consumers.len() + ent_direct_tests.len() + ent_derived.len(),
+            external_consumer_count: ent_consumers.len(),
+            test_consumer_count: ent_direct_tests.len(),
+            derived_consumer_count: ent_derived.len(),
             strong_consumer_count: ent_strong_consumers.len(),
             proven_consumer_count: ent_proven_consumers.len(),
             contract_consumer_count: ent_contract_consumers.len(),
-            consumer_files: ent_consumer_files.into_iter().collect(),
+            consumer_files: ent_all_consumer_files.into_iter().collect(),
+            external_consumer_files: ent_consumer_files.into_iter().collect(),
             covering_tests: ent_tests.len(),
             consumers_migrated_in_diff: ent_migrated.len(),
             call_shapes: ConsumerCallShapeSummary {
@@ -1044,6 +1151,140 @@ mod tests {
         }
     }
 
+    /// A consumer entity in `file` whose role makes it a test.
+    fn test_entity_in_file(name: &str, file: &str, line: u32) -> Entity {
+        Entity {
+            role: EntityRole::Test,
+            ..entity_in_file(name, file, line)
+        }
+    }
+
+    /// FIR-3305, the reported shape, reduced to one export and one test.
+    ///
+    /// `impact_analysis(files: ["lib/express.js"])` on express 5.2.1 at
+    /// `023767fe` returned `consumer_count: 0` and `consumer_files: []` for
+    /// seven live exports whose only consumers are test files, and the run that
+    /// found it reported that as the worst failure of its session, because the
+    /// direction a false zero fails in is the one that gets code deleted.
+    /// `find_references`, pinned by the same entity ids, found every one of them
+    /// and returned `verdict.state: "certified"`. Both tools read the same
+    /// inbound edges. Only this one dropped a class without saying so.
+    #[test]
+    fn an_export_consumed_only_by_a_test_does_not_report_zero_consumers() {
+        let export = entity_in_file("json", "lib/express.js", 77);
+        let covering_test = test_entity_in_file("express.json", "test/express.json.js", 60);
+
+        let mut graph = MockImpactGraph::default();
+        for entity in [&export, &covering_test] {
+            graph.entities.insert(entity.id, entity.clone());
+        }
+        graph
+            .inbound
+            .insert(export.id, vec![calls(&covering_test, &export)]);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&export)],
+            ..Default::default()
+        };
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let impact = report
+            .entity_impact(&export.id)
+            .expect("the changed export has an impact row");
+
+        assert_eq!(
+            impact.consumer_count, 1,
+            "the export is consumed by a test, so the count a reader deletes on is 1, not 0"
+        );
+        assert_eq!(
+            impact.consumer_files,
+            vec!["test/express.json.js".to_string()],
+            "the consuming file is named; an empty list here is what read as `nothing uses this`"
+        );
+        assert_eq!(
+            impact.test_consumer_count, 1,
+            "the class is named rather than implied"
+        );
+        assert_eq!(
+            impact.external_consumer_count, 0,
+            "a test breaking with the code it tests is still not a stranded external break"
+        );
+        assert!(
+            impact.external_consumer_files.is_empty(),
+            "the break-relevant file list stays the break-relevant one"
+        );
+    }
+
+    /// Every consumer is counted somewhere and every exclusion has a name.
+    ///
+    /// The row's own arithmetic is the guarantee: `consumer_count` equals the
+    /// three named classes summed, so a class cannot be dropped in future
+    /// without the sum going wrong. Before FIR-3305 a derived consumer was
+    /// counted in none of them and left no trace in the response at all.
+    #[test]
+    fn every_excluded_consumer_is_counted_under_its_own_name() {
+        let export = entity_in_file("Router", "lib/express.js", 71);
+        let caller = entity_in_file("mount", "examples/multi-router/index.js", 12);
+        let covering_test = test_entity_in_file("router_spec", "test/app.router.js", 4);
+        let bundled = Entity {
+            role: EntityRole::Vendored,
+            ..entity_in_file("Router", "vendor/express.bundle.js", 900)
+        };
+
+        let mut graph = MockImpactGraph::default();
+        for entity in [&export, &caller, &covering_test, &bundled] {
+            graph.entities.insert(entity.id, entity.clone());
+        }
+        graph.inbound.insert(
+            export.id,
+            vec![
+                calls(&caller, &export),
+                calls(&covering_test, &export),
+                calls(&bundled, &export),
+            ],
+        );
+
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&export)],
+            ..Default::default()
+        };
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let impact = report
+            .entity_impact(&export.id)
+            .expect("the changed export has an impact row");
+
+        assert_eq!(impact.consumer_count, 3, "all three consumers are counted");
+        assert_eq!(
+            impact.external_consumer_count, 1,
+            "the caller alone strands"
+        );
+        assert_eq!(impact.test_consumer_count, 1, "the test is named");
+        assert_eq!(
+            impact.derived_consumer_count, 1,
+            "the vendored copy is named"
+        );
+        assert_eq!(
+            impact.external_consumer_count
+                + impact.test_consumer_count
+                + impact.derived_consumer_count,
+            impact.consumer_count,
+            "the named classes must account for the whole total, with nothing dropped"
+        );
+        assert_eq!(
+            impact.consumer_files,
+            vec![
+                "examples/multi-router/index.js".to_string(),
+                "test/app.router.js".to_string(),
+                "vendor/express.bundle.js".to_string(),
+            ],
+            "every consuming file is named, tests and vendored copies included"
+        );
+        assert_eq!(
+            impact.external_consumer_files,
+            vec!["examples/multi-router/index.js".to_string()],
+            "the break-relevant list still holds only the consumer a change strands"
+        );
+    }
+
     #[test]
     fn consumer_count_counts_direct_inbound_not_two_hop_through_changed() {
         // A and B are both changed (co-updated). B consumes A directly, C
@@ -1125,14 +1366,33 @@ mod tests {
             .entity_impact(&target.id)
             .expect("target has an impact entry");
         assert_eq!(
-            impact.consumer_count, 1,
-            "the single_include/ amalgamated copy must be excluded by path; only the real \
-             src/invoice.rs consumer counts"
+            impact.external_consumer_count, 1,
+            "the single_include/ amalgamated copy must be excluded by path from the count a \
+             break is read off; only the real src/invoice.rs consumer strands"
+        );
+        assert_eq!(
+            impact.external_consumer_files,
+            vec!["src/invoice.rs".to_string()],
+            "the break-relevant file list must not include the generated single-header bundle"
+        );
+        // Excluded from the break count, and named rather than dropped. Before
+        // FIR-3305 the bundle appeared in no count and no list at all, so a
+        // reader had no way to learn it existed.
+        assert_eq!(
+            impact.derived_consumer_count, 1,
+            "the bundle is still a consumer, and the row says which class excluded it"
+        );
+        assert_eq!(
+            impact.consumer_count, 2,
+            "the total counts both, so nothing is silently missing from it"
         );
         assert_eq!(
             impact.consumer_files,
-            vec!["src/invoice.rs".to_string()],
-            "consumer_files must not include the generated single-header bundle"
+            vec![
+                "single_include/catch.hpp".to_string(),
+                "src/invoice.rs".to_string()
+            ],
+            "every consuming file is reachable from the response"
         );
     }
 

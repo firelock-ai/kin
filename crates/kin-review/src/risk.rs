@@ -38,17 +38,7 @@ fn per_entity(impact: &ImpactReport, entity_id: &EntityId) -> EntityImpact {
     impact
         .entity_impact(entity_id)
         .cloned()
-        .unwrap_or_else(|| EntityImpact {
-            entity_id: *entity_id,
-            consumer_count: 0,
-            strong_consumer_count: 0,
-            proven_consumer_count: 0,
-            contract_consumer_count: 0,
-            consumer_files: Vec::new(),
-            covering_tests: 0,
-            consumers_migrated_in_diff: 0,
-            call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
-        })
+        .unwrap_or_else(|| EntityImpact::empty(*entity_id))
 }
 
 /// `name (Kind) at file:line` for a removed entity, so a finding reads as code.
@@ -204,7 +194,9 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
                 // Signature changed?
                 if old.signature != new.signature {
                     let entity = per_entity(impact, &change.entity_id);
-                    if entity.consumer_count > 0 || entity.contract_consumer_count > 0 {
+                    // External consumers only: a signature change its own tests
+                    // cover is not a break somebody else has to absorb.
+                    if entity.external_consumer_count > 0 || entity.contract_consumer_count > 0 {
                         breaking_changes.push(format!(
                             "Signature change on `{}`: `{}` -> `{}`",
                             new.name, old.signature, new.signature,
@@ -484,15 +476,13 @@ mod tests {
         covering_tests: usize,
     ) -> crate::impact::EntityImpact {
         crate::impact::EntityImpact {
-            entity_id,
             consumer_count,
+            external_consumer_count: consumer_count,
             strong_consumer_count: consumer_count,
             proven_consumer_count: consumer_count,
             contract_consumer_count,
-            consumer_files: Vec::new(),
             covering_tests,
-            consumers_migrated_in_diff: 0,
-            call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
+            ..crate::impact::EntityImpact::empty(entity_id)
         }
     }
 
