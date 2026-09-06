@@ -389,11 +389,13 @@ mod tests {
                 .find(|(_, character)| character.is_ascii_alphabetic())
                 .map(|(index, _)| line[..index].chars().count())
                 .expect("each line carries its text");
-            assert_eq!(
-                at,
-                MARK_COLUMNS + GUTTER_COLUMNS,
-                "text starts at column {at} on line {line:?}"
-            );
+            // The literal, not `MARK_COLUMNS + GUTTER_COLUMNS`. Written
+            // against the constants, this assertion recomputed its own
+            // expectation whenever either moved, so it held for every value
+            // they could take and guarded nothing. The mutation sweep found it:
+            // dropping the gutter to one column left this test green while its
+            // sibling, written against the literal, went red.
+            assert_eq!(at, 7, "text starts at column {at} on line {line:?}");
         }
     }
 

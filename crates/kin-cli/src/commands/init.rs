@@ -1641,15 +1641,20 @@ fn render_human_result(
     // parsed: the acceptance suites read this block, and every one of them
     // captures stdout, so off a terminal this is the headline alone and every
     // reader of it sees what it always saw.
-    let header = crate::mark::beside_for_stdout(&[
-        "",
-        &format!(
-            "Initialized Kin repository authority at {}",
-            result.layout.root().display()
+    let root = result.layout.root().display().to_string();
+    let header = match crate::mark::MarkStyle::for_stdout() {
+        // On a terminal the path takes its own row beside the mark. On one
+        // line with the mark's seven columns in front of it, an ordinary path
+        // made this ninety-two columns and it wrapped, and the mark is not
+        // what a reader should pay for.
+        Some(style) => crate::mark::beside(
+            style,
+            &["", "Initialized Kin repository authority", &root, ""],
         ),
-        "",
-        "",
-    ]);
+        // Off a terminal, the one line every reader of this block already
+        // parses, unchanged.
+        None => vec![format!("Initialized Kin repository authority at {root}")],
+    };
     // More than the headline means the mark drew, and its lower rows would
     // otherwise sit directly on top of the detail lines below, which are
     // indented two rather than seven. The blank line is part of the mark, so it
@@ -1772,12 +1777,25 @@ fn workspace_head_line(head: &kin_model::WorkspaceHead) -> String {
 /// Two commands, not a menu. `locate` is the one the README leads with, and
 /// `status` is the one that answers what just happened to this repository.
 fn next_step_lines() -> Vec<String> {
-    vec![
-        String::new(),
-        "Next:".to_string(),
-        "  kin locate \"<what you are looking for>\"  ask the graph".to_string(),
-        "  kin status                                what this repository holds now".to_string(),
-    ]
+    // Padded from the commands themselves rather than by hand. Written out, the
+    // two descriptions landed a column apart, and the kind of drift nobody
+    // notices in a diff is exactly the kind a reader sees straight away.
+    let steps = [
+        ("kin locate \"<what you are looking for>\"", "ask the graph"),
+        ("kin status", "what this repository holds now"),
+    ];
+    let widest = steps
+        .iter()
+        .map(|(command, _)| command.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![String::new(), "Next:".to_string()];
+    lines.extend(
+        steps
+            .iter()
+            .map(|(command, description)| format!("  {command:<widest$}  {description}")),
+    );
+    lines
 }
 
 /// Keep language-server and cross-file guidance before the embedding notice.
@@ -2174,6 +2192,26 @@ mod tests {
                 "the next step must not put an em dash in front of a reader: {line}"
             );
         }
+
+        // Every description starts in the same column. Written out by hand the
+        // two landed a column apart, which a diff hides and a reader sees.
+        let columns: Vec<usize> = lines[2..]
+            .iter()
+            .map(|line| {
+                let gap = line
+                    .find("  ")
+                    .and_then(|_| line[2..].find("  ").map(|at| at + 2))
+                    .expect("each step separates its command from its description");
+                line[gap..]
+                    .find(|c: char| !c.is_whitespace())
+                    .expect("each step carries a description")
+                    + gap
+            })
+            .collect();
+        assert!(
+            columns.windows(2).all(|pair| pair[0] == pair[1]),
+            "the descriptions start at columns {columns:?}, so the block is ragged"
+        );
     }
 
     /// A queue nobody is draining is not work in flight.

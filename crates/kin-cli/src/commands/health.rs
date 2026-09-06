@@ -5601,10 +5601,29 @@ mod tests {
             "the scan did not read this file, so its result says nothing"
         );
 
+        // Both forms. The character is the obvious one. The escape is what a
+        // mutation sweep put in this file to test this guard, and the guard
+        // stayed green: `\u{2014}` is seven ASCII bytes in the source and an em
+        // dash on the reader's terminal, so a scan of source bytes alone misses
+        // exactly the case someone would write to get around it.
+        // Built from the code point rather than written as an escape. Spelled
+        // out, this line would carry the very sequence the scan below looks
+        // for, and the guard would report itself: a self-matching guard passes
+        // only while it is the one offender, then fails forever for the wrong
+        // reason and gets deleted.
+        const EM_DASH_CODE: u32 = 0x2014;
+        let em_dash = char::from_u32(EM_DASH_CODE).expect("2014 is a character");
+        // No case folding. Folding the line was the first attempt and it made
+        // this guard unable to fire at all: `to_uppercase` turns the `u` of
+        // `\u{...}` into `U`, so the needle never matched a line that carried
+        // it. The mutation sweep is what caught that, because the escape form
+        // went in and the test stayed green. The hex here is four digits and no
+        // letters, so there is no case to fold in the first place.
+        let escape = format!("\\u{{{EM_DASH_CODE:04x}}}");
         let offenders: Vec<(usize, &str)> = source
             .lines()
             .enumerate()
-            .filter(|(_, line)| line.contains('\u{2014}'))
+            .filter(|(_, line)| line.contains(em_dash) || line.contains(&escape))
             .filter(|(_, line)| !line.trim_start().starts_with("//"))
             .map(|(index, line)| (index + 1, line.trim()))
             .collect();

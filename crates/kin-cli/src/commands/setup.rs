@@ -13152,6 +13152,41 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Print a `note:` or `fix:` line under a row, wrapped when it does not fit.
+///
+/// These carry the remedy, so they are the lines a reader most needs to be able
+/// to read. Wrapped, the continuation lines align under the text rather than
+/// under the label, so the label keeps marking where one remedy starts. Off a
+/// terminal, `width` is `None` and the line is printed exactly as it always was.
+fn print_labelled_line(label: &str, text: &str, width: Option<usize>) {
+    for line in labelled_lines(label, text, width) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_labelled_line`] would print.
+///
+/// Split from the printing so the decision can be tested. Written as one
+/// function that printed as it went, the only test that could reach it was a
+/// test of `wrap_words` beside it, and a mutation that made this always take
+/// the fits arm left that test green: it never called this code at all.
+fn labelled_lines(label: &str, text: &str, width: Option<usize>) -> Vec<String> {
+    let indent = DETAIL_CONTINUATION_INDENT;
+    let hanging = indent + label.chars().count();
+    let fits = width.is_none_or(|width| hanging + console::measure_text_width(text) <= width);
+    if fits {
+        return vec![format!("{}{label}{text}", " ".repeat(indent))];
+    }
+    let width = width.unwrap_or_default();
+    let mut wrapped = wrap_words(text, width.saturating_sub(hanging).max(20)).into_iter();
+    let Some(first) = wrapped.next() else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!("{}{label}{first}", " ".repeat(indent))];
+    lines.extend(wrapped.map(|line| format!("{}{line}", " ".repeat(hanging))));
+    lines
+}
+
 /// The width to lay a report out at, or `None` when nothing is watching.
 fn report_width() -> Option<usize> {
     if !io::stdout().is_terminal() {
@@ -13209,11 +13244,11 @@ fn print_human_report(report: &crate::commands::health::HealthReport) {
             }
         }
         if let Some(note) = &check.platform_note {
-            println!("      note: {note}");
+            print_labelled_line("note: ", note, width);
         }
         if !matches!(check.status, HealthStatus::Healthy) {
             if let Some(fix) = &check.manual_fix {
-                println!("      fix:  {fix}");
+                print_labelled_line("fix:  ", fix, width);
             }
         }
     }
@@ -15825,6 +15860,52 @@ mod tests {
             matches!(detail_layout(&long, None), DetailLayout::Beside),
             "with no width to lay out at, the detail must be printed as it always was"
         );
+    }
+
+    /// A `fix:` line that does not fit is wrapped under its own label.
+    ///
+    /// These carry the remedy, so they are the lines a reader most needs whole.
+    /// After the row wrap landed, seven of `kin doctor`'s lines were still past
+    /// an eighty-column margin at 80 and four at 120, and every one of them was
+    /// a `fix:`. The continuation lines align under the text rather than under
+    /// the label, so the label keeps marking where one remedy starts.
+    #[test]
+    fn a_fix_line_that_does_not_fit_wraps_under_its_label() {
+        use super::{labelled_lines, DETAIL_CONTINUATION_INDENT};
+
+        let fix = "run `kin vfs on` to engage a projection and record it, or `kin vfs status` \
+                   for what each mode would need here";
+        let hanging = DETAIL_CONTINUATION_INDENT + "fix:  ".len();
+        assert!(
+            hanging + console::measure_text_width(fix) > 80,
+            "this fixture must be a line that does not fit, or the test proves nothing"
+        );
+
+        let lines = labelled_lines("fix:  ", fix, Some(80));
+        assert!(
+            lines.len() > 1,
+            "a line this long must be wrapped: {lines:?}"
+        );
+        assert!(
+            lines[0].starts_with(&format!("{}fix:  ", " ".repeat(DETAIL_CONTINUATION_INDENT))),
+            "the label stays on the first line: {:?}",
+            lines[0]
+        );
+        for line in &lines {
+            let width = console::measure_text_width(line);
+            assert!(width <= 80, "the wrapped line {line:?} is {width} columns");
+        }
+        for line in &lines[1..] {
+            assert!(
+                line.starts_with(&" ".repeat(hanging)),
+                "continuation lines align under the text, not under the label: {line:?}"
+            );
+        }
+
+        // Off a terminal it is one line, exactly as this report always printed.
+        let plain = labelled_lines("fix:  ", fix, None);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0], format!("      fix:  {fix}"));
     }
 
     /// Wrapping never loses or reorders a word, and never splits one.

@@ -2778,12 +2778,27 @@ fn version_lines(version: &str) -> Vec<String> {
         Some((number, rest)) => (number, rest.trim_end_matches(')')),
         None => (version, ""),
     };
-    vec![
+    let mut lines = vec![
         String::new(),
         format!("kin {number}"),
         CATEGORY_LINE.to_string(),
-        build.to_string(),
-    ]
+    ];
+    // The commit sha gets its own line, and the branch and build time the next.
+    // Together they are seventy columns on a release build, whose branch reads
+    // `detached`, and ninety on a working branch whose name is long: the first
+    // build of this change printed
+    // `5372dc8c2299f86d7cfaedfd0b0108a9a177f8b8 chore/lane-clilook-kin
+    // 2026-09-06T16:52:11Z`, which wraps at eighty. Splitting them is what makes
+    // the bound hold for every branch name rather than for the ones a release
+    // happens to have.
+    match build.split_once(' ') {
+        Some((commit, rest)) => {
+            lines.push(commit.to_string());
+            lines.push(rest.to_string());
+        }
+        None => lines.push(build.to_string()),
+    }
+    lines
 }
 
 /// The canon Category line, shared by `--help` and `--version`.
@@ -5230,23 +5245,30 @@ mod tests {
         // is an assertion that cannot fail, and it would sit here looking like
         // one that could.
         assert_eq!(lines[2], "The system of record for AI-written software.");
-        assert_eq!(
-            lines[3],
-            "dca8e950e99f6a1cb9afe4359611e2da288004f2 detached 2026-09-06T08:24:29Z"
-        );
+        assert_eq!(lines[3], "dca8e950e99f6a1cb9afe4359611e2da288004f2");
+        assert_eq!(lines[4], "detached 2026-09-06T08:24:29Z");
 
-        for paint in [
-            kin_cli::mark::Paint::Truecolor,
-            kin_cli::mark::Paint::Indexed,
-            kin_cli::mark::Paint::None,
-        ] {
-            let style = kin_cli::mark::MarkStyle::new(kin_cli::mark::Glyphs::Unicode, paint);
-            for line in rendered_version(composed, Some(style)).lines() {
-                let width = console::measure_text_width(line);
-                assert!(
-                    width <= 80,
-                    "the version line {line:?} is {width} columns wide, so it wraps at 80"
-                );
+        // Both a release build, whose branch reads `detached`, and a working
+        // branch with a long name. The second is not hypothetical: the first
+        // build of this change reported `chore/lane-clilook-kin` and its
+        // version line was ninety columns, which the release-shaped input alone
+        // could never have caught.
+        let working = "0.7.3 (5372dc8c2299f86d7cfaedfd0b0108a9a177f8b8 \
+                       chore/lane-clilook-kin 2026-09-06T16:52:11Z)";
+        for version in [composed, working] {
+            for paint in [
+                kin_cli::mark::Paint::Truecolor,
+                kin_cli::mark::Paint::Indexed,
+                kin_cli::mark::Paint::None,
+            ] {
+                let style = kin_cli::mark::MarkStyle::new(kin_cli::mark::Glyphs::Unicode, paint);
+                for line in rendered_version(version, Some(style)).lines() {
+                    let width = console::measure_text_width(line);
+                    assert!(
+                        width <= 80,
+                        "the version line {line:?} is {width} columns wide, so it wraps at 80"
+                    );
+                }
             }
         }
     }
@@ -5280,6 +5302,7 @@ mod tests {
         let lines = version_lines("0.7.2");
         assert_eq!(lines[1], "kin 0.7.2");
         assert_eq!(lines[3], "");
+        assert_eq!(lines.len(), 4, "an absent build detail adds no second line");
     }
 
     /// With no terminal, `--version` is the exact line it has always been.
