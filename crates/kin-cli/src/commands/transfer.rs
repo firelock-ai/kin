@@ -266,14 +266,7 @@ pub(crate) fn resolve_peer(
                         .map(|value| value.trim().to_string())
                         .filter(|value| !value.is_empty())
                 })
-                .with_context(|| {
-                    format!(
-                        "native-kin remote {} is hosted on KinLab, whose transfer seam is scoped \
-                         to an organization, and {base_url} names none. Re-add it with a full \
-                         locator like `--url kinlab://<org>/<repo>`, or set KIN_ORG_ID.",
-                        selected.name
-                    )
-                })?,
+                .with_context(|| missing_organization_message(&selected.name, &base_url))?,
         ),
         _ => None,
     };
@@ -283,6 +276,34 @@ pub(crate) fn resolve_peer(
         base_url,
         organization_id,
     })
+}
+
+/// The refusal a hosted remote's transfer pre-flight prints when nothing names
+/// an organization.
+///
+/// The address is redacted rather than interpolated. This site printed the
+/// configured URL back verbatim, so a remote added as
+/// `--url https://user:password@kinlab.ai` answered a missing `KIN_ORG_ID` by
+/// echoing the password onto the terminal and into whatever captured it. The
+/// three sites kin#1561 fixed already call
+/// `kin_remote::repository_transfer::redacted_remote_address`; this is the
+/// fourth, and it was the only remaining verbatim base URL in this module.
+///
+/// A function rather than an inline `format!`, for the reason
+/// `remote::missing_bearer_token_message` is one: the address half has a `None`
+/// arm, `redacted_remote_address` withholds any URL whose `@` sits outside the
+/// authority, and the obvious way to spend that `Option` at a call site is
+/// `unwrap_or_else(|| base_url.to_string())`, which hands the whole
+/// credential-bearing URL back and restores exactly the leak the redaction
+/// closes. Inlined, that arm sits where no test can reach it.
+fn missing_organization_message(remote_name: &str, base_url: &str) -> String {
+    let address = kin_remote::repository_transfer::redacted_remote_address(base_url)
+        .unwrap_or_else(|| "that remote".to_string());
+    format!(
+        "native-kin remote {remote_name} is hosted on KinLab, whose transfer seam is scoped to an \
+         organization, and {address} names none. Re-add it with a full locator like `--url \
+         kinlab://<org>/<repo>`, or set KIN_ORG_ID."
+    )
 }
 
 fn parse_ref(value: Option<&str>) -> Result<Option<RefName>> {
@@ -565,6 +586,61 @@ mod tests {
         assert!(
             !base.contains("/api/orgs/"),
             "base carries an org path: {base}"
+        );
+    }
+
+    /// The `None` arm of the redaction, graded where this pre-flight spends it.
+    ///
+    /// Same shape as `remote::a_url_the_redaction_withholds_is_never_named_in_the_refusal`:
+    /// `redacted_remote_address` withholds a URL whose `@` sits outside the
+    /// authority, because it cannot tell a smuggled userinfo from an ordinary
+    /// path character, and what a refusal does with that withholding has exactly
+    /// one wrong answer, which is printing the URL back. This refusal printed it
+    /// back unconditionally until now.
+    #[test]
+    fn a_url_the_redaction_withholds_is_never_named_in_the_org_scope_refusal() {
+        // The unencoded `/` ends the authority before the `@`, so this is the
+        // shape no redactor can parse and every part of it is a credential.
+        let message = missing_organization_message("origin", "https://alice:s3cr3t/pw@kinlab.ai");
+        for (named, carried) in [
+            ("the password", "s3cr3t"),
+            ("the username", "alice"),
+            ("a host it could not vouch for", "kinlab.ai"),
+        ] {
+            assert!(
+                !message.contains(carried),
+                "the org-scope refusal named {named} out of a URL the redaction withheld: \
+                 {message}"
+            );
+        }
+        assert!(
+            message.contains("that remote names none"),
+            "it must still say a remote named no organization, without naming one: {message}"
+        );
+        assert!(
+            message.contains("KIN_ORG_ID"),
+            "and must still carry the remedy that fixes it: {message}"
+        );
+    }
+
+    /// The positive control for the assertions above, in both directions: a
+    /// refusal that named nothing at all would pass every one of them, and a
+    /// remote whose URL parses must still be named in full.
+    #[test]
+    fn a_parseable_remote_is_named_in_the_org_scope_refusal_without_its_credentials() {
+        let message =
+            missing_organization_message("origin", "https://alice:s3cr3t@kinlab.ai/team?t=v#f");
+        assert!(
+            message.contains("https://kinlab.ai/team names none"),
+            "a parseable remote must be named, path included: {message}"
+        );
+        assert!(
+            !message.contains("s3cr3t") && !message.contains("alice") && !message.contains("t=v"),
+            "and named without the credentials it carried: {message}"
+        );
+        assert!(
+            message.contains("native-kin remote origin is hosted on KinLab"),
+            "and the refusal must still say which remote it is about: {message}"
         );
     }
 
