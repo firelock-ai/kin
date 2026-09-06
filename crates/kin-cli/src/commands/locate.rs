@@ -742,7 +742,7 @@ fn query_names_entity_symbolically(query: &str, name: &str) -> bool {
 /// merely ending in the same word.
 ///
 /// The whole path is compared, not just its tail. Matching on the tail alone
-/// is how one dotted run in a prose question lifts FIR-3079's demotion off
+/// is how one dotted run in a prose question lifts the prose-word demotion off
 /// every entity that happens to share that word: `Session.get` in a sentence
 /// would spare `RequestsCookieJar.get`, and a bare filename like
 /// `package.json` would spare anything whose own name tail is `json`. Because
@@ -22882,7 +22882,7 @@ mod tests {
 
     /// A query that SPELLS the symbol has named it, qualifier and all.
     ///
-    /// FIR-3079 takes the exact-name tier away from a name match resting on
+    /// The prose-word rule takes the exact-name tier away from a name match resting on
     /// nothing but a plain English word in a sentence, by asking whether a
     /// SYMBOL-SHAPED token named the entity. [`query_tokens`] splits on the
     /// dot, so a query that wrote the symbol as a qualified path was answered
@@ -22901,7 +22901,7 @@ mod tests {
         // nothing below passes because one of them quietly stopped holding.
         assert!(
             query_is_prose(query),
-            "control: this query has to read as prose or FIR-3079 never fires"
+            "control: this query has to read as prose or the demotion never fires"
         );
         assert!(
             !is_symbolic_search_term("get"),
@@ -22978,7 +22978,7 @@ mod tests {
             "but a suffix that is not on a separator boundary is a different name"
         );
 
-        // The case FIR-3079 was written for is untouched.
+        // The case the prose-word rule was written for is untouched.
         let prose = "when I send a command, how does it reach the socket";
         assert!(
             !query_names_entity_symbolically(prose, "send"),
@@ -23337,7 +23337,7 @@ mod tests {
         }
         // And the anchors are still on the page. Pricing them under the band is
         // not the same as switching them off, which is the thing that would
-        // undo FIR-3079's own measured win.
+        // undo the prose-word rule's own measured win.
         assert!(
             fixed
                 .entities
