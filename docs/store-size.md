@@ -31,7 +31,8 @@ store.
 The store is not a copy of the packfile, so it is not bounded by one, and the
 gap is much larger than the semantic layer alone accounts for.
 
-Two things inside `.kin/` account for all of it, to within rounding. Broken down on
+Two things account for almost all of the store on the repository broken down
+below, and a third can appear and rival the snapshot in size. Broken down on
 ripgrep at 2,261 commits, whose 6.1 MiB object store became a 405.4 MiB store:
 
 | Part of `.kin/` | Size | Share |
@@ -58,9 +59,22 @@ entities across 2,327 changes, and an entity's identity is derived partly from
 its starting line, so an edit that shifts a function down a file retires one
 identity and creates another for code that did not change.
 
-Both terms scale with **history depth** rather than with the size of your
-checkout, which is why a repository with a small working tree and thousands of
-commits can still produce a large store.
+**The prepared query graph.** Not present in the ripgrep breakdown above, and
+large enough elsewhere that a reader should not treat that breakdown as the
+shape of every store. Kin writes a prepared workspace query graph at
+`kindb/<repo>/prepared/<workspace>.kpqg`, with a small `.kpqg.json` binding
+beside it, to accelerate reopening a workspace. On psf/requests at `dae7ef63b`
+under v0.7.0 it measured 1163.50 MiB, 46.2% of a 2.46 GiB store, slightly
+smaller than that store's graph snapshot and roughly nine times its admitted
+bodies. It is written during `kin init` rather than by a later commit: on the
+measured store its mtime preceded the command's own return by 24 seconds. It
+appears to be tied to a workspace carrying a semantic overlay rather than
+written unconditionally, so treat it as a component that can appear and can be
+roughly half the store, not as a guaranteed third row.
+
+The first two terms scale with **history depth** rather than with the size of
+your checkout, which is why a repository with a small working tree and thousands
+of commits can still produce a large store.
 
 The ratio is not a constant and is not fully explained. It varies by more than
 3x across repositories of similar size in different languages, and why is an open
@@ -105,10 +119,24 @@ listed as corroboration rather than as rows measured the same way: anyhow 47x,
 click 109.1x, zod 163x, sinatra 75.1x, and a 27-file shell repository with zero
 entities extracted at 27.4x.
 
+Across every real repository named on this page, the table and the corroboration
+list together, the measured ratios span **27.4x to 163x**: 27.4x, 47x, 55.6x,
+66.5x, 75.1x, 109.1x and 163x. The table's other two rows are fixtures built to
+show edge behaviour rather than repositories. So the table's two repository rows
+are not the range, and reading the table alone gives a much narrower impression
+than this page's own numbers support.
+
 This is a record of what has been measured, not a bound. Kin does not currently
 cap store size, warn above a threshold, or refuse to admit a repository for
-being large. If your repository lands far outside this range, that is worth
+being large. If your repository lands far outside 27.4x to 163x, that is worth
 reporting, and the numbers `kin status` prints are what to report.
+
+One repository is deliberately absent from the table. psf/requests at
+`dae7ef63b` has been measured at 178.0x under v0.7.0, but that store carried a
+partial embedding pass and one commit, so it was not produced by `kin init`
+alone and a row from it would not mean what the other rows mean. It is named
+here rather than added above, because a table whose rows were gathered different
+ways stops being a comparison.
 
 ## Where to see it
 
