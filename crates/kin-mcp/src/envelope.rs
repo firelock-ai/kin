@@ -1581,18 +1581,31 @@ fn merge_file_coverage_classes(
         Some("absent") | Some("partial") | Some("failed") => STATE_ABSENT,
         _ => STATE_UNKNOWN,
     };
-    // A full parse of bytes the tree no longer holds is not a present class. The
-    // handler publishes the provenance beside the parse state rather than folding
-    // it in, so a reader can see which of the two failed; the verdict sees one
-    // class, and it is absent when either does.
+    // A full parse of bytes the tree no longer holds is not a present class, and
+    // neither is a full parse of bytes the host has since replaced. The handler
+    // publishes both readings beside the parse state rather than folding them
+    // in, so a reader can see which of the three failed; the verdict sees one
+    // class, and it is absent when any does.
     let spans_stale = coverage
         .and_then(|coverage| coverage.get("span_provenance"))
         .and_then(Value::as_str)
         == Some("stale");
-    let parsed = if spans_stale { STATE_ABSENT } else { parsed };
+    let bytes_unadmitted = coverage
+        .and_then(|coverage| coverage.get("host_bytes"))
+        .and_then(Value::as_str)
+        == Some("diverged");
+    let parsed = if spans_stale || bytes_unadmitted {
+        STATE_ABSENT
+    } else {
+        parsed
+    };
     classes.insert("file_parsed".to_string(), json!(parsed));
     decided_by.push("file_parsed".to_string());
-    if spans_stale {
+    // Named in the order the handler's own gate names them, so the limit and the
+    // limiting factor a reader acts on cannot point at different causes.
+    if bytes_unadmitted {
+        limits.push("file_bytes_unadmitted".to_string());
+    } else if spans_stale {
         limits.push("file_spans_stale".to_string());
     } else if parsed != STATE_PRESENT {
         // Name the cause when the answer carries one. `file_parsed_absent` is
@@ -1661,6 +1674,10 @@ fn file_entities_counted(payload: &Value) -> Option<Value> {
         .and_then(|coverage| coverage.get("span_provenance"))
         .and_then(Value::as_str)
         == Some("stale");
+    let bytes_unadmitted = coverage
+        .and_then(|coverage| coverage.get("host_bytes"))
+        .and_then(Value::as_str)
+        == Some("diverged");
 
     let mut counted = json!({
         "unit": "entities_in_file",
@@ -1671,10 +1688,14 @@ fn file_entities_counted(payload: &Value) -> Option<Value> {
     // Named in the order a reader acts on. A file the adapter never parsed is
     // the limiting factor whatever the paging did, because following every
     // cursor to the end still assembles a set the extractor never produced.
-    // Spans derived from bytes the tree no longer holds come next: the set is
-    // complete for a file that is not the one at the path any more.
+    // Bytes the graph has not taken come next, then spans derived from bytes the
+    // tree no longer holds: in both cases the set is complete for a file that is
+    // not the one at the path any more, and the first names the one a caller can
+    // fix with a reconcile.
     if parsed != "full" {
         counted["floor_reason"] = json!(format!("file_parsed_{parsed}"));
+    } else if bytes_unadmitted {
+        counted["floor_reason"] = json!("file_bytes_unadmitted");
     } else if spans_stale {
         counted["floor_reason"] = json!("file_spans_stale");
     } else if shifted {
