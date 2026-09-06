@@ -696,7 +696,7 @@ async fn check_daemon_running() -> HealthCheck {
                 "daemon_running",
                 "kin-daemon running",
                 HealthStatus::Unsupported,
-                "n/a — not in a Kin repository (the daemon is repo-scoped)",
+                "not in a Kin repository, and the daemon is repo-scoped",
             )
             .with_manual_fix(
                 "cd into a Kin repository, then run any `kin` command to start its daemon",
@@ -745,7 +745,7 @@ fn daemon_not_running_check_for(repo: &str, endpoint_record: &Path) -> HealthChe
             "daemon_running",
             "kin-daemon running",
             HealthStatus::Unsupported,
-            format!("no daemon started for {repo} yet — one starts on first use"),
+            format!("no daemon started for {repo} yet; one starts on first use"),
         )
         .fixable()
         .with_manual_fix("run any `kin` command in the repo to auto-start the daemon")
@@ -1217,7 +1217,7 @@ fn vfs_projection_check_for(
             "VFS projection",
             HealthStatus::Misconfigured,
             format!(
-                "shim is 0 bytes ({}) — a 0-byte injected library crashes processes",
+                "shim is 0 bytes ({}), and a 0-byte injected library crashes processes",
                 lib_path.display()
             ),
         )
@@ -1228,7 +1228,7 @@ fn vfs_projection_check_for(
             "VFS projection",
             HealthStatus::Misconfigured,
             format!(
-                "shim at {} is not a valid {} — it is truncated or corrupt",
+                "shim at {} is not a valid {}, so it is truncated or corrupt",
                 lib_path.display(),
                 shim_object_kind()
             ),
@@ -2298,7 +2298,7 @@ fn session_runtime_check_for(layout: Option<&kin_core::KinLayout>) -> HealthChec
             "session_runtime",
             "Session runtime",
             HealthStatus::Unsupported,
-            "not inside a Kin repository — from a Kin repo, run project tools with `kin exec -- <cmd>`",
+            "not inside a Kin repository; from one, run project tools with `kin exec -- <cmd>`",
         );
     };
 
@@ -3037,7 +3037,7 @@ fn mcp_client_check_from(
             &label,
             HealthStatus::Unsupported,
             format!(
-                "kin is not registered in this client — {} is a config Kin has not written to",
+                "kin is not registered in this client, and {} is a config Kin has not written to",
                 path.display()
             ),
         )
@@ -3178,7 +3178,7 @@ fn check_setup_ledger() -> HealthCheck {
             "setup_ledger",
             "Install ledger",
             HealthStatus::Unsupported,
-            "no install ledger yet — run `kin setup` to record what gets installed",
+            "no install ledger yet; run `kin setup` to record what gets installed",
         );
     }
 
@@ -3457,7 +3457,7 @@ async fn check_background_work() -> HealthCheck {
             "background_work",
             "Background work",
             HealthStatus::Unsupported,
-            "n/a — not in a Kin repository",
+            "not in a Kin repository",
         );
     };
     let Some(daemon_url) = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
@@ -3466,7 +3466,7 @@ async fn check_background_work() -> HealthCheck {
             "background_work",
             "Background work",
             HealthStatus::Unsupported,
-            "n/a — no daemon running for this repository, so there is no background work to \
+            "no daemon running for this repository, so there is no background work to \
              account for; a daemon starts on first use",
         );
     };
@@ -3562,7 +3562,7 @@ fn coverage_row_for_unread_graph<'a>(
             ID,
             LABEL,
             HealthStatus::Unsupported,
-            "n/a — not in a Kin repository",
+            "not in a Kin repository",
         )),
         GraphStatusForRun::NoDaemon => Err(coverage_unreadable(
             HealthStatus::Unsupported,
@@ -3735,13 +3735,13 @@ fn relation_census_row_for_unread_graph(
             ID,
             LABEL,
             HealthStatus::Unsupported,
-            "n/a — not in a Kin repository",
+            "not in a Kin repository",
         )),
         GraphStatusForRun::NoDaemon => Err(HealthCheck::new(
             ID,
             LABEL,
             HealthStatus::Unsupported,
-            "n/a — no daemon running for this repository, so the relation census cannot be \
+            "no daemon running for this repository, so the relation census cannot be \
              read; a daemon starts on first use",
         )
         .with_manual_fix("run any `kin` command in the repo to auto-start the daemon")),
@@ -3823,8 +3823,10 @@ fn coverage_unreadable(
 
     let detail = detail.into();
     if missing_servers.is_empty() {
-        return HealthCheck::new(ID, LABEL, status, format!("n/a — {detail}"))
-            .with_manual_fix(manual_fix);
+        // The report's status column already prints "n/a", so the "n/a - "
+        // this detail used to be prefixed with said it twice and spent an em
+        // dash doing it.
+        return HealthCheck::new(ID, LABEL, status, detail).with_manual_fix(manual_fix);
     }
     // A missing server is a measured host fact even when the graph is not
     // readable, so it decides the status rather than deferring to the unread
@@ -3939,7 +3941,7 @@ fn semantic_query_readiness_without_a_daemon() -> HealthCheck {
         "semantic_query_readiness",
         "Semantic query readiness",
         HealthStatus::Unsupported,
-        "n/a — no daemon running for this repository, so graph embedding coverage cannot \
+        "no daemon running for this repository, so graph embedding coverage cannot \
          be read; a daemon starts on first use",
     )
     .with_manual_fix("run any `kin` command in the repo to auto-start the daemon")
@@ -4092,7 +4094,7 @@ async fn check_semantic_query_readiness() -> SemanticQueryReadinessSample {
                 "semantic_query_readiness",
                 "Semantic query readiness",
                 HealthStatus::Unsupported,
-                "n/a — not in a Kin repository",
+                "not in a Kin repository",
             )
             .into();
         }
@@ -5509,7 +5511,7 @@ fn check_retrieval_profile() -> HealthCheck {
     .collect();
     let detail =
         format!(
-        "{}profile {} — semantic_locate routing: {}; entity fusion: {}; lexical parity floor: {}; \
+        "{}profile {}. semantic_locate routing: {}; entity fusion: {}; lexical parity floor: {}; \
          cross-encoder rerank: {} (model {} {})",
         if levers_off.is_empty() {
             ""
@@ -5570,6 +5572,47 @@ mod tests {
     use super::*;
     use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
+
+    /// No em dash reaches a reader through this file.
+    ///
+    /// `kin doctor` shipped eight of them in v0.7.2, in rows like
+    /// `n/a - not in a Kin repository`. The brand book says it twice, under
+    /// Voice and again under Claim discipline: hyphens, not em dashes, and the
+    /// kinlab web build fails public copy carrying one with no carve-out. The
+    /// CLI is public copy and has no such build gate, so this is it.
+    ///
+    /// Comment lines are exempt: a doc comment is not copy, and this file's
+    /// comments carry em dashes in quoted prose that documents the defects
+    /// above them. The scan is scoped to the lines a string can be printed
+    /// from, which is where the ones a reader met actually lived.
+    ///
+    /// A scan that read nothing would pass, so the reading is checked first
+    /// against a needle this file certainly contains.
+    #[test]
+    fn no_em_dash_reaches_a_reader_from_this_file() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/commands/health.rs"
+        ))
+        .expect("this file is readable from its own test");
+
+        assert!(
+            source.contains("Embedding model"),
+            "the scan did not read this file, so its result says nothing"
+        );
+
+        let offenders: Vec<(usize, &str)> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains('\u{2014}'))
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .map(|(index, line)| (index + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these lines put an em dash in front of a reader: {offenders:#?}"
+        );
+    }
 
     fn write_editor_manifest(
         extensions_dir: &Path,

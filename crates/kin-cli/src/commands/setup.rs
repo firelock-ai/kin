@@ -13082,11 +13082,103 @@ fn status_label(status: &crate::commands::health::HealthStatus) -> &'static str 
     }
 }
 
+/// Where the detail column starts, from the row format below.
+///
+/// Two leading spaces, the status glyph, a space, a twenty-six column label, a
+/// space, a fourteen column status word, and a space.
+const DETAIL_COLUMN: usize = 46;
+
+/// Indent for a detail that moved off its row.
+///
+/// Six rather than forty-six. A detail wrapped into the thirty-four columns
+/// left of an eighty-column terminal would be twenty-three lines of ribbon; the
+/// same text at this indent is six lines that read like a paragraph, and it
+/// lines up with the `fix:` and `note:` lines already printed under a row.
+const DETAIL_CONTINUATION_INDENT: usize = 6;
+
+/// A detail short enough to sit on its row, or the lines it becomes.
+enum DetailLayout {
+    Beside,
+    Below(Vec<String>),
+}
+
+/// Decide how one row's detail is laid out at a known width.
+///
+/// `None` is "nothing is watching": no terminal, or a width that could not be
+/// read. That arm prints exactly what this report has always printed, which is
+/// what keeps every capture of it, and every acceptance suite reading one,
+/// seeing the same bytes.
+///
+/// The measured case is `kin doctor` on an eighty-column terminal, where
+/// thirty-three of forty-seven lines ran past the margin and the longest was
+/// seven hundred and seventy-eight characters inside a row whose columns are
+/// aligned for a short value. A terminal reflows that to the left margin with
+/// no hanging indent, so the table's alignment is destroyed by its own content.
+fn detail_layout(detail: &str, width: Option<usize>) -> DetailLayout {
+    let Some(width) = width else {
+        return DetailLayout::Beside;
+    };
+    if DETAIL_COLUMN + console::measure_text_width(detail) <= width {
+        return DetailLayout::Beside;
+    }
+    DetailLayout::Below(wrap_words(
+        detail,
+        width.saturating_sub(DETAIL_CONTINUATION_INDENT).max(20),
+    ))
+}
+
+/// Greedy word wrap. A word longer than the width gets its own line rather than
+/// being broken, because the long words here are paths and hashes and half of
+/// one is worse than an overhanging one.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if console::measure_text_width(&current) + 1 + console::measure_text_width(word)
+            <= width
+        {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// The width to lay a report out at, or `None` when nothing is watching.
+fn report_width() -> Option<usize> {
+    if !io::stdout().is_terminal() {
+        return None;
+    }
+    console::Term::stdout()
+        .size_checked()
+        .map(|(_, columns)| usize::from(columns))
+}
+
 /// Render a [`HealthReport`] as the human-readable table used by
 /// `kin setup status` and `kin doctor`.
 fn print_human_report(report: &crate::commands::health::HealthReport) {
     use crate::commands::health::HealthStatus;
-    println!("Platform: {}", report.platform);
+    let width = report_width();
+    // `kin doctor` is the command the archive's own INSTALL.md tells a reader
+    // to run before anything else, so it is one of the three surfaces that
+    // carry the mark. Off a terminal this is the `Platform:` line alone, which
+    // is what every capture of this report has always started with.
+    for line in crate::mark::beside_for_stdout(&[
+        "",
+        "Kin doctor",
+        &format!("Platform: {}", report.platform),
+        "",
+    ]) {
+        println!("{line}");
+    }
     println!();
     for check in &report.checks {
         let mark = match check.status {
@@ -13098,12 +13190,24 @@ fn print_human_report(report: &crate::commands::health::HealthReport) {
             HealthStatus::Pending => style("…").yellow(),
             HealthStatus::Unsupported => style("→").cyan(),
         };
-        println!(
-            "  {mark} {:<26} {:<14} {}",
-            check.label,
-            status_label(&check.status),
-            check.detail
-        );
+        match detail_layout(&check.detail, width) {
+            DetailLayout::Beside => println!(
+                "  {mark} {:<26} {:<14} {}",
+                check.label,
+                status_label(&check.status),
+                check.detail
+            ),
+            DetailLayout::Below(lines) => {
+                println!(
+                    "  {mark} {:<26} {}",
+                    check.label,
+                    status_label(&check.status)
+                );
+                for line in lines {
+                    println!("{}{line}", " ".repeat(DETAIL_CONTINUATION_INDENT));
+                }
+            }
+        }
         if let Some(note) = &check.platform_note {
             println!("      note: {note}");
         }
@@ -15674,6 +15778,80 @@ mod tests {
     use super::{fix_verdict, readiness_line, UnfinishedRepair};
     use crate::commands::health::{HealthCheck, HealthReport, HealthStatus, HealthVerdict};
     use kin_model::LanguageId;
+
+    /// A row's detail stays on its row while it fits, and moves under it when
+    /// it does not.
+    ///
+    /// The measurement this is written from: on the released v0.7.2 bytes at
+    /// eighty columns, thirty-three of `kin doctor`'s forty-seven lines ran
+    /// past the margin, and the `Memory floor` row's detail was seven hundred
+    /// and seventy-eight characters on one line.
+    #[test]
+    fn a_detail_that_does_not_fit_its_row_moves_under_it() {
+        use super::{detail_layout, DetailLayout, DETAIL_COLUMN};
+
+        let short = "ok";
+        assert!(
+            matches!(detail_layout(short, Some(80)), DetailLayout::Beside),
+            "a short detail must stay on its row"
+        );
+
+        let long = "x ".repeat(400);
+        let DetailLayout::Below(lines) = detail_layout(&long, Some(80)) else {
+            panic!("a {}-character detail must not stay on a row that starts at column {DETAIL_COLUMN} of 80", long.len());
+        };
+        assert!(lines.len() > 1, "the detail must actually be wrapped");
+        for line in &lines {
+            let width = console::measure_text_width(line) + super::DETAIL_CONTINUATION_INDENT;
+            assert!(
+                width <= 80,
+                "the wrapped line {line:?} is {width} columns wide once indented"
+            );
+        }
+    }
+
+    /// Off a terminal the report is byte-identical to what it always printed.
+    ///
+    /// The acceptance suites capture this report and read substrings out of it,
+    /// and a substring that spans a wrap point is a substring that stops
+    /// matching. Nothing is watching a captured stream, so nothing is wrapped
+    /// in one.
+    #[test]
+    fn a_captured_report_is_never_rewrapped() {
+        use super::{detail_layout, DetailLayout};
+
+        let long = "x ".repeat(400);
+        assert!(
+            matches!(detail_layout(&long, None), DetailLayout::Beside),
+            "with no width to lay out at, the detail must be printed as it always was"
+        );
+    }
+
+    /// Wrapping never loses or reorders a word, and never splits one.
+    ///
+    /// The long details here are paths, hashes and daemon ids. Half of a hash
+    /// is worse than an overhanging one, so a word past the width takes its own
+    /// line whole.
+    #[test]
+    fn wrapping_preserves_every_word_and_splits_none() {
+        use super::wrap_words;
+
+        let text = "128.0 GiB of memory here (this host's RAM); one repository daemon is allowed \
+                    8.0 GiB of that";
+        let wrapped = wrap_words(text, 30);
+        assert_eq!(
+            wrapped.join(" ").split_whitespace().collect::<Vec<_>>(),
+            text.split_whitespace().collect::<Vec<_>>(),
+            "wrapping changed the words"
+        );
+
+        let hash = "a".repeat(64);
+        let wrapped = wrap_words(&format!("seal {hash} sealed"), 20);
+        assert!(
+            wrapped.iter().any(|line| line == &hash),
+            "a word past the width must survive whole; got {wrapped:?}"
+        );
+    }
 
     #[tokio::test]
     async fn post_install_refresh_requires_an_available_enrichment_channel() {
