@@ -42,14 +42,24 @@ who else is working nearby. Reach for it before merging or refactoring to gauge 
 radius, answering \"if I change this, what else might break?\", from the graph in one \
 call instead of hand-tracing callers. Pair it with semantic_diff (what changed) or use \
 semantic_review when you want diff + impact + risk together in a single report. \
-Per-entity counts separate `consumer_count` (every inbound edge) from \
-`proven_consumer_count` (only edges resolved above `name_only`). `covering_tests` is a \
+Per-entity, `consumer_count` is every direct inbound consumer, and it is never narrowed \
+without saying so: `external_consumer_count`, `test_consumer_count` and \
+`derived_consumer_count` name each class beside it and sum to it, so a zero is a zero and \
+an exclusion has a name. One set sits outside it and is reported rather than dropped: a \
+consumer changed in this same diff is counted in `consumers_migrated_in_diff`, which is \
+why this count matches what `find_references` reports for the same entity id except where \
+a consumer co-changed, and the migrated count is exactly that difference. Read a \
+break against `external_consumer_count`, since a test that breaks with the code it tests \
+was never stranded, and read a used/unused claim against `consumer_count`. \
+`proven_consumer_count` narrows the external count to edges resolved above `name_only`. \
+`covering_tests` is a \
 graph-observed lower bound, labeled beside every count rather than a claim about every \
-test in the working copy. This response carries \
+test in the working copy, and it also counts tests two hops out, so it is wider than \
+`test_consumer_count` and cannot be subtracted from anything. This response carries \
 counts and buckets rather than ranked paths: the per-hop ranked report, where every step \
 carries its own `resolution` and a confidence score, is produced only by \
-`kin impact --json` on the CLI and is not reachable from here. Read a used/unused claim \
-against the proven count: a \
+`kin impact --json` on the CLI and is not reachable from here. Read that used/unused claim \
+against the proven count as well: a \
 call edge matched by bare method name is a candidate, not a fact. The response also \
 carries an additive `negative` object whose `safe_to_conclude_absent` flag says whether \
 this graph could have seen the impact it reports missing: the verdicts are read off \
@@ -1178,10 +1188,14 @@ mod tests {
             entity_impacts: vec![kin_review::EntityImpact {
                 entity_id: direct.id,
                 consumer_count: 0,
+                external_consumer_count: 0,
+                test_consumer_count: 0,
+                derived_consumer_count: 0,
                 strong_consumer_count: 0,
                 proven_consumer_count: 0,
                 contract_consumer_count: 0,
                 consumer_files: vec![],
+                external_consumer_files: vec![],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
                 call_shapes: kin_review::impact::ConsumerCallShapeSummary::default(),

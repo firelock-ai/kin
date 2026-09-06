@@ -787,7 +787,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
     // the multi-focal assembler. A call naming only `entity_id` keeps this
     // handler's original path and its original payload, so nothing reading
     // today's shape moves under it.
-    if let Some(result) = multi_focal_pack_result(args, store)? {
+    if let Some(result) = multi_focal_pack_result(args, store, repository_authority)? {
         return Ok(result);
     }
 
@@ -1257,6 +1257,7 @@ fn pack_token_budget(args: &HashMap<String, serde_json::Value>) -> kin_model::co
 fn multi_focal_pack_result<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<Option<ToolCallResult>> {
     use kin_context::FocalResolution;
 
@@ -1381,33 +1382,89 @@ fn multi_focal_pack_result<G: GraphStore>(
         resolutions,
         coverage: get_optional_string_param(args, "coverage"),
     };
-    let (pack, report) = kin_context::build_multi_focal_pack(store, &ids, &opts)
+    let (pack, mut report) = kin_context::build_multi_focal_pack(store, &ids, &opts)
         .map_err(|error| McpError::Context(error.to_string()))?;
 
+    // Bodies come from graph-owned repository authority, exactly as the
+    // single-focal path below reads them. The pack's own focal content is
+    // `kin_context::builder::project_full_body`, which that function's doc
+    // comment says is a HEADER and must never be surfaced as a body, and this
+    // path used to publish it under `projection: "FullBody"` with nothing said.
+    // Measured on psf/requests at v0.7.2: `Session.merge_environment_settings`
+    // came back `FullBody` carrying 85 tokens for a 38-line method, while
+    // `kin graph source` on the same id returned the whole body. It was never a
+    // body gap; it was a path that did not ask.
+    let held = HeldSourceAuthority::new(store, repository_authority);
     let row =
         |entry: &kin_model::context::ContextEntry, section: &str| -> Result<serde_json::Value> {
             let entity = store
                 .get_entity(&entry.entity_id)
                 .map_err(McpError::graph)?;
-            Ok(match entity {
-                Some(entity) => serde_json::json!({
-                    "id": entity.id,
-                    "name": entity.name,
-                    "kind": entity.kind,
-                    "signature": entity.signature,
-                    "file_path": entity.file_origin.as_ref().map(|path| path.to_string()),
-                    "read_path": entity_read_path(&entity),
-                    "start_line": entity_presentation_start_line(&entity),
-                    "end_line": entity_presentation_end_line(&entity),
-                    "section": section,
-                    "projection": format!("{:?}", entry.projection_level),
-                }),
-                None => serde_json::json!({
+            let Some(entity) = entity else {
+                return Ok(serde_json::json!({
                     "id": entry.entity_id,
                     "section": section,
                     "projection": format!("{:?}", entry.projection_level),
-                }),
-            })
+                }));
+            };
+            let mut obj = serde_json::json!({
+                "id": entity.id,
+                "name": entity.name,
+                "kind": entity.kind,
+                "signature": entity.signature,
+                "file_path": entity.file_origin.as_ref().map(|path| path.to_string()),
+                "read_path": entity_read_path(&entity),
+                "start_line": entity_presentation_start_line(&entity),
+                "end_line": entity_presentation_end_line(&entity),
+                "section": section,
+                "projection": format!("{:?}", entry.projection_level),
+            });
+            // Only a row CLAIMING a body has to produce one. A signature-only
+            // dependency already says what it is, and reading a body for every row
+            // in the pack would spend the request's IO on material the caller did
+            // not ask for.
+            if entry.projection_level != kin_model::context::ProjectionLevel::FullBody {
+                return Ok(obj);
+            }
+            let (body, absent_reason) = match read_entity_source_excerpt_detailed_held(
+                &held,
+                &entity,
+                MCP_SOURCE_MAX_LINES,
+                MCP_SOURCE_MAX_CHARS,
+                EntitySourceScope::WorkspaceHead,
+            ) {
+                Ok(body) => (body, None),
+                Err(error) if is_absent_at_generation(&error) => (None, Some(error.to_string())),
+                Err(error) => return Err(error),
+            };
+            // Which authority answered, under the same key the single-focal path
+            // publishes it, so a caller reading one surface is not learning two
+            // vocabularies for one fact.
+            obj["source"] = serde_json::json!(LAST_READ_SOURCE.with(|f| f.get()));
+            match body {
+                Some(source) => {
+                    obj["body"] = serde_json::json!(source.body);
+                    if let Some(map) = obj.as_object_mut() {
+                        map.extend(source_provenance_fields(&source));
+                    }
+                }
+                None => {
+                    // The claim goes with the body. A row that cannot produce one
+                    // reports the level it actually carries, so the label and the
+                    // content cannot disagree the way they did on v0.7.2.
+                    obj["projection"] = serde_json::json!(format!(
+                        "{:?}",
+                        kin_model::context::ProjectionLevel::SignatureOnly
+                    ));
+                    obj["projection_downgraded_from"] =
+                        serde_json::json!(format!("{:?}", entry.projection_level));
+                    obj["body"] = serde_json::Value::Null;
+                    obj["body_unavailable"] = serde_json::json!(
+                        absent_reason.unwrap_or_else(|| entity_body_gap_reason(&entity))
+                    );
+                }
+            }
+            Ok(obj)
         };
 
     let mut entities = Vec::new();
@@ -1432,6 +1489,33 @@ fn multi_focal_pack_result<G: GraphStore>(
         entities.push(row(entry, kin_context::group::CONTRACTS)?);
     }
 
+    // `focals[]` is the PACK's account of what it rendered, which is a header
+    // either way, so it went on saying `header_and_signature` about a focal
+    // this response had just served a real body for. One focal described two
+    // ways that disagree is the same class of defect as the label this change
+    // exists to fix, one level up.
+    //
+    // Read back off the rows rather than tracked in parallel while building
+    // them: the correction is then derived from the value that was actually
+    // published, and cannot drift from it.
+    let served_bodies: std::collections::HashSet<String> = entities
+        .iter()
+        .filter(|row| {
+            row.get("section").and_then(serde_json::Value::as_str) == Some("focal")
+                && row.get("body").is_some_and(|body| !body.is_null())
+        })
+        .filter_map(|row| {
+            row.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    for contribution in report.focals.iter_mut() {
+        if served_bodies.contains(&contribution.entity_id) {
+            contribution.projection = kin_context::SERVED_BODY_PROJECTION_NAME.to_string();
+        }
+    }
+
     let mut result = serde_json::json!({
         "method": report.method,
         "focals": serde_json::to_value(&report.focals).map_err(McpError::Json)?,
@@ -1446,6 +1530,17 @@ fn multi_focal_pack_result<G: GraphStore>(
         "measured_tokens": report.measured_tokens,
         "entities": entities,
         "lines": kin_context::render_multi_focal_lines(&pack, &report),
+        // The rendered pack, and what `measured_tokens` counts. It is the
+        // header projection throughout, because kin-context cannot read source;
+        // a focal that served a real body carries it on its own `entities[]`
+        // row and not here. Said out loud, because a reader who finds a header
+        // in `lines` beside a body on the row is otherwise left to guess which
+        // one the response means.
+        "lines_note": format!(
+            "rendered pack at the {} projection kin-context can build; served bodies are on \
+             the entities[] rows",
+            kin_context::FULL_BODY_PROJECTION_NAME
+        ),
         "tokens_used": 0,
     });
     if !unresolved.is_empty() {
@@ -9960,6 +10055,87 @@ mod tests {
         args.insert("granularity".to_string(), serde_json::json!("module"));
         let err = handle_semantic_locate(&args, &store).unwrap_err();
         assert!(matches!(err, McpError::InvalidParams(_)));
+    }
+
+    /// A multi-focal focal claims `FullBody` only when it carries one.
+    ///
+    /// Measured on psf/requests at v0.7.2, `get_context_pack` with two focals
+    /// returned `Session.merge_environment_settings` and
+    /// `HTTPAdapter.build_connection_pool_key_attributes` both labelled
+    /// `projection: "FullBody"` and both carrying
+    /// `kin_context::builder::project_full_body`, which is a comment header, a
+    /// doc summary and a signature. That function's own doc comment says
+    /// consumers must NOT surface it as a body and that the MCP handler reads
+    /// the real body instead. The single-focal path in this file does; the
+    /// multi-focal path returned before reaching it and took no repository
+    /// authority at all, so it never asked.
+    ///
+    /// Two things are pinned here, and the first is what makes the second
+    /// meaningful: the row goes through the body read at all (it has a `body`
+    /// key, which it did not before), and when the read comes back empty the
+    /// row stops claiming a body it does not have.
+    #[test]
+    fn a_multi_focal_focal_never_claims_a_body_it_did_not_serve() {
+        let store = InMemoryGraph::new();
+        let left = make_entity("merge_environment_settings", "src/sessions.py");
+        let right = make_entity("build_connection_pool_key_attributes", "src/adapters.py");
+        store.upsert_entity(&left).unwrap();
+        store.upsert_entity(&right).unwrap();
+
+        // `question_focals` is the pre-resolved form the daemon hands this
+        // handler, which is the only form the multi-focal path accepts.
+        let mut args = HashMap::new();
+        args.insert(
+            "question_focals".to_string(),
+            serde_json::json!([
+                {"entity_id": left.id.to_string(), "route": "name", "query": left.name},
+                {"entity_id": right.id.to_string(), "route": "name", "query": right.name},
+            ]),
+        );
+        args.insert("token_budget".to_string(), serde_json::json!(8000));
+        args.insert("depth".to_string(), serde_json::json!(1));
+
+        // Through the handler rather than straight into the builder, because
+        // the defect WAS the handler: `multi_focal_pack_result` short-circuits
+        // at the top of `handle_get_context_pack` and used to return before the
+        // body read the single-focal path below it performs.
+        let sessions = SessionRegistry::empty_for_test();
+        let result = handle_get_context_pack(&args, &store, &sessions, None).unwrap();
+        let value = parsed_response(&result);
+        let rows = value["entities"].as_array().expect("entities is an array");
+        let focals: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|row| row["section"] == "focal")
+            .collect();
+        assert_eq!(focals.len(), 2, "both focals are in the pack: {rows:?}");
+
+        for focal in focals {
+            // It ASKED. Before this fix a focal row had no `body` key at all,
+            // because the multi-focal path never read one.
+            assert!(
+                focal.get("body").is_some(),
+                "a focal row must carry the outcome of a body read: {focal}"
+            );
+            // This store has no repository authority behind it, so there are no
+            // bytes to serve, and the row says exactly that instead of calling
+            // a header a full body.
+            assert!(focal["body"].is_null(), "no authority, so no body: {focal}");
+            assert_eq!(
+                focal["projection"], "SignatureOnly",
+                "the claim goes with the body: {focal}"
+            );
+            assert_eq!(
+                focal["projection_downgraded_from"], "FullBody",
+                "and the row says what it would have claimed: {focal}"
+            );
+            let reason = focal["body_unavailable"]
+                .as_str()
+                .expect("a null body names its gap");
+            assert!(
+                !reason.is_empty(),
+                "the gap reason has to say something: {focal}"
+            );
+        }
     }
 
     /// `caller -> focal -> callee`: the focal has exactly one dependent and one

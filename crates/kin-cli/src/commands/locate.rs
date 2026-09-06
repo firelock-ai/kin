@@ -727,10 +727,87 @@ fn query_names_entity_symbolically(query: &str, name: &str) -> bool {
     }
     let target = name.to_ascii_lowercase();
     let tail = qualified_name_tail(&target);
-    query_tokens(query).any(|token| {
+    let named_by_token = query_tokens(query).any(|token| {
         let lowered = token.to_ascii_lowercase();
         (lowered == target || lowered == tail) && is_symbolic_search_term(token)
-    })
+    });
+    named_by_token
+        || query_qualified_paths(query).any(|path| {
+            let lowered = path.to_ascii_lowercase();
+            lowered == target || qualified_path_names_entity(&lowered, &target)
+        })
+}
+
+/// Whether a qualified path a query spelled out names THIS entity, rather than
+/// merely ending in the same word.
+///
+/// The whole path is compared, not just its tail. Matching on the tail alone
+/// is how one dotted run in a prose question lifts the prose-word demotion off
+/// every entity that happens to share that word: `Session.get` in a sentence
+/// would spare `RequestsCookieJar.get`, and a bare filename like
+/// `package.json` would spare anything whose own name tail is `json`. Because
+/// [`order_locate_entities`] reads the exact-name tier BEFORE the score, a row
+/// spared that way sorts above rows carrying real evidence whatever it scored,
+/// so the over-match is not a small mispricing, it is a promotion.
+///
+/// So the qualifier has to agree too. `entity_name` is already lowercased by
+/// the caller, and both sides are compared by their own segments: the path
+/// names the entity when the entity's qualified name ENDS with it on a
+/// separator boundary (`Session.get` names `requests.Session.get`), or when the
+/// path ends with the entity's qualified name the same way (`kin.Session.get`
+/// names `Session.get`). A tail that agrees while the container does not is
+/// exactly the case this refuses.
+fn qualified_path_names_entity(path: &str, entity_name: &str) -> bool {
+    fn is_qualified(name: &str) -> bool {
+        name.contains('.') || name.contains("::")
+    }
+    fn ends_on_boundary(longer: &str, shorter: &str) -> bool {
+        if longer.len() <= shorter.len() {
+            return false;
+        }
+        let Some(prefix) = longer.strip_suffix(shorter) else {
+            return false;
+        };
+        prefix.ends_with('.') || prefix.ends_with("::")
+    }
+    // BOTH sides have to be qualified, or the shorter one is a bare tail and
+    // this collapses back into the tail match it exists to refuse. `Session.get`
+    // in a sentence would otherwise name a free function called `get`, because
+    // the path does end with that word on a separator. `path` is always
+    // qualified, since [`query_qualified_paths`] yields nothing else, so the
+    // check that does work is the one on the entity.
+    if !is_qualified(path) || !is_qualified(entity_name) {
+        return path == entity_name;
+    }
+    path == entity_name
+        || ends_on_boundary(entity_name, path)
+        || ends_on_boundary(path, entity_name)
+}
+
+/// The QUALIFIED symbol paths a query spells out, whole, in their original
+/// case.
+///
+/// [`query_tokens`] splits on every character that is not alphanumeric or an
+/// underscore, so a dotted path is gone before any rule can read it as one. A
+/// question that wrote `Session.merge_environment_settings` reaches
+/// [`is_symbolic_search_term`] as two bare words, and a rule asking whether a
+/// SYMBOL-SHAPED token named the entity therefore answers no about a query that
+/// named it in the most explicit form there is.
+///
+/// This yields the run whole so [`qualified_path_names_entity`] can compare it
+/// as a path. Only runs carrying a separator are yielded, because a single bare
+/// word is what [`query_tokens`] already offers and the shape the tokenizer
+/// destroys is the only thing this exists to recover.
+///
+/// It is deliberately NOT enough on its own. Yielding the run is half the rule;
+/// the other half is that the run has to name the entity by its qualifier as
+/// well as its tail, or one dotted token in a sentence spares every entity that
+/// shares a word with it.
+fn query_qualified_paths(query: &str) -> impl Iterator<Item = &str> {
+    query
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':'))
+        .map(|run| run.trim_matches(|c| c == '.' || c == ':'))
+        .filter(|path| path.contains('.') || path.contains("::"))
 }
 
 /// Whether this entity's name match rests on nothing but a plain English word
@@ -17881,6 +17958,53 @@ fn entity_projection_role_penalty(path: &str, test_query: bool) -> f32 {
     penalty
 }
 
+/// The score a file anchor's share is taken FROM.
+///
+/// Not the ranking's single best row, but the WEAKEST row retrieval still
+/// scored well, so an anchor is priced beneath the whole band of rows the
+/// retrieval found rather than beneath only its leader. `well` is a share of
+/// the top score, which is the same scale-free idiom
+/// `KIN_LOCATE_COLLISION_SIBLING_SHARE` uses to ask the same question, and it
+/// is the only form that behaves alike on a store whose text arm tops out at
+/// 280 and one where it reaches 1152.
+///
+/// The two shapes this has to tell apart are both measured, and the band is
+/// what separates them.
+///
+/// On React, `ReactFiberWorkLoop.js` ranked FIRST for "what happens between a
+/// component asking for an update and that update appearing on screen" and
+/// contributed one row at rank 97 of 136. Retrieval scored exactly one row
+/// well there (852.2, against a helper at 95.7), the band is that one row, and
+/// the reference is unchanged from taking the maximum. That is the case
+/// anchors exist for and it must not move;
+/// `a_prose_question_gets_the_top_ranked_files_own_anchor` pins it.
+///
+/// On psf/requests at v0.7.2, fully embedded, "where HTTP redirects are
+/// resolved and followed after a response" scored three rows well and close
+/// together: `Response` 349.06, `TooManyRedirects` 292.29 and the right
+/// answer, `SessionRedirectMixin.resolve_redirects`, at 283.20. A share of the
+/// leader alone prices anchors into the middle of that cluster, which is how
+/// five of them came to sit above the right answer. A share of the band prices
+/// them under it.
+///
+/// Returns 0.0 for a ranking with no positively scored row, which is the
+/// docs-and-config store the caller answers with `KIN_LOCATE_FILE_ANCHOR_SCORE`.
+fn anchor_reference_band(ranked: &[(usize, LocateEntity)], well: f32) -> f32 {
+    let top = ranked
+        .iter()
+        .map(|(_, entity)| entity.score)
+        .fold(0.0_f32, f32::max);
+    if top <= 0.0 {
+        return 0.0;
+    }
+    let floor = top * well;
+    ranked
+        .iter()
+        .map(|(_, entity)| entity.score)
+        .filter(|score| *score >= floor)
+        .fold(top, f32::min)
+}
+
 /// FIR-3079: demote a prose-word collision its own file does not corroborate.
 ///
 /// kin#1367 takes such a row out of the exact-name tier, and on two measured
@@ -18083,6 +18207,12 @@ pub fn build_entity_view(
     // Used only when a ranking has no scored row to take a share of, which is
     // the docs-and-config repo whose files carry no entities at all.
     let anchor_base = locate_env_f32("KIN_LOCATE_FILE_ANCHOR_SCORE", 100.0);
+    // Which rows count as "retrieval scored this well", and therefore which
+    // score the anchor share is taken from ([`anchor_reference_band`]). The
+    // same 0.25 idiom `KIN_LOCATE_COLLISION_SIBLING_SHARE` already uses for the
+    // same question, and for the same reason: comparing against this ranking's
+    // own top row is the only scale-free way to ask it.
+    let anchor_band_share = locate_env_f32("KIN_LOCATE_FILE_ANCHOR_BAND_SHARE", 0.25);
     // Built once on the first ranked file that resolves to no entity, because
     // it walks every tracked artifact and most rankings never need it.
     let mut tracked_artifacts: Option<HashSet<String>> = None;
@@ -18216,11 +18346,44 @@ pub fn build_entity_view(
     // the ordering then reads ([`apply_entity_surface_penalty`]).
     apply_entity_surface_penalty(&mut ranked, query);
 
-    // The anchors, beneath every row retrieval scored. The reference is this
-    // ranking's own top score, so the admission adapts to the store's scale
-    // instead of imposing one, and the share is strictly below 1.0 so an anchor
-    // can never take rank one from a row that carries real evidence. The decay
-    // keeps the file arm's order among the anchors themselves.
+    // The floor is a CAP on the collision demotion, and it is pinned from both
+    // sides by measurement. It has to be under 0.810 or React's
+    // `Resolved.component` at 1052.0 keeps rank one over a best non-colliding
+    // 852.3, and it has to be high enough that a right answer alone in its file
+    // still lands on the six-row default page: at 0.5 the synthetic fixture's
+    // row fell from rank one to rank eight, off the page an agent reads.
+    let collision_floor = locate_env_f32("KIN_LOCATE_COLLISION_LONE_FLOOR", 0.75);
+    let collision_target = locate_env_usize("KIN_LOCATE_COLLISION_CORROBORATION_TARGET", 2);
+    // BEFORE the anchors, because the anchor reference is a share of the scores
+    // in this vector and a collision row's score is not final until this has
+    // run. Measured on psf/requests at v0.7.2 with the store fully embedded
+    // (1722 of 1722): the class `Response` seeded the reference at 465.42 and
+    // shipped at 349.06 after this demotion, so five anchors priced at
+    // 0.9 x 465.42 sorted above the very row they took their share from and
+    // rank one went to an anchor, which is exactly what this file's own comment
+    // and `a_prose_question_gets_the_top_ranked_files_own_anchor` both say can
+    // never happen.
+    //
+    // Two things move with it, and neither is the corroboration COUNT. That
+    // loop already skips every `FILE_ANCHOR_ORIGIN` row, so no anchor
+    // corroborated anything from the later position either, and every row that
+    // does corroborate is present here.
+    //
+    // What moves is the pair of judgments that read anchors. The
+    // `collision_scores` map does NOT skip them, so an anchor that is itself a
+    // collision used to set its file's threshold and can no longer do so; the
+    // threshold is now the retrieval collision's own score, which is the score
+    // the sibling share was written to be a share OF. And an anchor collision
+    // is now demoted against the anchors alone, which corroborate nothing, so
+    // it takes the full floor. Both are the conservative direction for a row
+    // whose whole claim is that it is a second opinion.
+    apply_collision_corroboration_penalty(&mut ranked, query, collision_floor, collision_target);
+
+    // The anchors, beneath the band of rows retrieval scored well. The
+    // reference adapts to the store's scale instead of imposing one, and the
+    // share is strictly below 1.0 so an anchor can never take rank one from a
+    // row that carries real evidence. The decay keeps the file arm's order
+    // among the anchors themselves.
     if !anchor_candidates.is_empty() {
         // ONE budget across the whole anchor window, spent by structural mass.
         // `rank_file_anchors` already orders exactly that way (mass desc, type
@@ -18245,12 +18408,9 @@ pub fn build_entity_view(
                     .collect();
             anchor_candidates.retain(|(_, _, _, entity, _)| keep.contains(&entity.id.to_string()));
         }
-        let top = ranked
-            .iter()
-            .map(|(_, entity)| entity.score)
-            .fold(0.0_f32, f32::max);
-        let reference = if top > 0.0 {
-            top * anchor_share
+        let band = anchor_reference_band(&ranked, anchor_band_share);
+        let reference = if band > 0.0 {
+            band * anchor_share
         } else {
             anchor_base
         };
@@ -18328,23 +18488,17 @@ pub fn build_entity_view(
             ));
         }
         apply_entity_surface_penalty(&mut admitted, query);
+        // An anchor the query happens to name is a name hit like any other and
+        // can be a prose-word collision like any other, so it faces the same
+        // demotion the retrieval rows already took above.
+        apply_collision_corroboration_penalty(
+            &mut admitted,
+            query,
+            collision_floor,
+            collision_target,
+        );
         ranked.extend(admitted);
     }
-
-    // After the anchors, because an anchor must not corroborate a collision, and
-    // before the ordering, because the ordering reads the score this moves.
-    apply_collision_corroboration_penalty(
-        &mut ranked,
-        query,
-        // The floor is a CAP on the demotion, and it is pinned from both sides by
-        // measurement. It has to be under 0.810 or React's `Resolved.component`
-        // at 1052.0 keeps rank one over a best non-colliding 852.3, and it has to
-        // be high enough that a right answer alone in its file still lands on the
-        // six-row default page: at 0.5 the synthetic fixture's row fell from rank
-        // one to rank eight, off the page an agent reads.
-        locate_env_f32("KIN_LOCATE_COLLISION_LONE_FLOOR", 0.75),
-        locate_env_usize("KIN_LOCATE_COLLISION_CORROBORATION_TARGET", 2),
-    );
 
     let owner_mass_of = |entity: &LocateEntity| {
         name_owner_mass
@@ -22724,6 +22878,521 @@ mod tests {
             fixed.entities[1].score,
             fixed.entities[2].score
         );
+    }
+
+    /// A query that SPELLS the symbol has named it, qualifier and all.
+    ///
+    /// The prose-word rule takes the exact-name tier away from a name match resting on
+    /// nothing but a plain English word in a sentence, by asking whether a
+    /// SYMBOL-SHAPED token named the entity. [`query_tokens`] splits on the
+    /// dot, so a query that wrote the symbol as a qualified path was answered
+    /// with two bare words and judged to have named nothing symbolically.
+    ///
+    /// Every case here turns on a tail that is NOT symbol-shaped on its own,
+    /// because a snake_case tail like `merge_environment_settings` is already
+    /// accepted by the token arm above and would prove nothing about this rule.
+    /// `get` and `json` are the shapes that reach it.
+    #[test]
+    fn a_qualified_query_path_names_its_own_symbol_and_no_other() {
+        let query = "where Session.get reads a stored cookie and how the jar \
+                     resolves it across domains";
+
+        // Controls: the preconditions this rule needs are really present, so
+        // nothing below passes because one of them quietly stopped holding.
+        assert!(
+            query_is_prose(query),
+            "control: this query has to read as prose or the demotion never fires"
+        );
+        assert!(
+            !is_symbolic_search_term("get"),
+            "control: the tail must not be symbol-shaped, or the token arm \
+             above would accept it and this rule would not be under test"
+        );
+
+        assert!(
+            query_names_entity_symbolically(query, "Session.get"),
+            "the query wrote the qualified path, which is naming it symbolically"
+        );
+        assert!(
+            !is_prose_word_collision(query, "Session.get"),
+            "so the row is not a prose-word collision"
+        );
+        let mut named = mk_locate_entity("Session.get", 283.2, true);
+        named.match_kind = Some(LocateMatchKind::Name);
+        assert_eq!(
+            locate_exact_name_tier(&named, query),
+            1,
+            "and it keeps the tier a query that named it is supposed to earn"
+        );
+
+        // The defect this rule must not have: one dotted run in a sentence
+        // sparing every entity that shares its last word. `RequestsCookieJar.get`
+        // is a real requests symbol and this query never asked for it.
+        for other in ["RequestsCookieJar.get", "LookupDict.get", "get"] {
+            assert!(
+                !query_names_entity_symbolically(query, other),
+                "a different container is a different symbol, however the tail \
+                 reads, but {other} was claimed"
+            );
+            assert!(
+                is_prose_word_collision(query, other),
+                "so {other} keeps its demotion"
+            );
+        }
+
+        // A bare filename is a qualified run too, and it names no symbol.
+        let filename_query = "the build reads package.json before it resolves anything else";
+        assert!(query_is_prose(filename_query), "control: still prose");
+        assert!(
+            query_qualified_paths(filename_query).any(|path| path == "package.json"),
+            "control: the filename really is yielded as a run, so the guard below does work"
+        );
+        for name in ["json", "config.json", "Config.json"] {
+            assert!(
+                !query_names_entity_symbolically(filename_query, name),
+                "a filename in a sentence names no symbol, but it claimed {name}"
+            );
+        }
+
+        // Qualification runs both ways: a query may spell more of the path than
+        // the graph stores, or less, as long as it agrees on a separator.
+        assert!(
+            query_names_entity_symbolically(
+                "does requests.Session.get read the stored cookie for this domain",
+                "Session.get"
+            ),
+            "a query that over-qualifies still names it"
+        );
+        assert!(
+            query_names_entity_symbolically(
+                "does Session.get read the stored cookie for this domain",
+                "requests.Session.get"
+            ),
+            "and so does one that under-qualifies, on a separator boundary"
+        );
+        assert!(
+            !query_names_entity_symbolically(
+                "does xSession.get read the stored cookie for this domain",
+                "Session.get"
+            ),
+            "but a suffix that is not on a separator boundary is a different name"
+        );
+
+        // The case the prose-word rule was written for is untouched.
+        let prose = "when I send a command, how does it reach the socket";
+        assert!(
+            !query_names_entity_symbolically(prose, "send"),
+            "a plain word in a sentence still names nothing symbolically"
+        );
+        assert!(
+            is_prose_word_collision(prose, "send"),
+            "and it is still a collision"
+        );
+    }
+
+    /// [`query_qualified_paths`] yields the shape [`query_tokens`] destroys,
+    /// and yields nothing else.
+    #[test]
+    fn qualified_paths_are_the_runs_the_tokenizer_splits() {
+        let paths: Vec<&str> =
+            query_qualified_paths("where router.param callbacks are registered.").collect();
+        assert_eq!(
+            paths,
+            vec!["router.param"],
+            "the dotted run comes back whole, and a sentence-ending period is not a path"
+        );
+        assert_eq!(
+            query_qualified_paths("kin_db::InMemoryGraph holds it").collect::<Vec<_>>(),
+            vec!["kin_db::InMemoryGraph"],
+            "a scoped path is a qualified path too"
+        );
+        assert!(
+            query_qualified_paths("how does a request reach the router")
+                .next()
+                .is_none(),
+            "a sentence with no separator offers no path, so the rule cannot fire on prose"
+        );
+    }
+
+    /// An anchor cannot be priced off a score its own ranking is about to cut.
+    ///
+    /// The half of the requests defect the band alone does not answer, isolated
+    /// so it can be falsified on its own. When the ranking's leader is a
+    /// prose-word collision and nothing else scores near it, the band IS that
+    /// leader, and reading it before the demotion hands every anchor 90% of a
+    /// number the leader does not keep. On the released v0.7.2 archive that is
+    /// exactly what happened: `Response` seeded the reference at 465.42 and
+    /// shipped at 349.06.
+    ///
+    /// The fixture puts the second-best row well under the band share, so the
+    /// band is the leader and only the ORDER of the demotion decides the
+    /// outcome.
+    #[test]
+    fn an_anchor_is_never_priced_off_a_score_the_demotion_removes() {
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let file = |path: &str, score: f32, symbols: Vec<LocateSymbol>| LocateFileEntry {
+            path: path.to_string(),
+            score,
+            signals: vec![],
+            spans: vec![],
+            symbols,
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        };
+        let symbol = |name: &str, score: f32| LocateSymbol {
+            name: name.to_string(),
+            span: Some([10, 20]),
+            score,
+            kind: "class".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        };
+
+        let graph = kin_db::InMemoryGraph::new();
+        let leader = test_entity("Response", "src/requests/models.py", 732, 1000);
+        let far_behind = test_entity("get_encoding_from_headers", "src/requests/utils.py", 10, 30);
+        graph.upsert_entity(&leader).unwrap();
+        graph.upsert_entity(&far_behind).unwrap();
+        // One anchor, in the leader's own file, with the mass that earns a slot.
+        let anchor = test_entity("PreparedRequest", "src/requests/models.py", 378, 729);
+        graph.upsert_entity(&anchor).unwrap();
+        for _ in 0..12 {
+            let caller = test_entity("caller", "src/requests/api.py", 1, 2);
+            graph.upsert_entity(&caller).unwrap();
+            graph
+                .upsert_relation(&relation(RelationKind::Calls, caller.id, anchor.id))
+                .unwrap();
+        }
+
+        let question = "where HTTP redirects are resolved and followed after a response";
+        let mut result = LocateResult {
+            files: vec![
+                // Chosen so the BAND rule cannot be what saves this ranking,
+                // and only the ordering can. Under the mutant, where the
+                // demotion runs after the anchors, the band floor is
+                // 0.25 x 465.42 = 116.35, this row is beneath it, the band is
+                // the leader alone and the anchor is priced at 418.88, above
+                // the 349.06 the leader keeps. Under the fix the floor is
+                // 0.25 x 349.06 = 87.27, this row clears it, the band ends here
+                // and the anchor is priced at 90.0.
+                file(
+                    "src/requests/models.py",
+                    0.20,
+                    vec![symbol("Response", 465.42)],
+                ),
+                file(
+                    "src/requests/utils.py",
+                    0.10,
+                    vec![symbol("get_encoding_from_headers", 100.0)],
+                ),
+            ],
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut result,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            question,
+            false,
+        )
+        .unwrap();
+
+        let rows: Vec<(&str, f32, &str)> = result
+            .entities
+            .iter()
+            .map(|entity| {
+                (
+                    entity.name.as_str(),
+                    entity.score,
+                    entity.provenance.origin.as_str(),
+                )
+            })
+            .collect();
+
+        // Control: the leader really is a collision and really was cut, or this
+        // fixture is about nothing.
+        let leader_row = result
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Response")
+            .expect("the leader is in the ranking");
+        assert_eq!(leader_row.match_kind, Some(LocateMatchKind::Name));
+        assert!(
+            is_prose_word_collision(question, "Response"),
+            "control: the leader has to be a prose-word collision"
+        );
+        assert!(
+            leader_row.score < 465.42,
+            "control: the demotion has to have cut it, got {}",
+            leader_row.score
+        );
+
+        assert_eq!(
+            result.entities[0].name, "Response",
+            "the row retrieval scored keeps rank one, got {rows:?}"
+        );
+        assert_ne!(
+            result.entities[0].provenance.origin, FILE_ANCHOR_ORIGIN,
+            "an anchor never takes rank one from a row that carries real evidence: {rows:?}"
+        );
+        let anchor_score = result
+            .entities
+            .iter()
+            .find(|entity| entity.provenance.origin == FILE_ANCHOR_ORIGIN)
+            .map(|entity| entity.score)
+            .expect("the anchor is still admitted");
+        assert!(
+            anchor_score < leader_row.score,
+            "the share is strictly below the score the leader KEEPS, {anchor_score} vs {}",
+            leader_row.score
+        );
+    }
+
+    /// The psf/requests shape, end to end: no anchor sits above the right
+    /// answer.
+    ///
+    /// Measured on the released v0.7.2 archive against the stranger run's own
+    /// store (`psf/requests` at dae7ef63b, fully embedded, 1722 of 1722):
+    /// "where HTTP redirects are resolved and followed after a response"
+    /// returned `SessionRedirectMixin.resolve_redirects` at rank 8 of 10, with
+    /// five file anchors above it and a sixth below. The numbers here are that
+    /// ranking's own, so the fixture is the measurement rather than a sketch
+    /// of it.
+    ///
+    /// Two defects compound in that run and this pins both. The `Response`
+    /// class is a prose-word collision on the word "response": it seeds the
+    /// anchor reference at 465.42 and then ships at 349.06, because the
+    /// demotion used to run AFTER the anchors were priced. And the reference
+    /// was a share of that leader alone rather than of the band, so anchors
+    /// landed inside a cluster of three rows the retrieval had scored within
+    /// 70 points of each other.
+    #[test]
+    fn no_anchor_outranks_the_answer_in_a_tight_retrieval_band() {
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let file = |path: &str, score: f32, symbols: Vec<LocateSymbol>| LocateFileEntry {
+            path: path.to_string(),
+            score,
+            signals: vec![],
+            spans: vec![],
+            symbols,
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        };
+        let symbol = |name: &str, score: f32| LocateSymbol {
+            name: name.to_string(),
+            span: Some([10, 20]),
+            score,
+            kind: "method".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        };
+
+        let graph = kin_db::InMemoryGraph::new();
+        // The rows retrieval actually scored, one per file, at the scores the
+        // released binary produced.
+        let answer = test_entity(
+            "SessionRedirectMixin.resolve_redirects",
+            "src/requests/sessions.py",
+            208,
+            329,
+        );
+        let response = test_entity("Response", "src/requests/models.py", 732, 1000);
+        let too_many = test_entity("TooManyRedirects", "src/requests/exceptions.py", 106, 110);
+        for entity in [&answer, &response, &too_many] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // The anchors each file offers: the classes the rest of the repository
+        // depends on, which is exactly what the anchor rule reaches for.
+        let mut anchors = Vec::new();
+        for (name, path) in [
+            ("Session", "src/requests/sessions.py"),
+            ("SessionRedirectMixin", "src/requests/sessions.py"),
+            ("PreparedRequest", "src/requests/models.py"),
+            ("Request", "src/requests/models.py"),
+            ("RequestException", "src/requests/exceptions.py"),
+        ] {
+            let anchor = test_entity(name, path, 1, 900);
+            graph.upsert_entity(&anchor).unwrap();
+            for _ in 0..12 {
+                let caller = test_entity("caller", "src/requests/api.py", 1, 2);
+                graph.upsert_entity(&caller).unwrap();
+                graph
+                    .upsert_relation(&relation(RelationKind::Calls, caller.id, anchor.id))
+                    .unwrap();
+            }
+            anchors.push(name);
+        }
+
+        let question = "where HTTP redirects are resolved and followed after a response";
+        let build = |band: &str| {
+            let _guard =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_FILE_ANCHOR_BAND_SHARE", band);
+            let mut result = LocateResult {
+                files: vec![
+                    file(
+                        "src/requests/sessions.py",
+                        0.161940,
+                        vec![symbol("SessionRedirectMixin.resolve_redirects", 283.20)],
+                    ),
+                    file(
+                        "src/requests/models.py",
+                        0.157106,
+                        vec![symbol("Response", 465.42)],
+                    ),
+                    file(
+                        "src/requests/exceptions.py",
+                        0.149054,
+                        vec![symbol("TooManyRedirects", 292.29)],
+                    ),
+                ],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                question,
+                false,
+            )
+            .unwrap();
+            result
+        };
+
+        let rank_of = |result: &LocateResult, name: &str| {
+            result
+                .entities
+                .iter()
+                .position(|entity| entity.name == name)
+                .map(|index| index + 1)
+                .unwrap_or_else(|| panic!("{name} is not in the ranking"))
+        };
+
+        // Control first. A band share of 1.0 admits only the top row into the
+        // band, which IS taking the share from the leader alone, so the defect
+        // has to be visible here or this fixture proves nothing.
+        let leader_only = build("1.0");
+        let control_rank = rank_of(&leader_only, "SessionRedirectMixin.resolve_redirects");
+        assert!(
+            control_rank > 3,
+            "control: pricing anchors off the leader alone has to bury the answer, \
+             got rank {control_rank}: {:?}",
+            leader_only
+                .entities
+                .iter()
+                .map(|e| (&e.name, e.score, &e.provenance.origin))
+                .collect::<Vec<_>>()
+        );
+
+        let fixed = build("0.25");
+        let answer_rank = rank_of(&fixed, "SessionRedirectMixin.resolve_redirects");
+        assert_eq!(
+            answer_rank,
+            3,
+            "the answer sits behind the two retrieval rows that outscore it and \
+             nothing else, got {:?}",
+            fixed
+                .entities
+                .iter()
+                .map(|e| (&e.name, e.score, &e.provenance.origin))
+                .collect::<Vec<_>>()
+        );
+        for entity in fixed.entities.iter().take(answer_rank - 1) {
+            assert_ne!(
+                entity.provenance.origin, FILE_ANCHOR_ORIGIN,
+                "no anchor may sit above the answer, found {} at {}",
+                entity.name, entity.score
+            );
+        }
+        // And the anchors are still on the page. Pricing them under the band is
+        // not the same as switching them off, which is the thing that would
+        // undo the prose-word rule's own measured win.
+        assert!(
+            fixed
+                .entities
+                .iter()
+                .any(|entity| entity.provenance.origin == FILE_ANCHOR_ORIGIN),
+            "the anchors still rank, they just rank beneath the evidence"
+        );
+    }
+
+    /// An anchor is priced beneath the BAND of rows retrieval scored well, not
+    /// beneath its leader alone.
+    ///
+    /// Measured on psf/requests at v0.7.2, store fully embedded (1722 of 1722):
+    /// "where HTTP redirects are resolved and followed after a response" scored
+    /// three rows well and close together, `Response` 349.06,
+    /// `TooManyRedirects` 292.29 and the right answer
+    /// `SessionRedirectMixin.resolve_redirects` 283.20. Taking the share from
+    /// the leader alone priced five anchors into the middle of that cluster and
+    /// put the right answer at rank 8 of 10.
+    #[test]
+    fn an_anchor_is_priced_under_the_band_retrieval_scored_well() {
+        let row = |score: f32| {
+            (
+                0usize,
+                mk_locate_entity(&format!("row{score}"), score, true),
+            )
+        };
+        let cluster = vec![row(349.06), row(292.29), row(283.20), row(84.94)];
+
+        // The band is the weakest row still above the share of the top, which
+        // on this ranking is the right answer's own score.
+        let band = anchor_reference_band(&cluster, 0.25);
+        assert!(
+            (band - 283.20).abs() < 0.01,
+            "the band ends at the weakest well-scored row, got {band}"
+        );
+        assert!(
+            band * 0.9 < 283.20,
+            "so an anchor's share of it lands under every row in the band"
+        );
+
+        // The React shape, where retrieval scored exactly one row well: the
+        // band IS that row, and the reference is what it always was. This is
+        // the case anchors exist for and it must not move.
+        let lone = vec![row(852.2), row(95.7)];
+        let lone_band = anchor_reference_band(&lone, 0.25);
+        assert!(
+            (lone_band - 852.2).abs() < 0.01,
+            "one well-scored row means the band is the maximum, got {lone_band}"
+        );
+
+        // A ranking with nothing positive to take a share of says so, and the
+        // caller answers it with KIN_LOCATE_FILE_ANCHOR_SCORE.
+        assert_eq!(anchor_reference_band(&[], 0.25), 0.0);
+        assert_eq!(anchor_reference_band(&[row(0.0)], 0.25), 0.0);
     }
 
     /// FIR-3106, the measured shape as a fixture: one anchor budget spent

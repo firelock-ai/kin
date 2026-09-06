@@ -455,7 +455,7 @@ pub fn build_shadow_report_at<G: GraphStore>(
 /// every REMOVED entity.
 ///
 /// A removed entity does not exist at head, so its head-scoped
-/// `consumer_count` understates (often to zero) the surviving non-test
+/// `external_consumer_count` understates (often to zero) the surviving non-test
 /// consumers that still reference the deleted surface. The base ref still
 /// holds the entity and its inbound edges, so the breaking-removal rule reads
 /// the surviving-consumer count from there. Only removed-entity entries are
@@ -1275,10 +1275,15 @@ fn derive_policy(
             {
                 continue;
             }
+            // The EXTERNAL count. This gate decides whether a removed or
+            // changed surface strands somebody, and a test that goes with the
+            // code it tests was never stranded, so the wider `consumer_count`
+            // would block on exactly the case the rule below exists to let
+            // through.
             let entity_consumers = review
                 .impact
                 .entity_impact(&change.entity_id)
-                .map_or(0, |entry| entry.consumer_count);
+                .map_or(0, crate::impact::EntityImpact::external_consumers);
             if entity_consumers == 0 {
                 continue;
             }
@@ -2586,10 +2591,14 @@ mod tests {
                         .map(|&entity_id| EntityImpact {
                             entity_id,
                             consumer_count: 1,
+                            external_consumer_count: 1,
+                            test_consumer_count: 0,
+                            derived_consumer_count: 0,
                             strong_consumer_count: 1,
                             proven_consumer_count: 0,
                             contract_consumer_count: 0,
                             consumer_files: vec!["src/consumer.rs".to_string()],
+                            external_consumer_files: vec!["src/consumer.rs".to_string()],
                             covering_tests: 0,
                             consumers_migrated_in_diff: 0,
                             call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
@@ -3656,10 +3665,14 @@ mod tests {
                 entity_impacts: vec![EntityImpact {
                     entity_id: moved_old_id,
                     consumer_count: 1,
+                    external_consumer_count: 1,
+                    test_consumer_count: 0,
+                    derived_consumer_count: 0,
                     strong_consumer_count: 1,
                     proven_consumer_count: 0,
                     contract_consumer_count: 0,
                     consumer_files: vec!["src/consumer.rs".to_string()],
+                    external_consumer_files: vec!["src/consumer.rs".to_string()],
                     covering_tests: 0,
                     consumers_migrated_in_diff: 0,
                     call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
@@ -3757,10 +3770,14 @@ mod tests {
                 entity_impacts: vec![EntityImpact {
                     entity_id: new.id,
                     consumer_count: 0,
+                    external_consumer_count: 0,
+                    test_consumer_count: 0,
+                    derived_consumer_count: 0,
                     strong_consumer_count: 0,
                     proven_consumer_count: 0,
                     contract_consumer_count: 0,
                     consumer_files: vec![],
+                    external_consumer_files: vec![],
                     covering_tests: 0,
                     consumers_migrated_in_diff: 0,
                     call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
@@ -4373,10 +4390,14 @@ mod tests {
                 entity_impacts: vec![EntityImpact {
                     entity_id: removed_id,
                     consumer_count: 1,
+                    external_consumer_count: 1,
+                    test_consumer_count: 0,
+                    derived_consumer_count: 0,
                     strong_consumer_count: 1,
                     proven_consumer_count: 0,
                     contract_consumer_count: 0,
                     consumer_files: vec!["src/consumer.rs".to_string()],
+                    external_consumer_files: vec!["src/consumer.rs".to_string()],
                     covering_tests: 0,
                     consumers_migrated_in_diff: 0,
                     call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
@@ -4479,10 +4500,18 @@ mod tests {
                 entity_impacts: vec![EntityImpact {
                     entity_id: new.id,
                     consumer_count: 3,
+                    external_consumer_count: 3,
+                    test_consumer_count: 0,
+                    derived_consumer_count: 0,
                     strong_consumer_count: 3,
                     proven_consumer_count: 0,
                     contract_consumer_count: 0,
                     consumer_files: vec![
+                        "src/pytester.py".to_string(),
+                        "src/pytester.py".to_string(),
+                        "src/pytester.py".to_string(),
+                    ],
+                    external_consumer_files: vec![
                         "src/pytester.py".to_string(),
                         "src/pytester.py".to_string(),
                         "src/pytester.py".to_string(),

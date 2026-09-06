@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (526 total, 356 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (527 total, 357 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -407,6 +407,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_EXPLICIT_PHASE_MISMATCH_PENALTY` | float>=0 | 0.22 | correctness | locate tuning knob: explicit phase mismatch penalty |
 | `KIN_LOCATE_FALLBACK_TERM_LIMIT` | usize | 6 | correctness | locate tuning knob: fallback term limit |
 | `KIN_LOCATE_FILE_ANCHORS` | bool | true | correctness | locate tuning knob: file anchors |
+| `KIN_LOCATE_FILE_ANCHOR_BAND_SHARE` | float>=0 | 0.25 | correctness | locate tuning knob: file anchor band share |
 | `KIN_LOCATE_FILE_ANCHOR_BUDGET` | usize | 8 | correctness | locate tuning knob: file anchor budget |
 | `KIN_LOCATE_FILE_ANCHOR_FILES` | usize | 5 | correctness | locate tuning knob: file anchor files |
 | `KIN_LOCATE_FILE_ANCHOR_MASS_WEIGHT` | float>=0 | 0.0 | correctness | locate tuning knob: file anchor mass weight |
