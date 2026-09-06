@@ -179,6 +179,19 @@ fn without_blocking_runtime_worker<T>(work: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
 
+    /// Budget for an acquisition a test asserts MUST succeed.
+    ///
+    /// Not zero, because one non-blocking claim can report contention that no
+    /// holder explains, and this path takes two inodes before it answers; a
+    /// zero budget would rest a must-succeed assertion on both claims winning
+    /// on their first syscall. Not the shipped
+    /// [`REPOSITORY_RUNTIME_AUTHORITY_RETRY_BUDGET`] either, because that is
+    /// long enough to absorb a real regression: this arm is what fails when
+    /// release stops being visible to the next acquisition, and it can only do
+    /// that while its tolerance stays far below the interval a defect would
+    /// hold for. Several retry intervals is the width that answers both.
+    const REACQUIRE_BUDGET: Duration = Duration::from_millis(1_000);
+
     #[test]
     fn authority_is_canonical_exclusive_and_never_unlinks_its_inode() {
         let directory = tempfile::tempdir().unwrap();
@@ -206,7 +219,7 @@ mod tests {
             ""
         );
         assert!(
-            acquire_repository_runtime_authority_within(&root, Duration::ZERO, "owner-b")
+            acquire_repository_runtime_authority_within(&root, REACQUIRE_BUDGET, "owner-b")
                 .unwrap()
                 .is_some()
         );

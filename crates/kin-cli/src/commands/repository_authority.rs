@@ -666,9 +666,13 @@ mod tests {
     fn offline_materialization_refuses_runtime_contention_before_authority_open() {
         let directory = tempfile::tempdir().unwrap();
         let initialized = kin_core::init(directory.path()).unwrap();
+        // Setting up the holder is not a timing property either. This call
+        // creates `.kin/daemon.lifecycle`, since nothing before it does, and
+        // then claims it, so a zero budget would decide the whole test on one
+        // non-blocking claim against a freshly created inode.
         let held = crate::daemon_client::acquire_repository_runtime_authority_within(
             initialized.layout.root(),
-            std::time::Duration::ZERO,
+            kin_daemon_spawn::REPOSITORY_RUNTIME_AUTHORITY_RETRY_BUDGET,
         )
         .unwrap()
         .expect("test owns repository runtime authority");
@@ -688,9 +692,17 @@ mod tests {
         );
 
         drop(held);
+        // The refusal above is the property under test and takes the zero
+        // budget so it decides without waiting. The recovery below is not a
+        // timing property, so it takes the budget the shipped command uses.
+        // Acquisition claims the coordination inode before the authority
+        // inode, and a single non-blocking claim on either can report
+        // contention that no holder explains, so a zero budget here would
+        // assert that acquisition wins on its first syscall, which is not
+        // something acquisition promises.
         let outcome = materialize_workspace_base_offline_within(
             &initialized.layout,
-            std::time::Duration::ZERO,
+            kin_daemon_spawn::REPOSITORY_RUNTIME_AUTHORITY_RETRY_BUDGET,
         )
         .unwrap();
         assert_eq!(
@@ -701,6 +713,82 @@ mod tests {
             repository_authority_opens_on_this_thread(),
             opens_before + 1,
             "the successful maintenance arm opens authority exactly once"
+        );
+    }
+
+    /// A hold on the coordination inode is not authority contention.
+    ///
+    /// `.kin/daemon.lifecycle` serializes runtime acquisition against endpoint
+    /// publication, so a brief section owns it while nothing owns runtime
+    /// authority at all. Offline maintenance must wait that window out within
+    /// its budget. Answering it as contention would tell an operator to stop a
+    /// daemon that is not running, and would leave the graph section
+    /// unmaterialized for a lock that was already free.
+    ///
+    /// The hold is shorter than the retry budget by two orders of magnitude, so
+    /// this asserts the retry exists rather than racing it. Give the call the
+    /// zero budget instead and it fails on the first attempt.
+    #[test]
+    fn offline_materialization_waits_out_a_coordination_hold_that_is_not_authority() {
+        use fs2::FileExt;
+
+        /// Long enough to outlast the acquire's first claim and its first
+        /// retry interval, and far shorter than the budget it is measured
+        /// against.
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(150);
+
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(directory.path()).unwrap();
+        let kin_root = initialized.layout.root().canonicalize().unwrap();
+
+        let coordination = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(kin_root.join("daemon.lifecycle"))
+            .unwrap();
+        coordination.try_lock_exclusive().unwrap();
+        assert!(
+            crate::daemon_client::acquire_repository_runtime_authority_within(
+                initialized.layout.root(),
+                std::time::Duration::ZERO,
+            )
+            .unwrap()
+            .is_none(),
+            "the coordination hold must really block a zero-budget acquisition"
+        );
+
+        let opens_before = repository_authority_opens_on_this_thread();
+        let releasing = std::thread::spawn(move || {
+            std::thread::sleep(HOLD);
+            fs2::FileExt::unlock(&coordination).unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = materialize_workspace_base_offline_within(
+            &initialized.layout,
+            kin_daemon_spawn::REPOSITORY_RUNTIME_AUTHORITY_RETRY_BUDGET,
+        )
+        .expect("a coordination hold nobody holds authority behind must not refuse");
+        let waited = started.elapsed();
+        releasing.join().unwrap();
+
+        assert_eq!(
+            outcome.state,
+            GraphSectionMaterializationState::NoBaseTarget
+        );
+        // The hold outlives the call's first claim by construction, so this
+        // cannot be met by a run that never retried. Without it the assertion
+        // above passes just as well when the hold was already gone.
+        assert!(
+            waited >= HOLD,
+            "acquisition returned in {waited:?}, before the {HOLD:?} hold could have been released"
+        );
+        assert_eq!(
+            repository_authority_opens_on_this_thread(),
+            opens_before + 1,
+            "waiting out the hold still opens authority exactly once"
         );
     }
 }
