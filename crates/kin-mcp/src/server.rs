@@ -1282,6 +1282,13 @@ async fn handle_tools_call<G: PersistableMcpStore>(
         sessions,
         config.session_authority_mode,
         config.repository_authority.as_ref(),
+        // No working copy on this route. It is the explicit offline runtime,
+        // which serves a store rather than a repository a daemon watches, and
+        // `kin mcp start` reaches the daemon route instead
+        // (`session_authority_mode` is `DaemonRequired` there). A probe built
+        // from this process's own working directory would be a second, weaker
+        // guess at a repository this route never bound.
+        None,
     ));
     let outcome = std::future::poll_fn(|cx| {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

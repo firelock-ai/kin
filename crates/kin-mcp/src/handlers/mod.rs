@@ -33,8 +33,16 @@ use crate::error::{McpError, Result};
 use crate::server::SessionAuthorityMode;
 use crate::session::SessionRegistry;
 use crate::types::ToolCallResult;
+use crate::working_copy::WorkingCopyProbe;
 
 /// Dispatch a tool call to the appropriate handler.
+///
+/// `host` is the working copy graph truth is supposed to be level with, offered
+/// by whichever layer knows this repository has one. It is a disclosure input
+/// only: a handler may read one host entry through it to refuse certifying an
+/// answer, and no row of any answer is ever produced from it
+/// ([`crate::working_copy`]). `None` is the honest state for a caller with no
+/// working copy, or one whose graph is its own write authority.
 pub async fn handle_tool_call<G: GraphStore>(
     tool_name: &str,
     arguments: &HashMap<String, serde_json::Value>,
@@ -42,6 +50,7 @@ pub async fn handle_tool_call<G: GraphStore>(
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
     repository_authority: Option<&RequestRepositoryAuthority>,
+    host: Option<&WorkingCopyProbe>,
 ) -> Result<ToolCallResult> {
     match tool_name {
         // Exact repository membership and bytes
@@ -83,7 +92,7 @@ pub async fn handle_tool_call<G: GraphStore>(
         "dead_code" => entities::handle_dead_code(arguments, store),
         "find_dead_code_seeded" => entities::handle_find_dead_code_seeded(arguments, store),
         "graph_neighborhood" => entities::handle_graph_neighborhood(arguments, store),
-        "list_file_entities" => file_entities::handle_list_file_entities(arguments, store),
+        "list_file_entities" => file_entities::handle_list_file_entities(arguments, store, host),
         // Review
         "semantic_diff" => review::handle_semantic_diff(arguments, store),
         "impact_analysis" => review::handle_impact_analysis(arguments, store, sessions).await,
@@ -1712,6 +1721,7 @@ mod tests {
             &sessions,
             SessionAuthorityMode::OfflineFallback,
             None,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -1737,6 +1747,7 @@ mod tests {
             &sessions,
             SessionAuthorityMode::OfflineFallback,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1759,6 +1770,7 @@ mod tests {
             &sessions,
             SessionAuthorityMode::OfflineFallback,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1773,6 +1785,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
             None,
         )
         .await
@@ -7827,6 +7840,7 @@ mod tests {
             &sessions,
             SessionAuthorityMode::OfflineFallback,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -7857,6 +7871,7 @@ mod tests {
             &store,
             &sessions,
             SessionAuthorityMode::OfflineFallback,
+            None,
             None,
         )
         .await

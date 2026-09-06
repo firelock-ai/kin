@@ -75,10 +75,11 @@ const TRACE_PATH_TOOL: &str = crate::handlers::path::TOOL_NAME;
 /// carries no entities at all for a file no language adapter parsed, and every
 /// store-level gate reads healthy while it says so.
 ///
-/// Four things can stop the certification and each is named separately, because
-/// the remediation differs: a file nothing parsed needs an adapter, a partial
-/// parse needs the syntax fixed, a page needs its cursor followed, and a shifted
-/// enumeration needs re-walking from the start.
+/// Five things can stop the certification and each is named separately, because
+/// the remediation differs: a file whose host bytes the graph has not taken needs
+/// a reconcile, a file nothing parsed needs an adapter, a partial parse needs the
+/// syntax fixed, a page needs its cursor followed, and a shifted enumeration
+/// needs re-walking from the start.
 fn file_enumeration_gap(payload: &Value) -> Option<String> {
     let Some(coverage) = payload
         .get(crate::handlers::file_entities::FILE_COVERAGE_KEY)
@@ -101,7 +102,24 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(|detail| format!(" ({detail})"))
         .unwrap_or_default();
-    // Provenance first: a full parse of other bytes is a stronger disqualifier
+    // The host first, ahead of every graph-internal reading. A path whose bytes
+    // no admission has taken is the strongest disqualifier of the five: the two
+    // graph-internal readings below both agree in that state, because the entity
+    // digest and the tree blob describe the same pre-edit bytes, so `parsed`
+    // reads `full` and `span_provenance` reads `digest_verified` over spans into
+    // a file that has since moved. Naming the reconcile is also the only remedy
+    // of the five the caller can act on immediately.
+    if coverage.get("host_bytes").and_then(Value::as_str) == Some("diverged") {
+        return Some(
+            "file_bytes_unadmitted: the working copy holds content at this path that graph \
+             truth does not carry, so every span here was derived from earlier bytes and the \
+             line numbers do not describe the file as it is now. `kin reconcile` takes the \
+             edit, and a commit takes it anyway"
+                .to_string(),
+        );
+    }
+
+    // Provenance next: a full parse of other bytes is a stronger disqualifier
     // than any parse state, because every row it produced describes a file that
     // is no longer at this path.
     if coverage.get("span_provenance").and_then(Value::as_str) == Some("stale") {

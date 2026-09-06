@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-09-06
+
+### Changed
+
+- Give the authority tests a retry budget on every must-succeed acquisition (#1567)
+
+
 ## [0.7.2] - 2026-09-05
 
 ### Changed
