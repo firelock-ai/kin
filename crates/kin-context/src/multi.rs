@@ -33,6 +33,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use kin_model::relation::RelationKind;
 use kin_model::{
     ContextEntry, ContextPack, Entity, EntityId, GraphNodeId, GraphStore, ProjectionLevel,
     TokenBudget,
@@ -283,6 +284,67 @@ pub struct RouteReport {
     /// Route entities the budget could not carry, or that another focal had
     /// already put in the pack.
     pub withheld: usize,
+    /// The graph edges the walk crossed, in walk order, one per hop.
+    ///
+    /// A route without this is a claim a reader cannot check. Measured on
+    /// psf/requests at v0.7.2, `get_context_pack` joined
+    /// `Session.merge_environment_settings` to
+    /// `HTTPAdapter.build_connection_pool_key_attributes` "in 2 hops through
+    /// `RequestEncodingMixin._encode_params`", and a reader had no way to learn
+    /// that both hops are `References` edges pointing INTO the middle node, so
+    /// the graph carries no path from one focal to the other at all, only two
+    /// rows that mention the same third thing. Both facts are in this field.
+    ///
+    /// Defaulted on deserialization so a pack written before this field
+    /// existed still reads back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<RouteEdgeReport>,
+}
+
+/// One graph edge a route walk crossed.
+///
+/// `from_name` and `to_name` are in WALK order, which is the order a reader
+/// follows the route in. `direction` says whether the edge in the graph agrees
+/// with that order, because [`route_between`] deliberately ignores direction
+/// and the two readings are different claims: `A -Calls-> B -Calls-> C` is a
+/// chain, while `A -References-> X <-References- C` is two rows mentioning the
+/// same thing and is not a path between A and C in any useful sense.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteEdgeReport {
+    pub from_name: String,
+    pub to_name: String,
+    /// The relation kind, spelled exactly as the graph holds it.
+    pub kind: String,
+    /// [`ROUTE_EDGE_FORWARD`] when the walk followed the edge from its source
+    /// to its destination, [`ROUTE_EDGE_REVERSE`] when it read it backwards.
+    pub direction: String,
+}
+
+/// The walk followed this edge from its source to its destination.
+pub const ROUTE_EDGE_FORWARD: &str = "forward";
+
+/// The walk read this edge backwards, from its destination to its source.
+pub const ROUTE_EDGE_REVERSE: &str = "reverse";
+
+/// A route's edges as one line a human reads left to right.
+///
+/// `A -Calls-> B` for an edge the walk followed and `A <-Calls- B` for one it
+/// read backwards, so the two shapes [`RouteEdgeReport`] exists to separate are
+/// separated on sight. Empty for a route with no edges, which cannot happen for
+/// a reported route and is rendered as the empty string rather than as a claim.
+pub fn render_route_edges(edges: &[RouteEdgeReport]) -> String {
+    let Some(first) = edges.first() else {
+        return String::new();
+    };
+    let mut line = first.from_name.clone();
+    for edge in edges {
+        if edge.direction == ROUTE_EDGE_REVERSE {
+            line.push_str(&format!(" <-{}- {}", edge.kind, edge.to_name));
+        } else {
+            line.push_str(&format!(" -{}-> {}", edge.kind, edge.to_name));
+        }
+    }
+    line
 }
 
 /// What the route search did, including whether a bound stopped it.
@@ -399,8 +461,9 @@ pub fn water_fill(demands: &[usize], capacity: usize) -> Vec<usize> {
 /// The outcome of one route search between two focals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RouteOutcome {
-    /// The entities strictly between the two focals, in walk order.
-    Found(Vec<EntityId>),
+    /// The entities strictly between the two focals, in walk order, and the
+    /// edges the walk crossed, one per hop.
+    Found(Vec<EntityId>, Vec<RouteEdgeReport>),
     /// The walk finished within its bounds and found nothing.
     None,
     /// A bound stopped the walk, so nothing was proved either way.
@@ -448,10 +511,15 @@ where
     G: GraphStore,
 {
     if from == to {
-        return Ok(RouteOutcome::Found(Vec::new()));
+        return Ok(RouteOutcome::Found(Vec::new(), Vec::new()));
     }
 
-    let mut parent: HashMap<EntityId, EntityId> = HashMap::new();
+    // The edge is recorded beside the parent, not derived afterwards. A second
+    // pass over the graph to re-find "the" edge between two entities picks one
+    // of however many join them, which need not be the one the walk actually
+    // crossed, and the whole point of reporting the edges is that they are the
+    // ones the walk crossed.
+    let mut parent: HashMap<EntityId, (EntityId, RelationKind, bool)> = HashMap::new();
     let mut seen: HashSet<EntityId> = HashSet::new();
     seen.insert(*from);
     let mut frontier = vec![*from];
@@ -470,23 +538,24 @@ where
                 if !is_dependency_edge(&relation.kind) {
                     continue;
                 }
-                let neighbor = if relation.src == node_ref {
-                    relation.dst.as_entity()
+                let (neighbor, followed) = if relation.src == node_ref {
+                    (relation.dst.as_entity(), true)
                 } else if relation.dst == node_ref {
-                    relation.src.as_entity()
+                    (relation.src.as_entity(), false)
                 } else {
-                    None
+                    (None, true)
                 };
                 let Some(neighbor) = neighbor else { continue };
                 if neighbor == node {
                     continue;
                 }
                 if neighbor == *to {
-                    parent.insert(neighbor, node);
-                    return Ok(RouteOutcome::Found(walk_back(&parent, from, to)));
+                    parent.insert(neighbor, (node, relation.kind, followed));
+                    let (via, edges) = walk_back(graph, &parent, from, to)?;
+                    return Ok(RouteOutcome::Found(via, edges));
                 }
                 if seen.insert(neighbor) {
-                    parent.insert(neighbor, node);
+                    parent.insert(neighbor, (node, relation.kind, followed));
                     next.push(neighbor);
                 }
             }
@@ -501,14 +570,41 @@ where
 }
 
 /// The entities strictly between `from` and `to`, read out of a parent map.
-fn walk_back(
-    parent: &HashMap<EntityId, EntityId>,
+fn walk_back<G>(
+    graph: &G,
+    parent: &HashMap<EntityId, (EntityId, RelationKind, bool)>,
     from: &EntityId,
     to: &EntityId,
-) -> Vec<EntityId> {
+) -> Result<(Vec<EntityId>, Vec<RouteEdgeReport>)>
+where
+    G: GraphStore,
+{
+    let name_of = |id: &EntityId| -> Result<String> {
+        Ok(graph
+            .get_entity(id)
+            .map_err(|error| ContextError::Graph(error.to_string()))?
+            .map(|entity| entity.name)
+            .unwrap_or_default())
+    };
+
     let mut chain = Vec::new();
+    let mut edges = Vec::new();
     let mut cursor = *to;
-    while let Some(previous) = parent.get(&cursor) {
+    // Walked from `to` back to `from`, so both lists come out reversed and are
+    // turned around together at the end. The edge recorded at `cursor` is the
+    // one the walk crossed to REACH cursor, so it is rendered from its parent
+    // to cursor, which is forward walk order.
+    while let Some((previous, kind, followed)) = parent.get(&cursor) {
+        edges.push(RouteEdgeReport {
+            from_name: name_of(previous)?,
+            to_name: name_of(&cursor)?,
+            kind: format!("{kind:?}"),
+            direction: if *followed {
+                ROUTE_EDGE_FORWARD.to_string()
+            } else {
+                ROUTE_EDGE_REVERSE.to_string()
+            },
+        });
         if previous == from {
             break;
         }
@@ -516,7 +612,8 @@ fn walk_back(
         cursor = *previous;
     }
     chain.reverse();
-    chain
+    edges.reverse();
+    Ok((chain, edges))
 }
 
 /// One row waiting for a place in the pack.
@@ -717,16 +814,17 @@ where
                 ROUTE_MAX_HOPS,
                 &mut meter,
             )?;
-            let via = match outcome {
+            let (via, edges) = match outcome {
                 RouteOutcome::Bounded => {
                     route_search.bounded = true;
                     continue;
                 }
                 RouteOutcome::None => continue,
-                RouteOutcome::Found(via) => via,
+                RouteOutcome::Found(via, edges) => (via, edges),
             };
             route_search.pairs_connected += 1;
             let route_index = routes.len();
+            let edge_line = render_route_edges(&edges);
             let mut report = RouteReport {
                 from: focals[left].id.to_string(),
                 from_name: focals[left].name.clone(),
@@ -737,6 +835,7 @@ where
                 via_names: Vec::new(),
                 tokens: 0,
                 withheld: 0,
+                edges,
             };
             for (step, id) in via.iter().enumerate() {
                 if admitted.contains(id) {
@@ -750,12 +849,17 @@ where
                     report.withheld += 1;
                     continue;
                 };
+                // The edge line rides on every step of the route, because the
+                // reader who needs it is reading one row, not the report. Left
+                // off, the row says two functions are joined and leaves the
+                // reader to assume the join is a call.
                 let content = format!(
-                    "{ROUTE_MARKER} {} to {}, step {} of {}\n{}",
+                    "{ROUTE_MARKER} {} to {}, step {} of {}, over {}\n{}",
                     focals[left].name,
                     focals[right].name,
                     step + 1,
                     via.len(),
+                    edge_line,
                     project_signature_only(&entity)
                 );
                 let tokens = estimate_tokens(&content);
@@ -1150,9 +1254,25 @@ fn bump_elision(elisions: &mut BTreeMap<String, PackElision>, group_name: &str, 
     record_elision(elisions, group_name, 1, kept);
 }
 
+/// What a focal row actually CARRIES, which is not always what its
+/// [`ProjectionLevel`] is called.
+///
+/// `ProjectionLevel::FullBody` reports `header_and_signature`, because that is
+/// what [`crate::builder::project_full_body`] renders and that function's own
+/// doc comment says so: this crate has no source-reading capability, bodies
+/// live in content-addressed blobs a layer above, and what it produces is a
+/// header, a doc summary and a signature.
+///
+/// The old name was `full_body`. Measured on psf/requests at v0.7.2,
+/// `get_context_pack` returned `Session.merge_environment_settings` and
+/// `HTTPAdapter.build_connection_pool_key_attributes` labelled `full_body` and
+/// carrying 85 and 652 tokens of header, for methods spanning 38 and 51 lines,
+/// with nothing in the response saying the label and the content disagreed. The
+/// level is unchanged, because the budget ladder is what it is for; only the
+/// word this surface publishes about it changes, to one that is true.
 fn projection_name(level: ProjectionLevel) -> &'static str {
     match level {
-        ProjectionLevel::FullBody => "full_body",
+        ProjectionLevel::FullBody => "header_and_signature",
         ProjectionLevel::SignatureOnly => "signature_only",
         ProjectionLevel::NameAndKind => "name_and_kind",
     }
@@ -1224,13 +1344,25 @@ pub fn method_line(report: &MultiFocalReport) -> String {
             .iter()
             .filter(|route| !route.via.is_empty())
             .map(|route| {
+                // "in 2 hops through X" is what a reader had before, and it is
+                // the sentence that made a pair of `References` edges pointing
+                // into one node read as a chain. The edges are the difference
+                // between a route and a coincidence, so they are in the
+                // sentence rather than only in the JSON beside it.
+                let over = render_route_edges(&route.edges);
+                let over = if over.is_empty() {
+                    String::new()
+                } else {
+                    format!(", over {over}")
+                };
                 format!(
-                    "{} to {} in {} hop{} through {}",
+                    "{} to {} in {} hop{} through {}{}",
                     route.from_name,
                     route.to_name,
                     route.hops,
                     if route.hops == 1 { "" } else { "s" },
-                    route.via_names.join(", ")
+                    route.via_names.join(", "),
+                    over
                 )
             })
             .collect();
@@ -1428,6 +1560,25 @@ mod tests {
             .unwrap();
     }
 
+    /// A `References` edge, which [`is_dependency_edge`] admits exactly like a
+    /// call and which a route walk therefore crosses exactly like one. That it
+    /// is NOT a call is the whole content of the finding these tests pin.
+    fn references(store: &kin_db::InMemoryGraph, src: &Entity, dst: &Entity) {
+        store
+            .upsert_relation(&Relation {
+                id: kin_model::ids::RelationId::new(),
+                kind: RelationKind::References,
+                src: GraphNodeId::Entity(src.id),
+                dst: GraphNodeId::Entity(dst.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
     /// A five-link chain, each entity in its own file so no same-file fallback
     /// can supply what only the route should.
     fn chain(len: usize) -> (kin_db::InMemoryGraph, Vec<Entity>) {
@@ -1526,7 +1677,7 @@ mod tests {
             report
                 .focals
                 .iter()
-                .all(|focal| focal.projection == "full_body"),
+                .all(|focal| focal.projection == "header_and_signature"),
             "a generous budget carries every focal whole: {:?}",
             report
                 .focals
@@ -1723,6 +1874,101 @@ mod tests {
         assert_eq!(report.routes[0].via_names, vec!["middle".to_string()]);
     }
 
+    /// A route says what it is made OF, so a reader can tell a chain from a
+    /// coincidence.
+    ///
+    /// The measured shape, on psf/requests at v0.7.2. `get_context_pack` joined
+    /// `Session.merge_environment_settings` to
+    /// `HTTPAdapter.build_connection_pool_key_attributes` "in 2 hops through
+    /// `RequestEncodingMixin._encode_params`" and the two hops are both
+    /// `References` edges pointing INTO that middle node, which is not a path
+    /// from one focal to the other at all. `kin graph inspect` on the middle
+    /// node reported 149 relations, almost all of them inbound references from
+    /// unrelated code, so a two-hop walk through it joins nearly any pair in
+    /// the repository. Every particular of that was invisible in the response.
+    #[test]
+    fn a_route_reports_the_edges_it_walked_and_which_way_they_point() {
+        let store = kin_db::InMemoryGraph::new();
+        let left = make_entity("left", "src/a.rs");
+        let middle = make_entity("middle", "src/m.rs");
+        let right = make_entity("right", "src/b.rs");
+        for entity in [&left, &middle, &right] {
+            store.upsert_entity(entity).unwrap();
+        }
+        // Both ends REFERENCE the middle. Neither reaches the other.
+        references(&store, &left, &middle);
+        references(&store, &right, &middle);
+
+        let (pack, report) =
+            build_multi_focal_pack(&store, &[left.id, right.id], &opts(8000)).unwrap();
+        let route = &report.routes[0];
+
+        assert_eq!(
+            route.edges.len(),
+            route.hops,
+            "a route reports one edge per hop, got {:?}",
+            route.edges
+        );
+        assert!(
+            route.edges.iter().all(|edge| edge.kind == "References"),
+            "the kinds are the graph's own, got {:?}",
+            route.edges
+        );
+        assert_eq!(
+            route.edges[0].direction, ROUTE_EDGE_FORWARD,
+            "the walk followed left's own reference"
+        );
+        assert_eq!(
+            route.edges[1].direction, ROUTE_EDGE_REVERSE,
+            "and read right's backwards, which is the fact that makes this a \
+             co-reference rather than a chain"
+        );
+
+        // The rendered line is where a reader actually sees it, and both arrows
+        // point at the middle.
+        let line = render_route_edges(&route.edges);
+        assert_eq!(
+            line, "left -References-> middle <-References- right",
+            "got {line}"
+        );
+
+        // It reaches the surfaces a caller reads, not just the JSON.
+        assert!(
+            report.method.contains("<-References- right"),
+            "the method sentence carries the edges: {}",
+            report.method
+        );
+        let rendered = render_multi_focal_lines(&pack, &report).join("\n");
+        assert!(
+            rendered.contains("<-References- right"),
+            "and so does the route row itself:\n{rendered}"
+        );
+    }
+
+    /// A real chain reads as a chain: every edge forward, nothing to warn about.
+    ///
+    /// The positive control for the test above. Without it, that one could pass
+    /// on a build that labelled every edge `reverse`.
+    #[test]
+    fn a_directed_chain_reports_every_edge_forward() {
+        let (store, links) = chain(3);
+        let (_, report) =
+            build_multi_focal_pack(&store, &[links[0].id, links[2].id], &opts(8000)).unwrap();
+        let route = &report.routes[0];
+        assert!(
+            route
+                .edges
+                .iter()
+                .all(|edge| edge.direction == ROUTE_EDGE_FORWARD && edge.kind == "Calls"),
+            "got {:?}",
+            route.edges
+        );
+        assert_eq!(
+            render_route_edges(&route.edges),
+            "link_0 -Calls-> link_1 -Calls-> link_2"
+        );
+    }
+
     // ---- the budget bound ------------------------------------------------
 
     #[test]
@@ -1911,7 +2157,7 @@ mod tests {
             generous
                 .focals
                 .iter()
-                .all(|focal| focal.projection == "full_body"),
+                .all(|focal| focal.projection == "header_and_signature"),
             "control: both focals are admitted whole when there is room"
         );
 
@@ -1927,7 +2173,7 @@ mod tests {
             report
                 .focals
                 .iter()
-                .any(|focal| focal.projection != "full_body"),
+                .any(|focal| focal.projection != "header_and_signature"),
             "and at least one was walked down to make the frame fit: {:?}",
             report
                 .focals
