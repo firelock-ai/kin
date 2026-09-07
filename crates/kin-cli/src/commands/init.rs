@@ -1294,13 +1294,33 @@ fn reject_existing_repository(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The refusal `kin init` raises over a directory that already holds a store.
+/// The refusal `kin init` raises over a directory that already holds a `.kin`.
 ///
-/// The reader who arrives here most often is the one the store wall just sent,
-/// after an older store refused to open. That wall names a rebuild, and `kin
-/// init` is half of it, so this refusal names the same rebuild instead of
-/// stopping at the fact that a store exists.
+/// Two different directories answer to that name, and naming one remedy for
+/// both is how this went wrong. A repository store is the case the store wall
+/// sends readers from, after an older store refused to open; that wall names a
+/// rebuild, and `kin init` is half of it, so the refusal names the same
+/// rebuild.
+///
+/// The managed install root is the other, and it is the one a first-run reader
+/// reaches. The installer puts `~/.kin` in the home directory a fresh terminal
+/// already opens in, so a `kin init` typed before any `cd` lands on the
+/// toolchain rather than on a project. Naming the rebuild there tells that
+/// reader to delete the binaries, the injected shim and the cross-repo registry
+/// they installed a minute earlier, which is worse than the refusal it explains.
+/// [`KinLayout::discover`](kin_core::KinLayout::discover) already declines to
+/// bind this directory as a repository, and asking the same question here keeps
+/// the two from disagreeing about what `~/.kin` is.
 fn existing_repository_refusal(dir: &Path) -> String {
+    if kin_core::layout::is_managed_kin_home(&dir.join(".kin")) {
+        return format!(
+            "the .kin in {} is your Kin installation, not a repository. `kin init` runs inside a \
+             project, so change into the repository you want Kin to admit and run it there. Leave \
+             this directory where it is: it holds the installed binaries, the injected shim and \
+             the cross-repo registry.",
+            dir.display(),
+        );
+    }
     format!(
         "Kin repository already exists at {}; `kin init` never rebuilds graph authority from the \
          working tree. If this build cannot open that store, {} again to rebuild it from the \
@@ -3319,6 +3339,74 @@ mod tests {
         assert!(
             !wall.contains("fresh checkout") && !refusal.contains("fresh checkout"),
             "neither text may send the reader to a checkout they do not have"
+        );
+    }
+
+    /// The `.kin` a first-run reader actually meets is the installation, and
+    /// the refusal over it must never name a removal.
+    ///
+    /// The installer writes `~/.kin`, a fresh terminal opens in `~`, and the
+    /// quickstart ends on `kin init`. A reader who types that before any `cd`
+    /// points `kin init` at the toolchain. Sending them to `remove .kin/` there
+    /// deletes the binaries, the injected shim and the cross-repo registry they
+    /// installed a minute earlier, so this arm names a `cd` instead and tells
+    /// them the directory is theirs to keep.
+    ///
+    /// The fixture carries the installer's own markers rather than repointing
+    /// `HOME`, so the question is decided by what the directory holds and the
+    /// test does not race another test over a process-wide variable.
+    #[test]
+    fn the_refusal_over_the_installation_never_names_a_removal() {
+        let scratch = tempfile::tempdir().unwrap();
+        let home = scratch.path();
+        let managed = home.join(".kin");
+        std::fs::create_dir_all(managed.join("bin")).unwrap();
+        std::fs::create_dir_all(managed.join("lib")).unwrap();
+        std::fs::write(managed.join("registry.toml"), "").unwrap();
+
+        let refusal = existing_repository_refusal(home);
+
+        assert!(
+            !refusal.contains(crate::commands::REBUILD_INCOMPATIBLE_STORE),
+            "the install root must not be sent to the store rebuild: {refusal}"
+        );
+        assert!(
+            !refusal.contains("remove"),
+            "the install root must not be named in a removal at all: {refusal}"
+        );
+        assert!(
+            refusal.contains("is your Kin installation, not a repository"),
+            "the refusal must say what the directory actually is: {refusal}"
+        );
+        assert!(
+            refusal.contains("change into the repository"),
+            "the refusal must name the move that works: {refusal}"
+        );
+    }
+
+    /// The store arm, so the branch above cannot be satisfied by answering the
+    /// installation text everywhere.
+    ///
+    /// A `.kin` holding a manifest and none of the installer's markers is a
+    /// reader's own repository, and the shared rebuild remedy is still the one
+    /// the store wall sent them to look for.
+    #[test]
+    fn the_refusal_over_a_real_store_still_names_the_rebuild() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path();
+        let store = repo.join(".kin");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("manifest.json"), "{}").unwrap();
+
+        let refusal = existing_repository_refusal(repo);
+
+        assert!(
+            refusal.contains(crate::commands::REBUILD_INCOMPATIBLE_STORE),
+            "a real store must still name the shared rebuild remedy: {refusal}"
+        );
+        assert!(
+            !refusal.contains("is your Kin installation"),
+            "a real store must not be described as the installation: {refusal}"
         );
     }
 
