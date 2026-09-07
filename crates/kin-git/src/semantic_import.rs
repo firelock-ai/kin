@@ -795,9 +795,11 @@ pub struct CommitTreeFacts {
 
 /// What a derivation still holds once every commit has been visited.
 struct DerivedGitHistory {
-    /// Under [`TreeRetention::Whole`], every commit's exact tree. Under
-    /// [`TreeRetention::Frontier`], only the trees no reader has finished with,
-    /// which at the end of a complete walk is the workspace seed's tree.
+    /// Every commit's exact tree, for a test that walked under
+    /// [`TreeRetention::Whole`]. The product never reads a tree out of a
+    /// finished derivation, so the field exists only where the test helper
+    /// that returns it does.
+    #[cfg(any(test, feature = "test-support"))]
     commit_trees: BTreeMap<GitObjectId, ResolvedTree>,
     /// Every commit's tree by canonical hash, whatever the retention.
     commit_tree_hashes: BTreeMap<GitObjectId, Hash256>,
@@ -1030,6 +1032,7 @@ fn derive_semantic_git_history(
     }
 
     Ok(DerivedGitHistory {
+        #[cfg(any(test, feature = "test-support"))]
         commit_trees,
         commit_tree_hashes,
         content,
