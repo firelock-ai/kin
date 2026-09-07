@@ -141,13 +141,24 @@ can open later.
 
 ## Shortest graph-backed path
 
-Five commands, and the last one is the answer:
+Run the installer on its own and finish any setup prompts:
 
 ```sh
 curl -fsSL https://get.kinlab.dev/install | sh
+```
+
+Once it finishes, reload your shell with this separate command:
+
+```sh
 exec "$SHELL" -l
-cd /path/to/your/repository
-kin init .
+```
+
+At the new prompt, replace the path below with your repository's location and
+run this block:
+
+```sh
+cd /path/to/your/repository &&
+kin init . &&
 kin locate "where are webhook retries handled"
 ```
 
@@ -174,11 +185,21 @@ same path with the detail behind each step.
 
 ### 1. Install and configure Kin
 
-On macOS or Linux:
+On macOS or Linux, run the installer on its own and finish any setup prompts:
 
 ```sh
 curl -fsSL https://get.kinlab.dev/install | sh
+```
+
+Once it finishes, reload your shell with this separate command:
+
+```sh
 exec "$SHELL" -l
+```
+
+At the new prompt, configure your client:
+
+```sh
 kin setup --intent agent
 ```
 
@@ -259,9 +280,10 @@ Windows install path.
 
 ### 2. Admit an existing repository as graph truth
 
+Replace the path below with your repository's location:
+
 ```sh
-cd /path/to/your/repository
-kin init .
+cd /path/to/your/repository && kin init .
 ```
 
 In a detected Git repository, `kin init` atomically admits complete reachable
