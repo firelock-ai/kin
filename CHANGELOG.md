@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-09-07
+
+### Changed
+
+- Fix quickstart paste boundaries and repository selection (FIR-3348) (#1581)
+
+
 ## [0.7.3] - 2026-09-06
 
 **Heads up:** 0.7.3 does not change Kin's on-disk repo format, but an upcoming release will. Any store you create before that lands will not open afterward, and rebuilding one just means running `kin init` again. Nothing in your working tree is touched.
