@@ -15,6 +15,10 @@ If you admitted your repository from Git, the recovery path is `kin init` again,
 
 Work that only ever lived in Kin is a different question, because Git never had it. Native commits, Kin branches, reviews and specs live in `.kin` and go when it goes, and today the only way to carry any of it out is `kin git export --output <dir>`, which writes commits and refs into a plain Git repository and carries no review, no spec and no entity history. So the format change ships together with an upgrade command that carries native state forward, or it does not ship.
 
+**JavaScript and TypeScript callers you were not being shown.** Two defects were dropping call edges, so `kin refs --kind calls`, `kin impact` and `find_references` answered some questions with fewer callers than the code has. A module whose default export is an expression rather than a declaration, `export default isSupported && function (config) {...}` for instance, contributed no call edges at all from inside it, and a call to a default-imported callee could bind to the callee's file rather than to the callee. Both are fixed. Measured on axios at b8d67bbb, three functions went from 2 of their 15 real call sites to 15 of 15.
+
+A store admitted before this release keeps the edges it already has, because those edges are written during admission. Kin has no re-index command, so refreshing one means deleting its `.kin` and running `kin init` again, which rebuilds it from the repository's Git history. `kin init` on its own refuses on an existing store and says so. Your working tree is never touched.
+
 ### Changed
 
 - Fix quickstart paste boundaries and repository selection (FIR-3348) (#1581)
