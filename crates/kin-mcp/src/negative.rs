@@ -2519,6 +2519,17 @@ pub fn negative_for(
         if let Some(gap) = unadmitted_host_content_gap(envelope) {
             push_gap(&mut trustworthy, &mut trust_reason, gap);
         }
+        // A search whose whole-query name filter matched nothing and whose
+        // per-token fallback also matched nothing is a miss about vocabulary. The
+        // certified sentence for this tool says no declaration in the index
+        // carries this name, which is true and useless for a question phrased as
+        // a sentence: no declaration is named "how does reconcile detect a stale
+        // graph", and a reader who takes that as an authoritative absence reads it
+        // as proof the repository does not reconcile. Certify the name lookup,
+        // never the question.
+        if let Some(gap) = crate::query_tokens::absence_gap(payload) {
+            push_gap(&mut trustworthy, &mut trust_reason, gap);
+        }
     }
 
     // Gaps the response carries that this function cannot observe from the

@@ -159,6 +159,11 @@ kin-lsp = { version = "=0.7.16", registry = "kin" }
 # additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
 # binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
 kin-db = { version = "=0.7.104", registry = "kin", default-features = false }
+# Pinned to the exact version kin-db builds its name-token index with. A
+# per-token name query hits that index only when the token came out of the same
+# tokenizer, so a version skew here would be a silent recall loss rather than a
+# build failure.
+kin-search = { version = "=0.1.9", registry = "kin" }
 kin-vfs-core = { version = "=0.4.24", registry = "kin" }
 
 [profile.release]
