@@ -2684,7 +2684,7 @@ mod tests {
         );
     }
 
-    /// , the reported shape. A `semantic_locate` for "where
+    /// This is the shape the outside-graph input refuses. A `semantic_locate` for "where
     /// `router.param` callbacks are registered and stored, and how a request is
     /// dispatched through the middleware stack" on express 5.2.1 came back
     /// `state: "certified"`, `limiting_factor: null`, `bound: "exact"`,

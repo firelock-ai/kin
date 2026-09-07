@@ -6,15 +6,20 @@
 //!
 //! The first version of this disclosure was attached in `kin_mcp`'s dispatcher,
 //! and the express case still read `certified`, `exact`, `complete`, because the
-//! daemon never reaches that dispatcher for the tools the case was found on.
-//! `semantic_locate` returns out of the fused pipeline, `find_references` out of
-//! its stable-authority path, and the hosted route serves three tools from its
-//! own view. A test on the observation alone cannot see any of that, which is
-//! why these arms run the function the routes actually call, on a payload shaped
-//! like the one they actually build, and then compute the response's real
-//! verdict over the result.
-
-use std::collections::HashMap;
+//! daemon never reaches that dispatcher for the tools the case was found on:
+//! `semantic_locate` returns out of the fused pipeline and `find_references` out
+//! of its stable-authority path. A test on the observation alone cannot see any
+//! of that, which is why four of these arms run the function the local route
+//! actually calls, on a payload shaped like the one it actually builds, and then
+//! compute the response's real verdict over the result. The fifth posts to the
+//! route itself, because the claim it makes is about the route's own read of the
+//! question rather than about the function that read is handed to.
+//!
+//! Scope is the LOCAL route, `POST /mcp/tools/call`. The repo-scoped hosted
+//! route serves `semantic_locate`, `get_context_pack` and `trace_data_flow` from
+//! its own view and deliberately does NOT disclose, because its handlers
+//! finalize their own envelope before the point a block could be inserted.
+//! Nothing in this file covers that route.
 
 use serde_json::{json, Value};
 
@@ -61,10 +66,12 @@ fn entity(name: &str, file: Option<&str>, role: EntityRole, kind: EntityKind) ->
     }
 }
 
-/// A store shaped like the express graph the stranger asked: one function this
-/// repository owns, and one symbol reached through a package it never admitted.
-fn express_graph() -> InMemoryGraph {
-    let graph = InMemoryGraph::new();
+/// One function this repository owns, and one symbol reached through a package
+/// it never admitted: the express graph the stranger asked, in two entities.
+///
+/// Taken as a store rather than returning one, because the route arms have to
+/// seed the store the daemon already owns and the function arms build their own.
+fn seed_express_entities(graph: &InMemoryGraph) {
     graph
         .upsert_entity(&entity(
             "app.handle",
@@ -81,6 +88,13 @@ fn express_graph() -> InMemoryGraph {
             EntityKind::Module,
         ))
         .expect("the external reference target admits");
+}
+
+/// A standalone store shaped like the express graph, for the arms that call the
+/// disclosure directly.
+fn express_graph() -> InMemoryGraph {
+    let graph = InMemoryGraph::new();
+    seed_express_entities(&graph);
     graph
 }
 
@@ -122,17 +136,14 @@ fn certifiable_payload(collection: &str) -> Value {
     })
 }
 
-/// The arguments each daemon route carries its question in.
-fn arguments_with(name: &str, question: &str) -> HashMap<String, Value> {
-    HashMap::from([(name.to_string(), json!(question))])
-}
-
-/// The reported case, on each tool the daemon serves off its own path.
+/// The reported case, on each tool the local route serves off its own path.
 ///
-/// `semantic_locate` and `find_references` return from the local route before
-/// the shared dispatcher; `get_context_pack` and `trace_data_flow` are served by
-/// the hosted route from its own view. Every one of them ends on the line this
-/// disclosure sits on, and every one of them must stop certifying.
+/// `semantic_locate` and `find_references` return from that route before the
+/// shared dispatcher, and `get_context_pack` and `trace_data_flow` reach it
+/// through the dispatcher. All four end on the line this disclosure sits on,
+/// because it sits after the inner dispatch rather than inside it, and all four
+/// must stop certifying. The hosted route serves three of these tools from its
+/// own view, discloses nothing, and is not graded here.
 #[test]
 fn every_daemon_served_tool_stops_certifying_the_express_question() {
     let graph = express_graph();
@@ -243,16 +254,107 @@ fn a_non_json_result_is_returned_verbatim() {
     assert_eq!(disclosed.is_error, Some(true));
 }
 
-/// Both argument names reach the disclosure, because `get_context_pack` carries
-/// its question as `question` where the rest carry `query`.
-#[test]
-fn the_route_reads_the_question_from_either_argument_name() {
-    for name in ["query", "question"] {
-        let arguments = arguments_with(name, EXPRESS_QUESTION);
+/// One tool call served by the local MCP route, and the payload it answered
+/// with.
+///
+/// The store is the daemon's own, seeded before the call, so the graph the route
+/// resolves for the disclosure is the graph this fixture built.
+async fn payload_served_by_the_local_route(tool: &str, arguments: Value) -> Value {
+    let state = super::test_state();
+    seed_express_entities(&state.graph);
+    state
+        .is_initialized
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let request = axum::http::Request::post("/mcp/tools/call")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            json!({ "name": tool, "arguments": arguments }).to_string(),
+        ))
+        .expect("the fixture request builds");
+    let response = tower::ServiceExt::oneshot(crate::api::router(state), request)
+        .await
+        .expect("the router answers");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "{tool}: the route must serve this call for the disclosure to be gradeable"
+    );
+
+    let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("the served body reads");
+    let result: kin_mcp::ToolCallResult =
+        serde_json::from_slice(&body).expect("the route answers a tool result");
+    let kin_mcp::ContentBlock::Text { text } = result
+        .content
+        .first()
+        .expect("a served tool result carries one content block");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{tool}: the tool itself must succeed, or this arm grades an error string: {text}"
+    );
+    serde_json::from_str(text).unwrap_or_else(|_| panic!("{tool}: served a JSON payload: {text}"))
+}
+
+/// A question carried under either argument name is disclosed on the response the
+/// route served. Both names exist because `get_context_pack` carries its
+/// question as `question` where the rest carry `query`.
+///
+/// Named for what it observes rather than for what attached the block, and the
+/// distinction is load-bearing. This test used to call
+/// `kin_mcp::outside_graph::question_argument` on a hand-built map under the
+/// name `the_route_reads_the_question_from_either_argument_name`. That function
+/// is covered where it lives, the call stayed green with the route's own read of
+/// it deleted, and so the name claimed coverage the body did not have. It now
+/// posts to `POST /mcp/tools/call` and reads what the route served.
+///
+/// What each arm pins is different. `semantic_locate` returns out of the fused
+/// pipeline without reaching `kin_mcp::handlers::handle_tool_call`, so a block
+/// on that payload can only have come from this route's own disclosure: delete
+/// either the route's `question_argument` read or its `disclose_outside_graph`
+/// call and that arm goes red. `get_context_pack` does reach the shared
+/// dispatcher, which attaches the same block from the same observation, so that
+/// arm pins that the `question` name is served disclosed without saying which of
+/// the two attached it. No arm can say, because the two blocks are identical.
+///
+/// `get_context_pack` is also given `entities`, which the route never reads.
+/// Question resolution needs a live daemon index, so without a focal the tool
+/// answers an error string and there is no payload to disclose into.
+#[tokio::test]
+async fn a_question_under_either_argument_name_is_disclosed_on_the_route() {
+    for (tool, argument, extra) in [
+        ("semantic_locate", "query", json!({})),
+        (
+            "get_context_pack",
+            "question",
+            json!({ "entities": ["app.handle"] }),
+        ),
+    ] {
+        let arguments = |question: &str| {
+            let mut arguments = extra.clone();
+            arguments[argument] = json!(question);
+            arguments
+        };
+
+        let payload = payload_served_by_the_local_route(tool, arguments(EXPRESS_QUESTION)).await;
+        let block = payload.get("outside_graph").unwrap_or_else(|| {
+            panic!("{tool}: a question carried as `{argument}` reaches the disclosure: {payload}")
+        });
         assert_eq!(
-            kin_mcp::outside_graph::question_argument(&arguments),
-            Some(EXPRESS_QUESTION),
-            "{name} is a question this route must act on"
+            block["symbols"],
+            json!([{ "symbol": "Router", "modules": [] }]),
+            "{tool}: the symbol the question named is the one reported"
+        );
+
+        // The control, on the same route and the same store. Without it this
+        // test passes against a route that discloses unconditionally, which is
+        // the failure mode a disclosure pass is most likely to acquire.
+        let local = payload_served_by_the_local_route(tool, arguments(LOCAL_QUESTION)).await;
+        assert!(
+            local.get("outside_graph").is_none(),
+            "{tool}: a question naming nothing outside the graph is served untouched: {local}"
         );
     }
 }
