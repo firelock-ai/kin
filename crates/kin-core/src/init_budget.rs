@@ -3,12 +3,16 @@
 
 //! What a conversion will hold, read before it starts holding it.
 //!
-//! A conversion's peak follows history depth, because every commit's entity and
-//! relation deltas are derived in phase 5 and held from there until the store
-//! holds them at phase 13, and beside them the store itself is built and then
-//! opened. Tree width sets the peak instead when the tree is wide enough:
-//! the tree a conversion admits is parsed whole to derive its semantics. What a
-//! conversion no longer holds is one resolved tree per commit. The history
+//! A conversion's peak follows the volume of change in the history it admits:
+//! every commit's entity and relation deltas are derived in phase 5 from the
+//! bytes of every file version in history and held from there until the store
+//! holds them at phase 13, and at phase 17 the finished store is opened whole
+//! for its final proof, the same load the daemon pays. Reachable history bytes
+//! are the input that tracks that volume; the commit count is a second floor
+//! for a history of many small changes; and tree width sets the peak instead
+//! when the tree is wide enough, because the tree a conversion admits is parsed
+//! whole to derive its semantics. What a conversion no longer holds is one
+//! resolved tree per commit. The history
 //! derivation resolves each commit's tree from its first parent's and the
 //! leaves that differ, hands it to every reader that needs it while it is
 //! live, keeps a hash and a content observation in its place, and drops it once
@@ -72,6 +76,21 @@ pub const INIT_MEMORY_CEILING_ENV: &str = "KIN_INIT_MEMORY_CEILING_BYTES";
 /// outside the process: peak 4,800,708,608 bytes, 739,368 per commit. This
 /// rounds under it.
 const BYTES_PER_COMMIT: u64 = 700_000;
+
+/// Bytes a conversion holds for each byte of reachable history it admits.
+///
+/// Every blob reachable from HEAD is a file version the enrichment fold reads
+/// and diffs, and the store that is written and then opened whole carries what
+/// those diffs produced, so the peak tracks this volume more closely than it
+/// tracks the commit count. Measured on the frontier walk across three
+/// repositories, resident bytes held at the whole-run peak per reachable blob
+/// byte: hiredis 55.5 (27,715,552 bytes of history, 1,538,834,432 held),
+/// requests 49.5 (112,476,293 against 5,568,004,096), kin 19.6 (1,400,991,245
+/// against 27,428,945,920). Nineteen is the floor of that spread, so a
+/// requests-shaped history can hold two to three times this forecast, and kin
+/// holds it almost exactly; the spread is what makes this a floor and not a
+/// prediction.
+const BYTES_PER_HISTORY_BYTE: u64 = 19;
 
 /// Bytes the repository daemon holds for each commit of the store it loads.
 ///
@@ -139,7 +158,7 @@ const BYTES_PER_HEAD_ARTIFACT: u64 = 250_000;
 /// this term.
 const BYTES_PER_SOURCE_BYTE: u64 = 33;
 
-/// The two numbers that drive a conversion's peak, counted from the source.
+/// The three numbers that drive a conversion's peak, counted from the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistorySurvey {
     /// Commits reachable from HEAD. One set of semantic deltas is derived and
@@ -148,24 +167,48 @@ pub struct HistorySurvey {
     /// Artifacts the index tracks, which is the width of the tree the
     /// conversion parses whole.
     pub tracked_artifacts: u64,
+    /// Bytes of every distinct blob reachable from HEAD, which is every file
+    /// version the enrichment reads and the volume the store carries.
+    pub history_bytes: u64,
+}
+
+/// Which of the survey's floors decided a forecast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecidingTerm {
+    Commits,
+    TrackedArtifacts,
+    HistoryBytes,
 }
 
 impl HistorySurvey {
     /// Bytes a conversion of this repository is expected to hold at its peak.
     ///
-    /// The larger of two floors rather than their sum. Both terms are real and
-    /// a conversion pays both, so the sum is the better prediction; but each
-    /// coefficient is already the smallest value any measured conversion
-    /// justified, and summing two independently minimised terms is how a floor
-    /// stops being one. Taking the larger keeps the guarantee that matters:
-    /// whatever this returns, every conversion measured at that scale needed at
-    /// least that much.
+    /// The largest of three floors rather than their sum. Every term is real
+    /// and a conversion pays all three, so the sum is the better prediction;
+    /// but each coefficient is already the smallest value any measured
+    /// conversion justified, and summing independently minimised terms is how
+    /// a floor stops being one. Taking the largest keeps the guarantee that
+    /// matters: whatever this returns, every conversion measured at that scale
+    /// needed at least that much.
     pub fn forecast_peak_bytes(&self) -> u64 {
+        self.forecast().0
+    }
+
+    /// The forecast and the floor that decided it.
+    pub fn forecast(&self) -> (u64, DecidingTerm) {
         let by_commit = self.commits.saturating_mul(BYTES_PER_COMMIT);
         let by_head = self
             .tracked_artifacts
             .saturating_mul(BYTES_PER_HEAD_ARTIFACT);
-        by_commit.max(by_head)
+        let by_history = self.history_bytes.saturating_mul(BYTES_PER_HISTORY_BYTE);
+        let mut decided = (by_commit, DecidingTerm::Commits);
+        if by_head > decided.0 {
+            decided = (by_head, DecidingTerm::TrackedArtifacts);
+        }
+        if by_history > decided.0 {
+            decided = (by_history, DecidingTerm::HistoryBytes);
+        }
+        decided
     }
 
     /// Bytes the repository daemon is expected to hold once it loads the store
@@ -388,6 +431,11 @@ impl BudgetVerdict {
             return Vec::new();
         };
         let times = *forecast_bytes / (*ceiling_bytes).max(1);
+        let decided = match survey.forecast().1 {
+            DecidingTerm::HistoryBytes => "the bytes of history decide it",
+            DecidingTerm::Commits => "the commit count decides it",
+            DecidingTerm::TrackedArtifacts => "the width of the tree decides it",
+        };
         vec![
             format!(
                 "this conversion needs more memory than this {} has: at least {}, about {} times \
@@ -398,15 +446,20 @@ impl BudgetVerdict {
                 human_bytes(*ceiling_bytes),
             ),
             format!(
-                "  {} commits over {} tracked files is what drives it: a conversion holds every \
-                 commit's entity and relation deltas from the phase that derives them until the \
-                 store holds them, so its peak follows the commit count, and it parses the whole \
-                 tree it admits, so a wide enough tree sets the peak instead",
-                survey.commits, survey.tracked_artifacts,
+                "  {} commits over {} tracked files carrying {} of history is what drives it, and \
+                 {}: a conversion derives every commit's entity and relation deltas from every file \
+                 version in that history and holds them until the store holds them, then opens \
+                 the finished store whole for its final proof, and it parses the whole tree it \
+                 admits, so its peak follows the largest of the three",
+                survey.commits,
+                survey.tracked_artifacts,
+                human_bytes(survey.history_bytes),
+                decided,
             ),
             "  that figure is a floor and not a prediction, taken from the least any measured \
-             conversion needed per commit and per file; the change one commit carries varies \
-             sixfold across measured repositories, so a conversion can need several times this"
+             conversion needed per commit, per file and per byte of history; across the \
+             repositories measured a conversion held between one and three times its floor, so \
+             read this as the least it will need"
                 .to_string(),
             format!(
                 "  give it more than {}, on a larger machine or by raising this {}'s memory limit",
@@ -505,10 +558,13 @@ pub fn survey_history(source: &Path) -> Result<HistorySurvey, String> {
         .all()
         .map_err(|error| format!("walk history: {error}"))?;
     let mut commits: u64 = 0;
+    let mut commit_ids = Vec::new();
     for step in walk {
-        step.map_err(|error| format!("walk history: {error}"))?;
+        let info = step.map_err(|error| format!("walk history: {error}"))?;
+        commit_ids.push(info.id().detach());
         commits += 1;
     }
+    let history_bytes = reachable_history_bytes(&repo, &commit_ids)?;
 
     let index_path = repo.git_dir().join("index");
     let index = gix::index::File::at_or_default(
@@ -523,7 +579,79 @@ pub fn survey_history(source: &Path) -> Result<HistorySurvey, String> {
     Ok(HistorySurvey {
         commits,
         tracked_artifacts,
+        history_bytes,
     })
+}
+
+/// Bytes of every distinct blob reachable from the given commits.
+///
+/// The same closure the capture enumerates, read as object headers rather than
+/// bodies: each tree object is decoded once, each blob is sized once from its
+/// header, and nothing is decompressed but the trees, so on facebook/react
+/// this is seconds over 130,822 trees and 110,404 blobs. The physical object
+/// store is read directly, as the capture reads it, so a well-known empty tree
+/// the repository does not actually hold is not fabricated.
+fn reachable_history_bytes(
+    repo: &gix::Repository,
+    commit_ids: &[gix::ObjectId],
+) -> Result<u64, String> {
+    use gix::objs::{Find as _, FindHeader as _};
+    use std::collections::HashSet;
+
+    let hash_kind = repo.object_hash();
+    let mut seen_trees = HashSet::<gix::ObjectId>::new();
+    let mut seen_blobs = HashSet::<gix::ObjectId>::new();
+    let mut pending = Vec::<gix::ObjectId>::new();
+    let mut body = Vec::new();
+    for commit_id in commit_ids {
+        let data = repo
+            .objects
+            .try_find(commit_id, &mut body)
+            .map_err(|error| format!("read commit {commit_id}: {error}"))?
+            .ok_or_else(|| format!("commit {commit_id} is missing from the object store"))?;
+        let commit = gix::objs::CommitRef::from_bytes(data.data, hash_kind)
+            .map_err(|error| format!("decode commit {commit_id}: {error}"))?;
+        let tree = commit.tree();
+        if seen_trees.insert(tree) {
+            pending.push(tree);
+        }
+    }
+    let mut bytes: u64 = 0;
+    while let Some(tree_id) = pending.pop() {
+        let data = repo
+            .objects
+            .try_find(&tree_id, &mut body)
+            .map_err(|error| format!("read tree {tree_id}: {error}"))?
+            .ok_or_else(|| format!("tree {tree_id} is missing from the object store"))?;
+        let tree = gix::objs::TreeRef::from_bytes(data.data, hash_kind)
+            .map_err(|error| format!("decode tree {tree_id}: {error}"))?;
+        for entry in tree.entries {
+            let oid = entry.oid.to_owned();
+            match entry.mode.kind() {
+                gix::objs::tree::EntryKind::Tree => {
+                    if seen_trees.insert(oid) {
+                        pending.push(oid);
+                    }
+                }
+                gix::objs::tree::EntryKind::Blob
+                | gix::objs::tree::EntryKind::BlobExecutable
+                | gix::objs::tree::EntryKind::Link => {
+                    if seen_blobs.insert(oid) {
+                        let header = repo
+                            .objects
+                            .try_header(&oid)
+                            .map_err(|error| format!("read blob header {oid}: {error}"))?
+                            .ok_or_else(|| {
+                                format!("blob {oid} is missing from the object store")
+                            })?;
+                        bytes = bytes.saturating_add(header.size);
+                    }
+                }
+                gix::objs::tree::EntryKind::Commit => {}
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 /// Decide, before any capture, whether this conversion fits.
@@ -848,6 +976,7 @@ mod tests {
         let forecast = HistorySurvey {
             commits: 1,
             tracked_artifacts: head_artifacts,
+            history_bytes: 0,
         }
         .forecast_peak_bytes();
         let projected = snapshot(head_artifacts, object_bytes).projected_peak_bytes();
@@ -926,6 +1055,7 @@ mod tests {
             let forecast = HistorySurvey {
                 commits,
                 tracked_artifacts: tracked,
+                history_bytes: 0,
             }
             .forecast_peak_bytes();
             let projected = ImportSurvey {
@@ -1036,7 +1166,109 @@ mod tests {
         HistorySurvey {
             commits,
             tracked_artifacts,
+            history_bytes: 0,
         }
+    }
+
+    fn history(commits: u64, tracked_artifacts: u64, history_bytes: u64) -> HistorySurvey {
+        HistorySurvey {
+            commits,
+            tracked_artifacts,
+            history_bytes,
+        }
+    }
+
+    /// The three measured frontier-walk conversions, as the survey would have
+    /// counted them: commits from HEAD, tracked files, reachable blob bytes,
+    /// and the whole-run resident peak.
+    const MEASURED_HISTORIES: [(&str, u64, u64, u64, u64); 3] = [
+        ("hiredis", 1_141, 79, 27_715_552, 1_538_834_432),
+        ("requests", 6_493, 130, 112_476_293, 5_568_004_096),
+        ("kin", 2_924, 1_033, 1_400_991_245, 27_428_945_920),
+    ];
+
+    /// The history term is the one that decides kin, and it decides it the
+    /// way the machine does: refused on 8 and 16 GB, spoken about on 32.
+    ///
+    /// kin's whole-run peak was 25.5 GiB, in the phase that opens the finished
+    /// store for its final proof, and neither the commit count (2.0 GB) nor
+    /// the tree width (0.26 GB) says anything like it. A forecast that stayed
+    /// silent on 16 GB and let the conversion be killed there is the silence
+    /// this module exists to end.
+    #[test]
+    fn a_history_heavy_repository_is_refused_where_it_would_be_killed() {
+        let kin = history(2_924, 1_033, 1_400_991_245);
+        let (forecast, term) = kin.forecast();
+        assert_eq!(term, DecidingTerm::HistoryBytes);
+        assert!(
+            forecast > 26 * 1000 * 1000 * 1000,
+            "kin forecast {forecast}"
+        );
+        for gb in [8u64, 16] {
+            let verdict = verdict_for(kin, gb * 1024 * 1024 * 1024);
+            assert!(
+                verdict.refuses(),
+                "kin must be refused on {gb} GB, got {verdict:?}"
+            );
+            let text = verdict.refusal_lines().join("\n");
+            assert!(text.contains("1.3 GB of history"), "text was:\n{text}");
+            assert!(
+                text.contains("the bytes of history decide it"),
+                "the refusal has to name the term that decided it: {text}"
+            );
+        }
+        assert!(
+            matches!(
+                verdict_for(kin, 32 * 1024 * 1024 * 1024),
+                BudgetVerdict::Tight { .. }
+            ),
+            "kin on 32 GB is close and says so"
+        );
+        // And the term does not make the two repositories that fit speak.
+        for (name, commits, files, bytes, _) in MEASURED_HISTORIES {
+            if name == "kin" {
+                continue;
+            }
+            let verdict = verdict_for(history(commits, files, bytes), 16 * 1024 * 1024 * 1024);
+            assert!(
+                !verdict.refuses(),
+                "{name} converts on 16 GB and must not be refused there, got {verdict:?}"
+            );
+        }
+    }
+
+    /// The history term has to be a floor on every conversion it was read
+    /// off, including the one it was read off tightest.
+    #[test]
+    fn the_history_term_floors_every_measured_history() {
+        for (name, commits, files, bytes, held) in MEASURED_HISTORIES {
+            let forecast = history(commits, files, bytes).forecast_peak_bytes();
+            assert!(
+                forecast <= held,
+                "{name}: forecast {forecast} exceeds the {held} it held, so the history term is \
+                 no longer a floor"
+            );
+        }
+    }
+
+    /// facebook/react at its September 2026 pin, as the survey would count it
+    /// on a normal clone: refused on 16 GB, spoken about on 32, and admitted
+    /// where the machine has room, in place of a 582.5 GB refusal everywhere.
+    #[test]
+    fn react_is_forecast_from_its_history_rather_than_refused_everywhere() {
+        let react = history(21_679, 7_213, 2_187_539_173);
+        let (forecast, term) = react.forecast();
+        assert_eq!(term, DecidingTerm::HistoryBytes);
+        assert!(
+            forecast > 41 * 1000 * 1000 * 1000 && forecast < 42 * 1000 * 1000 * 1000,
+            "react forecast {forecast}"
+        );
+        assert!(verdict_for(react, 16 * 1024 * 1024 * 1024).refuses());
+        assert!(matches!(
+            verdict_for(react, 32 * 1024 * 1024 * 1024),
+            BudgetVerdict::Tight { .. }
+        ));
+        assert!(!verdict_for(react, 128 * 1024 * 1024 * 1024).refuses());
     }
 
     #[test]
@@ -1125,6 +1357,11 @@ mod tests {
         let text = verdict.refusal_lines().join("\n");
         assert!(text.contains("40000 commits"), "text was:\n{text}");
         assert!(text.contains("1676 tracked files"), "text was:\n{text}");
+        assert!(text.contains("of history"), "text was:\n{text}");
+        assert!(
+            text.contains("the commit count decides it"),
+            "the refusal has to name the term that decided it: {text}"
+        );
         assert!(text.contains("8.0 GB"), "text was:\n{text}");
         assert!(
             text.contains("entity and relation deltas"),
@@ -1156,11 +1393,16 @@ mod tests {
     /// forecast is legitimately not a refusal.
     #[test]
     fn an_overflowing_survey_saturates_instead_of_wrapping() {
-        let huge = survey(u64::MAX, u64::MAX);
+        let huge = history(u64::MAX, u64::MAX, u64::MAX);
         assert_eq!(
             huge.forecast_peak_bytes(),
             u64::MAX,
             "the forecast wrapped instead of saturating"
+        );
+        assert_eq!(
+            history(1, 1, u64::MAX).forecast_peak_bytes(),
+            u64::MAX,
+            "the history term wrapped instead of saturating"
         );
         assert_eq!(
             huge.daemon_load_bytes(),
@@ -1193,6 +1435,11 @@ mod tests {
             survey(1_000, 10_000).forecast_peak_bytes() > wide,
             "width did not move a forecast whose width term does win"
         );
+        let heavy = history(1_000, 1, 1_000_000_000).forecast_peak_bytes();
+        assert!(
+            history(1_000, 1, 2_000_000_000).forecast_peak_bytes() > heavy,
+            "history bytes did not move a forecast whose history term does win"
+        );
     }
 
     /// The forecast never exceeds what a conversion really held, or it is not
@@ -1218,30 +1465,57 @@ mod tests {
     fn the_forecast_is_a_floor_on_every_conversion_it_was_measured_against() {
         const CEILING: u64 = 8 * 1024 * 1024 * 1024;
         // (name, commits, tracked files, bytes actually held)
+        // (name, commits, tracked files, reachable history bytes where they
+        // were counted, bytes actually held). The 0.6.0 rows predate the
+        // history count and carry zero for it, which keeps them floors.
         let measured = [
-            ("axum 0.6.0", 1_983_u64, 503_u64, 4_067_635_200_u64),
-            ("flask 0.6.0", 5_556, 236, 6_731_427_840),
-            ("requests 0.6.0", 6_493, 130, 8_589_705_216),
-            ("requests 0.7.3", 6_493, 130, 4_800_708_608),
+            ("axum 0.6.0", 1_983_u64, 503_u64, 0_u64, 4_067_635_200_u64),
+            ("flask 0.6.0", 5_556, 236, 0, 6_731_427_840),
+            ("requests 0.6.0", 6_493, 130, 0, 8_589_705_216),
+            ("requests 0.7.3", 6_493, 130, 112_476_293, 4_800_708_608),
             // The frontier walk's own bytes, resident set sampled from outside
             // the process once a second on a 128 GB host, without enrichment.
-            // requests ran beside its v0.7.3 twin under the same pressure.
-            ("requests frontier walk", 6_493, 130, 5_568_004_096),
-            ("hiredis frontier walk", 1_141, 79, 1_526_988_800),
-            ("kin frontier walk", 2_924, 1_033, 13_266_026_496),
+            // requests ran beside its v0.7.3 twin under the same pressure; kin
+            // is its whole-run peak, reached opening the finished store.
+            (
+                "requests frontier walk",
+                6_493,
+                130,
+                112_476_293,
+                5_568_004_096,
+            ),
+            (
+                "hiredis frontier walk",
+                1_141,
+                79,
+                27_715_552,
+                1_538_834_432,
+            ),
+            (
+                "kin frontier walk",
+                2_924,
+                1_033,
+                1_400_991_245,
+                27_428_945_920,
+            ),
         ];
-        for (name, commits, artifacts, held_bytes) in measured {
-            let survey = survey(commits, artifacts);
+        for (name, commits, artifacts, history_bytes, held_bytes) in measured {
+            let survey = history(commits, artifacts, history_bytes);
             let forecast = survey.forecast_peak_bytes();
             assert!(
                 forecast <= held_bytes,
                 "{name}: forecast {forecast} exceeds the {held_bytes} it really held, so the \
                  forecast is not a floor"
             );
+            // Every row converted, and every row but kin fits an 8 GiB
+            // ceiling; kin's row is the one the history term exists to refuse
+            // there, since it held 25.5 GiB.
             let verdict = verdict_for(survey, CEILING);
-            assert!(
-                !verdict.refuses(),
-                "{name}: converted under 8 GiB and must not be refused there, got {verdict:?}"
+            assert_eq!(
+                verdict.refuses(),
+                name == "kin frontier walk",
+                "{name}: refuses() is {} under 8 GiB, got {verdict:?}",
+                verdict.refuses()
             );
         }
     }

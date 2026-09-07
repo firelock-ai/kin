@@ -313,23 +313,25 @@ against it, so what a conversion needs follows the commits and the width of the
 tree it admits rather than the two multiplied together. Every commit still lands
 in one graph, each building on the last. On a history too long for the machine,
 Kin still refuses in words with a memory forecast, before it captures anything,
-rather than dying partway; the forecast counts commits and tracked files, and
+rather than dying partway; the forecast counts commits, tracked files and the
+bytes of history reachable from HEAD, names which of the three decided it, and
 its coefficients are floors read off measured conversions, a floor and not a
-predictor, because the change one commit carries varies sixfold across the
-repositories measured. Measured against the release npm serves today, without
+predictor: across the repositories measured a conversion held between one and
+three times its floor. Measured against the release npm serves today, without
 enrichment: `redis/hiredis`, 1,141 commits
 over 79 files, admits in 74 seconds at a 1.4 GB peak and leaves a 256 MB store;
 `psf/requests`, 6,497 commits over 130 files, admits in about ten minutes at a
 5.2 GB peak; kin's own repository, 2,924 commits over 1,033 files, admits in
 33 minutes at a 25.5 GB peak, reached when the finished store is opened for
-its final proof, which the forecast does not predict, so it admits on 32 GB
-and on 8 or 16 GB it is not refused and would be killed partway, because its
-commits carry far more entity change each than requests' and that change,
-held across the conversion and then loaded from the store, is now what sets
-the peak; a normal clone of `facebook/react`,
-21,679 commits over 7,213 files, is no longer refused by the forecast, and its
-peak is set by the same per-commit change, so treat it as a repository for a
-machine with tens of gigabytes free until its measured number is published. A shallow clone is not the way around a refusal:
+its final proof, so it admits on 32 GB and is refused on 8 and 16 GB with its
+1.3 GB of history named as the reason, because its commits carry far more
+entity change each than requests' and that change, held across the
+conversion and then loaded from the store, is what sets the peak; a normal
+clone of `facebook/react`,
+21,679 commits over 7,213 files, is forecast at 41.6 GB from its 2.2 GB of
+history, refused on 16 GB, warned about on 32, and admitted where the machine
+has room, in place of a 582.5 GB refusal everywhere; its measured peak
+follows once its run completes. A shallow clone is not the way around a refusal:
 `git clone --depth` leaves a boundary Kin refuses, because a history whose
 oldest commits have absent parents cannot be captured losslessly. There is no
 partial-history mode.

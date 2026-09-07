@@ -96,7 +96,7 @@
     {
       "file": "crates/kin-git/src/semantic_import.rs",
       "function": "resolve_tree_transition",
-      "digest": "sha256:d1171aeef95c7608495ac21c08b7156cd025e588489b0f2dd38bb0be838aedbc",
+      "digest": "sha256:975042e4e2bb219d78c9a84891e5d72fbf8cd7a440aff77c9dd36c4ce4c75b74",
       "reason": "Assigns the stable artifact identities trees and entities are keyed by across the imported history, now from the leaves that differ between a commit's tree and its first parent's rather than from the whole tree, under the rule assign_artifact_identities applied. Reassignment here silently repoints every historical file.",
       "owner": "kin-git"
     },
