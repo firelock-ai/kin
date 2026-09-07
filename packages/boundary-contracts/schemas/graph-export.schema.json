@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "kin://contracts/graph-export",
-  "description": "The drawable projection of a Kin repository graph, as served by GET /graph/export on the daemon and by `kin graph export`. Nodes and links are what a renderer draws; the counts describe the population the sample was drawn from, so a consumer can say how much of the graph it is showing.",
+  "description": "The drawable projection of a Kin repository graph, as served by GET /graph/export and GET /repos/{repo_id}/graph/export on the daemon, and by `kin graph export`. Nodes and links are what a renderer draws; the counts describe the population the sample was drawn from, so a consumer can say how much of the graph it is showing.",
   "type": "object",
   "required": [
     "root_hash",

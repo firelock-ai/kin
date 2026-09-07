@@ -1666,6 +1666,33 @@ fn extract_js_node(
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
                     });
+                    // The exported value's body, which nothing else walks.
+                    //
+                    // Every other arm above pairs its entity with a call walk
+                    // over the subtree that entity owns. This one minted the
+                    // entity and stopped, so a module whose default export is
+                    // an expression rather than a declaration contributed no
+                    // Calls edge at all, however the expression was written.
+                    // Measured on axios at b8d67bbb: `lib/adapters/xhr.js` is
+                    // `export default isXHRAdapterSupported && function (config)
+                    // {...}` and yielded 0 call edges for the whole file, and
+                    // `lib/adapters/http.js` is the same shape and yielded none
+                    // of the 7 sites inside its adapter body while still
+                    // yielding 95 from the declarations above it.
+                    //
+                    // Depth is not what decides this and a fix keyed on depth
+                    // would be aimed at the wrong thing: the walk below already
+                    // recurses without limit, and axios's own
+                    // `lib/adapters/fetch.js` resolves a call three function
+                    // levels down inside a promise executor because its
+                    // enclosing declaration is a `lexical_declaration` this
+                    // match has an arm for.
+                    //
+                    // `default` as the context name because that is the entity
+                    // just pushed; a relation naming the inner function would
+                    // name something the entity set does not hold, and the
+                    // linker resolves a relation's source by (file, name).
+                    extract_calls_from_context(&val, source, "default", None, relations);
                 }
             }
         }
