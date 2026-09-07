@@ -320,11 +320,13 @@ repositories measured. Measured against the release npm serves today, without
 enrichment: `redis/hiredis`, 1,141 commits
 over 79 files, admits in 74 seconds at a 1.4 GB peak and leaves a 256 MB store;
 `psf/requests`, 6,497 commits over 130 files, admits in about ten minutes at a
-5.2 GB peak; kin's own repository, 2,924 commits over 1,033 files, admits at a
-12.4 GB peak, which the forecast does not predict, so it admits on 16 and 32 GB
-and on 8 GB it is not refused and would be killed partway, because its commits
-carry far more entity change each than requests' and that change, held across
-the conversion, is now what sets the peak; a normal clone of `facebook/react`,
+5.2 GB peak; kin's own repository, 2,924 commits over 1,033 files, admits in
+33 minutes at a 25.5 GB peak, reached when the finished store is opened for
+its final proof, which the forecast does not predict, so it admits on 32 GB
+and on 8 or 16 GB it is not refused and would be killed partway, because its
+commits carry far more entity change each than requests' and that change,
+held across the conversion and then loaded from the store, is now what sets
+the peak; a normal clone of `facebook/react`,
 21,679 commits over 7,213 files, is no longer refused by the forecast, and its
 peak is set by the same per-commit change, so treat it as a repository for a
 machine with tens of gigabytes free until its measured number is published. A shallow clone is not the way around a refusal:
