@@ -69,6 +69,30 @@ function describeFailedRelease(marker) {
   return `The Release run that owns it is ${url || `run ${id}`} (id ${id}).`;
 }
 
+// The one hold reason that means the blocking tag does not exist.
+//
+// Both exits this body used to name unconditionally assume the tag is real.
+// Recovery retries the Release run that tag produced, and abandonment records
+// the tag in `scripts/abandoned-release-tags.json`, whose entries carry a `sha`
+// and a `failed_release_run_id`. A tag nobody ever created has neither, so a
+// reader who tries either one spends the trip and arrives nowhere.
+//
+// The train already tells the two apart and this reader used to throw that away.
+// `.github/workflows/release-train.yml` fetches every tag
+// (`git fetch origin "+refs/tags/*:refs/tags/*"`) BEFORE it decides, and only
+// then writes this reason, under `if ! git rev-parse --verify --quiet
+// "${tag}^{commit}"`. So the code is a proof taken against a complete tag set
+// that the tag this alarm names was never cut. `tag_not_finalized`, the other
+// reason that reaches this body, is written when a tag does exist and is not
+// GitHub Latest, and both original exits apply there unchanged.
+//
+// This is not a cosmetic wrong. On 2026-09-07 the alarm fired truthfully and on
+// time, and a captain and a lane still spent about forty minutes establishing
+// that a workflow switch was off, because the body sent them to a Release run
+// that had never started and to a tag that had never been created. The real
+// cause was reachable in two API calls that nothing told them to make.
+export const STAGED_REASON = "tag_staged";
+
 export function buildBody(marker, consecutive, threshold) {
   const drift = marker.drift;
   const blocking = marker.blocking_tag || "an unresolved tag";
@@ -88,24 +112,76 @@ export function buildBody(marker, consecutive, threshold) {
   lines.push(`Hold reason reported by the train: ${marker.detail || marker.reason || "unreported"}.`);
   lines.push(`Most recent train run: ${marker.run_url || `run ${marker.run_id ?? "unknown"}`}.`);
   lines.push("");
-  lines.push(describeFailedRelease(marker));
-  lines.push("");
-  lines.push("There are two ways out, and both of them move the rail.");
-  lines.push("");
-  lines.push(
-    "Recover the release. If the defect that blocks the tag can still be " +
-      "reached, fix it and let Release Recovery retry the tag. A tag run " +
-      "resolves its workflows from the tag, so confirm the fix is reachable " +
-      "from the tagged tree before spending a retry on it.",
-  );
-  lines.push("");
-  lines.push(
-    "Record the abandonment. If the defect is frozen into the tag, add the " +
-      "tag to `scripts/abandoned-release-tags.json` with all five required " +
-      "fields, prove the entry with `python3 " +
-      "scripts/select-admissible-release-tag.py`, and land it. The train steps " +
-      "past a tag only on a reviewed record.",
-  );
+  if (marker.reason === STAGED_REASON) {
+    lines.push(
+      `\`${blocking}\` was never cut. The train reports it as staged on main, ` +
+        "which it writes only after fetching every tag and finding that ref " +
+        "absent. This is a tag that does not exist, not a tag whose release " +
+        "failed.",
+    );
+    lines.push("");
+    lines.push(
+      "The two usual exits do not apply, and both will waste the trip. " +
+        "Recovery retries the Release run that owns a tag, and no Release run " +
+        "has ever started for this one. Abandonment records a tag in " +
+        "`scripts/abandoned-release-tags.json`, whose entries carry a `sha` " +
+        "and a `failed_release_run_id` that an uncut tag cannot supply.",
+    );
+    lines.push("");
+    lines.push(
+      "What is stuck is candidate selection. " +
+        "`.github/workflows/release-tag.yml` tags the newest reviewed main " +
+        "commit in the staged version's range carrying " +
+        "`evidence/<sha>/preflight.json` on the `release-evidence` branch. " +
+        "With no such commit it reports having no candidate and exits 0, " +
+        "which is why every mint run reads green while the rail stands still.",
+    );
+    lines.push("");
+    lines.push(
+      "The only automated publisher of that record is `Release Cut`, " +
+        "`.github/workflows/release-cut.yml`, which this fleet operates as a " +
+        "switch rather than leaving on. Read these two before looking " +
+        "anywhere else:",
+    );
+    lines.push("");
+    lines.push("```");
+    lines.push(
+      "gh api repos/{owner}/{repo}/actions/workflows/release-cut.yml --jq .state",
+    );
+    lines.push(
+      'gh api "repos/{owner}/{repo}/git/trees/release-evidence?recursive=1" \\',
+    );
+    lines.push(
+      "  --jq '[.tree[].path | select(endswith(\"preflight.json\"))] | length'",
+    );
+    lines.push("```");
+    lines.push("");
+    lines.push(
+      "`disabled_manually` is the whole answer: no candidate can exist until " +
+        "that workflow is enabled. Enabling it opens a window in which the " +
+        "cut proves whatever is newest and green, so it is a decision to take " +
+        "deliberately rather than an automatic repair.",
+    );
+  } else {
+    lines.push(describeFailedRelease(marker));
+    lines.push("");
+    lines.push("There are two ways out, and both of them move the rail.");
+    lines.push("");
+    lines.push(
+      "Recover the release. If the defect that blocks the tag can still be " +
+        "reached, fix it and let Release Recovery retry the tag. A tag run " +
+        "resolves its workflows from the tag, so confirm the fix is reachable " +
+        "from the tagged tree before spending a retry on it.",
+    );
+    lines.push("");
+    lines.push(
+      "Record the abandonment. If the defect is frozen into the tag, add the " +
+        "tag to `scripts/abandoned-release-tags.json` with all five required " +
+        "fields, prove the entry with `python3 " +
+        "scripts/select-admissible-release-tag.py`, and land it. The train steps " +
+        "past a tag only on a reviewed record.",
+    );
+  }
   lines.push("");
   lines.push(
     `This issue closes itself on the next cycle that mints, and it stays quiet ` +

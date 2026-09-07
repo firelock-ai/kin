@@ -37,6 +37,20 @@ function held({ drift = 9, blocking = 'v0.5.18', latest = 'v0.5.17' } = {}) {
   };
 }
 
+// A hold whose blocking tag does not exist. The train writes `tag_staged` only
+// after fetching every tag and failing to resolve this one, so the reason code
+// is the whole discriminator and no other field has to be consulted.
+function staged({ drift = 7, blocking = 'v0.7.3', latest = 'v0.7.2' } = {}) {
+  return {
+    ...held({ drift, blocking, latest }),
+    reason: 'tag_staged',
+    detail: `${blocking} is already staged on main; tag reconciliation owns the next transition`,
+    base_tag: latest,
+    failed_release_run_id: null,
+    failed_release_run_url: null,
+  };
+}
+
 function clear() {
   return {
     schema: MARKER_SCHEMA,
@@ -172,6 +186,41 @@ test('the body names both exits and never uses an em dash', () => {
   assert.match(body, /abandoned-release-tags\.json/);
   assert.match(body, /Release Recovery retry the tag/);
   assert.doesNotMatch(body, /—/);
+});
+
+test('a tag that was never cut says so, and points at the publisher rather than at two exits that need a tag', () => {
+  const markers = [staged(), staged(), staged(), staged()];
+  const { body } = decide({ markers, issue: null });
+  assert.match(body, /`v0\.7\.3` was never cut/);
+  assert.match(body, /release-cut\.yml --jq \.state/);
+  assert.match(body, /evidence\/<sha>\/preflight\.json/);
+  // The sentence that sent a reader down two dead ends. Its absence is the
+  // whole behaviour, so it is asserted rather than left to the eye.
+  assert.doesNotMatch(body, /There are two ways out/);
+  assert.doesNotMatch(body, /Release Recovery retry the tag/);
+  assert.doesNotMatch(body, /—/);
+});
+
+test('a tag that exists still gets both original exits, so the staged branch cannot swallow the body everyone reads', () => {
+  const markers = [held(), held(), held(), held()];
+  const { body } = decide({ markers, issue: null });
+  assert.match(body, /There are two ways out/);
+  assert.match(body, /Release Recovery retry the tag/);
+  assert.match(body, /abandoned-release-tags\.json/);
+  assert.doesNotMatch(body, /was never cut/);
+  assert.doesNotMatch(body, /release-cut\.yml/);
+});
+
+test('an existing tag whose failed Release run could not be found is not mistaken for a tag that was never cut', () => {
+  // The trap this guards. A `tag_not_finalized` marker can also carry a null
+  // failed run id, because the train's lookup is allowed to come back empty.
+  // Keying the branch on that null instead of on the reason code would hand
+  // this marker the staged body and tell a captain a real tag does not exist.
+  const marker = { ...held(), failed_release_run_id: null, failed_release_run_url: null };
+  const { body } = decide({ markers: [marker, marker, marker, marker], issue: null });
+  assert.match(body, /No failed Release run was found/);
+  assert.doesNotMatch(body, /was never cut/);
+  assert.doesNotMatch(body, /release-cut\.yml/);
 });
 
 test('the command line agrees with the exported decision', () => {
