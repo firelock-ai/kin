@@ -99,6 +99,32 @@ way still admits successfully. Init reports the rewritten files under `Uncommitt
 worktree state:` rather than treating them as your edits. To make the worktree match
 what Kin admitted, run `git config --global core.autocrlf false` and clone again.
 
+### Homebrew
+
+A Homebrew tap tracks the same release channel:
+
+```sh
+brew install firelock-ai/kin/kin
+```
+
+The tap's formula is generated rather than hand-maintained. Its version and its
+per-platform SHA-256 are regenerated from each Kin release by
+`update-formula.yml` in the tap repository, on a dispatch the release itself
+sends, with a six-hourly reconcile that self-heals a missed one. That is why the
+checksum Homebrew verifies is the one published beside the archive rather than a
+separately curated copy of it. Confirm what you installed with `kin --version`,
+as you should on any install path.
+
+### Manual archive
+
+For manual installation, each archive and its `.sha256` file is published under
+`https://github.com/firelock-ai/kin/releases/latest/download/`. The moving asset
+names are `kin-macos-aarch64`, `kin-macos-x86_64`, `kin-linux-aarch64`,
+`kin-linux-x86_64`, and `kin-windows-x86_64`; use the `.tar.gz` suffix for the
+macOS and Linux archives and the `.zip` suffix for Windows, as shown on the
+latest release page. The Windows zip is also what the PowerShell installer and
+the npm launcher fetch.
+
 ### Installer options
 
 Configure the installers with environment variables (supported by both `install.sh`
@@ -788,3 +814,19 @@ exist and cannot be inside the Kin working repository. Working-file edits and
 the ambient `.git/` object store are not export inputs. Exact publication is
 currently supported on Unix hosts; other hosts refuse before creating the
 export until an equivalent retained-handle namespace transaction is available.
+
+### Removing a setup-managed install
+
+To remove only setup-managed integrations, run `kin setup uninstall`. For the
+default managed root (`~/.kin`), `kin setup uninstall --all` also stops all Kin
+daemons, removes exact legacy installer PATH blocks, and recursively deletes the
+managed install (`--dry-run` previews it). A custom `KIN_HOME` is never removed
+recursively: first run the ledger-scoped uninstall, then review and remove that
+directory explicitly. Modified setup-owned slices block full removal unless you
+add `--force`, so uninstall never silently overwrites a user's edited client or
+shell configuration. On Windows, the CLI schedules its locked install directory
+for deletion immediately after the running process exits. Windows intentionally
+retains one inert, current-user-only sibling authority sidecar; keeping that lock
+identity stable prevents a crash or concurrent future install from creating two
+independent mutation authorities. The CLI and JSON result disclose this retained
+coordination metadata rather than claiming zero residual bytes.
