@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/kin-banner-2026.png" alt="Kin, the semantic system of record for AI-written software" width="100%" />
+  <img src="docs/assets/kin-banner-2026.png" alt="Kin, the system of record for AI-written software" width="100%" />
 </p>
 
 <div align="center">
