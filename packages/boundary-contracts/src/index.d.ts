@@ -994,9 +994,10 @@ export interface RepoImportedWorkSummary {
 /**
  * The drawable projection of a Kin repository graph.
  *
- * Served by `GET /graph/export` on the daemon and by `kin graph export`. The
- * counts describe the population the sample was drawn from, not what was
- * drawn, so a consumer can say how much of the graph it is showing.
+ * Served by `GET /graph/export` and `GET /repos/{repo_id}/graph/export` on the
+ * daemon, and by `kin graph export`. The counts describe the population the
+ * sample was drawn from, not what was drawn, so a consumer can say how much of
+ * the graph it is showing.
  */
 export interface GraphExportNode {
   /** Entity UUID. */

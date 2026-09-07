@@ -55,6 +55,27 @@ its endpoints is counted once.
 A session holding a temporal scope exports the graph that scope names, the same
 resolution `/graph/bootstrap` uses.
 
+### Addressing one repository
+
+`GET /repos/{repo_id}/graph/export` is the same export over the graph a repo id
+names. Same parameters, same caps, same response, so a consumer types one shape
+and picks the route by what it is holding.
+
+```
+curl "$KIN_DAEMON_URL/repos/$REPO_ID/graph/export?limit=1400"
+```
+
+Reach for it when you hold a repository id and no session. A daemon serving
+many repositories cannot answer `/graph/export` for one of them, because that
+route resolves whichever graph the request's session names, and a control plane
+drawing a repository has no session to name it with. The id is the one
+`GET /health` advertises, and it is the same id every other `/repos/{repo_id}`
+route takes. An id this daemon does not serve answers 404 naming both the served
+and the requested id, which is an addressing mismatch rather than a failure.
+
+No session scope is read on this route. A repository-addressed read is answered
+from the graph that id names.
+
 ## The sampling rule
 
 A repository graph is bigger than any renderer wants. The cap is applied server

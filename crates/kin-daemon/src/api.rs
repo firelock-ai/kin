@@ -2228,6 +2228,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/repos", get(list_repos))
         .route("/repos/{repo_id}/health", get(repo_health))
         .route("/repos/{repo_id}/entities", get(repo_entities))
+        .route("/repos/{repo_id}/graph/export", get(repo_graph_export))
         .route("/repos/{repo_id}/files", get(repo_files))
         .route("/repos/{repo_id}/blob", get(crate::repo_blob::repo_blob))
         .route(
@@ -7698,7 +7699,8 @@ async fn graph_bootstrap(
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes))
 }
 
-/// Query parameters for `GET /graph/export`.
+/// Query parameters for `GET /graph/export` and
+/// `GET /repos/{repo_id}/graph/export`, which take the same ones.
 #[derive(Debug, Deserialize)]
 struct GraphExportParams {
     /// Node cap. `0` asks for the whole graph; absent uses the default cap.
@@ -7730,10 +7732,45 @@ async fn graph_export(
     Query(params): Query<GraphExportParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    use kin_cli::commands::graph_export as export;
-
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    export_graph_projection(&state, graph, params).await
+}
+
+/// GET /repos/{repo_id}/graph/export: the same drawable projection, addressed
+/// by repository rather than by session.
+///
+/// A daemon serving many repositories cannot answer from the session route. A
+/// control plane asking for one repository's graph holds a repo id and no
+/// session, and `/graph/export` resolves whatever graph the request's session
+/// names, which is not the repository being asked about. This resolves the
+/// graph the id names and then runs the same projection, so a consumer picks
+/// the route by what it is holding and types one response shape for both.
+///
+/// No session scope is read here, deliberately. A repository-addressed read is
+/// answered from the graph that id names, the same rule every other
+/// `/repos/{repo_id}` route follows.
+async fn repo_graph_export(
+    Path(repo_id): Path<String>,
+    Query(params): Query<GraphExportParams>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let graph = repo_scoped_graph(&state, &repo_id).await?;
+    export_graph_projection(&state, graph, params).await
+}
+
+/// Project one already-resolved graph into the export payload.
+///
+/// Both export routes come through here rather than each assembling a payload
+/// of its own. The response shape is a contract a consumer types once, and a
+/// copied handler is exactly how a second route ends up serving a shape that is
+/// nearly the same.
+async fn export_graph_projection(
+    state: &DaemonState,
+    graph: Arc<kin_db::InMemoryGraph>,
+    params: GraphExportParams,
+) -> Result<Json<kin_cli::commands::graph_export::GraphExportPayload>, (StatusCode, String)> {
+    use kin_cli::commands::graph_export as export;
 
     let options = export::ExportOptions {
         limit: match params.limit {
@@ -34725,6 +34762,7 @@ mod tests {
 
         for path in [
             format!("/repos/{repo_id}/entities"),
+            format!("/repos/{repo_id}/graph/export"),
             format!("/repos/{repo_id}/refs"),
             format!("/repos/{repo_id}/files"),
             format!("/repos/{repo_id}/history"),
@@ -34771,6 +34809,7 @@ mod tests {
         for path in [
             format!("/repos/{unserved}/health"),
             format!("/repos/{unserved}/entities"),
+            format!("/repos/{unserved}/graph/export"),
             format!("/repos/{unserved}/provenance/verify"),
             format!("/repos/{unserved}/files"),
             format!("/repos/{unserved}/refs"),
@@ -41915,6 +41954,141 @@ mod tests {
         assert!(
             second.seq >= emitted.seq,
             "an export taken after the event must include it in its cut"
+        );
+    }
+
+    /// Ask a repository-addressed `/graph/export` and read its payload back.
+    async fn repo_export_payload(
+        state: Arc<DaemonState>,
+        repo_id: &str,
+        query: &str,
+    ) -> kin_cli::commands::graph_export::GraphExportPayload {
+        let uri = if query.is_empty() {
+            format!("/repos/{repo_id}/graph/export")
+        } else {
+            format!("/repos/{repo_id}/graph/export?{query}")
+        };
+        let (status, body) = repo_route(state, &uri).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET {uri}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The read the session route cannot serve: one named repository's own
+    /// entity-to-entity relations, in one request.
+    ///
+    /// A control plane drawing a repository holds a repo id and no session, and
+    /// `/graph/export` answers from whatever graph the request's session
+    /// resolves to. Without this route the only repository-addressed graph read
+    /// is `/repos/{repo_id}/entities`, which carries no relations at all, so a
+    /// renderer has nothing to draw an edge from except the file each entity
+    /// happens to sit in.
+    #[tokio::test]
+    async fn a_repo_scoped_export_draws_the_named_repositorys_relations() {
+        let state = test_state();
+        let repo_id = advertised_repo_id(Arc::clone(&state)).await;
+        let caller = test_entity("caller", "src/a.py");
+        let callee = test_entity("callee", "src/b.py");
+        state.graph.upsert_entity(&caller).unwrap();
+        state.graph.upsert_entity(&callee).unwrap();
+        link(&state, &caller, &callee, RelationKind::Calls);
+
+        let payload = repo_export_payload(Arc::clone(&state), &repo_id, "").await;
+
+        assert_eq!(payload.nodes.len(), 2);
+        assert_eq!(payload.entity_count, 2);
+        assert_eq!(payload.relation_count, 1);
+        assert!(!payload.sampled);
+        assert!(
+            !payload.root_hash.is_empty(),
+            "without a root hash a client cannot pair this with the event stream"
+        );
+        assert_eq!(
+            payload.links.len(),
+            1,
+            "the entity-to-entity edge is the whole point of this route"
+        );
+        assert_eq!(payload.links[0].kind, "Calls");
+        let caller_id = caller.id.to_string();
+        let callee_id = callee.id.to_string();
+        let endpoints = [
+            payload.links[0].source.as_str(),
+            payload.links[0].target.as_str(),
+        ];
+        assert!(
+            endpoints.contains(&caller_id.as_str()) && endpoints.contains(&callee_id.as_str()),
+            "the edge must join the two entities that were linked: {endpoints:?}"
+        );
+        for node in &payload.nodes {
+            assert_eq!(
+                node.degree, 1,
+                "both endpoints of the one edge have degree 1"
+            );
+        }
+    }
+
+    /// The cap is the same cap, applied server side, and the counts still
+    /// describe the population rather than the drawing.
+    #[tokio::test]
+    async fn a_repo_scoped_export_caps_and_reports_what_it_sampled_from() {
+        let state = test_state();
+        let repo_id = advertised_repo_id(Arc::clone(&state)).await;
+        for index in 0..6 {
+            let entity = test_entity(&format!("fn{index}"), &format!("src/m{index}.py"));
+            state.graph.upsert_entity(&entity).unwrap();
+        }
+
+        let capped = repo_export_payload(Arc::clone(&state), &repo_id, "limit=2").await;
+        assert_eq!(capped.nodes.len(), 2);
+        assert!(capped.sampled);
+        assert_eq!(capped.limit, Some(2));
+        assert_eq!(
+            capped.entity_count, 6,
+            "the count is the population, not the drawing"
+        );
+
+        let uncapped = repo_export_payload(Arc::clone(&state), &repo_id, "limit=0").await;
+        assert_eq!(uncapped.nodes.len(), 6);
+        assert!(!uncapped.sampled);
+        assert_eq!(uncapped.limit, None);
+    }
+
+    /// One shape for both routes, so a consumer types the response once.
+    ///
+    /// Over the same graph the two exports differ in nothing but `seq`, which
+    /// is a cut position in the event stream and moves on its own. A copied
+    /// handler would pass every assertion above and still drift here.
+    #[tokio::test]
+    async fn both_export_routes_answer_one_shape() {
+        let state = test_state();
+        let repo_id = advertised_repo_id(Arc::clone(&state)).await;
+        let caller = test_entity("caller", "src/a.py");
+        let callee = test_entity("callee", "src/b.py");
+        state.graph.upsert_entity(&caller).unwrap();
+        state.graph.upsert_entity(&callee).unwrap();
+        link(&state, &caller, &callee, RelationKind::Calls);
+
+        // Uncapped, so both payloads sort their nodes by id and this compares
+        // values rather than two draws of a sample.
+        let query = "limit=0&include=line,signature";
+        let session = export_payload(Arc::clone(&state), query).await;
+        let scoped = repo_export_payload(Arc::clone(&state), &repo_id, query).await;
+
+        let mut session_json = serde_json::to_value(&session).unwrap();
+        let mut scoped_json = serde_json::to_value(&scoped).unwrap();
+        assert!(
+            session_json.get("seq").is_some() && scoped_json.get("seq").is_some(),
+            "both payloads carry the cut position a client resyncs on"
+        );
+        session_json["seq"] = serde_json::Value::Null;
+        scoped_json["seq"] = serde_json::Value::Null;
+        assert_eq!(
+            session_json, scoped_json,
+            "the repo-scoped export must be the session export's shape and values"
         );
     }
 
