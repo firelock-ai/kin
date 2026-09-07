@@ -404,8 +404,9 @@ impl BudgetVerdict {
                  tree it admits, so a wide enough tree sets the peak instead",
                 survey.commits, survey.tracked_artifacts,
             ),
-            "  that figure is a floor, taken from the least any measured conversion needed per \
-             commit and per file, so read it as an order of magnitude rather than as a target"
+            "  that figure is a floor and not a prediction, taken from the least any measured \
+             conversion needed per commit and per file; the change one commit carries varies \
+             sixfold across measured repositories, so a conversion can need several times this"
                 .to_string(),
             format!(
                 "  give it more than {}, on a larger machine or by raising this {}'s memory limit",

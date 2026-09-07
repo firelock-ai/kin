@@ -305,21 +305,32 @@ answer from that same graph. Local repository work runs on your machine.
 
 These are the limits worth knowing before you start.
 
-**Admission holds every commit's tree at once.** `kin init` materializes one
-resolved tree per commit and keeps every one of them, so what a conversion needs
-follows history depth multiplied by tree size. On a history too long for the
-machine, Kin refuses in words with a memory forecast, before it captures
-anything, rather than dying partway. Commits multiplied by tracked files is the
-number that decides it. Measured against the release npm serves today, refusal
-starts somewhere above 6.44 million on a 16 GB machine and 12.88 million on
-32 GB. `redis/hiredis`, 1,390 commits over 79 files, admits in under three
-minutes and leaves a 310 MB store. `axios`, 2,180 commits over 466 files, admits
-in about seven minutes. `facebook/react` is 21,679 commits over 7,213 tracked
-files, which is 156 million, and a normal clone of it is refused. A shallow
-clone is not the way around it: `git clone --depth` leaves a boundary Kin
-refuses, because a
-history whose oldest commits have absent parents cannot be captured losslessly.
-There is no partial-history mode.
+**Admission holds the frontier of history, not every commit's tree.** `kin init`
+walks a repository's commits oldest first and resolves each commit's tree from
+its first parent's and the paths that differ, keeps a hash and a content
+observation in the tree's place, and drops the tree once nothing later resolves
+against it, so what a conversion needs follows the commits and the width of the
+tree it admits rather than the two multiplied together. Every commit still lands
+in one graph, each building on the last. On a history too long for the machine,
+Kin still refuses in words with a memory forecast, before it captures anything,
+rather than dying partway; the forecast counts commits and tracked files, and
+its coefficients are floors read off measured conversions, a floor and not a
+predictor, because the change one commit carries varies sixfold across the
+repositories measured. Measured against the release npm serves today, without
+enrichment: `redis/hiredis`, 1,141 commits
+over 79 files, admits in 74 seconds at a 1.4 GB peak and leaves a 256 MB store;
+`psf/requests`, 6,497 commits over 130 files, admits in about ten minutes at a
+5.2 GB peak; kin's own repository, 2,924 commits over 1,033 files, admits at a
+12.4 GB peak, which the forecast does not predict, so it admits on 16 and 32 GB
+and on 8 GB it is not refused and would be killed partway, because its commits
+carry far more entity change each than requests' and that change, held across
+the conversion, is now what sets the peak; a normal clone of `facebook/react`,
+21,679 commits over 7,213 files, is no longer refused by the forecast, and its
+peak is set by the same per-commit change, so treat it as a repository for a
+machine with tens of gigabytes free until its measured number is published. A shallow clone is not the way around a refusal:
+`git clone --depth` leaves a boundary Kin refuses, because a history whose
+oldest commits have absent parents cannot be captured losslessly. There is no
+partial-history mode.
 
 **Some repositories refuse to import at all.** Repositories carrying submodules
 or Git LFS are refused before admission. Kin does not model submodules yet, so
