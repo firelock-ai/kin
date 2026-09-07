@@ -282,10 +282,11 @@ re-understand what was already understood.
 At some point I started wondering why that structural understanding isn't just
 part of the repository.
 
-Linus said it himself when he made it: it's a stupid content tracker. It only
-tracks what changed. Kin records the software. Everybody is trying to put bolt-ons on top of Git, and I understand
-why. My thesis is that it's the wrong way to store code for the velocity and the
-way we're doing coding in 2026.
+Git is a great content tracker. Linus said it himself when he made it: it's a
+stupid content tracker. It only tracks what changed. Kin records the software.
+Everybody is trying to put bolt-ons on top of Git, and I understand why. My
+thesis is that it's the wrong way to store code for the velocity and the way
+we're doing coding in 2026.
 
 It's like using a paper map versus Google Maps. Same roads either way. One of
 them knows where you are and what connects to what.
@@ -309,11 +310,14 @@ resolved tree per commit and keeps every one of them, so what a conversion needs
 follows history depth multiplied by tree size. On a history too long for the
 machine, Kin refuses in words with a memory forecast, before it captures
 anything, rather than dying partway. Commits multiplied by tracked files is the
-number that decides it, and refusal starts somewhere above 6.44 million on a
-16 GB machine and 12.88 million on 32 GB. `redis/hiredis`, 1,390 commits over 79
-files, admits in under three minutes and leaves a 310 MB store. `facebook/react`
-is 156 million, and a normal clone of it is refused. A shallow clone is not the
-way around it: `git clone --depth` leaves a boundary Kin refuses, because a
+number that decides it. Measured against the release npm serves today, refusal
+starts somewhere above 6.44 million on a 16 GB machine and 12.88 million on
+32 GB. `redis/hiredis`, 1,390 commits over 79 files, admits in under three
+minutes and leaves a 310 MB store. `axios`, 2,180 commits over 466 files, admits
+in about seven minutes. `facebook/react` is 21,679 commits over 7,213 tracked
+files, which is 156 million, and a normal clone of it is refused. A shallow
+clone is not the way around it: `git clone --depth` leaves a boundary Kin
+refuses, because a
 history whose oldest commits have absent parents cannot be captured losslessly.
 There is no partial-history mode.
 
@@ -340,7 +344,7 @@ admitted as content and stays queryable as history and text, but `locate` and
 complete, so treat an empty answer as a question rather than as a proof. You
 still need your compiler, your tests, and your own judgment.
 
-**Your data survives a format change, by policy.** No release will drop an
+**No format change ships without a migration path.** No release will drop an
 existing store without a tested migration path. A repository admitted from Git
 can always be re-admitted from Git. State that exists only in Kin will be
 carried forward by an upgrade command shipped with any format change, or the
