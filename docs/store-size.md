@@ -41,13 +41,14 @@ whose 5.7 MiB object store became a 703.9 MiB store:
 | `kindb/<repo>/snapshots` (the graph snapshot) | 592.9 MiB | 78.6% |
 | `kindb/<repo>/source-blobs` (admitted bodies) | 154.0 MiB | 20.4% |
 | everything else | about 7 MiB | 1.0% |
+| total (by `du`) | 754.2 MiB | 100% |
 
 This breakdown is measured by `du`, which counts allocated disk blocks rather
 than the logical file bytes this page's own walk sums, so it totals 754.2 MiB
-here, above the 703.9 MiB `kin init` itself prints. The two methods measure
-different things and are not meant to be added across columns; a table like
-this one, left unlabeled, is what put a wrong number on this page the first
-time.
+here (v0.7.2, 2026-09-07), above the 703.9 MiB `kin init` itself prints. The
+two methods measure different things and are not meant to be added across
+columns; a table like this one, left unlabeled, is what put a wrong number on
+this page the first time.
 
 **Source blobs.** Git keeps history as zlib-compressed objects packed with
 deltas, so one packfile holds every revision of a file as a base plus a chain of
