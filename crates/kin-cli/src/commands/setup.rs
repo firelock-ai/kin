@@ -1775,6 +1775,74 @@ fn client_write_summary(name: &str, detected: bool, path: &Path) -> String {
     }
 }
 
+/// Which register one client's non-write is reported in.
+///
+/// The two are not decorations of one another. A failure says a person has to
+/// go and look at something; a deferral says the install is on its normal path
+/// and names the command that continues it. Rendering both as a failure is what
+/// FIR-3337 is, and rendering both as a deferral would be worse.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientNotConfigured {
+    /// Nothing is wrong. One command finishes the job.
+    Deferred,
+    /// This client is on the machine and its configuration genuinely failed.
+    Failed,
+}
+
+/// What the wizard prints for a client whose configuration produced no config
+/// file, as the register plus the lines, with no glyph and no indent.
+///
+/// Split out from the printing for the same reason `hosted_followup_lines` is:
+/// the wording is the whole product of this path, and a test that cannot read it
+/// can only check that something was printed.
+fn client_not_configured_lines(
+    name: &str,
+    error: &anyhow::Error,
+) -> (ClientNotConfigured, Vec<String>) {
+    // `downcast_ref` walks the whole context chain, so a caller that adds
+    // context above this error keeps the classification.
+    match error.downcast_ref::<RepoNotInitializedYet>() {
+        Some(deferred) => (
+            ClientNotConfigured::Deferred,
+            vec![
+                format!("{name} is not configured yet: {}", deferred.reason()),
+                deferred.next_action().to_string(),
+            ],
+        ),
+        None => (
+            ClientNotConfigured::Failed,
+            vec![format!("{name} configuration failed: {error}")],
+        ),
+    }
+}
+
+/// The closing next step for clients that are waiting on `kin init`.
+///
+/// The deferred line prints near the top of a first run and the health checklist
+/// is long, so by the time a reader reaches the end of the output that line has
+/// scrolled away. This is the same next action, in the list a first run reads
+/// last. `None` when nothing is waiting, so a run with no deferral says nothing.
+fn deferred_clients_next_step(names: &[String]) -> Option<String> {
+    let (first, rest) = names.split_first()?;
+    let joined = match rest.split_last() {
+        None => first.clone(),
+        Some((last, middle)) => {
+            let mut joined = first.clone();
+            for name in middle {
+                joined.push_str(", ");
+                joined.push_str(name);
+            }
+            joined.push_str(" and ");
+            joined.push_str(last);
+            joined
+        }
+    };
+    Some(format!(
+        "{joined} {} a repository to bind to. Run `kin init`, then `kin setup` again from inside that repository.",
+        if rest.is_empty() { "still needs" } else { "still need" }
+    ))
+}
+
 /// Names of the AI clients setup detects on this machine.
 ///
 /// `kin doctor` reads this rather than keeping its own rule, because the two
@@ -2070,15 +2138,7 @@ fn merge_mcp_config_toml_locked(
 fn configure_codex() -> Result<PathBuf> {
     let home = home_dir()?;
     let target = home.join(".codex").join("config.toml");
-    let cwd = env::current_dir().context("could not determine the current directory")?;
-    let repo_root = crate::commands::managed_config_scope::discover_repo_root()
-        .and_then(|root| root.canonicalize().ok())
-        .with_context(|| {
-            format!(
-                "Codex MCP setup requires an initialized Kin repository; run `kin init` in the target repository and re-run `kin setup` from it (current directory: {})",
-                cwd.display()
-            )
-        })?;
+    let repo_root = current_initialized_setup_repo("Codex CLI")?;
     merge_mcp_config_toml(&target, &repo_root)?;
     Ok(target)
 }
@@ -2107,16 +2167,66 @@ fn configure_windsurf() -> Result<PathBuf> {
     Ok(target)
 }
 
-fn current_initialized_setup_repo(client: &str) -> Result<PathBuf> {
+/// A client whose MCP entry names a repository, asked for before one exists.
+///
+/// Four of the six clients setup configures address a file under the home
+/// directory and never look at a repository. The other two write the repository
+/// path into the client's own config, so `kin init` has to have run before their
+/// entry can be written at all. The install script runs `kin setup` and the
+/// reader runs `kin init` after it, which makes this the ordinary order of a
+/// first install rather than a fault: nothing is broken, nothing was
+/// half-written, and one command finishes the job.
+///
+/// It is a distinct error type rather than a message the wizard matches on,
+/// because a render that classifies by string is one reworded error away from
+/// calling a real failure a deferral, and that direction of mistake is the
+/// expensive one.
+#[derive(Debug)]
+struct RepoNotInitializedYet {
+    client: &'static str,
+    searched_from: PathBuf,
+}
+
+impl RepoNotInitializedYet {
+    /// Why the entry could not be written, with no client name in it, so the
+    /// wizard can put its own label in front and this can also stand alone.
+    fn reason(&self) -> String {
+        format!(
+            "its Kin entry has to name a repository, and there is no Kin repository at {}",
+            self.searched_from.display()
+        )
+    }
+
+    /// The one command that finishes the job, in the reader's own terms.
+    fn next_action(&self) -> &'static str {
+        "Run `kin init` in the repository you want Kin to serve, then `kin setup` again from inside it."
+    }
+}
+
+impl std::fmt::Display for RepoNotInitializedYet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is not configured yet: {}. {}",
+            self.client,
+            self.reason(),
+            self.next_action()
+        )
+    }
+}
+
+impl std::error::Error for RepoNotInitializedYet {}
+
+fn current_initialized_setup_repo(client: &'static str) -> Result<PathBuf> {
     let cwd = env::current_dir().context("could not determine the current directory")?;
     crate::commands::managed_config_scope::discover_repo_root()
         .and_then(|root| root.canonicalize().ok())
         .and_then(|root| canonical_initialized_repo(&root))
-        .with_context(|| {
-            format!(
-                "{client} MCP setup requires an initialized Kin repository; run `kin init` in the target repository and re-run `kin setup` from it (current directory: {})",
-                cwd.display()
-            )
+        .ok_or_else(|| {
+            anyhow::Error::new(RepoNotInitializedYet {
+                client,
+                searched_from: cwd,
+            })
         })
 }
 
@@ -2125,7 +2235,7 @@ fn current_initialized_setup_repo(client: &str) -> Result<PathBuf> {
 /// antigravity-ide path is touched only when it already contains a Kin entry.
 fn configure_antigravity() -> Result<PathBuf> {
     let home = home_dir()?;
-    let repo_root = current_initialized_setup_repo("Antigravity")?;
+    let repo_root = current_initialized_setup_repo("Google Antigravity")?;
     let global = home.join(".gemini").join("config").join("mcp_config.json");
     let legacy = home
         .join(".gemini")
@@ -12235,8 +12345,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     let shell_name = opts.shell.as_deref().unwrap_or_else(|| detect_shell());
     let plan = build_plan(intent, &opts, &assistants, shell_name, interactive)?;
 
-    let configured_assistants =
-        apply_plan(&plan, &assistants, shell_name, !opts.skip_mcp_check).await?;
+    let applied = apply_plan(&plan, &assistants, shell_name, !opts.skip_mcp_check).await?;
 
     print_intent_followups(&plan, interactive, editor_extension_installed);
 
@@ -12258,7 +12367,12 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     let report = crate::commands::health::run_health_checks().await;
     print_human_report(&report, Some("Kin setup"));
 
-    print_next_steps(intent, plan.install_shell_hook, &configured_assistants);
+    print_next_steps(
+        intent,
+        plan.install_shell_hook,
+        &applied.configured_assistants,
+        &applied.deferred_clients,
+    );
 
     Ok(())
 }
@@ -12554,6 +12668,15 @@ fn build_advanced_plan(
     }
 }
 
+/// What an applied [`SetupPlan`] leaves for the closing summary to report.
+struct AppliedSetup {
+    /// One row per client setup tried, carrying the config path it wrote or
+    /// `None` when no config was written, deferral included.
+    configured_assistants: Vec<(String, Option<PathBuf>)>,
+    /// Clients whose binding is waiting on `kin init`, in the order tried.
+    deferred_clients: Vec<String>,
+}
+
 /// Apply a [`SetupPlan`]: install the shell hook, write MCP configs, inject
 /// discovery reminders, and persist the daemon config. Existing config is
 /// detected and the user is told what changes before it is touched.
@@ -12562,7 +12685,7 @@ async fn apply_plan(
     assistants: &[AiAssistant],
     shell_name: &str,
     verify_mcp_round_trip: bool,
-) -> Result<Vec<(String, Option<PathBuf>)>> {
+) -> Result<AppliedSetup> {
     // Shell integration.
     if plan.install_shell_hook {
         let rc_path = shell_rc(shell_name)?;
@@ -12597,6 +12720,9 @@ async fn apply_plan(
 
     // AI client MCP configuration.
     let mut configured_assistants: Vec<(String, Option<PathBuf>)> = Vec::new();
+    // Clients whose binding is waiting on `kin init`, so the closing next steps
+    // can name them after the health checklist has scrolled their own line away.
+    let mut deferred_clients: Vec<String> = Vec::new();
     // Assistant indices whose MCP server this run actually registered. Gates the
     // discovery reminders below so a directive is never written for a client
     // Kin did not wire up.
@@ -12647,11 +12773,26 @@ async fn apply_plan(
                     configured_assistants.push((a.name.to_string(), Some(path)));
                 }
                 Some(Err(e)) => {
-                    println!(
-                        "  {} {} configuration failed: {e}",
-                        style("✗").red(),
-                        a.name
-                    );
+                    let (register, lines) = client_not_configured_lines(a.name, &e);
+                    let mark = match register {
+                        ClientNotConfigured::Deferred => style("→").cyan(),
+                        ClientNotConfigured::Failed => style("✗").red(),
+                    };
+                    for (position, line) in lines.iter().enumerate() {
+                        if position == 0 {
+                            println!("  {mark} {line}");
+                        } else {
+                            println!("      {line}");
+                        }
+                    }
+                    if register == ClientNotConfigured::Deferred {
+                        deferred_clients.push(a.name.to_string());
+                    }
+                    // Recorded as not configured either way. A deferral is a
+                    // quieter register, never a claim that the client is wired
+                    // up: the round-trip proof, the discovery reminder and the
+                    // install ledger below all read this list, and every one of
+                    // them would then assert something that is not on disk.
                     configured_assistants.push((a.name.to_string(), None));
                 }
                 None => {}
@@ -12723,7 +12864,10 @@ async fn apply_plan(
     // and `kin setup uninstall` can remove exactly it.
     record_setup_ledger(plan, shell_name, &written_reminders);
 
-    Ok(configured_assistants)
+    Ok(AppliedSetup {
+        configured_assistants,
+        deferred_clients,
+    })
 }
 
 /// Read the kin MCP server sub-value from a client config, if present.
@@ -13011,6 +13155,7 @@ fn print_next_steps(
     intent: SetupIntent,
     installed_shell: bool,
     configured_assistants: &[(String, Option<PathBuf>)],
+    deferred_clients: &[String],
 ) {
     println!();
     if installed_shell {
@@ -13039,6 +13184,11 @@ fn print_next_steps(
                 .join(", "),
             if missing_servers.len() == 1 { "" } else { "s" }
         );
+    }
+
+    if let Some(waiting) = deferred_clients_next_step(deferred_clients) {
+        println!();
+        println!("  {} {waiting}", style("→").cyan());
     }
 
     let configured_any = configured_assistants.iter().any(|(_, p)| p.is_some());
@@ -17503,6 +17653,180 @@ wait
         assert!(
             absent.contains("/home/u/.claude.json"),
             "the file that was written is still named: {absent}"
+        );
+    }
+
+    /// A first install runs `kin setup` before the reader has run `kin init`,
+    /// and the two clients whose entry names a repository cannot be written
+    /// until one exists. That is the ordinary order, so it renders as a next
+    /// action rather than as a red failure.
+    #[test]
+    fn a_client_waiting_on_kin_init_is_a_next_action_not_a_failure() {
+        let error = anyhow::Error::new(RepoNotInitializedYet {
+            client: "Codex CLI",
+            searched_from: PathBuf::from("/home/u/scratch"),
+        });
+
+        let (register, lines) = client_not_configured_lines("Codex CLI", &error);
+
+        assert_eq!(register, ClientNotConfigured::Deferred);
+        assert_eq!(
+            lines,
+            vec![
+                "Codex CLI is not configured yet: its Kin entry has to name a repository, and there is no Kin repository at /home/u/scratch".to_string(),
+                "Run `kin init` in the repository you want Kin to serve, then `kin setup` again from inside it.".to_string(),
+            ]
+        );
+    }
+
+    /// The other half of the same decision, and the one that matters more: a
+    /// client that is installed and whose configuration actually broke has to
+    /// keep shouting. A change that quiets a real failure is worse than the bug
+    /// it was written to fix.
+    #[test]
+    fn a_client_that_genuinely_broke_still_renders_as_a_failure() {
+        let error = anyhow::anyhow!(
+            "refusing to overwrite /home/u/.codex/config.toml: the existing file is not valid TOML"
+        );
+
+        let (register, lines) = client_not_configured_lines("Codex CLI", &error);
+
+        assert_eq!(register, ClientNotConfigured::Failed);
+        assert_eq!(
+            lines,
+            vec![
+                "Codex CLI configuration failed: refusing to overwrite /home/u/.codex/config.toml: the existing file is not valid TOML".to_string(),
+            ]
+        );
+        assert_eq!(
+            deferred_clients_next_step(&[]),
+            None,
+            "a run with no deferral closes with no line about one"
+        );
+    }
+
+    /// The register is decided by the error's type, never by its words. A
+    /// classification that reads message text is one rewording away from
+    /// calling a real failure a deferral, so a wrapped deferral must still
+    /// classify and a failure that borrows the deferral's vocabulary must not.
+    #[test]
+    fn the_register_is_decided_by_type_and_not_by_wording() {
+        let wrapped = anyhow::Error::new(RepoNotInitializedYet {
+            client: "Google Antigravity",
+            searched_from: PathBuf::from("/home/u/scratch"),
+        })
+        .context("while configuring Google Antigravity");
+        assert_eq!(
+            client_not_configured_lines("Google Antigravity", &wrapped).0,
+            ClientNotConfigured::Deferred,
+            "context above a deferral must not turn it into a failure"
+        );
+
+        let impostor = anyhow::anyhow!(
+            "Codex CLI is not configured yet: there is no Kin repository at /home/u/scratch"
+        );
+        let (register, lines) = client_not_configured_lines("Codex CLI", &impostor);
+        assert_eq!(
+            register,
+            ClientNotConfigured::Failed,
+            "a real failure wearing the deferral's words is still a failure"
+        );
+        assert!(
+            lines[0].starts_with("Codex CLI configuration failed:"),
+            "and it is still rendered as one: {}",
+            lines[0]
+        );
+    }
+
+    /// The deferred line prints near the top of a long first run, so the same
+    /// next action is repeated in the list a reader sees last. One client reads
+    /// as one; two read as two.
+    #[test]
+    fn the_closing_next_step_names_every_client_that_is_waiting() {
+        assert_eq!(
+            deferred_clients_next_step(&["Codex CLI".to_string()]).unwrap(),
+            "Codex CLI still needs a repository to bind to. Run `kin init`, then `kin setup` again from inside that repository."
+        );
+        assert_eq!(
+            deferred_clients_next_step(&[
+                "Codex CLI".to_string(),
+                "Google Antigravity".to_string()
+            ])
+            .unwrap(),
+            "Codex CLI and Google Antigravity still need a repository to bind to. Run `kin init`, then `kin setup` again from inside that repository."
+        );
+        assert_eq!(
+            deferred_clients_next_step(&["a".to_string(), "b".to_string(), "c".to_string()])
+                .unwrap(),
+            "a, b and c still need a repository to bind to. Run `kin init`, then `kin setup` again from inside that repository."
+        );
+    }
+
+    /// The wiring, not just the wording: the error the two repository-bound
+    /// clients actually produce with no repository to bind to is the one the
+    /// wizard classifies as deferred. Without this, the render could be perfect
+    /// and still never fire.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn configuring_a_repo_bound_client_with_no_repository_defers() {
+        struct CurrentDirGuard(PathBuf);
+        impl Drop for CurrentDirGuard {
+            fn drop(&mut self) {
+                let _ = env::set_current_dir(&self.0);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let work = dir.path().join("work");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        assert!(
+            !work.join(".kin").exists(),
+            "the fixture has no repository by construction"
+        );
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        // Pinned rather than left ambient: discovery walks upward, and the scan
+        // root is what stops it binding whatever repository encloses the test
+        // runner. Set through the guard so no other mutating test can change it
+        // underneath this one.
+        let _scan_root =
+            EnvVarGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &work);
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(&work).unwrap();
+        let _cwd = CurrentDirGuard(previous);
+        let canonical_work = work.canonicalize().unwrap();
+
+        for (name, configure) in [
+            ("Codex CLI", configure_codex as fn() -> Result<PathBuf>),
+            ("Google Antigravity", configure_antigravity),
+        ] {
+            let error = configure()
+                .expect_err("a client whose entry names a repository cannot bind without one");
+            let (register, lines) = client_not_configured_lines(name, &error);
+            assert_eq!(
+                register,
+                ClientNotConfigured::Deferred,
+                "{name} must defer, not fail: {error:#}"
+            );
+            assert_eq!(
+                lines[0],
+                format!(
+                    "{name} is not configured yet: its Kin entry has to name a repository, and there is no Kin repository at {}",
+                    canonical_work.display()
+                )
+            );
+        }
+
+        assert!(
+            !home.join(".codex").exists(),
+            "a deferral writes nothing, so no client config may appear"
+        );
+        assert!(
+            !home.join(".gemini").exists(),
+            "a deferral writes nothing, so no client config may appear"
         );
     }
 
