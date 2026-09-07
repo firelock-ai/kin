@@ -16,6 +16,7 @@ pub mod daemon_error;
 pub mod embed_model;
 pub mod entity_identity;
 pub mod entity_ref;
+pub mod mark;
 pub mod model_residency;
 pub mod open_files;
 pub mod output_style;

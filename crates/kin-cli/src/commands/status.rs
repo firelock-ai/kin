@@ -1822,7 +1822,12 @@ fn render_embedding_coverage(coverage: &EmbeddingCoverage) -> String {
     }
 }
 
-fn render_head(head: &WorkspaceHead) -> String {
+/// A workspace head in a reader's terms.
+///
+/// `pub(crate)` because `kin init` needs the same rendering. It used to
+/// serialize the model instead, so the last line of a first-time reader's
+/// `kin init` was a hex-encoded byte array whose payload was `refs/heads/main`.
+pub(crate) fn render_head(head: &WorkspaceHead) -> String {
     match head {
         WorkspaceHead::Symbolic { target } => format!("symbolic {target}"),
         WorkspaceHead::Detached { target } => format!("detached {}", render_target(target)),
