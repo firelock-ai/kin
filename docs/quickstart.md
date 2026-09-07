@@ -263,6 +263,32 @@ byte counts under `store_footprint`. Kin does not cap store size or refuse a
 repository for being large, so plan disk against your history rather than
 against your checkout.
 
+### What survives if you have to rebuild the store
+
+An upcoming release changes Kin's on-disk repo format, and a store created
+before it will not open afterward. Your working tree is never touched, so
+nothing you have on disk is at risk.
+
+What a rebuild recovers depends on where the work came from. Kin writes `.kin`
+and reads `.git`, so deleting the store cannot touch Git history: if you
+admitted this repository from Git, the recovery path is `kin init` again, and it
+is tested. Measured on 0.7.3 against a 261-commit repository, deleting `.kin`
+and re-running `kin init` returned all 261 commits, all 61 refs and every tag,
+each pointing at the same object as before. Keep the `Repository:` id that
+`kin init` printed, though. A rebuild mints a new one and every exact-transfer
+surface is bound to it, so a store that has ever pushed to a Kin remote needs
+`kin init --adopt-repository-id <ID>` to push where the old one could.
+
+Work that only ever lived in Kin is a different question, because Git never had
+it. `kin commit` records in Kin authority and not in Git, and native commits,
+Kin branches, reviews and specs all live in `.kin` and go when it goes. Today
+the only way to carry any of it out is `kin git export --output <dir>`, which
+writes every imported commit, every ref and your native commits into a fresh Git
+repository. It carries no review, no spec and no entity history, and it refuses
+a destination that already exists, so treat it as a way out rather than as a
+backup. The format change will ship together with an upgrade command that
+carries native state forward, or it will not ship.
+
 ### Profiling a slow command
 
 Every `kin` command can profile itself. No rebuild, no external profiler, and

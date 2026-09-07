@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.7.4] - 2026-09-07
 
+**How a repo-format change affects your work.** 0.7.3 does not change Kin's on-disk repo format. An upcoming release will, and a store created before it will not open afterward. Your working tree is never touched.
+
+If you admitted your repository from Git, the recovery path is `kin init` again, and it is tested. Delete `.kin`, re-run it, and everything Git holds comes back. Measured on 0.7.3 against a 261-commit repository: all 261 commits, all 61 refs and every tag returned, and the Git head was unchanged. Keep the `Repository:` id that `kin init` printed, though. A rebuild mints a new one and every exact-transfer surface is bound to it, so a store that has ever pushed to a Kin remote needs `kin init --adopt-repository-id <ID>` to push where the old one could.
+
+Work that only ever lived in Kin is a different question, because Git never had it. Native commits, Kin branches, reviews and specs live in `.kin` and go when it goes, and today the only way to carry any of it out is `kin git export --output <dir>`, which writes commits and refs into a plain Git repository and carries no review, no spec and no entity history. So the format change ships together with an upgrade command that carries native state forward, or it does not ship.
+
 ### Changed
 
 - Fix quickstart paste boundaries and repository selection (FIR-3348) (#1581)
@@ -16,7 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.7.3] - 2026-09-06
 
-**Heads up:** 0.7.3 does not change Kin's on-disk repo format, but an upcoming release will. Any store you create before that lands will not open afterward, and rebuilding one just means running `kin init` again. Nothing in your working tree is touched.
+**How a repo-format change affects your work.** 0.7.3 does not change Kin's on-disk repo format. An upcoming release will, and a store created before it will not open afterward. Your working tree is never touched.
+
+If you admitted your repository from Git, the recovery path is `kin init` again, and it is tested. Delete `.kin`, re-run it, and everything Git holds comes back. Measured on 0.7.3 against a 261-commit repository: all 261 commits, all 61 refs and every tag returned, and the Git head was unchanged. Keep the `Repository:` id that `kin init` printed, though. A rebuild mints a new one and every exact-transfer surface is bound to it, so a store that has ever pushed to a Kin remote needs `kin init --adopt-repository-id <ID>` to push where the old one could.
+
+Work that only ever lived in Kin is a different question, because Git never had it. Native commits, Kin branches, reviews and specs live in `.kin` and go when it goes, and today the only way to carry any of it out is `kin git export --output <dir>`, which writes commits and refs into a plain Git repository and carries no review, no spec and no entity history. So the format change ships together with an upgrade command that carries native state forward, or it does not ship.
 
 ### Changed
 
