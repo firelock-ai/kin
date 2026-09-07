@@ -427,7 +427,7 @@ fn init_from_git_with_hooks(
     // the plan's proved facts, and every one of those readers was checked by
     // name: the plan fingerprint hashes each change's id, the snapshot binding
     // reads the five raw-snapshot fields, the index and worktree observations
-    // read the workspace seed, and the published seal reads the commit trees
+    // read the workspace seed, and the published seal reads the content summary
     // and the seed tree. What the plan still held past this line was an entity,
     // relation and tree delta set for every commit in history, live across the
     // conversion's peak inside the bootstrap commit, answering nothing.
