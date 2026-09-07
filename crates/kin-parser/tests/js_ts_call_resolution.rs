@@ -44,6 +44,30 @@ fn parse_fixture(adapter: &dyn LanguageAdapter, lang: &str, file: &str) -> Parse
         .expect("extract")
 }
 
+fn parse_source(adapter: &dyn LanguageAdapter, path: &str, src: &str) -> ParseOutput {
+    let bytes = src.as_bytes();
+    let tree = adapter.parse(bytes).expect("parse");
+    adapter
+        .extract(&tree, bytes, &FilePathId::new(path))
+        .expect("extract")
+}
+
+/// Every `Calls` edge to `callee`, as `(source entity, 1-based site line)`.
+fn call_sites<'a>(output: &'a ParseOutput, callee: &str) -> Vec<(&'a str, u32)> {
+    let mut sites: Vec<(&str, u32)> = calls(output)
+        .into_iter()
+        .filter(|r| r.dst_name == callee)
+        .map(|r| {
+            (
+                r.src_name.as_str(),
+                r.site.as_ref().map(|s| s.start_line + 1).unwrap_or(0),
+            )
+        })
+        .collect();
+    sites.sort_unstable();
+    sites
+}
+
 fn calls(output: &ParseOutput) -> Vec<&ExtractedRelation> {
     output
         .relations
@@ -368,5 +392,116 @@ fn ts_member_calls_record_receivers_through_the_same_constructor() {
         receiver_for(&output, "c"),
         None,
         "`a.b().c()` is written on a call, which names no binding"
+    );
+}
+
+// ---- `export default <expression>` ----
+
+/// A module whose default export is an expression rather than a declaration.
+///
+/// The control and the subject are byte-identical bodies at the same nesting
+/// depth, three function levels down through a promise executor and an event
+/// callback, and they differ only in what encloses them at the top level. That
+/// is the whole finding: `export default <expression>` reached no arm of the
+/// adapter's walk, so the fallback that mints the file's `default` entity was
+/// the only thing that ran and the body was never read for calls.
+///
+/// Depth is explicitly NOT the variable, and the control is what proves it. On
+/// axios at b8d67bbb the missed sites sit two to four function levels deep and
+/// the found ones sit one to three deep, so a test that only asserted the
+/// nested case would pass under a fix aimed at the wrong mechanism.
+const DEFAULT_EXPORT_SOURCE: &str = r#"import settle from '../core/settle.js';
+
+const isSupported = true;
+
+export function topAdapter(config) {
+  return new Promise(function dispatch(resolve, reject) {
+    request.on('done', function onDone(response) {
+      settle(response);
+    });
+  });
+}
+
+export default isSupported &&
+  function nestedAdapter(config) {
+    return new Promise(function dispatch(resolve, reject) {
+      request.on('done', function onDone(response) {
+        settle(response);
+      });
+    });
+  };
+"#;
+
+#[test]
+fn js_default_export_expression_yields_the_calls_in_its_body() {
+    let output = parse_source(
+        &JavaScriptAdapter,
+        "adapters/both.js",
+        DEFAULT_EXPORT_SOURCE,
+    );
+    assert_eq!(
+        call_sites(&output, "settle"),
+        vec![("default", 17), ("topAdapter", 8)],
+        "both bodies call `settle` once, at the same depth; the `export default \
+         <expression>` one is recorded against the `default` entity the same \
+         fallback mints"
+    );
+}
+
+#[test]
+fn js_default_export_arrow_yields_the_calls_in_its_body() {
+    // `export default (config) => {...}` is an `arrow_function`, which the walk
+    // has no arm for either, so it took the same fallback and lost the same way.
+    let output = parse_source(
+        &JavaScriptAdapter,
+        "adapters/arrow.js",
+        "import settle from './settle.js';
+export default (config) => {
+  settle(config);
+};
+",
+    );
+    assert_eq!(
+        call_sites(&output, "settle"),
+        vec![("default", 3)],
+        "an arrow default export is an expression too"
+    );
+}
+
+#[test]
+fn ts_default_export_expression_yields_the_calls_in_its_body() {
+    // TypeScript keeps its own copy of this fallback, and a Flow-annotated
+    // `.js` file is extracted through it, so the two must not drift.
+    let output = parse_source(
+        &TypeScriptAdapter,
+        "adapters/both.ts",
+        DEFAULT_EXPORT_SOURCE,
+    );
+    assert_eq!(
+        call_sites(&output, "settle"),
+        vec![("default", 17), ("topAdapter", 8)],
+        "the TypeScript extractor must record the same two edges"
+    );
+}
+
+/// The fallback fires only when the recursion produced no entity, so a named
+/// declaration must keep exactly one edge rather than gaining a second one
+/// attributed to `default`.
+#[test]
+fn js_named_default_export_is_not_walked_twice() {
+    let output = parse_source(
+        &JavaScriptAdapter,
+        "core/settle.js",
+        "import check from './check.js';
+export default function settle(response) {
+  check(response);
+}
+",
+    );
+    assert_eq!(
+        call_sites(&output, "check"),
+        vec![("settle", 3)],
+        "`export default function settle` is walked by the function arm; the \
+         default-export fallback must not walk it again"
     );
 }

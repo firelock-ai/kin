@@ -5589,15 +5589,52 @@ fn package_dir_candidates(pkg_name: &str) -> Vec<String> {
     }
 }
 
-/// Resolve a default export from a target file.
+/// Resolve a default export from a target file, or decline to guess.
 ///
 /// When `import Foo from './bar'` maps original_name to `"default"`, the target
-/// file may not have an entity literally named `"default"`. In JS/TS, the
-/// default export is typically the file's primary declaration. We find it by
-/// looking for the first entity in the target file that is Public (exported).
-/// If none are Public, fall back to the first entity in the file.
+/// file may hold no entity literally named `"default"`, because
+/// `export default function bar() {}` mints an entity called `bar`. This is the
+/// fallback for that case, and it answers ONLY when the file leaves it no
+/// choice: exactly one exported entity that is not the file's own module. With
+/// two or more it returns `None` and the pinned-import tier below resolves the
+/// call by the name the caller actually wrote, which is evidence rather than a
+/// guess.
+///
+/// Both halves of that rule were bought on axios at b8d67bbb.
+///
+/// The Module skip: a Module entity is the file, and no `export default` names
+/// it. The caller iterates `sorted_universe`, `entity_link_order` sorts by span,
+/// and a Module spans the whole file, so it starts at the lowest line and column
+/// of anything in that file and sorts first. Every JS and TS file carries one,
+/// so every call to a default-imported callee bound to the callee's module
+/// rather than to the callee: `settle` is `export default function settle` in
+/// `lib/core/settle.js`, and `kin refs settle --kind calls` answered "No
+/// incoming Calls relations" while `kin impact settle` found the same callers
+/// on the module identity beside it.
+///
+/// The uniqueness rule: "the first exported entity" is not the default export
+/// whenever a file exports anything ahead of it, which is ordinary. Skipping
+/// only the Module left `lib/helpers/buildURL.js` answering `encode`, because
+/// `export function encode` is declared at line 14 and
+/// `export default function buildURL` at line 31, and all three of buildURL's
+/// call sites then landed on `encode`: the wrong function in the right file,
+/// which reads as a real answer in a way the module never did. Declining sends
+/// those calls to `resolve_import_pinned_target`, which looks `buildURL` up
+/// inside the pinned file and gets it right.
+///
+/// A file with no exported entity at all also returns `None` now, where this
+/// used to answer with the file's first entity whatever it was. Same reasoning:
+/// there is no evidence in that file for which entity a default import means.
+///
+/// Keying the rule on kind and count rather than on order is also what keeps the
+/// two linkers agreeing. The batch path iterates in span order and reached the
+/// Module first, while [`resolve_default_export_incremental`] iterates in the
+/// parser's emission order, where the JS adapter pushes the module last and the
+/// declaration therefore won by luck. `entity_link_order` exists so that
+/// cross-file linking is order-independent, and a rule that reads order is what
+/// let the two drift apart.
 fn resolve_default_export(target_file: &str, universe_entities: &[&Entity]) -> Option<EntityId> {
-    let mut first_in_file: Option<EntityId> = None;
+    let mut only: Option<EntityId> = None;
     for entity in universe_entities {
         let Some(ref file_path) = entity.file_origin else {
             continue;
@@ -5605,14 +5642,15 @@ fn resolve_default_export(target_file: &str, universe_entities: &[&Entity]) -> O
         if file_path.0.as_str() != target_file {
             continue;
         }
-        if first_in_file.is_none() {
-            first_in_file = Some(entity.id);
+        if entity.kind == EntityKind::Module || entity.visibility != Visibility::Public {
+            continue;
         }
-        if entity.visibility == Visibility::Public {
-            return Some(entity.id);
+        if only.is_some() {
+            return None;
         }
+        only = Some(entity.id);
     }
-    first_in_file
+    only
 }
 
 /// Incremental cross-file relation linker state.
@@ -6093,18 +6131,22 @@ impl IncrementalLinker {
 fn resolve_default_export_incremental(
     target_file: &str,
     entities_by_file: &HashMap<String, Vec<(EntityId, Visibility)>>,
+    entity_kind_by_id: &HashMap<EntityId, EntityKind>,
 ) -> Option<EntityId> {
     let entities = entities_by_file.get(target_file)?;
-    let mut first_in_file: Option<EntityId> = None;
+    let mut only: Option<EntityId> = None;
     for &(id, visibility) in entities {
-        if first_in_file.is_none() {
-            first_in_file = Some(id);
+        if entity_kind_by_id.get(&id) == Some(&EntityKind::Module)
+            || visibility != Visibility::Public
+        {
+            continue;
         }
-        if visibility == Visibility::Public {
-            return Some(id);
+        if only.is_some() {
+            return None;
         }
+        only = Some(id);
     }
-    first_in_file
+    only
 }
 
 /// Files below which the cross-file linker prints no progress bar.
@@ -6619,7 +6661,11 @@ fn resolve_one_file_incremental(
                     let dst_id = if direct.is_some() {
                         direct
                     } else if original_name == "default" {
-                        resolve_default_export_incremental(&target_file, &linker.entities_by_file)
+                        resolve_default_export_incremental(
+                            &target_file,
+                            &linker.entities_by_file,
+                            &linker.entity_kind_by_id,
+                        )
                     } else {
                         None
                     };

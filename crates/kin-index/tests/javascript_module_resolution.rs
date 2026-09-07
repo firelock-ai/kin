@@ -13,8 +13,11 @@
 //! (a directory whose entry is `lib/router/index.js`), and an example nested
 //! two directories deep requires `../..`, the repository root.
 
-use kin_index::{link_cross_file as link_cross_file_with_identities, FileParseData};
-use kin_model::{ArtifactId, Entity, FilePathId, GraphNodeId, Relation, RelationKind};
+use kin_index::{
+    link_cross_file as link_cross_file_with_identities, link_cross_file_incremental, FileParseData,
+    IncrementalLinker,
+};
+use kin_model::{ArtifactId, Entity, EntityKind, FilePathId, GraphNodeId, Relation, RelationKind};
 use kin_parser::{JavaScriptAdapter, LanguageAdapter, TypeScriptAdapter};
 use std::collections::HashMap;
 
@@ -337,5 +340,266 @@ fn a_specifier_that_resolves_to_the_importing_file_produces_no_edge() {
         linked.import_edge_count(),
         0,
         "a self-loop is not a resolved import"
+    );
+}
+
+// ---- Default exports: which entity in the target file a default import means ----
+
+/// `core/lib.js` names its module `lib` and its default export `defaultCallee`,
+/// so the two identities are distinguishable by name. A file whose default
+/// export is named for the file, which is the common JS idiom and is what
+/// axios's `lib/core/settle.js` does, puts both under one name and makes the
+/// mistake invisible from the outside.
+const CALLEE_LIB: &str = r#"export default function defaultCallee(response) {
+  return response;
+}
+
+export function namedCallee(response) {
+  return response;
+}
+"#;
+
+const TOP_CALLER: &str = r#"import defaultCallee from '../core/lib.js';
+import { namedCallee } from '../core/lib.js';
+
+export function topAdapter(config) {
+  return new Promise(function dispatch(resolve, reject) {
+    request.on('done', function onDone(response) {
+      defaultCallee(response);
+      namedCallee(response);
+    });
+  });
+}
+"#;
+
+/// The positive control, kept as its own test rather than as the first
+/// assertion of the one below it.
+///
+/// A control that shares a test with its subject cannot be OBSERVED to hold
+/// while the subject fails: the run reports one verdict for both, and reading
+/// it as "the control held" is reading the panic message rather than the
+/// result. Split out, it prints its own `ok` line in every falsification arm.
+///
+/// `namedCallee` is called on the line below the `defaultCallee` call the next
+/// test is about, in the same body at the same depth. It resolved before this
+/// change and it must go on resolving.
+#[test]
+fn a_named_imported_callee_resolves_from_the_same_nested_call_site() {
+    let linked = link(vec![
+        js("core/lib.js", CALLEE_LIB),
+        js("adapters/top.js", TOP_CALLER),
+    ]);
+    assert!(
+        linked.has_call(
+            linked.entity_id("adapters/top.js", "topAdapter"),
+            linked.entity_id("core/lib.js", "namedCallee")
+        ),
+        "a named-imported callee three function levels down inside a promise \
+         executor inside an event callback resolves, which is what says nesting \
+         depth is not the mechanism in the two tests below"
+    );
+}
+
+/// The default import is the subject: it landed on `lib`, the Module entity for
+/// the callee's own file, because the resolver returned the first Public entity
+/// in that file and a Module spans the whole file, so it sorts first.
+#[test]
+fn a_default_imported_callee_binds_to_the_declaration_not_the_files_module() {
+    let linked = link(vec![
+        js("core/lib.js", CALLEE_LIB),
+        js("adapters/top.js", TOP_CALLER),
+    ]);
+
+    let caller = linked.entity_id("adapters/top.js", "topAdapter");
+    let default_callee = linked.entity_id("core/lib.js", "defaultCallee");
+    let callee_module = linked.entity_id("core/lib.js", "lib");
+
+    assert!(
+        linked.has_call(caller, default_callee),
+        "a default-imported callee must reach the function it names"
+    );
+    assert!(
+        !linked.has_call(caller, callee_module),
+        "the callee file's Module entity is not its default export"
+    );
+}
+
+/// Both halves of FIR-3357 in one assertion, from the shape axios is written
+/// in: the call sits inside `export default <expression>`, which the parser
+/// walked past, and its callee is default-imported, which the linker bound to
+/// the wrong node. Either defect alone makes this red.
+#[test]
+fn a_default_export_expressions_body_reaches_a_default_imported_callee() {
+    let nested = r#"import defaultCallee from '../core/lib.js';
+
+const isSupported = true;
+
+export default isSupported &&
+  function nestedAdapter(config) {
+    return new Promise(function dispatch(resolve, reject) {
+      request.on('done', function onDone(response) {
+        defaultCallee(response);
+      });
+    });
+  };
+"#;
+    let linked = link(vec![
+        js("core/lib.js", CALLEE_LIB),
+        js("adapters/nested.js", nested),
+    ]);
+
+    let caller = linked.entity_id("adapters/nested.js", "default");
+    let default_callee = linked.entity_id("core/lib.js", "defaultCallee");
+    assert!(
+        linked.has_call(caller, default_callee),
+        "the adapter body under `export default <expression>` calls \
+         `defaultCallee`, and the graph must hold that edge"
+    );
+}
+
+/// axios's `lib/helpers/buildURL.js` shape: the file exports a helper BEFORE
+/// its default export.
+///
+/// This is the case that says the fallback must decline rather than guess.
+/// Skipping only the file's Module still left "the first exported entity",
+/// which here is `encode` at the top of the file rather than `buildUrl` below
+/// it, and on the real repository all three of `buildURL`'s call sites landed
+/// on `encode`: the wrong function in the right file. Declining hands the call
+/// to the pinned-import tier, which looks the caller's own binding name up
+/// inside the pinned file.
+#[test]
+fn a_default_export_below_a_named_one_is_not_confused_with_it() {
+    let linked = link(vec![
+        js(
+            "helpers/url.js",
+            r#"export function encode(val) {
+  return val;
+}
+
+export default function buildUrl(url, params) {
+  return encode(url) + params;
+}
+"#,
+        ),
+        js(
+            "core/axios.js",
+            r#"import buildUrl from '../helpers/url.js';
+
+export function getUri(config) {
+  return buildUrl(config.url, config.params);
+}
+"#,
+        ),
+    ]);
+
+    let caller = linked.entity_id("core/axios.js", "getUri");
+    assert!(
+        linked.has_call(caller, linked.entity_id("helpers/url.js", "buildUrl")),
+        "the default-imported callee is `buildUrl`, the file's default export"
+    );
+    assert!(
+        !linked.has_call(caller, linked.entity_id("helpers/url.js", "encode")),
+        "`encode` is exported first and is not the default export; binding to it \
+         is worse than binding to nothing, because it reads as a real answer"
+    );
+}
+
+/// The file that leaves the fallback no choice: one exported declaration and
+/// nothing else, which is axios's `lib/core/settle.js` and the common shape.
+/// Here the fallback does answer, and it must answer with the declaration
+/// rather than with the file's own module.
+#[test]
+fn a_lone_default_export_still_resolves_through_the_fallback() {
+    // The file is `settler.js` and the declaration is `settle`, so the module
+    // and the function carry different names and the assertion below can tell
+    // which of the two the call reached. axios's own file is `settle.js`, where
+    // they collide and the mistake is invisible from outside.
+    let linked = link(vec![
+        js(
+            "core/settler.js",
+            r#"export default function settle(response) {
+  return response;
+}
+"#,
+        ),
+        js(
+            "adapters/only.js",
+            r#"import settle from '../core/settler.js';
+
+export function send(response) {
+  return settle(response);
+}
+"#,
+        ),
+    ]);
+
+    let caller = linked.entity_id("adapters/only.js", "send");
+    assert!(
+        linked.has_call(caller, linked.entity_id("core/settler.js", "settle")),
+        "one exported declaration leaves no ambiguity, so the fallback answers"
+    );
+    assert!(
+        !linked.has_call(caller, linked.entity_id("core/settler.js", "settler")),
+        "and it answers with the declaration, not with the file's own module"
+    );
+}
+
+/// The incremental linker reads the entity list in the order its caller hands
+/// it over, and the batch linker sorts by span. Both must answer this the same
+/// way, so the rule is keyed on the entity's KIND rather than on where it
+/// happens to sit in a list.
+///
+/// The module is moved to the front here on purpose. In the order the JavaScript
+/// adapter emits today it sits last, so an order-reading resolver gets the right
+/// answer by luck and a test that used the emission order could not fail.
+#[test]
+fn the_incremental_linker_skips_the_module_whatever_order_it_was_given() {
+    let mut callee = js("core/lib.js", CALLEE_LIB);
+    callee
+        .entities
+        .sort_by_key(|entity| entity.kind != EntityKind::Module);
+    assert_eq!(
+        callee.entities.first().map(|entity| entity.kind),
+        Some(EntityKind::Module),
+        "the fixture must hand the module over first, or this test proves nothing"
+    );
+    let caller = js("adapters/top.js", TOP_CALLER);
+
+    let mut linker = IncrementalLinker::new();
+    let files = vec![callee, caller];
+    for file in &files {
+        linker.add_file(&file.file_path, ArtifactId::new(), &file.entities);
+    }
+    let relations = link_cross_file_incremental(&files, &linker).expect("incremental link");
+
+    let id = |file: &str, name: &str| {
+        files
+            .iter()
+            .flat_map(|f| f.entities.iter())
+            .find(|e| e.name == name && e.file_origin.as_ref().map(|p| p.0.as_str()) == Some(file))
+            .unwrap_or_else(|| panic!("entity `{name}` in `{file}` not found"))
+            .id
+    };
+    let has_call = |src, dst| {
+        relations.iter().any(|r| {
+            r.kind == RelationKind::Calls
+                && r.src == GraphNodeId::Entity(src)
+                && r.dst == GraphNodeId::Entity(dst)
+        })
+    };
+
+    assert!(
+        has_call(
+            id("adapters/top.js", "topAdapter"),
+            id("core/lib.js", "defaultCallee")
+        ),
+        "the incremental linker must reach the declaration too"
+    );
+    assert!(
+        !has_call(
+            id("adapters/top.js", "topAdapter"),
+            id("core/lib.js", "lib")
+        ),
+        "and must not park the call on the callee file's module"
     );
 }

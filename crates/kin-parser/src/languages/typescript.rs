@@ -455,6 +455,12 @@ fn extract_ts_node(
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
                     });
+                    // The exported value's body, which nothing else walks. The
+                    // JavaScript adapter carries the same line beside the same
+                    // fallback and the reasoning is written out there; a Flow
+                    // `.js` file reaches THIS extractor, so leaving it out here
+                    // would keep the defect for every Flow-annotated module.
+                    extract_calls_from_context(&val, source, "default", None, relations);
                 }
             }
         }
