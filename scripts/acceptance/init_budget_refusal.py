@@ -130,8 +130,9 @@ TINY_CEILING = "1"
 ROOMY_CEILING = str(512 * 1024 * 1024 * 1024)
 # A daemon share smaller than any fixture this suite builds will produce, so
 # check 5's band is entered by the comparison rather than by the fixture's size.
-# The four-commit fixture forecasts 4,800,000 bytes, one BYTES_PER_COMMIT term
-# per commit, so anything well under that works and this is two orders below.
+# The four-commit fixture's daemon load is 4,800,000 bytes, one
+# DAEMON_BYTES_PER_COMMIT term per commit, so anything well under that works
+# and this is two orders below.
 TIGHT_DAEMON_BUDGET = str(64 * 1024)
 # And a share no fixture can exceed, for the silent control.
 ROOMY_DAEMON_BUDGET = str(512 * 1024 * 1024 * 1024)

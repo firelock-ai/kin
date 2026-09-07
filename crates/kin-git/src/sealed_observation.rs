@@ -21,6 +21,7 @@
 //! and any entry that cannot be sealed fails admission with an enumerated gap
 //! report instead of degrading into a filesystem fallback.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use kin_blobs::digest;
@@ -72,16 +73,149 @@ impl SealedContentSource for BlobStore {
     }
 }
 
+/// What one admitted tree contributes to the sealed observation, taken once
+/// while the tree was live.
+///
+/// The digest binds the tree's exact (path, shape, body) sequence, so two
+/// closures that agree on every count but place different bodies at different
+/// paths still fingerprint apart. The tallies are what the observation sums.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedTreeObservation {
+    pub entries: usize,
+    pub regular_file_entries: usize,
+    pub executable_file_entries: usize,
+    pub symlink_entries: usize,
+    pub gitlink_entries: usize,
+    pub digest: Hash256,
+}
+
+/// Everything the sealed all-content observation reads from a closure's
+/// commit trees, without the trees.
+///
+/// A conversion used to keep every commit's exact tree alive so this
+/// observation could walk them at phases 10 and 17, which is one map over
+/// every artifact in the repository per commit in its history. Each tree is
+/// walked here instead at the moment the derivation resolves it, and what the
+/// walk keeps is a digest and five counters per commit, plus one entry per
+/// distinct content identity, non-UTF-8 path and foreign gitlink the trees
+/// reference between them. The seal proves the same bodies it always proved,
+/// from the same trees, and fingerprints to the same value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AdmittedContentSummary {
+    /// One observation per imported commit tree, keyed by commit.
+    pub trees: BTreeMap<GitObjectId, SealedTreeObservation>,
+    /// Every distinct content identity some commit tree references, with the
+    /// first path the derivation saw it at, so a gap can be reported by path.
+    pub identities: BTreeMap<Hash256, RepoPath>,
+    /// Distinct observed paths this host cannot name as UTF-8.
+    pub non_utf8_paths: BTreeSet<RepoPath>,
+    /// Content the observation declares rather than owns, by path and target.
+    pub exclusions: BTreeMap<(RepoPath, GitObjectId), DeclaredContentExclusion>,
+}
+
+impl AdmittedContentSummary {
+    /// Observe one commit's exact tree and keep what the seal needs of it.
+    pub fn observe_commit_tree(
+        &mut self,
+        oid: GitObjectId,
+        tree: &ResolvedTree,
+    ) -> Result<SealedTreeObservation> {
+        let observation = observe_tree_content(
+            tree,
+            &mut self.identities,
+            &mut self.non_utf8_paths,
+            &mut self.exclusions,
+        );
+        if self.trees.insert(oid, observation.clone()).is_some() {
+            return Err(GitError::InvalidSnapshot(format!(
+                "commit {oid} was observed twice for the sealed content observation"
+            )));
+        }
+        Ok(observation)
+    }
+}
+
+/// Observe one exact tree: its digest and entry tally, and the identities,
+/// paths and exclusions it adds to the sets every tree shares.
+pub(crate) fn observe_tree_content(
+    tree: &ResolvedTree,
+    identities: &mut BTreeMap<Hash256, RepoPath>,
+    non_utf8_paths: &mut BTreeSet<RepoPath>,
+    exclusions: &mut BTreeMap<(RepoPath, GitObjectId), DeclaredContentExclusion>,
+) -> SealedTreeObservation {
+    let mut observation = SealedTreeObservation {
+        entries: 0,
+        regular_file_entries: 0,
+        executable_file_entries: 0,
+        symlink_entries: 0,
+        gitlink_entries: 0,
+        digest: Hash256::from_bytes([0; 32]),
+    };
+    // One digest per admitted tree over its exact (path, shape, body)
+    // sequence. Counts alone cannot distinguish two closures that agree on
+    // totals but describe different content, so the observed content itself
+    // is what the fingerprint ends up binding.
+    let mut tree_content = Vec::new();
+    tree_content.extend_from_slice(b"kin.git.sealed-content-observation.tree.v1\0");
+    for artifact in tree.artifacts_by_path() {
+        observation.entries += 1;
+        let path = &artifact.path;
+        if path.as_utf8().is_none() {
+            non_utf8_paths.insert(path.clone());
+        }
+        append_bytes(&mut tree_content, path.as_bytes());
+        let identity = match artifact.entry {
+            TreeEntry::Blob { hash, executable } => {
+                if executable {
+                    observation.executable_file_entries += 1;
+                    tree_content.push(SHAPE_EXECUTABLE_FILE);
+                } else {
+                    observation.regular_file_entries += 1;
+                    tree_content.push(SHAPE_REGULAR_FILE);
+                }
+                append_bytes(&mut tree_content, hash.as_bytes());
+                hash
+            }
+            TreeEntry::Symlink { target_blob } => {
+                observation.symlink_entries += 1;
+                tree_content.push(SHAPE_SYMLINK);
+                append_bytes(&mut tree_content, target_blob.as_bytes());
+                target_blob
+            }
+            TreeEntry::Gitlink { target } => {
+                observation.gitlink_entries += 1;
+                tree_content.push(SHAPE_FOREIGN_GITLINK);
+                append_bytes(&mut tree_content, target.to_string().as_bytes());
+                exclusions.entry((path.clone(), target)).or_insert_with(|| {
+                    DeclaredContentExclusion {
+                        path: path.clone(),
+                        reason: ContentExclusionReason::ForeignGitlinkTarget { target },
+                    }
+                });
+                continue;
+            }
+        };
+        identities.entry(identity).or_insert_with(|| path.clone());
+    }
+    observation.digest = digest(&tree_content);
+    observation
+}
+
 /// An admitted closure whose content can be sealed.
 ///
-/// Implemented by both the exact import plan and its admitted form so the same
-/// observation can be derived independently from either and the two results
-/// compared, rather than assuming the two agree.
+/// Implemented by the exact import plan, the closure that outlives its bodies
+/// and the admitted form, so the same observation can be derived from any of
+/// them and the results compared, rather than assuming they agree. None of
+/// them holds a tree per commit: what each carries is the summary the
+/// derivation took from every commit tree as it resolved it, and the one tree
+/// the workspace seed admits.
 pub trait AdmittedContentClosure {
     fn closure_repository_id(&self) -> &RepositoryId;
-    /// Every admitted tree, in a deterministic order: one per imported commit,
-    /// then the workspace seed tree.
-    fn admitted_trees(&self) -> Vec<&ResolvedTree>;
+    /// What every imported commit tree contributed, in commit order, and the
+    /// sets those trees reference between them.
+    fn admitted_content(&self) -> Cow<'_, AdmittedContentSummary>;
+    /// The workspace seed tree, observed after every commit tree.
+    fn admitted_seed_tree(&self) -> &ResolvedTree;
 }
 
 impl AdmittedContentClosure for SemanticGitImportPlan {
@@ -89,11 +223,12 @@ impl AdmittedContentClosure for SemanticGitImportPlan {
         &self.repository_id
     }
 
-    fn admitted_trees(&self) -> Vec<&ResolvedTree> {
-        self.commit_trees
-            .values()
-            .chain(std::iter::once(&self.workspace_seed.base_tree))
-            .collect()
+    fn admitted_content(&self) -> Cow<'_, AdmittedContentSummary> {
+        Cow::Borrowed(&self.content)
+    }
+
+    fn admitted_seed_tree(&self) -> &ResolvedTree {
+        &self.workspace_seed.base_tree
     }
 }
 
@@ -102,11 +237,12 @@ impl AdmittedContentClosure for crate::semantic_import::ProvedImportClosure {
         &self.repository_id
     }
 
-    fn admitted_trees(&self) -> Vec<&ResolvedTree> {
-        self.commit_trees
-            .values()
-            .chain(std::iter::once(&self.workspace_seed.base_tree))
-            .collect()
+    fn admitted_content(&self) -> Cow<'_, AdmittedContentSummary> {
+        Cow::Borrowed(&self.content)
+    }
+
+    fn admitted_seed_tree(&self) -> &ResolvedTree {
+        &self.workspace_seed.base_tree
     }
 }
 
@@ -115,11 +251,12 @@ impl AdmittedContentClosure for AdmittedSemanticGitImportPlan {
         &self.repository_id
     }
 
-    fn admitted_trees(&self) -> Vec<&ResolvedTree> {
-        self.commit_trees
-            .values()
-            .chain(std::iter::once(&self.workspace_seed.base_tree))
-            .collect()
+    fn admitted_content(&self) -> Cow<'_, AdmittedContentSummary> {
+        Cow::Borrowed(&self.content)
+    }
+
+    fn admitted_seed_tree(&self) -> &ResolvedTree {
+        &self.workspace_seed.base_tree
     }
 }
 
@@ -196,106 +333,75 @@ pub fn seal_all_content_observation(
     seal_all_content_observation_observed(closure, content, &mut |_, _| {})
 }
 
-/// Prove sealed all-content observation, reporting progress as it walks.
+/// Prove sealed all-content observation, reporting progress as it goes.
 ///
-/// The observation is Sigma over every admitted tree of that tree's full entry
-/// count, so on a repository with deep history it runs for minutes. `observe`
-/// is called with `(trees_completed, trees_total)` after each tree so a caller
-/// can show that the walk is advancing. It changes nothing the observation
-/// proves: [`seal_all_content_observation`] is this function with an observer
-/// that does nothing.
+/// The trees were observed when the derivation resolved them, so what remains
+/// here is the body proof: every distinct content identity the admitted trees
+/// reference is loaded from `content` and checked against that identity, once
+/// whatever number of trees reference it. `observe` is called with
+/// `(bodies_proved, bodies_total)` after each body so a caller can show that
+/// the proof is advancing. It changes nothing the observation proves:
+/// [`seal_all_content_observation`] is this function with an observer that
+/// does nothing.
 pub fn seal_all_content_observation_observed(
     closure: &impl AdmittedContentClosure,
     content: &impl SealedContentSource,
     observe: &mut dyn FnMut(usize, usize),
 ) -> Result<SealedContentObservation> {
+    let summary = closure.admitted_content();
+    // The workspace seed tree is observed after every commit tree, into the
+    // same sets, which is the order the trees were walked in when every one
+    // of them was walked here.
+    let mut identities = summary.identities.clone();
+    let mut non_utf8_paths = summary.non_utf8_paths.clone();
+    let mut exclusions = summary.exclusions.clone();
+    let seed = observe_tree_content(
+        closure.admitted_seed_tree(),
+        &mut identities,
+        &mut non_utf8_paths,
+        &mut exclusions,
+    );
+
     let mut coverage = SealedContentCoverage::default();
     let mut observed_entries = 0usize;
-    let mut observed_trees = 0usize;
-    let mut sealed = BTreeSet::<Hash256>::new();
+    let mut tree_digests = Vec::with_capacity(summary.trees.len() + 1);
+    for tree in summary.trees.values().chain(std::iter::once(&seed)) {
+        observed_entries += tree.entries;
+        coverage.regular_file_entries += tree.regular_file_entries;
+        coverage.executable_file_entries += tree.executable_file_entries;
+        coverage.symlink_entries += tree.symlink_entries;
+        coverage.gitlink_entries += tree.gitlink_entries;
+        tree_digests.push(tree.digest);
+    }
+    let observed_trees = summary.trees.len() + 1;
+
+    let total_bodies = identities.len();
     let mut failed = BTreeSet::<Hash256>::new();
     let mut reported_gaps = Vec::<UnsealedContentGap>::new();
-    let mut exclusions = BTreeMap::<(RepoPath, GitObjectId), DeclaredContentExclusion>::new();
-    let mut non_utf8_paths = BTreeSet::<RepoPath>::new();
-    let mut tree_digests = Vec::<Hash256>::new();
-
-    let admitted_trees = closure.admitted_trees();
-    let total_trees = admitted_trees.len();
-    for tree in admitted_trees {
-        observed_trees += 1;
-        // One digest per admitted tree over its exact (path, shape, body)
-        // sequence. Counts alone cannot distinguish two closures that agree on
-        // totals but describe different content, so the observed content itself
-        // is what the fingerprint ends up binding.
-        let mut tree_content = Vec::new();
-        tree_content.extend_from_slice(b"kin.git.sealed-content-observation.tree.v1\0");
-        for artifact in tree.artifacts_by_path() {
-            observed_entries += 1;
-            let path = &artifact.path;
-            if path.as_utf8().is_none() {
-                non_utf8_paths.insert(path.clone());
+    for (proved, (identity, path)) in identities.iter().enumerate() {
+        match seal_body(content, *identity) {
+            Ok(body) => {
+                coverage.sealed_bodies += 1;
+                coverage.sealed_body_bytes += body.len() as u64;
+                if body.is_empty() {
+                    coverage.empty_bodies += 1;
+                }
+                if std::str::from_utf8(&body).is_err() {
+                    coverage.opaque_bodies += 1;
+                }
             }
-            append_bytes(&mut tree_content, path.as_bytes());
-            let identity = match artifact.entry {
-                TreeEntry::Blob { hash, executable } => {
-                    if executable {
-                        coverage.executable_file_entries += 1;
-                        tree_content.push(SHAPE_EXECUTABLE_FILE);
-                    } else {
-                        coverage.regular_file_entries += 1;
-                        tree_content.push(SHAPE_REGULAR_FILE);
-                    }
-                    append_bytes(&mut tree_content, hash.as_bytes());
-                    hash
-                }
-                TreeEntry::Symlink { target_blob } => {
-                    coverage.symlink_entries += 1;
-                    tree_content.push(SHAPE_SYMLINK);
-                    append_bytes(&mut tree_content, target_blob.as_bytes());
-                    target_blob
-                }
-                TreeEntry::Gitlink { target } => {
-                    coverage.gitlink_entries += 1;
-                    tree_content.push(SHAPE_FOREIGN_GITLINK);
-                    append_bytes(&mut tree_content, target.to_string().as_bytes());
-                    exclusions.entry((path.clone(), target)).or_insert_with(|| {
-                        DeclaredContentExclusion {
-                            path: path.clone(),
-                            reason: ContentExclusionReason::ForeignGitlinkTarget { target },
-                        }
+            Err(detail) => {
+                failed.insert(*identity);
+                if reported_gaps.len() < MAX_REPORTED_GAPS {
+                    reported_gaps.push(UnsealedContentGap {
+                        path: path.as_bytes().to_vec(),
+                        expected: identity.to_string(),
+                        detail,
                     });
-                    continue;
-                }
-            };
-            if sealed.contains(&identity) || failed.contains(&identity) {
-                continue;
-            }
-            match seal_body(content, identity) {
-                Ok(body) => {
-                    sealed.insert(identity);
-                    coverage.sealed_bodies += 1;
-                    coverage.sealed_body_bytes += body.len() as u64;
-                    if body.is_empty() {
-                        coverage.empty_bodies += 1;
-                    }
-                    if std::str::from_utf8(&body).is_err() {
-                        coverage.opaque_bodies += 1;
-                    }
-                }
-                Err(detail) => {
-                    failed.insert(identity);
-                    if reported_gaps.len() < MAX_REPORTED_GAPS {
-                        reported_gaps.push(UnsealedContentGap {
-                            path: path.as_bytes().to_vec(),
-                            expected: identity.to_string(),
-                            detail,
-                        });
-                    }
                 }
             }
         }
-        tree_digests.push(digest(&tree_content));
-        observe(observed_trees, total_trees);
+        observe(proved + 1, total_bodies);
     }
 
     // One gap per distinct unsealed body, so a report that lists every gap it
@@ -437,29 +543,31 @@ mod tests {
         }
     }
 
-    /// An explicit list of admitted trees, so a test can seal a deliberately
-    /// altered closure through the production observation rather than asserting
-    /// against a hand-computed fingerprint.
+    /// An explicit closure, so a test can seal a deliberately altered one
+    /// through the production observation rather than asserting against a
+    /// hand-computed fingerprint.
     struct ObservedTrees {
         repository_id: RepositoryId,
-        trees: Vec<ResolvedTree>,
+        content: AdmittedContentSummary,
+        seed: ResolvedTree,
     }
 
     impl ObservedTrees {
         fn from_closure(closure: &impl AdmittedContentClosure) -> Self {
             Self {
                 repository_id: closure.closure_repository_id().clone(),
-                trees: closure.admitted_trees().into_iter().cloned().collect(),
+                content: closure.admitted_content().into_owned(),
+                seed: closure.admitted_seed_tree().clone(),
             }
         }
 
         /// Exchange the bodies of two same-shape entries in the last admitted
-        /// tree, leaving every count and the byte total untouched.
+        /// tree, the workspace seed's, leaving every count and the byte total
+        /// untouched.
         fn with_exchanged_head_bodies(&self, left: &[u8], right: &[u8]) -> Self {
             let left = RepoPath::from_bytes(left.to_vec()).unwrap();
             let right = RepoPath::from_bytes(right.to_vec()).unwrap();
-            let mut trees = self.trees.clone();
-            let head = trees.last_mut().expect("the closure observes a tree");
+            let mut head = self.seed.clone();
             let left_entry = head
                 .artifact_at_path(&left)
                 .expect("left path exists")
@@ -484,10 +592,11 @@ mod tests {
                     artifact
                 })
                 .collect::<Vec<_>>();
-            *head = ResolvedTree::from_artifacts(exchanged).unwrap();
+            head = ResolvedTree::from_artifacts(exchanged).unwrap();
             Self {
                 repository_id: self.repository_id.clone(),
-                trees,
+                content: self.content.clone(),
+                seed: head,
             }
         }
     }
@@ -497,8 +606,12 @@ mod tests {
             &self.repository_id
         }
 
-        fn admitted_trees(&self) -> Vec<&ResolvedTree> {
-            self.trees.iter().collect()
+        fn admitted_content(&self) -> Cow<'_, AdmittedContentSummary> {
+            Cow::Borrowed(&self.content)
+        }
+
+        fn admitted_seed_tree(&self) -> &ResolvedTree {
+            &self.seed
         }
     }
 

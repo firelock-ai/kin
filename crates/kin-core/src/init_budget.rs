@@ -3,34 +3,37 @@
 
 //! What a conversion will hold, read before it starts holding it.
 //!
-//! A conversion's peak follows history depth multiplied by tree size, because
-//! the import plan materializes one resolved tree per commit and keeps every
-//! one of them live until proof 1 releases the plan's bodies five phases later.
-//! `build_semantic_git_import_plan` derives that history under
-//! `TreeRetention::Whole` precisely so the plan can carry all of them, and the
-//! `commit_trees` field says in its own doc comment that it is the largest
-//! whole-history structure a conversion holds.
+//! A conversion's peak follows history depth, because every commit's entity and
+//! relation deltas are derived in phase 5 and held from there until the store
+//! holds them at phase 13, and beside them the store itself is built and then
+//! opened. Tree width sets the peak instead when the tree is wide enough:
+//! the tree a conversion admits is parsed whole to derive its semantics. What a
+//! conversion no longer holds is one resolved tree per commit. The history
+//! derivation resolves each commit's tree from its first parent's and the
+//! leaves that differ, hands it to every reader that needs it while it is
+//! live, keeps a hash and a content observation in its place, and drops it once
+//! nothing later resolves against it, so history depth multiplied by tree
+//! width is no longer a term here.
 //!
-//! On a repository whose product of the two is larger than the machine, that
-//! peak ends the run at phase 4 and says nothing at all. `SIGKILL` runs no
-//! destructor and writes no message, so the operator sees four phase lines and
-//! a shell that prints `Killed`. The post-mortem this crate already writes is
-//! excellent and arrives one run too late, because it is read off disk by the
-//! NEXT command; the run that dies is the run a first-time user has.
+//! On a repository whose demand is larger than the machine, the peak ends the
+//! run at phase 5 or 13 and says nothing at all. `SIGKILL` runs no destructor
+//! and writes no message, so the operator sees a few phase lines and a shell
+//! that prints `Killed`. The post-mortem this crate already writes is excellent
+//! and arrives one run too late, because it is read off disk by the NEXT
+//! command; the run that dies is the run a first-time user has.
 //!
 //! So the ladder asks the cheap question first. Counting a repository's commits
 //! and its tracked artifacts costs a rev-walk and one index read, both of which
-//! finish before phase 2 would have started copying anything, and the two
-//! numbers are the whole driver. When their product forecasts more than this
-//! process can read as a ceiling, the conversion refuses in words instead of
-//! dying in silence.
+//! finish before phase 2 would have started copying anything. When those
+//! forecast more than this process can read as a ceiling, the conversion
+//! refuses in words instead of dying in silence.
 //!
 //! # What the forecast is, and what it is not
 //!
 //! It is a floor, not a prediction. Each coefficient below is the LOWEST demand
 //! per unit of work observed across measured conversions, and the forecast takes
-//! the larger of the two terms rather than their sum, so a forecast that exceeds
-//! the ceiling is a statement that the real demand exceeds it too. Nothing here
+//! the larger of its terms rather than their sum, so a forecast that exceeds the
+//! ceiling is a statement that the real demand exceeds it too. Nothing here
 //! forecasts how long a conversion takes, and a forecast under the ceiling is
 //! not a promise the conversion fits: a repository can be unusual in ways two
 //! numbers do not capture, and the machine's free memory moves while the
@@ -39,7 +42,7 @@
 //! That asymmetry is deliberate. A refusal that fires wrongly costs a user a
 //! conversion that would have worked, and the only way back is an environment
 //! variable. A refusal that fails to fire costs nothing that is not already
-//! being paid today, because dying at phase 4 is the current behaviour.
+//! being paid today, because dying mid-ladder is the behaviour it replaces.
 
 use std::path::Path;
 
@@ -57,34 +60,41 @@ pub const INIT_MEMORY_CEILING_ENV: &str = "KIN_INIT_MEMORY_CEILING_BYTES";
 
 /// Bytes a conversion holds for each commit, whatever its trees are like.
 ///
-/// One `SemanticChange` and one `ExternalChangeAlias` per commit, plus the
-/// parsed commit, its identity entry and its ordering slot, and everything the
-/// bootstrap transaction later carries for it.
+/// The enriched entity and relation deltas of one commit, resident from the
+/// phase that derives them through the admitted plan, the transaction and the
+/// store's own copy, plus one `SemanticChange`, one alias, the parsed commit,
+/// its tree hash and its content observation.
 ///
 /// The value is the SMALLEST per-commit demand measured across full
 /// conversions, so it understates every one of them rather than fitting any.
-const BYTES_PER_COMMIT: u64 = 1_200_000;
+/// Measured on psf/requests at 6,493 commits over 130 files on kin 0.7.3, a
+/// scratch store and `--no-enrich`, resident set sampled once a second from
+/// outside the process: peak 4,800,708,608 bytes, 739,368 per commit. This
+/// rounds under it.
+const BYTES_PER_COMMIT: u64 = 700_000;
 
-/// Bytes a conversion holds per commit for each artifact in that commit's tree.
+/// Bytes the repository daemon holds for each commit of the store it loads.
 ///
-/// `build_semantic_git_import_plan` derives history under `TreeRetention::Whole`
-/// and keeps one `ResolvedTree` per commit, each a pair of maps over every
-/// artifact in that tree, so this term is O(commits x tree width) by
-/// construction. Same discipline as the term above: the smallest measured, not
-/// the best fitted.
-const BYTES_PER_COMMIT_ARTIFACT: u64 = 4_000;
+/// Not the conversion's demand. `kin init` does not end when the conversion
+/// ends: it starts a repository daemon on the store it just wrote, and that
+/// daemon loads the store whole. Measured on the same psf/requests store at
+/// three ceilings, the load came back 8.351 GiB by resident set at 9 GiB,
+/// 8.0 GiB by the daemon's own footprint accounting at 12 GiB, and 7.9 GiB by
+/// the same accounting at 16 GiB, the last of those being the only one taken
+/// with room to spare. Per commit that is 1.22 MB at the least, and this rounds
+/// under it.
+///
+/// A separate coefficient from [`BYTES_PER_COMMIT`] on purpose. One number used
+/// to serve both, and the conversion's own demand has since come down while
+/// the daemon's has not, so a single floor on the conversion would have
+/// stopped speaking about a daemon it still cannot describe.
+const DAEMON_BYTES_PER_COMMIT: u64 = 1_200_000;
 
 /// Fraction of the ceiling a forecast may reach before the conversion says so.
 ///
 /// Under it the conversion is silent, because a line about memory on a
 /// conversion that had room to spare is noise that trains an operator to skip
 /// the line that matters.
-///
-/// Set where the measured subjects fall on the right side of it: on an 8 GiB
-/// ceiling the forecast puts axum at 46 percent and stays silent, and puts flask
-/// at 78 percent and requests at 91 percent and says so. Those are the two whose
-/// real conversions went to 78 and 100 percent of that cap, and the second of
-/// them hit the ceiling 883 times without being killed.
 const TIGHT_FRACTION: f64 = 0.7;
 
 /// How far past the ceiling a forecast has to reach before the conversion is
@@ -97,32 +107,50 @@ const TIGHT_FRACTION: f64 = 0.7;
 /// its own calibration. A false refusal costs a user a conversion that would
 /// have worked and sends them to an environment variable; a warning costs them
 /// a line of text and tells them the same thing.
-///
-/// The case this exists for is not marginal. prometheus forecasts 14 times an
-/// 8 GiB ceiling, so it refuses under any threshold in this range, and the
-/// repositories that sit just over the line get the warning instead, before the
-/// work rather than after it.
 const REFUSE_MULTIPLE: f64 = 1.5;
+
+/// Bytes a conversion holds for each artifact in the head tree it admits.
+///
+/// Deriving semantics from the admitted tree is where a wide tree's memory
+/// goes: on a measured 18,508-file snapshot the conversion reached 13.68 GiB
+/// inside phase 5, before a single byte of it had been staged.
+///
+/// Same discipline as the coefficients above: the SMALLEST demand per head
+/// artifact measured across snapshot conversions, so the forecast understates
+/// every one of them rather than fitting any. Measured on three one-commit
+/// snapshots, peak resident bytes per head artifact: react 254,734 over 7,210
+/// files, redis 947,678 over 1,857, vscode 968,025 over 18,508. React is the
+/// floor and this rounds under it.
+const BYTES_PER_HEAD_ARTIFACT: u64 = 250_000;
+
+/// Bytes a conversion holds for each byte of source it admits.
+///
+/// Paired with [`BYTES_PER_HEAD_ARTIFACT`] and taken as the larger of the two,
+/// because neither alone survives both shapes: a tree of many tiny files is
+/// driven by its file count, and a tree of few large files by its bytes. A
+/// repository that is extreme in either direction is one the other term
+/// forecasts at nothing, and the measured subjects sit on opposite sides of
+/// that line: react's projection comes from its file count and vscode's from
+/// its bytes.
+///
+/// Same floor discipline. Peak resident bytes per byte of captured object:
+/// redis 82.76, react 45.37, vscode 33.69. Vscode is the floor and this rounds
+/// under it. Phase 1 has no byte count, so only the phase-4 projection carries
+/// this term.
+const BYTES_PER_SOURCE_BYTE: u64 = 33;
 
 /// The two numbers that drive a conversion's peak, counted from the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistorySurvey {
-    /// Commits reachable from HEAD. One resolved tree is materialized for each.
+    /// Commits reachable from HEAD. One set of semantic deltas is derived and
+    /// held for each.
     pub commits: u64,
-    /// Artifacts the index tracks, which is the width of each of those trees.
+    /// Artifacts the index tracks, which is the width of the tree the
+    /// conversion parses whole.
     pub tracked_artifacts: u64,
 }
 
 impl HistorySurvey {
-    /// Tree entries the plan materializes across the whole conversion.
-    ///
-    /// Saturating rather than wrapping: the product is what the forecast is
-    /// built on, and a repository large enough to overflow it is a repository
-    /// that should refuse rather than be forecast at zero.
-    pub fn tree_entries(&self) -> u64 {
-        self.commits.saturating_mul(self.tracked_artifacts)
-    }
-
     /// Bytes a conversion of this repository is expected to hold at its peak.
     ///
     /// The larger of two floors rather than their sum. Both terms are real and
@@ -134,10 +162,16 @@ impl HistorySurvey {
     /// least that much.
     pub fn forecast_peak_bytes(&self) -> u64 {
         let by_commit = self.commits.saturating_mul(BYTES_PER_COMMIT);
-        let by_tree = self
-            .tree_entries()
-            .saturating_mul(BYTES_PER_COMMIT_ARTIFACT);
-        by_commit.max(by_tree)
+        let by_head = self
+            .tracked_artifacts
+            .saturating_mul(BYTES_PER_HEAD_ARTIFACT);
+        by_commit.max(by_head)
+    }
+
+    /// Bytes the repository daemon is expected to hold once it loads the store
+    /// this conversion writes.
+    pub fn daemon_load_bytes(&self) -> u64 {
+        self.commits.saturating_mul(DAEMON_BYTES_PER_COMMIT)
     }
 }
 
@@ -171,40 +205,25 @@ pub enum BudgetVerdict {
         forecast_bytes: u64,
         ceiling_bytes: u64,
     },
-    /// The forecast fits the ceiling, but not the daemon's share of it.
+    /// The conversion fits the ceiling, but the store it writes is forecast
+    /// past the daemon's share of it.
     ///
     /// `kin init` does not end when the conversion ends. It starts a repository
     /// daemon on the store it just wrote, and that daemon is allowed half this
-    /// same ceiling by [`memory_pressure::FootprintBudget`]. A forecast under
-    /// [`TIGHT_FRACTION`] of the ceiling but over that half is the band where
-    /// the conversion succeeds and the daemon it starts arrives already past
-    /// what it is allowed to hold.
+    /// same ceiling by [`memory_pressure::FootprintBudget`]. A daemon load over
+    /// that half is the band where the conversion succeeds and the daemon it
+    /// starts arrives already past what it is allowed to hold.
     ///
     /// Measured on psf/requests at 6493 commits inside a 12 GiB container: the
-    /// forecast was 0.61 of the ceiling, so this module said nothing, all
-    /// seventeen phases completed, and the daemon was then killed four times
-    /// across `kin init` and three `kin graph status` attempts. The same corpus
-    /// in a 9 GiB container held 8.351 GiB of resident set in the daemon
-    /// against 5.518 GiB in the conversion, so the daemon is the larger of the
-    /// two and it is the one nothing was forecasting.
-    ///
-    /// No new coefficient pays for this. Both numbers already exist: the
-    /// conversion forecast and the allowance. What makes the first a usable
-    /// floor for the second is measured rather than assumed. The daemon's cost
-    /// to load that store was read at three different ceilings and came back
-    /// 8.351 GiB by resident set at 9 GiB, 8.0 GiB by the daemon's own footprint
-    /// accounting at 12 GiB, and 7.9 GiB by the same accounting at 16 GiB, the
-    /// last of those being the only one taken with room to spare. The forecast
-    /// for the same repository is 7.26 GiB, so it sits just under the load,
-    /// understating it by about eight percent, which is the direction a floor
-    /// should err in.
-    ///
-    /// A per-commit rate is deliberately NOT quoted here. The obvious one is
-    /// wrong: the two largest runs both peaked at exactly their cap, so a rate
-    /// derived from them measures the caps rather than the daemon.
+    /// conversion completed all seventeen phases, and the daemon was then
+    /// killed four times across `kin init` and three `kin graph status`
+    /// attempts. The same corpus in a 9 GiB container held 8.351 GiB of
+    /// resident set in the daemon against 5.518 GiB in the conversion, so the
+    /// daemon is the larger of the two and it is the one this band describes.
     DaemonAllowance {
         survey: HistorySurvey,
         forecast_bytes: u64,
+        daemon_load_bytes: u64,
         ceiling_bytes: u64,
         allowance_bytes: u64,
     },
@@ -233,6 +252,7 @@ impl BudgetVerdict {
         if let Self::DaemonAllowance {
             survey,
             forecast_bytes,
+            daemon_load_bytes,
             ceiling_bytes,
             allowance_bytes,
         } = self
@@ -240,6 +260,7 @@ impl BudgetVerdict {
             return Some(Self::daemon_allowance_line(
                 survey,
                 *forecast_bytes,
+                *daemon_load_bytes,
                 *ceiling_bytes,
                 *allowance_bytes,
             ));
@@ -274,8 +295,8 @@ impl BudgetVerdict {
         ))
     }
 
-    /// The line for a conversion that fits the machine but not the daemon's
-    /// share of it.
+    /// The line for a conversion that fits the machine while the store it
+    /// writes does not fit the daemon's share of it.
     ///
     /// Its own wording rather than the [`Self::Tight`] sentence, because the
     /// two say different things. Tight says the conversion might not finish.
@@ -291,8 +312,8 @@ impl BudgetVerdict {
     ///
     /// The remedy is stated as a number the reader can act on rather than as a
     /// direction. Below the derived budget's own ceiling the allowance is half
-    /// the machine, so twice the forecast is the size that leaves the daemon
-    /// room. Above it the allowance is capped whatever the machine has, so more
+    /// the machine, so twice the daemon's load is the size that leaves it room.
+    /// Above it the allowance is capped whatever the machine has, so more
     /// memory is not a remedy and the line says so instead of sending a reader
     /// to buy some. Nothing here offers `KIN_DAEMON_MEMORY_BUDGET_BYTES`:
     /// raising a self-imposed allowance does not create memory, and advice that
@@ -300,36 +321,39 @@ impl BudgetVerdict {
     fn daemon_allowance_line(
         survey: &HistorySurvey,
         forecast_bytes: u64,
+        daemon_load_bytes: u64,
         ceiling_bytes: u64,
         allowance_bytes: u64,
     ) -> String {
-        let remedy = if forecast_bytes <= memory_pressure::DERIVED_BUDGET_CEILING_BYTES {
+        let remedy = if daemon_load_bytes <= memory_pressure::DERIVED_BUDGET_CEILING_BYTES {
             format!(
                 "give this {} more than {}",
                 ceiling_noun(),
-                human_bytes(forecast_bytes.saturating_mul(2))
+                human_bytes(daemon_load_bytes.saturating_mul(2))
             )
         } else {
             format!(
-                "no machine size fixes this, because one repository daemon is never allowed more                  than {}, so this store needs less history",
+                "no machine size fixes this, because one repository daemon is never allowed more \
+                 than {}, so this store needs less history",
                 human_bytes(memory_pressure::DERIVED_BUDGET_CEILING_BYTES)
             )
         };
         format!(
             "  this conversion is expected to hold about {}, which fits the {} this {} allows. \
              The daemon `kin init` starts on the finished store is a different matter: one \
-             repository daemon here is allowed {}, and {} commits over {} tracked files is \
-             forecast above that. So the conversion will probably finish and \
-             the daemon that serves it afterward starts already past its allowance, which stops \
-             its background work and can end with the kernel stopping the daemon, leaving a \
-             store that reports success and answers nothing. To leave it room, {}, or convert a \
-             repository with less history",
+             repository daemon here is allowed {}, and loading the store that {} commits over \
+             {} tracked files write is expected to take about {}, above that. So the conversion \
+             will probably finish and the daemon that serves it afterward starts already past \
+             its allowance, which stops its background work and can end with the kernel stopping \
+             the daemon, leaving a store that reports success and answers nothing. To leave it \
+             room, {}, or convert a repository with less history",
             human_bytes(forecast_bytes),
             human_bytes(ceiling_bytes),
             ceiling_noun(),
             human_bytes(allowance_bytes),
             survey.commits,
             survey.tracked_artifacts,
+            human_bytes(daemon_load_bytes),
             remedy,
         )
     }
@@ -374,13 +398,14 @@ impl BudgetVerdict {
                 human_bytes(*ceiling_bytes),
             ),
             format!(
-                "  {} commits over {} tracked files is what drives it: a conversion materializes \
-                 one resolved tree per commit and holds every one of them, so its peak follows \
-                 the two multiplied together",
+                "  {} commits over {} tracked files is what drives it: a conversion holds every \
+                 commit's entity and relation deltas from the phase that derives them until the \
+                 store holds them, so its peak follows the commit count, and it parses the whole \
+                 tree it admits, so a wide enough tree sets the peak instead",
                 survey.commits, survey.tracked_artifacts,
             ),
-            "  that figure is a floor, taken from the least any measured conversion needed at a \
-             smaller size, so read it as an order of magnitude rather than as a target"
+            "  that figure is a floor, taken from the least any measured conversion needed per \
+             commit and per file, so read it as an order of magnitude rather than as a target"
                 .to_string(),
             format!(
                 "  give it more than {}, on a larger machine or by raising this {}'s memory limit",
@@ -562,22 +587,17 @@ pub fn verdict_for_with_allowance(
     }
     // The conversion is not the whole command. Below TIGHT_FRACTION the
     // conversion has room, and the question that remains is whether the daemon
-    // this command starts on the finished store has any. A forecast over the
-    // allowance describes a store that daemon cannot hold within its own share
-    // of this machine. The share is half the ceiling when Kin derived it and
-    // whatever an operator named when they set the budget outright, which is
-    // why it arrives as an argument rather than being computed here.
-    //
-    // Checked against every case this module has measured. requests at 6493
-    // commits moves from silent to spoken at a 12 GiB ceiling, which is the one
-    // band where the conversion succeeded and the daemon died. axum at 46
-    // percent of an 8 GiB ceiling stays silent, because 46 percent is under the
-    // half. flask and prometheus are unaffected, being already Tight and
-    // already Exceeds.
-    if forecast_bytes > allowance_bytes {
+    // this command starts on the finished store has any. A daemon load over
+    // the allowance describes a store that daemon cannot hold within its own
+    // share of this machine. The share is half the ceiling when Kin derived it
+    // and whatever an operator named when they set the budget outright, which
+    // is why it arrives as an argument rather than being computed here.
+    let daemon_load_bytes = survey.daemon_load_bytes();
+    if daemon_load_bytes > allowance_bytes {
         return BudgetVerdict::DaemonAllowance {
             survey,
             forecast_bytes,
+            daemon_load_bytes,
             ceiling_bytes,
             allowance_bytes,
         };
@@ -591,48 +611,15 @@ pub fn verdict_for_with_allowance(
 
 // ------------------------------------------------- the plan's own projection
 
-/// Bytes a conversion holds for each artifact in the head tree it admits.
-///
-/// The term [`HistorySurvey`] does not have. Its per-artifact coefficient is
-/// multiplied by the commit count, so a one-commit snapshot forecasts one
-/// tree's worth of tree ENTRIES and nothing at all for what deriving semantics
-/// from those artifacts costs. That derivation is where the memory goes: on a
-/// measured 18,508-file snapshot the conversion reached 13.68 GiB inside phase
-/// 5, before a single byte of it had been staged, and the phase-1 forecast for
-/// the same repository was 74 MB.
-///
-/// Same discipline as the coefficients above: the SMALLEST demand per head
-/// artifact measured across snapshot conversions, so the projection understates
-/// every one of them rather than fitting any. Measured on three one-commit
-/// snapshots, peak resident bytes per head artifact: react 254,734 over 7,210
-/// files, redis 947,678 over 1,857, vscode 968,025 over 18,508. React is the
-/// floor and this rounds under it.
-const BYTES_PER_HEAD_ARTIFACT: u64 = 250_000;
-
-/// Bytes a conversion holds for each byte of source it admits.
-///
-/// Paired with [`BYTES_PER_HEAD_ARTIFACT`] and taken as the larger of the two,
-/// because neither alone survives both shapes: a tree of many tiny files is
-/// driven by its file count, and a tree of few large files by its bytes. A
-/// repository that is extreme in either direction is one the other term
-/// forecasts at nothing, and the measured subjects sit on opposite sides of
-/// that line: react's projection comes from its file count and vscode's from
-/// its bytes.
-///
-/// Same floor discipline. Peak resident bytes per byte of captured object:
-/// redis 82.76, react 45.37, vscode 33.69. Vscode is the floor and this rounds
-/// under it.
-const BYTES_PER_SOURCE_BYTE: u64 = 33;
-
 /// What the import plan knows about the conversion it has just planned.
 ///
 /// Distinct from [`HistorySurvey`], which is counted from the source before
-/// anything is read and can therefore only see history depth. By phase 4 the
-/// plan holds the head tree it is going to admit and a size for every object it
-/// captured, so the width of the conversion is finally a number rather than a
-/// guess. Both are needed: the survey refuses a deep history before capture
-/// spends minutes on it, and this one describes the shape the survey is blind
-/// to.
+/// anything is read and can therefore see the tree only as a file count. By
+/// phase 4 the plan holds the head tree it is going to admit and a size for
+/// every object it captured, so the bytes of the tree are finally a number
+/// rather than a guess. Both are needed: the survey refuses a deep history
+/// before capture spends minutes on it, and this one describes the shape the
+/// survey is blind to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImportSurvey {
     /// Changes the plan carries, one per admitted commit.
@@ -651,21 +638,17 @@ impl ImportSurvey {
     /// already the smallest any measured conversion justified, and adding
     /// independently minimised terms is how a floor stops being one.
     ///
-    /// The first two terms are the history-depth forecast this repeats so a
-    /// deep history is never projected LOWER at phase 4 than it was at phase 1.
-    /// The third is the snapshot term, and it is the one that fires on a
-    /// shallow clone of a wide tree.
+    /// The first two terms are the phase-1 forecast repeated, so a repository
+    /// is never projected LOWER at phase 4 than it was forecast at phase 1.
+    /// The third is the bytes term, and it is the one that fires on a tree of
+    /// few large files.
     pub fn projected_peak_bytes(&self) -> u64 {
         let by_commit = self.commits.saturating_mul(BYTES_PER_COMMIT);
-        let by_tree = self
-            .commits
-            .saturating_mul(self.head_artifacts)
-            .saturating_mul(BYTES_PER_COMMIT_ARTIFACT);
         let by_head = self
             .head_artifacts
             .saturating_mul(BYTES_PER_HEAD_ARTIFACT)
             .max(self.object_bytes.saturating_mul(BYTES_PER_SOURCE_BYTE));
-        by_commit.max(by_tree).max(by_head)
+        by_commit.max(by_head)
     }
 }
 
@@ -847,17 +830,18 @@ mod tests {
         assert!(projection.advisory_line().is_some());
     }
 
-    /// The blindness this was written to cover, pinned so it cannot be argued
-    /// away later.
+    /// Phase 1 sees a wide tree by its file count; phase 4 adds its bytes.
     ///
-    /// [`HistorySurvey`] multiplies its per-artifact term by the commit count.
-    /// At one commit that term collapses, and the same repository the
-    /// projection puts at over sixteen gigabytes the phase-1 forecast puts at
-    /// well under one. Both numbers are in this assertion on purpose: a future
-    /// change that fixes the phase-1 forecast makes this test fail loudly
-    /// rather than leaving two forecasts silently disagreeing.
+    /// The phase-1 forecast used to multiply a per-artifact term by the commit
+    /// count, so a one-commit snapshot of a wide tree forecast one tree's
+    /// worth of entries and nothing for parsing them, and the projection was
+    /// the only thing that caught it. The per-head-artifact term now lives at
+    /// phase 1 too, so the same snapshot the projection puts over sixteen
+    /// gigabytes is forecast in the gigabytes at phase 1 rather than under
+    /// one. What phase 1 still cannot see is the source's byte count, which
+    /// is the term that carries vscode from four gigabytes to seventeen.
     #[test]
-    fn the_phase_one_forecast_is_blind_to_the_shape_this_projection_catches() {
+    fn the_phase_one_forecast_sees_the_tree_width_and_the_projection_adds_its_bytes() {
         let head_artifacts = 18_508;
         let object_bytes = 531_828_795;
         let forecast = HistorySurvey {
@@ -867,13 +851,14 @@ mod tests {
         .forecast_peak_bytes();
         let projected = snapshot(head_artifacts, object_bytes).projected_peak_bytes();
         assert!(
-            forecast < 1024 * 1024 * 1024,
-            "the phase-1 forecast for a one-commit snapshot was {forecast}, which is no longer \
-             the blindness this projection covers"
+            forecast > 4 * 1000 * 1000 * 1000,
+            "the phase-1 forecast for a one-commit snapshot of 18,508 files was {forecast}, so \
+             phase 1 went blind to tree width again"
         );
         assert!(
-            projected > 16 * 1000 * 1000 * 1000,
-            "the projection has to see what the forecast cannot, got {projected}"
+            projected > 16 * 1000 * 1000 * 1000 && projected > forecast,
+            "the projection has to add what the forecast cannot see, got {projected} against \
+             {forecast}"
         );
     }
 
@@ -928,15 +913,15 @@ mod tests {
         }
     }
 
-    /// A deep history is never projected lower here than it was forecast at
-    /// phase 1.
+    /// A repository is never projected lower at phase 4 than it was forecast
+    /// at phase 1.
     ///
     /// The two run four phases apart on the same conversion, and a second
     /// number that undercut the first would read as the danger having passed.
     /// It has not: the projection adds a term, it does not replace one.
     #[test]
-    fn a_deep_history_is_never_projected_below_its_phase_one_forecast() {
-        for (commits, tracked) in [(18_514u64, 1_676u64), (6_493, 900), (200, 40), (1, 18_508)] {
+    fn a_repository_is_never_projected_below_its_phase_one_forecast() {
+        for (commits, tracked) in [(18_514u64, 1_676u64), (6_493, 130), (200, 40), (1, 18_508)] {
             let forecast = HistorySurvey {
                 commits,
                 tracked_artifacts: tracked,
@@ -956,27 +941,22 @@ mod tests {
         }
     }
 
-    /// A repository large enough to overflow the product saturates high rather
+    /// A repository large enough to overflow a term saturates high rather
     /// than wrapping to a projection of nothing, which is the direction a
     /// forecast is allowed to be wrong in.
     ///
-    /// Each case overflows exactly one of the two terms this projection adds,
-    /// while the terms it inherited stay small. A survey that is `u64::MAX` in
-    /// every field would saturate on the inherited per-commit term alone and
-    /// pass with both new multiplications wrapping, which is a test that cannot
-    /// fail for the code it was written for.
+    /// Each case overflows exactly one term while the others stay small. A
+    /// survey that is `u64::MAX` in every field would saturate on the
+    /// per-commit term alone and pass with the others wrapping, which is a
+    /// test that cannot fail for the code it was written for.
     #[test]
     fn a_projection_large_enough_to_overflow_saturates_high() {
-        // Over u64::MAX at 250,000 bytes per artifact, still under it at the
-        // 4,000 the inherited per-commit-artifact term charges.
         let by_artifact_count = ImportSurvey {
             commits: 1,
             head_artifacts: 100_000_000_000_000,
             object_bytes: 0,
         };
         assert_eq!(by_artifact_count.projected_peak_bytes(), u64::MAX);
-        // Over u64::MAX at 33 bytes per source byte, with no artifacts at all,
-        // so nothing but the source-byte term can produce the saturation.
         let by_source_bytes = ImportSurvey {
             commits: 1,
             head_artifacts: 0,
@@ -1060,7 +1040,7 @@ mod tests {
 
     #[test]
     fn a_forecast_over_the_ceiling_refuses() {
-        let verdict = verdict_for(survey(18_514, 1_676), 8 * 1024 * 1024 * 1024);
+        let verdict = verdict_for(survey(40_000, 1_676), 8 * 1024 * 1024 * 1024);
         assert!(verdict.refuses(), "expected a refusal, got {verdict:?}");
         assert!(matches!(verdict, BudgetVerdict::Exceeds { .. }));
     }
@@ -1136,14 +1116,23 @@ mod tests {
     }
 
     /// Every remedy the refusal offers has to be in the words it prints, or the
-    /// operator meets the same dead end the silence left them in.
+    /// operator meets the same dead end the silence left them in, and the
+    /// mechanism it names has to be the one the conversion has.
     #[test]
-    fn the_refusal_names_both_remedies_and_the_shallow_dead_end() {
-        let verdict = verdict_for(survey(18_514, 1_676), 8 * 1024 * 1024 * 1024);
+    fn the_refusal_names_the_mechanism_both_remedies_and_the_shallow_dead_end() {
+        let verdict = verdict_for(survey(40_000, 1_676), 8 * 1024 * 1024 * 1024);
         let text = verdict.refusal_lines().join("\n");
-        assert!(text.contains("18514 commits"), "text was:\n{text}");
+        assert!(text.contains("40000 commits"), "text was:\n{text}");
         assert!(text.contains("1676 tracked files"), "text was:\n{text}");
         assert!(text.contains("8.0 GB"), "text was:\n{text}");
+        assert!(
+            text.contains("entity and relation deltas"),
+            "the refusal has to name what a conversion holds per commit: {text}"
+        );
+        assert!(
+            !text.contains("one resolved tree per commit"),
+            "the refusal names a structure the conversion no longer holds: {text}"
+        );
         assert!(text.contains("give it more than"), "text was:\n{text}");
         assert!(
             text.contains("convert a repository with less history"),
@@ -1154,7 +1143,7 @@ mod tests {
         assert!(text.contains("no staging to reclaim"), "text was:\n{text}");
     }
 
-    /// A repository large enough to overflow the product saturates high rather
+    /// A repository large enough to overflow a term saturates high rather
     /// than wrapping to a forecast of nothing.
     ///
     /// Wrapping is the failure that matters and it fails silently: a product
@@ -1165,17 +1154,17 @@ mod tests {
     /// ceiling near `u64::MAX`, which no machine has and where a saturated
     /// forecast is legitimately not a refusal.
     #[test]
-    fn an_overflowing_product_saturates_instead_of_wrapping() {
+    fn an_overflowing_survey_saturates_instead_of_wrapping() {
         let huge = survey(u64::MAX, u64::MAX);
-        assert_eq!(
-            huge.tree_entries(),
-            u64::MAX,
-            "the product wrapped instead of saturating"
-        );
         assert_eq!(
             huge.forecast_peak_bytes(),
             u64::MAX,
             "the forecast wrapped instead of saturating"
+        );
+        assert_eq!(
+            huge.daemon_load_bytes(),
+            u64::MAX,
+            "the daemon load wrapped instead of saturating"
         );
         assert!(
             verdict_for(huge, 64 * 1024 * 1024 * 1024).refuses(),
@@ -1198,99 +1187,87 @@ mod tests {
             survey(2_000, 1).forecast_peak_bytes() > deep,
             "depth did not move a forecast whose width term cannot win"
         );
-        let wide = survey(1_000, 1_000).forecast_peak_bytes();
+        let wide = survey(1_000, 5_000).forecast_peak_bytes();
         assert!(
-            survey(1_000, 2_000).forecast_peak_bytes() > wide,
+            survey(1_000, 10_000).forecast_peak_bytes() > wide,
             "width did not move a forecast whose width term does win"
         );
     }
 
-    /// Every conversion this forecast was calibrated on, and the one that could
-    /// not finish, land on the side of the ceiling they actually landed on.
+    /// The forecast never exceeds what a conversion really held, or it is not
+    /// a floor and it will refuse work that would have finished.
     ///
-    /// This is the check that stops the coefficients drifting into a forecast
-    /// nobody measured. The four rows are full `kin init` runs of the shipped
+    /// The rows are full `kin init` runs. The first three are the shipped
     /// 0.6.0 inside one Debian 12 container hard-capped at 8 GiB, with the peak
-    /// taken by sampling the cgroup's `memory.current` beside the run rather
-    /// than by reading `memory.peak`, which reports the cap exactly on any run
-    /// the cap actually stopped.
-    ///
-    /// Two properties are asserted, and they pull in opposite directions, which
-    /// is the point. The forecast must never exceed what a conversion really
-    /// held, or it is not a floor and it will refuse work that would have
-    /// finished. And it must still refuse the one repository that could not be
-    /// converted, or it is a check that cannot fire.
+    /// taken by sampling the cgroup's `memory.current` beside the run; the
+    /// requests row at the cap held 8,589,705,216 of an 8,589,934,592 cap and
+    /// survived, so its reading is the ceiling rather than its demand, and a
+    /// floor on the demand is all this assertion needs. The fourth is kin
+    /// 0.7.3 on a 128 GB host with the resident set sampled from outside the
+    /// process once a second, which is the row [`BYTES_PER_COMMIT`] was read
+    /// off. prometheus, 18,514 commits over 1,676 files, was killed at phase 4
+    /// under 0.6.0 on the tree structures this conversion no longer holds, so
+    /// it says nothing about this forecast and is not a row.
     #[test]
     fn the_forecast_is_a_floor_on_every_conversion_it_was_measured_against() {
         const CEILING: u64 = 8 * 1024 * 1024 * 1024;
-        // (name, commits, tracked files, bytes actually held, did it convert)
+        // (name, commits, tracked files, bytes actually held)
         let measured = [
-            ("axum", 1_983_u64, 503_u64, 4_067_635_200_u64, true),
-            ("flask", 5_556, 236, 6_731_427_840, true),
-            // Held 8,589,705,216 of an 8,589,934,592 cap and survived, so its
-            // reading is the ceiling rather than its demand. It is a floor on
-            // the demand, which is all this assertion needs.
-            ("requests", 6_493, 130, 8_589_705_216, true),
-            // Killed at phase 4 of 17, twice, so nothing was measured beyond
-            // "more than the cap". Recorded at the cap for the same reason.
-            ("prometheus", 18_514, 1_676, 8_589_934_592, false),
+            ("axum 0.6.0", 1_983_u64, 503_u64, 4_067_635_200_u64),
+            ("flask 0.6.0", 5_556, 236, 6_731_427_840),
+            ("requests 0.6.0", 6_493, 130, 8_589_705_216),
+            ("requests 0.7.3", 6_493, 130, 4_800_708_608),
         ];
-        for (name, commits, artifacts, held_bytes, converted) in measured {
+        for (name, commits, artifacts, held_bytes) in measured {
             let survey = survey(commits, artifacts);
             let forecast = survey.forecast_peak_bytes();
-            // The floor property is asserted only where the reading IS the
-            // demand. A conversion the cap stopped read the cap, so its figure
-            // bounds its demand from below, and requiring the forecast to stay
-            // under it would be requiring the forecast not to exceed a number it
-            // exists to exceed.
-            let reading_is_the_demand = converted;
-            if reading_is_the_demand {
-                assert!(
-                    forecast <= held_bytes,
-                    "{name}: forecast {forecast} exceeds the {held_bytes} it really held, so the \
-                     forecast is not a floor"
-                );
-            }
+            assert!(
+                forecast <= held_bytes,
+                "{name}: forecast {forecast} exceeds the {held_bytes} it really held, so the \
+                 forecast is not a floor"
+            );
             let verdict = verdict_for(survey, CEILING);
-            assert_eq!(
-                verdict.refuses(),
-                !converted,
-                "{name}: refuses() is {} for a repository that {} convert under 8 GiB",
-                verdict.refuses(),
-                if converted { "did" } else { "did not" }
+            assert!(
+                !verdict.refuses(),
+                "{name}: converted under 8 GiB and must not be refused there, got {verdict:?}"
             );
         }
     }
 
-    /// The advisory band caught the two conversions that ran close to the cap
-    /// and left the one with room alone.
+    /// The bands separate the measured conversions the way their daemons
+    /// separated them.
     ///
-    /// Separated from the floor test above because it grades a different thing:
-    /// that test proves the forecast never over-claims, this one proves the
-    /// threshold over it is set somewhere useful. A band nothing ever lands in
-    /// would pass every assertion above.
+    /// Separated from the floor test above because it grades a different
+    /// thing: that test proves the forecast never over-claims, this one proves
+    /// the thresholds over it are set somewhere useful. A band nothing ever
+    /// lands in would pass every assertion above. At an 8 GiB ceiling axum's
+    /// store loads under the daemon's half and says nothing; flask's and
+    /// requests' load over it and say so, through the daemon band rather than
+    /// the conversion band, because on this forecast neither conversion is
+    /// itself close to the ceiling.
     #[test]
-    fn the_advisory_band_separates_the_measured_conversions() {
+    fn the_bands_separate_the_measured_conversions() {
         const CEILING: u64 = 8 * 1024 * 1024 * 1024;
         assert!(
             matches!(
                 verdict_for(survey(1_983, 503), CEILING),
                 BudgetVerdict::Fits { .. }
             ),
-            "axum used 47 percent of this cap and should convert without comment"
+            "axum should convert without comment"
         );
         for (name, commits, artifacts) in [("flask", 5_556_u64, 236_u64), ("requests", 6_493, 130)]
         {
             let verdict = verdict_for(survey(commits, artifacts), CEILING);
             assert!(
-                matches!(verdict, BudgetVerdict::Tight { .. }),
-                "{name} ran close to this cap and should say so, got {verdict:?}"
+                matches!(verdict, BudgetVerdict::DaemonAllowance { .. }),
+                "{name}'s store loads over the daemon's half of 8 GiB and should say so, got \
+                 {verdict:?}"
             );
             assert!(
                 verdict
                     .advisory_line()
-                    .is_some_and(|line| line.contains("expected to hold")),
-                "{name}'s advisory does not state what it expects to hold"
+                    .is_some_and(|line| line.contains("repository daemon")),
+                "{name}'s advisory does not name the daemon"
             );
         }
     }
@@ -1314,12 +1291,17 @@ mod tests {
         );
         assert!(!verdict.refuses(), "this band warns, it does not refuse");
 
-        // The two figures that make the case are both in the sentence, because
-        // a reader who is told only one of them cannot see why it applies.
+        // The figures that make the case are all in the sentence, because a
+        // reader who is told only one of them cannot see why it applies.
         let line = verdict
             .advisory_line()
             .expect("this band prints its one line");
-        for phrase in ["repository daemon", "is allowed", "6493 commits"] {
+        for phrase in [
+            "repository daemon",
+            "is allowed",
+            "6493 commits",
+            "expected to take about",
+        ] {
             assert!(line.contains(phrase), "line was: {line}");
         }
         // And it does not reuse the Tight sentence, whose claim is about the
@@ -1330,37 +1312,37 @@ mod tests {
         );
     }
 
-    /// The lower edge of the new band is the allowance, to the byte.
+    /// The lower edge of the daemon band is the allowance, to the byte.
     ///
     /// Written as a pair rather than as one assertion, because a band whose
     /// floor is never crossed in either direction is a rule nothing exercises.
     #[test]
     fn the_daemon_band_starts_exactly_at_the_allowance() {
         let survey = survey(6_493, 130);
-        let forecast = survey.forecast_peak_bytes();
-        // A ceiling whose half is exactly the forecast leaves the daemon room,
+        let load = survey.daemon_load_bytes();
+        // A ceiling whose half is exactly the load leaves the daemon room,
         // because the comparison is strictly greater.
-        let roomy = forecast * 2;
+        let roomy = load * 2;
         assert_eq!(
             memory_pressure::FootprintBudget::derived_from(roomy),
-            forecast,
+            load,
             "this test's arithmetic assumes the allowance is half the ceiling here"
         );
         assert!(
             matches!(verdict_for(survey, roomy), BudgetVerdict::Fits { .. }),
-            "a ceiling of exactly twice the forecast should be silent"
+            "a ceiling of exactly twice the load should be silent"
         );
-        // One byte of ceiling less puts the forecast over the allowance.
+        // One byte of allowance less puts the load over it.
         assert!(
             matches!(
                 verdict_for(survey, roomy - 2),
                 BudgetVerdict::DaemonAllowance { .. }
             ),
-            "two bytes below twice the forecast should speak"
+            "two bytes below twice the load should speak"
         );
     }
 
-    /// A forecast no machine size can give the daemon room for is told that,
+    /// A load no machine size can give the daemon room for is told that,
     /// rather than told to find a bigger machine.
     ///
     /// The derived allowance is capped at [`memory_pressure::DERIVED_BUDGET_CEILING_BYTES`]
@@ -1368,17 +1350,15 @@ mod tests {
     /// advice that cannot work, which is the failure mode this product already
     /// carries a ticket for on its OOM recovery text.
     #[test]
-    fn a_forecast_past_the_allowance_cap_does_not_send_a_reader_to_buy_memory() {
-        // Large enough that twice the forecast is still short of what the
-        // allowance would need, and the ceiling is large enough that the
-        // conversion itself has room.
+    fn a_load_past_the_allowance_cap_does_not_send_a_reader_to_buy_memory() {
+        // Large enough that the load is past the cap, with a ceiling large
+        // enough that the conversion itself has room.
         let survey = survey(20_000, 100);
-        let forecast = survey.forecast_peak_bytes();
         assert!(
-            forecast > memory_pressure::DERIVED_BUDGET_CEILING_BYTES,
-            "this test needs a forecast past the allowance cap"
+            survey.daemon_load_bytes() > memory_pressure::DERIVED_BUDGET_CEILING_BYTES,
+            "this test needs a load past the allowance cap"
         );
-        let ceiling = forecast * 4;
+        let ceiling = survey.forecast_peak_bytes() * 4;
         let verdict = verdict_for(survey, ceiling);
         let line = verdict
             .advisory_line()
@@ -1393,21 +1373,22 @@ mod tests {
         );
     }
 
-    /// The new band does not swallow the silence the old one guaranteed.
+    /// The daemon band does not swallow the silence an ordinary conversion is
+    /// owed.
     ///
-    /// axum sits at 46.4 percent of an 8 GiB ceiling, which is under the half
-    /// by about seven percent. That margin is small, so it is pinned here as
-    /// well as in the band test above: a change that widened the daemon rule
-    /// would make an ordinary conversion narrate itself, which is the noise
-    /// TIGHT_FRACTION's own comment exists to prevent.
+    /// axum's store loads to about 55 percent of the daemon's half of an 8 GiB
+    /// ceiling. That margin is pinned here as well as in the band test above:
+    /// a change that widened the daemon rule would make an ordinary conversion
+    /// narrate itself, which is the noise TIGHT_FRACTION's own comment exists
+    /// to prevent.
     #[test]
     fn the_daemon_band_leaves_an_ordinary_conversion_silent() {
         const CEILING: u64 = 8 * 1024 * 1024 * 1024;
         let survey = survey(1_983, 503);
         let allowance = memory_pressure::FootprintBudget::derived_from(CEILING);
         assert!(
-            survey.forecast_peak_bytes() < allowance,
-            "axum's forecast must sit under the allowance for this to be silence rather than luck"
+            survey.daemon_load_bytes() < allowance,
+            "axum's load must sit under the allowance for this to be silence rather than luck"
         );
         let verdict = verdict_for(survey, CEILING);
         assert!(
@@ -1428,20 +1409,20 @@ mod tests {
     fn the_named_allowance_and_not_the_ceiling_decides_the_daemon_band() {
         const CEILING: u64 = 8 * 1024 * 1024 * 1024;
         let survey = survey(1_983, 503);
-        let forecast = survey.forecast_peak_bytes();
+        let load = survey.daemon_load_bytes();
         assert!(
             matches!(
-                verdict_for_with_allowance(survey, CEILING, forecast + 1),
+                verdict_for_with_allowance(survey, CEILING, load + 1),
                 BudgetVerdict::Fits { .. }
             ),
-            "an allowance above the forecast leaves the daemon room"
+            "an allowance above the load leaves the daemon room"
         );
         assert!(
             matches!(
-                verdict_for_with_allowance(survey, CEILING, forecast - 1),
+                verdict_for_with_allowance(survey, CEILING, load - 1),
                 BudgetVerdict::DaemonAllowance { .. }
             ),
-            "an allowance below the forecast does not"
+            "an allowance below the load does not"
         );
     }
 

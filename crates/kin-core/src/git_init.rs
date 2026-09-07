@@ -89,8 +89,8 @@ fn published_closure_is_diverged() -> bool {
     DIVERGED_PUBLISHED_CLOSURE.get()
 }
 
-/// A closure whose last admitted tree carries the bodies of two plain files
-/// exchanged.
+/// A closure whose last admitted tree, the workspace seed's, carries the
+/// bodies of two plain files exchanged.
 ///
 /// Every shape count, distinct body, and byte total is unchanged by the
 /// exchange, so this is exactly the divergence a fingerprint over counts alone
@@ -98,7 +98,8 @@ fn published_closure_is_diverged() -> bool {
 #[cfg(all(unix, test))]
 struct DivergedClosure {
     repository_id: RepositoryId,
-    trees: Vec<kin_model::ResolvedTree>,
+    content: kin_git::AdmittedContentSummary,
+    seed: kin_model::ResolvedTree,
 }
 
 #[cfg(all(unix, test))]
@@ -106,14 +107,7 @@ impl DivergedClosure {
     fn from_closure(closure: &impl AdmittedContentClosure) -> Self {
         use kin_model::{ResolvedTree, TreeEntry};
 
-        let mut trees = closure
-            .admitted_trees()
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let head = trees
-            .last_mut()
-            .expect("an admitted closure observes a tree");
+        let head = closure.admitted_seed_tree();
         let plain_files = head
             .artifacts_by_path()
             .filter(|artifact| {
@@ -147,11 +141,12 @@ impl DivergedClosure {
                 artifact
             })
             .collect::<Vec<_>>();
-        *head = ResolvedTree::from_artifacts(exchanged)
+        let seed = ResolvedTree::from_artifacts(exchanged)
             .expect("exchanging two entries preserves tree validity");
         Self {
             repository_id: closure.closure_repository_id().clone(),
-            trees,
+            content: closure.admitted_content().into_owned(),
+            seed,
         }
     }
 }
@@ -162,8 +157,12 @@ impl AdmittedContentClosure for DivergedClosure {
         &self.repository_id
     }
 
-    fn admitted_trees(&self) -> Vec<&kin_model::ResolvedTree> {
-        self.trees.iter().collect()
+    fn admitted_content(&self) -> std::borrow::Cow<'_, kin_git::AdmittedContentSummary> {
+        std::borrow::Cow::Borrowed(&self.content)
+    }
+
+    fn admitted_seed_tree(&self) -> &kin_model::ResolvedTree {
+        &self.seed
     }
 }
 
@@ -379,7 +378,7 @@ fn init_from_git_with_hooks(
     let semantic_plan = {
         let _span = info_span!(
             "kin.init.bind_historical_semantics",
-            changes = semantic_plan.commit_trees.len()
+            changes = semantic_plan.changes.len()
         )
         .entered();
         bind_historical_semantics(semantic_plan, &capture_store)?
@@ -1009,7 +1008,7 @@ fn seal_observed_content(
             report_every = progress_interval(total);
         }
         if done.is_multiple_of(report_every) || done == total {
-            progress.detail(format_args!("{done}/{total} trees"));
+            progress.detail(format_args!("{done}/{total} bodies"));
         }
     })
 }
@@ -1249,50 +1248,37 @@ fn git_boundary_error(context: impl std::fmt::Display, error: impl std::fmt::Dis
 /// repository, its index, or the worktree. Binding recomputes change, parent,
 /// and alias identities, so it must happen before any identity derived from the
 /// plan is published.
+///
+/// The fold is fed each commit's exact tree by the walk that re-derives the
+/// plan from its raw objects to check it, one commit at a time, in the plan's
+/// own parent-first order. Nothing here ever holds a tree for every commit:
+/// the walk keeps a tree only while a later commit still resolves against it,
+/// and the fold keeps a commit's semantic state only while a later commit
+/// still folds against it. What the phase accumulates is the deltas
+/// themselves, which are what the bootstrap transaction carries.
 fn bind_historical_semantics(
     plan: kin_git::SemanticGitImportPlan,
     capture_store: &BlobStore,
 ) -> Result<kin_git::SemanticGitImportPlan> {
-    // Lend the exact trees rather than copy them. This map exists only to re-key
-    // `commit_trees` from Git object id to semantic change id for the enrichment
-    // fold, which reads a tree and never keeps one. Cloning here doubled the
-    // largest structure a whole-history conversion holds, and held both copies
-    // for the whole phase, to change a key.
-    let mut trees = std::collections::BTreeMap::new();
-    for alias in &plan.aliases {
-        let tree = plan.commit_trees.get(&alias.oid).ok_or_else(|| {
-            git_boundary_error(
-                "bind historical semantics",
-                format!("imported commit {} has no exact resolved tree", alias.oid),
-            )
-        })?;
-        if trees.insert(alias.change_id, tree).is_some() {
-            return Err(git_boundary_error(
-                "bind historical semantics",
-                format!("imported history repeats change {}", alias.change_id),
-            ));
-        }
-    }
-
+    let mut fold = kin_index::HistoricalSemanticFold::new(&plan.changes)
+        .map_err(|error| git_boundary_error("derive historical semantics", error))?;
     // Handed over rather than copied. The fold has no further use for what it
-    // derived, and the plan is where those deltas are going, so a whole
-    // history's entity and relation deltas used to exist twice for the length
-    // of this call for no reader.
-    let bindings =
-        kin_index::derive_historical_semantic_deltas(&plan.changes, &trees, capture_store)
-            .map_err(|error| git_boundary_error("derive historical semantics", error))?
-            .into_iter()
-            .map(|delta| {
-                kin_git::HistoricalSemanticBinding::owned(
-                    delta.change_id,
-                    delta.entity_deltas,
-                    delta.relation_deltas,
-                )
-            })
-            .collect::<Vec<_>>();
-
-    plan.with_historical_semantics(capture_store, bindings)
-        .map_err(|error| git_boundary_error("bind historical semantics", error))
+    // derived, and the plan is where those deltas are going.
+    let plan = plan
+        .enrich_with_historical_semantics(capture_store, &mut |change, tree| {
+            let delta = fold.enrich(change, tree, capture_store).map_err(|error| {
+                kin_git::GitError::Other(format!("derive historical semantics: {error}"))
+            })?;
+            Ok(kin_git::HistoricalSemanticBinding::owned(
+                delta.change_id,
+                delta.entity_deltas,
+                delta.relation_deltas,
+            ))
+        })
+        .map_err(|error| git_boundary_error("bind historical semantics", error))?;
+    fold.finish()
+        .map_err(|error| git_boundary_error("derive historical semantics", error))?;
+    Ok(plan)
 }
 
 /// Park a captured init where a test can kill it on a settled capture tree.

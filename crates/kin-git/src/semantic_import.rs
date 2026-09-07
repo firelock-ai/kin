@@ -11,7 +11,6 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use kin_blobs::BlobStore;
@@ -19,14 +18,15 @@ use kin_model::{
     compute_resolved_tree_hash, compute_semantic_change_id, validate_semantic_change_id,
     ArtifactId, AuthorId, ChangeOrigin, DefaultRefExpectation, DefaultRefMutation, EntityDelta,
     ExternalChangeAlias, ExternalObjectId, ExternalObjectKind, ExternalObjectRecord, GitObjectId,
-    Hash256, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RelationDelta,
-    RepositoryId, RepositoryRefState, ResolvedArtifact, ResolvedTree, SemanticChange,
+    Hash256, LocatedEntry, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
+    RelationDelta, RepositoryId, RepositoryRefState, ResolvedTree, SemanticChange,
     SemanticChangeId, Timestamp, TreeDelta, TreeEntry, WorkspaceHead,
 };
 use uuid::Uuid;
 
 use crate::error::{GitError, Result};
 use crate::lossless::{validate_snapshot, GitObjectFormat, LosslessGitRepository};
+use crate::sealed_observation::{AdmittedContentSummary, SealedTreeObservation};
 
 const GIT_ARTIFACT_NAMESPACE: Uuid = Uuid::from_bytes([
     0x6b, 0x69, 0x6e, 0x2d, 0x67, 0x69, 0x74, 0x2d, 0x61, 0x72, 0x74, 0x69, 0x66, 0x61, 0x63, 0x74,
@@ -104,9 +104,11 @@ impl<'a> HistoricalSemanticBinding<'a> {
 
 /// Deterministic, transaction-ready import of one lossless Git snapshot.
 ///
-/// `changes` are parent-first. `commit_trees` contains the exact resolved tree
-/// for every imported commit. Ref mutations retain external-object targets so
-/// Git can be projected byte-exactly after semantic admission.
+/// `changes` are parent-first. `commit_tree_hashes` names the exact resolved
+/// tree of every imported commit by its canonical hash, and `content` is what
+/// the sealed all-content observation reads from those trees; neither holds a
+/// tree. Ref mutations retain external-object targets so Git can be projected
+/// byte-exactly after semantic admission.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticGitImportPlan {
     pub repository_id: RepositoryId,
@@ -114,13 +116,19 @@ pub struct SemanticGitImportPlan {
     pub external_objects: Vec<ExternalObjectRecord>,
     pub changes: Vec<SemanticChange>,
     pub aliases: Vec<ExternalChangeAlias>,
-    /// Shared, never copied. The admitted form of this plan carries the same
-    /// trees and is live beside it for five phases of the admission ladder, so
-    /// owning them twice put the largest whole-history structure in memory
-    /// twice for the whole of that window. Nothing mutates a tree after
-    /// derivation, so sharing changes no value and no comparison: two plans
-    /// derived separately still hold separate maps and still compare in full.
-    pub commit_trees: Arc<BTreeMap<GitObjectId, ResolvedTree>>,
+    /// The canonical identity of every imported commit's exact tree, keyed by
+    /// commit: thirty-two bytes where a conversion used to hold the tree
+    /// itself, one per commit, for the whole of the ladder. The derivation
+    /// resolves each tree against its first parent's, hands it to whoever
+    /// needs it while it is live, and keeps this. A proof re-derives the tree
+    /// and compares the hash, which is the equality `ResolvedTree` computes,
+    /// because the hash is canonical over the tree's artifacts.
+    pub commit_tree_hashes: BTreeMap<GitObjectId, Hash256>,
+    /// What the sealed all-content observation needs from every commit tree,
+    /// taken once while each tree was live: one digest and entry tally per
+    /// commit, plus the distinct content identities, non-UTF-8 paths and
+    /// declared exclusions the trees reference between them.
+    pub content: AdmittedContentSummary,
     pub refs: RepositoryRefState,
     pub head: WorkspaceHead,
     pub workspace_seed: GitWorkspaceSeed,
@@ -132,11 +140,11 @@ pub struct SemanticGitImportPlan {
 ///
 /// Every proof in a conversion reads the same nine things out of an import
 /// plan: the five raw-snapshot fields it must stay bound to, the change ids and
-/// aliases and commit trees its fingerprint covers, and the workspace seed the
-/// index and worktree observations are taken against. None of them is a change
-/// BODY. Naming that set as a trait is what lets one proof hold a whole plan
-/// and the proofs after it hold only the closure, without the two ever
-/// computing a fingerprint from different inputs.
+/// aliases and commit tree hashes its fingerprint covers, and the workspace
+/// seed the index and worktree observations are taken against. None of them is
+/// a change BODY. Naming that set as a trait is what lets one proof hold a
+/// whole plan and the proofs after it hold only the closure, without the two
+/// ever computing a fingerprint from different inputs.
 pub trait ProvedPlanFacts {
     fn proved_repository_id(&self) -> &RepositoryId;
     fn proved_object_format(&self) -> GitObjectFormat;
@@ -146,7 +154,7 @@ pub trait ProvedPlanFacts {
     /// Change ids in the plan's own parent-first order.
     fn proved_change_ids(&self) -> impl Iterator<Item = SemanticChangeId> + '_;
     fn proved_aliases(&self) -> &[ExternalChangeAlias];
-    fn proved_commit_trees(&self) -> &BTreeMap<GitObjectId, ResolvedTree>;
+    fn proved_commit_tree_hashes(&self) -> &BTreeMap<GitObjectId, Hash256>;
     fn proved_refs(&self) -> &RepositoryRefState;
     fn proved_head(&self) -> &WorkspaceHead;
     fn proved_workspace_seed(&self) -> &GitWorkspaceSeed;
@@ -171,8 +179,8 @@ impl ProvedPlanFacts for SemanticGitImportPlan {
     fn proved_aliases(&self) -> &[ExternalChangeAlias] {
         &self.aliases
     }
-    fn proved_commit_trees(&self) -> &BTreeMap<GitObjectId, ResolvedTree> {
-        &self.commit_trees
+    fn proved_commit_tree_hashes(&self) -> &BTreeMap<GitObjectId, Hash256> {
+        &self.commit_tree_hashes
     }
     fn proved_refs(&self) -> &RepositoryRefState {
         &self.refs
@@ -193,8 +201,8 @@ impl ProvedPlanFacts for SemanticGitImportPlan {
 /// proof nothing reads a change's body again. Every later reader was checked by
 /// name: the plan fingerprint hashes each change's ID, the snapshot binding
 /// reads the five raw-snapshot fields, the index and worktree observations read
-/// the workspace seed, and the published seal reads the commit trees and the
-/// seed tree. What stays behind is `entity_deltas`, `relation_deltas` and
+/// the workspace seed, and the published seal reads the content summary and
+/// the seed tree. What stays behind is `entity_deltas`, `relation_deltas` and
 /// `tree_deltas` for every commit in history, live across the conversion's
 /// peak, answering no question.
 ///
@@ -204,8 +212,7 @@ impl ProvedPlanFacts for SemanticGitImportPlan {
 /// area keeps producing. A closure that never carried the bodies cannot.
 ///
 /// It is built by consuming the plan, so the bodies are freed at the call
-/// rather than copied out beside them, and `commit_trees` moves as the shared
-/// pointer it already is.
+/// rather than copied out beside them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProvedImportClosure {
     pub repository_id: RepositoryId,
@@ -215,7 +222,8 @@ pub struct ProvedImportClosure {
     /// proof after the first ever took from `changes`.
     pub change_ids: Vec<SemanticChangeId>,
     pub aliases: Vec<ExternalChangeAlias>,
-    pub commit_trees: Arc<BTreeMap<GitObjectId, ResolvedTree>>,
+    pub commit_tree_hashes: BTreeMap<GitObjectId, Hash256>,
+    pub content: AdmittedContentSummary,
     pub refs: RepositoryRefState,
     pub head: WorkspaceHead,
     pub workspace_seed: GitWorkspaceSeed,
@@ -235,7 +243,8 @@ impl ProvedImportClosure {
             external_objects: plan.external_objects,
             change_ids,
             aliases: plan.aliases,
-            commit_trees: plan.commit_trees,
+            commit_tree_hashes: plan.commit_tree_hashes,
+            content: plan.content,
             refs: plan.refs,
             head: plan.head,
             workspace_seed: plan.workspace_seed,
@@ -262,8 +271,8 @@ impl ProvedPlanFacts for ProvedImportClosure {
     fn proved_aliases(&self) -> &[ExternalChangeAlias] {
         &self.aliases
     }
-    fn proved_commit_trees(&self) -> &BTreeMap<GitObjectId, ResolvedTree> {
-        &self.commit_trees
+    fn proved_commit_tree_hashes(&self) -> &BTreeMap<GitObjectId, Hash256> {
+        &self.commit_tree_hashes
     }
     fn proved_refs(&self) -> &RepositoryRefState {
         &self.refs
@@ -309,9 +318,49 @@ impl SemanticGitImportPlan {
             &snapshot,
             blob_store,
             TreeRetention::Frontier,
-            &mut |oid, change, alias, tree| comparison.check_commit(oid, change, alias, tree),
+            &mut |oid, change, alias, _tree, facts| {
+                comparison.check_commit(oid, change, alias, facts)
+            },
         )?;
         comparison.finish(&derived)
+    }
+
+    /// Derive this plan's historical semantics from its own exact trees, one
+    /// commit at a time, and bind them.
+    ///
+    /// The walk that re-derives the plan from raw objects to check it is the
+    /// walk that hands each commit's live tree to `enrich`, so no whole-history
+    /// map of trees is ever built to serve the fold: a tree exists for the
+    /// commits that still resolve against it and is dropped after the last of
+    /// them. `enrich` receives the held unenriched change the tree belongs to,
+    /// in the plan's own parent-first order, and returns the deltas to bind to
+    /// it. Everything [`Self::with_historical_semantics`] proves about a held
+    /// plan and a set of bindings is proved here too, by the same comparison
+    /// and the same re-identification.
+    pub fn enrich_with_historical_semantics(
+        self,
+        blob_store: &BlobStore,
+        enrich: &mut dyn FnMut(
+            &SemanticChange,
+            &ResolvedTree,
+        ) -> Result<HistoricalSemanticBinding<'static>>,
+    ) -> Result<Self> {
+        let snapshot = self.raw_snapshot();
+        let mut comparison = HeldPlanComparison::new(&self, Enrichment::None, EXACT_UNENRICHED)?;
+        let mut bindings = Vec::with_capacity(self.changes.len());
+        let derived = derive_semantic_git_history(
+            &snapshot,
+            blob_store,
+            TreeRetention::Frontier,
+            &mut |oid, change, alias, tree, facts| {
+                comparison.check_commit(oid, change, alias, facts)?;
+                let held = comparison.held_change(oid)?;
+                bindings.push(enrich(held, tree)?);
+                Ok(())
+            },
+        )?;
+        comparison.finish(&derived)?;
+        apply_historical_semantic_deltas_unchecked(self, bindings)
     }
 
     /// Bind deterministic CAS-native semantic deltas and recompute every
@@ -333,7 +382,9 @@ impl SemanticGitImportPlan {
             &snapshot,
             blob_store,
             TreeRetention::Frontier,
-            &mut |oid, change, alias, tree| comparison.check_commit(oid, change, alias, tree),
+            &mut |oid, change, alias, _tree, facts| {
+                comparison.check_commit(oid, change, alias, facts)
+            },
         )?;
         comparison.finish(&derived)?;
         apply_historical_semantic_deltas_unchecked(self, bindings)
@@ -358,6 +409,10 @@ pub(crate) struct DerivedEnrichedHistory {
     pub(crate) workspace_seed: GitWorkspaceSeed,
     pub(crate) ref_mutations: Vec<RefMutation>,
     pub(crate) default_ref_mutation: Option<DefaultRefMutation>,
+    /// Every commit's tree by canonical hash, for a caller to compare whole.
+    pub(crate) commit_tree_hashes: BTreeMap<GitObjectId, Hash256>,
+    /// Every commit tree's contribution to the sealed observation.
+    pub(crate) content: AdmittedContentSummary,
     /// Commits derived, which a caller compares against what it holds.
     pub(crate) commits: usize,
 }
@@ -385,6 +440,7 @@ pub(crate) fn derive_enriched_semantic_git_history<'held>(
         SemanticChange,
         ExternalChangeAlias,
         &ResolvedTree,
+        &CommitTreeFacts,
     ) -> Result<()>,
 ) -> Result<DerivedEnrichedHistory> {
     // Pre-enrichment identity to (object id, enriched identity). A derived
@@ -397,7 +453,7 @@ pub(crate) fn derive_enriched_semantic_git_history<'held>(
         snapshot,
         blob_store,
         TreeRetention::Frontier,
-        &mut |oid, mut change, _unenriched_alias, tree| {
+        &mut |oid, mut change, _unenriched_alias, tree, facts| {
             let unenriched_id = change.id;
             let mut parent_oids = Vec::with_capacity(change.parents.len());
             let mut parents = Vec::with_capacity(change.parents.len());
@@ -428,13 +484,15 @@ pub(crate) fn derive_enriched_semantic_git_history<'held>(
                     "pre-enrichment semantic identity {unenriched_id} maps to more than one Git commit"
                 )));
             }
-            visit(oid, &parent_oids, change, alias, tree)
+            visit(oid, &parent_oids, change, alias, tree, facts)
         },
     )?;
     Ok(DerivedEnrichedHistory {
         workspace_seed: derived.workspace_seed,
         ref_mutations: derived.ref_mutations,
         default_ref_mutation: derived.default_ref_mutation,
+        commit_tree_hashes: derived.commit_tree_hashes,
+        content: derived.content,
         commits: derived.commits,
     })
 }
@@ -608,12 +666,22 @@ impl<'a> HeldPlanComparison<'a> {
         GitError::InvalidSnapshot(self.refusal.to_string())
     }
 
+    /// The held change for one Git commit, wherever it sits in the plan.
+    fn held_change(&self, oid: GitObjectId) -> Result<&'a SemanticChange> {
+        let index = *self.held_by_oid.get(&oid).ok_or_else(|| {
+            GitError::InvalidSnapshot(format!(
+                "semantic Git import is missing enriched commit {oid}"
+            ))
+        })?;
+        self.plan.changes.get(index).ok_or_else(|| self.refuse())
+    }
+
     fn check_commit(
         &mut self,
         oid: GitObjectId,
         mut change: SemanticChange,
         alias: ExternalChangeAlias,
-        tree: &ResolvedTree,
+        facts: &CommitTreeFacts,
     ) -> Result<()> {
         let held_index = *self.held_by_oid.get(&oid).ok_or_else(|| {
             GitError::InvalidSnapshot(format!(
@@ -653,10 +721,15 @@ impl<'a> HeldPlanComparison<'a> {
         // content. The held commit is located by object id for its deltas and
         // compared at the position the derivation reached, so a plan whose
         // changes are reordered still fails here.
+        // The tree is compared by its canonical hash and by what the seal
+        // will read from it, both computed fresh by this derivation, so a
+        // held plan whose tree hash or content summary was altered fails at
+        // the commit it was altered for.
         let index = self.checked;
         if self.plan.changes.get(index) != Some(&change)
             || self.plan.aliases.get(index) != Some(&alias)
-            || self.plan.commit_trees.get(&oid) != Some(tree)
+            || self.plan.commit_tree_hashes.get(&oid) != Some(&facts.tree_hash)
+            || self.plan.content.trees.get(&oid) != Some(&facts.content)
         {
             return Err(self.refuse());
         }
@@ -673,7 +746,8 @@ impl<'a> HeldPlanComparison<'a> {
         if self.checked != derived.commits
             || self.plan.changes.len() != derived.commits
             || self.plan.aliases.len() != derived.commits
-            || self.plan.commit_trees.len() != derived.commits
+            || self.plan.commit_tree_hashes.len() != derived.commits
+            || self.plan.content != derived.content
             || self.plan.workspace_seed != derived.workspace_seed
             || self.plan.ref_mutations != derived.ref_mutations
             || self.plan.default_ref_mutation != derived.default_ref_mutation
@@ -686,14 +760,17 @@ impl<'a> HeldPlanComparison<'a> {
 
 /// What a history derivation keeps while it walks parent-first.
 ///
-/// A conversion holds one exact `ResolvedTree` per commit, which is the largest
-/// structure in the ladder and the one that scales with history. Whether that
-/// is unavoidable depends entirely on who reads it afterwards, so the retention
-/// rule is a parameter of the walk rather than a property of the planner.
+/// An exact `ResolvedTree` is the widest structure the walk touches, one map
+/// over every artifact in the repository, and holding one per commit is what
+/// made a conversion's peak follow commits multiplied by files. Nothing in the
+/// product reads a whole-history map of them any more: every reader takes its
+/// tree from the walk while the tree is live, so the product walks under
+/// [`Self::Frontier`] and only a test asks for [`Self::Whole`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TreeRetention {
-    /// Keep every commit's exact tree, because the plan under construction
-    /// carries all of them and later phases resolve against them.
+    /// Keep every commit's exact tree, for a test that wants to look at one
+    /// after the walk.
+    #[cfg(any(test, feature = "test-support"))]
     Whole,
     /// Keep only the trees a later commit still resolves against, plus the one
     /// the workspace seed peels to.
@@ -706,13 +783,26 @@ enum TreeRetention {
     Frontier,
 }
 
+/// What a derivation computes from one commit's exact tree while the tree is
+/// live, and a plan keeps in the tree's place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitTreeFacts {
+    /// The tree's canonical identity, `compute_resolved_tree_hash`.
+    pub tree_hash: Hash256,
+    /// What the sealed all-content observation reads from the tree.
+    pub content: SealedTreeObservation,
+}
+
 /// What a derivation still holds once every commit has been visited.
 struct DerivedGitHistory {
     /// Under [`TreeRetention::Whole`], every commit's exact tree. Under
     /// [`TreeRetention::Frontier`], only the trees no reader has finished with,
-    /// which at the end of a complete walk is the workspace seed's tree and the
-    /// tip of every ref.
+    /// which at the end of a complete walk is the workspace seed's tree.
     commit_trees: BTreeMap<GitObjectId, ResolvedTree>,
+    /// Every commit's tree by canonical hash, whatever the retention.
+    commit_tree_hashes: BTreeMap<GitObjectId, Hash256>,
+    /// Every commit tree's contribution to the sealed observation.
+    content: AdmittedContentSummary,
     workspace_seed: GitWorkspaceSeed,
     ref_mutations: Vec<RefMutation>,
     default_ref_mutation: Option<DefaultRefMutation>,
@@ -726,7 +816,10 @@ struct DerivedGitHistory {
 /// This is the single derivation rule. Building a plan and re-deriving one to
 /// check it against are the same walk with different visitors, so the two can
 /// never drift apart, and only the visitor decides what survives the commit it
-/// was handed.
+/// was handed. Each commit's tree is resolved from its first parent's and the
+/// leaves that differ between the two Git tree objects, so the walk's work per
+/// commit follows what the commit changed, and its memory follows the trees
+/// still being resolved against rather than the length of history.
 fn derive_semantic_git_history(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
@@ -736,6 +829,7 @@ fn derive_semantic_git_history(
         SemanticChange,
         ExternalChangeAlias,
         &ResolvedTree,
+        &CommitTreeFacts,
     ) -> Result<()>,
 ) -> Result<DerivedGitHistory> {
     let bodies = validate_snapshot(snapshot, blob_store)?;
@@ -748,14 +842,7 @@ fn derive_semantic_git_history(
     let commits = parse_commits(snapshot, &bodies, hash_kind)?;
     let order = topological_commit_order(&commits)?;
 
-    let mut tree_decoder = TreeDecoder::new(hash_kind, &bodies, &records);
-    for record in snapshot
-        .objects
-        .iter()
-        .filter(|record| record.object.kind == ExternalObjectKind::Tree)
-    {
-        tree_decoder.decode_relative(record.object.oid)?;
-    }
+    let tree_decoder = TreeDecoder::new(hash_kind, &bodies, &records);
 
     // A commit's exact tree has exactly two kinds of reader: the commits that
     // name it as a parent, and the workspace seed. Counting them before the
@@ -773,6 +860,8 @@ fn derive_semantic_git_history(
     }
 
     let mut commit_trees = BTreeMap::new();
+    let mut commit_tree_hashes = BTreeMap::new();
+    let mut content = AdmittedContentSummary::default();
     let mut change_ids = BTreeMap::new();
     let mut known_artifact_ids = BTreeSet::new();
     let unborn_tree = ResolvedTree::default();
@@ -790,6 +879,20 @@ fn derive_semantic_git_history(
             })?,
             None => &unborn_tree,
         };
+        let first_parent_root = parsed
+            .parents
+            .first()
+            .map(|parent| {
+                commits
+                    .get(parent)
+                    .map(|parsed| parsed.tree)
+                    .ok_or_else(|| {
+                        GitError::InvalidSnapshot(format!(
+                            "first parent {parent} was not parsed before commit {oid}"
+                        ))
+                    })
+            })
+            .transpose()?;
         let secondary_parent_trees = parsed
             .parents
             .iter()
@@ -802,25 +905,20 @@ fn derive_semantic_git_history(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let raw_tree = tree_decoder.resolved_entries(parsed.tree)?;
-        let resolved_tree = assign_artifact_identities(
+        let raw_changes = tree_decoder.diff_trees(first_parent_root, parsed.tree)?;
+        let (tree_deltas, resolved_tree) = resolve_tree_transition(
             oid,
             first_parent_tree,
             &secondary_parent_trees,
-            raw_tree,
+            raw_changes,
             &known_artifact_ids,
         )?;
-        let tree_deltas = exact_tree_deltas(first_parent_tree, &resolved_tree);
-        let applied = first_parent_tree.apply(&tree_deltas).map_err(|error| {
-            GitError::InvalidSnapshot(format!(
-                "commit {oid} has an invalid first-parent tree transition: {error}"
-            ))
-        })?;
-        if applied != resolved_tree {
-            return Err(GitError::InvalidSnapshot(format!(
-                "commit {oid} tree deltas do not reconstruct its exact tree"
-            )));
-        }
+        // Only an added path brings a new identity into history; every other
+        // identity in this tree was known when the tree it was carried from
+        // was derived.
+        known_artifact_ids.extend(tree_deltas.iter().filter_map(|delta| {
+            matches!(delta, TreeDelta::Added { .. }).then(|| delta.artifact_id())
+        }));
 
         let parents = parsed
             .parents
@@ -855,13 +953,13 @@ fn derive_semantic_git_history(
         let alias = ExternalChangeAlias::new(snapshot.repository_id.clone(), oid, change.id);
         alias.validate_change(&change)?;
 
-        known_artifact_ids.extend(
-            resolved_tree
-                .artifacts()
-                .map(|artifact| artifact.artifact_id),
-        );
+        let facts = CommitTreeFacts {
+            tree_hash: compute_resolved_tree_hash(&resolved_tree)?,
+            content: content.observe_commit_tree(oid, &resolved_tree)?,
+        };
+        commit_tree_hashes.insert(oid, facts.tree_hash);
         change_ids.insert(oid, change.id);
-        visit(oid, change, alias, &resolved_tree)?;
+        visit(oid, change, alias, &resolved_tree, &facts)?;
         commit_trees.insert(oid, resolved_tree);
         derived += 1;
 
@@ -933,11 +1031,33 @@ fn derive_semantic_git_history(
 
     Ok(DerivedGitHistory {
         commit_trees,
+        commit_tree_hashes,
+        content,
         workspace_seed,
         ref_mutations,
         default_ref_mutation,
         commits: commits.len(),
     })
+}
+
+/// Every commit's exact resolved tree, derived whole, for a test that wants to
+/// look at one after the walk.
+///
+/// The product never asks for this: a conversion holds a tree only while a
+/// later commit still resolves against it. This exists so a test can pin what
+/// a commit's tree contains without the plan carrying every tree for it.
+#[cfg(any(test, feature = "test-support"))]
+pub fn derive_commit_trees(
+    snapshot: &LosslessGitRepository,
+    blob_store: &BlobStore,
+) -> Result<BTreeMap<GitObjectId, ResolvedTree>> {
+    let derived = derive_semantic_git_history(
+        snapshot,
+        blob_store,
+        TreeRetention::Whole,
+        &mut |_oid, _change, _alias, _tree, _facts| Ok(()),
+    )?;
+    Ok(derived.commit_trees)
 }
 
 fn build_semantic_git_import_plan(
@@ -949,15 +1069,16 @@ fn build_semantic_git_import_plan(
     let derived = derive_semantic_git_history(
         snapshot,
         blob_store,
-        TreeRetention::Whole,
-        &mut |_oid, change, alias, _tree| {
+        TreeRetention::Frontier,
+        &mut |_oid, change, alias, _tree, _facts| {
             changes.push(change);
             aliases.push(alias);
             Ok(())
         },
     )?;
 
-    if derived.commit_trees.len() != derived.commits
+    if derived.commit_tree_hashes.len() != derived.commits
+        || derived.content.trees.len() != derived.commits
         || changes.len() != derived.commits
         || aliases.len() != derived.commits
     {
@@ -972,7 +1093,8 @@ fn build_semantic_git_import_plan(
         external_objects: snapshot.objects.clone(),
         changes,
         aliases,
-        commit_trees: Arc::new(derived.commit_trees),
+        commit_tree_hashes: derived.commit_tree_hashes,
+        content: derived.content,
         refs: snapshot.refs.clone(),
         head: snapshot.head.clone(),
         workspace_seed: derived.workspace_seed,
@@ -1081,12 +1203,37 @@ fn topological_commit_order(
     Ok(ordered)
 }
 
+/// Decodes tree objects out of the verified closure, one directory at a time.
+///
+/// It reads a tree object's DIRECT entries, nothing beneath them, and it
+/// caches nothing. The decoder this replaces flattened every tree object in
+/// the closure into a map of every leaf under it and cached each map, so a
+/// repository's root tree, distinct in nearly every commit, was held once per
+/// commit with every file in it: commits times files, before the resolved
+/// trees were counted at all. A commit is resolved here by comparing its root
+/// tree object with its first parent's and descending only where the two
+/// differ, so the work per commit follows what the commit changed rather than
+/// what the repository holds.
 struct TreeDecoder<'a> {
     hash_kind: gix::hash::Kind,
     bodies: &'a BTreeMap<ExternalObjectId, Vec<u8>>,
     records: &'a BTreeMap<ExternalObjectId, &'a ExternalObjectRecord>,
-    cache: BTreeMap<GitObjectId, BTreeMap<Vec<u8>, TreeEntry>>,
-    active: BTreeSet<GitObjectId>,
+}
+
+/// One direct entry of a decoded tree object.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawTreeEntry {
+    /// A subdirectory, named by its tree object.
+    Tree(GitObjectId),
+    /// A leaf, already resolved to the identity Kin records for it.
+    Leaf(TreeEntry),
+}
+
+/// One leaf that differs between a commit's tree and its first parent's.
+struct RawPathChange {
+    path: kin_model::RepoPath,
+    old: Option<TreeEntry>,
+    new: Option<TreeEntry>,
 }
 
 impl<'a> TreeDecoder<'a> {
@@ -1099,120 +1246,131 @@ impl<'a> TreeDecoder<'a> {
             hash_kind,
             bodies,
             records,
-            cache: BTreeMap::new(),
-            active: BTreeSet::new(),
         }
     }
 
-    fn resolved_entries(
-        &mut self,
-        tree_oid: GitObjectId,
-    ) -> Result<BTreeMap<kin_model::RepoPath, TreeEntry>> {
-        self.decode_relative(tree_oid)?
-            .into_iter()
-            .map(|(path, entry)| {
-                kin_model::RepoPath::from_bytes(path)
-                    .map(|path| (path, entry))
-                    .map_err(|error| {
-                        GitError::InvalidSnapshot(format!(
-                            "invalid path in tree {tree_oid}: {error}"
-                        ))
-                    })
-            })
-            .collect()
-    }
-
-    fn decode_relative(&mut self, tree_oid: GitObjectId) -> Result<BTreeMap<Vec<u8>, TreeEntry>> {
-        if let Some(cached) = self.cache.get(&tree_oid) {
-            return Ok(cached.clone());
-        }
-        if !self.active.insert(tree_oid) {
-            return Err(GitError::InvalidSnapshot(format!(
-                "Git tree graph contains a cycle at {tree_oid}"
-            )));
-        }
-
-        let result = (|| {
-            let object = ExternalObjectId::new(ExternalObjectKind::Tree, tree_oid);
-            let body =
-                self.bodies
-                    .get(&object)
-                    .cloned()
-                    .ok_or_else(|| GitError::MissingObject {
-                        oid: tree_oid.to_string(),
-                        context: "semantic tree decoding".to_string(),
-                    })?;
-            let tree = gix::objs::TreeRef::from_bytes(&body, self.hash_kind).map_err(|error| {
-                GitError::InvalidSnapshot(format!("decode tree {tree_oid}: {error}"))
+    /// The direct entries of one tree object, keyed by name.
+    fn direct_entries(&self, tree_oid: GitObjectId) -> Result<BTreeMap<Vec<u8>, RawTreeEntry>> {
+        let object = ExternalObjectId::new(ExternalObjectKind::Tree, tree_oid);
+        let body = self
+            .bodies
+            .get(&object)
+            .ok_or_else(|| GitError::MissingObject {
+                oid: tree_oid.to_string(),
+                context: "semantic tree decoding".to_string(),
             })?;
-            let mut entries = BTreeMap::new();
-            for entry in tree.entries {
-                let entry_oid = git_object_id(entry.oid.to_owned())?;
-                match entry.mode.kind() {
-                    gix::objs::tree::EntryKind::Tree => {
-                        let children = self.decode_relative(entry_oid)?;
-                        for (child_path, child_entry) in children {
-                            let mut path =
-                                Vec::with_capacity(entry.filename.len() + 1 + child_path.len());
-                            path.extend_from_slice(entry.filename);
-                            path.push(b'/');
-                            path.extend_from_slice(&child_path);
-                            if entries.insert(path.clone(), child_entry).is_some() {
-                                return Err(GitError::InvalidSnapshot(format!(
-                                    "tree {tree_oid} repeats path {}",
-                                    display_path(&path)
-                                )));
-                            }
-                        }
-                    }
-                    gix::objs::tree::EntryKind::Blob => {
-                        insert_leaf(
-                            &mut entries,
-                            tree_oid,
-                            entry.filename,
-                            self.blob_entry(entry_oid, false)?,
-                        )?;
-                    }
-                    gix::objs::tree::EntryKind::BlobExecutable => {
-                        insert_leaf(
-                            &mut entries,
-                            tree_oid,
-                            entry.filename,
-                            self.blob_entry(entry_oid, true)?,
-                        )?;
-                    }
-                    gix::objs::tree::EntryKind::Link => {
-                        let record = self.blob_record(entry_oid)?;
-                        insert_leaf(
-                            &mut entries,
-                            tree_oid,
-                            entry.filename,
-                            TreeEntry::symlink(record.body_hash),
-                        )?;
-                    }
-                    gix::objs::tree::EntryKind::Commit if entry.mode.value() == 0o160000 => {
-                        insert_leaf(
-                            &mut entries,
-                            tree_oid,
-                            entry.filename,
-                            TreeEntry::gitlink(entry_oid),
-                        )?;
-                    }
-                    gix::objs::tree::EntryKind::Commit => {
-                        return Err(GitError::InvalidSnapshot(format!(
-                            "tree {tree_oid} contains unsupported mode {:#o}",
-                            entry.mode.value()
-                        )));
-                    }
+        let tree = gix::objs::TreeRef::from_bytes(body, self.hash_kind).map_err(|error| {
+            GitError::InvalidSnapshot(format!("decode tree {tree_oid}: {error}"))
+        })?;
+        let mut entries = BTreeMap::new();
+        for entry in tree.entries {
+            let entry_oid = git_object_id(entry.oid.to_owned())?;
+            let resolved = match entry.mode.kind() {
+                gix::objs::tree::EntryKind::Tree => RawTreeEntry::Tree(entry_oid),
+                gix::objs::tree::EntryKind::Blob => {
+                    RawTreeEntry::Leaf(self.blob_entry(entry_oid, false)?)
                 }
+                gix::objs::tree::EntryKind::BlobExecutable => {
+                    RawTreeEntry::Leaf(self.blob_entry(entry_oid, true)?)
+                }
+                gix::objs::tree::EntryKind::Link => {
+                    RawTreeEntry::Leaf(TreeEntry::symlink(self.blob_record(entry_oid)?.body_hash))
+                }
+                gix::objs::tree::EntryKind::Commit if entry.mode.value() == 0o160000 => {
+                    RawTreeEntry::Leaf(TreeEntry::gitlink(entry_oid))
+                }
+                gix::objs::tree::EntryKind::Commit => {
+                    return Err(GitError::InvalidSnapshot(format!(
+                        "tree {tree_oid} contains unsupported mode {:#o}",
+                        entry.mode.value()
+                    )));
+                }
+            };
+            if entries.insert(entry.filename.to_vec(), resolved).is_some() {
+                return Err(GitError::InvalidSnapshot(format!(
+                    "tree {tree_oid} repeats path {}",
+                    display_path(entry.filename)
+                )));
             }
-            Ok(entries)
-        })();
-        self.active.remove(&tree_oid);
-        if let Ok(entries) = &result {
-            self.cache.insert(tree_oid, entries.clone());
         }
-        result
+        Ok(entries)
+    }
+
+    /// Every leaf that differs between `base` and `target`, in path order.
+    ///
+    /// `None` for `base` is the empty tree a root commit descends from. Two
+    /// subtrees named by the same object are identical to the byte, so the walk
+    /// never opens them, which is what makes a commit cost what it touched.
+    fn diff_trees(
+        &self,
+        base: Option<GitObjectId>,
+        target: GitObjectId,
+    ) -> Result<Vec<RawPathChange>> {
+        let mut changes = Vec::new();
+        self.diff_into(base, Some(target), &mut Vec::new(), &mut changes)?;
+        changes.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+        Ok(changes)
+    }
+
+    fn diff_into(
+        &self,
+        base: Option<GitObjectId>,
+        target: Option<GitObjectId>,
+        prefix: &mut Vec<u8>,
+        changes: &mut Vec<RawPathChange>,
+    ) -> Result<()> {
+        if base == target {
+            return Ok(());
+        }
+        let base_entries = base
+            .map(|oid| self.direct_entries(oid))
+            .transpose()?
+            .unwrap_or_default();
+        let target_entries = target
+            .map(|oid| self.direct_entries(oid))
+            .transpose()?
+            .unwrap_or_default();
+        let names = base_entries
+            .keys()
+            .chain(target_entries.keys())
+            .map(Vec::as_slice)
+            .collect::<BTreeSet<_>>();
+        for name in names {
+            let old = base_entries.get(name).copied();
+            let new = target_entries.get(name).copied();
+            if old == new {
+                continue;
+            }
+            let mark = prefix.len();
+            if !prefix.is_empty() {
+                prefix.push(b'/');
+            }
+            prefix.extend_from_slice(name);
+            let (old_leaf, old_tree) = split_raw_entry(old);
+            let (new_leaf, new_tree) = split_raw_entry(new);
+            // A side that is a directory contributes every leaf beneath it,
+            // and a side that is a leaf contributes itself at this path. A
+            // path that changes shape between the two, a file replaced by a
+            // directory or the reverse, therefore yields both.
+            if old_tree.is_some() || new_tree.is_some() {
+                self.diff_into(old_tree, new_tree, prefix, changes)?;
+            }
+            if old_leaf.is_some() || new_leaf.is_some() {
+                let path = kin_model::RepoPath::from_bytes(prefix.clone()).map_err(|error| {
+                    GitError::InvalidSnapshot(format!(
+                        "invalid path {} in tree: {error}",
+                        display_path(prefix)
+                    ))
+                })?;
+                changes.push(RawPathChange {
+                    path,
+                    old: old_leaf,
+                    new: new_leaf,
+                });
+            }
+            prefix.truncate(mark);
+        }
+        Ok(())
     }
 
     fn blob_entry(&self, oid: GitObjectId, executable: bool) -> Result<TreeEntry> {
@@ -1234,107 +1392,162 @@ impl<'a> TreeDecoder<'a> {
     }
 }
 
-fn insert_leaf(
-    entries: &mut BTreeMap<Vec<u8>, TreeEntry>,
-    tree_oid: GitObjectId,
-    filename: &[u8],
-    entry: TreeEntry,
-) -> Result<()> {
-    if entries.insert(filename.to_vec(), entry).is_some() {
-        return Err(GitError::InvalidSnapshot(format!(
-            "tree {tree_oid} repeats path {}",
-            display_path(filename)
-        )));
+fn split_raw_entry(entry: Option<RawTreeEntry>) -> (Option<TreeEntry>, Option<GitObjectId>) {
+    match entry {
+        Some(RawTreeEntry::Leaf(leaf)) => (Some(leaf), None),
+        Some(RawTreeEntry::Tree(tree)) => (None, Some(tree)),
+        None => (None, None),
     }
-    Ok(())
 }
 
-fn assign_artifact_identities(
+/// Resolve a commit's exact tree from its first parent's and the leaves that
+/// differ, carrying artifact identity across the transition.
+///
+/// The identity rule is the one the whole-tree resolution applied, unchanged,
+/// so a repository admitted before this derivation and one admitted after it
+/// derive the same artifact identities, the same tree deltas and the same
+/// change identities: a path the first parent carries keeps that parent's
+/// identity whatever happens to its entry; a path it does not carry takes the
+/// identity of the one artifact in a secondary parent with exactly the same
+/// entry, when that match is unique in both directions and the first parent
+/// does not still hold it; and every other new path is introduced under an
+/// identity derived from this commit and the path.
+///
+/// The deltas are sorted by artifact identity, as before, and the tree is
+/// built by applying them to the first parent's, which is the transition the
+/// whole-tree resolution checked its result against. Building the tree that
+/// way makes the check the construction.
+fn resolve_tree_transition(
     introducing_commit: GitObjectId,
     first_parent: &ResolvedTree,
     secondary_parents: &[&ResolvedTree],
-    raw_tree: BTreeMap<kin_model::RepoPath, TreeEntry>,
+    changes: Vec<RawPathChange>,
     known_artifact_ids: &BTreeSet<ArtifactId>,
-) -> Result<ResolvedTree> {
+) -> Result<(Vec<TreeDelta>, ResolvedTree)> {
+    let first_parent_id = |path: &kin_model::RepoPath| {
+        first_parent
+            .artifact_at_path(path)
+            .map(|artifact| artifact.artifact_id)
+            .ok_or_else(|| {
+                GitError::InvalidSnapshot(format!(
+                    "commit {introducing_commit} changes {path}, which its first parent's tree \
+                     does not carry"
+                ))
+            })
+    };
+
     let mut addition_counts = HashMap::<TreeEntry, usize>::new();
-    for (path, entry) in &raw_tree {
-        if first_parent.artifact_at_path(path).is_none() {
-            *addition_counts.entry(*entry).or_default() += 1;
-        }
-    }
-    let mut secondary_candidates = HashMap::<TreeEntry, BTreeSet<ArtifactId>>::new();
-    for parent in secondary_parents {
-        for artifact in parent.artifacts() {
-            secondary_candidates
-                .entry(artifact.entry)
-                .or_default()
-                .insert(artifact.artifact_id);
-        }
-    }
-    let reserved_first_parent_ids = raw_tree
-        .keys()
-        .filter_map(|path| {
-            first_parent
-                .artifact_at_path(path)
-                .map(|artifact| artifact.artifact_id)
-        })
-        .collect::<BTreeSet<_>>();
-    let mut candidate_target_counts = BTreeMap::<ArtifactId, usize>::new();
-    for (path, entry) in &raw_tree {
-        if first_parent.artifact_at_path(path).is_some() {
-            continue;
-        }
-        if let Some(candidates) = secondary_candidates.get(entry) {
-            for candidate in candidates {
-                *candidate_target_counts.entry(*candidate).or_default() += 1;
+    let mut removed_ids = BTreeSet::new();
+    for change in &changes {
+        match (change.old, change.new) {
+            (None, Some(entry)) => *addition_counts.entry(entry).or_default() += 1,
+            (Some(_), None) => {
+                removed_ids.insert(first_parent_id(&change.path)?);
             }
+            _ => {}
         }
     }
 
-    let mut assigned = BTreeSet::new();
-    let mut artifacts = Vec::with_capacity(raw_tree.len());
-    for (path, entry) in raw_tree {
-        let artifact_id = if let Some(first_parent_artifact) = first_parent.artifact_at_path(&path)
-        {
-            first_parent_artifact.artifact_id
-        } else {
-            let candidate = (addition_counts.get(&entry) == Some(&1))
-                .then(|| secondary_candidates.get(&entry))
-                .flatten()
-                .filter(|candidates| candidates.len() == 1)
-                .and_then(|candidates| candidates.first().copied())
-                .filter(|candidate| {
-                    candidate_target_counts.get(candidate) == Some(&1)
-                        && !reserved_first_parent_ids.contains(candidate)
-                        && !assigned.contains(candidate)
-                });
-            match candidate {
-                Some(candidate) => candidate,
-                None => {
-                    let derived = introduced_artifact_id(introducing_commit, &path);
-                    if known_artifact_ids.contains(&derived) || assigned.contains(&derived) {
-                        return Err(GitError::InvalidSnapshot(format!(
-                            "deterministic artifact identity collision at {} in commit {}",
-                            path, introducing_commit
-                        )));
-                    }
-                    derived
+    // Only a merge can carry an identity in from a secondary parent, and only
+    // an added path can receive one, so the candidate table is built only when
+    // both exist. It is the one place this resolution still reads a whole
+    // parent tree, once per secondary parent of a merge that adds a path.
+    let mut secondary_candidates = HashMap::<TreeEntry, BTreeSet<ArtifactId>>::new();
+    let mut candidate_target_counts = BTreeMap::<ArtifactId, usize>::new();
+    if !addition_counts.is_empty() && !secondary_parents.is_empty() {
+        for parent in secondary_parents {
+            for artifact in parent.artifacts() {
+                secondary_candidates
+                    .entry(artifact.entry)
+                    .or_default()
+                    .insert(artifact.artifact_id);
+            }
+        }
+        for change in &changes {
+            let (None, Some(entry)) = (change.old, change.new) else {
+                continue;
+            };
+            if let Some(candidates) = secondary_candidates.get(&entry) {
+                for candidate in candidates {
+                    *candidate_target_counts.entry(*candidate).or_default() += 1;
                 }
             }
-        };
-        if !assigned.insert(artifact_id) {
-            return Err(GitError::InvalidSnapshot(format!(
-                "artifact identity {artifact_id:?} is assigned to more than one path in commit {introducing_commit}"
-            )));
         }
-        artifacts.push(ResolvedArtifact::new(artifact_id, path, entry));
     }
+    // An identity the first parent still holds at a path this commit keeps.
+    let reserved_by_first_parent = |candidate: &ArtifactId| {
+        first_parent.get(candidate).is_some() && !removed_ids.contains(candidate)
+    };
 
-    ResolvedTree::from_artifacts(artifacts).map_err(|error| {
+    let mut assigned = BTreeSet::new();
+    let mut deltas = Vec::with_capacity(changes.len());
+    for change in changes {
+        let RawPathChange { path, old, new } = change;
+        match (old, new) {
+            (Some(old), Some(new)) => {
+                let artifact_id = first_parent_id(&path)?;
+                deltas.push(TreeDelta::Updated {
+                    artifact_id,
+                    old: LocatedEntry::new(path.clone(), old),
+                    new: LocatedEntry::new(path, new),
+                });
+            }
+            (Some(old), None) => {
+                let artifact_id = first_parent_id(&path)?;
+                deltas.push(TreeDelta::Removed {
+                    artifact_id,
+                    old: LocatedEntry::new(path, old),
+                });
+            }
+            (None, Some(new)) => {
+                let candidate = (addition_counts.get(&new) == Some(&1))
+                    .then(|| secondary_candidates.get(&new))
+                    .flatten()
+                    .filter(|candidates| candidates.len() == 1)
+                    .and_then(|candidates| candidates.first().copied())
+                    .filter(|candidate| {
+                        candidate_target_counts.get(candidate) == Some(&1)
+                            && !reserved_by_first_parent(candidate)
+                            && !assigned.contains(candidate)
+                    });
+                let artifact_id = match candidate {
+                    Some(candidate) => candidate,
+                    None => {
+                        let derived = introduced_artifact_id(introducing_commit, &path);
+                        if known_artifact_ids.contains(&derived) || assigned.contains(&derived) {
+                            return Err(GitError::InvalidSnapshot(format!(
+                                "deterministic artifact identity collision at {} in commit {}",
+                                path, introducing_commit
+                            )));
+                        }
+                        derived
+                    }
+                };
+                if !assigned.insert(artifact_id) {
+                    return Err(GitError::InvalidSnapshot(format!(
+                        "artifact identity {artifact_id:?} is assigned to more than one path in commit {introducing_commit}"
+                    )));
+                }
+                deltas.push(TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(path, new),
+                });
+            }
+            (None, None) => {
+                return Err(GitError::InvalidSnapshot(format!(
+                    "commit {introducing_commit} reports a change at {path} with no side"
+                )));
+            }
+        }
+    }
+    deltas.sort_by_key(TreeDelta::artifact_id);
+
+    let resolved = first_parent.apply(&deltas).map_err(|error| {
         GitError::InvalidSnapshot(format!(
-            "commit {introducing_commit} resolved tree is invalid: {error}"
+            "commit {introducing_commit} has an invalid first-parent tree transition: {error}"
         ))
-    })
+    })?;
+    Ok((deltas, resolved))
 }
 
 /// Derive the identity of an artifact from the content event that introduced
@@ -1374,34 +1587,6 @@ fn append_identity_field(target: &mut Vec<u8>, field: &[u8]) {
             .to_le_bytes(),
     );
     target.extend_from_slice(field);
-}
-
-fn exact_tree_deltas(base: &ResolvedTree, target: &ResolvedTree) -> Vec<TreeDelta> {
-    let mut deltas = Vec::new();
-    for old in base.artifacts() {
-        match target.get(&old.artifact_id) {
-            Some(new) if old.path == new.path && old.entry == new.entry => {}
-            Some(new) => deltas.push(TreeDelta::Updated {
-                artifact_id: old.artifact_id,
-                old: old.located_entry(),
-                new: new.located_entry(),
-            }),
-            None => deltas.push(TreeDelta::Removed {
-                artifact_id: old.artifact_id,
-                old: old.located_entry(),
-            }),
-        }
-    }
-    for new in target.artifacts() {
-        if base.get(&new.artifact_id).is_none() {
-            deltas.push(TreeDelta::Added {
-                artifact_id: new.artifact_id,
-                new: new.located_entry(),
-            });
-        }
-    }
-    deltas.sort_by_key(TreeDelta::artifact_id);
-    deltas
 }
 
 /// The commit whose exact tree seeds the workspace, or `None` for an unborn
@@ -1949,7 +2134,20 @@ mod tests {
 
         assert_eq!(second.changes.len(), 6);
         assert_eq!(second.aliases.len(), 6);
-        assert_eq!(second.commit_trees.len(), 6);
+        assert_eq!(second.commit_tree_hashes.len(), 6);
+        assert_eq!(second.content.trees.len(), 6);
+        // The plan names every tree by hash and holds none; a test that wants
+        // to look inside one derives them whole, and each one it derives is
+        // the tree the plan named.
+        let trees = derive_commit_trees(&snapshot, &fixture.blob_store).unwrap();
+        assert_eq!(trees.len(), 6);
+        for (oid, tree) in &trees {
+            assert_eq!(
+                second.commit_tree_hashes.get(oid),
+                Some(&compute_resolved_tree_hash(tree).unwrap()),
+                "the plan's hash for {oid} is not the hash of its derived tree"
+            );
+        }
         assert!(second.changes.iter().all(|change| {
             matches!(change.origin, ChangeOrigin::GitCommit { .. })
                 && change.entity_deltas.is_empty()
@@ -1962,17 +2160,18 @@ mod tests {
         assert_eq!(empty_change.parents, vec![initial_change.id]);
         assert!(empty_change.tree_deltas.is_empty());
         assert_eq!(
-            second.commit_trees.get(&fixture.empty),
-            second.commit_trees.get(&fixture.initial)
+            second.commit_tree_hashes.get(&fixture.empty),
+            second.commit_tree_hashes.get(&fixture.initial)
         );
+        assert_eq!(trees.get(&fixture.empty), trees.get(&fixture.initial));
         assert_eq!(
             merge_change.parents,
             [fixture.empty, fixture.one, fixture.two, fixture.three]
                 .map(|oid| alias_for_oid(&second, oid).change_id)
         );
 
-        let initial_tree = second.commit_trees.get(&fixture.initial).unwrap();
-        let merge_tree = second.commit_trees.get(&fixture.merge).unwrap();
+        let initial_tree = trees.get(&fixture.initial).unwrap();
+        let merge_tree = trees.get(&fixture.merge).unwrap();
         assert_eq!(
             artifact_id(initial_tree, b"compose.yaml"),
             artifact_id(merge_tree, b"compose.yaml")
@@ -1986,20 +2185,11 @@ mod tests {
             artifact_id(merge_tree, b"config-link")
         );
         assert_eq!(
-            artifact_id(
-                second.commit_trees.get(&fixture.one).unwrap(),
-                b"branch-one.txt"
-            ),
+            artifact_id(trees.get(&fixture.one).unwrap(), b"branch-one.txt"),
             artifact_id(merge_tree, b"branch-one.txt")
         );
-        let branch_same_a = artifact_id(
-            second.commit_trees.get(&fixture.one).unwrap(),
-            b"same-a.bin",
-        );
-        let branch_same_b = artifact_id(
-            second.commit_trees.get(&fixture.two).unwrap(),
-            b"same-b.bin",
-        );
+        let branch_same_a = artifact_id(trees.get(&fixture.one).unwrap(), b"same-a.bin");
+        let branch_same_b = artifact_id(trees.get(&fixture.two).unwrap(), b"same-b.bin");
         let merge_same_a = artifact_id(merge_tree, b"same-a.bin");
         let merge_same_b = artifact_id(merge_tree, b"same-b.bin");
         assert_ne!(merge_same_a, branch_same_a);
@@ -2177,24 +2367,18 @@ mod tests {
         replay.validate(&fixture.blob_store).unwrap();
 
         assert_eq!(admitted.external_objects, semantic.external_objects);
-        assert_eq!(admitted.commit_trees, semantic.commit_trees);
-        // Equal is not the assertion that matters here. The admitted plan is
-        // live beside the plan it was derived from for five phases of the
-        // admission ladder, and resolved trees are the largest whole-history
-        // structure either of them holds, so an equal-but-separate map is a
-        // second copy of the repository's history in memory for the whole of
-        // that window. Pointer identity is the only form of this check that
-        // fails when the copy comes back, because a copy still compares equal.
-        assert!(
-            Arc::ptr_eq(&admitted.commit_trees, &semantic.commit_trees),
-            "admission copied the resolved trees instead of sharing them"
-        );
+        assert_eq!(admitted.commit_tree_hashes, semantic.commit_tree_hashes);
+        assert_eq!(admitted.content, semantic.content);
         assert_eq!(admitted.refs, semantic.refs);
         assert_eq!(admitted.head, semantic.head);
         assert_eq!(admitted.workspace_seed, semantic.workspace_seed);
         assert_eq!(admitted.changes.len(), semantic.changes.len());
         assert_eq!(admitted.aliases.len(), semantic.aliases.len());
-        assert_eq!(admitted.commit_policies.len(), semantic.commit_trees.len());
+        assert_eq!(
+            admitted.commit_policies.len(),
+            semantic.commit_tree_hashes.len()
+        );
+        let trees = derive_commit_trees(&snapshot, &fixture.blob_store).unwrap();
 
         let initial_policy = admitted.commit_policies.get(&fixture.initial).unwrap();
         assert_eq!(initial_policy.generation, 0);
@@ -2242,8 +2426,7 @@ mod tests {
         for source in &initial_policy.sources {
             let body = fixture.blob_store.read(&source.body_hash).unwrap();
             assert_eq!(source.body_len, u64::try_from(body.len()).unwrap());
-            let tree_entry = semantic
-                .commit_trees
+            let tree_entry = trees
                 .get(&fixture.initial)
                 .unwrap()
                 .artifact_at_path(&source.path)
@@ -2326,21 +2509,22 @@ mod tests {
             Some(admitted_alias_for_oid(&admitted, fixture.merge).change_id)
         );
 
-        let merge_tree = admitted.commit_trees.get(&fixture.merge).unwrap();
+        // Admission changes no tree: the admitted plan names the same tree
+        // for the merge, by the hash of the tree derived from raw objects.
+        let merge_tree = trees.get(&fixture.merge).unwrap();
+        assert_eq!(
+            admitted.commit_tree_hashes.get(&fixture.merge),
+            Some(&compute_resolved_tree_hash(merge_tree).unwrap())
+        );
         for path in [
             b"compose.yaml".as_slice(),
             b"assets/raw.bin",
             b"unclassified/archive.unknownlang",
             b"NOTICE.txt",
         ] {
-            assert_eq!(
-                merge_tree.artifact_at_path(&repo_path(path)),
-                semantic
-                    .commit_trees
-                    .get(&fixture.merge)
-                    .unwrap()
-                    .artifact_at_path(&repo_path(path)),
-                "non-policy artifact changed during admission: {}",
+            assert!(
+                merge_tree.artifact_at_path(&repo_path(path)).is_some(),
+                "non-policy artifact missing from the merge tree: {}",
                 display_path(path)
             );
         }
@@ -2471,9 +2655,50 @@ mod tests {
             mutated.validate(&blob_store),
             Err(GitError::InvalidSnapshot(_))
         ));
+        // The plan names its trees by hash and carries what the seal reads
+        // from them in their place, so both are checked against the
+        // re-derivation the way the trees themselves used to be: a hash that
+        // names a tree the raw objects do not derive, or a content summary
+        // that describes one, is refused at the commit it belongs to.
+        let mut mutated = plan.clone();
+        let (oid, hash) = mutated
+            .commit_tree_hashes
+            .iter()
+            .next()
+            .map(|(oid, hash)| (*oid, *hash))
+            .unwrap();
+        let mut bytes = *hash.as_bytes();
+        bytes[0] ^= 0xff;
+        mutated
+            .commit_tree_hashes
+            .insert(oid, Hash256::from_bytes(bytes));
+        assert!(matches!(
+            mutated.validate(&blob_store),
+            Err(GitError::InvalidSnapshot(_))
+        ));
+        let mut mutated = plan.clone();
+        mutated
+            .content
+            .trees
+            .get_mut(&oid)
+            .unwrap()
+            .regular_file_entries += 1;
+        assert!(matches!(
+            mutated.validate(&blob_store),
+            Err(GitError::InvalidSnapshot(_))
+        ));
+        let mut mutated = plan.clone();
+        mutated
+            .content
+            .identities
+            .insert(Hash256::from_bytes([7; 32]), repo_path(b"phantom"));
+        assert!(matches!(
+            mutated.validate(&blob_store),
+            Err(GitError::InvalidSnapshot(_))
+        ));
 
-        let ignore_hash = match plan
-            .commit_trees
+        let ignore_hash = match derive_commit_trees(&snapshot, &blob_store)
+            .unwrap()
             .values()
             .next()
             .unwrap()
@@ -2504,6 +2729,323 @@ mod tests {
             admit_semantic_git_import(&plan, &blob_store),
             Err(GitError::Blob(kin_blobs::BlobError::HashMismatch { .. }))
         ));
+    }
+
+    /// The delta-based resolution derives exactly what the whole-tree
+    /// resolution derived, commit for commit.
+    ///
+    /// The identity rule and the delta shape are what every admitted store's
+    /// change identities rest on, so they are pinned here against the
+    /// algorithm they replaced, kept verbatim as the oracle: flatten the
+    /// commit's whole tree, assign identities over every path, and diff two
+    /// whole trees. The new path never sees a whole tree of a commit; it sees
+    /// the leaves that differ from the first parent. Both walk the octopus
+    /// fixture, which carries additions, removals, a mode flip, a symlink
+    /// retarget, identities carried in from secondary parents and the
+    /// ambiguous pair that must not be, and a second repository whose paths
+    /// change shape between a file and a directory.
+    #[cfg(unix)]
+    #[test]
+    fn delta_resolution_matches_the_whole_tree_oracle() {
+        let fixture = SemanticFixture::octopus_polyglot();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("semantic-oracle").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+        let shapes = oracle::compare_every_commit(&snapshot, &fixture.blob_store);
+        assert_eq!(shapes.commits, 6);
+        assert!(shapes.added > 0 && shapes.removed > 0 && shapes.updated > 0);
+
+        let root = tempdir().unwrap();
+        let repo = root.path().join("shapes");
+        fs::create_dir(&repo).unwrap();
+        git_ok(&repo, ["init", "--initial-branch=main"]);
+        configure_git(&repo);
+        write(&repo, "thing", b"a file\n");
+        write(&repo, "dir/keep.txt", b"kept\n");
+        write(&repo, "dir/nested/deep.txt", b"deep\n");
+        git_ok(&repo, ["add", "--all"]);
+        git_ok(&repo, ["commit", "-m", "file and directory"]);
+        // The file becomes a directory, the nested directory becomes a file,
+        // and an untouched sibling stays where it is.
+        fs::remove_file(repo.join("thing")).unwrap();
+        write(&repo, "thing/inside.txt", b"now a directory\n");
+        fs::remove_dir_all(repo.join("dir/nested")).unwrap();
+        write(&repo, "dir/nested", b"now a file\n");
+        git_ok(&repo, ["add", "--all"]);
+        git_ok(&repo, ["commit", "-m", "shapes change"]);
+        // And back again, with a body change on the untouched sibling.
+        fs::remove_dir_all(repo.join("thing")).unwrap();
+        write(&repo, "thing", b"a file again\n");
+        write(&repo, "dir/keep.txt", b"kept, edited\n");
+        git_ok(&repo, ["add", "--all"]);
+        git_ok(&repo, ["commit", "-m", "shapes change back"]);
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &repo,
+            RepositoryId::new("semantic-oracle-shapes").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let shapes = oracle::compare_every_commit(&snapshot, &blob_store);
+        assert_eq!(shapes.commits, 3);
+        assert!(shapes.added > 0 && shapes.removed > 0 && shapes.updated > 0);
+    }
+
+    /// The whole-tree resolution this module replaced, kept verbatim as the
+    /// oracle for [`delta_resolution_matches_the_whole_tree_oracle`].
+    #[cfg(unix)]
+    mod oracle {
+        use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+        use kin_blobs::BlobStore;
+        use kin_model::{
+            ArtifactId, GitObjectId, RepoPath, ResolvedArtifact, ResolvedTree, TreeDelta, TreeEntry,
+        };
+
+        use super::super::{
+            gix_hash_kind, introduced_artifact_id, parse_commits, resolve_tree_transition,
+            topological_commit_order, RawTreeEntry, TreeDecoder,
+        };
+        use crate::error::{GitError, Result};
+        use crate::lossless::{validate_snapshot, LosslessGitRepository};
+
+        pub(super) struct ComparedShapes {
+            pub(super) commits: usize,
+            pub(super) added: usize,
+            pub(super) removed: usize,
+            pub(super) updated: usize,
+        }
+
+        /// Resolve every commit both ways and require the trees and deltas to
+        /// agree, returning what shapes the comparison covered.
+        pub(super) fn compare_every_commit(
+            snapshot: &LosslessGitRepository,
+            blob_store: &BlobStore,
+        ) -> ComparedShapes {
+            let bodies = validate_snapshot(snapshot, blob_store).unwrap();
+            let records = snapshot
+                .objects
+                .iter()
+                .map(|record| (record.object, record))
+                .collect::<BTreeMap<_, _>>();
+            let hash_kind = gix_hash_kind(snapshot.object_format);
+            let commits = parse_commits(snapshot, &bodies, hash_kind).unwrap();
+            let order = topological_commit_order(&commits).unwrap();
+            let decoder = TreeDecoder::new(hash_kind, &bodies, &records);
+            let mut trees = BTreeMap::<GitObjectId, ResolvedTree>::new();
+            let mut known = BTreeSet::new();
+            let mut shapes = ComparedShapes {
+                commits: 0,
+                added: 0,
+                removed: 0,
+                updated: 0,
+            };
+            for oid in order {
+                let parsed = commits.get(&oid).unwrap();
+                let first_parent = parsed
+                    .parents
+                    .first()
+                    .map(|parent| trees.get(parent).unwrap().clone())
+                    .unwrap_or_default();
+                let secondary = parsed
+                    .parents
+                    .iter()
+                    .skip(1)
+                    .map(|parent| trees.get(parent).unwrap())
+                    .collect::<Vec<_>>();
+
+                let raw_tree = flatten(&decoder, parsed.tree);
+                let expected_tree =
+                    assign_artifact_identities(oid, &first_parent, &secondary, raw_tree, &known)
+                        .unwrap();
+                let expected_deltas = exact_tree_deltas(&first_parent, &expected_tree);
+
+                let changes = decoder
+                    .diff_trees(
+                        parsed
+                            .parents
+                            .first()
+                            .map(|parent| commits.get(parent).unwrap().tree),
+                        parsed.tree,
+                    )
+                    .unwrap();
+                let (deltas, tree) =
+                    resolve_tree_transition(oid, &first_parent, &secondary, changes, &known)
+                        .unwrap();
+                assert_eq!(
+                    tree, expected_tree,
+                    "commit {oid} resolved a different tree"
+                );
+                assert_eq!(
+                    deltas, expected_deltas,
+                    "commit {oid} resolved different tree deltas"
+                );
+                for delta in &deltas {
+                    match delta {
+                        TreeDelta::Added { .. } => shapes.added += 1,
+                        TreeDelta::Removed { .. } => shapes.removed += 1,
+                        TreeDelta::Updated { .. } => shapes.updated += 1,
+                    }
+                }
+                known.extend(tree.artifacts().map(|artifact| artifact.artifact_id));
+                trees.insert(oid, tree);
+                shapes.commits += 1;
+            }
+            shapes
+        }
+
+        fn flatten(
+            decoder: &TreeDecoder<'_>,
+            tree_oid: GitObjectId,
+        ) -> BTreeMap<RepoPath, TreeEntry> {
+            fn walk(
+                decoder: &TreeDecoder<'_>,
+                tree_oid: GitObjectId,
+                prefix: &mut Vec<u8>,
+                out: &mut BTreeMap<RepoPath, TreeEntry>,
+            ) {
+                for (name, entry) in decoder.direct_entries(tree_oid).unwrap() {
+                    let mark = prefix.len();
+                    if !prefix.is_empty() {
+                        prefix.push(b'/');
+                    }
+                    prefix.extend_from_slice(&name);
+                    match entry {
+                        RawTreeEntry::Tree(sub) => walk(decoder, sub, prefix, out),
+                        RawTreeEntry::Leaf(leaf) => {
+                            assert!(out
+                                .insert(RepoPath::from_bytes(prefix.clone()).unwrap(), leaf)
+                                .is_none());
+                        }
+                    }
+                    prefix.truncate(mark);
+                }
+            }
+            let mut out = BTreeMap::new();
+            walk(decoder, tree_oid, &mut Vec::new(), &mut out);
+            out
+        }
+
+        fn assign_artifact_identities(
+            introducing_commit: GitObjectId,
+            first_parent: &ResolvedTree,
+            secondary_parents: &[&ResolvedTree],
+            raw_tree: BTreeMap<RepoPath, TreeEntry>,
+            known_artifact_ids: &BTreeSet<ArtifactId>,
+        ) -> Result<ResolvedTree> {
+            let mut addition_counts = HashMap::<TreeEntry, usize>::new();
+            for (path, entry) in &raw_tree {
+                if first_parent.artifact_at_path(path).is_none() {
+                    *addition_counts.entry(*entry).or_default() += 1;
+                }
+            }
+            let mut secondary_candidates = HashMap::<TreeEntry, BTreeSet<ArtifactId>>::new();
+            for parent in secondary_parents {
+                for artifact in parent.artifacts() {
+                    secondary_candidates
+                        .entry(artifact.entry)
+                        .or_default()
+                        .insert(artifact.artifact_id);
+                }
+            }
+            let reserved_first_parent_ids = raw_tree
+                .keys()
+                .filter_map(|path| {
+                    first_parent
+                        .artifact_at_path(path)
+                        .map(|artifact| artifact.artifact_id)
+                })
+                .collect::<BTreeSet<_>>();
+            let mut candidate_target_counts = BTreeMap::<ArtifactId, usize>::new();
+            for (path, entry) in &raw_tree {
+                if first_parent.artifact_at_path(path).is_some() {
+                    continue;
+                }
+                if let Some(candidates) = secondary_candidates.get(entry) {
+                    for candidate in candidates {
+                        *candidate_target_counts.entry(*candidate).or_default() += 1;
+                    }
+                }
+            }
+
+            let mut assigned = BTreeSet::new();
+            let mut artifacts = Vec::with_capacity(raw_tree.len());
+            for (path, entry) in raw_tree {
+                let artifact_id = if let Some(first_parent_artifact) =
+                    first_parent.artifact_at_path(&path)
+                {
+                    first_parent_artifact.artifact_id
+                } else {
+                    let candidate = (addition_counts.get(&entry) == Some(&1))
+                        .then(|| secondary_candidates.get(&entry))
+                        .flatten()
+                        .filter(|candidates| candidates.len() == 1)
+                        .and_then(|candidates| candidates.first().copied())
+                        .filter(|candidate| {
+                            candidate_target_counts.get(candidate) == Some(&1)
+                                && !reserved_first_parent_ids.contains(candidate)
+                                && !assigned.contains(candidate)
+                        });
+                    match candidate {
+                        Some(candidate) => candidate,
+                        None => {
+                            let derived = introduced_artifact_id(introducing_commit, &path);
+                            if known_artifact_ids.contains(&derived) || assigned.contains(&derived)
+                            {
+                                return Err(GitError::InvalidSnapshot(format!(
+                                    "deterministic artifact identity collision at {} in commit {}",
+                                    path, introducing_commit
+                                )));
+                            }
+                            derived
+                        }
+                    }
+                };
+                if !assigned.insert(artifact_id) {
+                    return Err(GitError::InvalidSnapshot(format!(
+                        "artifact identity {artifact_id:?} is assigned to more than one path in commit {introducing_commit}"
+                    )));
+                }
+                artifacts.push(ResolvedArtifact::new(artifact_id, path, entry));
+            }
+
+            ResolvedTree::from_artifacts(artifacts).map_err(|error| {
+                GitError::InvalidSnapshot(format!(
+                    "commit {introducing_commit} resolved tree is invalid: {error}"
+                ))
+            })
+        }
+
+        fn exact_tree_deltas(base: &ResolvedTree, target: &ResolvedTree) -> Vec<TreeDelta> {
+            let mut deltas = Vec::new();
+            for old in base.artifacts() {
+                match target.get(&old.artifact_id) {
+                    Some(new) if old.path == new.path && old.entry == new.entry => {}
+                    Some(new) => deltas.push(TreeDelta::Updated {
+                        artifact_id: old.artifact_id,
+                        old: old.located_entry(),
+                        new: new.located_entry(),
+                    }),
+                    None => deltas.push(TreeDelta::Removed {
+                        artifact_id: old.artifact_id,
+                        old: old.located_entry(),
+                    }),
+                }
+            }
+            for new in target.artifacts() {
+                if base.get(&new.artifact_id).is_none() {
+                    deltas.push(TreeDelta::Added {
+                        artifact_id: new.artifact_id,
+                        new: new.located_entry(),
+                    });
+                }
+            }
+            deltas.sort_by_key(TreeDelta::artifact_id);
+            deltas
+        }
     }
 
     #[cfg(unix)]
