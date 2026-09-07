@@ -33,29 +33,37 @@ gap is much larger than the semantic layer alone accounts for.
 
 Two things account for almost all of the store on the repository broken down
 below, and a third can appear and rival the snapshot in size. Broken down on
-ripgrep at 2,261 commits, whose 6.1 MiB object store became a 405.4 MiB store:
+ripgrep at 2,261 commits under v0.7.2 (measured 2026-09-07 at `e89fff89`),
+whose 5.7 MiB object store became a 703.9 MiB store:
 
-| Part of `.kin/` | Size | Share |
+| Part of `.kin/` | Size (by `du`) | Share |
 | --- | --- | --- |
-| `kindb/<repo>/snapshots` (the graph snapshot) | 287.4 MiB | 64% |
-| `kindb/<repo>/source-blobs` (admitted bodies) | 159.8 MiB | 36% |
-| everything else | under 1 MiB | rounding |
+| `kindb/<repo>/snapshots` (the graph snapshot) | 592.9 MiB | 78.6% |
+| `kindb/<repo>/source-blobs` (admitted bodies) | 154.0 MiB | 20.4% |
+| everything else | about 7 MiB | 1.0% |
+
+This breakdown is measured by `du`, which counts allocated disk blocks rather
+than the logical file bytes this page's own walk sums, so it totals 754.2 MiB
+here, above the 703.9 MiB `kin init` itself prints. The two methods measure
+different things and are not meant to be added across columns; a table like
+this one, left unlabeled, is what put a wrong number on this page the first
+time.
 
 **Source blobs.** Git keeps history as zlib-compressed objects packed with
 deltas, so one packfile holds every revision of a file as a base plus a chain of
 differences. Kin admits that same reachable history into a content-addressed
 store that writes each body verbatim, one file per body, with no compression and
-no deltas between revisions. Everything Git had folded together is unfolded, and
-14,063 reachable objects become 14,063 files. This cost is paid even where Kin
-parses nothing: a 27-file shell repository with zero entities extracted still
-produced a store many times its pack.
+no deltas between revisions. Everything Git had folded together is unfolded: on
+ripgrep's admitted history (v0.7.2, 2026-09-07) 13,383 reachable objects become
+13,383 files. This cost is paid even on a repository with no entities extracted
+at all, since every admitted revision still needs a body on disk.
 
 **The graph snapshot.** Larger than the blobs, and it is not a snapshot of the
 current state. It carries the semantic layer for the whole history, one delta per
 change, and a delta records entities in full rather than by reference. So the
 snapshot grows with the number of entity identities the history ever held, which
-is far more than the number alive at the tip: ripgrep's tip carries 3,568
-entities across 2,327 changes, and an entity's identity is derived partly from
+is far more than the number alive at the tip: ripgrep's tip carries 3,563
+entities (v0.7.2, 2026-09-07), and an entity's identity is derived partly from
 its starting line, so an edit that shifts a function down a file retires one
 identity and creates another for code that did not change.
 
@@ -63,21 +71,25 @@ identity and creates another for code that did not change.
 large enough elsewhere that a reader should not treat that breakdown as the
 shape of every store. Kin writes a prepared workspace query graph at
 `kindb/<repo>/prepared/<workspace>.kpqg`, with a small `.kpqg.json` binding
-beside it, to accelerate reopening a workspace. On psf/requests at `dae7ef63b`
-under v0.7.0 it measured 1163.50 MiB, 46.2% of a 2.46 GiB store, slightly
-smaller than that store's graph snapshot and roughly nine times its admitted
-bodies. It is written during `kin init` rather than by a later commit: on the
-measured store its mtime preceded the command's own return by 24 seconds. It
-appears to be tied to a workspace carrying a semantic overlay rather than
-written unconditionally, so treat it as a component that can appear and can be
-roughly half the store, not as a guaranteed third row.
+beside it, to accelerate reopening a workspace. On psf/requests at
+`dae7ef63b` it measured 1163.50 MiB under v0.7.0 and 1377.80 MiB under v0.7.2
+(2026-09-06), a rise of 18.4% on byte-identical input; under v0.7.0 that was
+46.2% of a 2.46 GiB store, slightly smaller than that store's graph snapshot
+and roughly nine times its admitted bodies. It is written during `kin init`
+rather than by a later commit: on the measured store its mtime preceded the
+command's own return by 24 seconds. It appears to be tied to a workspace
+carrying a semantic overlay rather than written unconditionally, so treat it
+as a component that can appear and can be roughly half the store, not as a
+guaranteed third row.
 
 The first two terms scale with **history depth** rather than with the size of
 your checkout, which is why a repository with a small working tree and thousands
 of commits can still produce a large store.
 
-The ratio is not a constant and is not fully explained. It varies by more than
-3x across repositories of similar size in different languages, and why is an open
+The ratio is not a constant and is not fully explained. It depends on how much
+of a repository's history is still reachable, how many distinct entity
+identities that history ever held, and how a language's own structure maps to
+entities, and why it varies as much as it does across repositories is an open
 question rather than a documented property.
 
 A store can also land **below** its Git object store, but not for the reason it
@@ -105,38 +117,40 @@ questions, and a ratio quoted without its denominator is not a measurement.
 
 Measured with the walk described above, on stores produced by `kin init` alone
 with no embedding pass. Adding embeddings adds a vector index on top of these
-numbers.
+numbers. Every figure below carries the Kin version and the date it was
+measured, because a number without both is not safe to read as current: an
+unstamped ripgrep figure sat on this page for a month and understated the real
+cost by 1.74x, as the row below now shows.
 
-| Repository | Commits | Git object store | Kin store | Ratio |
-| --- | --- | --- | --- | --- |
-| ripgrep (Rust), at `e89fff89` | 2,261 | 6.1 MiB | 405.4 MiB | 66.5x |
-| cobra (Go), at `adbc8813` | 1,106 | 2.2 MiB | 121.2 MiB | 55.6x |
-| a two-commit fixture (one Rust file) | 2 | 444 B | 16.0 KiB | 36.9x |
-| a fixture that reset away a 3 MB commit | 1 | 2.9 MiB | 10.6 KiB | `<0.01x` |
+| Repository | Commits | Git object store | Kin store | Ratio | Version, date |
+| --- | --- | --- | --- | --- | --- |
+| ripgrep (Rust), at `e89fff89` | 2,261 | 5.7 MiB | 703.9 MiB | 122.7x | v0.7.2, 2026-09-07 |
+| a two-commit fixture (one Rust file) | 2 | 444 B | 16.0 KiB | 36.9x | synthetic fixture |
+| a fixture that reset away a 3 MB commit | 1 | 2.9 MiB | 10.6 KiB | `<0.01x` | synthetic fixture |
 
-Reported separately, measured against packs rather than by the walk above, so
-listed as corroboration rather than as rows measured the same way: anyhow 47x,
-click 109.1x, zod 163x, sinatra 75.1x, and a 27-file shell repository with zero
-entities extracted at 27.4x.
-
-Across every real repository named on this page, the table and the corroboration
-list together, the measured ratios span **27.4x to 163x**: 27.4x, 47x, 55.6x,
-66.5x, 75.1x, 109.1x and 163x. The table's other two rows are fixtures built to
-show edge behaviour rather than repositories. So the table's two repository rows
-are not the range, and reading the table alone gives a much narrower impression
-than this page's own numbers support.
+Cobra and a corroboration list of five more repositories this page used to
+cite (anyhow at 47x, click at 109.1x, zod at 163x, sinatra at 75.1x, and a
+27-file shell repository at 27.4x) are removed here. All six came from the
+same August 2026 measurement pass as the old ripgrep figure, a Kin build from
+around v0.5.6, at least a dozen releases before today's v0.7.2, and none could
+be traced to an exact build. The ripgrep row above shows what that gap costs
+when a figure sits unstamped: the same-vintage number understated today's real
+cost by 1.74x. They are pending re-measurement on the shipped release rather
+than published as comparisons this page can no longer stand behind.
 
 This is a record of what has been measured, not a bound. Kin does not currently
 cap store size, warn above a threshold, or refuse to admit a repository for
-being large. If your repository lands far outside 27.4x to 163x, that is worth
-reporting, and the numbers `kin status` prints are what to report.
+being large. Right now this page can stand behind one current ratio, ripgrep's
+122.7x under v0.7.2; the wider range this page used to quote came from the
+figures pulled above. If your own repository's ratio surprises you, the
+numbers `kin status` prints are what to report.
 
 One repository is deliberately absent from the table. psf/requests at
-`dae7ef63b` has been measured at 178.0x under v0.7.0, but that store carried a
-partial embedding pass and one commit, so it was not produced by `kin init`
-alone and a row from it would not mean what the other rows mean. It is named
-here rather than added above, because a table whose rows were gathered different
-ways stops being a comparison.
+`dae7ef63b` measures 178.0x under v0.7.0 and 208.7x under v0.7.2 (2026-09-06),
+both produced by `kin init` alone, but both runs also completed a full
+embedding pass before the store was read, so the figure carries a vector index
+on top of what the table above measures. A row from it would not mean what the
+other rows mean, so it is named here rather than added above.
 
 ## Where to see it
 
