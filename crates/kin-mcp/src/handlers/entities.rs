@@ -12617,6 +12617,15 @@ mod tests {
             ("change_log", "crates/kin-daemon/src/provenance.rs"),
             // The two-word shape the hosted route was measured on.
             ("reconcile_report", "crates/kin-daemon/src/loop_runner.rs"),
+            // "where are the projections and entities stored". Both plural words
+            // have to reduce before either reaches this declaration, and neither
+            // reaches the distractor, so the question is unanswerable without
+            // the reduction and answered wrongly with only the distractor.
+            (
+                "projection_entity_store",
+                "crates/kin-projection/src/store.rs",
+            ),
+            ("stored_blob_count", "crates/kin-blobs/src/metrics.rs"),
         ] {
             store
                 .upsert_entity(&make_entity_in(LanguageId::Rust, name, file))
@@ -12776,6 +12785,44 @@ mod tests {
             payload[crate::query_tokens::LEXICAL_FALLBACK_KEY]["retrieved_by"],
             serde_json::json!("one declaration-name query per token"),
             "the answer has to say so, or the empty slot above is silent"
+        );
+    }
+
+    /// A question's plural words have to reach the singular tokens the index
+    /// holds, and this is the input that proves the reduction is load-bearing.
+    ///
+    /// Written after a falsification arm that disabled the reduction left every
+    /// other test in this file green. The reason was a second defence rather than
+    /// a weak assertion: on "where are projections written to disk" the token
+    /// `disk` retrieves the intended declaration on its own, so the plural word
+    /// never had to work for that answer to be right.
+    ///
+    /// Here it has to. Both content words of the question are plural, the
+    /// declaration that answers it is named for one projection and one entity,
+    /// and the distractor is named for the only word that needs no reduction. So
+    /// with the reduction the answer covers two of the question's words and wins;
+    /// without it the answer is not retrieved at all and the distractor is the
+    /// whole page.
+    #[test]
+    fn a_question_in_the_plural_reaches_a_declaration_named_in_the_singular() {
+        let store = phrase_store();
+        let payload = parsed_response(
+            &handle_semantic_search(
+                &search_args("where are the projections and entities stored", None),
+                &store,
+            )
+            .unwrap(),
+        );
+        let names = search_names(&payload);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("projection_entity_store"),
+            "the plural question must reach the singular declaration: {names:?}"
+        );
+        assert!(
+            names.contains(&"stored_blob_count".to_string()),
+            "the distractor must still be retrieved, or this test could pass \
+             because the store returned nothing at all: {names:?}"
         );
     }
 
