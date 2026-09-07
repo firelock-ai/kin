@@ -209,76 +209,17 @@ impl HistoricalSemanticFold {
     ///
     /// The change must be one the fold was opened over, must not have been
     /// enriched yet, and every one of its parents must have been enriched
-    /// before it, which parent-first order guarantees.
+    /// before it, which parent-first order guarantees. The replay itself is
+    /// [`enrich_historical_change`], a free function so the replay-semantics
+    /// guard can pin its source the way it pins every other function that
+    /// authors persisted history.
     pub fn enrich(
         &mut self,
         change: &SemanticChange,
         tree: &ResolvedTree,
         blob_store: &BlobStore,
     ) -> Result<HistoricalSemanticDelta> {
-        if !self.pending.remove(&change.id) {
-            return Err(invalid(format!(
-                "change {} was not opened for enrichment, or was enriched twice",
-                change.id
-            )));
-        }
-        let parent_states = change
-            .parents
-            .iter()
-            .map(|parent| {
-                self.states.get(parent).ok_or_else(|| {
-                    invalid(format!(
-                        "parent {} of change {} was not enriched first",
-                        parent, change.id
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let empty_parent = SemanticTreeState::default();
-        let first_parent = parent_states.first().copied().unwrap_or(&empty_parent);
-        let current = semantic_state_for_tree(
-            tree,
-            &parent_states,
-            blob_store,
-            &self.pipeline,
-            &mut self.external_fingerprints,
-        )?;
-        let entity_deltas = diff_entities(&first_parent.entities, &current.entities);
-        let relation_deltas = diff_relations(&first_parent.relations, &current.relations);
-        let delta = HistoricalSemanticDelta {
-            change_id: change.id,
-            entity_deltas,
-            relation_deltas,
-        };
-
-        drop(parent_states);
-        for parent in &change.parents {
-            let remaining = self.remaining_child_uses.get_mut(parent).ok_or_else(|| {
-                invalid(format!(
-                    "parent {} of change {} has no child-use accounting",
-                    parent, change.id
-                ))
-            })?;
-            *remaining = remaining.checked_sub(1).ok_or_else(|| {
-                invalid(format!(
-                    "parent {} of change {} has invalid child-use accounting",
-                    parent, change.id
-                ))
-            })?;
-            if *remaining == 0 {
-                self.states.remove(parent);
-            }
-        }
-        if self
-            .remaining_child_uses
-            .get(&change.id)
-            .copied()
-            .unwrap_or(0)
-            > 0
-        {
-            self.states.insert(change.id, current);
-        }
-        Ok(delta)
+        enrich_historical_change(self, change, tree, blob_store)
     }
 
     /// Close the fold, requiring every opened change to have been enriched and
@@ -297,6 +238,85 @@ impl HistoricalSemanticFold {
         }
         Ok(())
     }
+}
+
+/// Enrich one change of a parent-first history against its exact tree.
+///
+/// This is the per-change replay: it decides the baseline the change is
+/// diffed from (its first parent's semantic state, or nothing for a root),
+/// derives the tree's state against every parent so carried-forward parses
+/// are reused, diffs entities and relations, and then releases each parent
+/// state whose last child this was. The whole-map derivation and the streaming
+/// fold both run exactly this, once per change, in the same order.
+fn enrich_historical_change(
+    fold: &mut HistoricalSemanticFold,
+    change: &SemanticChange,
+    tree: &ResolvedTree,
+    blob_store: &BlobStore,
+) -> Result<HistoricalSemanticDelta> {
+    if !fold.pending.remove(&change.id) {
+        return Err(invalid(format!(
+            "change {} was not opened for enrichment, or was enriched twice",
+            change.id
+        )));
+    }
+    let parent_states = change
+        .parents
+        .iter()
+        .map(|parent| {
+            fold.states.get(parent).ok_or_else(|| {
+                invalid(format!(
+                    "parent {} of change {} was not enriched first",
+                    parent, change.id
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let empty_parent = SemanticTreeState::default();
+    let first_parent = parent_states.first().copied().unwrap_or(&empty_parent);
+    let current = semantic_state_for_tree(
+        tree,
+        &parent_states,
+        blob_store,
+        &fold.pipeline,
+        &mut fold.external_fingerprints,
+    )?;
+    let entity_deltas = diff_entities(&first_parent.entities, &current.entities);
+    let relation_deltas = diff_relations(&first_parent.relations, &current.relations);
+    let delta = HistoricalSemanticDelta {
+        change_id: change.id,
+        entity_deltas,
+        relation_deltas,
+    };
+
+    drop(parent_states);
+    for parent in &change.parents {
+        let remaining = fold.remaining_child_uses.get_mut(parent).ok_or_else(|| {
+            invalid(format!(
+                "parent {} of change {} has no child-use accounting",
+                parent, change.id
+            ))
+        })?;
+        *remaining = remaining.checked_sub(1).ok_or_else(|| {
+            invalid(format!(
+                "parent {} of change {} has invalid child-use accounting",
+                parent, change.id
+            ))
+        })?;
+        if *remaining == 0 {
+            fold.states.remove(parent);
+        }
+    }
+    if fold
+        .remaining_child_uses
+        .get(&change.id)
+        .copied()
+        .unwrap_or(0)
+        > 0
+    {
+        fold.states.insert(change.id, current);
+    }
+    Ok(delta)
 }
 
 fn semantic_state_for_tree(
