@@ -70,8 +70,7 @@ pub fn handle_semantic_search<G: GraphStore>(
             Some(planned) => {
                 let hits = retrieve_query_tokens(store, &filter, &planned)?;
                 let ranked = crate::query_tokens::rank(&planned, &hits);
-                let disclosure =
-                    crate::query_tokens::disclosure(&planned, &hits, ranked.len());
+                let disclosure = crate::query_tokens::disclosure(&planned, &hits, ranked.len());
                 (
                     ranked.into_iter().map(|hit| hit.entity).collect::<Vec<_>>(),
                     Some(disclosure),
@@ -12734,8 +12733,9 @@ mod tests {
                 "record_provenance_for_change",
             ),
         ] {
-            let payload =
-                parsed_response(&handle_semantic_search(&search_args(question, None), &store).unwrap());
+            let payload = parsed_response(
+                &handle_semantic_search(&search_args(question, None), &store).unwrap(),
+            );
             let names = search_names(&payload);
             assert_eq!(
                 names.first().map(String::as_str),
@@ -12831,8 +12831,9 @@ mod tests {
     #[test]
     fn two_words_and_an_underscore_now_answer_the_same_row() {
         let store = phrase_store();
-        let underscored =
-            parsed_response(&handle_semantic_search(&search_args("reconcile_report", None), &store).unwrap());
+        let underscored = parsed_response(
+            &handle_semantic_search(&search_args("reconcile_report", None), &store).unwrap(),
+        );
         assert_eq!(search_names(&underscored), vec!["reconcile_report"]);
         assert!(
             underscored
@@ -12841,8 +12842,9 @@ mod tests {
             "a query the name filter answered must not claim a fallback ran"
         );
 
-        let spaced =
-            parsed_response(&handle_semantic_search(&search_args("reconcile report", None), &store).unwrap());
+        let spaced = parsed_response(
+            &handle_semantic_search(&search_args("reconcile report", None), &store).unwrap(),
+        );
         assert_eq!(search_names(&spaced), vec!["reconcile_report"]);
         assert_eq!(
             spaced[crate::query_tokens::LEXICAL_FALLBACK_KEY]["matched"],
@@ -12861,8 +12863,9 @@ mod tests {
     #[test]
     fn a_single_identifier_that_is_absent_stays_absent_and_claims_no_fallback() {
         let store = phrase_store();
-        let payload =
-            parsed_response(&handle_semantic_search(&search_args("SnapshotManager", None), &store).unwrap());
+        let payload = parsed_response(
+            &handle_semantic_search(&search_args("SnapshotManager", None), &store).unwrap(),
+        );
         assert_eq!(payload["total_matches"], serde_json::json!(0));
         assert!(search_names(&payload).is_empty());
         assert!(
@@ -12885,7 +12888,10 @@ mod tests {
         assert_eq!(payload["total_matches"], serde_json::json!(0));
         let block = &payload[crate::query_tokens::LEXICAL_FALLBACK_KEY];
         assert_eq!(block["matched"], serde_json::json!(0));
-        assert_eq!(block["answered_by"], serde_json::json!("name_token_coverage"));
+        assert_eq!(
+            block["answered_by"],
+            serde_json::json!("name_token_coverage")
+        );
         assert!(block["query_tokens"]
             .as_array()
             .is_some_and(|tokens| tokens.iter().any(|t| t == "qqzz")));

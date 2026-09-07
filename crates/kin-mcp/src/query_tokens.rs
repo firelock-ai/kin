@@ -479,8 +479,8 @@ mod tests {
 
     #[test]
     fn the_fan_out_is_capped_and_says_so() {
-        let planned = plan("alpha beta gamma delta epsilon zeta eta theta iota kappa")
-            .expect("phrase plans");
+        let planned =
+            plan("alpha beta gamma delta epsilon zeta eta theta iota kappa").expect("phrase plans");
         assert_eq!(planned.tokens.len(), MAX_QUERY_TOKENS);
         assert!(planned.capped);
         assert!(planned.dropped.contains(&"iota".to_string()));
