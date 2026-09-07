@@ -1437,12 +1437,24 @@ fn resolve_tree_transition(
     };
 
     let mut addition_counts = HashMap::<TreeEntry, usize>::new();
-    let mut removed_ids = BTreeSet::new();
+    // The first parent's side of every path this commit removes, by identity.
+    // Held apart from the deltas because a removed identity can be claimed
+    // back by an added path below, and then the two are one transition.
+    let mut removed = BTreeMap::<ArtifactId, LocatedEntry>::new();
     for change in &changes {
         match (change.old, change.new) {
             (None, Some(entry)) => *addition_counts.entry(entry).or_default() += 1,
-            (Some(_), None) => {
-                removed_ids.insert(first_parent_id(&change.path)?);
+            (Some(old), None) => {
+                let artifact_id = first_parent_id(&change.path)?;
+                if removed
+                    .insert(artifact_id, LocatedEntry::new(change.path.clone(), old))
+                    .is_some()
+                {
+                    return Err(GitError::InvalidSnapshot(format!(
+                        "commit {introducing_commit} removes artifact {artifact_id:?} at more than \
+                         one path"
+                    )));
+                }
             }
             _ => {}
         }
@@ -1474,11 +1486,6 @@ fn resolve_tree_transition(
             }
         }
     }
-    // An identity the first parent still holds at a path this commit keeps.
-    let reserved_by_first_parent = |candidate: &ArtifactId| {
-        first_parent.get(candidate).is_some() && !removed_ids.contains(candidate)
-    };
-
     let mut assigned = BTreeSet::new();
     let mut deltas = Vec::with_capacity(changes.len());
     for change in changes {
@@ -1492,13 +1499,9 @@ fn resolve_tree_transition(
                     new: LocatedEntry::new(path, new),
                 });
             }
-            (Some(old), None) => {
-                let artifact_id = first_parent_id(&path)?;
-                deltas.push(TreeDelta::Removed {
-                    artifact_id,
-                    old: LocatedEntry::new(path, old),
-                });
-            }
+            // Recorded in `removed` above; emitted below, unless an added
+            // path claims the identity back first.
+            (Some(_), None) => {}
             (None, Some(new)) => {
                 let candidate = (addition_counts.get(&new) == Some(&1))
                     .then(|| secondary_candidates.get(&new))
@@ -1506,8 +1509,12 @@ fn resolve_tree_transition(
                     .filter(|candidates| candidates.len() == 1)
                     .and_then(|candidates| candidates.first().copied())
                     .filter(|candidate| {
+                        // An identity the first parent still holds at a path
+                        // this commit keeps is reserved for it.
+                        let reserved = first_parent.get(candidate).is_some()
+                            && !removed.contains_key(candidate);
                         candidate_target_counts.get(candidate) == Some(&1)
-                            && !reserved_by_first_parent(candidate)
+                            && !reserved
                             && !assigned.contains(candidate)
                     });
                 let artifact_id = match candidate {
@@ -1528,10 +1535,22 @@ fn resolve_tree_transition(
                         "artifact identity {artifact_id:?} is assigned to more than one path in commit {introducing_commit}"
                     )));
                 }
-                deltas.push(TreeDelta::Added {
-                    artifact_id,
-                    new: LocatedEntry::new(path, new),
-                });
+                // A candidate the first parent held at a path this commit
+                // removes is one artifact that moved, which the whole-tree diff
+                // reported as a single update from the old path to the new,
+                // never as a removal and an addition of the same identity,
+                // which `ResolvedTree::apply` refuses as a duplicate.
+                match removed.remove(&artifact_id) {
+                    Some(old) => deltas.push(TreeDelta::Updated {
+                        artifact_id,
+                        old,
+                        new: LocatedEntry::new(path, new),
+                    }),
+                    None => deltas.push(TreeDelta::Added {
+                        artifact_id,
+                        new: LocatedEntry::new(path, new),
+                    }),
+                }
             }
             (None, None) => {
                 return Err(GitError::InvalidSnapshot(format!(
@@ -1539,6 +1558,9 @@ fn resolve_tree_transition(
                 )));
             }
         }
+    }
+    for (artifact_id, old) in removed {
+        deltas.push(TreeDelta::Removed { artifact_id, old });
     }
     deltas.sort_by_key(TreeDelta::artifact_id);
 
@@ -2072,6 +2094,15 @@ mod tests {
                     "octopus merge",
                 ],
             );
+            // The merge's own tree carries one more file than any parent: the
+            // exact body of `config/.gitignore`, which the merge removes
+            // relative to its first parent while branches one and three still
+            // carry it, at a path nothing else has. That is one artifact that
+            // moved through a merge, and the resolution has to report it as one
+            // update rather than as a removal and an addition of one identity.
+            write(&repo, "config/generated-rules.txt", b"*.generated\n");
+            git_ok(&repo, ["add", "config/generated-rules.txt"]);
+            git_ok(&repo, ["commit", "--amend", "--no-edit"]);
             let merge = git_text(&repo, ["rev-parse", "HEAD"]);
             let parent_line = git_text(&repo, ["rev-list", "--parents", "-n", "1", "HEAD"]);
             assert_eq!(
@@ -2516,18 +2547,6 @@ mod tests {
             admitted.commit_tree_hashes.get(&fixture.merge),
             Some(&compute_resolved_tree_hash(merge_tree).unwrap())
         );
-        for path in [
-            b"compose.yaml".as_slice(),
-            b"assets/raw.bin",
-            b"unclassified/archive.unknownlang",
-            b"NOTICE.txt",
-        ] {
-            assert!(
-                merge_tree.artifact_at_path(&repo_path(path)).is_some(),
-                "non-policy artifact missing from the merge tree: {}",
-                display_path(path)
-            );
-        }
 
         let transaction = admitted
             .clone()

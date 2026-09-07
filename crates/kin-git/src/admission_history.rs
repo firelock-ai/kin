@@ -409,7 +409,24 @@ fn derive_admitted_semantic_git_history(
         &snapshot,
         blob_store,
         &held_semantics,
-        &mut |oid, parent_oids, enriched, _enriched_alias, tree, _facts| {
+        &mut |oid, parent_oids, enriched, enriched_alias, tree, facts| {
+            // The re-derivation has to reproduce the held plan at every
+            // position before its tree is trusted for admission, the same
+            // comparison `SemanticGitImportPlan::validate` makes, so a plan
+            // that drifted from its raw objects is refused here as well as
+            // there rather than admitted from a tree it never described.
+            let index = deriver.derived;
+            if plan.changes.get(index) != Some(&enriched)
+                || plan.aliases.get(index) != Some(&enriched_alias)
+                || plan.commit_tree_hashes.get(&oid) != Some(&facts.tree_hash)
+                || plan.content.trees.get(&oid) != Some(&facts.content)
+            {
+                return Err(GitError::InvalidSnapshot(
+                    "semantic Git import plan does not match its deterministic raw-object \
+                     derivation"
+                        .to_string(),
+                ));
+            }
             let (admitted, alias) =
                 deriver.derive_commit(oid, parent_oids, tree, enriched, blob_store)?;
             visit(oid, admitted, alias)

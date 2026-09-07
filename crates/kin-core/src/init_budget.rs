@@ -1206,9 +1206,14 @@ mod tests {
     /// floor on the demand is all this assertion needs. The fourth is kin
     /// 0.7.3 on a 128 GB host with the resident set sampled from outside the
     /// process once a second, which is the row [`BYTES_PER_COMMIT`] was read
-    /// off. prometheus, 18,514 commits over 1,676 files, was killed at phase 4
-    /// under 0.6.0 on the tree structures this conversion no longer holds, so
-    /// it says nothing about this forecast and is not a row.
+    /// off, and the last three are the frontier walk itself on the same host
+    /// and method, which is what lets this test fail on the binary it ships
+    /// in rather than only on a predecessor's. prometheus, 18,514 commits over
+    /// 1,676 files, was killed at phase 4 under 0.6.0 on the tree structures
+    /// this conversion no longer holds, so it says nothing about this forecast
+    /// and is not a row. The per-commit demand across the frontier-walk rows
+    /// spans 0.86 MB to 4.5 MB, which is why the coefficient is a floor on
+    /// every one of them and a prediction of none.
     #[test]
     fn the_forecast_is_a_floor_on_every_conversion_it_was_measured_against() {
         const CEILING: u64 = 8 * 1024 * 1024 * 1024;
@@ -1218,6 +1223,12 @@ mod tests {
             ("flask 0.6.0", 5_556, 236, 6_731_427_840),
             ("requests 0.6.0", 6_493, 130, 8_589_705_216),
             ("requests 0.7.3", 6_493, 130, 4_800_708_608),
+            // The frontier walk's own bytes, resident set sampled from outside
+            // the process once a second on a 128 GB host, without enrichment.
+            // requests ran beside its v0.7.3 twin under the same pressure.
+            ("requests frontier walk", 6_493, 130, 5_568_004_096),
+            ("hiredis frontier walk", 1_141, 79, 1_526_988_800),
+            ("kin frontier walk", 2_924, 1_033, 13_266_026_496),
         ];
         for (name, commits, artifacts, held_bytes) in measured {
             let survey = survey(commits, artifacts);
