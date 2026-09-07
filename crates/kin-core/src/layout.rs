@@ -512,7 +512,14 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// and it is still bound. A directory carrying the markers is the install root
 /// whatever else appears in it, so planting a `manifest.json` there does not
 /// turn it into a repository.
-fn is_managed_kin_home(candidate: &Path) -> bool {
+///
+/// Public because [`discover`](KinLayout::discover) is not the only caller that
+/// has to tell the two directories apart. `kin init` refuses a directory that
+/// already holds a `.kin`, and the remedy it should name depends on which of
+/// them this is; asking here keeps that answer in one place, so a command
+/// cannot decide the install root is a repository while discovery decides it is
+/// not.
+pub fn is_managed_kin_home(candidate: &Path) -> bool {
     if carries_managed_home_markers(candidate) {
         return true;
     }
