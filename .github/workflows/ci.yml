@@ -1055,6 +1055,39 @@ jobs:
       - name: Falsify kin-actions pin visibility guard
         run: python3 scripts/falsify-kin-actions-pin-visibility.py
 
+      # docs/store-size.md published a ripgrep store size that was wrong by
+      # 1.74x for about a month, and the launch post carried it outward. Two
+      # defects made it and neither was arithmetic: the figures were measured
+      # at workspace version 0.5.6 and nothing on the page said so, and the
+      # breakdown was measured with `du` while the total came from Kin's own
+      # logical-byte walk, so the two halves could never add up. A reader who
+      # "verified" that page was adding numbers that were never comparable.
+      #
+      # It belongs in THIS job rather than under scripts/acceptance/, and the
+      # distinction is the whole value of the guard. `Product Acceptance`
+      # carries `if: github.event_name != 'pull_request'`, so a rule added
+      # there would not run on the pull request that breaks the page; it would
+      # report a release later, which is exactly the delay that let the wrong
+      # number ship. This job has no `if:` and no `needs:`, so it runs on every
+      # event including a docs-only pull request, and it carries the required
+      # `Fast gate lint and policy` context. It is a pure scanner over one
+      # markdown file with no toolchain and no network, so it costs under a
+      # second beside the guards above.
+      #
+      # The falsifier runs first on purpose: it plants sixteen mutants in the
+      # real page and requires the guard to refuse each one BY RULE NAME, plus
+      # two controls, one of which requires the guard to stay green when the
+      # du-side total moves further from the walk-side total. That control is
+      # the design property under test. The guard never reconciles across
+      # methods, because no tolerance can: pick 2% and the correct page goes
+      # red on a real 7.1% method gap, pick 10% and the original 10.3% defect
+      # walks through. Learn the guard still works before trusting its verdict.
+      - name: Falsify store-size figure guard
+        run: python3 scripts/falsify-store-size-figures.py
+
+      - name: Check store-size figures carry a version and a method
+        run: python3 scripts/check-store-size-figures.py
+
       # ADDED here rather than moved out of `check`, for the reason the kin-vfs
       # step below records. `check` carries `github.event_name != 'pull_request'`,
       # so for as long as these two guards ran only there, a pull request could
