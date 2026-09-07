@@ -207,6 +207,7 @@ jobs:
             --crate kin-model
             --crate kin-db
             --crate kin-lsp
+            --crate kin-search
             --crate kin-vfs-core
           )
           title="refresh Kin registry dependency pins"

@@ -11,6 +11,7 @@ pub mod error;
 pub mod handlers;
 pub mod negative;
 pub mod outside_graph;
+pub mod query_tokens;
 pub mod remediation;
 pub mod server;
 pub mod session;

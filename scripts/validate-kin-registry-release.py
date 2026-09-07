@@ -22,6 +22,7 @@ ALLOWED_SOURCES = {
     "kin-db": "firelock-ai/kin-db",
     "kin-lsp": "firelock-ai/kin-lsp",
     "kin-model": "firelock-ai/kin-model",
+    "kin-search": "firelock-ai/kin-search",
     "kin-vfs-core": "firelock-ai/kin-vfs",
 }
 PAYLOAD_KEYS = frozenset(

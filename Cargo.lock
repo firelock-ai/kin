@@ -3470,6 +3470,7 @@ dependencies = [
  "kin-ranking",
  "kin-review",
  "kin-runtime",
+ "kin-search",
  "kin-spine",
  "libc",
  "pretty_assertions",

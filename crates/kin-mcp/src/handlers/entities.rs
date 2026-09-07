@@ -54,6 +54,33 @@ pub fn handle_semantic_search<G: GraphStore>(
     let compact = get_optional_bool(args, "compact", true);
 
     let entities = store.query_entities(&filter).map_err(McpError::graph)?;
+
+    // A question phrased as a sentence cannot survive the store's name filter:
+    // its index tokenizes the pattern and its predicate substring-matches the
+    // whole pattern, so anything the index does return is thrown away by the
+    // predicate, and a pattern carrying a space is what no declaration name can
+    // contain. Re-ask it as one query per token and rank the union here.
+    //
+    // Gated on the empty answer, so no query that answers today changes at all,
+    // and gated on whitespace inside `crate::query_tokens::plan`, so a bare
+    // identifier that is genuinely absent keeps reporting a clean miss rather
+    // than a page of entities that merely share a word with it.
+    let (entities, fallback) = if entities.is_empty() {
+        match crate::query_tokens::plan(&query) {
+            Some(planned) => {
+                let hits = retrieve_query_tokens(store, &filter, &planned)?;
+                let ranked = crate::query_tokens::rank(&planned, &hits);
+                let disclosure = crate::query_tokens::disclosure(&planned, &hits, ranked.len());
+                (
+                    ranked.into_iter().map(|hit| hit.entity).collect::<Vec<_>>(),
+                    Some(disclosure),
+                )
+            }
+            None => (entities, None),
+        }
+    } else {
+        (entities, None)
+    };
     let total_matches = entities.len();
 
     let mut payload = if compact {
@@ -143,8 +170,70 @@ pub fn handle_semantic_search<G: GraphStore>(
         payload[crate::edge_coverage::EDGE_COVERAGE_KEY] = observation;
     }
 
+    // Additive, and attached whether or not the fan-out found anything, because
+    // an empty answer to a sentence is exactly the answer a reader is most
+    // likely to read as "the repository does not do this".
+    if let Some(disclosure) = fallback {
+        payload[crate::query_tokens::LEXICAL_FALLBACK_KEY] = disclosure;
+    }
+
     let json = serde_json::to_string_pretty(&payload).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// Ask the store for each planned token in turn, under the same narrowing
+/// filters the caller asked for.
+///
+/// Sequential and bounded on purpose. One phrase becomes at most
+/// `MAX_QUERY_TOKENS` store queries, each truncated to
+/// `max_candidates_per_token`, so a long sentence cannot multiply the work a
+/// single search asks of a daemon. The narrowing filters ride along unchanged:
+/// a caller that asked for `kind: "class"` asked about classes, and a fallback
+/// that quietly widened the question would answer one nobody put.
+///
+/// A token that matches nothing is asked once more in its singular spelling,
+/// since a question says "projections" where the declaration is named for one
+/// projection, and the index holds only the tokens the names produced.
+fn retrieve_query_tokens<G: GraphStore>(
+    store: &G,
+    filter: &EntityFilter,
+    planned: &crate::query_tokens::TokenPlan,
+) -> Result<Vec<crate::query_tokens::TokenHits>> {
+    let cap = crate::query_tokens::max_candidates_per_token();
+    let mut hits = Vec::with_capacity(planned.tokens.len());
+    for token in &planned.tokens {
+        let mut pattern = token.clone();
+        let mut entities = store
+            .query_entities(&EntityFilter {
+                name_pattern: Some(pattern.clone()),
+                ..filter.clone()
+            })
+            .map_err(McpError::graph)?;
+        if entities.is_empty() {
+            if let Some(reduced) = crate::query_tokens::singular(token) {
+                entities = store
+                    .query_entities(&EntityFilter {
+                        name_pattern: Some(reduced.clone()),
+                        ..filter.clone()
+                    })
+                    .map_err(McpError::graph)?;
+                if !entities.is_empty() {
+                    pattern = reduced;
+                }
+            }
+        }
+        let total_matching = entities.len();
+        let truncated = total_matching > cap;
+        entities.truncate(cap);
+        hits.push(crate::query_tokens::TokenHits {
+            token: token.clone(),
+            pattern,
+            entities,
+            total_matching,
+            truncated,
+        });
+    }
+    Ok(hits)
 }
 
 /// The narrowing filters a search request applied beside its name pattern, named
@@ -12486,6 +12575,376 @@ mod tests {
         assert_eq!(
             value["_kin"]["degraded"]["offline_fallback"],
             serde_json::json!(true)
+        );
+    }
+
+    // ── A question phrased as a sentence ────────────────────────────────────
+
+    /// A store shaped like a slice of this repository, with a distractor beside
+    /// every answer that shares one of the question's words.
+    ///
+    /// Built on the real `InMemoryGraph` rather than a double on purpose: the
+    /// defect under test is the storage engine's own two-stage name filter, and
+    /// a hand-written matcher would be a restatement of what this code believes
+    /// that filter does rather than a run against it.
+    fn phrase_store() -> InMemoryGraph {
+        let store = InMemoryGraph::new();
+        for (name, file) in [
+            // "where does kin init stage the store"
+            ("stage_store_root", "crates/kin-cli/src/commands/init.rs"),
+            ("store_open", "crates/kin-core/src/store.rs"),
+            // "how does reconcile detect a stale graph"
+            (
+                "detect_stale_graph",
+                "crates/kin-reconcile/src/staleness.rs",
+            ),
+            ("graph_status", "crates/kin-daemon/src/status.rs"),
+            // "where does the MCP server register its tools"
+            ("register_tools", "crates/kin-mcp/src/server.rs"),
+            ("tool_budget", "crates/kin-mcp/src/budget.rs"),
+            // "where are projections written to disk"
+            (
+                "projection_disk_writer",
+                "crates/kin-projection/src/writer.rs",
+            ),
+            ("flush_pages", "crates/kin-projection/src/disk.rs"),
+            // "how is provenance recorded for a change"
+            (
+                "record_provenance_for_change",
+                "crates/kin-daemon/src/provenance.rs",
+            ),
+            ("change_log", "crates/kin-daemon/src/provenance.rs"),
+            // The two-word shape the hosted route was measured on.
+            ("reconcile_report", "crates/kin-daemon/src/loop_runner.rs"),
+            // "where are the projections and entities stored". Both plural words
+            // have to reduce before either reaches this declaration, and neither
+            // reaches the distractor, so the question is unanswerable without
+            // the reduction and answered wrongly with only the distractor.
+            (
+                "projection_entity_store",
+                "crates/kin-projection/src/store.rs",
+            ),
+            ("stored_blob_count", "crates/kin-blobs/src/metrics.rs"),
+        ] {
+            store
+                .upsert_entity(&make_entity_in(LanguageId::Rust, name, file))
+                .unwrap();
+        }
+        store
+    }
+
+    fn search_names(payload: &serde_json::Value) -> Vec<String> {
+        payload["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .map(|row| row["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The defect, on the store the fix is then measured against.
+    ///
+    /// Asked directly of the graph, the way the handler asks it, so this is the
+    /// engine's answer and not a claim about it. Every one of these phrases
+    /// names a declaration the store holds, and the whole-query filter returns
+    /// none of them. `reconcile report` is the sharpest of the set: the same two
+    /// tokens joined by an underscore return the row, and the store's own name
+    /// index produces that row for both spellings. It is the predicate behind
+    /// the index, substring-matching the entire pattern, that throws it away
+    /// when the pattern carries a space.
+    #[test]
+    fn the_stores_whole_query_name_filter_answers_no_phrase_at_all() {
+        let store = phrase_store();
+        for phrase in [
+            "where does kin init stage the store",
+            "how does reconcile detect a stale graph",
+            "where does the MCP server register its tools",
+            "where are projections written to disk",
+            "how is provenance recorded for a change",
+            "reconcile report",
+        ] {
+            let matched = store
+                .query_entities(&EntityFilter {
+                    name_pattern: Some(phrase.to_string()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(
+                matched.is_empty(),
+                "the whole-query filter answered {phrase:?} with {} rows, so this store no \
+                 longer reproduces the defect the fallback exists for",
+                matched.len()
+            );
+        }
+
+        // The positive control the negatives above are worthless without: the
+        // same filter, one token, on the same store, returns the row.
+        let single = store
+            .query_entities(&EntityFilter {
+                name_pattern: Some("reconcile_report".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            single.len(),
+            1,
+            "the single-token control must hit, or every assertion above passes for the wrong \
+             reason"
+        );
+    }
+
+    /// Five questions, each phrased as a sentence, each with one declaration in
+    /// the store that answers it and one distractor that shares a word.
+    ///
+    /// Rank one rather than top three, because the store is small enough that
+    /// anything less would be evidence the ranking is not doing the work: the
+    /// question's own words are the only signal here, and the intended answer
+    /// carries more of them, or carries them on its name where the distractor
+    /// carries them on its path.
+    ///
+    /// Two of the distractors are the ones that matter. `store_open` and
+    /// `graph_status` are outranked on coverage, and `change_log` is outranked
+    /// on the field score alone: it and `record_provenance_for_change` each
+    /// carry two of that question's words, and the answer wins because it
+    /// carries "provenance" in its own name where the distractor only sits in a
+    /// file named for it. `flush_pages` is the case the response's
+    /// `retrieved_by` line describes: it shares two words with its question but
+    /// carries neither in its name, so no token query returns it and it is not
+    /// in the union to be ranked at all.
+    #[test]
+    fn a_multi_word_question_ranks_the_declaration_that_covers_it_first() {
+        let store = phrase_store();
+        for (question, expected) in [
+            ("where does kin init stage the store", "stage_store_root"),
+            (
+                "how does reconcile detect a stale graph",
+                "detect_stale_graph",
+            ),
+            (
+                "where does the MCP server register its tools",
+                "register_tools",
+            ),
+            (
+                "where are projections written to disk",
+                "projection_disk_writer",
+            ),
+            (
+                "how is provenance recorded for a change",
+                "record_provenance_for_change",
+            ),
+        ] {
+            let payload = parsed_response(
+                &handle_semantic_search(&search_args(question, None), &store).unwrap(),
+            );
+            let names = search_names(&payload);
+            assert_eq!(
+                names.first().map(String::as_str),
+                Some(expected),
+                "{question:?} ranked {names:?}"
+            );
+            assert_eq!(
+                payload[crate::query_tokens::LEXICAL_FALLBACK_KEY]["answered_by"],
+                serde_json::json!("name_token_coverage"),
+                "{question:?} answered without saying which path answered"
+            );
+            assert_eq!(
+                payload[crate::query_tokens::LEXICAL_FALLBACK_KEY]["reason"],
+                serde_json::json!("no_vector_coverage")
+            );
+            assert_eq!(
+                payload[crate::query_tokens::LEXICAL_FALLBACK_KEY]["vector_ranked"],
+                serde_json::json!(false)
+            );
+        }
+    }
+
+    /// The retrieval boundary the response states, pinned rather than described.
+    ///
+    /// `flush_pages` sits in `crates/kin-projection/src/disk.rs`, so it carries
+    /// two of this question's words in its path and neither in its name. The
+    /// answer says candidates are retrieved by declaration name, and this is the
+    /// entity that makes that sentence load-bearing: a reader who assumed path
+    /// matching would read this empty slot as "no such code" rather than as "not
+    /// reachable by this path".
+    #[test]
+    fn a_declaration_no_query_token_names_is_not_in_the_union() {
+        let store = phrase_store();
+        let payload = parsed_response(
+            &handle_semantic_search(
+                &search_args("where are projections written to disk", None),
+                &store,
+            )
+            .unwrap(),
+        );
+        assert!(
+            !search_names(&payload).contains(&"flush_pages".to_string()),
+            "retrieval is by declaration name, so a path-only sharer must not appear: {:?}",
+            search_names(&payload)
+        );
+        assert_eq!(
+            payload[crate::query_tokens::LEXICAL_FALLBACK_KEY]["retrieved_by"],
+            serde_json::json!("one declaration-name query per token"),
+            "the answer has to say so, or the empty slot above is silent"
+        );
+    }
+
+    /// A question's plural words have to reach the singular tokens the index
+    /// holds, and this is the input that proves the reduction is load-bearing.
+    ///
+    /// Written after a falsification arm that disabled the reduction left every
+    /// other test in this file green. The reason was a second defence rather than
+    /// a weak assertion: on "where are projections written to disk" the token
+    /// `disk` retrieves the intended declaration on its own, so the plural word
+    /// never had to work for that answer to be right.
+    ///
+    /// Here it has to. Both content words of the question are plural, the
+    /// declaration that answers it is named for one projection and one entity,
+    /// and the distractor is named for the only word that needs no reduction. So
+    /// with the reduction the answer covers two of the question's words and wins;
+    /// without it the answer is not retrieved at all and the distractor is the
+    /// whole page.
+    #[test]
+    fn a_question_in_the_plural_reaches_a_declaration_named_in_the_singular() {
+        let store = phrase_store();
+        let payload = parsed_response(
+            &handle_semantic_search(
+                &search_args("where are the projections and entities stored", None),
+                &store,
+            )
+            .unwrap(),
+        );
+        let names = search_names(&payload);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("projection_entity_store"),
+            "the plural question must reach the singular declaration: {names:?}"
+        );
+        assert!(
+            names.contains(&"stored_blob_count".to_string()),
+            "the distractor must still be retrieved, or this test could pass \
+             because the store returned nothing at all: {names:?}"
+        );
+    }
+
+    /// The two-word case, which fails one stage earlier than a sentence does and
+    /// is the shape the hosted route was measured on.
+    #[test]
+    fn two_words_and_an_underscore_now_answer_the_same_row() {
+        let store = phrase_store();
+        let underscored = parsed_response(
+            &handle_semantic_search(&search_args("reconcile_report", None), &store).unwrap(),
+        );
+        assert_eq!(search_names(&underscored), vec!["reconcile_report"]);
+        assert!(
+            underscored
+                .get(crate::query_tokens::LEXICAL_FALLBACK_KEY)
+                .is_none(),
+            "a query the name filter answered must not claim a fallback ran"
+        );
+
+        let spaced = parsed_response(
+            &handle_semantic_search(&search_args("reconcile report", None), &store).unwrap(),
+        );
+        assert_eq!(search_names(&spaced), vec!["reconcile_report"]);
+        assert_eq!(
+            spaced[crate::query_tokens::LEXICAL_FALLBACK_KEY]["matched"],
+            serde_json::json!(1)
+        );
+    }
+
+    /// The guarantee that keeps a certified miss certified.
+    ///
+    /// A bare identifier the graph does not hold is the one query whose empty
+    /// answer is the true answer, and the measured store had exactly that case:
+    /// a type defined in another repository and absent from this index. Answering
+    /// it with declarations that merely share a word would turn the one honest
+    /// miss in the set into a page that looks like a find, so the fallback is
+    /// gated on whitespace and this query never reaches it.
+    #[test]
+    fn a_single_identifier_that_is_absent_stays_absent_and_claims_no_fallback() {
+        let store = phrase_store();
+        let payload = parsed_response(
+            &handle_semantic_search(&search_args("SnapshotManager", None), &store).unwrap(),
+        );
+        assert_eq!(payload["total_matches"], serde_json::json!(0));
+        assert!(search_names(&payload).is_empty());
+        assert!(
+            payload
+                .get(crate::query_tokens::LEXICAL_FALLBACK_KEY)
+                .is_none(),
+            "a single-token miss must keep the answer it has always given"
+        );
+    }
+
+    /// An empty answer to a sentence is the answer most likely to be misread, so
+    /// it is the one that must name the path that produced it.
+    #[test]
+    fn a_phrase_that_matches_nothing_still_says_which_path_looked() {
+        let store = phrase_store();
+        let payload = parsed_response(
+            &handle_semantic_search(&search_args("zqx not a real symbol qqzz", None), &store)
+                .unwrap(),
+        );
+        assert_eq!(payload["total_matches"], serde_json::json!(0));
+        let block = &payload[crate::query_tokens::LEXICAL_FALLBACK_KEY];
+        assert_eq!(block["matched"], serde_json::json!(0));
+        assert_eq!(
+            block["answered_by"],
+            serde_json::json!("name_token_coverage")
+        );
+        assert!(block["query_tokens"]
+            .as_array()
+            .is_some_and(|tokens| tokens.iter().any(|t| t == "qqzz")));
+
+        // And the absence must not come back certified. The sentence this tool
+        // otherwise prints says no declaration in the index carries this name,
+        // which is true of every question ever typed and tells a reader nothing
+        // about whether the repository does the thing they asked about.
+        let negative = crate::negative::negative_for(
+            "semantic_search",
+            &payload,
+            &ready_daemon_envelope(11),
+            &[],
+        )
+        .expect("an empty search carries a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            serde_json::json!(false),
+            "a phrase that no declaration shares a word with is a miss about vocabulary, not a \
+             certifiable absence"
+        );
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("lexical_fallback_matched_nothing")),
+            "the verdict must name the path that could not answer: {}",
+            negative["trust_reason"]
+        );
+    }
+
+    /// The narrowing filters a caller asked for still apply on this path.
+    ///
+    /// A fallback that quietly widened `kind` would answer a question nobody put,
+    /// and would do it on exactly the requests whose whole-query filter came back
+    /// empty because the narrowing removed everything.
+    #[test]
+    fn the_fallback_keeps_the_kind_filter_the_caller_asked_for() {
+        let store = phrase_store();
+        let payload = parsed_response(
+            &handle_semantic_search(
+                &search_args("how does reconcile detect a stale graph", Some("class")),
+                &store,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            payload["total_matches"],
+            serde_json::json!(0),
+            "every entity in this store is a function, so a class-only question has no answer"
+        );
+        assert_eq!(
+            payload[crate::query_tokens::LEXICAL_FALLBACK_KEY]["matched"],
+            serde_json::json!(0)
         );
     }
 }
