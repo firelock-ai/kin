@@ -1429,6 +1429,14 @@ impl CanonicalTransaction<'_> {
     /// if a field is added to one and not the other, which is the failure that
     /// would otherwise move every identity in every store on disk silently.
     fn write_canonical_preimage<S: CanonicalSink>(&self, out: &mut S) -> Result<()> {
+        self.write_preimage_with_changes(out, |out| append_canonical_seq(out, &self.changes))
+    }
+
+    fn write_preimage_with_changes<S: CanonicalSink>(
+        &self,
+        out: &mut S,
+        changes: impl FnOnce(&mut S) -> Result<()>,
+    ) -> Result<()> {
         let source = self.source;
         let field_count = HUMAN_READABLE_FIELD_COUNT
             + usize::from(source.merge_transaction_delta.is_some())
@@ -1442,7 +1450,7 @@ impl CanonicalTransaction<'_> {
         append_canonical_key(out, "aliases")?;
         append_canonical_seq(out, &self.aliases)?;
         append_canonical_key(out, "changes")?;
-        append_canonical_seq(out, &self.changes)?;
+        changes(out)?;
         // "changes" then "collaboration_delta" then "default_ref_mutation":
         // they share nothing past the first byte, and 'h' < 'o' < 'e' is not the
         // comparison, 'c' == 'c' then 'h' < 'o' is, and then 'c' < 'd'.
@@ -1759,6 +1767,14 @@ impl Serialize for CanonicalWorkspaceSemanticDelta<'_> {
 
 impl RepositoryTransaction {
     pub fn validate(&self) -> Result<()> {
+        self.validate_changes(self.changes.len(), self.changes.iter().map(Ok))
+    }
+
+    fn validate_changes<C: std::borrow::Borrow<SemanticChange>>(
+        &self,
+        change_count: usize,
+        changes: impl IntoIterator<Item = Result<C>>,
+    ) -> Result<()> {
         if self.schema_version != REPOSITORY_TRANSACTION_SCHEMA_VERSION {
             return Err(ModelError::InvalidOperation(format!(
                 "unsupported repository transaction version {}",
@@ -1777,7 +1793,7 @@ impl RepositoryTransaction {
         }
         if self.external_objects.is_empty()
             && self.git_authority_delta.is_none()
-            && self.changes.is_empty()
+            && change_count == 0
             && self.aliases.is_empty()
             && self.ref_mutations.is_empty()
             && self.default_ref_mutation.is_none()
@@ -1801,17 +1817,6 @@ impl RepositoryTransaction {
                 "expected generation {} does not match root bundle generation {}",
                 self.expected_generation, self.expected_roots.generation
             )));
-        }
-
-        let mut changes = BTreeMap::new();
-        for change in &self.changes {
-            validate_semantic_change_id(change)?;
-            if changes.insert(change.id, change).is_some() {
-                return Err(ModelError::InvalidOperation(format!(
-                    "repository transaction contains duplicate change {}",
-                    change.id
-                )));
-            }
         }
 
         let mut objects = BTreeSet::new();
@@ -1854,12 +1859,31 @@ impl RepositoryTransaction {
                     alias.oid
                 )));
             }
-            if let Some(change) = changes.get(&alias.change_id) {
-                alias.validate_change(change)?;
-            }
         }
 
-        for change in &self.changes {
+        let mut aliases_by_change: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for alias in &self.aliases {
+            aliases_by_change
+                .entry(alias.change_id)
+                .or_default()
+                .push(alias);
+        }
+        let mut ids = BTreeSet::new();
+        for change in changes {
+            let change = change?;
+            let change = change.borrow();
+            validate_semantic_change_id(change)?;
+            if !ids.insert(change.id) {
+                return Err(ModelError::InvalidOperation(format!(
+                    "repository transaction contains duplicate change {}",
+                    change.id
+                )));
+            }
+            if let Some(aliases) = aliases_by_change.get(&change.id) {
+                for alias in aliases {
+                    alias.validate_change(change)?;
+                }
+            }
             if let crate::ChangeOrigin::GitCommit { oid } = change.origin {
                 let commit = crate::ExternalObjectId::new(ExternalObjectKind::Commit, oid);
                 if !objects.contains(&commit) {
@@ -1875,6 +1899,12 @@ impl RepositoryTransaction {
                     )));
                 }
             }
+        }
+
+        if ids.len() != change_count {
+            return Err(ModelError::InvalidOperation(
+                "streamed change count mismatch".into(),
+            ));
         }
 
         let mut refs = BTreeSet::new();
@@ -1957,6 +1987,58 @@ impl RepositoryTransaction {
         self.canonical_hash()
     }
 
+    /// Hash metadata with externally stored changes in strictly increasing identity order.
+    ///
+    /// `self.changes` must be empty. The factory is opened three times and must
+    /// return the same fallible sequence each time. Every change is validated,
+    /// and canonical change digests are compared across passes before returning
+    /// a hash. Memory holds one change body and compact identity indexes.
+    pub fn transaction_hash_with_changes<F, I>(
+        &self,
+        change_count: usize,
+        mut open: F,
+    ) -> Result<Hash256>
+    where
+        F: FnMut() -> Result<I>,
+        I: IntoIterator<Item = Result<SemanticChange>>,
+    {
+        if !self.changes.is_empty() {
+            return Err(ModelError::InvalidOperation(
+                "streamed transaction metadata must have no owned changes".into(),
+            ));
+        }
+        let mut validated = HashingSink::new();
+        let mut previous = None;
+        self.validate_changes(
+            change_count,
+            open()?.into_iter().map(|item| {
+                let change = item?;
+                check_stream_order(&mut previous, change.id)?;
+                append_canonical_value(&mut validated, &CanonicalChange::new(&change))?;
+                Ok(change)
+            }),
+        )?;
+        let digest = validated.finish();
+        let view = CanonicalTransaction::new(self);
+        let mut counter = CountingSink::default();
+        view.write_preimage_with_changes(&mut counter, |out| {
+            write_streamed_changes(out, change_count, open()?, digest)
+        })?;
+        let mut sink = HashingSink::new();
+        sink.write_bytes(REPOSITORY_TRANSACTION_HASH_DOMAIN);
+        sink.write_bytes(&counter.len().to_le_bytes());
+        let header_len = sink.written();
+        view.write_preimage_with_changes(&mut sink, |out| {
+            write_streamed_changes(out, change_count, open()?, digest)
+        })?;
+        if sink.written() - header_len != counter.len() {
+            return Err(ModelError::InvalidOperation(
+                "canonical preimage length differs between counting and hashing passes".into(),
+            ));
+        }
+        Ok(Hash256::from_bytes(sink.finish()))
+    }
+
     /// Canonical identity of this transaction, without validating it.
     ///
     /// Split from [`Self::transaction_hash`] so the canonicalization can be
@@ -1997,6 +2079,52 @@ impl RepositoryTransaction {
 
         Ok(Hash256::from_bytes(sink.finish()))
     }
+}
+
+fn check_stream_order(previous: &mut Option<SemanticChangeId>, id: SemanticChangeId) -> Result<()> {
+    if previous.is_some_and(|previous| previous >= id) {
+        return Err(ModelError::InvalidOperation(
+            "streamed changes must have strictly increasing identities".into(),
+        ));
+    }
+    *previous = Some(id);
+    Ok(())
+}
+
+fn write_streamed_changes<S: CanonicalSink>(
+    out: &mut S,
+    expected: usize,
+    changes: impl IntoIterator<Item = Result<SemanticChange>>,
+    validated_digest: [u8; 32],
+) -> Result<()> {
+    out.push_byte(4);
+    out.write_bytes(
+        &u64::try_from(expected)
+            .map_err(|_| ModelError::InvalidOperation("canonical array exceeds u64".into()))?
+            .to_le_bytes(),
+    );
+    let mut digest = HashingSink::new();
+    let mut previous = None;
+    let mut count = 0;
+    for change in changes {
+        let change = change?;
+        check_stream_order(&mut previous, change.id)?;
+        if count == expected {
+            return Err(ModelError::InvalidOperation(
+                "streamed change count mismatch".into(),
+            ));
+        }
+        let bytes = canonical_json_bytes(&CanonicalChange::new(&change))?;
+        out.write_bytes(&bytes);
+        digest.write_bytes(&bytes);
+        count += 1;
+    }
+    if count != expected || digest.finish() != validated_digest {
+        return Err(ModelError::InvalidOperation(
+            "streamed changes differ from validated sequence".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -4467,6 +4595,89 @@ mod tests {
 
     /// A transaction large enough that a whole-transaction clone is visible in
     /// the heap, which the 32-commit fixtures above are not.
+    #[test]
+    fn external_change_stream_matches_owned_hash_and_validation() {
+        let mut accepted = 0;
+        for (name, transaction) in preimage_corpus() {
+            let mut metadata = transaction.clone();
+            let mut changes = std::mem::take(&mut metadata.changes);
+            changes.sort_by_key(|change| change.id);
+            let actual = metadata.transaction_hash_with_changes(changes.len(), || {
+                Ok(changes.clone().into_iter().map(Ok))
+            });
+            match transaction.transaction_hash() {
+                Ok(expected) => {
+                    assert_eq!(actual.unwrap(), expected, "{name}");
+                    accepted += 1;
+                }
+                Err(_) => assert!(actual.is_err(), "{name}"),
+            }
+        }
+        assert!(accepted > 0);
+    }
+
+    #[test]
+    fn external_change_stream_rejects_bad_sources() {
+        let mut metadata = canonicalizable_transaction();
+        let mut changes = std::mem::take(&mut metadata.changes);
+        changes.sort_by_key(|change| change.id);
+        assert!(changes.len() >= 2);
+        assert!(metadata
+            .transaction_hash_with_changes(changes.len(), || Ok(changes
+                .clone()
+                .into_iter()
+                .map(Ok)))
+            .is_ok());
+        for count in [changes.len() - 1, changes.len() + 1] {
+            assert!(metadata
+                .transaction_hash_with_changes(count, || Ok(changes.clone().into_iter().map(Ok)))
+                .is_err());
+        }
+        let mut reversed = changes.clone();
+        reversed.reverse();
+        assert!(metadata
+            .transaction_hash_with_changes(reversed.len(), || Ok(reversed
+                .clone()
+                .into_iter()
+                .map(Ok)))
+            .is_err());
+        let duplicate = vec![changes[0].clone(), changes[0].clone()];
+        assert!(metadata
+            .transaction_hash_with_changes(2, || Ok(duplicate.clone().into_iter().map(Ok)))
+            .is_err());
+        for failing_pass in 1..=3 {
+            let mut pass = 0;
+            assert!(metadata
+                .transaction_hash_with_changes(changes.len(), || {
+                    pass += 1;
+                    let mut items: Vec<_> = changes.clone().into_iter().map(Ok).collect();
+                    if pass == failing_pass {
+                        items[0] = Err(ModelError::InvalidOperation("read failed".into()));
+                    }
+                    Ok(items)
+                })
+                .is_err());
+        }
+        for changed_pass in [2, 3] {
+            let mut pass = 0;
+            assert!(metadata
+                .transaction_hash_with_changes(changes.len(), || {
+                    pass += 1;
+                    let mut items = changes.clone();
+                    if pass == changed_pass {
+                        let replacement = if items[0].message.starts_with('x') {
+                            "y"
+                        } else {
+                            "x"
+                        };
+                        items[0].message = replacement.repeat(items[0].message.len());
+                    }
+                    Ok(items.into_iter().map(Ok))
+                })
+                .is_err());
+        }
+    }
+
     fn large_transaction(change_count: usize) -> RepositoryTransaction {
         let mut transaction = canonicalizable_transaction();
         transaction.changes = (0..change_count)
