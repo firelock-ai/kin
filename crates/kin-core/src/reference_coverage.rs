@@ -1186,8 +1186,8 @@ impl LanguageParseCoverage {
         format!(
             "{}: {} of {} admitted {} files did not parse as written{named}. Some entities may \
              be retained from earlier parses while independently verified entities are current. \
-             File coverage remains incomplete. Fix the syntax and the next admission re-derives \
-             the complete file.",
+             File coverage remains incomplete. Once a complete parse is available, admission \
+             re-derives the complete file.",
             crate::retained_parse::RETAINED_OBSERVATION,
             self.retained,
             self.tracked,
