@@ -1184,10 +1184,10 @@ impl LanguageParseCoverage {
             )
         };
         format!(
-            "{}: {} of {} admitted {} files did not parse as written, so any entities the graph \
-             still holds for them came from an earlier parse of bytes that are gone, and a file \
-             the graph never parsed is absent from it entirely{named}. Fix the syntax and the \
-             next admission re-derives them.",
+            "{}: {} of {} admitted {} files did not parse as written{named}. Some entities may \
+             be retained from earlier parses while independently verified entities are current. \
+             File coverage remains incomplete. Fix the syntax and the next admission re-derives \
+             the complete file.",
             crate::retained_parse::RETAINED_OBSERVATION,
             self.retained,
             self.tracked,
@@ -2617,7 +2617,8 @@ mod tests {
         // True of both populations. A file created with a typo has no earlier
         // parse, so the clause about what the graph holds has to be conditional.
         assert!(
-            lines.contains("any entities the graph still holds"),
+            lines.contains("Some entities may")
+                && lines.contains("File coverage remains incomplete"),
             "the sentence may not diagnose one member of the set: {lines}"
         );
 

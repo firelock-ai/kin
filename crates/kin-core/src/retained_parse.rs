@@ -158,20 +158,12 @@ impl RetainedParseRead {
                     String::new()
                 };
                 let age = crate::last_admission::humanize_age(age_seconds(recorded.at, now));
-                // Established half first, conditional half second, and the split
-                // is the point. The seam knows which of the two populations a
-                // path is in; this record does not, and widening it to carry
-                // that is a change to the on-disk shape rather than to a
-                // sentence. So the line asserts only what is true of both: the
-                // bytes on disk do not parse. What the graph still holds for
-                // them is stated as a conditional, because a file created with
-                // a typo has no earlier parse to hold.
                 Some(format!(
-                    "Did not parse as written: {named}{and_more}. The bytes on disk do not parse, \
-                     so any entities the graph still holds for these paths came from an earlier \
-                     parse of bytes that are gone, and a path the graph never parsed is absent \
-                     from it entirely. Fix the syntax and the next admission re-derives them. \
-                     Observed {age} ago."
+                    "Did not parse as written: {named}{and_more}. Some entities may be retained \
+                     from earlier parses while independently verified entities are current. \
+                     File coverage remains incomplete, and declarations that were never admitted \
+                     remain absent. Fix the syntax and the next admission re-derives the complete \
+                     file. Observed {age} ago."
                 ))
             }
             Self::Absent => None,
@@ -407,7 +399,7 @@ mod tests {
         let line = read_back.describe(at()).expect("a retained path speaks");
         assert!(line.contains("search.py (4 parse errors)"), "{line}");
         assert!(
-            line.contains("The bytes on disk do not parse"),
+            line.contains("Did not parse as written"),
             "the established half leads: {line}"
         );
         // The half a brand-new file with a typo makes load-bearing. `FileEvent`
@@ -415,7 +407,8 @@ mod tests {
         // this set holds paths with no earlier parse at all. A sentence that
         // asserted one would be a false diagnosis on five surfaces.
         assert!(
-            line.contains("any entities the graph still holds"),
+            line.contains("Some entities may be retained")
+                && line.contains("File coverage remains incomplete"),
             "what the graph holds is a conditional, not an assertion: {line}"
         );
         assert!(

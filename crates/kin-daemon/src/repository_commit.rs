@@ -1571,22 +1571,115 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
             continue;
         };
         let indexed = indexed.indexed_file;
-        // Only a clean parse can say the graph's entities are wrong. A file the
-        // parser could not read whole keeps the entities its last readable
-        // version produced, deliberately: the daemon reconciles under
-        // `ReconcilePolicy::FallbackToLkg`, an author mid-edit produces this
-        // constantly, and a fresh parse of a half-written file disagrees with
-        // the graph for a reason that has nothing to do with the window this
-        // check exists to close. Refusing on it would leave a caller holding one
-        // broken file unable to record anything at all, which is the outcome
-        // `drain_semantic_debt` already declines to produce for the same reason.
-        if !matches!(indexed.parse_state, kin_model::ParseState::Valid) {
-            continue;
-        }
         let held = graph.query_entities(&kin_model::EntityFilter {
             file_path: Some(file_id.clone()),
             ..Default::default()
         })?;
+        if !matches!(indexed.parse_state, kin_model::ParseState::Valid) {
+            let mut stale = false;
+            for entity in &held {
+                let candidates: Vec<_> = indexed
+                    .entities
+                    .iter()
+                    .filter(|e| e.name == entity.name && e.kind == entity.kind)
+                    .collect();
+                let unique = candidates.len() == 1
+                    && held
+                        .iter()
+                        .filter(|e| e.name == entity.name && e.kind == entity.kind)
+                        .count()
+                        == 1;
+                let current = entity
+                    .metadata
+                    .extra
+                    .get("blob_hash")
+                    .and_then(|v| v.as_str())
+                    == Some(hash.to_string().as_str());
+                let proof = entity.metadata.extra.get("partial_parse_admission");
+                if proof.is_some_and(|proof| {
+                    proof.get("source_blob_hash") != entity.metadata.extra.get("blob_hash")
+                }) {
+                    stale = true;
+                    continue;
+                }
+                if current {
+                    // A partial admission claims only this declaration. Recheck
+                    // the old CAS context and the exact new payload, not a
+                    // complete-set equality over an incomplete file.
+                    let previous = proof
+                        .and_then(|v| v.get("previous_blob_hash"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|v| kin_model::Hash256::from_hex(v).ok());
+                    let verified = previous
+                        .and_then(|previous| {
+                            read_publishable_source(blobs, authority, previous).ok()
+                        })
+                        .and_then(|previous| {
+                            let before = pipeline
+                                .index_file_content_with_tests(
+                                    &file_id,
+                                    previous.body(),
+                                    kin_blobs::digest(previous.body()),
+                                )
+                                .ok()?;
+                            let originals: Vec<_> = before
+                                .indexed_file
+                                .entities
+                                .iter()
+                                .filter(|e| e.name == entity.name && e.kind == entity.kind)
+                                .collect();
+                            Some(
+                                unique
+                                    && originals.len() == 1
+                                    && pipeline.supports_partial_refresh(
+                                        originals[0],
+                                        candidates[0],
+                                        previous.body(),
+                                        content,
+                                    )
+                                    && {
+                                        let mut expected = candidates[0].clone();
+                                        expected.id = entity.id;
+                                        expected.created_in = entity.created_in;
+                                        expected.lineage_parent = entity.lineage_parent;
+                                        if let Some(proof) = proof {
+                                            expected.metadata.extra.insert(
+                                                "partial_parse_admission".into(),
+                                                proof.clone(),
+                                            );
+                                        }
+                                        expected == *entity
+                                    },
+                            )
+                        })
+                        .unwrap_or(false);
+                    stale |= !verified;
+                } else if !current && unique {
+                    // Do not seal a refreshable declaration in the window
+                    // before its partial transaction reaches graph truth.
+                    let previous = entity
+                        .metadata
+                        .extra
+                        .get("blob_hash")
+                        .and_then(|v| v.as_str())
+                        .and_then(|v| kin_model::Hash256::from_hex(v).ok());
+                    if let Some(previous) = previous.and_then(|previous| {
+                        read_publishable_source(blobs, authority, previous).ok()
+                    }) {
+                        stale |= pipeline.supports_partial_refresh(
+                            entity,
+                            candidates[0],
+                            previous.body(),
+                            content,
+                        );
+                    }
+                }
+            }
+            if stale {
+                behind.push(new.path.clone());
+            }
+            continue;
+        }
         // No skip for a path the graph holds nothing at: a clean parse that
         // produces entities where the graph has none is the same defect one step
         // further along, and the comparison below already says so.
@@ -4626,6 +4719,146 @@ mod tests {
         commit_native_plan_with_projection(&init.layout, blobs, plan).unwrap();
         update_artifact_bytes(graph, blobs, &artifact, after);
         held
+    }
+
+    #[test]
+    fn partial_c_commit_reopens_current_identity_and_retains_incomplete_coverage() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(parent.path()).unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let before = include_str!("../../kin-parser/tests/fixtures/c/hiredis-sds.c");
+        let after = before.replacen("reqlen", "required_len", 3);
+        let artifact = add_artifact(&graph, &blobs, b"sds.c", before.as_bytes(), |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let held = derive_entities_into_graph(&graph, &blobs, "sds.c", before.as_bytes());
+        let target = held.iter().find(|e| e.name == "sdsMakeRoomFor").unwrap();
+        let initial = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("tests"),
+            "Record C source".into(),
+        )
+        .unwrap();
+        commit_native_plan_with_projection(&init.layout, &blobs, initial).unwrap();
+        update_artifact_bytes(&graph, &blobs, &artifact, after.as_bytes());
+        let plan = || {
+            plan_native_commit(
+                &init.layout,
+                &graph,
+                &blobs,
+                OperationId::new(),
+                fixed_timestamp(),
+                AuthorId::new("tests"),
+                "Refresh C declaration".into(),
+            )
+        };
+        assert!(
+            plan().is_err(),
+            "a refreshable entity must not be sealed before admission"
+        );
+        let indexed = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(
+                &kin_model::FilePathId::new("sds.c"),
+                after.as_bytes(),
+                blobs.write(after.as_bytes()).unwrap(),
+            )
+            .unwrap()
+            .indexed_file;
+        let mut reconciler = kin_reconcile::Reconciler::new(root.path().to_path_buf());
+        let result = reconciler
+            .reconcile_indexed_content(&indexed, &blobs, &graph)
+            .unwrap();
+        let kin_reconcile::ReconcileOutcome::PartiallyUpdated {
+            retained,
+            error_ranges,
+            ..
+        } = &result.outcome
+        else {
+            panic!("{:?}", result.outcome);
+        };
+        assert_eq!(error_ranges.len(), 25);
+        crate::loop_runner::persist_partial_observation(&init.layout, &result.outcome).unwrap();
+        graph.apply_transaction_delta(&result.delta).unwrap();
+        let observation = crate::loop_runner::observed_parse_of(
+            &RepoPath::from_utf8("sds.c").unwrap(),
+            &result.outcome,
+        )
+        .unwrap();
+        kin_core::retained_parse::record(&init.layout, &[observation]);
+        let good = graph.get_entity(&target.id).unwrap().unwrap();
+        for corruption in ["proof", "span", "digest", "signature", "body"] {
+            let mut corrupt = good.clone();
+            match corruption {
+                "proof" => {
+                    corrupt.metadata.extra.remove("partial_parse_admission");
+                }
+                "span" => {
+                    corrupt.span.as_mut().unwrap().start_byte += 1;
+                }
+                "signature" => {
+                    corrupt.signature.push_str(" invalid");
+                }
+                "digest" => {
+                    corrupt.metadata.extra.insert(
+                        "blob_hash".into(),
+                        kin_blobs::digest(before.as_bytes()).to_string().into(),
+                    );
+                }
+                _ => {
+                    corrupt.fingerprint.behavior_hash = Hash256::from_bytes([0; 32]);
+                }
+            }
+            graph.upsert_entity(&corrupt).unwrap();
+            assert!(
+                plan().is_err(),
+                "commit accepted corrupted {corruption} proof"
+            );
+            graph.upsert_entity(&good).unwrap();
+        }
+        commit_native_plan_with_projection(&init.layout, &blobs, plan().unwrap()).unwrap();
+        let authority = reopen(&init);
+        let lease = authority.read_authority();
+        let snapshot = lease
+            .workspace_graph_snapshot(&init.workspace_id)
+            .unwrap()
+            .unwrap();
+        let current = snapshot.entities.get(&target.id).unwrap();
+        assert_eq!(current, &good);
+        let digest = Hash256::from_bytes(kin_blobs::digest(after.as_bytes()).0);
+        kin_mcp::handlers::common::span_source_coherence(current, &digest, "sds.c").unwrap();
+        let source = read_publishable_source(&blobs, &authority, digest).unwrap();
+        let span = current.span.as_ref().unwrap();
+        assert!(
+            std::str::from_utf8(&source.body()[span.start_byte..span.end_byte])
+                .unwrap()
+                .contains("required_len")
+        );
+        for id in retained {
+            let old = held.iter().find(|e| e.id == *id).unwrap();
+            assert_eq!(snapshot.entities.get(id), Some(old));
+            assert!(
+                kin_mcp::handlers::common::span_source_coherence(old, &digest, "sds.c").is_err()
+            );
+        }
+        let disclosure = kin_core::retained_parse::read(&init.layout);
+        assert_eq!(disclosure.errors_for("sds.c"), Some(25));
+        let entities: Vec<_> = snapshot.entities.values().cloned().collect();
+        let coverage = kin_core::reference_coverage::collect_parse_coverage_from(
+            &snapshot.resolved_tree,
+            &entities,
+            &disclosure,
+        );
+        assert!(coverage.any_retained());
+        assert!(coverage
+            .summary_lines()
+            .join("\n")
+            .contains("retained_last_good_parse"));
     }
 
     /// A commit must not seal a tree delta over a path whose graph entities a
