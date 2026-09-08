@@ -7,12 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Let a hosted store persist the vectors it embeds. A hosted daemon bound its durable vector artifact to the hash of the query snapshot it resolved out of a repository-v6 envelope, and that snapshot carried no entity adjacency: the materialization cleared it, correctly, and the graph rebuilt it from the relations on load. The retrieval authority folds that adjacency through the graph root, so the binding retained at open could never equal the one every flush computes from the live graph, and any hosted store with at least one entity-to-entity edge refused every durable vector save for the life of the process while the embedding pass retried and walked the container into its memory limit. The materialization now rebuilds the adjacency the served graph will hold, so the snapshot a binding names is the graph the daemon serves. A save that is still refused is recorded against the binding it refused: the embedding worker parks rather than retrying on that binding and wakes again once a rebind replaces it, the vectors nothing can write are released rather than held for the life of the process, and `/health` reports `hosted_vector_persistence.status` as `refused` with the reason.
+
 ## [0.7.5] - 2026-09-08
 
 ### Changed
 
 - Replace retired canon lines in README with the unified packet's (#1591)
-
 
 ## [0.7.4] - 2026-09-07
 

@@ -700,6 +700,24 @@ async fn drain_pending_flush(pending: &mut Option<tokio::task::JoinHandle<Result
     }
 }
 
+/// Let go of what a stopping embedding worker embedded and could not persist.
+///
+/// Called where the worker observes its own halt, which is the only place it
+/// knows it is leaving for the life of the process. A pass the supervisor
+/// stopped for holding the CPU without recording progress made nothing durable
+/// in that stretch, so what it is holding is memory nothing will read again and
+/// that a hosted container's cgroup limit is still counting. Silent when
+/// nothing was stranded, because a release that reclaimed nothing is not news.
+fn release_stopped_embed_worker_vectors(state: &DaemonState) {
+    let released = state.release_stranded_embedded_vectors();
+    if released > 0 {
+        warn!(
+            released_vectors = released,
+            "embedding worker released the vectors it was holding that no durable artifact holds"
+        );
+    }
+}
+
 /// Drain the in-flight flush and credit what it persisted to the embedding pass.
 ///
 /// Progress is credited here rather than when a batch finishes embedding,
@@ -4830,6 +4848,7 @@ pub async fn run_with_authority_on(
                 break;
             }
             if embed_pass.halted() {
+                release_stopped_embed_worker_vectors(&embed_state);
                 break;
             }
 
@@ -4877,6 +4896,36 @@ pub async fn run_with_authority_on(
                 if embed_pass.halted() {
                     drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass)
                         .await;
+                    // A pass the supervisor stopped for holding the CPU without
+                    // recording progress recorded nothing durable in that
+                    // stretch, and this worker is leaving for the life of the
+                    // process. Whatever it embedded that no artifact holds is
+                    // memory nothing will ever read again, and on a hosted
+                    // container it is memory the cgroup limit is counting.
+                    release_stopped_embed_worker_vectors(&embed_state);
+                    break 'wake;
+                }
+                // A durable save refused against the binding this daemon holds
+                // does not become writable by trying again: the refusal is a
+                // property of the binding, so every batch after it spends the
+                // CPU and the memory of a hosted container to produce vectors
+                // nothing can write. Stand down here, at the worker's own
+                // checkpoint, and say why on the pass surface. The record is
+                // matched against the installed binding, so a rebind after the
+                // next graph commit retires it and a later wake may drain
+                // again; this is a stand-down on one binding, not on the store.
+                if let Some(reason) = embed_state.hosted_vector_binding_refusal() {
+                    drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass)
+                        .await;
+                    embed_pass.halt(format!(
+                        "the background embedding worker stopped because nothing it embeds can be \
+                         persisted against the hosted vector binding this daemon holds, and \
+                         retrying on the same binding would repeat the refusal: {reason}"
+                    ));
+                    error!(
+                        reason = %reason,
+                        "embedding worker stopped: durable vector persistence is refused against the retained hosted binding; the daemon keeps serving"
+                    );
                     break 'wake;
                 }
                 if embed_state.background_embed_paused() {
