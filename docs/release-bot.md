@@ -66,13 +66,25 @@ train asserts the squash-only PR_TITLE + PR_BODY policy before trusting the
 resolution, and refuses a mention of the key that git does not parse as a
 trailer, a duplicate trailer, or an unsupported value.
 
-Nothing editable resolves the bump. Labels are applied to describe the resolved
+If a historical commit records one valid intent but Git cannot parse it as a trailer,
+`scripts/release-intent-attestations.json` can record its full 40-character SHA,
+intent and reason through a reviewed PR. The resolver reads the committed file
+from the same main snapshot as its policy and includes the reason in its evidence.
+An entry cannot override readable intent, duplicate or unsupported trailers, or a
+commit with no mention. The attested intent must equal the single recorded value;
+ambiguous or unsupported raw values still fail. Missing attestation for malformed
+evidence still fails.
+A nonzero reconciliation outcome writes a failed marker, including failures before
+drift resolution and failures after an all-clear. That marker opens or updates the
+rail alarm immediately; ordinary holds retain their four-cycle threshold.
+
+Nothing editable outside reviewed main resolves the bump. Labels are applied to describe the resolved
 intent and are never read back, and the reconcile dispatch carries no bump
 override. A merged pull request's labels can be changed afterwards, so reading
 them would let a later scheduled run resolve a lower bump than an earlier one
 and rewrite a prepared minor or major release back to a patch. A commit message
 on protected main cannot change, and the first-parent range only grows, so the
-resolution is stable and monotone.
+resolution is stable and monotone for a fixed reviewed attestation set.
 
 The release App has repository Contents permission but no `main` bypass. It can
 only update `automation/release-next`; the repository `GITHUB_TOKEN` opens the

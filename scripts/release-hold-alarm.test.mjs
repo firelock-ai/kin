@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -250,4 +250,111 @@ test('the command line refuses a threshold it cannot honour', () => {
   assert.throws(() =>
     execFileSync('node', [SCRIPT, '--markers', markersPath, '--threshold', '0'], { stdio: 'pipe' }),
   );
+});
+
+function finalOutcomeScript() {
+  const workflow = fs.readFileSync(new URL('../.github/workflows/release-train.yml', import.meta.url), 'utf8');
+  const section = workflow.split("      - name: Record this cycle's final outcome\n")[1]?.split("      # Uploaded on every path")[0];
+  assert.ok(section, 'the final outcome step must exist');
+  assert.match(section, /id: report/);
+  assert.match(section, /if: always\(\)/);
+  assert.match(section, /RECONCILE_STATUS: \$\{\{ job.status \}\}/);
+  assert.match(workflow, /marker: \$\{\{ steps.report.outputs.marker \}\}/);
+  assert.match(workflow, /CURRENT_MARKER: \$\{\{ needs.reconcile.outputs.marker \}\}/);
+  return section.split('        run: |\n')[1].split('\n').map(line => line.replace(/^          /, '')).join('\n');
+}
+
+for (const previous of [null, clear(), held()]) {
+  test(`a nonzero step produces an actionable final marker after ${previous?.state ?? 'no marker'}`, () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-release-outcome-'));
+    try {
+      const markerPath = path.join(root, 'release-hold-marker.json');
+      if (previous) fs.writeFileSync(markerPath, JSON.stringify(previous));
+      const failed = spawnSync('bash', ['-c', 'set -e; exit 4']);
+      assert.equal(failed.status, 4);
+      const output = path.join(root, 'output');
+      const outcome = spawnSync('bash', ['-c', finalOutcomeScript()], { encoding: 'utf8', env: {
+        ...process.env, RUNNER_TEMP: root, GITHUB_OUTPUT: output,
+        RECONCILE_STATUS: failed.status === 0 ? 'success' : 'failure',
+        REPO: 'firelock-ai/kin', GITHUB_RUN_ID: '123', GITHUB_SERVER_URL: 'https://github.com',
+      } });
+      assert.equal(outcome.status, 0, outcome.stderr);
+      const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+      assert.equal(marker.state, 'failed');
+      assert.equal(marker.drift, null);
+      assert.match(fs.readFileSync(output, 'utf8'), /"state":"failed"/);
+      const decision = decide({ markers: [marker], issue: null });
+      assert.equal(decision.action, 'open');
+      assert.equal(decision.reason, 'reconcile_failed');
+      assert.match(decision.body, /actions\/runs\/123/);
+      assert.doesNotMatch(decision.body, /runs concluded success/);
+      const existing = decide({ markers: [marker], issue: OPEN_ISSUE });
+      assert.equal(existing.action, 'update');
+      assert.equal(existing.issue, OPEN_ISSUE.number);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
+test('a successful final outcome preserves the observed marker', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-release-outcome-'));
+  try {
+    const marker = clear();
+    fs.writeFileSync(path.join(root, 'release-hold-marker.json'), JSON.stringify(marker));
+    execFileSync('bash', ['-c', finalOutcomeScript()], { env: {
+      ...process.env, RUNNER_TEMP: root, GITHUB_OUTPUT: path.join(root, 'output'), RECONCILE_STATUS: 'success',
+    } });
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'release-hold-marker.json'), 'utf8')), marker);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the workflow opens and updates crash alarms with a loud accurate diagnostic', () => {
+  const workflow = fs.readFileSync(new URL('../.github/workflows/release-train.yml', import.meta.url), 'utf8');
+  const arm = workflow.split('          case "$action" in\n')[1]?.split('          esac')[0];
+  assert.ok(arm, 'alarm dispatch case must exist');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-release-alarm-'));
+  try {
+    const marker = { schema: MARKER_SCHEMA, state: 'failed', reason: 'reconcile_failed', run_id: '123', drift: null };
+    for (const issue of [null, OPEN_ISSUE]) {
+      const decision = decide({ markers: [marker], issue });
+      const filename = path.join(root, 'decision.json');
+      fs.writeFileSync(filename, JSON.stringify(decision));
+      const script = 'set -euo pipefail\ngh() { printf "%s\\n" "$*" >> "$work/gh-calls"; }\n' +
+        'case "$action" in\n' + arm + '\nesac\n';
+      const result = spawnSync('bash', ['-c', script], { encoding: 'utf8', env: {
+        ...process.env, work: root, decision: filename, action: decision.action, reason: decision.reason,
+        REPO: 'firelock-ai/kin', title: ALARM_TITLE,
+      } });
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.equal(result.stderr, '');
+      assert.match(result.stdout, /::error::Release rail.*reconcile_failed/);
+      assert.doesNotMatch(result.stdout, /consecutive cycles|blocking tag|two ways out/);
+      assert.match(fs.readFileSync(path.join(root, 'gh-calls'), 'utf8'), issue ? /issue edit 4242/ : /issue create/);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the alarm job result overrides missing or stale markers after finalizer or upload failure', () => {
+  const workflow = fs.readFileSync(new URL('../.github/workflows/release-train.yml', import.meta.url), 'utf8');
+  const section = workflow.split('      - name: Gather this cycle')[1]?.split('          prior_ids=')[0];
+  assert.ok(section, 'alarm history step must exist');
+  assert.match(section, /RECONCILE_RESULT: \$\{\{ needs.reconcile.result \}\}/);
+  const script = section.split('        run: |\n')[1].split('\n').map(line => line.replace(/^          /, '')).join('\n');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-release-result-'));
+  try {
+    for (const result of ['failure', 'cancelled', 'success']) {
+      for (const previous of ['', JSON.stringify(clear())]) {
+        execFileSync('bash', ['-c', script], { env: {
+          ...process.env, RUNNER_TEMP: root, RECONCILE_RESULT: result, CURRENT_MARKER: previous,
+          GITHUB_RUN_ID: '123', GITHUB_SERVER_URL: 'https://github.com', REPO: 'firelock-ai/kin',
+        } });
+        const marker = JSON.parse(fs.readFileSync(path.join(root, 'release-hold-history/current.json'), 'utf8'));
+        if (result === 'success') {
+          assert.equal(marker.state ?? 'unreadable', previous ? 'clear' : 'unreadable');
+        } else {
+          assert.equal(marker.state, 'failed');
+          assert.equal(decide({ markers: [marker], issue: OPEN_ISSUE }).action, 'update');
+        }
+      }
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

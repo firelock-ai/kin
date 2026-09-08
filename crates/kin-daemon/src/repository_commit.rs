@@ -1518,6 +1518,7 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     tree_deltas: &[kin_model::TreeDelta],
     scope: SealedPathScope,
+    changed_entities: &BTreeSet<kin_model::EntityId>,
 ) -> Result<Vec<RepoPath>> {
     use kin_model::EntityStore;
 
@@ -1571,22 +1572,172 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
             continue;
         };
         let indexed = indexed.indexed_file;
-        // Only a clean parse can say the graph's entities are wrong. A file the
-        // parser could not read whole keeps the entities its last readable
-        // version produced, deliberately: the daemon reconciles under
-        // `ReconcilePolicy::FallbackToLkg`, an author mid-edit produces this
-        // constantly, and a fresh parse of a half-written file disagrees with
-        // the graph for a reason that has nothing to do with the window this
-        // check exists to close. Refusing on it would leave a caller holding one
-        // broken file unable to record anything at all, which is the outcome
-        // `drain_semantic_debt` already declines to produce for the same reason.
-        if !matches!(indexed.parse_state, kin_model::ParseState::Valid) {
-            continue;
-        }
         let held = graph.query_entities(&kin_model::EntityFilter {
             file_path: Some(file_id.clone()),
             ..Default::default()
         })?;
+        if let kin_model::ParseState::Incomplete { error_ranges } = &indexed.parse_state {
+            let mut stale = false;
+            for entity in &held {
+                let candidates: Vec<_> = indexed
+                    .entities
+                    .iter()
+                    .filter(|e| e.name == entity.name && e.kind == entity.kind)
+                    .collect();
+                let unique = candidates.len() == 1
+                    && held
+                        .iter()
+                        .filter(|e| e.name == entity.name && e.kind == entity.kind)
+                        .count()
+                        == 1;
+                let current = entity
+                    .metadata
+                    .extra
+                    .get("blob_hash")
+                    .and_then(|v| v.as_str())
+                    == Some(hash.to_string().as_str());
+                let proof = entity.metadata.extra.get("partial_parse_admission");
+                if proof.is_some_and(|proof| {
+                    proof.get("source_blob_hash") != entity.metadata.extra.get("blob_hash")
+                }) {
+                    stale = true;
+                    continue;
+                }
+                // An unchanged, previously admitted payload needs no new
+                // partial-refresh proof when its original source is restored.
+                if current && proof.is_none() && !changed_entities.contains(&entity.id) {
+                    continue;
+                }
+                if current {
+                    let held_relations = kin_model::EntityStore::traverse(
+                        graph,
+                        &kin_model::GraphNodeId::Entity(entity.id),
+                        &[],
+                        1,
+                    )?
+                    .relations;
+                    // A partial admission claims only this declaration. Recheck
+                    // the old CAS context and the exact new payload, not a
+                    // complete-set equality over an incomplete file.
+                    let previous = proof
+                        .and_then(|v| v.get("previous_blob_hash"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|v| kin_model::Hash256::from_hex(v).ok());
+                    let verified = previous
+                        .and_then(|previous| {
+                            read_publishable_source(blobs, authority, previous).ok()
+                        })
+                        .and_then(|previous| {
+                            let before = pipeline
+                                .index_file_content_with_tests(
+                                    &file_id,
+                                    previous.body(),
+                                    kin_blobs::digest(previous.body()),
+                                )
+                                .ok()?;
+                            let originals: Vec<_> = before
+                                .indexed_file
+                                .entities
+                                .iter()
+                                .filter(|e| e.name == entity.name && e.kind == entity.kind)
+                                .collect();
+                            Some(
+                                unique
+                                    && originals.len() == 1
+                                    && pipeline.supports_partial_refresh(
+                                        originals[0],
+                                        candidates[0],
+                                        previous.body(),
+                                        content,
+                                    )
+                                    && {
+                                        let mut expected = candidates[0].clone();
+                                        expected.id = entity.id;
+                                        expected.created_in = entity.created_in;
+                                        expected.lineage_parent = entity.lineage_parent;
+                                        expected.metadata.extra.insert(
+                                            "partial_parse_admission".into(),
+                                            serde_json::json!({
+                                                "previous_blob_hash": kin_blobs::digest(previous.body()).to_string(),
+                                                "source_blob_hash": hash.to_string(),
+                                                "error_ranges": error_ranges,
+                                            }),
+                                        );
+                                        let mut original = originals[0].clone();
+                                        original.id = entity.id;
+                                        let declaration = candidates[0].span.as_ref()?;
+                                        expected == *entity && held_relations.iter().all(|relation| {
+                                            let associated = relation.evidence.iter().filter_map(|e| e.source_span.as_ref()).any(|span| {
+                                                span.file == declaration.file && (relation.src == kin_model::GraphNodeId::Entity(entity.id)
+                                                    || (declaration.start_line <= span.start_line && span.end_line <= declaration.end_line))
+                                            });
+                                            !associated || pipeline.verifies_partial_relation(
+                                                &original, candidates[0], previous.body(), content, relation, &held,
+                                            )
+                                        })
+                                    },
+                            )
+                        })
+                        .unwrap_or(false);
+                    stale |= !verified;
+                } else if !current && unique {
+                    // Do not seal a refreshable declaration in the window
+                    // before its partial transaction reaches graph truth.
+                    let previous = entity
+                        .metadata
+                        .extra
+                        .get("blob_hash")
+                        .and_then(|v| v.as_str())
+                        .and_then(|v| kin_model::Hash256::from_hex(v).ok());
+                    if let Some(previous) = previous.and_then(|previous| {
+                        read_publishable_source(blobs, authority, previous).ok()
+                    }) {
+                        let relations = kin_model::EntityStore::traverse(
+                            graph,
+                            &kin_model::GraphNodeId::Entity(entity.id),
+                            &[],
+                            1,
+                        )?
+                        .relations;
+                        stale |= pipeline.supports_partial_refresh(
+                            entity,
+                            candidates[0],
+                            previous.body(),
+                            content,
+                        ) && relations.iter().all(|relation| {
+                            let associated = entity.span.as_ref().is_some_and(|declaration| {
+                                relation
+                                    .evidence
+                                    .iter()
+                                    .filter_map(|e| e.source_span.as_ref())
+                                    .any(|span| {
+                                        span.file == declaration.file
+                                            && (relation.src
+                                                == kin_model::GraphNodeId::Entity(entity.id)
+                                                || (declaration.start_line <= span.start_line
+                                                    && span.end_line <= declaration.end_line))
+                                    })
+                            });
+                            !associated
+                                || pipeline
+                                    .rebase_partial_relation(
+                                        entity,
+                                        candidates[0],
+                                        previous.body(),
+                                        content,
+                                        relation,
+                                        &held,
+                                    )
+                                    .is_some()
+                        });
+                    }
+                }
+            }
+            if stale {
+                behind.push(new.path.clone());
+            }
+            continue;
+        }
         // No skip for a path the graph holds nothing at: a clean parse that
         // produces entities where the graph has none is the same defect one step
         // further along, and the comparison below already says so.
@@ -1759,6 +1910,11 @@ fn plan_native_commit_inner(
                     } else {
                         SealedPathScope::UpdatedOnly
                     },
+                    &workspace_semantic_delta
+                        .entity_deltas()
+                        .iter()
+                        .map(kin_model::EntityDelta::target_id)
+                        .collect(),
                 )
             })?
         }
@@ -1955,6 +2111,24 @@ fn plan_native_commit_inner(
         }
     }
     source_hashes.extend(shared_policy.sources.iter().map(|source| source.body_hash));
+    for entity in change
+        .entity_deltas
+        .iter()
+        .filter_map(kin_model::EntityDelta::new_state)
+    {
+        if let Some(previous) = entity
+            .metadata
+            .extra
+            .get("partial_parse_admission")
+            .and_then(|proof| proof.get("previous_blob_hash"))
+            .and_then(|value| value.as_str())
+        {
+            source_hashes.insert(
+                Hash256::from_hex(previous)
+                    .map_err(|error| invalid(format!("invalid partial proof source: {error}")))?,
+            );
+        }
+    }
 
     // The lease is a read of this authority and the plan carries the authority
     // itself, so the read ends here and the open does not.
@@ -4626,6 +4800,526 @@ mod tests {
         commit_native_plan_with_projection(&init.layout, blobs, plan).unwrap();
         update_artifact_bytes(graph, blobs, &artifact, after);
         held
+    }
+
+    /// An observed rename in an incomplete C file must refresh the independently
+    /// verified declaration while preserving its graph identity.
+    #[test]
+    fn a_semantically_neutral_c_rename_leaves_no_entity_answering_from_bytes_that_are_gone() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(parent.path()).unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let before = include_str!("../../kin-parser/tests/fixtures/c/hiredis-sds.c");
+        assert_eq!(
+            before.matches("reqlen").count(),
+            3,
+            "the disclosed edit is three occurrences of one local"
+        );
+        let after = before.replacen("reqlen", "required_len", 3);
+
+        // The premise, asserted rather than assumed. These bytes do not parse
+        // whole either side of the rename, and by the same count, which is what
+        // makes the rename innocent and the retained span inexcusable. If the C
+        // adapter ever reads this file cleanly the class is gone, and this test
+        // must fail loudly saying so instead of passing on a technicality.
+        let errors = |source: &str| {
+            let indexed = kin_index::IndexPipeline::new()
+                .index_file_content_with_tests(
+                    &kin_model::FilePathId::new("sds.c"),
+                    source.as_bytes(),
+                    blobs.write(source.as_bytes()).unwrap(),
+                )
+                .unwrap()
+                .indexed_file;
+            match indexed.parse_state {
+                kin_model::ParseState::Incomplete { error_ranges } => error_ranges.len(),
+                other => panic!("the fixture must not parse whole: {other:?}"),
+            }
+        };
+        assert_eq!(errors(before), 25);
+        assert_eq!(errors(&after), 25, "the rename introduces no parse error");
+
+        // Import admits what a partial parse yields, which is how the disclosed
+        // store came to hold `sdsMakeRoomFor` at all.
+        let working_dir = init.layout.working_dir().to_path_buf();
+        let host = working_dir.join("sds.c");
+        std::fs::write(&host, before).unwrap();
+        let artifact = add_artifact(&graph, &blobs, b"sds.c", before.as_bytes(), |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let held = derive_entities_into_graph(&graph, &blobs, "sds.c", before.as_bytes());
+        let target = held.iter().find(|e| e.name == "sdsMakeRoomFor").unwrap();
+        let old_digest = Hash256::from_bytes(kin_blobs::digest(before.as_bytes()).0);
+        let new_digest = Hash256::from_bytes(kin_blobs::digest(after.as_bytes()).0);
+
+        // Two controls before the edit, so a change that simply stopped
+        // recording provenance could not satisfy the assertion at the end. The
+        // read is coherent while the path holds the bytes the span came from,
+        // and it is the disclosed refusal the moment those bytes move.
+        kin_mcp::handlers::common::span_source_coherence(target, &old_digest, "sds.c").unwrap();
+        std::fs::write(&host, &after).unwrap();
+        update_artifact_bytes(&graph, &blobs, &artifact, after.as_bytes());
+        let refusal =
+            kin_mcp::handlers::common::span_source_coherence(target, &new_digest, "sds.c")
+                .expect_err("a span derived from other bytes cannot describe these");
+        assert!(
+            refusal
+                .to_string()
+                .contains("does not describe these bytes"),
+            "{refusal}"
+        );
+
+        // One reconcile of the observed write: the whole of what the disclosed
+        // run got between the edit and the refusal.
+        let result = kin_reconcile::Reconciler::new(working_dir)
+            .reconcile_file_change(&kin_index::FileEvent::Changed(host.clone()), &blobs, &graph)
+            .unwrap();
+        graph.apply_transaction_delta(&result.delta).unwrap();
+
+        let current = graph.get_entity(&target.id).unwrap().unwrap();
+        assert_eq!(current.id, target.id, "identity survives the refresh");
+        kin_mcp::handlers::common::span_source_coherence(&current, &new_digest, "sds.c")
+            .expect("the edited declaration must answer about the bytes at its path");
+        let span = current.span.as_ref().unwrap();
+        assert!(
+            after[span.start_byte..span.end_byte].contains("required_len"),
+            "the recorded span must slice the renamed body"
+        );
+    }
+
+    #[test]
+    fn partial_c_commit_reopens_current_identity_and_retains_incomplete_coverage() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(parent.path()).unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let before = include_str!("../../kin-parser/tests/fixtures/c/hiredis-sds.c");
+        let after = before.replacen("reqlen", "required_len", 3);
+        let artifact = add_artifact(&graph, &blobs, b"sds.c", before.as_bytes(), |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let held = derive_entities_into_graph(&graph, &blobs, "sds.c", before.as_bytes());
+        let target = held.iter().find(|e| e.name == "sdsMakeRoomFor").unwrap();
+        let initial = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("tests"),
+            "Record C source".into(),
+        )
+        .unwrap();
+        commit_native_plan_with_projection(&init.layout, &blobs, initial).unwrap();
+        let artifact = update_artifact_bytes(&graph, &blobs, &artifact, after.as_bytes());
+        let plan = || {
+            plan_native_commit(
+                &init.layout,
+                &graph,
+                &blobs,
+                OperationId::new(),
+                fixed_timestamp(),
+                AuthorId::new("tests"),
+                "Refresh C declaration".into(),
+            )
+        };
+        assert!(
+            plan().is_err(),
+            "a refreshable entity must not be sealed before admission"
+        );
+        // Through the entrypoint the daemon's watcher uses, which is where the
+        // broken-AST decision is taken. `reconcile_indexed_content` beside it
+        // keeps its full re-derive for the commit paths that need a layout.
+        let host = root.path().join("sds.c");
+        std::fs::write(&host, &after).unwrap();
+        let mut reconciler = kin_reconcile::Reconciler::new(root.path().to_path_buf());
+        let result = reconciler
+            .reconcile_file_change(&kin_index::FileEvent::Changed(host), &blobs, &graph)
+            .unwrap();
+        let kin_reconcile::ReconcileOutcome::PartiallyUpdated {
+            retained,
+            error_ranges,
+            ..
+        } = &result.outcome
+        else {
+            panic!("{:?}", result.outcome);
+        };
+        assert_eq!(error_ranges.len(), 25);
+        crate::loop_runner::persist_partial_observation(&init.layout, &result.outcome).unwrap();
+        graph.apply_transaction_delta(&result.delta).unwrap();
+        let observation = crate::loop_runner::observed_parse_of(
+            &RepoPath::from_utf8("sds.c").unwrap(),
+            &result.outcome,
+        )
+        .unwrap();
+        kin_core::retained_parse::record(&init.layout, &[observation]);
+        let good = graph.get_entity(&target.id).unwrap().unwrap();
+        for corruption in [
+            "proof",
+            "error_ranges",
+            "span",
+            "digest",
+            "signature",
+            "body",
+        ] {
+            let mut corrupt = good.clone();
+            match corruption {
+                "proof" => {
+                    corrupt.metadata.extra.remove("partial_parse_admission");
+                }
+                "error_ranges" => {
+                    corrupt
+                        .metadata
+                        .extra
+                        .get_mut("partial_parse_admission")
+                        .unwrap()["error_ranges"] = serde_json::json!([]);
+                }
+                "span" => {
+                    corrupt.span.as_mut().unwrap().start_byte += 1;
+                }
+                "signature" => {
+                    corrupt.signature.push_str(" invalid");
+                }
+                "digest" => {
+                    corrupt.metadata.extra.insert(
+                        "blob_hash".into(),
+                        kin_blobs::digest(before.as_bytes()).to_string().into(),
+                    );
+                }
+                _ => {
+                    corrupt.fingerprint.behavior_hash = Hash256::from_bytes([0; 32]);
+                }
+            }
+            graph.upsert_entity(&corrupt).unwrap();
+            assert!(
+                plan().is_err(),
+                "commit accepted corrupted {corruption} proof"
+            );
+            graph.upsert_entity(&good).unwrap();
+        }
+        publish_workspace_tree(
+            &init.layout,
+            &blobs,
+            &graph.resolved_tree(),
+            OperationId::new(),
+            AuthorId::new("tests"),
+        )
+        .unwrap();
+        let expected = graph.to_snapshot();
+        commit_native_plan_with_projection(&init.layout, &blobs, plan().unwrap()).unwrap();
+        let authority = reopen(&init);
+        let lease = authority.read_authority();
+        let snapshot = lease
+            .workspace_graph_snapshot(&init.workspace_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.entities, expected.entities);
+        assert_eq!(snapshot.relations, expected.relations);
+        assert_eq!(snapshot.resolved_tree, expected.resolved_tree);
+        let current = snapshot.entities.get(&target.id).unwrap();
+        assert_eq!(current, &good);
+        let digest = Hash256::from_bytes(kin_blobs::digest(after.as_bytes()).0);
+        kin_mcp::handlers::common::span_source_coherence(current, &digest, "sds.c").unwrap();
+        let source = read_publishable_source(&blobs, &authority, digest).unwrap();
+        let span = current.span.as_ref().unwrap();
+        assert!(
+            std::str::from_utf8(&source.body()[span.start_byte..span.end_byte])
+                .unwrap()
+                .contains("required_len")
+        );
+        for id in retained {
+            let old = held.iter().find(|e| e.id == *id).unwrap();
+            assert_eq!(snapshot.entities.get(id), Some(old));
+            assert!(
+                kin_mcp::handlers::common::span_source_coherence(old, &digest, "sds.c").is_err()
+            );
+        }
+        let disclosure = kin_core::retained_parse::read(&init.layout);
+        assert_eq!(disclosure.errors_for("sds.c"), Some(25));
+        let entities: Vec<_> = snapshot.entities.values().cloned().collect();
+        let coverage = kin_core::reference_coverage::collect_parse_coverage_from(
+            &snapshot.resolved_tree,
+            &entities,
+            &disclosure,
+        );
+        assert!(coverage.any_retained());
+        assert!(coverage
+            .summary_lines()
+            .join("\n")
+            .contains("retained_last_good_parse"));
+        drop(lease);
+        drop(authority);
+        std::fs::write(root.path().join("sds.c"), before).unwrap();
+        update_artifact_bytes(&graph, &blobs, &artifact, before.as_bytes());
+        let restored = reconciler
+            .reconcile_file_change(
+                &kin_index::FileEvent::Changed(root.path().join("sds.c")),
+                &blobs,
+                &graph,
+            )
+            .unwrap();
+        graph.apply_transaction_delta(&restored.delta).unwrap();
+        publish_workspace_tree(
+            &init.layout,
+            &blobs,
+            &graph.resolved_tree(),
+            OperationId::new(),
+            AuthorId::new("tests"),
+        )
+        .unwrap();
+        commit_native_plan_with_projection(&init.layout, &blobs, plan().unwrap()).expect(
+            "restoring imported incomplete bytes keeps unchanged admitted declarations valid",
+        );
+    }
+
+    #[test]
+    fn partial_c_commit_publishes_intermediate_proof_source() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(parent.path()).unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let before = "int good(void){int value=1;return value;}\nint bad(void){test_cond(1)}\n";
+        let middle = before.replace("value", "middle");
+        let after = before.replace("value", "final_value");
+        let mut artifact = add_artifact(&graph, &blobs, b"test.c", before.as_bytes(), |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        derive_entities_into_graph(&graph, &blobs, "test.c", before.as_bytes());
+        let plan = || {
+            plan_native_commit(
+                &init.layout,
+                &graph,
+                &blobs,
+                OperationId::new(),
+                fixed_timestamp(),
+                AuthorId::new("tests"),
+                "Record C source".into(),
+            )
+        };
+        commit_native_plan_with_projection(&init.layout, &blobs, plan().unwrap()).unwrap();
+        let mut reconciler = kin_reconcile::Reconciler::new(root.path().to_path_buf());
+        for body in [&middle, &after] {
+            let host = root.path().join("test.c");
+            std::fs::write(&host, body).unwrap();
+            artifact = update_artifact_bytes(&graph, &blobs, &artifact, body.as_bytes());
+            let result = reconciler
+                .reconcile_file_change(&kin_index::FileEvent::Changed(host), &blobs, &graph)
+                .unwrap();
+            assert!(matches!(
+                result.outcome,
+                kin_reconcile::ReconcileOutcome::PartiallyUpdated { .. }
+            ));
+            graph.apply_transaction_delta(&result.delta).unwrap();
+        }
+        let middle_hash = Hash256::from_bytes(kin_blobs::digest(middle.as_bytes()).0);
+        assert!(reopen(&init)
+            .load_source_blob(middle_hash)
+            .unwrap()
+            .is_none());
+        publish_workspace_tree(
+            &init.layout,
+            &blobs,
+            &graph.resolved_tree(),
+            OperationId::new(),
+            AuthorId::new("tests"),
+        )
+        .unwrap();
+        let expected = graph.to_snapshot();
+        commit_native_plan_with_projection(&init.layout, &blobs, plan().unwrap()).unwrap();
+        let authority = reopen(&init);
+        let empty = tempfile::tempdir().unwrap();
+        let empty_ingest = kin_blobs::BlobStore::new(empty.path().to_path_buf()).unwrap();
+        assert_eq!(
+            read_publishable_source(&empty_ingest, &authority, middle_hash)
+                .unwrap()
+                .body(),
+            middle.as_bytes()
+        );
+        let lease = authority.read_authority();
+        let snapshot = lease
+            .workspace_graph_snapshot(&init.workspace_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.entities, expected.entities);
+        assert_eq!(snapshot.relations, expected.relations);
+        assert_eq!(snapshot.resolved_tree, expected.resolved_tree);
+    }
+
+    #[test]
+    fn partial_c_call_evidence_commits_and_reopens_at_the_current_call_site() {
+        let before = "int helper(void) { return 7; }\nint good(void) {\n  int value=1;\n  return helper();\n}\nint bad(void) { test_cond(1) }\n";
+        let site = |source: &str, zero_bytes: bool| {
+            let start = source.find("helper()").unwrap();
+            let end = start + "helper".len();
+            let line = source[..start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count() as u32;
+            let column = start - source[..start].rfind('\n').map_or(0, |offset| offset + 1);
+            kin_model::SourceSpan {
+                file: kin_model::FilePathId::new("test.c"),
+                start_byte: if zero_bytes { 0 } else { start },
+                end_byte: if zero_bytes { 0 } else { end },
+                start_line: line,
+                end_line: line,
+                start_col: column as u32,
+                end_col: (column + end - start) as u32,
+            }
+        };
+        for (prefix, unsupported) in [(true, false), (false, false), (true, true)] {
+            let parent = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir_in(parent.path()).unwrap();
+            let init = kin_core::init(root.path()).unwrap();
+            let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+            let graph = kin_db::InMemoryGraph::new();
+            let artifact = add_artifact(&graph, &blobs, b"test.c", before.as_bytes(), |hash| {
+                TreeEntry::blob(hash, false)
+            });
+            let held = derive_entities_into_graph(&graph, &blobs, "test.c", before.as_bytes());
+            let caller = held.iter().find(|entity| entity.name == "good").unwrap();
+            let callee = held.iter().find(|entity| entity.name == "helper").unwrap();
+            let mut relation = kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 0.75,
+                origin: kin_model::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: vec![kin_model::RelationEvidence {
+                    source_span: Some(site(before, prefix)),
+                    ..Default::default()
+                }],
+            };
+            if unsupported {
+                relation.evidence[0].source_span = caller.span.clone();
+            }
+            graph.upsert_relation(&relation).unwrap();
+            let plan = || {
+                plan_native_commit(
+                    &init.layout,
+                    &graph,
+                    &blobs,
+                    OperationId::new(),
+                    fixed_timestamp(),
+                    AuthorId::new("tests"),
+                    "Record current call evidence".into(),
+                )
+            };
+            std::fs::write(root.path().join("test.c"), before).unwrap();
+            publish_workspace_tree(
+                &init.layout,
+                &blobs,
+                &graph.resolved_tree(),
+                OperationId::new(),
+                AuthorId::new("tests"),
+            )
+            .unwrap();
+            commit_native_plan_with_projection(&init.layout, &blobs, plan().unwrap()).unwrap();
+            let after = if prefix {
+                format!("// prefix\n{before}")
+            } else {
+                before.replace("int value=1;", "int renamed=1;\n\n")
+            };
+            update_artifact_bytes(&graph, &blobs, &artifact, after.as_bytes());
+            let host = root.path().join("test.c");
+            std::fs::write(&host, &after).unwrap();
+            let mut reconciler = kin_reconcile::Reconciler::new(root.path().to_path_buf());
+            let result = reconciler
+                .reconcile_file_change(&kin_index::FileEvent::Changed(host), &blobs, &graph)
+                .unwrap();
+            assert!(
+                matches!(&result.outcome, kin_reconcile::ReconcileOutcome::PartiallyUpdated { modified, .. } if modified.contains(&caller.id) != unsupported),
+                "{:?}",
+                result.outcome
+            );
+            crate::loop_runner::persist_partial_observation(&init.layout, &result.outcome).unwrap();
+            graph.apply_transaction_delta(&result.delta).unwrap();
+            if unsupported {
+                assert_eq!(graph.get_entity(&caller.id).unwrap().as_ref(), Some(caller));
+                publish_workspace_tree(
+                    &init.layout,
+                    &blobs,
+                    &graph.resolved_tree(),
+                    OperationId::new(),
+                    AuthorId::new("tests"),
+                )
+                .unwrap();
+                commit_native_plan_with_projection(&init.layout, &blobs, plan().unwrap()).unwrap();
+                let authority = reopen(&init);
+                let lease = authority.read_authority();
+                let snapshot = lease
+                    .workspace_graph_snapshot(&init.workspace_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(snapshot.entities.get(&caller.id), Some(caller));
+                assert_eq!(snapshot.relations.get(&relation.id), Some(&relation));
+                assert_eq!(
+                    kin_core::retained_parse::read(&init.layout).errors_for("test.c"),
+                    Some(1)
+                );
+                continue;
+            }
+            let mut expected = relation.clone();
+            expected.evidence[0].source_span = Some(site(&after, false));
+            let updated = graph
+                .get_all_relations_for_entity(&caller.id)
+                .unwrap()
+                .into_iter()
+                .find(|held| held.id == relation.id)
+                .unwrap();
+            assert_eq!(
+                updated, expected,
+                "the partial transaction must move the existing call evidence"
+            );
+            graph.upsert_relation(&relation).unwrap();
+            assert!(
+                plan().is_err(),
+                "commit accepted retained old call-site coordinates for a current caller"
+            );
+            graph.upsert_relation(&updated).unwrap();
+            publish_workspace_tree(
+                &init.layout,
+                &blobs,
+                &graph.resolved_tree(),
+                OperationId::new(),
+                AuthorId::new("tests"),
+            )
+            .unwrap();
+            commit_native_plan_with_projection(&init.layout, &blobs, plan().unwrap()).unwrap();
+            let authority = reopen(&init);
+            let lease = authority.read_authority();
+            let snapshot = lease
+                .workspace_graph_snapshot(&init.workspace_id)
+                .unwrap()
+                .unwrap();
+            let current = snapshot.entities.get(&caller.id).unwrap();
+            assert_eq!(
+                current.metadata.extra["blob_hash"],
+                kin_blobs::digest(after.as_bytes()).to_string()
+            );
+            let reopened = snapshot.relations.get(&relation.id).unwrap();
+            assert_eq!(reopened, &expected);
+            let lines = kin_mcp::handlers::common::relation_reference_lines(
+                reopened,
+                Some(&kin_model::FilePathId::new("test.c")),
+            );
+            assert_eq!(lines.lines, vec![site(&after, false).start_line + 1]);
+            assert!(after
+                .lines()
+                .nth(lines.lines[0] as usize - 1)
+                .unwrap()
+                .contains("helper()"));
+            assert_eq!(
+                kin_core::retained_parse::read(&init.layout).errors_for("test.c"),
+                Some(1)
+            );
+        }
     }
 
     /// A commit must not seal a tree delta over a path whose graph entities a

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// resolve-release-intent.mjs — resolve the SemVer intent for the next Kin
+// resolve-release-intent.mjs: resolve the SemVer intent for the next Kin
 // release from immutable evidence only.
 //
 // The intent is read from `Kin-Release-Intent:` git trailers on the
@@ -9,7 +9,7 @@
 // editable after a merge, so a later scheduled run could resolve a lower bump
 // than an earlier one and quietly rewrite a prepared minor or major release
 // back to a patch. A commit message cannot be edited once it is on protected
-// main, so the same range always resolves to the same intent.
+// main. Misplaced valid intent needs an explicit reviewed SHA attestation.
 //
 // The trailer reaches the commit through the pull-request body, which the
 // repository's squash-only PR_TITLE + PR_BODY merge policy copies verbatim into
@@ -17,7 +17,7 @@
 // this resolution.
 //
 // Absent evidence means `patch`. The highest intent in the range wins, and the
-// range only grows, so the resolution is monotone by construction.
+// range only grows. With a fixed attestation set, resolution is monotone.
 
 import fs from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -53,7 +53,25 @@ function git(args, options = {}) {
   });
 }
 
-function commitIntent(root, commit) {
+function validateAttestations(document) {
+  if (document?.schema !== 'kin.release-intent-attestations.v1' ||
+      !Array.isArray(document.attestations)) {
+    throw new Error('invalid release intent attestation document');
+  }
+  const byCommit = new Map();
+  for (const entry of document.attestations) {
+    if (!entry || !/^[0-9a-f]{40}$/.test(entry.sha ?? '') ||
+        !RANK.has(entry.intent) || typeof entry.reason !== 'string' ||
+        !entry.reason.trim()) {
+      throw new Error('attestation requires a full 40-character SHA, valid intent and reason');
+    }
+    if (byCommit.has(entry.sha)) throw new Error(`duplicate attestation for ${entry.sha}`);
+    byCommit.set(entry.sha, entry);
+  }
+  return byCommit;
+}
+
+function commitIntent(root, commit, attestation) {
   const message = git(['show', '-s', '--format=%B', commit], { root });
   const mentions = message.match(RAW_MENTION) ?? [];
   const parsed = execFileSync('git', ['interpret-trailers', '--parse'], {
@@ -69,7 +87,18 @@ function commitIntent(root, commit) {
     return match ? [match[1].toLowerCase()] : [];
   });
 
+  if (attestation && (intents.length !== 0 || mentions.length === 0)) {
+    throw new Error(`${commit} attestation requires unreadable trailer evidence; readable or absent evidence cannot be overridden`);
+  }
   if (mentions.length !== intents.length) {
+    if (attestation) {
+      const recorded = mentions.length === 1 ? PARSED_TRAILER.exec(mentions[0].trim()) : null;
+      if (!recorded || !RANK.has(recorded[1].toLowerCase()) ||
+          recorded[1].toLowerCase() !== attestation.intent) {
+        throw new Error(`${commit} attestation requires one explicit valid intent matching the recorded value`);
+      }
+      return attestation.intent;
+    }
     throw new Error(`${commit} has malformed or non-footer ${TRAILER_KEY} evidence`);
   }
   if (intents.length > 1) {
@@ -84,7 +113,9 @@ function commitIntent(root, commit) {
   return intent;
 }
 
-export function resolveReleaseIntent({ root = process.cwd(), baseRef, headRef = 'HEAD' }) {
+export function resolveReleaseIntent({ root = process.cwd(), baseRef, headRef = 'HEAD',
+  attestations = { schema: 'kin.release-intent-attestations.v1', attestations: [] } }) {
+  const byCommit = validateAttestations(attestations);
   const ancestor = spawnSync(
     'git',
     ['--no-replace-objects', 'merge-base', '--is-ancestor', baseRef, headRef],
@@ -105,9 +136,11 @@ export function resolveReleaseIntent({ root = process.cwd(), baseRef, headRef = 
   const evidence = [];
   let intent = 'patch';
   for (const commit of commits) {
-    const found = commitIntent(root, commit);
+    const attestation = byCommit.get(commit);
+    const found = commitIntent(root, commit, attestation);
     if (found === null) continue;
-    evidence.push({ commit, intent: found });
+    evidence.push({ commit, intent: found,
+      ...(attestation ? { source: 'attestation', reason: attestation.reason } : {}) });
     if (RANK.get(found) > RANK.get(intent)) intent = found;
   }
   return { baseRef, headRef, intent, evidence };
@@ -127,7 +160,10 @@ function main() {
   const baseRef = args.get('base-ref');
   const headRef = args.get('head-ref') ?? 'HEAD';
   if (!baseRef) throw new Error('--base-ref is required');
-  const result = resolveReleaseIntent({ baseRef, headRef });
+  const attestationPath = args.get('attestations');
+  const attestations = attestationPath
+    ? JSON.parse(fs.readFileSync(attestationPath, 'utf8')) : undefined;
+  const result = resolveReleaseIntent({ baseRef, headRef, attestations });
   emitOutputs(result);
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
