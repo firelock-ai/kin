@@ -4003,8 +4003,11 @@ impl InMemoryGraph {
 
     /// Return the exact authority digest that persisted lexical/vector
     /// sidecars must match before they can answer queries.
+    ///
+    /// Reads the served retrieval domains under their read lock without
+    /// exporting a snapshot or copying change history and annotation stores.
     #[cfg(any(feature = "vector", test))]
-    pub(crate) fn retrieval_authority_hash(&self) -> [u8; 32] {
+    pub fn retrieval_authority_hash(&self) -> [u8; 32] {
         let ent = self.entities.read();
         self.flush_merkle(&ent);
         let graph_root_hash = self.merkle.read().root_hash();
