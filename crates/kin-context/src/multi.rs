@@ -42,8 +42,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::builder::{
     build_context_pack_with_provenance, group, is_dependency_edge, project_full_body,
-    project_name_and_kind, project_signature_only, AssistantHint, ContextOptions,
-    DependencyRelation, FULL_BODY_PROJECTION_NAME,
+    project_name_and_kind, project_signature_only, source_projection, AssistantHint, BodyCandidate,
+    ContextOptions, ContextProjectionProvider, DependencyRelation, ProjectionLimits,
+    ProjectionReport, FULL_BODY_PROJECTION_NAME, SERVED_BODY_PROJECTION_NAME,
 };
 use crate::error::{ContextError, Result};
 use crate::tokens::estimate_tokens;
@@ -674,6 +675,49 @@ pub fn build_multi_focal_pack<G>(
 where
     G: GraphStore,
 {
+    build_multi_focal_pack_inner(
+        graph,
+        focal_ids,
+        opts,
+        None,
+        ProjectionLimits::default(),
+        None,
+    )
+    .map(|(pack, report, _)| (pack, report))
+}
+
+type MultiMeasure<'a> =
+    dyn FnMut(&ContextPack, &MultiFocalReport, &ProjectionReport) -> Result<usize> + 'a;
+
+pub fn build_multi_focal_pack_with_provider<G: GraphStore>(
+    graph: &G,
+    focal_ids: &[EntityId],
+    opts: &MultiFocalOptions,
+    provider: &mut dyn ContextProjectionProvider,
+    limits: ProjectionLimits,
+    mut measure: impl FnMut(&ContextPack, &MultiFocalReport, &ProjectionReport) -> Result<usize>,
+) -> Result<(ContextPack, MultiFocalReport, ProjectionReport)> {
+    build_multi_focal_pack_inner(
+        graph,
+        focal_ids,
+        opts,
+        Some(provider),
+        limits,
+        Some(&mut measure),
+    )
+}
+
+fn build_multi_focal_pack_inner<G: GraphStore>(
+    graph: &G,
+    focal_ids: &[EntityId],
+    opts: &MultiFocalOptions,
+    mut provider: Option<&mut dyn ContextProjectionProvider>,
+    limits: ProjectionLimits,
+    measure: Option<&mut MultiMeasure<'_>>,
+) -> Result<(ContextPack, MultiFocalReport, ProjectionReport)> {
+    let mut projections = ProjectionReport::default();
+    let source_aware = provider.is_some();
+    let mut retained_bytes = 0usize;
     let mut ordered: Vec<EntityId> = Vec::new();
     for id in focal_ids {
         if !ordered.contains(id) {
@@ -704,11 +748,47 @@ where
     //    affords. A focal that cannot fit even its name is reported rather than
     //    dropped quietly, because a pack silently missing one end of a chain is
     //    the exact failure this module was written for.
-    let full_bodies: Vec<String> = focals.iter().map(project_full_body).collect();
-    let demands: Vec<usize> = full_bodies
-        .iter()
-        .map(|body| estimate_tokens(body))
-        .collect();
+    let mut full_bodies = Vec::with_capacity(focals.len());
+    let mut demands = Vec::with_capacity(focals.len());
+    let mut exact_demands = Vec::with_capacity(focals.len());
+    for entity in &focals {
+        if let Some(source) = provider.as_deref_mut() {
+            // Probe one candidate at a time. Its allocation is released before
+            // the next probe; only costs survive into water filling.
+            let probe_limits = ProjectionLimits {
+                max_retained_bytes: limits.max_candidate_bytes,
+                ..limits
+            };
+            match source.full_body(entity, probe_limits)? {
+                BodyCandidate::Exact { body } => {
+                    if body.len() > limits.max_candidate_bytes {
+                        return Err(ContextError::Other(
+                            "source provider exceeded its probe byte allowance".into(),
+                        ));
+                    }
+                    demands.push(estimate_tokens(&body));
+                    exact_demands.push(true);
+                }
+                BodyCandidate::Unavailable { reason } => {
+                    projections.downgrades.insert(entity.id, reason);
+                    demands.push(estimate_tokens(&project_signature_only(entity)));
+                    exact_demands.push(false);
+                }
+                BodyCandidate::OverLimit { body_bytes } => {
+                    projections.budget_withheld.insert(entity.id);
+                    projections.downgrades.insert(entity.id, format!("whole graph-owned span of {body_bytes} bytes exceeds its inline byte allowance"));
+                    demands.push(estimate_tokens(&project_signature_only(entity)));
+                    exact_demands.push(false);
+                }
+            }
+            full_bodies.push(None);
+        } else {
+            let body = project_full_body(entity);
+            demands.push(estimate_tokens(&body));
+            full_bodies.push(Some(body));
+            exact_demands.push(false);
+        }
+    }
     let allowances = water_fill(&demands, budget_max);
 
     let mut focal_entries: Vec<ContextEntry> = Vec::new();
@@ -724,11 +804,32 @@ where
         let signature = project_signature_only(entity);
         let name_and_kind = project_name_and_kind(entity);
         ladders.insert(entity.id, (signature.clone(), name_and_kind.clone()));
-        let ladder = [
-            (ProjectionLevel::FullBody, full_bodies[index].clone()),
-            (ProjectionLevel::SignatureOnly, signature),
-            (ProjectionLevel::NameAndKind, name_and_kind),
-        ];
+        let body = if let Some(source) = provider.as_deref_mut() {
+            if exact_demands[index] && demands[index] <= room {
+                let remaining = ProjectionLimits {
+                    max_retained_bytes: limits.max_retained_bytes.saturating_sub(retained_bytes),
+                    ..limits
+                };
+                source_projection(source, entity, remaining, room, &mut projections)?
+            } else {
+                if exact_demands[index] {
+                    projections.budget_withheld.insert(entity.id);
+                    projections.downgrades.insert(
+                        entity.id,
+                        "whole source body exceeds its token allowance".into(),
+                    );
+                }
+                None
+            }
+        } else {
+            full_bodies[index].take()
+        };
+        let mut ladder = Vec::with_capacity(3);
+        if let Some(body) = body {
+            ladder.push((ProjectionLevel::FullBody, body));
+        }
+        ladder.push((ProjectionLevel::SignatureOnly, signature));
+        ladder.push((ProjectionLevel::NameAndKind, name_and_kind));
         let chosen = ladder
             .into_iter()
             .find(|(_, content)| estimate_tokens(content) <= room);
@@ -741,13 +842,24 @@ where
         let (projection, focal_tokens) = match chosen {
             Some((level, content)) => {
                 let cost = estimate_tokens(&content);
+                if source_aware && level == ProjectionLevel::FullBody {
+                    retained_bytes += content.len();
+                }
                 spent += cost;
                 focal_entries.push(ContextEntry {
                     entity_id: entity.id,
                     projection_level: level,
                     content,
                 });
-                (projection_name(level).to_string(), cost)
+                (
+                    if source_aware && level == ProjectionLevel::FullBody {
+                        SERVED_BODY_PROJECTION_NAME
+                    } else {
+                        projection_name(level)
+                    }
+                    .to_string(),
+                    cost,
+                )
             }
             None => {
                 focals_elided += 1;
@@ -1033,9 +1145,10 @@ where
         &mut order,
         &ladders,
         budget_max,
+        (&mut projections, measure),
     )?;
 
-    Ok((assembled, report))
+    Ok((assembled, report, projections))
 }
 
 fn candidate_from(entry: &ContextEntry, group_name: &'static str) -> Candidate {
@@ -1062,12 +1175,49 @@ fn fit_to_budget(
     order: &mut Vec<Admitted>,
     ladders: &HashMap<EntityId, (String, String)>,
     budget_max: usize,
+    fitting: (&mut ProjectionReport, Option<&mut MultiMeasure<'_>>),
 ) -> Result<()> {
+    let (projections, mut measure) = fitting;
     loop {
-        let measured = settle_measurement(pack, report);
+        for entry in &pack.focal_entities {
+            if entry.projection_level != ProjectionLevel::FullBody
+                && projections.full_bodies.remove(&entry.entity_id)
+            {
+                projections.downgrades.insert(
+                    entry.entity_id,
+                    "projection reduced to fit the complete rendered response".into(),
+                );
+                projections.budget_withheld.insert(entry.entity_id);
+            }
+        }
+        let mut measured = settle_measurement(pack, report);
+        if let Some(callback) = measure.as_deref_mut() {
+            let mut settled = None;
+            for _ in 0..MEASURED_TOKEN_PASSES {
+                let current = callback(pack, report, projections)?;
+                if report.measured_tokens == current && pack.actual_tokens == current {
+                    settled = Some(current);
+                    break;
+                }
+                report.measured_tokens = current;
+                pack.actual_tokens = current;
+                report.method = method_line(report);
+            }
+            measured = settled.ok_or_else(|| {
+                ContextError::Other("context response accounting did not converge".into())
+            })?;
+        }
         if measured <= budget_max {
             pack.actual_tokens = measured;
             return Ok(());
+        }
+        if measure.is_some()
+            && order
+                .last()
+                .is_some_and(|entry| matches!(entry.origin, Origin::Route(_)))
+            && shrink_one_focal(pack, report, ladders)
+        {
+            continue;
         }
         let Some(dropped) = order.pop() else {
             // Nothing left to drop. The sentence describing the pack is now
