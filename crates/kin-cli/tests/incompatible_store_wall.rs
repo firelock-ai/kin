@@ -96,8 +96,8 @@ fn a_pre_v2_store_refuses_a_command_by_leading_with_the_version_gap() {
         "a refusal that spawns nothing has no cleanup to report: {stderr}"
     );
     assert!(
-        stderr.contains("remove .kin/ and run `kin init`"),
-        "the refusal must name the remedy that works in place: {stderr}"
+        stderr.contains("keep .kin/ intact") && stderr.contains("the Kin version that wrote it"),
+        "the refusal must preserve native state and name the matching binary: {stderr}"
     );
     assert!(
         !stderr.contains("fresh checkout"),
@@ -111,8 +111,7 @@ fn a_pre_v2_store_refuses_a_command_by_leading_with_the_version_gap() {
 
 #[test]
 fn init_over_an_existing_store_names_the_same_remedy_the_wall_does() {
-    // A reader the wall sent to `kin init` runs it in place first. The refusal
-    // they get has to continue that instruction rather than contradict it.
+    // Both entry points must preserve the existing native state.
     let root = tempdir().expect("temp root");
     let repo = root.path().join("pre-v2-init");
     fs::create_dir_all(&repo).expect("create repository directory");
@@ -123,6 +122,7 @@ fn init_over_an_existing_store_names_the_same_remedy_the_wall_does() {
         .kin_command()
         .arg("init")
         .arg(&repo)
+        .current_dir(&repo)
         .output()
         .expect("run kin init over an existing store");
 
@@ -139,43 +139,66 @@ fn init_over_an_existing_store_names_the_same_remedy_the_wall_does() {
         "the refusal must state its condition: {stderr}"
     );
     assert!(
-        stderr.contains("remove .kin/ and run `kin init`"),
+        stderr.contains("keep .kin/ intact") && stderr.contains("the Kin version that wrote it"),
         "the refusal must name the same remedy the store wall does: {stderr}"
     );
 }
 
 #[test]
-fn the_remedy_the_wall_names_rebuilds_the_store_in_place() {
-    // A remedy nothing checks is a guess. This runs the exact instruction the
-    // wall gives, in the directory the reader is standing in, and requires it
-    // to produce a store the current build wrote.
+fn incompatible_native_state_is_preserved_even_with_git_history_and_force() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("worked-in");
     seed_git_repo(&repo);
     seed_pre_v2_store(&repo);
+    let manifest = fs::read(repo.join(".kin/manifest.json")).unwrap();
+    fs::write(
+        repo.join(".kin/native-state"),
+        b"native state absent from Git",
+    )
+    .unwrap();
 
     let runtime = IsolatedDaemonRuntime::new(&repo);
-    fs::remove_dir_all(repo.join(".kin")).expect("remove the store the wall said to remove");
     let output = runtime
         .kin_command()
         .arg("init")
         .arg(&repo)
+        .current_dir(&repo)
         .output()
-        .expect("run the rebuild the wall names");
+        .expect("run init against mixed Git and incompatible native state");
 
     assert!(
-        output.status.success(),
-        "the named remedy must rebuild the store: stdout={} stderr={}",
+        !output.status.success(),
+        "force must not replace incompatible native state: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(fs::read(repo.join(".kin/manifest.json")).unwrap(), manifest);
     assert_eq!(
-        fs::read_to_string(repo.join(".kin/version"))
-            .expect("the rebuilt store carries a layout marker")
-            .trim(),
-        kin_core::layout::KIN_LAYOUT_VERSION.to_string(),
-        "the rebuilt store must be one this build serves"
+        fs::read(repo.join(".kin/native-state")).unwrap(),
+        b"native state absent from Git"
     );
+    assert!(!repo.join(".kin/version").exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Git history cannot recover native Kin"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("remove .kin/"), "{stderr}");
+    let forced = runtime
+        .kin_command()
+        .args(["init", "--force"])
+        .arg(&repo)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(!forced.status.success());
+    assert!(String::from_utf8_lossy(&forced.stderr).contains("unexpected argument '--force'"));
+    assert_eq!(fs::read(repo.join(".kin/manifest.json")).unwrap(), manifest);
+    assert_eq!(
+        fs::read(repo.join(".kin/native-state")).unwrap(),
+        b"native state absent from Git"
+    );
+    assert!(!repo.join(".kin/version").exists());
 }
 
 #[test]

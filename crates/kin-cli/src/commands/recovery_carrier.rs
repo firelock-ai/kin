@@ -88,6 +88,19 @@ fn open_regular(path: &Path) -> Result<File> {
     )
 }
 
+fn open_sync_directory(path: &Path) -> Result<File> {
+    let directory = open_directory(path)?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY);
+    }
+    // Directory traversal capabilities may use O_PATH, which cannot be synced.
+    Ok(directory.open_with(".", &options)?.into_std())
+}
+
 fn open_regular_at(parent: &Dir, name: &Path) -> Result<File> {
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
@@ -300,7 +313,7 @@ pub(super) fn publish(source: &Path, target: &Path, mut manifest: Manifest) -> R
     if parent.starts_with(source.canonicalize()?) {
         bail!("backup must be outside the source .kin directory");
     }
-    let parent_handle = open_directory(&parent)?.into_std_file();
+    let parent_handle = open_sync_directory(&parent)?;
     let staging = tempfile::Builder::new()
         .prefix(".kin-backup-incomplete-")
         .tempdir_in(&parent)?;
@@ -496,7 +509,7 @@ pub(super) fn restore(
     if same_source {
         bail!("restore requires a different working-directory path from the original repository; preserve the carrier and choose a fresh location");
     }
-    let parent_handle = open_directory(&parent)?.into_std_file();
+    let parent_handle = open_sync_directory(&parent)?;
     let staging = tempfile::Builder::new()
         .prefix(".kin-restore-incomplete-")
         .tempdir_in(&parent)?;
@@ -535,6 +548,21 @@ mod tests {
 
     fn scratch() -> tempfile::TempDir {
         tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn publication_parent_handle_can_sync_and_retains_directory_identity() {
+        let temp = scratch();
+        let parent = temp.path().join("parent");
+        let moved = temp.path().join("moved");
+        fs::create_dir(&parent).unwrap();
+        let handle = open_sync_directory(&parent).unwrap();
+        handle.sync_all().unwrap();
+        fs::rename(&parent, &moved).unwrap();
+        fs::create_dir(&parent).unwrap();
+        handle.sync_all().unwrap();
+        ensure_directory_identity(&handle, &moved).unwrap();
+        assert!(ensure_directory_identity(&handle, &parent).is_err());
     }
 
     fn retain_installed_authority_marker(source: &Path) -> std::path::PathBuf {

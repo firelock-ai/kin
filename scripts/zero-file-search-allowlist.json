@@ -12,6 +12,7 @@
       "allow_fn": [
         "ensure_directory_identity",
         "open_directory",
+        "open_sync_directory",
         "open_regular",
         "open_regular_at",
         "digest_open_file",
