@@ -2121,6 +2121,17 @@ pub(crate) fn retire_enrichment_marker(state: &DaemonState, files: &[String]) {
     }
 }
 
+fn buffer_lsp_startup(
+    buffer: &mut std::collections::VecDeque<crate::state::LspEnrichmentMessage>,
+    current: crate::state::LspEnrichmentRequest,
+    receiver: &mut tokio::sync::mpsc::Receiver<crate::state::LspEnrichmentMessage>,
+) {
+    buffer.push_front(crate::state::LspEnrichmentMessage::Incremental(current));
+    while let Ok(queued) = receiver.try_recv() {
+        buffer.push_back(queued);
+    }
+}
+
 /// Publish that the cold sweep this worker was running has ended.
 ///
 /// Extracted from the worker's own tail so the daemon has one named place where
@@ -3600,6 +3611,7 @@ struct SweepTally {
     /// carries it. These files are still visited and still get the per-entity
     /// arm, so they are not blocked; what they lost is the definitions pass.
     definitions_over_budget: usize,
+    query_failures: usize,
     /// Whether the loop stopped before walking every file, on shutdown or on
     /// the background-work supervisor's verdict.
     ///
@@ -3684,6 +3696,42 @@ impl SweepTally {
     }
 }
 
+fn mark_completed_sweep_files(
+    state: &DaemonState,
+    files: &[String],
+    epoch: u64,
+    tally: &SweepTally,
+    relations: EnrichmentWrite,
+    published: bool,
+) -> bool {
+    // A published subset cannot certify query arms that failed or timed out.
+    if tally.query_failures > 0
+        || tally.definitions_over_budget > 0
+        || !sweep_marker_is_durable(relations, published)
+    {
+        return false;
+    }
+    mark_files_enriched(state, files, epoch);
+    true
+}
+
+fn sweep_work_succeeded(
+    tally: &SweepTally,
+    total_files: usize,
+    relations: EnrichmentWrite,
+    published: bool,
+) -> bool {
+    !tally.ended_early
+        && tally.blocked() == 0
+        && tally.unaccounted(total_files) == 0
+        && tally.not_visited(total_files) == 0
+        && tally.definitions_over_budget == 0
+        && tally.query_failures == 0
+        && relations.lost() == 0
+        && relations.vector_stale == 0
+        && (relations.published == 0 || published)
+}
+
 /// How long the file-level definitions pass may take for one file.
 ///
 /// The pass had no bound of any kind. It is called at its sweep site as
@@ -3724,8 +3772,10 @@ where
 {
     match tokio::time::timeout(budget, pass).await {
         Ok(Ok(result)) => result,
-        // A pass that failed keeps the behaviour the call site always had.
-        Ok(Err(_)) => kin_lsp::file_enrichment::FileEnrichmentResult::default(),
+        Ok(Err(_)) => {
+            tally.query_failures += 1;
+            kin_lsp::file_enrichment::FileEnrichmentResult::default()
+        }
         Err(_) => {
             tally.definitions_over_budget += 1;
             warn!(
@@ -4031,6 +4081,23 @@ pub(crate) fn install_lsp_relations(
     written
 }
 
+async fn lsp_query_within_budget<F, T, E>(
+    pass: F,
+    budget: Duration,
+    failures: &mut usize,
+) -> Option<T>
+where
+    F: std::future::Future<Output = std::result::Result<T, E>>,
+{
+    match tokio::time::timeout(budget, pass).await {
+        Ok(Ok(answer)) => Some(answer),
+        _ => {
+            *failures += 1;
+            None
+        }
+    }
+}
+
 /// Enrich a single entity with all available LSP relation types (calls, overrides,
 /// uses-type, references). Each query is capped at 5 seconds.
 ///
@@ -4044,59 +4111,50 @@ async fn enrich_single_entity(
     index: &kin_lsp::EntityIndex,
     root: &std::path::Path,
     documents: Option<kin_lsp::DocumentProvider<'_>>,
-) -> Vec<kin_model::Relation> {
-    let timeout = std::time::Duration::from_secs(5);
-    let mut derived: Vec<kin_model::Relation> = Vec::new();
-
-    // Calls
-    match tokio::time::timeout(
-        timeout,
+) -> (Vec<kin_model::Relation>, usize) {
+    let timeout = Duration::from_secs(5);
+    let mut derived = Vec::new();
+    let mut failures = 0;
+    if let Some(relations) = lsp_query_within_budget(
         kin_lsp::enrichment::enrich_entity_calls(server, entity_ref, index, root),
+        timeout,
+        &mut failures,
     )
     .await
     {
-        Ok(Ok(relations)) => {
-            derived.extend(relations);
-        }
-        Ok(Err(e)) => {
-            debug!(entity = %entity_ref.name, error = %e, "LSP calls enrichment failed");
-        }
-        Err(_) => {
-            debug!(entity = %entity_ref.name, "LSP calls enrichment timed out");
-        }
+        derived.extend(relations);
     }
-
-    // Overrides
-    if let Ok(Ok(relations)) = tokio::time::timeout(
-        timeout,
+    if let Some(relations) = lsp_query_within_budget(
         kin_lsp::enrichment::enrich_entity_overrides(server, entity_ref, index, root),
+        timeout,
+        &mut failures,
     )
     .await
     {
         derived.extend(relations);
     }
-
-    // UsesType
-    if let Ok(Ok(relations)) = tokio::time::timeout(
-        timeout,
+    if let Some(relations) = lsp_query_within_budget(
         kin_lsp::enrichment::enrich_entity_uses_type(server, entity_ref, index, root, documents),
-    )
-    .await
-    {
-        derived.extend(relations);
-    }
-
-    // References
-    if let Ok(Ok(relations)) = tokio::time::timeout(
         timeout,
-        kin_lsp::enrichment::enrich_entity_references(server, entity_ref, index, root),
+        &mut failures,
     )
     .await
     {
         derived.extend(relations);
     }
-
-    derived
+    if let Some(relations) = lsp_query_within_budget(
+        kin_lsp::enrichment::enrich_entity_references(server, entity_ref, index, root),
+        timeout,
+        &mut failures,
+    )
+    .await
+    {
+        derived.extend(relations);
+    }
+    if failures > 0 {
+        debug!(entity = %entity_ref.name, failures, "LSP query arms failed or exceeded their budget");
+    }
+    (derived, failures)
 }
 
 /// Run the kin daemon. This is the main entry point.
@@ -4263,7 +4321,7 @@ pub async fn run_with_authority_on(
     // killed sweep leaves and a second daemon would read it as its own. Queueing
     // does not: the sweep is handed to the gate below, which starts it once the
     // embedding backfill is out of the way.
-    let mut sweep_admitted = false;
+    let mut startup_sweep_work = None;
     let hold_sweep = hold_sweep_from(std::env::var(HOLD_SWEEP_ENV).ok().as_deref());
     if hold_sweep {
         // The thin-answer state, on purpose. Until the sweep publishes, the
@@ -4299,7 +4357,7 @@ pub async fn run_with_authority_on(
                 // reads. Nothing further is needed here beyond not queueing.
             }
             SweepStartDecision::Queue => {
-                sweep_admitted = true;
+                startup_sweep_work = Some(state.lsp_work.reserve());
                 clear_pressure_refusal_for_work(
                     &state,
                     kin_core::memory_pressure::HeavyWork::LspSweep,
@@ -4810,7 +4868,7 @@ pub async fn run_with_authority_on(
     // So the one that checkpoints goes first. A store with nothing left to embed
     // is released on the gate's first look and behaves exactly as it did before
     // this existed.
-    if sweep_admitted {
+    if let Some(mut startup_work) = startup_sweep_work {
         let gate_state = Arc::clone(&state);
         let pending_state = Arc::clone(&state);
         let mut gate_cancel = cancel_rx.clone();
@@ -4844,7 +4902,13 @@ pub async fn run_with_authority_on(
                 stall_bound_s = SWEEP_BACKFILL_STALL_BOUND.as_secs(),
                 "queueing an LSP sweep so a graph with unenriched files converges"
             );
-            gate_state.queue_lsp_sweep();
+            if gate_state.queue_lsp_sweep()
+                || gate_state
+                    .lsp_sweep_running
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                startup_work.complete();
+            }
         });
     }
 
@@ -4909,7 +4973,7 @@ pub async fn run_with_authority_on(
                 kin_lsp::lifecycle::LspServer,
             > = std::collections::HashMap::new();
             // Buffer for requests that arrive during server startup.
-            let mut pending_buffer: Vec<crate::state::LspEnrichmentRequest> = Vec::new();
+            let mut pending_buffer = std::collections::VecDeque::new();
             // Track which languages have had their first didOpen processed.
             let mut first_open_done: std::collections::HashSet<kin_model::LanguageId> =
                 std::collections::HashSet::new();
@@ -4936,9 +5000,9 @@ pub async fn run_with_authority_on(
                 // would drain forever with the demand still sitting in the bit.
                 drain_pending_lsp_sweep(&lsp_state);
 
-                // Process buffered requests first (always incremental), then wait for new messages.
-                let message = if let Some(buffered) = pending_buffer.pop() {
-                    LspEnrichmentMessage::Incremental(buffered)
+                // Replay every accepted message in arrival order.
+                let message = if let Some(buffered) = pending_buffer.pop_front() {
+                    buffered
                 } else {
                     // Blocked on the channel is genuinely doing nothing, so the
                     // working stretch ends here. A wedged enrichment never
@@ -4966,6 +5030,7 @@ pub async fn run_with_authority_on(
                     }
                 };
                 lsp_pass.working(Instant::now());
+                let mut work = lsp_state.lsp_work.resume();
 
                 match message {
                     LspEnrichmentMessage::Incremental(request) => {
@@ -5008,13 +5073,12 @@ pub async fn run_with_authority_on(
                                         servers.insert(lang, server);
 
                                         // Buffer the current request + drain any that arrived during startup.
-                                        pending_buffer.push(request);
-                                        while let Ok(queued) = lsp_rx.try_recv() {
-                                            if let LspEnrichmentMessage::Incremental(req) = queued {
-                                                pending_buffer.push(req);
-                                            }
-                                            // Sweep messages are not buffered — they'll be re-sent if needed.
-                                        }
+                                        buffer_lsp_startup(
+                                            &mut pending_buffer,
+                                            request,
+                                            &mut lsp_rx,
+                                        );
+                                        work.transfer();
                                         info!(
                                             buffered = pending_buffer.len(),
                                             "replaying requests after server startup"
@@ -5156,14 +5220,16 @@ pub async fn run_with_authority_on(
                             })
                             .collect();
 
+                        let mut failed_queries = 0;
                         let mut pending = PendingEnrichment::default();
                         let mut total_relations = EnrichmentWrite::default();
                         for entity_ref in &file_entities {
                             info!(entity = %entity_ref.name, "querying LSP for entity");
-                            let derived = enrich_single_entity(
+                            let (derived, failures) = enrich_single_entity(
                                 server, entity_ref, &index, &lsp_root, documents,
                             )
                             .await;
+                            failed_queries += failures;
                             total_relations += pending
                                 .absorb(derived, |batch| install_lsp_relations(&lsp_state, batch));
                         }
@@ -5189,6 +5255,12 @@ pub async fn run_with_authority_on(
                                 entities_queried = file_entities.len(),
                                 "LSP enrichment completed — no new relations found"
                             );
+                        }
+                        if failed_queries == 0
+                            && total_relations.lost() == 0
+                            && total_relations.vector_stale == 0
+                        {
+                            work.complete();
                         }
                     } // end Incremental
 
@@ -5527,10 +5599,11 @@ pub async fn run_with_authority_on(
                             // Also run per-entity call hierarchy for Calls relations
                             // (definition approach gives References, call hierarchy gives Calls).
                             for entity_ref in &file_entity_refs {
-                                let derived = enrich_single_entity(
+                                let (derived, failures) = enrich_single_entity(
                                     server, entity_ref, &index, &lsp_root, documents,
                                 )
                                 .await;
+                                tally.query_failures += failures;
                                 file_relations += pending.absorb(derived, |batch| {
                                     install_lsp_relations(&lsp_state, batch)
                                 });
@@ -5707,9 +5780,14 @@ pub async fn run_with_authority_on(
                                  marker no longer describes this sweep"
                             );
                         }
-                        if sweep_marker_is_durable(total_relations, published) {
-                            mark_files_enriched(&lsp_state, &enriched_this_sweep, marker_epoch);
-                        } else {
+                        if !mark_completed_sweep_files(
+                            &lsp_state,
+                            &enriched_this_sweep,
+                            marker_epoch,
+                            &tally,
+                            total_relations,
+                            published,
+                        ) {
                             warn!(
                                 files = enriched_this_sweep.len(),
                                 relations = total_relations.published,
@@ -5755,6 +5833,9 @@ pub async fn run_with_authority_on(
                         }
                         let unaccounted = tally.unaccounted(total_files);
                         let not_visited = tally.not_visited(total_files);
+                        if sweep_work_succeeded(&tally, total_files, total_relations, published) {
+                            work.complete();
+                        }
 
                         // The sweep's own zero-loss verdict, written where a
                         // later process can read it. A pass that published
@@ -6796,6 +6877,209 @@ pub(crate) fn spawn_background_embedding_worker(
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn partial_query_success_does_not_persist_a_skip_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let state = super::DaemonState::open(init.layout.clone()).unwrap();
+        let files = vec!["pkg/sessions.py".to_string()];
+        let published = super::EnrichmentWrite {
+            published: 1,
+            offered: 1,
+            vector_stale: 0,
+        };
+        let epoch = super::current_marker_epoch(&state);
+        let mut tally = super::SweepTally {
+            enriched: 1,
+            query_failures: 1,
+            ..Default::default()
+        };
+        assert!(!super::mark_completed_sweep_files(
+            &state, &files, epoch, &tally, published, true
+        ));
+        assert!(!state.lsp_enriched_files.lock().unwrap().contains(&files[0]));
+        assert!(!super::lsp_enriched_marker_path(&state).exists());
+        tally.query_failures = 0;
+        tally.definitions_over_budget = 1;
+        assert!(!super::mark_completed_sweep_files(
+            &state, &files, epoch, &tally, published, true
+        ));
+        assert!(!super::lsp_enriched_marker_path(&state).exists());
+        tally.definitions_over_budget = 0;
+        assert!(super::mark_completed_sweep_files(
+            &state, &files, epoch, &tally, published, true
+        ));
+        assert!(state.lsp_enriched_files.lock().unwrap().contains(&files[0]));
+        let saved: Vec<String> = serde_json::from_slice(
+            &std::fs::read(super::lsp_enriched_marker_path(&state)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved, files);
+    }
+
+    #[test]
+    fn startup_buffer_keeps_current_request_ahead_of_existing_buffer() {
+        use crate::state::{LspEnrichmentMessage, LspEnrichmentRequest};
+        let (_tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut buffer = std::collections::VecDeque::from([LspEnrichmentMessage::Sweep]);
+        super::buffer_lsp_startup(
+            &mut buffer,
+            LspEnrichmentRequest {
+                file_id: kin_model::FilePathId::new("pkg/other.py"),
+                changed_entity_ids: Vec::new(),
+            },
+            &mut rx,
+        );
+        assert!(matches!(
+            buffer.pop_front(),
+            Some(LspEnrichmentMessage::Incremental(_))
+        ));
+        assert!(matches!(
+            buffer.pop_front(),
+            Some(LspEnrichmentMessage::Sweep)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_and_timed_out_lsp_queries_are_not_successful_empty_answers() {
+        let mut failures = 0;
+        assert_eq!(
+            super::lsp_query_within_budget(
+                async { Ok::<_, ()>(Vec::<u8>::new()) },
+                std::time::Duration::from_millis(5),
+                &mut failures
+            )
+            .await,
+            Some(Vec::new())
+        );
+        assert_eq!(failures, 0);
+        assert_eq!(
+            super::lsp_query_within_budget(
+                async { Err::<Vec<u8>, _>(()) },
+                std::time::Duration::from_millis(5),
+                &mut failures
+            )
+            .await,
+            None
+        );
+        assert_eq!(failures, 1);
+        assert_eq!(
+            super::lsp_query_within_budget(
+                std::future::pending::<Result<Vec<u8>, ()>>(),
+                std::time::Duration::from_millis(1),
+                &mut failures
+            )
+            .await,
+            None
+        );
+        assert_eq!(failures, 2);
+        let mut tally = super::SweepTally::default();
+        super::file_definitions_within_budget(
+            async { Err::<kin_lsp::file_enrichment::FileEnrichmentResult, _>(()) },
+            std::time::Duration::from_millis(5),
+            "pkg/other.py",
+            &mut tally,
+        )
+        .await;
+        assert_eq!(tally.query_failures, 1);
+        super::file_definitions_within_budget(
+            std::future::pending::<Result<kin_lsp::file_enrichment::FileEnrichmentResult, ()>>(),
+            std::time::Duration::from_millis(1),
+            "pkg/other.py",
+            &mut tally,
+        )
+        .await;
+        assert_eq!(tally.definitions_over_budget, 1);
+        let mut completed = super::SweepTally {
+            enriched: 1,
+            ..Default::default()
+        };
+        assert!(super::sweep_work_succeeded(
+            &completed,
+            1,
+            Default::default(),
+            false
+        ));
+        completed.definitions_over_budget = 1;
+        assert!(!super::sweep_work_succeeded(
+            &completed,
+            1,
+            Default::default(),
+            false
+        ));
+        completed.definitions_over_budget = 0;
+        completed.query_failures = 1;
+        assert!(!super::sweep_work_succeeded(
+            &completed,
+            1,
+            Default::default(),
+            false
+        ));
+    }
+
+    #[test]
+    fn startup_buffer_preserves_sweep_and_pending_until_every_handler_finishes() {
+        use crate::state::{LspEnrichmentMessage, LspEnrichmentRequest, LspWorkTracker};
+        use std::sync::{atomic::Ordering, Arc};
+        let tracker = Arc::new(LspWorkTracker::default());
+        let request = || LspEnrichmentRequest {
+            file_id: kin_model::FilePathId::new("pkg/sessions.py"),
+            changed_entity_ids: Vec::new(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let current = tracker.reserve();
+        tracker.reserve().transfer();
+        tx.try_send(LspEnrichmentMessage::Sweep).unwrap();
+        tracker.reserve().transfer();
+        tx.try_send(LspEnrichmentMessage::Incremental(request()))
+            .unwrap();
+        let mut buffer = std::collections::VecDeque::new();
+        super::buffer_lsp_startup(&mut buffer, request(), &mut rx);
+        current.transfer();
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 3);
+        assert!(matches!(
+            buffer.pop_front(),
+            Some(LspEnrichmentMessage::Incremental(_))
+        ));
+        let mut first = tracker.resume();
+        first.complete();
+        drop(first);
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            buffer.pop_front(),
+            Some(LspEnrichmentMessage::Sweep)
+        ));
+        let mut sweep = tracker.resume();
+        sweep.complete();
+        drop(sweep);
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            buffer.pop_front(),
+            Some(LspEnrichmentMessage::Incremental(_))
+        ));
+        let mut last = tracker.resume();
+        last.complete();
+        drop(last);
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 0);
+        assert_eq!(tracker.failed.load(Ordering::SeqCst), 0);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn startup_demand_and_failed_handler_cannot_read_as_successful_idle() {
+        use crate::state::LspWorkTracker;
+        use std::sync::{atomic::Ordering, Arc};
+        let tracker = Arc::new(LspWorkTracker::default());
+        let mut startup = tracker.reserve();
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 1);
+        tracker.reserve().transfer();
+        startup.complete();
+        drop(startup);
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 1);
+        drop(tracker.resume());
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 0);
+        assert_eq!(tracker.failed.load(Ordering::SeqCst), 1);
+    }
 
     use super::{
         await_watch_armed, coverage_drain_verdict, drain_pending_flush, embed_work_outstanding,
@@ -10275,6 +10559,7 @@ mod sweep_tally_tests {
             server_unavailable: 6,
             source_unreadable: 7,
             definitions_over_budget: 0,
+            query_failures: 0,
             ended_early: false,
         };
         assert_eq!(tally.files_processed(), 7);

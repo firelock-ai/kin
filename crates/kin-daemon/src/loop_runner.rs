@@ -3883,10 +3883,8 @@ pub async fn run_loop_armed(
             }
         }
 
-        // Drop write locks before rebuilding projection (it takes its own locks).
-        drop(reconciler);
-        drop(coordination);
-
+        // Register enrichment before a waiting commit can observe this pass complete.
+        // The sends are non-blocking and the worker takes its own graph locks.
         // Queue only changed entities for LSP enrichment.
         for (file_id, entity_ids) in lsp_changed {
             state.queue_lsp_enrichment(LspEnrichmentRequest {
@@ -3894,6 +3892,9 @@ pub async fn run_loop_armed(
                 changed_entity_ids: entity_ids,
             });
         }
+
+        drop(reconciler);
+        drop(coordination);
 
         // Persistence is handled by the background save task, so the reconcile
         // loop just marks the graph dirty.
