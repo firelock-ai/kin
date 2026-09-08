@@ -971,6 +971,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check Hydration Replay Semantics
+        run: python3 scripts/verify-hydration-semantics.py
+
+      - name: Falsify Hydration Replay Semantics guard
+        run: |
+          set -euo pipefail
+          poisoned="$(mktemp -d)"
+          trap 'rm -rf "$poisoned"' EXIT
+          cp -a crates scripts "$poisoned/"
+          python3 scripts/falsify-hydration-semantics.py "$poisoned"
+
+      - name: Verify hydration guard PR coverage
+        run: python3 scripts/test-hydration-pr-policy.py
+
       - name: Verify registry dependency-wave admission
         env:
           GH_TOKEN: ${{ github.token }}
