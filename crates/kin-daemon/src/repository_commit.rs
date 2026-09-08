@@ -1575,7 +1575,7 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
             file_path: Some(file_id.clone()),
             ..Default::default()
         })?;
-        if !matches!(indexed.parse_state, kin_model::ParseState::Valid) {
+        if let kin_model::ParseState::Incomplete { error_ranges } = &indexed.parse_state {
             let mut stale = false;
             for entity in &held {
                 let candidates: Vec<_> = indexed
@@ -1642,12 +1642,14 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
                                         expected.id = entity.id;
                                         expected.created_in = entity.created_in;
                                         expected.lineage_parent = entity.lineage_parent;
-                                        if let Some(proof) = proof {
-                                            expected.metadata.extra.insert(
-                                                "partial_parse_admission".into(),
-                                                proof.clone(),
-                                            );
-                                        }
+                                        expected.metadata.extra.insert(
+                                            "partial_parse_admission".into(),
+                                            serde_json::json!({
+                                                "previous_blob_hash": kin_blobs::digest(previous.body()).to_string(),
+                                                "source_blob_hash": hash.to_string(),
+                                                "error_ranges": error_ranges,
+                                            }),
+                                        );
                                         expected == *entity
                                     },
                             )
@@ -4792,11 +4794,25 @@ mod tests {
         .unwrap();
         kin_core::retained_parse::record(&init.layout, &[observation]);
         let good = graph.get_entity(&target.id).unwrap().unwrap();
-        for corruption in ["proof", "span", "digest", "signature", "body"] {
+        for corruption in [
+            "proof",
+            "error_ranges",
+            "span",
+            "digest",
+            "signature",
+            "body",
+        ] {
             let mut corrupt = good.clone();
             match corruption {
                 "proof" => {
                     corrupt.metadata.extra.remove("partial_parse_admission");
+                }
+                "error_ranges" => {
+                    corrupt
+                        .metadata
+                        .extra
+                        .get_mut("partial_parse_admission")
+                        .unwrap()["error_ranges"] = serde_json::json!([]);
                 }
                 "span" => {
                     corrupt.span.as_mut().unwrap().start_byte += 1;

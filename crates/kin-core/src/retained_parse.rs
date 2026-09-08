@@ -162,8 +162,8 @@ impl RetainedParseRead {
                     "Did not parse as written: {named}{and_more}. Some entities may be retained \
                      from earlier parses while independently verified entities are current. \
                      File coverage remains incomplete, and declarations that were never admitted \
-                     remain absent. Fix the syntax and the next admission re-derives the complete \
-                     file. Observed {age} ago."
+                     remain absent. Once a complete parse is available, admission re-derives \
+                     the complete file. Observed {age} ago."
                 ))
             }
             Self::Absent => None,
