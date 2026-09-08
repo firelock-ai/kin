@@ -299,6 +299,15 @@ async fn startup_diagnostic_full_loop_must_not_certify_the_missing_function() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         startup_diagnostic_trace("full_loop_startup_layout_published", &state);
+        while !state
+            .graph
+            .query_entities(&EntityFilter::default())
+            .unwrap()
+            .iter()
+            .any(|entity| entity.name == "orphan")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         // A distinct later event proves this real loop processes work after
         // all startup planners have run; it does not modify the stranded file.
         let mut attempt = 0;
@@ -340,13 +349,12 @@ async fn startup_diagnostic_full_loop_must_not_certify_the_missing_function() {
     );
     joined.unwrap().unwrap().unwrap();
     assert_eq!(arming, crate::daemon::WatchArming::Armed);
-    completed.expect("the full loop must publish the layout and process the later sentinel event");
-    startup_diagnostic_trace("full_loop_after_later_sentinel_event", &state);
+    startup_diagnostic_trace("full_loop_after_shutdown", &state);
     let answer = answer.expect("HTTP query must complete while the real loop is running");
     println!(
         "STARTUP_DIAGNOSTIC {}",
         serde_json::json!({
-            "stage": "http_query_after_full_startup_and_sentinel",
+            "stage": "full_loop_http_result",
             "response": answer,
         })
     );
@@ -354,6 +362,16 @@ async fn startup_diagnostic_full_loop_must_not_certify_the_missing_function() {
         !answer["entities"].as_array().unwrap().is_empty()
             || answer["file_coverage"]["certifies_enumeration"] != serde_json::json!(true),
         "the full startup loop must not certify an empty enumeration for a known admitted function"
+    );
+    completed.expect("the full loop must recover orphan and process the later sentinel event");
+    assert!(answer["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entity| entity["name"] == "orphan"));
+    assert_eq!(
+        answer["file_coverage"]["certifies_enumeration"],
+        serde_json::json!(true)
     );
 }
 

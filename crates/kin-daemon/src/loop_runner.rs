@@ -3002,8 +3002,8 @@ pub async fn run_loop_armed(
                     if !report.rederive.is_empty() {
                         warn!(
                             count = report.rederive.len(),
-                            "these paths hold entities a fresh parse of the tree's bytes does not \
-                             reproduce, so their spans describe an earlier state of the file; \
+                            "these paths hold entity spans that disagree with a fresh parse of \
+                             the tree's bytes; \
                              their parse observation was published as partial and they are being \
                              re-derived"
                         );
