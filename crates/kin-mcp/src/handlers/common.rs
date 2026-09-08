@@ -2719,49 +2719,21 @@ pub fn attach_context_projection(
 
 /// Limits additional inline body allocations across one context request.
 /// The authority cache owns artifact bytes separately; this bounds copied spans.
+///
+/// It carries no served/withheld counters and publishes nothing itself. What it
+/// refuses is disclosed on the row, by `attach_context_body` writing
+/// `body_elided`, `body_bytes` and `body_budget_remaining_bytes`, and the
+/// aggregate is derived from those rows by `disclose_projection_bodies`. One
+/// producer for one fact: a counter kept in parallel with the rows is a second
+/// account of the same cut that can disagree with the first.
 pub struct ContextBodyBudget {
-    max_bytes: usize,
     remaining_bytes: usize,
-    served: usize,
-    withheld: usize,
 }
 
 impl ContextBodyBudget {
     pub fn new(max_bytes: usize) -> Self {
         Self {
-            max_bytes: max_bytes.min(crate::budget::RESPONSE_MAX_MAX_CHARS),
             remaining_bytes: max_bytes.min(crate::budget::RESPONSE_MAX_MAX_CHARS),
-            served: 0,
-            withheld: 0,
-        }
-    }
-
-    pub fn disclose(&self, payload: &mut serde_json::Value) {
-        if self.withheld == 0 {
-            return;
-        }
-        crate::budget::record_elision_for(
-            payload,
-            "body",
-            self.served,
-            self.withheld,
-            crate::budget::BODY_HYDRATION_REASON,
-        );
-        let entry = serde_json::json!({
-            "component": "context_body_budget",
-            "reason": crate::budget::BODY_HYDRATION_REASON,
-            "detail": format!("{} whole source bodies withheld before copying because they did not fit the remaining shared {} byte inline allowance", self.withheld, self.max_bytes),
-            "remediation": "read an omitted body with get_entity_source or narrow the context request",
-            "max_body_bytes": self.max_bytes,
-            "copied_body_bytes": self.max_bytes - self.remaining_bytes,
-        });
-        if let Some(entries) = payload
-            .get_mut("degradations")
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            entries.push(entry);
-        } else {
-            payload["degradations"] = serde_json::json!([entry]);
         }
     }
 }
@@ -2793,7 +2765,6 @@ pub fn attach_context_body<G: GraphStore>(
     }
     let body_bytes = &bytes[span.start_byte..span.end_byte];
     if body_bytes.len() > budget.remaining_bytes {
-        budget.withheld += 1;
         downgrade_context_body(row, "whole graph-owned span exceeds the remaining inline body byte budget; use get_entity_source");
         row["body_elided"] = serde_json::json!(["body"]);
         row["body_bytes"] = serde_json::json!(body_bytes.len());
@@ -2807,7 +2778,6 @@ pub fn attach_context_body<G: GraphStore>(
         ))
     })?;
     budget.remaining_bytes -= body.len();
-    budget.served += 1;
     row["body"] = serde_json::Value::String(body.to_owned());
     row["body_complete"] = serde_json::json!(true);
     row["projection"] = serde_json::json!("FullBody");

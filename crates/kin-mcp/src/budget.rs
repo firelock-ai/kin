@@ -1710,24 +1710,28 @@ pub const BOUNDED_REASON: &str = "response_bounded";
 /// The reason code a response that stayed over its ceiling carries.
 pub const OVER_BUDGET_REASON: &str = "response_over_budget";
 
+/// The reason code an elision carries when a whole graph-owned body was
+/// withheld before it was copied, rather than cut after.
+///
+/// The elision is written by `disclose_projection_bodies`, which derives it from
+/// the rows themselves. Nothing writes a `degradations` entry under this reason,
+/// so `prior_bound` below does not look for one.
+pub const BODY_HYDRATION_REASON: &str = "whole_body_withheld";
+
 /// What an earlier arm recorded cutting this payload from, if one did.
 ///
 /// A cut discloses itself in the `degradations` channel, and the first such
 /// entry is the earliest arm's, because disclosures are appended. Reading it is
 /// what lets the second arm report the size the answer was built at instead of
 /// the size it inherited.
-pub const BODY_HYDRATION_REASON: &str = "whole_body_withheld";
-
 fn prior_bound(payload: &Value) -> Option<usize> {
     payload
         .get("degradations")?
         .as_array()?
         .iter()
         .find(|entry| {
-            (entry.get("component").and_then(Value::as_str) == Some("response_budget")
-                && entry.get("reason").and_then(Value::as_str) == Some(BOUNDED_REASON))
-                || (entry.get("component").and_then(Value::as_str) == Some("context_body_budget")
-                    && entry.get("reason").and_then(Value::as_str) == Some(BODY_HYDRATION_REASON))
+            entry.get("component").and_then(Value::as_str) == Some("response_budget")
+                && entry.get("reason").and_then(Value::as_str) == Some(BOUNDED_REASON)
         })
         .map(|entry| {
             entry

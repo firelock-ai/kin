@@ -1739,7 +1739,13 @@ fn disclose_projection_bodies(result: &mut serde_json::Value) {
     }
     visit(result, &mut served, &mut withheld);
     if withheld > 0 {
-        crate::budget::record_elision_for(result, "body", served, withheld, "whole_body_withheld");
+        crate::budget::record_elision_for(
+            result,
+            "body",
+            served,
+            withheld,
+            crate::budget::BODY_HYDRATION_REASON,
+        );
         let before = crate::budget::measure(result);
         crate::budget::mark_context_cut(result, before);
     }
