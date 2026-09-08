@@ -2607,6 +2607,137 @@ pub fn read_entity_source_excerpt_detailed_held<G: GraphStore>(
     Ok(Some(source))
 }
 
+/// Read the exact graph span, refusing an oversized body before copying it.
+pub fn read_entity_source_exact<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    max_bytes: usize,
+) -> Result<Option<ExactEntitySource>> {
+    let Some((mut source, bytes, span)) =
+        resolve_entity_source_authority(held, entity, EntitySourceScope::WorkspaceHead)?
+    else {
+        return Ok(None);
+    };
+    let body = &bytes[span.start_byte..span.end_byte];
+    if body.len() > max_bytes {
+        return Err(McpError::Context(format!("entity {} whole source span is {} bytes, above the {} byte inline limit; use kin_artifact_read", entity.id, body.len(), max_bytes)));
+    }
+    source.body = std::str::from_utf8(body)
+        .map_err(|error| {
+            graph_source_gap(format!(
+                "entity {} has a source span that is not valid UTF-8: {error}",
+                entity.id
+            ))
+        })?
+        .to_owned();
+    Ok(Some(source))
+}
+
+/// Limits additional inline body allocations across one context request.
+/// The authority cache owns artifact bytes separately; this bounds copied spans.
+pub struct ContextBodyBudget {
+    max_bytes: usize,
+    remaining_bytes: usize,
+    served: usize,
+    withheld: usize,
+}
+
+impl ContextBodyBudget {
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes: max_bytes.min(crate::budget::RESPONSE_MAX_MAX_CHARS),
+            remaining_bytes: max_bytes.min(crate::budget::RESPONSE_MAX_MAX_CHARS),
+            served: 0,
+            withheld: 0,
+        }
+    }
+
+    pub fn disclose(&self, payload: &mut serde_json::Value) {
+        if self.withheld == 0 {
+            return;
+        }
+        crate::budget::record_elision_for(
+            payload,
+            "body",
+            self.served,
+            self.withheld,
+            crate::budget::BODY_HYDRATION_REASON,
+        );
+        let entry = serde_json::json!({
+            "component": "context_body_budget",
+            "reason": crate::budget::BODY_HYDRATION_REASON,
+            "detail": format!("{} whole source bodies withheld before copying because they did not fit the remaining shared {} byte inline allowance", self.withheld, self.max_bytes),
+            "remediation": "read an omitted body with get_entity_source or narrow the context request",
+            "max_body_bytes": self.max_bytes,
+            "copied_body_bytes": self.max_bytes - self.remaining_bytes,
+        });
+        if let Some(entries) = payload
+            .get_mut("degradations")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            entries.push(entry);
+        } else {
+            payload["degradations"] = serde_json::json!([entry]);
+        }
+    }
+}
+
+/// Attach an exact graph-owned span or explicitly downgrade the projection.
+/// No excerpt expansion, line normalization, or partial body is permitted here.
+pub fn attach_context_body<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    row: &mut serde_json::Value,
+    budget: &mut ContextBodyBudget,
+) -> Result<()> {
+    let resolved =
+        match resolve_entity_source_authority(held, entity, EntitySourceScope::WorkspaceHead) {
+            Ok(source) => source,
+            Err(error) if is_absent_at_generation(&error) => {
+                downgrade_context_body(row, &error.to_string());
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+    row["source"] = serde_json::json!(LAST_READ_SOURCE.with(|value| value.get()));
+    let Some((source, bytes, span)) = resolved else {
+        downgrade_context_body(row, &entity_body_gap_reason(entity));
+        return Ok(());
+    };
+    if let Some(map) = row.as_object_mut() {
+        map.extend(source_provenance_fields(&source));
+    }
+    let body_bytes = &bytes[span.start_byte..span.end_byte];
+    if body_bytes.len() > budget.remaining_bytes {
+        budget.withheld += 1;
+        downgrade_context_body(row, "whole graph-owned span exceeds the remaining inline body byte budget; use get_entity_source");
+        row["body_elided"] = serde_json::json!(["body"]);
+        row["body_bytes"] = serde_json::json!(body_bytes.len());
+        row["body_budget_remaining_bytes"] = serde_json::json!(budget.remaining_bytes);
+        return Ok(());
+    }
+    let body = std::str::from_utf8(body_bytes).map_err(|error| {
+        graph_source_gap(format!(
+            "entity {} has a source span that is not valid UTF-8: {error}",
+            entity.id
+        ))
+    })?;
+    budget.remaining_bytes -= body.len();
+    budget.served += 1;
+    row["body"] = serde_json::Value::String(body.to_owned());
+    row["body_complete"] = serde_json::json!(true);
+    row["projection"] = serde_json::json!("FullBody");
+    Ok(())
+}
+
+pub fn downgrade_context_body(row: &mut serde_json::Value, reason: &str) {
+    row["body"] = serde_json::Value::Null;
+    row["body_complete"] = serde_json::json!(false);
+    row["projection"] = serde_json::json!("SignatureOnly");
+    row["projection_downgraded_from"] = serde_json::json!("FullBody");
+    row["body_unavailable"] = serde_json::json!(reason);
+}
+
 /// Explain, in agent-actionable terms, why an entity has no graph-owned body.
 ///
 /// Reached only when the projection returned no body without erroring, which is
@@ -2633,17 +2764,14 @@ pub fn entity_body_gap_reason(entity: &Entity) -> String {
 /// Caps for the inline snippet surfaced on a retrieval hit (`kin locate --json`
 /// symbols, `semantic_locate` entity results): a signature plus the first
 /// several body lines, dense enough for an agent to act on without a follow-up
-/// read, but far tighter than the full-body excerpt
-/// ([`MCP_SOURCE_MAX_LINES`]/[`MCP_SOURCE_MAX_CHARS`]) `get_entity_source` and
-/// `get_context_pack` serve. One bound shared by every agent surface so the
+/// read, but far tighter than the whole spans context packs serve. One bound shared by every agent surface so the
 /// snippet is identical wherever it appears.
 pub const RETRIEVAL_SNIPPET_MAX_LINES: usize = 12;
 pub const RETRIEVAL_SNIPPET_MAX_CHARS: usize = 800;
 
 /// Graph-native bounded snippet for an entity. Delegates to the same
 /// content-addressed, hash-verified body projection
-/// ([`read_entity_source_excerpt_detailed`]) that backs `get_entity_source` and
-/// `get_context_pack`, capped to
+/// ([`read_entity_source_excerpt_detailed`]), capped to
 /// [`RETRIEVAL_SNIPPET_MAX_LINES`]/[`RETRIEVAL_SNIPPET_MAX_CHARS`] for inline use
 /// on retrieval hits. Returns `None` only when the entity has no source
 /// coordinates. A tree, identity, span, UTF-8, or blob authority gap is an
@@ -3002,12 +3130,8 @@ pub fn entity_response_json<G: GraphStore>(
 /// fallback the parameter only obliged callers to build a value this function
 /// discards.
 ///
-/// Takes no `compact` flag either. Compact mode used to drop the focal body
-/// while still paying for the read that produced it, which left the one thing
-/// the pack is for out of the cheaper mode: a caller asking for a bounded pack
-/// spent a whole call learning it had to ask again. Compact now bounds the
-/// dependency rows, and the focal body it serves is already capped at
-/// [`MCP_SOURCE_MAX_LINES`]/[`MCP_SOURCE_MAX_CHARS`].
+/// Compact mode keeps the focal body. The request's shared byte budget limits
+/// exact spans without silently converting them into excerpts.
 pub fn focal_context_json<G: GraphStore>(
     store: &G,
     entity: &Entity,
@@ -3026,17 +3150,20 @@ pub fn focal_context_json_held<G: GraphStore>(
     held: &HeldSourceAuthority<'_, G>,
     entity: &Entity,
 ) -> Result<serde_json::Value> {
-    let start_line = entity_presentation_start_line(entity);
-    let end_line = entity_presentation_end_line(entity);
-    let source_excerpt = read_entity_source_excerpt_detailed_held(
+    focal_context_json_bounded(
         held,
         entity,
-        MCP_SOURCE_MAX_LINES,
-        MCP_SOURCE_MAX_CHARS,
-        EntitySourceScope::WorkspaceHead,
-    )?;
-    let source = LAST_READ_SOURCE.with(|f| f.get());
+        &mut ContextBodyBudget::new(crate::budget::RESPONSE_DEFAULT_MAX_CHARS),
+    )
+}
 
+pub fn focal_context_json_bounded<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    budget: &mut ContextBodyBudget,
+) -> Result<serde_json::Value> {
+    let start_line = entity_presentation_start_line(entity);
+    let end_line = entity_presentation_end_line(entity);
     let mut obj = serde_json::json!({
         "id": entity.id,
         "name": entity.name,
@@ -3046,21 +3173,9 @@ pub fn focal_context_json_held<G: GraphStore>(
         "read_path": entity_read_path(entity),
         "start_line": start_line,
         "end_line": end_line,
-        "source": source,
     });
 
-    match source_excerpt.as_ref() {
-        Some(source) => obj["body"] = serde_json::json!(source.body),
-        None => {
-            obj["body"] = serde_json::Value::Null;
-            obj["body_unavailable"] = serde_json::json!(entity_body_gap_reason(entity));
-        }
-    }
-    if let Some(source) = source_excerpt {
-        if let Some(map) = obj.as_object_mut() {
-            map.extend(source_provenance_fields(&source));
-        }
-    }
+    attach_context_body(held, entity, &mut obj, budget)?;
 
     Ok(obj)
 }

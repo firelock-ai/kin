@@ -4858,7 +4858,7 @@ mod tests {
     }
 
     // A separate synthetic row shape under the same conservative authority
-    // conditions. The full row shape above still needs suffix elisions.
+    // conditions, sized to isolate whitespace savings from qualification pointers.
     fn concise_reference_fixture() -> Value {
         let mut payload = conservative_reference_fixture();
         for row in payload["references"].as_array_mut().unwrap() {
@@ -4877,6 +4877,46 @@ mod tests {
             });
         }
         payload
+    }
+
+    #[test]
+    fn finalized_context_cannot_claim_full_bodies_after_elision() {
+        for multi in [false, true] {
+            let row = json!({"id": "focal", "body": "body ".repeat(4000),
+                "projection": "FullBody", "body_complete": true, "signature": "fn focal()"});
+            let raw = if multi {
+                json!({"entities": [row], "focals": [{"entity_id": "focal", "projection": "full_body"}]})
+            } else {
+                json!({"focal_entity": row, "dependencies": []})
+            };
+            let budget = ResponseBudget {
+                max_chars: 12000,
+                ..ResponseBudget::default()
+            };
+            let result = finalize_bounded(
+                ToolCallResult::text(raw.to_string()),
+                Envelope::daemon(),
+                "get_context_pack",
+                &budget,
+            );
+            let payload = annotated_value(&result);
+            let row = if multi {
+                &payload["entities"][0]
+            } else {
+                &payload["focal_entity"]
+            };
+            assert!(row["body"].is_null());
+            assert_eq!(row["projection"], "SignatureOnly");
+            assert_eq!(row["body_complete"], false);
+            assert_eq!(row["body_elided"], json!(["body"]));
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            assert!(text.len() <= budget.max_chars);
+            assert_eq!(
+                payload["_kin"]["response"]["chars_after_budget"],
+                text.len()
+            );
+            assert_eq!(payload["_kin"]["response"]["bounded"], true);
+        }
     }
 
     fn conservative_reference_envelope() -> Envelope {

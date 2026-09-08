@@ -420,13 +420,10 @@ pub fn handle_get_entity_source<G: GraphStore>(
 
     match store.get_entity(&entity_id).map_err(McpError::graph)? {
         Some(entity) => {
-            let exact_source = read_entity_source_excerpt_detailed(
-                store,
+            let exact_source = read_entity_source_exact(
+                &HeldSourceAuthority::new(store, repository_authority),
                 &entity,
-                10_000,
                 1_000_000,
-                repository_authority,
-                EntitySourceScope::WorkspaceHead,
             )?
             .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
             let source = LAST_READ_SOURCE.with(|f| f.get());
@@ -923,8 +920,11 @@ pub fn handle_get_context_pack<G: GraphStore>(
     // projection multiplies a full recovery by the pack's size.
     let held = HeldSourceAuthority::new(store, repository_authority);
 
+    let mut body_budget =
+        ContextBodyBudget::new(crate::budget::ResponseBudget::from_arguments(args).max_chars);
+
     let focal_json = if let (Some(_), Some(entity)) = (focal_entry, &focal_entity) {
-        focal_context_json_held(&held, entity)?
+        focal_context_json_bounded(&held, entity, &mut body_budget)?
     } else {
         serde_json::json!(null)
     };
@@ -935,8 +935,8 @@ pub fn handle_get_context_pack<G: GraphStore>(
     // alongside the pack the two are indistinguishable on the wire. Rows in the
     // sections that are not dependencies (transitive, tests, contracts) pass
     // `None` and carry no relation at all.
-    let project_dep = |entry: &kin_model::context::ContextEntry,
-                       relation: Option<DependencyRelation>|
+    let mut project_dep = |entry: &kin_model::context::ContextEntry,
+                           relation: Option<DependencyRelation>|
      -> Result<serde_json::Value> {
         // Look up the entity for structured fields.
         if let Some(e) = store
@@ -958,44 +958,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
             }
             if !compact {
                 obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
-                // A dependency whose file the current workspace does not contain
-                // is still a dependency graph truth asserts, so it stays in the
-                // pack and says why it has no body. Dropping it would shrink a
-                // structural answer silently, and failing here would lose the
-                // whole pack over one entity that history explains.
-                let (body, absent_reason) = match read_entity_source_excerpt_detailed_held(
-                    &held,
-                    &e,
-                    MCP_SOURCE_MAX_LINES,
-                    MCP_SOURCE_MAX_CHARS,
-                    EntitySourceScope::WorkspaceHead,
-                ) {
-                    Ok(body) => (body, None),
-                    Err(error) if is_absent_at_generation(&error) => {
-                        (None, Some(error.to_string()))
-                    }
-                    Err(error) => return Err(error),
-                };
-                let source = LAST_READ_SOURCE.with(|f| f.get());
-                obj["source"] = serde_json::json!(source);
-                // Same rule as the focal body: a dependency's `body` is the
-                // graph-owned projection or null. The pack's own `entry.content`
-                // is a token-accounting stub, and serving it here would hand an
-                // agent signature text shaped like an implementation.
-                match body {
-                    Some(source) => {
-                        obj["body"] = serde_json::json!(source.body);
-                        if let Some(map) = obj.as_object_mut() {
-                            map.extend(source_provenance_fields(&source));
-                        }
-                    }
-                    None => {
-                        obj["body"] = serde_json::Value::Null;
-                        obj["body_unavailable"] = serde_json::json!(
-                            absent_reason.unwrap_or_else(|| entity_body_gap_reason(&e))
-                        );
-                    }
-                }
+                attach_context_body(&held, &e, &mut obj, &mut body_budget)?;
             }
             Ok(obj)
         } else {
@@ -1316,6 +1279,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         );
     }
 
+    body_budget.disclose(&mut result);
     let json = serialize_with_measured_tokens(&mut result)?;
     Ok(ToolCallResult::text(json))
 }
@@ -1484,17 +1448,24 @@ fn multi_focal_pack_result<G: GraphStore>(
     // `kin graph source` on the same id returned the whole body. It was never a
     // body gap; it was a path that did not ask.
     let held = HeldSourceAuthority::new(store, repository_authority);
-    let row =
+    let mut body_budget =
+        ContextBodyBudget::new(crate::budget::ResponseBudget::from_arguments(args).max_chars);
+    let mut row =
         |entry: &kin_model::context::ContextEntry, section: &str| -> Result<serde_json::Value> {
             let entity = store
                 .get_entity(&entry.entity_id)
                 .map_err(McpError::graph)?;
             let Some(entity) = entity else {
-                return Ok(serde_json::json!({
+                let mut row = serde_json::json!({
                     "id": entry.entity_id,
                     "section": section,
                     "projection": format!("{:?}", entry.projection_level),
-                }));
+                });
+                if entry.projection_level == kin_model::context::ProjectionLevel::FullBody {
+                    downgrade_context_body(&mut row, "entity is unavailable in graph truth");
+                    row["projection"] = serde_json::Value::Null;
+                }
+                return Ok(row);
             };
             let mut obj = serde_json::json!({
                 "id": entity.id,
@@ -1515,44 +1486,7 @@ fn multi_focal_pack_result<G: GraphStore>(
             if entry.projection_level != kin_model::context::ProjectionLevel::FullBody {
                 return Ok(obj);
             }
-            let (body, absent_reason) = match read_entity_source_excerpt_detailed_held(
-                &held,
-                &entity,
-                MCP_SOURCE_MAX_LINES,
-                MCP_SOURCE_MAX_CHARS,
-                EntitySourceScope::WorkspaceHead,
-            ) {
-                Ok(body) => (body, None),
-                Err(error) if is_absent_at_generation(&error) => (None, Some(error.to_string())),
-                Err(error) => return Err(error),
-            };
-            // Which authority answered, under the same key the single-focal path
-            // publishes it, so a caller reading one surface is not learning two
-            // vocabularies for one fact.
-            obj["source"] = serde_json::json!(LAST_READ_SOURCE.with(|f| f.get()));
-            match body {
-                Some(source) => {
-                    obj["body"] = serde_json::json!(source.body);
-                    if let Some(map) = obj.as_object_mut() {
-                        map.extend(source_provenance_fields(&source));
-                    }
-                }
-                None => {
-                    // The claim goes with the body. A row that cannot produce one
-                    // reports the level it actually carries, so the label and the
-                    // content cannot disagree the way they did on v0.7.2.
-                    obj["projection"] = serde_json::json!(format!(
-                        "{:?}",
-                        kin_model::context::ProjectionLevel::SignatureOnly
-                    ));
-                    obj["projection_downgraded_from"] =
-                        serde_json::json!(format!("{:?}", entry.projection_level));
-                    obj["body"] = serde_json::Value::Null;
-                    obj["body_unavailable"] = serde_json::json!(
-                        absent_reason.unwrap_or_else(|| entity_body_gap_reason(&entity))
-                    );
-                }
-            }
+            attach_context_body(&held, &entity, &mut obj, &mut body_budget)?;
             Ok(obj)
         };
 
@@ -1645,6 +1579,7 @@ fn multi_focal_pack_result<G: GraphStore>(
         );
     }
 
+    body_budget.disclose(&mut result);
     let json = serialize_with_measured_tokens(&mut result)?;
     Ok(Some(ToolCallResult::text(json)))
 }

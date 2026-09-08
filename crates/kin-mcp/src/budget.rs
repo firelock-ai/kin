@@ -826,6 +826,7 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             // split by direction, and a group the budget cannot trim is a group
             // that can push a response past its cap on its own.
             collections: &[
+                "entities",
                 "dependencies",
                 "dependents",
                 "transitive_deps",
@@ -833,7 +834,7 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
                 "contracts",
             ],
             body_keys: &["body"],
-            explain_keys: &["projection"],
+            explain_keys: &[],
             top_explain_keys: &[],
             duplicate_keys: &[],
             bulk_keys: &[],
@@ -1565,14 +1566,18 @@ pub const OVER_BUDGET_REASON: &str = "response_over_budget";
 /// entry is the earliest arm's, because disclosures are appended. Reading it is
 /// what lets the second arm report the size the answer was built at instead of
 /// the size it inherited.
+pub const BODY_HYDRATION_REASON: &str = "whole_body_withheld";
+
 fn prior_bound(payload: &Value) -> Option<usize> {
     payload
         .get("degradations")?
         .as_array()?
         .iter()
         .find(|entry| {
-            entry.get("component").and_then(Value::as_str) == Some("response_budget")
-                && entry.get("reason").and_then(Value::as_str) == Some(BOUNDED_REASON)
+            (entry.get("component").and_then(Value::as_str) == Some("response_budget")
+                && entry.get("reason").and_then(Value::as_str) == Some(BOUNDED_REASON))
+                || (entry.get("component").and_then(Value::as_str) == Some("context_body_budget")
+                    && entry.get("reason").and_then(Value::as_str) == Some(BODY_HYDRATION_REASON))
         })
         .map(|entry| {
             entry
@@ -1723,6 +1728,11 @@ fn strip_keys_marking(
                 // it empty, and the marker beside it says who emptied it.
                 if *key == "body" {
                     map.insert((*key).to_string(), Value::Null);
+                    if map.get("projection").and_then(Value::as_str) == Some("FullBody") {
+                        map.insert("projection".into(), json!("SignatureOnly"));
+                        map.insert("projection_downgraded_from".into(), json!("FullBody"));
+                        map.insert("body_complete".into(), json!(false));
+                    }
                 }
             }
         }
@@ -1754,6 +1764,15 @@ fn strip_keys_marking(
         if let Some(map) = payload.get_mut(focal).and_then(Value::as_object_mut) {
             if strip_row(map) {
                 stripped += 1;
+            }
+        }
+    }
+    if keys.contains(&"body") && stripped > 0 {
+        if let Some(focals) = payload.get_mut("focals").and_then(Value::as_array_mut) {
+            for focal in focals {
+                if focal.get("projection").and_then(Value::as_str) == Some("full_body") {
+                    focal["projection"] = json!("header_and_signature");
+                }
             }
         }
     }
@@ -4130,6 +4149,50 @@ mod tests {
             rows.push(focal.clone());
         }
         rows
+    }
+
+    #[test]
+    fn context_body_elisions_downgrade_single_and_multi_focal_claims() {
+        for multi in [false, true] {
+            let row = json!({
+                "id": "focal", "name": "focal", "signature": "fn focal()",
+                "body": "whole body ".repeat(800), "projection": "FullBody",
+                "body_complete": true, "span_coherence": "digest_verified",
+            });
+            let mut payload = if multi {
+                json!({"entities": [row.clone()], "focals": [{"entity_id": "focal", "projection": "full_body"}]})
+            } else {
+                json!({"focal_entity": row.clone(), "dependencies": [row.clone()]})
+            };
+            let budget = ResponseBudget {
+                max_chars: 4000,
+                ..ResponseBudget::default()
+            };
+            let accounting = enforce(&mut payload, "get_context_pack", &budget).unwrap();
+            let rows = if multi {
+                vec![&payload["entities"][0]]
+            } else {
+                vec![&payload["focal_entity"], &payload["dependencies"][0]]
+            };
+            for row in rows {
+                assert!(row["body"].is_null());
+                assert_eq!(row["projection"], "SignatureOnly");
+                assert_eq!(row["projection_downgraded_from"], "FullBody");
+                assert_eq!(row["body_complete"], false);
+                assert_eq!(row["body_elided"], json!(["body"]));
+                assert_eq!(row["span_coherence"], "digest_verified");
+            }
+            if multi {
+                assert_eq!(payload["focals"][0]["projection"], "header_and_signature");
+            }
+            assert!(accounting.bounded);
+            assert_eq!(accounting.chars_after, render(&payload).unwrap().len());
+            assert!(accounting.chars_after <= budget.max_chars);
+            let mut fitting = json!({"entities": [{"body": "whole\r\n", "projection": "FullBody", "body_complete": true}]});
+            let before = fitting.clone();
+            enforce(&mut fitting, "get_context_pack", &budget).unwrap();
+            assert_eq!(fitting, before);
+        }
     }
 
     #[test]

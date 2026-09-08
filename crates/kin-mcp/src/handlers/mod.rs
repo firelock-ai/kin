@@ -3872,7 +3872,299 @@ mod tests {
     }
 
     #[test]
-    fn focal_context_json_expands_signature_only_python_span() {
+    fn context_full_bodies_preserve_exact_span_bytes_at_excerpt_boundaries() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut contents = vec![
+            "constant\n".to_string(),
+            "constant".to_string(),
+            "constant\r\n".to_string(),
+        ];
+        for lines in [39, 40, 41, 46] {
+            contents.push("  return café;\r\n".repeat(lines));
+        }
+        for bytes in [2399, 2400, 2401] {
+            contents.push("x".repeat(bytes));
+        }
+        for content in contents {
+            let source = make_source_backed_entity(&content);
+            let entity = &source.entity;
+            let mut store = EmptyStore::default();
+            store.entities_by_id.insert(entity.id, entity.clone());
+            store
+                .file_hashes
+                .insert(entity.file_origin.clone().unwrap(), source.hash);
+            install_empty_store_exact_tree(&mut store, source._dir.path());
+            let authority = test_repository_authority(source._dir.path());
+            let direct = tool_result_json(
+                entities::handle_get_entity_source(
+                    &HashMap::from([(
+                        "entity_id".into(),
+                        serde_json::json!(entity.id.to_string()),
+                    )]),
+                    &store,
+                    Some(&authority),
+                )
+                .unwrap(),
+            );
+            assert_eq!(direct["body"].as_str(), Some(content.as_str()));
+            let sessions = crate::session::SessionRegistry::empty_for_test();
+            for multi in [false, true] {
+                let mut args = HashMap::from([
+                    ("token_budget".into(), serde_json::json!(8000)),
+                    ("max_chars".into(), serde_json::json!(60000)),
+                ]);
+                if multi {
+                    args.insert(
+                        "question_focals".into(),
+                        serde_json::json!([{"entity_id": entity.id.to_string(), "route": "id"}]),
+                    );
+                } else {
+                    args.insert("entity_id".into(), serde_json::json!(entity.id.to_string()));
+                }
+                let value = tool_result_json(
+                    entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority))
+                        .unwrap(),
+                );
+                let row = if multi {
+                    &value["entities"][0]
+                } else {
+                    &value["focal_entity"]
+                };
+                assert_eq!(
+                    row["body"].as_str(),
+                    Some(content.as_str()),
+                    "multi={multi}, bytes={}",
+                    content.len()
+                );
+                assert_eq!(row["projection"], "FullBody");
+                assert_eq!(row["body_complete"], true);
+            }
+            let held = HeldSourceAuthority::new(&store, Some(&authority));
+            let mut budget = ContextBodyBudget::new(content.len());
+            let mut first = serde_json::json!({});
+            attach_context_body(&held, entity, &mut first, &mut budget).unwrap();
+            assert_eq!(first["body"].as_str(), Some(content.as_str()));
+            let mut second = serde_json::json!({});
+            attach_context_body(&held, entity, &mut second, &mut budget).unwrap();
+            assert!(second["body"].is_null());
+            assert_eq!(second["body_complete"], false);
+            assert_eq!(second["projection"], "SignatureOnly");
+            assert_eq!(second["body_budget_remaining_bytes"], 0);
+        }
+    }
+
+    #[test]
+    fn context_full_body_omits_an_oversized_single_line_without_clipping() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "é".repeat(30_001);
+        let source = make_source_backed_entity(&content);
+        let entity = &source.entity;
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        for multi in [false, true] {
+            let mut args = HashMap::from([("max_chars".into(), serde_json::json!(60000))]);
+            if multi {
+                args.insert(
+                    "question_focals".into(),
+                    serde_json::json!([{"entity_id": entity.id.to_string(), "route": "id"}]),
+                );
+            } else {
+                args.insert("entity_id".into(), serde_json::json!(entity.id.to_string()));
+            }
+            let value = tool_result_json(
+                entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority))
+                    .unwrap(),
+            );
+            let row = if multi {
+                &value["entities"][0]
+            } else {
+                &value["focal_entity"]
+            };
+            assert!(row["body"].is_null());
+            assert_eq!(row["body_complete"], false);
+            assert_eq!(row["projection"], "SignatureOnly");
+            assert_eq!(row["body_bytes"], content.len());
+            assert_eq!(row["body_elided"], serde_json::json!(["body"]));
+            assert!(row["body_unavailable"]
+                .as_str()
+                .unwrap()
+                .contains("whole graph-owned span"));
+            assert_eq!(value["elisions"]["body"]["elided"], 1);
+            let finalized = crate::envelope::finalize_bounded(
+                crate::types::ToolCallResult::text(value.to_string()),
+                crate::envelope::Envelope::daemon(),
+                "get_context_pack",
+                &crate::budget::ResponseBudget::default(),
+            );
+            let final_value = tool_result_json(finalized);
+            assert_eq!(final_value["_kin"]["response"]["bounded"], true);
+            assert_eq!(final_value["elisions"]["body"]["elided"], 1);
+        }
+    }
+
+    #[test]
+    fn context_dependency_bodies_preserve_the_whole_span() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "return café;\r\n".repeat(46);
+        let source = make_source_backed_entity(&content);
+        let entity = &source.entity;
+        let mut dependency = entity.clone();
+        dependency.id = EntityId::new();
+        dependency.name = "dependency".into();
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .entities_by_id
+            .insert(dependency.id, dependency.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        store.insert_test_calls_relation(entity, &dependency);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let args = HashMap::from([
+            ("entity_id".into(), serde_json::json!(entity.id.to_string())),
+            ("compact".into(), serde_json::json!(false)),
+        ]);
+        let value = tool_result_json(
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap(),
+        );
+        let dep = value["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == dependency.id.to_string())
+            .expect("dependency retained");
+        assert_eq!(dep["body"].as_str(), Some(content.as_str()));
+        assert_eq!(dep["projection"], "FullBody");
+        assert_eq!(dep["body_complete"], true);
+    }
+
+    #[test]
+    fn context_body_cuts_accumulate_across_hydration_and_finalization() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "x".repeat(60_001);
+        let source = make_source_backed_entity(&content);
+        let mut small = source.entity.clone();
+        small.span.as_mut().unwrap().end_byte = 20_000;
+        let mut large = source.entity.clone();
+        large.id = EntityId::new();
+        large.name = "large".into();
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(small.id, small.clone());
+        store.entities_by_id.insert(large.id, large.clone());
+        store
+            .file_hashes
+            .insert(small.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let args = HashMap::from([
+            (
+                "question_focals".into(),
+                serde_json::json!([
+                    {"entity_id": small.id.to_string(), "route": "id"},
+                    {"entity_id": large.id.to_string(), "route": "id"}
+                ]),
+            ),
+            ("max_chars".into(), serde_json::json!(60000)),
+        ]);
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let result =
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap();
+        let raw = tool_result_json(result.clone());
+        assert_eq!(raw["elisions"]["body"]["kept"], 1);
+        assert_eq!(raw["elisions"]["body"]["elided"], 1);
+        let budget = crate::budget::ResponseBudget {
+            max_chars: 12000,
+            ..crate::budget::ResponseBudget::default()
+        };
+        let final_result = crate::envelope::finalize_bounded(
+            result,
+            crate::envelope::Envelope::daemon(),
+            "get_context_pack",
+            &budget,
+        );
+        let payload = tool_result_json(final_result);
+        assert_eq!(payload["elisions"]["body"]["kept"], 0);
+        assert_eq!(payload["elisions"]["body"]["elided"], 2);
+        let reason = payload["elisions"]["body"]["reason"].as_str().unwrap();
+        assert!(reason.contains(crate::budget::BODY_HYDRATION_REASON));
+        assert!(reason.contains(crate::budget::ELISION_REASON_BUDGET));
+        assert_eq!(payload["_kin"]["response"]["bounded"], true);
+        for row in payload["entities"].as_array().unwrap() {
+            assert!(row["body"].is_null());
+            assert_eq!(row["body_complete"], false);
+            assert_eq!(row["projection"], "SignatureOnly");
+        }
+    }
+
+    #[test]
+    fn direct_source_refuses_a_whole_span_above_its_byte_limit() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "é".repeat(500_001);
+        let source = make_source_backed_entity(&content);
+        let entity = &source.entity;
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let error = entities::handle_get_entity_source(
+            &HashMap::from([("entity_id".into(), serde_json::json!(entity.id.to_string()))]),
+            &store,
+            Some(&authority),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("1000002 bytes"));
+        assert!(error.to_string().contains("1000000 byte inline limit"));
+    }
+
+    #[test]
+    fn context_full_body_rejects_a_span_splitting_utf8() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut source = make_source_backed_entity("éx\n");
+        source.entity.span.as_mut().unwrap().end_byte = 1;
+        let entity = &source.entity;
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let error = focal_context_json(&store, entity, Some(&authority)).unwrap_err();
+        assert!(error.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn focal_context_json_preserves_a_one_line_graph_span() {
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -3893,8 +4185,11 @@ mod tests {
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
-        assert!(body.contains("value <= max_val"));
-        assert_ne!(body.trim(), entity.signature);
+        let span = entity.span.as_ref().unwrap();
+        assert_eq!(body, &content[span.start_byte..span.end_byte]);
+        assert!(!body.contains("value <= max_val"));
+        assert_eq!(value["body_complete"], true);
+        assert_eq!(value["projection"], "FullBody");
     }
 
     #[test]
