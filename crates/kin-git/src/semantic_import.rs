@@ -341,54 +341,7 @@ impl SemanticGitImportPlan {
             &ResolvedTree,
         ) -> Result<HistoricalSemanticBinding<'static>>,
     ) -> Result<Self> {
-        let snapshot = self.raw_snapshot();
-        let mut comparison = HeldPlanComparison::new(&self, Enrichment::None, EXACT_UNENRICHED)?;
-        let mut changes = SemanticChangeSpoolWriter::new()?;
-        let mut aliases = Vec::with_capacity(self.aliases.len());
-        let mut old_to_new = BTreeMap::new();
-        let derived = derive_semantic_git_history(
-            &snapshot,
-            blob_store,
-            TreeRetention::Frontier,
-            &mut |oid, change, alias, tree, facts| {
-                comparison.check_commit(oid, change, alias, facts)?;
-                let mut held = comparison.held_change(oid)?;
-                let binding = enrich(&held, tree)?;
-                if binding.change_id != held.id {
-                    return Err(GitError::InvalidSnapshot(
-                        "historical semantic deltas name a different change".to_string(),
-                    ));
-                }
-                let old_id = held.id;
-                held.parents = held
-                    .parents
-                    .iter()
-                    .map(|parent| {
-                        old_to_new.get(parent).copied().ok_or_else(|| {
-                            GitError::InvalidSnapshot(format!(
-                                "parent {parent} was not reidentified before change {old_id}"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                held.entity_deltas = binding.entity_deltas.into_owned();
-                held.relation_deltas = binding.relation_deltas.into_owned();
-                held.id = placeholder_change_id();
-                held.id = compute_semantic_change_id(&held)?;
-                validate_semantic_change_id(&held)?;
-                let alias = ExternalChangeAlias::new(self.repository_id.clone(), oid, held.id);
-                alias.validate_change(&held)?;
-                old_to_new.insert(old_id, held.id);
-                changes.append(held)?;
-                aliases.push(alias);
-                Ok(())
-            },
-        )?;
-        comparison.finish(&derived)?;
-        let mut plan = self;
-        plan.changes = changes.finish()?;
-        plan.aliases = aliases;
-        Ok(plan)
+        enrich_with_historical_semantics(self, blob_store, enrich)
     }
 
     /// Bind deterministic CAS-native semantic deltas and recompute every
@@ -417,6 +370,64 @@ impl SemanticGitImportPlan {
         comparison.finish(&derived)?;
         apply_historical_semantic_deltas_unchecked(self, bindings)
     }
+}
+
+fn enrich_with_historical_semantics(
+    plan: SemanticGitImportPlan,
+    blob_store: &BlobStore,
+    enrich: &mut dyn FnMut(
+        &SemanticChange,
+        &ResolvedTree,
+    ) -> Result<HistoricalSemanticBinding<'static>>,
+) -> Result<SemanticGitImportPlan> {
+    let snapshot = plan.raw_snapshot();
+    let mut comparison = HeldPlanComparison::new(&plan, Enrichment::None, EXACT_UNENRICHED)?;
+    let mut changes = SemanticChangeSpoolWriter::new()?;
+    let mut aliases = Vec::with_capacity(plan.aliases.len());
+    let mut old_to_new = BTreeMap::new();
+    let derived = derive_semantic_git_history(
+        &snapshot,
+        blob_store,
+        TreeRetention::Frontier,
+        &mut |oid, change, alias, tree, facts| {
+            comparison.check_commit(oid, change, alias, facts)?;
+            let mut held = comparison.held_change(oid)?;
+            let binding = enrich(&held, tree)?;
+            if binding.change_id != held.id {
+                return Err(GitError::InvalidSnapshot(
+                    "historical semantic deltas name a different change".to_string(),
+                ));
+            }
+            let old_id = held.id;
+            held.parents = held
+                .parents
+                .iter()
+                .map(|parent| {
+                    old_to_new.get(parent).copied().ok_or_else(|| {
+                        GitError::InvalidSnapshot(format!(
+                            "parent {parent} was not reidentified before change {old_id}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            held.entity_deltas = binding.entity_deltas.into_owned();
+            held.relation_deltas = binding.relation_deltas.into_owned();
+            held.id = placeholder_change_id();
+            held.id = compute_semantic_change_id(&held)?;
+            validate_semantic_change_id(&held)?;
+            let alias = ExternalChangeAlias::new(plan.repository_id.clone(), oid, held.id);
+            alias.validate_change(&held)?;
+            old_to_new.insert(old_id, held.id);
+            changes.append(held)?;
+            aliases.push(alias);
+            Ok(())
+        },
+    )?;
+    comparison.finish(&derived)?;
+    let mut plan = plan;
+    plan.changes = changes.finish()?;
+    plan.aliases = aliases;
+    Ok(plan)
 }
 
 /// Build semantic Git history using only a lossless snapshot and its CAS.
