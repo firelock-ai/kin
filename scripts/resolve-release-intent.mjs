@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// resolve-release-intent.mjs — resolve the SemVer intent for the next Kin
+// resolve-release-intent.mjs: resolve the SemVer intent for the next Kin
 // release from immutable evidence only.
 //
 // The intent is read from `Kin-Release-Intent:` git trailers on the
@@ -9,7 +9,7 @@
 // editable after a merge, so a later scheduled run could resolve a lower bump
 // than an earlier one and quietly rewrite a prepared minor or major release
 // back to a patch. A commit message cannot be edited once it is on protected
-// main, so the same range always resolves to the same intent.
+// main. Misplaced valid intent needs an explicit reviewed SHA attestation.
 //
 // The trailer reaches the commit through the pull-request body, which the
 // repository's squash-only PR_TITLE + PR_BODY merge policy copies verbatim into
@@ -17,7 +17,7 @@
 // this resolution.
 //
 // Absent evidence means `patch`. The highest intent in the range wins, and the
-// range only grows, so the resolution is monotone by construction.
+// range only grows. With a fixed attestation set, resolution is monotone.
 
 import fs from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -91,7 +91,14 @@ function commitIntent(root, commit, attestation) {
     throw new Error(`${commit} attestation requires unreadable trailer evidence; readable or absent evidence cannot be overridden`);
   }
   if (mentions.length !== intents.length) {
-    if (attestation) return attestation.intent;
+    if (attestation) {
+      const recorded = mentions.length === 1 ? PARSED_TRAILER.exec(mentions[0].trim()) : null;
+      if (!recorded || !RANK.has(recorded[1].toLowerCase()) ||
+          recorded[1].toLowerCase() !== attestation.intent) {
+        throw new Error(`${commit} attestation requires one explicit valid intent matching the recorded value`);
+      }
+      return attestation.intent;
+    }
     throw new Error(`${commit} has malformed or non-footer ${TRAILER_KEY} evidence`);
   }
   if (intents.length > 1) {

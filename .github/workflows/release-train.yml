@@ -904,6 +904,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           CURRENT_MARKER: ${{ needs.reconcile.outputs.marker }}
+          RECONCILE_RESULT: ${{ needs.reconcile.result }}
           THRESHOLD: "4"
         run: |
           set -euo pipefail
@@ -917,7 +918,19 @@ jobs:
           # push, and counting those as observations would let a quiet stretch of
           # skips stand in for a rail nobody watched.
           current="$work/current.json"
-          if [ -n "${CURRENT_MARKER:-}" ] && jq -e . >/dev/null 2>&1 <<< "$CURRENT_MARKER"; then
+          if [ "$RECONCILE_RESULT" = failure ] || [ "$RECONCILE_RESULT" = cancelled ]; then
+            # Job timeout, runner loss, or marker-upload failure can happen
+            # after (or instead of) the in-job finalizer. The job result wins
+            # over an absent marker or an earlier all-clear.
+            jq -n --arg run_id "$GITHUB_RUN_ID" \
+              --arg run_url "${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}" \
+              --arg result "$RECONCILE_RESULT" \
+              '{schema: "kin.release-hold.v1", state: "failed",
+                reason: "reconcile_failed", drift: null,
+                detail: ("Release reconciliation concluded " + $result),
+                run_id: $run_id, run_url: $run_url,
+                observed_at: (now | todateiso8601)}' > "$current"
+          elif [ -n "${CURRENT_MARKER:-}" ] && jq -e . >/dev/null 2>&1 <<< "$CURRENT_MARKER"; then
             printf '%s\n' "$CURRENT_MARKER" > "$current"
           else
             jq -n --arg run "$GITHUB_RUN_ID" '{unreadable: true, run_id: $run}' > "$current"
@@ -1004,7 +1017,7 @@ jobs:
               body="$work/body.md"
               jq -er .body "$decision" > "$body"
               gh issue create --repo "$REPO" --title "$title" --body-file "$body" >/dev/null
-              echo "::error::The release rail has held with releasable drift for $(jq -er .consecutive "$decision") consecutive cycles. Opened the tracking issue that names the blocking tag and the two ways out."
+              echo "::error::Release rail requires attention (${reason}). Opened the tracking issue with the observed failure or hold and its recovery path."
               exit 1
               ;;
             update)
@@ -1012,7 +1025,7 @@ jobs:
               jq -er .body "$decision" > "$body"
               number="$(jq -er .issue "$decision")"
               gh issue edit "$number" --repo "$REPO" --body-file "$body" >/dev/null
-              echo "::error::The release rail is still held with releasable drift after $(jq -er .consecutive "$decision") consecutive cycles; issue #${number} carries the current state."
+              echo "::error::Release rail still requires attention (${reason}); issue #${number} carries the current failure or hold."
               exit 1
               ;;
             close)

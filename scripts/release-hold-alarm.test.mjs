@@ -306,3 +306,55 @@ test('a successful final outcome preserves the observed marker', () => {
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'release-hold-marker.json'), 'utf8')), marker);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('the workflow opens and updates crash alarms with a loud accurate diagnostic', () => {
+  const workflow = fs.readFileSync(new URL('../.github/workflows/release-train.yml', import.meta.url), 'utf8');
+  const arm = workflow.split('          case "$action" in\n')[1]?.split('          esac')[0];
+  assert.ok(arm, 'alarm dispatch case must exist');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-release-alarm-'));
+  try {
+    const marker = { schema: MARKER_SCHEMA, state: 'failed', reason: 'reconcile_failed', run_id: '123', drift: null };
+    for (const issue of [null, OPEN_ISSUE]) {
+      const decision = decide({ markers: [marker], issue });
+      const filename = path.join(root, 'decision.json');
+      fs.writeFileSync(filename, JSON.stringify(decision));
+      const script = 'set -euo pipefail\ngh() { printf "%s\\n" "$*" >> "$work/gh-calls"; }\n' +
+        'case "$action" in\n' + arm + '\nesac\n';
+      const result = spawnSync('bash', ['-c', script], { encoding: 'utf8', env: {
+        ...process.env, work: root, decision: filename, action: decision.action, reason: decision.reason,
+        REPO: 'firelock-ai/kin', title: ALARM_TITLE,
+      } });
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.equal(result.stderr, '');
+      assert.match(result.stdout, /::error::Release rail.*reconcile_failed/);
+      assert.doesNotMatch(result.stdout, /consecutive cycles|blocking tag|two ways out/);
+      assert.match(fs.readFileSync(path.join(root, 'gh-calls'), 'utf8'), issue ? /issue edit 4242/ : /issue create/);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the alarm job result overrides missing or stale markers after finalizer or upload failure', () => {
+  const workflow = fs.readFileSync(new URL('../.github/workflows/release-train.yml', import.meta.url), 'utf8');
+  const section = workflow.split('      - name: Gather this cycle')[1]?.split('          prior_ids=')[0];
+  assert.ok(section, 'alarm history step must exist');
+  assert.match(section, /RECONCILE_RESULT: \$\{\{ needs.reconcile.result \}\}/);
+  const script = section.split('        run: |\n')[1].split('\n').map(line => line.replace(/^          /, '')).join('\n');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-release-result-'));
+  try {
+    for (const result of ['failure', 'cancelled', 'success']) {
+      for (const previous of ['', JSON.stringify(clear())]) {
+        execFileSync('bash', ['-c', script], { env: {
+          ...process.env, RUNNER_TEMP: root, RECONCILE_RESULT: result, CURRENT_MARKER: previous,
+          GITHUB_RUN_ID: '123', GITHUB_SERVER_URL: 'https://github.com', REPO: 'firelock-ai/kin',
+        } });
+        const marker = JSON.parse(fs.readFileSync(path.join(root, 'release-hold-history/current.json'), 'utf8'));
+        if (result === 'success') {
+          assert.equal(marker.state ?? 'unreadable', previous ? 'clear' : 'unreadable');
+        } else {
+          assert.equal(marker.state, 'failed');
+          assert.equal(decide({ markers: [marker], issue: OPEN_ISSUE }).action, 'update');
+        }
+      }
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

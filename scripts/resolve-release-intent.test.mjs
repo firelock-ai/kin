@@ -172,7 +172,28 @@ test('a repaired patch does not lower a readable major in the same range', () =>
 test('the committed historical attestation binds only the recorded full SHA', () => {
   const document = JSON.parse(fs.readFileSync(new URL('./release-intent-attestations.json', import.meta.url), 'utf8'));
   assert.equal(document.schema, 'kin.release-intent-attestations.v1');
-  const entry = document.attestations.find(({ sha }) => sha === 'bffd6adda2eb46a37d0481a8b1aba8ef8759ce54');
-  assert.equal(entry?.intent, 'patch');
-  assert.match(entry.reason, /FIR-3412/);
+  for (const expected of [
+    'bffd6adda2eb46a37d0481a8b1aba8ef8759ce54',
+    '72414aa80531e7adee1ab360eacb28d56a621c6a',
+    '9e45cc6c89b12c72e519c86517ac38a8a79a7cea',
+    'c67efaa2c737ab0b7ac15d0057c8a3ec5a8041cc',
+  ]) {
+    const entry = document.attestations.find(({ sha }) => sha === expected);
+    assert.equal(entry?.intent, 'patch', expected);
+    assert.match(entry.reason, /FIR-3412/);
+  }
+});
+
+test('attestation cannot invent, change or disambiguate malformed raw intent', () => {
+  for (const message of [
+    malformed.replace('Intent: patch', 'Intent: enormous'),
+    malformed.replace('Intent: patch', 'Intent: major'),
+    malformed.replace('Intent: patch', 'Intent: patch\nKin-Release-Intent: minor'),
+    malformed.replace('Intent: patch', 'Intent: patch\nKin-Release-Intent: patch'),
+    malformed.replace('Intent: patch', 'Intent patch'),
+  ]) {
+    const root = repository([message]);
+    assert.throws(() => resolveReleaseIntent({ root, baseRef: 'v1.2.3', attestations: attested(root) }),
+      /attestation requires one explicit valid intent/);
+  }
 });

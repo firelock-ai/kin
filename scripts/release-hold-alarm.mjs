@@ -216,7 +216,7 @@ export function decide({ markers, issue, threshold = DEFAULT_THRESHOLD }) {
       reason: "reconcile_failed",
       ...(open ? { issue: open.number } : {}),
       title: ALARM_TITLE,
-      body: `Release reconciliation exited nonzero. No release progress is established by this cycle.\n\n` +
+      body: `Release reconciliation did not complete successfully. No release progress is established by this cycle.\n\n` +
         `Inspect the failed step in ${newest.run_url || `run ${newest.run_id ?? "unknown"}`}.\n\n` +
         `Repair that failure through the reviewed release workflow. This alarm does not authorize a new candidate, retry or tag abandonment.`,
     };
