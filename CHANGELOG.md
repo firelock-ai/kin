@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-09-08
+
+### Changed
+
+- Fail closed at credential transport and daemon startup boundaries (#1594)
+- Preserve native state with complete recovery carriers (#1597)
+- Bind a hosted store's vectors to the graph the daemon serves (FIR-3376) (#1592)
+- Bound cold hosted repository hydration admission (#1599)
+- Verify watcher and health readiness with bounded trace witnesses (#1596)
+- Stream complete history admission and bound ordinary commit memory (#1600)
+- chore(deps): refresh Kin registry dependency pins (#1525)
+- Tolerate brownfield:4's tracked FAIL and search clip witnesses (FIR-2464) (#1604)
+- Repair unreadable release intent and reconciliation failure alarms (#1605)
+
+
 ### Fixed
 
 - Let a hosted store persist the vectors it embeds. A hosted daemon bound its durable vector artifact to a query snapshot whose entity adjacency did not describe the graph loaded from it: the materialization cleared it, correctly, and the graph rebuilt it from the relations on load. The retrieval authority folds that adjacency through the graph root, so the binding retained at open could never equal the one every flush computes from the live graph, and any hosted store with at least one entity-to-entity edge refused every durable vector save for the life of the process while the embedding pass retried and walked the container into its memory limit. The daemon now normalizes the query snapshot's adjacency before binding it, including legacy hosted snapshots that omit derived adjacency, so a binding names the graph it serves without another whole-graph copy. A save that is still refused is recorded against the binding it refused: the embedding worker parks rather than retrying on that binding and wakes again once a rebind replaces it, every refused flush releases the vectors nothing can write, and `/health` reports `hosted_vector_persistence.status` as `refused` with the reason.
