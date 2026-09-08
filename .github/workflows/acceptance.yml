@@ -1295,10 +1295,15 @@ jobs:
       # than the exit codes.
       # A suite's exit status is one lever with two settings, demand a clean
       # sweep or demand nothing, and neither is right while one check is blocked
-      # on something outside the change under review. gate.py fails on any FAIL
-      # with no allowance possible, fails on any UNREADABLE that is not named
-      # here with a reason, and refuses an allowance that points at a check the
-      # report does not carry.
+      # on something outside the change under review. gate.py fails on any
+      # UNREADABLE that is not named here with a reason, fails on any FAIL that
+      # is not named here with a ticket AND the words that failure carries, and
+      # refuses an allowance that points at a check the report does not carry.
+      # The FAIL allowance is the narrower of the two on purpose: a check has
+      # more than one way to go red, so one keyed on the check id alone would
+      # tolerate the next regression too. Every failing assertion in the row has
+      # to carry the substring, and a failure that does not is reported with a
+      # warning saying the allowance was considered and did not match.
       - name: Acceptance verdict, gated on the suite reports
         if: always()
         run: |
@@ -1330,4 +1335,5 @@ jobs:
             --report prose_parity=acceptance/prose_parity.json \
             --report merge_precedence=acceptance/merge_precedence.json \
             --report detached_head=acceptance/detached_head.json \
-            --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk is truncated on ubuntu-latest, and its clipped_steps metadata confirms dropped callee and cross-file rows. This check therefore cannot distinguish an absent required edge from one the walk dropped. Any FAIL or other UNREADABLE still fails the gate, and the moment this check passes the allowance announces itself stale and can go.'
+            --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk comes back truncated, and a clip nothing can witness leaves the check unable to tell an absent required edge from a dropped one. A clip whose complete neighborhood witness re-supplies the dropped rows is readable and is graded on its merits, so this line now covers only the unwitnessable case and the FAIL allowance beside it covers the graded one. Any other UNREADABLE still fails the gate, and the moment this check passes both allowances announce themselves stale and can go.' \
+            --allow-fail 'brownfield:4=FIR-2464|the hand-off this.router.handle at lib/application.js:177|Measured on the red main run 34225725954 and reproduced locally on 2026-09-08. The absence is real and no truncation causes it: app.handle offers eight callees against a per-step cap of 25 and was never clipped, and the one clip in the walk is on application, whose complete witness carries 45 relations and no matching name either. express is pinned at 5.2.1, where the router is a dependency rather than lib/router/index.js, so this hand-off targets Router.prototype.handle in node_modules/router/index.js while the fixture admits the repository only, 140 of 140 files. The graph has an entity for Router and none for its handle member. Surfacing that hand-off is FIR-2464 itself and is unfixed, and bin/kin-parity has tolerated this same FAIL under this same ticket since it was written, so this line stops the two graders of one report disagreeing.'
