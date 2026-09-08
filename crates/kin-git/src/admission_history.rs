@@ -415,6 +415,15 @@ fn derive_admitted_semantic_git_history(
             // comparison `SemanticGitImportPlan::validate` makes, so a plan
             // that drifted from its raw objects is refused here as well as
             // there rather than admitted from a tree it never described.
+            //
+            // What this grades is everything the walk derives for itself: the
+            // tree deltas, the parents, the timestamp, author and message, the
+            // change id, the alias, the tree hash and the content observation.
+            // It is not a re-derivation of the entity and relation deltas,
+            // which `held_semantics` hands back out of the plan above, so that
+            // part of each change is equal by construction. Those deltas are
+            // graded where they are produced, by the enrichment fold's own
+            // tests and by the change-id equality of an admitted store.
             let index = deriver.derived;
             if plan.changes.get(index) != Some(&enriched)
                 || plan.aliases.get(index) != Some(&enriched_alias)

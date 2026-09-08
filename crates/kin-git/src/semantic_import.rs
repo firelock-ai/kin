@@ -2859,6 +2859,14 @@ mod tests {
             let decoder = TreeDecoder::new(hash_kind, &bodies, &records);
             let mut trees = BTreeMap::<GitObjectId, ResolvedTree>::new();
             let mut known = BTreeSet::new();
+            // The oracle accumulates known identities from each whole resolved
+            // tree. The product accumulates them from the Added deltas alone
+            // (`build_semantic_git_import_plan`), on the rule that an added path
+            // is the only way a new identity enters history. The two agree by
+            // induction, and the induction is what this second set checks at
+            // every commit, because feeding both algorithms the same
+            // whole-tree set would leave the product's own rule ungraded.
+            let mut known_from_added = BTreeSet::new();
             let mut shapes = ComparedShapes {
                 commits: 0,
                 added: 0,
@@ -2913,6 +2921,17 @@ mod tests {
                     }
                 }
                 known.extend(tree.artifacts().map(|artifact| artifact.artifact_id));
+                known_from_added.extend(
+                    deltas
+                        .iter()
+                        .filter(|delta| matches!(delta, TreeDelta::Added { .. }))
+                        .map(|delta| delta.artifact_id()),
+                );
+                assert_eq!(
+                    known_from_added, known,
+                    "commit {oid}: accumulating identities from Added deltas alone diverged from \
+                     accumulating them from every resolved tree"
+                );
                 trees.insert(oid, tree);
                 shapes.commits += 1;
             }

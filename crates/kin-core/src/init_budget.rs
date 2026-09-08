@@ -621,11 +621,17 @@ pub fn survey_history(source: &Path) -> Result<HistorySurvey, String> {
 /// Bytes of every distinct blob reachable from the given commits.
 ///
 /// The same closure the capture enumerates, read as object headers rather than
-/// bodies: each tree object is decoded once, each blob is sized once from its
-/// header, and nothing is decompressed but the trees, so on facebook/react
-/// this is seconds over 130,822 trees and 110,404 blobs. The physical object
-/// store is read directly, as the capture reads it, so a well-known empty tree
-/// the repository does not actually hold is not fabricated.
+/// bodies: each commit and each distinct tree is decoded once, each distinct
+/// blob is sized from its header without its body being read, so on
+/// facebook/react this is seconds over 21,679 commits, 130,822 trees and
+/// 110,404 blobs. The physical object store is read directly, as the capture
+/// reads it, so a well-known empty tree the repository does not actually hold
+/// is not fabricated.
+///
+/// The closure is the one reachable from HEAD, not from every ref, which is
+/// what `survey_history` walks. A repository whose unmerged branches are large
+/// is therefore forecast from less than `kin init` will go on to admit, and
+/// the forecast stays a floor because it counts fewer bytes rather than more.
 fn reachable_history_bytes(
     repo: &gix::Repository,
     commit_ids: &[gix::ObjectId],
@@ -1334,6 +1340,203 @@ mod tests {
         assert!(!verdict_for(react, 128 * 1024 * 1024 * 1024).refuses());
     }
 
+    fn git<const N: usize>(repository: &Path, args: [&str; N]) -> String {
+        let output = kin_git::test_support::fixture_git_in(repository)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn git_with_input<const N: usize>(repository: &Path, args: [&str; N], input: &[u8]) -> String {
+        let output = kin_git::test_support::fixture_git_in(repository)
+            .args(args)
+            .output_with_input(input)
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// The one function in this module that reads a repository, over a fixture
+    /// whose blob bytes are known before it runs.
+    ///
+    /// [`survey_history`] and [`reachable_history_bytes`] compute the term that
+    /// decides both refusals this module exists for, and nothing in this
+    /// repository exercised either: every other test here builds a
+    /// [`HistorySurvey`] by hand through `survey` and `history`, and the
+    /// acceptance suite's four-commit fixture has blobs so small that the
+    /// commit term decides it. So a count that returned zero, that added tree
+    /// object bytes, that dropped symbolic links, or that counted a blob once
+    /// per reference instead of once per object failed nothing.
+    ///
+    /// The fixture makes each of those a different number. One blob sits at two
+    /// paths across two commits, so counting by reference gives four times its
+    /// size rather than one. A symbolic link is an entry whose blob is its
+    /// target string. A gitlink names a commit that really exists in this
+    /// store, so an implementation that read it as a blob would add a commit
+    /// object's size rather than fail and be noticed that way. And a side
+    /// branch carrying a blob longer than the whole rest of the fixture is
+    /// reachable from a packed ref and an annotated tag but not from HEAD,
+    /// which is the scope this function documents.
+    #[test]
+    fn the_history_survey_counts_each_reachable_blob_once() {
+        const SHARED: &str = "one body, two paths, two commits\n";
+        const CHANGED: &str = "the second version of a.txt\n";
+        const NESTED: &str = "a file one directory down\n";
+        const LINK_TARGET: &str = "a.txt";
+        const OFF_HEAD: &str = "a side branch reaches this and HEAD does not, and it is longer \
+                                than every blob HEAD does reach put together, so a walk that \
+                                started from the refs instead would be caught by the total \
+                                rather than by luck\n";
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("source");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, ["init", "--initial-branch=main"]);
+        git(&repo, ["config", "user.email", "kin@example.invalid"]);
+        git(&repo, ["config", "user.name", "Kin Test"]);
+
+        // One commit, one blob, two paths, plus a symbolic link whose blob is
+        // its target string.
+        std::fs::write(repo.join("a.txt"), SHARED).unwrap();
+        std::fs::write(repo.join("b.txt"), SHARED).unwrap();
+        let link_blob = git_with_input(
+            &repo,
+            ["hash-object", "-w", "--stdin"],
+            LINK_TARGET.as_bytes(),
+        );
+        git(&repo, ["add", "a.txt", "b.txt"]);
+        git(
+            &repo,
+            [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("120000,{link_blob},link"),
+            ],
+        );
+        git(&repo, ["commit", "-m", "one"]);
+        let first = git(&repo, ["rev-parse", "HEAD"]);
+
+        // A second commit that changes one path, adds a nested one, and carries
+        // a gitlink pointing at the commit above.
+        std::fs::write(repo.join("a.txt"), CHANGED).unwrap();
+        std::fs::create_dir(repo.join("sub")).unwrap();
+        std::fs::write(repo.join("sub/c.txt"), NESTED).unwrap();
+        git(&repo, ["add", "a.txt", "sub/c.txt"]);
+        git(
+            &repo,
+            [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{first},vendor/mod"),
+            ],
+        );
+        git(&repo, ["commit", "-m", "two"]);
+
+        // A commit HEAD cannot reach, published through a branch and an
+        // annotated tag, with every ref then packed.
+        let off_head_blob =
+            git_with_input(&repo, ["hash-object", "-w", "--stdin"], OFF_HEAD.as_bytes());
+        let side_tree = git_with_input(
+            &repo,
+            ["mktree"],
+            format!("100644 blob {off_head_blob}\tonly-on-side.txt\n").as_bytes(),
+        );
+        let side_commit = git_with_input(&repo, ["commit-tree", &side_tree], b"off head\n");
+        git(&repo, ["update-ref", "refs/heads/side", &side_commit]);
+        git(&repo, ["tag", "-a", "v1", &side_commit, "-m", "annotated"]);
+        git(&repo, ["pack-refs", "--all"]);
+        assert!(
+            repo.join(".git/packed-refs").exists(),
+            "this fixture is meant to carry a packed ref"
+        );
+
+        let survey = survey_history(&repo).expect("survey the fixture");
+        let expected = (SHARED.len() + CHANGED.len() + NESTED.len() + LINK_TARGET.len()) as u64;
+        // What a count that took each blob once per reference would give
+        // instead. The fixture is only useful while the two differ, so that is
+        // asserted rather than assumed: an edit to these constants that made
+        // them coincide would leave the assertion below unable to fail.
+        let per_reference =
+            (3 * SHARED.len() + 2 * LINK_TARGET.len() + CHANGED.len() + NESTED.len()) as u64;
+        assert_ne!(
+            expected, per_reference,
+            "this fixture can no longer tell a per-object count from a per-reference one"
+        );
+        assert_eq!(
+            survey.history_bytes, expected,
+            "the reachable-history count is not the sum of the four distinct blobs HEAD reaches"
+        );
+        assert_eq!(
+            survey.commits, 2,
+            "HEAD reaches two commits, not the side one"
+        );
+        assert_eq!(
+            survey.tracked_artifacts, 5,
+            "a.txt, b.txt, link, sub/c.txt and vendor/mod are what the index tracks"
+        );
+        // Stated as its own assertion rather than left to the total, because
+        // this is the claim the doc comment makes and the one a walk over every
+        // ref would break.
+        assert!(
+            survey.history_bytes < OFF_HEAD.len() as u64,
+            "the count reached a blob only the side branch and the annotated tag hold"
+        );
+    }
+
+    /// A repository with no commits leaves the conversion exactly as it was.
+    ///
+    /// The survey is deliberately fallible, and this is the shape a first-time
+    /// user reaches first: `git init` and nothing else. It has to become
+    /// [`BudgetVerdict::Unmeasured`] through an error rather than a panic or a
+    /// forecast of zero, which would read as a repository that fits anything.
+    #[test]
+    fn an_unborn_head_is_an_error_rather_than_a_forecast_of_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("empty");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, ["init", "--initial-branch=main"]);
+        let error = survey_history(&repo).expect_err("an unborn HEAD cannot be surveyed");
+        assert!(
+            error.contains("resolve HEAD"),
+            "the error names what could not be read: {error}"
+        );
+    }
+
+    /// The third arm of the refusal's clause about what decided it.
+    ///
+    /// The history arm is read by
+    /// `a_history_heavy_repository_is_refused_where_it_would_be_killed` and the
+    /// commit arm by
+    /// `the_refusal_names_the_mechanism_both_remedies_and_the_shallow_dead_end`.
+    /// The tree-width arm was the one no test read, so a mutant that gave it
+    /// another arm's wording passed every test in this module.
+    #[test]
+    fn a_wide_tree_refusal_names_the_width_of_the_tree() {
+        let wide = survey(100, 200_000);
+        assert_eq!(wide.forecast().1, DecidingTerm::TrackedArtifacts);
+        let verdict = verdict_for(wide, 8 * 1024 * 1024 * 1024);
+        assert!(verdict.refuses(), "got {verdict:?}");
+        let text = verdict.refusal_lines().join("\n");
+        assert!(
+            text.contains("the width of the tree decides it"),
+            "the refusal has to name the term that decided it: {text}"
+        );
+    }
+
     #[test]
     fn a_forecast_over_the_ceiling_refuses() {
         let verdict = verdict_for(survey(40_000, 1_676), 8 * 1024 * 1024 * 1024);
@@ -1535,8 +1738,10 @@ mod tests {
     /// 1,676 files, was killed at phase 4 under 0.6.0 on the tree structures
     /// this conversion no longer holds, so it says nothing about this forecast
     /// and is not a row. The per-commit demand across the frontier-walk rows
-    /// spans 0.86 MB to 4.5 MB, which is why the coefficient is a floor on
-    /// every one of them and a prediction of none.
+    /// spans 0.86 MB on requests to 9.4 MB on kin, about eleven times, which is
+    /// why the coefficient is a floor on every one of them and a prediction of
+    /// none. Each of those is a whole-run figure, held bytes over commits from
+    /// the row beside it, rather than the peak of any one phase.
     #[test]
     fn the_forecast_is_a_floor_on_every_conversion_it_was_measured_against() {
         const CEILING: u64 = 8 * 1024 * 1024 * 1024;
