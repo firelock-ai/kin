@@ -58,17 +58,11 @@ pub(crate) fn validate_semantic_change_entries<'a>(
 #[derive(Clone, Copy)]
 pub(crate) enum AdmittedChangeMap<'a> {
     /// The pass ran in this process over exactly the borrowed map.
-    Derived(&'a std::collections::HashMap<SemanticChangeId, SemanticChange>),
-    /// The map is still on disk, and that IS the pass.
-    ///
-    /// An encoded map is built in exactly one place, by
-    /// `GraphSnapshot::from_bytes_with_encoded_history`, which recovery reaches
-    /// only when a durable validation record names these exact snapshot bytes
-    /// at this validator version. That record is the whole validator's verdict
-    /// on those bytes, admission included, so a map that is still encoded is a
-    /// map that record already admitted. Mutating one decodes it first
-    /// (`DerefMut` forces), so an encoded map is also provably the map the open
-    /// verified rather than a descendant of it.
+    Derived(&'a crate::storage::change_map::ChangeMap),
+    /// Recovery admitted the indexed base, either through an exact durable
+    /// proof or per-record validation. Any appended records passed admission
+    /// before their index entries became visible. Explicit mutable access
+    /// decodes and detaches the map, invalidating this witness.
     OnDisk(&'a crate::storage::change_map::ChangeMap),
 }
 
@@ -78,27 +72,27 @@ impl<'a> AdmittedChangeMap<'a> {
     /// This is the trust anchor and the only way to admit a map that no other
     /// witness already covers.
     pub(crate) fn admit(
-        changes: &'a std::collections::HashMap<SemanticChangeId, SemanticChange>,
+        changes: &'a crate::storage::change_map::ChangeMap,
         boundary: &str,
     ) -> Result<Self, KinDbError> {
-        validate_semantic_change_entries(changes.iter(), boundary)?;
+        for id in changes.change_ids() {
+            let change = changes.read_change(&id)?.ok_or_else(|| {
+                KinDbError::StorageError(format!("{boundary} missing change {id}"))
+            })?;
+            validate_semantic_change_entry(&id, &change, boundary)?;
+        }
         Ok(Self::Derived(changes))
     }
 
     /// Witness a map an open left on disk, or `None` for one in memory.
     ///
     /// `None` is the whole safety property of this constructor: a decoded map
-    /// carries no record of where it came from, so it gets the ordinary pass
-    /// and nothing here can hand it a free one. Only the encoded state, which
-    /// the variant above shows can be reached only under a durable validation
-    /// record, is witnessed.
-    ///
-    /// This exists because re-deriving the id of every change would decode the
-    /// history the open deliberately left on disk: measured on a full VS Code
-    /// store, 1,418,929,338 bytes retained for the life of the daemon to reach
-    /// a conclusion the record already carried.
+    /// carries no record of where it came from, so it gets the ordinary pass.
+    /// Only an admitted encoded base and validated append records qualify.
     pub(crate) fn on_disk(changes: &'a crate::storage::change_map::ChangeMap) -> Option<Self> {
-        (!changes.is_decoded()).then_some(Self::OnDisk(changes))
+        changes
+            .has_admitted_encoded_base()
+            .then_some(Self::OnDisk(changes))
     }
 
     /// Carry an existing admission onto a map the caller just cloned from the
@@ -110,7 +104,7 @@ impl<'a> AdmittedChangeMap<'a> {
     /// call site places it beside the clone that justifies it, and
     /// `carry_sites_stay_enumerated` fails if a new call site appears.
     pub(crate) fn carried_from_clone(
-        clone: &'a std::collections::HashMap<SemanticChangeId, SemanticChange>,
+        clone: &'a crate::storage::change_map::ChangeMap,
         admitted: &AdmittedChangeMap<'_>,
     ) -> Self {
         let _ = admitted;
@@ -127,9 +121,7 @@ impl<'a> AdmittedChangeMap<'a> {
     /// is a fresh allocation and never the map the witness borrowed.
     pub(crate) fn describes(&self, changes: &crate::storage::change_map::ChangeMap) -> bool {
         match self {
-            Self::Derived(admitted) => changes
-                .decoded_if_present()
-                .is_some_and(|decoded| std::ptr::eq(*admitted, decoded)),
+            Self::Derived(admitted) => changes.shares_storage(admitted),
             Self::OnDisk(admitted) => std::ptr::eq(*admitted, changes),
         }
     }

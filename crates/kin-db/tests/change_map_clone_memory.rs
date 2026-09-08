@@ -196,4 +196,34 @@ fn decoded_snapshot_clones_share_history_allocations() {
         "taking shared history retained {shared_retained} bytes; taking unique history \
          retained {unique_retained} bytes and peaked at {unique_peak} bytes"
     );
+
+    let floor = arm_peak();
+    let (spooled, spool_retained) = retained_by(|| {
+        let mut changes = kin_db::storage::ChangeMap::new();
+        for change in owned.values() {
+            changes
+                .append_change(change.clone())
+                .expect("append to bounded history");
+        }
+        changes
+    });
+    let spool_peak = peak_growth_since(floor);
+    assert_eq!(spooled.len(), COMMITS);
+    assert!(
+        spool_retained < ceiling && spool_peak < ceiling,
+        "spooled history retained {spool_retained} and peaked {spool_peak}, ceiling {ceiling}"
+    );
+    let floor = arm_peak();
+    spooled
+        .visit_changes(|change| {
+            assert_eq!(owned.get(&change.id), Some(change));
+            Ok(())
+        })
+        .unwrap();
+    let read_peak = peak_growth_since(floor);
+    assert!(
+        read_peak < ceiling,
+        "spool traversal retained history: {read_peak}"
+    );
+    println!("spooled history retained {spool_retained} bytes; append peak {spool_peak}; traversal peak {read_peak}; control {history_bytes}");
 }

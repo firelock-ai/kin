@@ -211,6 +211,10 @@ fn transient_copies<T>(name: &str, bytes: usize, run: impl FnOnce() -> T) -> (T,
     let transient = peak.saturating_sub(retained);
     let copies = transient as f64 / bytes as f64;
     println!("{name}: history={bytes} peak={peak} retained={retained} transient={transient} copies={copies:.3}");
+    assert!(
+        peak < bytes / 2,
+        "{name} retained or transiently decoded the complete history: peak={peak}, history={bytes}"
+    );
     (value, copies)
 }
 
@@ -255,6 +259,7 @@ fn complete_history_validation_does_not_copy_change_payloads_to_select_targets()
             .freeze_current_authority(&roots)
             .expect("full frozen validation")
     });
+    assert!(!frozen.authority().snapshot().changes.is_decoded());
     drop(frozen);
 
     // Save through the unvalidated backend boundary so this open cannot reuse a proof.
@@ -283,6 +288,7 @@ fn complete_history_validation_does_not_copy_change_payloads_to_select_targets()
             .expect("full reopen validation")
     });
     assert!(!reopened.opened_by_history_validation());
+    assert!(!reopened.read_authority().snapshot().changes.is_decoded());
     assert_eq!(reopened.read_authority().snapshot().changes.len(), COMMITS);
     assert!(freeze_copies < 0.5 && reopen_copies < 0.5,
         "complete validation held change-payload copies only to select replay targets: freeze={freeze_copies:.3}, reopen={reopen_copies:.3}");

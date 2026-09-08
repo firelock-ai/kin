@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! The repository change map, decoded from its snapshot on first use.
+//! Indexed repository history with disk-backed append records.
 //!
 //! A converted repository's snapshot IS its history: on psf/requests at 6733
 //! commits the `changes` map is 93.8 percent of a 1051.5 MiB body, and on the
@@ -11,24 +11,22 @@
 //! a map that the served graph reads by reference and a commit reads once.
 //!
 //! [`ChangeMap`] is the map's type in [`GraphSnapshot`](super::format::GraphSnapshot).
-//! It dereferences to the `HashMap` every reader already expects, so a read
-//! site compiles untouched and pays the decode the first time it is reached,
-//! and never before. An open that leaves the map encoded holds the snapshot
-//! file it came from and the byte range the map occupies in it; the first
-//! history read re-reads that frame, proves it is the frame the open verified
-//! by comparing the body checksum it carried then, and decodes the one
-//! element. Nothing about the on-disk format moves: a MessagePack positional
-//! array is self-delimiting, so one element of a body decodes exactly as it
-//! decodes inside the whole.
+//! Indexed reads decode one checksum-bound record. Appends retain compact
+//! metadata over an anonymous shared spool, and clones detach only metadata.
+//! Explicit legacy `Deref` access still materializes the complete map. The
+//! snapshot encoding stays unchanged: spooled records serialize as ordinary
+//! MessagePack map entries when a snapshot is written.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut, Range};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::KinDbError;
 use crate::types::{SemanticChange, SemanticChangeId};
@@ -110,6 +108,29 @@ impl fmt::Debug for HistorySource {
 }
 
 impl HistorySource {
+    fn read_record(&self, range: Range<usize>) -> Result<Vec<u8>, KinDbError> {
+        let mut bytes = vec![0; range.len()];
+        match self {
+            Self::File {
+                file, frame_len, ..
+            } => {
+                if range.end as u64 > *frame_len {
+                    return Err(KinDbError::StorageError(
+                        "history record exceeds its frame".into(),
+                    ));
+                }
+                read_exact_at(file, &mut bytes, range.start as u64).map_err(|error| {
+                    KinDbError::StorageError(format!("history record read failed: {error}"))
+                })?;
+            }
+            #[cfg(test)]
+            Self::Memory(frame) => bytes.copy_from_slice(frame.get(range).ok_or_else(|| {
+                KinDbError::StorageError("history record exceeds its frame".into())
+            })?),
+        }
+        Ok(bytes)
+    }
+
     fn describe(&self) -> String {
         match self {
             Self::File { display, .. } => display.clone(),
@@ -164,16 +185,26 @@ impl AsRef<[u8]> for FrameBytes<'_> {
 
 #[cfg(unix)]
 fn read_exact_from_start(file: &File, buffer: &mut [u8]) -> std::io::Result<()> {
+    read_exact_at(file, buffer, 0)
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
-    file.read_exact_at(buffer, 0)
+    file.read_exact_at(buffer, offset)
 }
 
 #[cfg(windows)]
 fn read_exact_from_start(file: &File, buffer: &mut [u8]) -> std::io::Result<()> {
+    read_exact_at(file, buffer, 0)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
     let mut filled = 0usize;
     while filled < buffer.len() {
-        let read = file.seek_read(&mut buffer[filled..], filled as u64)?;
+        let read = file.seek_read(&mut buffer[filled..], offset + filled as u64)?;
         if read == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -197,6 +228,117 @@ pub(crate) struct EncodedChanges {
     /// that does not carry the same checksum is not the snapshot that was
     /// opened and is refused rather than decoded.
     body_checksum: [u8; 32],
+    index: Option<HashMap<SemanticChangeId, HistoryRecord>>,
+}
+
+/// Metadata derived only while decoding a checksum-verified frame. Record
+/// digests bind positional reads to those exact bytes even if the open file
+/// is modified later. Ordered parents retain merge semantics.
+#[derive(Clone, Debug)]
+pub(crate) struct HistoryRecord {
+    pub(crate) range: Range<usize>,
+    pub(crate) sha256: [u8; 32],
+    pub(crate) parents: Vec<SemanticChangeId>,
+    pub(crate) leaf_digest: [u8; 32],
+}
+
+/// Clone-local metadata over a shared append-only anonymous file. No change
+/// bodies or per-record file handles survive an append.
+#[derive(Clone, Default)]
+struct ChangeOverlay {
+    records: HashMap<SemanticChangeId, HistoryRecord>,
+    spool: Option<Arc<Mutex<File>>>,
+}
+
+impl Deref for ChangeOverlay {
+    type Target = HashMap<SemanticChangeId, HistoryRecord>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.records
+    }
+}
+
+impl ChangeOverlay {
+    fn read_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>, KinDbError> {
+        let Some(record) = self.records.get(id) else {
+            return Ok(None);
+        };
+        let file = self
+            .spool
+            .as_ref()
+            .expect("overlay records have a spool")
+            .lock();
+        let mut bytes = vec![0; record.range.len()];
+        read_exact_at(&file, &mut bytes, record.range.start as u64).map_err(|error| {
+            KinDbError::StorageError(format!("history spool read failed: {error}"))
+        })?;
+        drop(file);
+        let actual: [u8; 32] = Sha256::digest(&bytes).into();
+        if actual != record.sha256 {
+            return Err(KinDbError::StorageError(format!(
+                "history spool record {id} changed after append"
+            )));
+        }
+        let change: SemanticChange = rmp_serde::from_slice(&bytes).map_err(|error| {
+            KinDbError::StorageError(format!("history spool decode failed: {error}"))
+        })?;
+        if change.id != *id || change.parents != record.parents {
+            return Err(KinDbError::StorageError(format!(
+                "history spool record {id} index mismatch"
+            )));
+        }
+        Ok(Some(change))
+    }
+
+    fn append(&mut self, change: &SemanticChange) -> Result<(), KinDbError> {
+        let leaf_digest = super::repository::canonical_leaf_hash("changes", &(&change.id, change))?;
+        let bytes = rmp_serde::to_vec(change).map_err(|error| {
+            KinDbError::StorageError(format!("history spool encode failed: {error}"))
+        })?;
+        let sha256 = Sha256::digest(&bytes).into();
+        if self.spool.is_none() {
+            self.spool = Some(Arc::new(Mutex::new(tempfile::tempfile().map_err(
+                |error| KinDbError::StorageError(format!("history spool create failed: {error}")),
+            )?)));
+        }
+        let mut file = self.spool.as_ref().expect("spool initialized").lock();
+        let range = (|| -> std::io::Result<Range<usize>> {
+            let start = usize::try_from(file.seek(SeekFrom::End(0))?)
+                .map_err(|_| std::io::Error::other("history spool offset overflow"))?;
+            let end = start
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("history spool length overflow"))?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+            // Publish metadata only after the positional reader observes the
+            // exact encoded bytes. A partial write leaves unreachable space.
+            let mut verified = 0;
+            let mut buffer = [0; 8192];
+            while verified < bytes.len() {
+                let length = buffer.len().min(bytes.len() - verified);
+                read_exact_at(&file, &mut buffer[..length], (start + verified) as u64)?;
+                if buffer[..length] != bytes[verified..verified + length] {
+                    return Err(std::io::Error::other("history spool verification mismatch"));
+                }
+                verified += length;
+            }
+            Ok(start..end)
+        })()
+        .map_err(|error| {
+            KinDbError::StorageError(format!("history spool append failed: {error}"))
+        })?;
+        drop(file);
+        self.records.insert(
+            change.id,
+            HistoryRecord {
+                range,
+                sha256,
+                parents: change.parents.clone(),
+                leaf_digest,
+            },
+        );
+        Ok(())
+    }
 }
 
 impl EncodedChanges {
@@ -211,7 +353,38 @@ impl EncodedChanges {
             range,
             len,
             body_checksum,
+            index: None,
         }
+    }
+
+    pub(crate) fn with_index(mut self, index: HashMap<SemanticChangeId, HistoryRecord>) -> Self {
+        self.index = Some(index);
+        self
+    }
+
+    fn read_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>, KinDbError> {
+        let Some(index) = &self.index else {
+            return Ok(self.decode()?.get(id).cloned());
+        };
+        let Some(record) = index.get(id) else {
+            return Ok(None);
+        };
+        let bytes = self.source.read_record(record.range.clone())?;
+        let actual: [u8; 32] = Sha256::digest(&bytes).into();
+        if actual != record.sha256 {
+            return Err(KinDbError::StorageError(format!(
+                "history record {id} changed after open"
+            )));
+        }
+        let change: SemanticChange = rmp_serde::from_slice(&bytes).map_err(|error| {
+            KinDbError::StorageError(format!("history record {id} decode failed: {error}"))
+        })?;
+        if change.id != *id || change.parents != record.parents {
+            return Err(KinDbError::StorageError(format!(
+                "history record {id} index mismatch"
+            )));
+        }
+        Ok(Some(change))
     }
 
     fn decode(&self) -> Result<ChangeMapInner, KinDbError> {
@@ -241,19 +414,15 @@ impl EncodedChanges {
     }
 }
 
-/// The repository's change map, decoded on first use.
-///
-/// Every read goes through [`Deref`], so the type is invisible at a read
-/// site. The decode is fallible in principle, because it re-reads a file, and
-/// `Deref` cannot say so; an open proves the file readable and its frame
-/// intact before it hands out an encoded map, so what remains is a file that
-/// changed or vanished underneath a running process, and that fails loud with
-/// the snapshot named rather than serving an empty history. Callers that can
-/// carry an error use [`ChangeMap::decoded`] instead.
+/// The repository's indexed change map. Fallible record reads preserve bounded
+/// body memory; explicit legacy [`Deref`] access materializes all entries and
+/// panics on storage corruption. [`ChangeMap::decoded`] exposes that error.
 pub struct ChangeMap {
     /// Clones share both first-use decoding and its result. Mutable access
     /// detaches the entries before handing them to the caller.
     body: Arc<ChangeMapBody>,
+    overlay: Arc<ChangeOverlay>,
+    combined: Arc<OnceLock<ChangeMapInner>>,
     /// Memoized history-root leaf digests, keyed by change identity.
     ///
     /// `history_root` folds this map through `canonical_leaf_hash`, which
@@ -322,6 +491,147 @@ pub(crate) struct LeafDigestMemo {
 }
 
 impl ChangeMap {
+    pub(crate) fn shares_storage(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.body, &other.body) && Arc::ptr_eq(&self.overlay, &other.overlay)
+    }
+
+    pub(crate) fn has_admitted_encoded_base(&self) -> bool {
+        self.body.encoded.is_some()
+            && self.body.decoded.get().is_none()
+            && self.combined.get().is_none()
+    }
+
+    /// Check identity membership using the compact index.
+    pub fn contains_change(&self, id: &SemanticChangeId) -> bool {
+        if self.overlay.contains_key(id) {
+            return true;
+        }
+        if let Some(decoded) = self.body.decoded.get() {
+            return decoded.contains_key(id);
+        }
+        if let Some(index) = self
+            .body
+            .encoded
+            .as_ref()
+            .and_then(|encoded| encoded.index.as_ref())
+        {
+            return index.contains_key(id);
+        }
+        self.force().contains_key(id)
+    }
+
+    pub fn contains_key(&self, id: &SemanticChangeId) -> bool {
+        self.contains_change(id)
+    }
+
+    /// Read one immutable change without materializing the rest of history.
+    pub fn read_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>, KinDbError> {
+        if self.overlay.contains_key(id) {
+            return self.overlay.read_change(id);
+        }
+        if let Some(decoded) = self.body.decoded.get() {
+            return Ok(decoded.get(id).cloned());
+        }
+        match &self.body.encoded {
+            Some(encoded) => encoded.read_change(id),
+            None => Ok(None),
+        }
+    }
+
+    /// Copy compact identity metadata, leaving change bodies on disk.
+    pub fn change_ids(&self) -> Vec<SemanticChangeId> {
+        let mut ids: Vec<_> = if let Some(decoded) = self.body.decoded.get() {
+            decoded.keys().copied().collect()
+        } else if let Some(index) = self
+            .body
+            .encoded
+            .as_ref()
+            .and_then(|encoded| encoded.index.as_ref())
+        {
+            index.keys().copied().collect()
+        } else {
+            self.body
+                .encoded
+                .as_ref()
+                .expect("encoded history has a source")
+                .decode()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .keys()
+                .copied()
+                .collect()
+        };
+        ids.extend(self.overlay.keys().copied());
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Visit complete records with at most one decoded body retained by this
+    /// reader. The visitor controls whether it retains any payload itself.
+    pub fn visit_changes(
+        &self,
+        mut visit: impl FnMut(&SemanticChange) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
+        if let Some(decoded) = self.body.decoded.get() {
+            for change in decoded.values() {
+                visit(change)?;
+            }
+            for id in self.overlay.keys() {
+                let change = self
+                    .overlay
+                    .read_change(id)?
+                    .expect("indexed overlay record");
+                visit(&change)?;
+            }
+        } else {
+            for id in self.change_ids() {
+                let change = self.read_change(&id)?.ok_or_else(|| {
+                    KinDbError::StorageError(format!("history record {id} missing"))
+                })?;
+                visit(&change)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Append an immutable record without detaching the base history. Reusing
+    /// an identity with different content is refused before the overlay moves.
+    pub fn append_change(&mut self, change: SemanticChange) -> Result<(), KinDbError> {
+        if let Some(existing) = self.read_change(&change.id)? {
+            return if existing == change {
+                Ok(())
+            } else {
+                Err(KinDbError::DuplicateChange(change.id.to_string()))
+            };
+        }
+        kin_model::validate_semantic_change_id(&change)?;
+        Arc::make_mut(&mut self.overlay).append(&change)?;
+        self.combined = Arc::default();
+        Ok(())
+    }
+
+    /// Ordered parent metadata without loading a change body.
+    pub fn change_parents(
+        &self,
+        id: &SemanticChangeId,
+    ) -> Result<Option<Vec<SemanticChangeId>>, KinDbError> {
+        if let Some(change) = self.overlay.get(id) {
+            return Ok(Some(change.parents.clone()));
+        }
+        if let Some(decoded) = self.body.decoded.get() {
+            return Ok(decoded.get(id).map(|change| change.parents.clone()));
+        }
+        if let Some(index) = self
+            .body
+            .encoded
+            .as_ref()
+            .and_then(|encoded| encoded.index.as_ref())
+        {
+            return Ok(index.get(id).map(|record| record.parents.clone()));
+        }
+        Ok(self.read_change(id)?.map(|change| change.parents))
+    }
+
     /// An empty, decoded map.
     pub fn new() -> Self {
         Self::from(ChangeMapInner::new())
@@ -336,6 +646,8 @@ impl ChangeMap {
                 decode_gate: Mutex::new(()),
             }),
             leaf_digests: Arc::default(),
+            overlay: Arc::default(),
+            combined: Arc::default(),
         }
     }
 
@@ -344,7 +656,11 @@ impl ChangeMap {
     /// `false` is the state an open leaves a converted store's history in, and
     /// the state the served graph never has to leave.
     pub fn is_decoded(&self) -> bool {
-        self.body.decoded.get().is_some()
+        if self.overlay.is_empty() {
+            self.body.decoded.get().is_some()
+        } else {
+            self.combined.get().is_some()
+        }
     }
 
     /// The entries if they are already in memory, and `None` if they are
@@ -354,16 +670,21 @@ impl ChangeMap {
     /// this is for the one caller that has to compare map identity without
     /// paying the decode the comparison exists to avoid.
     pub(crate) fn decoded_if_present(&self) -> Option<&ChangeMapInner> {
-        self.body.decoded.get()
+        if self.overlay.is_empty() {
+            self.body.decoded.get()
+        } else {
+            self.combined.get()
+        }
     }
 
     /// Number of changes, read from the map header when the map is encoded.
     pub fn len(&self) -> usize {
-        match (self.body.decoded.get(), &self.body.encoded) {
+        let base = match (self.body.decoded.get(), &self.body.encoded) {
             (Some(decoded), _) => decoded.len(),
             (None, Some(encoded)) => encoded.len,
             (None, None) => 0,
-        }
+        };
+        base + self.overlay.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -372,6 +693,18 @@ impl ChangeMap {
 
     /// The entries, decoding them first if they are still on disk.
     pub fn decoded(&self) -> Result<&ChangeMapInner, KinDbError> {
+        if !self.overlay.is_empty() {
+            if let Some(combined) = self.combined.get() {
+                return Ok(combined);
+            }
+            let mut combined = HashMap::with_capacity(self.len());
+            self.visit_changes(|change| {
+                combined.insert(change.id, change.clone());
+                Ok(())
+            })?;
+            let _ = self.combined.set(combined);
+            return Ok(self.combined.get().expect("combined history initialized"));
+        }
         if let Some(decoded) = self.body.decoded.get() {
             return Ok(decoded);
         }
@@ -411,7 +744,40 @@ impl ChangeMap {
         domain: &'static str,
         compute: impl Fn(&SemanticChangeId, &SemanticChange) -> Result<[u8; 32], E>,
     ) -> Result<Vec<[u8; 32]>, E> {
-        let entries = self.force();
+        if self.body.decoded.get().is_none() {
+            if let Some(index) = self
+                .body
+                .encoded
+                .as_ref()
+                .and_then(|encoded| encoded.index.as_ref())
+            {
+                let mut digests = Vec::with_capacity(self.len());
+                if domain == "changes" {
+                    digests.extend(index.values().map(|record| record.leaf_digest));
+                    digests.extend(self.overlay.values().map(|record| record.leaf_digest));
+                } else {
+                    for id in self.change_ids() {
+                        let change = self
+                            .read_change(&id)
+                            .unwrap_or_else(|error| panic!("{error}"))
+                            .expect("indexed history record");
+                        digests.push(compute(&id, &change)?);
+                    }
+                }
+                digests.sort_unstable();
+                return Ok(digests);
+            }
+        }
+        let entries = self.body.decoded.get().unwrap_or_else(|| {
+            self.body.decoded.get_or_init(|| {
+                self.body
+                    .encoded
+                    .as_ref()
+                    .expect("encoded history source")
+                    .decode()
+                    .unwrap_or_else(|error| panic!("{error}"))
+            })
+        });
         let mut memo = self.leaf_digests.lock();
         if memo.domain != Some(domain) {
             memo.domain = Some(domain);
@@ -445,6 +811,20 @@ impl ChangeMap {
                 }
             }
         }
+        for (id, record) in self.overlay.iter() {
+            let digest = if domain == "changes" {
+                record.leaf_digest
+            } else {
+                let change = self
+                    .overlay
+                    .read_change(id)
+                    .unwrap_or_else(|error| panic!("{error}"))
+                    .expect("indexed overlay record");
+                compute(id, &change)?
+            };
+            memo.digests.insert(*id, digest);
+            digests.push(digest);
+        }
         digests.sort_unstable();
         Ok(digests)
     }
@@ -460,6 +840,15 @@ impl ChangeMap {
     /// moves its allocation; a map another snapshot still shares is copied.
     pub fn into_inner(self) -> ChangeMapInner {
         self.force();
+        if !self.overlay.is_empty() {
+            return match Arc::try_unwrap(self.combined) {
+                Ok(combined) => combined.into_inner().expect("combined history initialized"),
+                Err(combined) => combined
+                    .get()
+                    .expect("combined history initialized")
+                    .clone(),
+            };
+        }
         match Arc::try_unwrap(self.body) {
             Ok(body) => body
                 .decoded
@@ -485,6 +874,8 @@ impl From<ChangeMapInner> for ChangeMap {
         Self {
             body: Arc::new(ChangeMapBody::from(inner)),
             leaf_digests: Arc::default(),
+            overlay: Arc::default(),
+            combined: Arc::default(),
         }
     }
 }
@@ -518,6 +909,11 @@ impl Deref for ChangeMap {
 impl DerefMut for ChangeMap {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.force();
+        if !self.overlay.is_empty() {
+            self.body = Arc::new(ChangeMapBody::from(self.force().clone()));
+            self.overlay = Arc::default();
+            self.combined = Arc::default();
+        }
         if Arc::get_mut(&mut self.body).is_none() {
             self.body = Arc::new(ChangeMapBody::from(self.force().clone()));
         }
@@ -537,6 +933,8 @@ impl Clone for ChangeMap {
         Self {
             body: Arc::clone(&self.body),
             leaf_digests: Arc::clone(&self.leaf_digests),
+            overlay: Arc::clone(&self.overlay),
+            combined: Arc::clone(&self.combined),
         }
     }
 }
@@ -602,7 +1000,21 @@ impl<'a> IntoIterator for &'a mut ChangeMap {
 
 impl Serialize for ChangeMap {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.force().serialize(serializer)
+        use serde::ser::SerializeMap;
+        if self.overlay.is_empty() {
+            if let Some(decoded) = self.body.decoded.get() {
+                return decoded.serialize(serializer);
+            }
+        }
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        for id in self.change_ids() {
+            let change = self
+                .read_change(&id)
+                .map_err(serde::ser::Error::custom)?
+                .ok_or_else(|| serde::ser::Error::custom("indexed change is missing"))?;
+            map.serialize_entry(&id, &change)?;
+        }
+        map.end()
     }
 }
 
@@ -615,6 +1027,123 @@ impl<'de> Deserialize<'de> for ChangeMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn large_change(index: usize) -> SemanticChange {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(crate::types::Hash256::from_bytes([0; 32])),
+            parents: Vec::new(),
+            timestamp: crate::types::Timestamp::now(),
+            author: crate::types::AuthorId::new("spool-test"),
+            message: format!("{index}:{}", "x".repeat(256 * 1024)),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    #[test]
+    fn append_spool_retains_only_metadata_and_clones_isolate_membership() {
+        let mut map = ChangeMap::new();
+        let first = large_change(0);
+        map.append_change(first.clone()).unwrap();
+        let old = map.clone();
+        for index in 1..16 {
+            map.append_change(large_change(index)).unwrap();
+        }
+        assert_eq!(old.len(), 1);
+        assert_eq!(map.len(), 16);
+        assert!(Arc::ptr_eq(
+            old.overlay.spool.as_ref().unwrap(),
+            map.overlay.spool.as_ref().unwrap()
+        ));
+        assert!(!Arc::ptr_eq(&old.overlay, &map.overlay));
+        assert!(map.body.decoded.get().unwrap().is_empty());
+        assert!(map.combined.get().is_none());
+        let spool_bytes = map
+            .overlay
+            .spool
+            .as_ref()
+            .unwrap()
+            .lock()
+            .metadata()
+            .unwrap()
+            .len();
+        let metadata_bytes = map.overlay.records.capacity()
+            * std::mem::size_of::<(SemanticChangeId, HistoryRecord)>();
+        assert!(spool_bytes >= 16 * 256 * 1024);
+        assert!(metadata_bytes < 16 * 1024);
+        assert_eq!(old.read_change(&first.id).unwrap(), Some(first));
+        let digests = map
+            .sorted_leaf_digests::<()>("changes", |_, _| {
+                panic!("spooled leaves are already computed")
+            })
+            .unwrap();
+        assert_eq!(digests.len(), 16);
+        let mut expected = Vec::new();
+        map.visit_changes(|change| {
+            expected.push(super::super::repository::canonical_leaf_hash(
+                "changes",
+                &(&change.id, change),
+            )?);
+            Ok(())
+        })
+        .unwrap();
+        expected.sort_unstable();
+        assert_eq!(digests, expected);
+    }
+
+    #[test]
+    fn spool_corruption_and_truncation_fail_reads() {
+        let mut map = ChangeMap::new();
+        let change = large_change(0);
+        let id = change.id;
+        map.append_change(change).unwrap();
+        {
+            let mut file = map.overlay.spool.as_ref().unwrap().lock();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&[0]).unwrap();
+        }
+        assert!(map
+            .read_change(&id)
+            .unwrap_err()
+            .to_string()
+            .contains("changed after append"));
+        map.overlay
+            .spool
+            .as_ref()
+            .unwrap()
+            .lock()
+            .set_len(0)
+            .unwrap();
+        assert!(map
+            .read_change(&id)
+            .unwrap_err()
+            .to_string()
+            .contains("spool read failed"));
+    }
+
+    #[test]
+    fn failed_spool_append_does_not_publish_a_record() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let readonly = File::open(temporary.path()).unwrap();
+        let mut map = ChangeMap::new();
+        Arc::make_mut(&mut map.overlay).spool = Some(Arc::new(Mutex::new(readonly)));
+        let change = large_change(0);
+        let id = change.id;
+        assert!(map.append_change(change).is_err());
+        assert_eq!(map.len(), 0);
+        assert!(!map.contains_change(&id));
+        assert!(map.read_change(&id).unwrap().is_none());
+    }
 
     #[test]
     fn a_decoded_map_reads_like_the_map_it_wraps() {

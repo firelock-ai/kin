@@ -2274,7 +2274,7 @@ pub(crate) struct RecoveredRepositoryAuthority {
     pub recovered: RecoveredSnapshot,
     pub reused_complete_validation: bool,
     /// Whether the change map was streamed through the caller's visitor and
-    /// left on disk. When this is false the visitor saw nothing and the
+    /// left encoded, with acknowledged frame changes appended. When this is false the visitor saw nothing and the
     /// snapshot's `changes` is decoded, so a caller that needs every change
     /// once reads it from the map instead.
     pub history_streamed: bool,
@@ -2324,8 +2324,8 @@ pub(crate) fn load_recovered_repository_authority<B: StorageBackend + ?Sized>(
 /// order the map stores them, and none is retained; the recovered snapshot's
 /// `changes` decodes itself the first time a reader asks for an entry. When
 /// the base cannot be decoded that way, because the backend kept no file
-/// handle, the journal is not empty, or no durable validation names these
-/// exact bytes, recovery decodes the whole body exactly as the plain entry
+/// handle, or the journal contains legacy graph deltas, recovery decodes the
+/// whole body exactly as the plain entry
 /// point does and the visitor is never called, which
 /// [`RecoveredRepositoryAuthority::history_streamed`] reports.
 pub(crate) fn load_recovered_repository_authority_streaming<B: StorageBackend + ?Sized>(
@@ -2342,14 +2342,14 @@ pub(crate) fn load_recovered_repository_authority_streaming<B: StorageBackend + 
     )
 }
 
-/// How recovery decodes a journal-free base that a durable validation names.
+/// How recovery decodes a base, independently of complete-validation reuse.
 pub(crate) enum HistoryDecode<'v> {
     /// The whole body, change map included, as every open did before
     /// FIR-3064.
     Eager,
     /// Every other element decoded, the change map streamed once through the
     /// visitor and left on disk. Falls back to `Eager` when the backend has no
-    /// file to hand back or the base is not journal-free and proven.
+    /// file to hand back or the journal contains legacy graph deltas.
     Streamed(&'v mut dyn FnMut(&kin_model::SemanticChange) -> Result<(), KinDbError>),
 }
 
@@ -2402,7 +2402,7 @@ pub(crate) fn recover_snapshot_from_state(
     authority: &SnapshotAuthority,
     raw_deltas: &[PersistedDelta],
     expected_validator_version: Option<u32>,
-    history: HistoryDecode<'_>,
+    mut history: HistoryDecode<'_>,
 ) -> Result<RecoveredRepositoryAuthority, KinDbError> {
     if authority.snapshot_generation > authority.head_generation {
         return Err(KinDbError::StorageError(format!(
@@ -2440,13 +2440,15 @@ pub(crate) fn recover_snapshot_from_state(
         let mut history_streamed = false;
         let snapshot = match (
             reused_complete_validation,
-            history,
+            &mut history,
             &authority.snapshot_source,
         ) {
-            (true, HistoryDecode::Streamed(visit_change), Some(source)) => {
-                let _span =
-                    tracing::info_span!("kindb.snapshot.reuse_exact_complete_validation_streamed")
-                        .entered();
+            (_, HistoryDecode::Streamed(visit_change), Some(source)) => {
+                let _span = tracing::info_span!(
+                    "kindb.snapshot.decode_streamed",
+                    reused_complete_validation
+                )
+                .entered();
                 let frame_len = u64::try_from(authority.snapshot_bytes.len()).map_err(|_| {
                     KinDbError::StorageError(format!(
                         "repo {repo_id} snapshot length does not fit u64"
@@ -2459,8 +2461,16 @@ pub(crate) fn recover_snapshot_from_state(
                         display: source.display.clone(),
                         frame_len,
                     },
-                    visit_change,
+                    &mut |change| {
+                        if !reused_complete_validation {
+                            crate::storage::change_validation::validate_semantic_change(change)?;
+                        }
+                        visit_change(change)
+                    },
                 )?;
+                if !reused_complete_validation {
+                    snapshot.validate_storage_admission()?;
+                }
                 history_streamed = true;
                 snapshot
             }
@@ -2650,9 +2660,40 @@ pub(crate) fn recover_snapshot_from_state(
             // validates the reconstructed head, and every base change and every
             // envelope entry the frames carry forward is inside that head, so a
             // separate pass over the base would prove nothing more.
+            let history_streamed = matches!(&history, HistoryDecode::Streamed(_))
+                && authority.snapshot_source.is_some();
             let mut snapshot = {
                 let _span = tracing::info_span!("kindb.snapshot.decode_journal_base").entered();
-                GraphSnapshot::from_bytes_reusing_exact_validation(&authority.snapshot_bytes)?
+                match (&mut history, &authority.snapshot_source) {
+                    (HistoryDecode::Streamed(visit_change), Some(source)) => {
+                        let frame_len =
+                            u64::try_from(authority.snapshot_bytes.len()).map_err(|_| {
+                                KinDbError::StorageError(format!(
+                                    "repo {repo_id} snapshot length does not fit u64"
+                                ))
+                            })?;
+                        GraphSnapshot::from_bytes_with_encoded_history(
+                            &authority.snapshot_bytes,
+                            crate::storage::change_map::HistorySource::File {
+                                file: std::sync::Arc::clone(&source.file),
+                                display: source.display.clone(),
+                                frame_len,
+                            },
+                            &mut |change| {
+                                if !reused_complete_validation {
+                                    crate::storage::change_validation::validate_semantic_change(
+                                        change,
+                                    )?;
+                                }
+                                visit_change(change)
+                            },
+                        )?
+                        .0
+                    }
+                    _ => GraphSnapshot::from_bytes_reusing_exact_validation(
+                        &authority.snapshot_bytes,
+                    )?,
+                }
             };
             if snapshot.repository_authority.is_none() {
                 return Err(KinDbError::StorageError(format!(
@@ -2672,6 +2713,13 @@ pub(crate) fn recover_snapshot_from_state(
                         "repo {repo_id} authority frame at generation {generation} does not apply: {error}"
                     ))
                 })?;
+                if history_streamed {
+                    if let HistoryDecode::Streamed(visit_change) = &mut history {
+                        for change in &frame.changes {
+                            visit_change(change)?;
+                        }
+                    }
+                }
             }
             if !reused_complete_validation {
                 let _span = tracing::info_span!("kindb.snapshot.validate_journal_head").entered();
@@ -2690,7 +2738,7 @@ pub(crate) fn recover_snapshot_from_state(
                     journal_sha256: Some(journal_sha256),
                 },
                 reused_complete_validation,
-                history_streamed: false,
+                history_streamed,
                 payload_stats,
             })
         }
@@ -9108,6 +9156,35 @@ impl StorageBackend for LocalFileBackend {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn unproven_local_recovery_keeps_history_encoded_without_reusing_validation() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        backend
+            .save_snapshot("streamed", &bytes, GENERATION_INIT)
+            .unwrap();
+        let mut seen = 0;
+        let recovered =
+            load_recovered_repository_authority_streaming(&backend, "streamed", 1, &mut |_| {
+                seen += 1;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(recovered.history_streamed);
+        assert!(!recovered.reused_complete_validation);
+        assert!(!recovered.recovered.snapshot.changes.is_decoded());
+        assert_eq!(seen, 0);
+        recovered
+            .recovered
+            .snapshot
+            .validate_storage_admission()
+            .unwrap();
+        assert!(!recovered.recovered.snapshot.changes.is_decoded());
+        assert_eq!(recovered.recovered.snapshot.to_bytes().unwrap(), bytes);
+    }
 
     #[cfg(unix)]
     fn copy_test_directory(source: &Path, destination: &Path) {

@@ -37,6 +37,7 @@
 //! transitions disagreed, and that fails the gate loudly instead of admitting
 //! an unproven history.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -178,6 +179,55 @@ impl ReplayProgress {
     }
 }
 
+/// Live graph and tree at one first-parent head, without revision timelines or tombstones.
+#[derive(Debug, Default)]
+pub struct ResolvedCurrentGraph {
+    pub entities: HashMap<EntityId, Entity>,
+    pub relations: HashMap<RelationId, Relation>,
+    pub external_references: HashMap<ExternalReferenceId, ExternalReference>,
+    pub tree: ResolvedTree,
+}
+
+/// Resolve live state while retaining only lineage IDs and one change body.
+///
+/// Indexed snapshots and append spools supply parent metadata without decoding
+/// their bodies. Replay applies bodies oldest first using the same validated
+/// transitions as authority admission. Secondary parents contribute ancestry,
+/// not material state. Full revision resolution remains a separate API.
+pub fn resolve_current_graph(
+    changes: &crate::storage::change_map::ChangeMap,
+    head: &SemanticChangeId,
+) -> Result<ResolvedCurrentGraph, KinDbError> {
+    let mut lineage = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = Some(*head);
+    while let Some(id) = current {
+        if !seen.insert(id) {
+            return Err(ModelError::Conflict(format!(
+                "cycle in first-parent history at change {id}"
+            ))
+            .into());
+        }
+        let parents = changes
+            .change_parents(&id)?
+            .ok_or_else(|| ModelError::ChangeNotFound(id.to_string()))?;
+        lineage.push(id);
+        current = parents.first().copied();
+    }
+    drop(seen);
+    let mut state = ReplayState::default();
+    for id in lineage.into_iter().rev() {
+        let change = lineage_change(changes, &id)?;
+        apply_change(&mut state, &change, Step::Forward)?;
+    }
+    Ok(ResolvedCurrentGraph {
+        entities: state.entities,
+        relations: state.relations,
+        external_references: state.external_references,
+        tree: state.tree,
+    })
+}
+
 /// The exact state a first-parent replay carries between changes.
 ///
 /// Entity revision timelines and tombstones are deliberately absent. Whole-graph
@@ -286,8 +336,8 @@ enum Step {
 /// `targets` are the changes whose lineage must be proven. Their first-parent
 /// ancestors are proven with them, because a target's own transition is only
 /// meaningful against the state its lineage published.
-pub(crate) fn validate_first_parent_history(
-    changes: &HashMap<SemanticChangeId, SemanticChange>,
+pub(crate) fn validate_first_parent_history<S: LineageSource + ?Sized>(
+    changes: &S,
     targets: &[SemanticChangeId],
 ) -> Result<(), KinDbError> {
     let lineage = collect_first_parent_lineage(changes, targets)?;
@@ -324,8 +374,8 @@ pub(crate) fn validate_first_parent_history(
 }
 
 /// Enter and unwind every lineage member exactly once, carrying one state.
-fn walk_first_parent_forest(
-    changes: &HashMap<SemanticChangeId, SemanticChange>,
+fn walk_first_parent_forest<S: LineageSource + ?Sized>(
+    changes: &S,
     lineage: &BTreeSet<SemanticChangeId>,
     children: &BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>>,
     roots: &BTreeSet<SemanticChangeId>,
@@ -347,7 +397,7 @@ fn walk_first_parent_forest(
                     .into());
                 }
                 let change = lineage_change(changes, &change_id)?;
-                apply_change(&mut state, change, Step::Forward)?;
+                apply_change(&mut state, &change, Step::Forward)?;
                 progress.record();
                 frames.push(Frame::Exit(change_id));
                 if let Some(next) = children.get(&change_id) {
@@ -358,7 +408,7 @@ fn walk_first_parent_forest(
             }
             Frame::Exit(change_id) => {
                 let change = lineage_change(changes, &change_id)?;
-                apply_change(&mut state, change, Step::Rewind)?;
+                apply_change(&mut state, &change, Step::Rewind)?;
             }
         }
     }
@@ -413,9 +463,9 @@ fn collect_first_parent_lineage<S: LineageSource + ?Sized>(
 fn lineage_change<'a, S: LineageSource + ?Sized>(
     changes: &'a S,
     change_id: &SemanticChangeId,
-) -> Result<&'a SemanticChange, KinDbError> {
+) -> Result<Cow<'a, SemanticChange>, KinDbError> {
     changes
-        .lineage_change(change_id)
+        .lineage_change(change_id)?
         .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()).into())
 }
 
@@ -426,24 +476,40 @@ fn lineage_change<'a, S: LineageSource + ?Sized>(
 /// Naming the one operation a traversal performs keeps a single walk
 /// serving both instead of forcing either side to copy its map.
 pub(crate) trait LineageSource {
-    fn lineage_change(&self, change_id: &SemanticChangeId) -> Option<&SemanticChange>;
+    fn lineage_change(
+        &self,
+        change_id: &SemanticChangeId,
+    ) -> Result<Option<Cow<'_, SemanticChange>>, KinDbError>;
 }
 
 impl LineageSource for HashMap<SemanticChangeId, SemanticChange> {
-    fn lineage_change(&self, change_id: &SemanticChangeId) -> Option<&SemanticChange> {
-        self.get(change_id)
+    fn lineage_change(
+        &self,
+        change_id: &SemanticChangeId,
+    ) -> Result<Option<Cow<'_, SemanticChange>>, KinDbError> {
+        Ok(self.get(change_id).map(Cow::Borrowed))
     }
 }
 
 impl LineageSource for hashbrown::HashMap<SemanticChangeId, SemanticChange> {
-    fn lineage_change(&self, change_id: &SemanticChangeId) -> Option<&SemanticChange> {
-        self.get(change_id)
+    fn lineage_change(
+        &self,
+        change_id: &SemanticChangeId,
+    ) -> Result<Option<Cow<'_, SemanticChange>>, KinDbError> {
+        Ok(self.get(change_id).map(Cow::Borrowed))
     }
 }
 
 impl LineageSource for crate::storage::change_map::ChangeMap {
-    fn lineage_change(&self, change_id: &SemanticChangeId) -> Option<&SemanticChange> {
-        self.get(change_id)
+    fn lineage_change(
+        &self,
+        change_id: &SemanticChangeId,
+    ) -> Result<Option<Cow<'_, SemanticChange>>, KinDbError> {
+        if let Some(decoded) = self.decoded_if_present() {
+            return Ok(decoded.get(change_id).map(Cow::Borrowed));
+        }
+        self.read_change(change_id)
+            .map(|change| change.map(Cow::Owned))
     }
 }
 
@@ -1017,6 +1083,7 @@ mod tests {
         changes: &HashMap<SemanticChangeId, SemanticChange>,
         targets: &[SemanticChangeId],
     ) -> Result<(), String> {
+        assert_current_projection_agrees(changes, targets);
         let legacy = legacy_outcome(changes, targets);
         let incremental = incremental_outcome(changes, targets);
         assert_eq!(
@@ -1024,6 +1091,45 @@ mod tests {
             "{label}: per-change replay and incremental replay disagree"
         );
         incremental
+    }
+
+    fn assert_current_projection_agrees(
+        changes: &HashMap<SemanticChangeId, SemanticChange>,
+        targets: &[SemanticChangeId],
+    ) {
+        let store = LegacyReplayStore {
+            changes: changes.clone(),
+        };
+        let decoded = crate::storage::ChangeMap::from(
+            changes
+                .iter()
+                .map(|(id, change)| (*id, change.clone()))
+                .collect::<crate::storage::ChangeMapInner>(),
+        );
+        let mut spooled = crate::storage::ChangeMap::new();
+        for change in changes.values() {
+            spooled.append_change(change.clone()).unwrap();
+        }
+        let decodes = crate::storage::change_map::change_maps_decoded_on_this_thread();
+        for target in targets {
+            for map in [&decoded, &spooled] {
+                match (store.resolve_graph_at(target), resolve_current_graph(map, target)) {
+                    (Ok(expected), Ok(actual)) => {
+                        assert_eq!(actual.entities, expected.entities);
+                        assert_eq!(actual.relations, expected.relations);
+                        assert_eq!(actual.external_references, expected.external_references);
+                        assert_eq!(actual.tree, expected.tree);
+                    }
+                    (Err(_), Err(_)) => {}
+                    (expected, actual) => panic!("current projection disagrees at {target}: oracle={expected:?}, current={actual:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            crate::storage::change_map::change_maps_decoded_on_this_thread(),
+            decodes
+        );
+        assert!(!spooled.is_decoded());
     }
 
     fn assert_agreed_refusal(
@@ -1770,6 +1876,17 @@ mod tests {
             changes.insert(id, cyclic);
         }
         let targets = vec![left, right];
+
+        let map = crate::storage::ChangeMap::from(
+            changes
+                .iter()
+                .map(|(id, change)| (*id, change.clone()))
+                .collect::<crate::storage::ChangeMapInner>(),
+        );
+        assert!(resolve_current_graph(&map, &left)
+            .unwrap_err()
+            .to_string()
+            .contains("cycle in first-parent history"));
 
         let legacy = legacy_outcome(&changes, &targets)
             .expect_err("the per-change replay must refuse a first-parent cycle");

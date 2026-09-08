@@ -476,10 +476,66 @@ fn derive_entity_revisions_across_history(
         }
     }
 
+    derive_entity_revisions_from_records(ordered.into_iter().map(Ok), pending_children)
+}
+
+/// Traverse compact parent metadata in the same order as the eager history
+/// walk, retaining only one decoded change body during revision derivation.
+fn derive_indexed_entity_revisions(
+    changes: &crate::storage::change_map::ChangeMap,
+) -> Result<HashMap<EntityId, Vec<EntityRevision>>, KinDbError> {
+    let mut ids = changes.change_ids();
+    ids.sort_by_key(|id| id.to_string());
+    let mut visited = HashSet::new();
+    let mut ordered = Vec::with_capacity(ids.len());
+    let mut pending_children = HashMap::new();
+    enum Frame {
+        Visit(SemanticChangeId),
+        Emit(SemanticChangeId),
+    }
+    for id in ids {
+        let mut stack = vec![Frame::Visit(id)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Visit(id) => {
+                    if !visited.insert(id) {
+                        continue;
+                    }
+                    let Some(parents) = changes.change_parents(&id)? else {
+                        continue;
+                    };
+                    if let Some(parent) = parents.first() {
+                        *pending_children.entry(*parent).or_insert(0) += 1;
+                    }
+                    stack.push(Frame::Emit(id));
+                    for parent in parents.into_iter().rev() {
+                        stack.push(Frame::Visit(parent));
+                    }
+                }
+                Frame::Emit(id) => ordered.push(id),
+            }
+        }
+    }
+    derive_entity_revisions_from_records(
+        ordered.into_iter().map(|id| {
+            changes
+                .read_change(&id)?
+                .ok_or_else(|| KinDbError::StorageError(format!("history record {id} missing")))
+        }),
+        pending_children,
+    )
+}
+
+fn derive_entity_revisions_from_records<C: std::borrow::Borrow<SemanticChange>>(
+    ordered: impl IntoIterator<Item = Result<C, KinDbError>>,
+    mut pending_children: HashMap<SemanticChangeId, usize>,
+) -> Result<HashMap<EntityId, Vec<EntityRevision>>, KinDbError> {
     let mut states: HashMap<SemanticChangeId, LineageEntities> = HashMap::new();
     let mut revisions: HashMap<EntityId, Vec<EntityRevision>> = HashMap::new();
 
     for change in ordered {
+        let change = change?;
+        let change = change.borrow();
         let change_id = change.id;
         // The last child to read a parent takes ownership of its state, so a
         // linear history moves one map forward rather than copying the whole
@@ -2568,13 +2624,17 @@ impl InMemoryGraph {
         }
         if snapshot.entity_revisions.is_empty() && !snapshot.changes.is_empty() {
             let _span = tracing::info_span!(
-                "kindb.graph.derive_entity_revisions",
+                "kindb.graph.validate_history",
                 changes = snapshot.changes.len()
             )
             .entered();
-            derive_entity_revisions_across_history(topologically_order_changes(
-                snapshot.changes.iter(),
-            ))?;
+            // Revision construction can fail only on the same entity
+            // transitions this replay validates. Its revision output is not
+            // consumed by this proof, so retain one replay state instead.
+            crate::storage::history_replay::validate_first_parent_history(
+                &snapshot.changes,
+                &snapshot.changes.change_ids(),
+            )?;
         }
         Ok(())
     }
@@ -2753,7 +2813,7 @@ impl InMemoryGraph {
                     changes = changes.len()
                 )
                 .entered();
-                derive_entity_revisions_across_history(topologically_order_changes(changes.iter()))?
+                derive_indexed_entity_revisions(&changes)?
             } else {
                 entity_revisions.into_iter().collect()
             };
@@ -9398,18 +9458,17 @@ impl ChangeStore for InMemoryGraph {
     fn get_entity_history(&self, id: &EntityId) -> Result<Vec<SemanticChange>, KinDbError> {
         let chg = self.changes.read();
         // Find all changes that mention this entity in their deltas
-        let mut history: Vec<SemanticChange> = chg
-            .changes
-            .values()
-            .filter(|change| {
-                change.entity_deltas.iter().any(|delta| match delta {
-                    EntityDelta::Added { new } => new.id == *id,
-                    EntityDelta::Modified { old, new } => old.id == *id || new.id == *id,
-                    EntityDelta::Removed { old } => old.id == *id,
-                })
-            })
-            .cloned()
-            .collect();
+        let mut history = Vec::new();
+        chg.changes.visit_changes(|change| {
+            if change.entity_deltas.iter().any(|delta| match delta {
+                EntityDelta::Added { new } => new.id == *id,
+                EntityDelta::Modified { old, new } => old.id == *id || new.id == *id,
+                EntityDelta::Removed { old } => old.id == *id,
+            }) {
+                history.push(change.clone());
+            }
+            Ok(())
+        })?;
         // Sort by timestamp ascending
         history.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         Ok(history)
@@ -9427,8 +9486,8 @@ impl ChangeStore for InMemoryGraph {
         let mut stack = vec![*a];
         while let Some(cid) = stack.pop() {
             if ancestors_a.insert(cid) {
-                if let Some(change) = chg.changes.get(&cid) {
-                    stack.extend_from_slice(&change.parents);
+                if let Some(parents) = chg.changes.change_parents(&cid)? {
+                    stack.extend(parents);
                 }
             }
         }
@@ -9447,8 +9506,8 @@ impl ChangeStore for InMemoryGraph {
                 // Don't traverse further past a merge base
                 continue;
             }
-            if let Some(change) = chg.changes.get(&cid) {
-                for parent in &change.parents {
+            if let Some(parents) = chg.changes.change_parents(&cid)? {
+                for parent in &parents {
                     queue.push_back((*parent, depth + 1));
                 }
             }
@@ -9476,13 +9535,15 @@ impl ChangeStore for InMemoryGraph {
         let entities_lock_ms = timer.lap_ms();
         let mut chg = self.changes.write();
         let changes_lock_ms = timer.lap_ms();
-        if let Some(existing) = chg.changes.get(&change.id) {
-            if semantic_change_payload(existing)? == payload {
+        if let Some(existing) = chg.changes.read_change(&change.id)? {
+            if semantic_change_payload(&existing)? == payload {
                 return Ok(());
             }
             return Err(KinDbError::DuplicateChange(change.id.to_string()));
         }
 
+        let mut next_changes = chg.changes.clone();
+        next_changes.append_change(change.clone())?;
         // Revisions, child edges, and the change payload are one durable
         // mutation. Keep the pending-delta lock for the entire authority
         // transition so a concurrent persistence detach cannot split them
@@ -9525,7 +9586,7 @@ impl ChangeStore for InMemoryGraph {
             );
         }
 
-        chg.changes.insert(change.id, change.clone());
+        chg.changes = next_changes;
         delta_map_upsert(&mut pending.delta.changes, change.id, change.clone());
         let pending_entity_revisions = pending.delta.entity_revisions.added.len()
             + pending.delta.entity_revisions.modified.len();
@@ -9578,7 +9639,7 @@ impl ChangeStore for InMemoryGraph {
     }
 
     fn get_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>, KinDbError> {
-        Ok(self.changes.read().changes.get(id).cloned())
+        self.changes.read().changes.read_change(id)
     }
 
     fn get_changes_since(
@@ -9597,9 +9658,9 @@ impl ChangeStore for InMemoryGraph {
             if cid == *base || !visited.insert(cid) {
                 continue;
             }
-            if let Some(change) = chg.changes.get(&cid) {
-                result.push(change.clone());
+            if let Some(change) = chg.changes.read_change(&cid)? {
                 stack.extend_from_slice(&change.parents);
+                result.push(change);
             }
         }
 
@@ -9727,8 +9788,8 @@ impl InMemoryGraph {
         let mut unique_changes = Vec::with_capacity(validated.len());
         let mut batch_payloads = HashMap::new();
         for (change, payload) in validated {
-            if let Some(existing) = chg.changes.get(&change.id) {
-                if semantic_change_payload(existing)? == payload {
+            if let Some(existing) = chg.changes.read_change(&change.id)? {
+                if semantic_change_payload(&existing)? == payload {
                     continue;
                 }
                 return Err(KinDbError::DuplicateChange(change.id.to_string()));
@@ -9744,6 +9805,11 @@ impl InMemoryGraph {
         }
         if unique_changes.is_empty() {
             return Ok(());
+        }
+
+        let mut next_changes = chg.changes.clone();
+        for change in &unique_changes {
+            next_changes.append_change(change.clone())?;
         }
 
         let mut pending = self.pending_delta.lock();
@@ -9784,9 +9850,9 @@ impl InMemoryGraph {
             // The pending delta and live graph both own the change. Clone once
             // for the delta, then move the original into the graph.
             pending_changes.push((change_id, change.clone()));
-            chg.changes.insert(change_id, change);
         }
 
+        chg.changes = next_changes;
         delta_map_upsert_batch(&mut pending.delta.changes, pending_changes);
 
         // Sequential create_change updates the same pending-delta entry on
@@ -15701,8 +15767,27 @@ mod tests {
         let mut snapshot = graph.to_snapshot();
         snapshot.entity_revisions.clear();
 
-        let reloaded = InMemoryGraph::from_snapshot(snapshot)
+        let expected = derive_entity_revisions_across_history(topologically_order_changes(
+            snapshot.changes.iter(),
+        ))
+        .unwrap();
+        let bytes = snapshot.to_bytes().unwrap();
+        let source =
+            crate::storage::change_map::HistorySource::Memory(std::sync::Arc::from(bytes.clone()));
+        let (indexed, _) =
+            GraphSnapshot::from_bytes_with_encoded_history(&bytes, source, &mut |_| Ok(()))
+                .unwrap();
+        let history = indexed.changes.clone();
+        assert!(!history.is_decoded());
+        let decoded_before = crate::storage::change_map::change_maps_decoded_on_this_thread();
+        assert_eq!(derive_indexed_entity_revisions(&history).unwrap(), expected);
+        let reloaded = InMemoryGraph::from_snapshot(indexed)
             .expect("merge history must reload without a stale-payload refusal");
+        assert!(!history.is_decoded());
+        assert_eq!(
+            crate::storage::change_map::change_maps_decoded_on_this_thread(),
+            decoded_before,
+        );
         let repaired = reloaded.to_snapshot();
         let revisions = repaired
             .entity_revisions

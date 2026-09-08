@@ -375,12 +375,14 @@ impl AuthorityFrame {
             ));
         }
 
-        let mut changes: Vec<SemanticChange> = next
-            .changes
-            .values()
-            .filter(|change| !current.changes.contains_key(&change.id))
-            .cloned()
-            .collect();
+        let mut changes = Vec::new();
+        for id in next.changes.change_ids() {
+            if !current.changes.contains_change(&id) {
+                changes.push(next.changes.read_change(&id)?.ok_or_else(|| {
+                    KinDbError::StorageError(format!("successor change {id} is missing"))
+                })?);
+            }
+        }
         changes.sort_by_key(|change| change.id);
         let mut new_change_ids: Vec<_> = changes.iter().map(|change| change.id).collect();
         new_change_ids.sort_unstable();
@@ -444,7 +446,7 @@ impl AuthorityFrame {
     ) -> Result<(), KinDbError> {
         let mut reconstructed = current.clone();
         self.apply(&mut reconstructed)?;
-        if let Some(collection) = first_difference(&reconstructed, next) {
+        if let Some(collection) = first_difference(&reconstructed, next)? {
             return Err(KinDbError::StorageError(format!(
                 "authority frame for generation {} does not reproduce the successor: {collection} differ; refusing to persist it",
                 self.generation()
@@ -475,10 +477,13 @@ impl AuthorityFrame {
             }
         }
         let envelope = self.apply_to_envelope(base_envelope.clone())?;
+        let mut changes = base.changes.clone();
         for change in &self.changes {
-            base.changes.insert(change.id, change.clone());
+            changes.append_change(change.clone())?;
         }
-        base.change_children = derive_change_children(&base.changes);
+        let change_children = derive_change_children(&changes)?;
+        base.changes = changes;
+        base.change_children = change_children;
         base.entity_revisions.clear();
         base.repository_authority = Some(envelope);
         Ok(())
@@ -683,7 +688,7 @@ fn take_drained_frame_tamper() -> Option<Box<dyn FnOnce(&mut AuthorityFrame)>> {
 pub(crate) fn first_difference(
     reconstructed: &GraphSnapshot,
     next: &GraphSnapshot,
-) -> Option<&'static str> {
+) -> Result<Option<&'static str>, KinDbError> {
     let GraphSnapshot {
         // Bound and not compared, for the same reason `materialized_graph` is
         // below and downstream of it. The version a snapshot declares is a pure
@@ -789,7 +794,7 @@ pub(crate) fn first_difference(
         ("relations", relations == next_relations),
         ("outgoing adjacency", outgoing == next_outgoing),
         ("incoming adjacency", incoming == next_incoming),
-        ("changes", changes == next_changes),
+        ("changes", same_changes(changes, next_changes)?),
         ("change children", change_children == next_change_children),
         (
             "work items",
@@ -880,9 +885,24 @@ pub(crate) fn first_difference(
             external_references == next_external_references,
         ),
     ];
-    checks
+    Ok(checks
         .into_iter()
-        .find_map(|(collection, same)| (!same).then_some(collection))
+        .find_map(|(collection, same)| (!same).then_some(collection)))
+}
+
+fn same_changes(left: &super::ChangeMap, right: &super::ChangeMap) -> Result<bool, KinDbError> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for id in left.change_ids() {
+        let Some(left_change) = left.read_change(&id)? else {
+            return Ok(false);
+        };
+        if right.read_change(&id)?.as_ref() != Some(&left_change) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn same_serialized<T: Serialize>(left: &T, right: &T) -> bool {

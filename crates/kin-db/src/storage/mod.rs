@@ -59,6 +59,7 @@ pub use gcs::GcsBackend;
 pub use gcs_compatibility::{
     GcsFullAuthorityEnvelopeCompatibility, GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY,
 };
+pub use history_replay::{resolve_current_graph, ResolvedCurrentGraph};
 pub use index::ReadIndex;
 pub use merkle::{
     build_entity_hash_map, compute_entity_hash, compute_graph_root_hash, compute_relation_hash,

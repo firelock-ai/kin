@@ -1086,10 +1086,16 @@ pub struct RepositoryAuthorityState {
 impl RepositoryAuthorityState {
     /// Build the read state after the enclosing snapshot has passed complete
     /// repository-authority and history validation.
-    fn from_validated_snapshot(snapshot: GraphSnapshot) -> Self {
+    fn from_validated_snapshot(snapshot: GraphSnapshot) -> Result<Self, KinDbError> {
         let mut authenticated_gitlinks = BTreeSet::new();
-        extend_authenticated_gitlinks(&mut authenticated_gitlinks, snapshot.changes.values());
-        Self::from_validated_snapshot_with_gitlinks(snapshot, authenticated_gitlinks)
+        snapshot.changes.visit_changes(|change| {
+            extend_authenticated_gitlinks(&mut authenticated_gitlinks, std::iter::once(change));
+            Ok(())
+        })?;
+        Ok(Self::from_validated_snapshot_with_gitlinks(
+            snapshot,
+            authenticated_gitlinks,
+        ))
     }
 
     /// [`from_validated_snapshot`](Self::from_validated_snapshot) for an open
@@ -2201,7 +2207,9 @@ impl LocalRepositoryAuthorityFreeze {
             locked.authority(),
             locked.frames(),
             None,
-            crate::storage::backend::HistoryDecode::Eager,
+            crate::storage::backend::HistoryDecode::Streamed(&mut |change| {
+                crate::storage::change_validation::validate_semantic_change(change)
+            }),
         )?
         .recovered
         .snapshot;
@@ -2217,14 +2225,14 @@ impl LocalRepositoryAuthorityFreeze {
             )));
         }
         snapshot.validate_storage_admission()?;
-        validate_history_replay(&snapshot, snapshot.changes.values())?;
+        validate_history_replay(&snapshot, &[])?;
         let body_backend = FrozenLocalBodyBackend {
             backend,
             freeze: &locked,
         };
         validate_all_authority_bodies(&body_backend, repository_id, &snapshot)?;
         Ok(Self {
-            state: RepositoryAuthorityState::from_validated_snapshot(snapshot),
+            state: RepositoryAuthorityState::from_validated_snapshot(snapshot)?,
             _lock: locked,
         })
     }
@@ -2768,7 +2776,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         // scale it is minutes of work to re-derive a conclusion already
         // reached about these exact bytes.
         if reopen_proof.is_none() {
-            validate_history_replay(&snapshot, snapshot.changes.values())?;
+            validate_history_replay(&snapshot, &[])?;
         }
         let replay_at = started.elapsed();
 
@@ -2822,7 +2830,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 std::mem::take(&mut sweep.authenticated_gitlinks),
             )
         } else {
-            RepositoryAuthorityState::from_validated_snapshot(snapshot)
+            RepositoryAuthorityState::from_validated_snapshot(snapshot)?
         };
         // Prepared state binds to the digest of the durable authority this open
         // actually loaded, so a repository with no persisted authority yet has
@@ -3202,7 +3210,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 ));
             }
             if let Some(field) =
-                crate::storage::authority_frame::first_difference(current.snapshot(), &snapshot)
+                crate::storage::authority_frame::first_difference(current.snapshot(), &snapshot)?
             {
                 return Err(storage(format!(
                     "materialized graph representation rewrite changed {field}"
@@ -3217,6 +3225,45 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                     authority_generation,
                 }),
             })
+        })
+    }
+
+    /// Commit a complete Git bootstrap from a fallible, replayable history map.
+    pub fn commit_git_bootstrap_with_changes(
+        &self,
+        transaction: RepositoryTransaction,
+        changes: ChangeMap,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        if transaction.expected_generation != 0 || !transaction.changes.is_empty() {
+            return Err(ModelError::InvalidOperation(
+                "streamed Git bootstrap requires generation zero and no owned changes".into(),
+            )
+            .into());
+        }
+        let transaction_hash = transaction.transaction_hash_with_changes(changes.len(), || {
+            Ok(changes.change_ids().into_iter().map(|id| {
+                let change = changes
+                    .read_change(&id)
+                    .map_err(|error| ModelError::InvalidOperation(error.to_string()))?
+                    .ok_or_else(|| ModelError::ChangeNotFound(id.to_string()))?;
+                if !matches!(change.origin, kin_model::ChangeOrigin::GitCommit { .. }) {
+                    return Err(ModelError::InvalidOperation(
+                        "streamed Git bootstrap accepts only Git-origin changes".into(),
+                    ));
+                }
+                Ok(change)
+            }))
+        })?;
+        self.publication.commit(|current| {
+            prepare_repository_commit_decision_with_history(
+                current,
+                &transaction,
+                transaction_hash,
+                &self.repository_id,
+                self.backend.as_ref(),
+                NativeAdmissionSource::LocalWorkspace,
+                Some(&changes),
+            )
         })
     }
 
@@ -3521,6 +3568,27 @@ fn prepare_repository_commit_decision_from<B: StorageBackend + ?Sized>(
     source: NativeAdmissionSource,
 ) -> Result<AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>, KinDbError>
 {
+    prepare_repository_commit_decision_with_history(
+        current,
+        transaction,
+        transaction_hash,
+        repository_id,
+        backend,
+        source,
+        None,
+    )
+}
+
+fn prepare_repository_commit_decision_with_history<B: StorageBackend + ?Sized>(
+    current: &RepositoryAuthorityState,
+    transaction: &RepositoryTransaction,
+    transaction_hash: Hash256,
+    repository_id: &RepositoryId,
+    backend: &B,
+    source: NativeAdmissionSource,
+    external_history: Option<&ChangeMap>,
+) -> Result<AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>, KinDbError>
+{
     let metadata = current.metadata();
     if &transaction.repository_id != repository_id {
         return Err(ModelError::InvalidOperation(format!(
@@ -3569,8 +3637,17 @@ fn prepare_repository_commit_decision_from<B: StorageBackend + ?Sized>(
         .into());
     }
 
-    let (next, receipt) =
-        prepare_successor(current, transaction, transaction_hash, backend, source)?;
+    let (next, receipt) = match external_history {
+        Some(changes) => prepare_successor_with_history(
+            current,
+            transaction,
+            transaction_hash,
+            backend,
+            source,
+            Some(changes),
+        )?,
+        None => prepare_successor(current, transaction, transaction_hash, backend, source)?,
+    };
     Ok(AuthorityCommitDecision::Publish {
         next,
         output: receipt,
@@ -3633,6 +3710,24 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     backend: &B,
     source: NativeAdmissionSource,
 ) -> Result<(RepositoryAuthorityState, RepositoryCommitReceipt), KinDbError> {
+    prepare_successor_with_history(
+        current,
+        transaction,
+        transaction_hash,
+        backend,
+        source,
+        None,
+    )
+}
+
+fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
+    current: &RepositoryAuthorityState,
+    transaction: &RepositoryTransaction,
+    transaction_hash: Hash256,
+    backend: &B,
+    source: NativeAdmissionSource,
+    external_history: Option<&ChangeMap>,
+) -> Result<(RepositoryAuthorityState, RepositoryCommitReceipt), KinDbError> {
     // Every lap below runs inside its own span as well as reporting its
     // milliseconds, and the two must not drift apart: a profiler reads spans and
     // an operator reads the summary event, and a lap that exists in one split
@@ -3662,9 +3757,27 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         &mut metadata,
         &transaction.external_objects,
     )?;
-    admit_changes(&mut snapshot, &transaction.changes)?;
+    if let Some(changes) = external_history {
+        if current.generation() != 0 || !snapshot.changes.is_empty() {
+            return Err(ModelError::InvalidOperation(
+                "streamed Git bootstrap requires an empty generation-zero history".into(),
+            )
+            .into());
+        }
+        snapshot.changes = changes.clone();
+        snapshot.change_children = derive_change_children(&snapshot.changes)?;
+        snapshot.entity_revisions.clear();
+    } else {
+        admit_changes(&mut snapshot, &transaction.changes)?;
+    }
     admit_aliases(&snapshot, &mut metadata, &transaction.aliases)?;
-    apply_git_authority(backend, &snapshot, &mut metadata, transaction)?;
+    apply_git_authority(
+        backend,
+        &snapshot,
+        &mut metadata,
+        transaction,
+        external_history,
+    )?;
     metadata.admission_policies = derive_admission_policies(&snapshot.changes)?;
     let admit_ms = timer.lap_ms();
     drop(lap);
@@ -3723,12 +3836,27 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     drop(lap);
 
     let lap = tracing::info_span!("kindb.prepare.change_bodies").entered();
-    validate_new_change_bodies(
-        backend,
-        &transaction.repository_id,
-        &transaction.changes,
-        &metadata.admission_policies,
-    )?;
+    if let Some(changes) = external_history {
+        changes.visit_changes(|change| {
+            validate_change_tree_bodies(
+                backend,
+                &transaction.repository_id,
+                std::iter::once(change),
+            )
+        })?;
+        for resolved in &metadata.admission_policies {
+            if let Some(policy) = &resolved.policy {
+                validate_shared_policy_bodies(backend, &transaction.repository_id, policy)?;
+            }
+        }
+    } else {
+        validate_new_change_bodies(
+            backend,
+            &transaction.repository_id,
+            &transaction.changes,
+            &metadata.admission_policies,
+        )?;
+    }
     let change_bodies_ms = timer.lap_ms();
     drop(lap);
 
@@ -3844,8 +3972,11 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     drop(lap);
 
     let lap = tracing::info_span!("kindb.prepare.successor_index").entered();
-    let state =
-        RepositoryAuthorityState::from_validated_successor(current, snapshot, &transaction.changes);
+    let state = if external_history.is_some() {
+        RepositoryAuthorityState::from_validated_snapshot(snapshot)?
+    } else {
+        RepositoryAuthorityState::from_validated_successor(current, snapshot, &transaction.changes)
+    };
     let successor_index_ms = timer.lap_ms();
     drop(lap);
     let elapsed = prepare_started.elapsed();
@@ -3978,19 +4109,13 @@ fn admit_changes(
     incoming: &[kin_model::SemanticChange],
 ) -> Result<(), KinDbError> {
     for change in incoming {
-        if let Some(existing) = snapshot.changes.get(&change.id) {
-            if existing != change {
-                return Err(KinDbError::DuplicateChange(change.id.to_string()));
-            }
-        } else {
-            snapshot.changes.insert(change.id, change.clone());
-        }
+        snapshot.changes.append_change(change.clone())?;
     }
 
     // Rebuild the inverse index from canonical history. Ordered and repeated
     // parent identity stays in each change; this derived lookup needs each
     // parent→child edge only once.
-    snapshot.change_children = derive_change_children(&snapshot.changes);
+    snapshot.change_children = derive_change_children(&snapshot.changes)?;
 
     // A repository with multiple refs has no single current entity/relation
     // revision view. Exact target replay derives revisions from the immutable
@@ -4005,26 +4130,29 @@ fn admit_changes(
 /// Successor preparation and authority-frame recovery both derive it from the
 /// same function, so a reconstructed head carries the index its writer carried.
 pub(crate) fn derive_change_children(
-    changes: &HashMap<SemanticChangeId, kin_model::SemanticChange>,
-) -> HashMap<SemanticChangeId, Vec<SemanticChangeId>> {
+    changes: &crate::storage::ChangeMap,
+) -> Result<HashMap<SemanticChangeId, Vec<SemanticChangeId>>, KinDbError> {
     let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
-    for change in changes.values() {
-        for parent in &change.parents {
-            children.entry(*parent).or_default().insert(change.id);
+    for id in changes.change_ids() {
+        for parent in changes
+            .change_parents(&id)?
+            .ok_or_else(|| ModelError::ChangeNotFound(id.to_string()))?
+        {
+            children.entry(parent).or_default().insert(id);
         }
     }
-    children
+    Ok(children
         .into_iter()
         .map(|(parent, children)| (parent, children.into_iter().collect()))
-        .collect()
+        .collect())
 }
 
 fn validate_unscoped_history_caches(snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
     let mut expected_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>> = HashMap::new();
     let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
-    for change in snapshot.changes.values() {
-        for parent in &change.parents {
-            children.entry(*parent).or_default().insert(change.id);
+    for id in snapshot.changes.change_ids() {
+        for parent in snapshot.changes.change_parents(&id)?.unwrap_or_default() {
+            children.entry(parent).or_default().insert(id);
         }
     }
     expected_children.extend(
@@ -4073,9 +4201,9 @@ fn admit_aliases(
     for alias in incoming {
         let change = snapshot
             .changes
-            .get(&alias.change_id)
+            .read_change(&alias.change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(alias.change_id.to_string()))?;
-        alias.validate_change(change)?;
+        alias.validate_change(&change)?;
         alias.validate_binding(aliases.get(&alias.oid).map(|existing| existing.change_id))?;
         aliases.entry(alias.oid).or_insert_with(|| alias.clone());
     }
@@ -4088,6 +4216,7 @@ fn apply_git_authority<B: StorageBackend + ?Sized>(
     snapshot: &GraphSnapshot,
     metadata: &mut PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
+    external_history: Option<&ChangeMap>,
 ) -> Result<(), KinDbError> {
     if let Some(delta) = &transaction.git_authority_delta {
         if metadata.git_external_authority.as_ref() != delta.old.as_ref() {
@@ -4103,6 +4232,7 @@ fn apply_git_authority<B: StorageBackend + ?Sized>(
     validate_transaction_git_projection_membership(
         transaction,
         metadata.git_external_authority.as_ref(),
+        external_history,
     )?;
     validate_git_authority_shape_and_projection(
         snapshot,
@@ -4122,6 +4252,7 @@ fn apply_git_authority<B: StorageBackend + ?Sized>(
 fn validate_transaction_git_projection_membership(
     transaction: &RepositoryTransaction,
     authority: Option<&GitExternalAuthority>,
+    external_history: Option<&ChangeMap>,
 ) -> Result<(), KinDbError> {
     let projected_oids = authority
         .into_iter()
@@ -4142,7 +4273,7 @@ fn validate_transaction_git_projection_membership(
             .into());
         }
     }
-    for change in &transaction.changes {
+    let validate = |change: &kin_model::SemanticChange| -> Result<(), KinDbError> {
         if let kin_model::ChangeOrigin::GitCommit { oid } = change.origin {
             if !projected_oids.contains(&oid) {
                 return Err(ModelError::InvalidOperation(format!(
@@ -4152,6 +4283,13 @@ fn validate_transaction_git_projection_membership(
                 .into());
             }
         }
+        Ok(())
+    };
+    for change in &transaction.changes {
+        validate(change)?;
+    }
+    if let Some(changes) = external_history {
+        changes.visit_changes(validate)?;
     }
     Ok(())
 }
@@ -4280,7 +4418,7 @@ fn validate_git_authority_shape_and_projection(
         })?;
         let change = snapshot
             .changes
-            .get(&alias.change_id)
+            .read_change(&alias.change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(alias.change_id.to_string()))?;
         match change.origin {
             kin_model::ChangeOrigin::GitCommit { oid } if oid == projection.commit_oid => {}
@@ -4391,7 +4529,7 @@ where
     for change_id in targets.keys() {
         let change = snapshot
             .changes
-            .get(change_id)
+            .read_change(change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
         if let Some(first_parent) = change.parents.first() {
             if !targets.contains_key(first_parent) {
@@ -4455,7 +4593,7 @@ where
                 }
                 let change = snapshot
                     .changes
-                    .get(&change_id)
+                    .read_change(&change_id)?
                     .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
                 let target = targets
                     .get(&change_id)
@@ -4490,7 +4628,7 @@ where
             GitProjectionTreeFrame::Exit(change_id) => {
                 let change = snapshot
                     .changes
-                    .get(&change_id)
+                    .read_change(&change_id)?
                     .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
                 let inverse = change
                     .tree_deltas
@@ -4567,13 +4705,13 @@ fn validate_persisted_git_alias_coverage(
         }
         let change = snapshot
             .changes
-            .get(&alias.change_id)
+            .read_change(&alias.change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(alias.change_id.to_string()))?;
-        alias.validate_change(change)?;
+        alias.validate_change(&change)?;
     }
-    for change in snapshot.changes.values() {
+    snapshot.changes.visit_changes(|change| {
         let kin_model::ChangeOrigin::GitCommit { oid } = change.origin else {
-            continue;
+            return Ok(());
         };
         if !projected_oids.contains(&oid) {
             return Err(ModelError::InvalidOperation(format!(
@@ -4589,7 +4727,8 @@ fn validate_persisted_git_alias_coverage(
             ))
             .into());
         }
-    }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -5138,28 +5277,17 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     // this whole lap. The lap is the largest single term in a full-history
     // conversion and which of these produces it was never measured.
     let next_base_change = workspace_base_change_id(metadata, mutation.new_base_target.as_ref())?;
-    // Deliberately NOT capturing here, and the reason is measured rather than
-    // stylistic. This resolution is at exactly the change a section names, so
-    // capturing it is tempting and was tried; it holds the resolved state as a
-    // second copy for the rest of the mutation, and
-    // `a_workspace_mutation_does_not_hold_the_whole_history_four_times` read
-    // 7.17 copies of the history against a ceiling of 4.4 and an intact reading
-    // of 4.08. That guard is calibrated and its ceiling is not the thing to
-    // move: the section is 185 MiB on a converted store, of which
-    // `entity_revisions` is 173.8 MiB, and it cannot be narrowed because a base
-    // with empty revisions is a DIFFERENT answer (FIR-3048).
-    //
-    // So a publish does not write sections. An explicit materialize operation
-    // does, where paying one graph copy is the point of the command rather than
-    // a tax on every commit, and where a store that never runs it simply keeps
-    // folding.
+    // This private preparation compares only live graph domains. It neither
+    // answers revision queries nor captures a persisted graph section, so it
+    // resolves an explicit current-state projection. Full workspace snapshots
+    // and materialized sections keep their exact historical revision output.
     let next_base = {
         let _holder = tracing::info_span!("kindb.prepare.workspace.next_base").entered();
         resolve_workspace_base_graph_snapshot(
             snapshot,
             metadata,
             mutation.new_base_target.as_ref(),
-            WorkspaceBaseHistory::Omitted,
+            WorkspaceBaseHistory::CurrentProjection,
         )?
     };
 
@@ -5173,7 +5301,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
                 snapshot,
                 metadata,
                 current_base_target,
-                WorkspaceBaseHistory::Omitted,
+                WorkspaceBaseHistory::CurrentProjection,
             )?
         }
     };
@@ -5387,7 +5515,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
         let change_id = target_change_id(metadata, base_target)?;
         let change = snapshot
             .changes
-            .get(&change_id)
+            .read_change(&change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
         let was_already_admitted = current.snapshot.changes.contains_key(&change_id);
         let is_verified_git = matches!(change.origin, kin_model::ChangeOrigin::GitCommit { .. });
@@ -6193,14 +6321,14 @@ fn validate_history_replay_with<'a>(
     if validation_targets.is_empty() {
         validation_targets = snapshot
             .changes
-            .keys()
+            .change_ids()
+            .into_iter()
             .filter(|change_id| {
                 snapshot
                     .change_children
                     .get(change_id)
                     .is_none_or(Vec::is_empty)
             })
-            .copied()
             .collect();
     }
     validation_targets.sort_unstable();
@@ -6209,19 +6337,23 @@ fn validate_history_replay_with<'a>(
 }
 
 fn topological_change_order(
-    changes: &HashMap<SemanticChangeId, kin_model::SemanticChange>,
+    changes: &crate::storage::ChangeMap,
 ) -> Result<Vec<SemanticChangeId>, KinDbError> {
     let mut indegree = BTreeMap::new();
     let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
-    for change in changes.values() {
-        let unique_parents: BTreeSet<_> = change.parents.iter().copied().collect();
+    for id in changes.change_ids() {
+        let unique_parents: BTreeSet<_> = changes
+            .change_parents(&id)?
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         for parent in &unique_parents {
-            if !changes.contains_key(parent) {
+            if !changes.contains_change(parent) {
                 return Err(ModelError::ChangeNotFound(parent.to_string()).into());
             }
-            children.entry(*parent).or_default().insert(change.id);
+            children.entry(*parent).or_default().insert(id);
         }
-        indegree.insert(change.id, unique_parents.len());
+        indegree.insert(id, unique_parents.len());
     }
     let mut ready: BTreeSet<_> = indegree
         .iter()
@@ -6249,12 +6381,14 @@ fn topological_change_order(
 }
 
 fn derive_admission_policies(
-    changes: &HashMap<SemanticChangeId, kin_model::SemanticChange>,
+    changes: &crate::storage::ChangeMap,
 ) -> Result<Vec<ChangeAdmissionPolicy>, KinDbError> {
     let order = topological_change_order(changes)?;
     let mut states: HashMap<SemanticChangeId, Option<SharedAdmissionPolicy>> = HashMap::new();
     for change_id in order {
-        let change = &changes[&change_id];
+        let change = changes
+            .read_change(&change_id)?
+            .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
         let inherited = change
             .parents
             .first()
@@ -6362,7 +6496,7 @@ fn is_ancestor(
         }
         let change = snapshot
             .changes
-            .get(&change_id)
+            .read_change(&change_id)?
             .ok_or_else(|| ModelError::ChangeNotFound(change_id.to_string()))?;
         stack.extend(change.parents.iter().copied());
     }
@@ -6513,7 +6647,7 @@ fn materialize_workspace_graph_snapshot_from_base(
 /// materialization path can reach them, and a future caller that does must be
 /// refused rather than silently served an empty answer.
 struct AuthorityHistoryView<'a> {
-    changes: &'a HashMap<SemanticChangeId, SemanticChange>,
+    changes: &'a crate::storage::ChangeMap,
 }
 
 impl AuthorityHistoryView<'_> {
@@ -6528,7 +6662,7 @@ impl ChangeStore for AuthorityHistoryView<'_> {
     type Error = KinDbError;
 
     fn get_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>, KinDbError> {
-        Ok(self.changes.get(id).cloned())
+        self.changes.read_change(id)
     }
 
     fn get_entity_history(&self, _id: &EntityId) -> Result<Vec<SemanticChange>, KinDbError> {
@@ -6714,7 +6848,11 @@ enum WorkspaceBaseHistory<'a> {
     /// Leave the change map out. A witness is unrepresentable here on purpose:
     /// carrying one onto an empty map would satisfy pointer identity while
     /// attesting nothing.
+    #[cfg(test)]
     Omitted,
+    /// Private mutation preparation consumes live facts only, never revisions
+    /// or a persisted section. Omit both history and revision output.
+    CurrentProjection,
 }
 
 /// The resolved graph at `change_id` from a persisted section, or why not.
@@ -6784,7 +6922,52 @@ fn resolve_workspace_base_graph_snapshot_capturing(
     let base_change = base_target
         .map(|target| target_change_id(metadata, target))
         .transpose()?;
+    let current_projection = if matches!(history, WorkspaceBaseHistory::CurrentProjection) {
+        if capture == WorkspaceBaseCapture::Retain {
+            return Err(storage(
+                "a current-state projection cannot become a full graph section".to_string(),
+            ));
+        }
+        base_change
+            .map(|change_id| {
+                let section = authority_snapshot
+                    .materialized_graph
+                    .as_ref()
+                    .ok_or(MaterializedGraphRefusal::Absent)
+                    .and_then(|section| section.validate_for(&change_id).map(|()| section));
+                if let Ok(section) = section {
+                    #[cfg(test)]
+                    BASE_GRAPHS_SERVED_FROM_SECTION.with(|count| count.set(count.get() + 1));
+                    tracing::debug!(
+                        change = %change_id,
+                        "served the current workspace projection from a materialized graph section"
+                    );
+                    return Ok(crate::storage::ResolvedCurrentGraph {
+                        entities: section.state.entities.clone(),
+                        relations: section.state.relations.clone(),
+                        external_references: section.state.external_references.clone(),
+                        tree: section.state.tree.clone(),
+                    });
+                }
+                if let Err(refusal) = section {
+                    if !matches!(refusal, MaterializedGraphRefusal::Absent) {
+                        tracing::warn!(
+                            refusal = %refusal,
+                            change = %change_id,
+                            "refused the materialized graph section; folding the current projection from history instead"
+                        );
+                    }
+                }
+                #[cfg(test)]
+                BASE_GRAPHS_RESOLVED_FROM_HISTORY.with(|count| count.set(count.get() + 1));
+                crate::storage::resolve_current_graph(&authority_snapshot.changes, &change_id)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let resolved = match base_change {
+        Some(_) if matches!(history, WorkspaceBaseHistory::CurrentProjection) => None,
         Some(change_id) => {
             Some(
                 match resolved_graph_from_section(authority_snapshot, &change_id) {
@@ -6846,23 +7029,30 @@ fn resolve_workspace_base_graph_snapshot_capturing(
             captured = Some(CapturedBaseGraph::capture(change_id, state.clone()));
         }
     }
-    let (entities, relations, entity_revisions, resolved_tree, external_references) = match resolved
-    {
-        Some(state) => (
-            state.entities,
-            state.relations,
-            state.entity_revisions,
-            state.tree,
-            state.external_references,
-        ),
-        None => (
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            ResolvedTree::default(),
-            HashMap::new(),
-        ),
-    };
+    let (entities, relations, entity_revisions, resolved_tree, external_references) =
+        match (current_projection, resolved) {
+            (Some(state), _) => (
+                state.entities,
+                state.relations,
+                HashMap::new(),
+                state.tree,
+                state.external_references,
+            ),
+            (None, Some(state)) => (
+                state.entities,
+                state.relations,
+                state.entity_revisions,
+                state.tree,
+                state.external_references,
+            ),
+            (None, None) => (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                ResolvedTree::default(),
+                HashMap::new(),
+            ),
+        };
     // Every field is named so that a new snapshot domain refuses to compile
     // here until someone decides whether a workspace base carries it. The
     // carried domains are cloned exactly as the whole-snapshot clone carried
@@ -6876,10 +7066,14 @@ fn resolve_workspace_base_graph_snapshot_capturing(
         incoming: HashMap::new(),
         changes: match history {
             WorkspaceBaseHistory::Carried(_) => authority_snapshot.changes.clone(),
+            WorkspaceBaseHistory::CurrentProjection => ChangeMap::new(),
+            #[cfg(test)]
             WorkspaceBaseHistory::Omitted => ChangeMap::new(),
         },
         change_children: match history {
             WorkspaceBaseHistory::Carried(_) => authority_snapshot.change_children.clone(),
+            WorkspaceBaseHistory::CurrentProjection => HashMap::new(),
+            #[cfg(test)]
             WorkspaceBaseHistory::Omitted => HashMap::new(),
         },
         work_items: authority_snapshot.work_items.clone(),
@@ -6926,9 +7120,11 @@ fn resolve_workspace_base_graph_snapshot_capturing(
             let carried = AdmittedChangeMap::carried_from_clone(&base.changes, admitted);
             base.validate_storage_admission_carrying(GitProjectionTreeReplay::Required, &carried)?;
         }
-        WorkspaceBaseHistory::Carried(None) | WorkspaceBaseHistory::Omitted => {
+        WorkspaceBaseHistory::Carried(None) | WorkspaceBaseHistory::CurrentProjection => {
             base.validate_storage_admission()?
         }
+        #[cfg(test)]
+        WorkspaceBaseHistory::Omitted => base.validate_storage_admission()?,
     }
     let admission_ms = timer.lap_ms();
     tracing::debug!(
@@ -7153,10 +7349,16 @@ fn validate_workspace_state(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     workspace: &WorkspaceState,
-    admitted: Option<&AdmittedChangeMap<'_>>,
+    _admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<(), KinDbError> {
     validate_workspace_state_without_materialization(replay, snapshot, metadata, workspace)?;
-    materialize_workspace_graph_snapshot(snapshot, metadata, workspace, admitted)?;
+    let base = resolve_workspace_base_graph_snapshot(
+        snapshot,
+        metadata,
+        workspace.base_target.as_ref(),
+        WorkspaceBaseHistory::CurrentProjection,
+    )?;
+    materialize_workspace_graph_snapshot_from_base(base, workspace, None)?;
     Ok(())
 }
 
@@ -7852,13 +8054,13 @@ fn collect_all_authority_body_requirements_with(
     }
     match changes {
         ChangeBodyRequirements::Walk(changes) => {
-            for change in changes.values() {
+            changes.visit_changes(|change| {
                 collect_tree_delta_body_requirements(
                     &mut requirements,
                     &change.tree_deltas,
                     &format!("change {}", change.id),
-                )?;
-            }
+                )
+            })?;
         }
         ChangeBodyRequirements::Collected(collected) => {
             for (digest, requirement) in collected {
@@ -10932,6 +11134,85 @@ mod tests {
             policy: RefUpdatePolicy::FastForwardOnly,
         });
         (transaction, old_body)
+    }
+
+    #[test]
+    fn streamed_git_bootstrap_matches_owned_commit_and_replays() {
+        let owned = initial_manager(Arc::new(MemoryBackend::default()));
+        let streamed = initial_manager(Arc::new(MemoryBackend::default()));
+        let fixture = git_authority_transaction_fixture(&owned, 0xa001);
+        let mut incoming = git_authority_transaction_fixture(&streamed, 0xa001).transaction;
+        let mut changes = ChangeMap::new();
+        for change in std::mem::take(&mut incoming.changes) {
+            changes.append_change(change).unwrap();
+        }
+        let expected = owned
+            .commit_repository_transaction(fixture.transaction)
+            .unwrap();
+        let actual = streamed
+            .commit_git_bootstrap_with_changes(incoming.clone(), changes.clone())
+            .unwrap();
+        assert_eq!(actual.transaction_hash, expected.transaction_hash);
+        assert_eq!(actual.roots_before, expected.roots_before);
+        // Independently committed operations receive different wall-clock
+        // timestamps. Normalize only that generated field for the root oracle.
+        let streamed_lease = streamed.read_authority();
+        let owned_lease = owned.read_authority();
+        let mut normalized = streamed_lease.metadata().clone();
+        normalized.operation_log[0].committed_at =
+            owned_lease.metadata().operation_log[0].committed_at.clone();
+        assert_eq!(
+            compute_roots(&streamed_lease.snapshot, &normalized, 1).unwrap(),
+            expected.roots_after
+        );
+        assert_eq!(actual.generation, 1);
+        assert_eq!(
+            streamed.read_authority().snapshot.changes.change_ids(),
+            owned.read_authority().snapshot.changes.change_ids()
+        );
+        assert_eq!(
+            streamed.read_authority().metadata().ref_state.refs,
+            owned.read_authority().metadata().ref_state.refs
+        );
+        let replay = streamed
+            .commit_git_bootstrap_with_changes(incoming, changes)
+            .unwrap();
+        assert_eq!(replay.outcome, RepositoryCommitOutcome::IdempotentReplay);
+        assert_eq!(replay.transaction_hash, expected.transaction_hash);
+        assert_eq!(streamed.read_authority().generation(), 1);
+    }
+
+    #[test]
+    fn streamed_git_bootstrap_rejects_native_changes() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let mut incoming = git_authority_transaction_fixture(&manager, 0xa001).transaction;
+        let mut change = incoming.changes.remove(0);
+        change.origin = ChangeOrigin::Native;
+        change.id = compute_semantic_change_id(&change).unwrap();
+        incoming.changes.clear();
+        let mut changes = ChangeMap::new();
+        changes.append_change(change).unwrap();
+        let error = manager
+            .commit_git_bootstrap_with_changes(incoming, changes)
+            .unwrap_err();
+        assert!(error.to_string().contains("only Git-origin"), "{error}");
+        assert_eq!(manager.read_authority().generation(), 0);
+    }
+
+    #[test]
+    fn streamed_git_bootstrap_rejects_missing_parent() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let mut incoming = git_authority_transaction_fixture(&manager, 0xa001).transaction;
+        let mut changes = ChangeMap::new();
+        for change in std::mem::take(&mut incoming.changes) {
+            if !change.parents.is_empty() {
+                changes.append_change(change).unwrap();
+            }
+        }
+        assert!(manager
+            .commit_git_bootstrap_with_changes(incoming, changes)
+            .is_err());
+        assert_eq!(manager.read_authority().generation(), 0);
     }
 
     #[test]
@@ -15167,7 +15448,7 @@ mod tests {
         )
         .expect("this file must be readable; the scan below is worthless without it");
         let start = source
-            .find("fn prepare_successor<B: StorageBackend + ?Sized>(")
+            .find("fn prepare_successor_with_history<B: StorageBackend + ?Sized>(")
             .expect(
                 "prepare_successor was not found in this file, so the scan matched nothing and \
                  would have reported every row below as satisfied",
@@ -15770,11 +16051,17 @@ mod tests {
         let expected = manager.read_authority();
         let marker = retain_installed_authority_marker(&directory);
         let before = freeze_storage_bytes(directory.path());
+        let decoded_before = crate::storage::change_map::change_maps_decoded_on_this_thread();
         let frozen = LocalRepositoryAuthorityFreeze::open_existing_read_only(
             repository_id(),
             backend.as_ref(),
         )
         .unwrap();
+        assert!(!frozen.authority().snapshot.changes.is_decoded());
+        assert_eq!(
+            crate::storage::change_map::change_maps_decoded_on_this_thread(),
+            decoded_before
+        );
         assert_same_authority(&expected, frozen.authority(), "read-only frozen journal");
         assert_eq!(before, freeze_storage_bytes(directory.path()));
         assert!(backend
@@ -15794,6 +16081,31 @@ mod tests {
             !marker.exists(),
             "normal open must clean the retained marker"
         );
+    }
+
+    #[test]
+    fn authority_frame_late_append_refusal_leaves_the_base_unchanged() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let mut base = manager.read_authority().snapshot().clone();
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_3092, 0x63))
+            .unwrap();
+        let bytes = std::fs::read(frame_path(&directory, 2)).unwrap();
+        let mut frame =
+            crate::storage::authority_frame::AuthorityFrame::from_bytes(&bytes).unwrap();
+        let id = base.changes.change_ids()[0];
+        let mut valid = base.changes.read_change(&id).unwrap().unwrap();
+        valid.message.push_str(" valid appended record");
+        valid.id = compute_semantic_change_id(&valid).unwrap();
+        let mut invalid = valid.clone();
+        invalid.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32]));
+        invalid.message.push_str(" invalidated identity");
+        frame.changes = vec![valid.clone(), invalid];
+        let before = rmp_serde::to_vec(&base).unwrap();
+        assert!(frame.apply(&mut base).is_err());
+        assert!(!base.changes.contains_change(&valid.id));
+        assert_eq!(rmp_serde::to_vec(&base).unwrap(), before);
     }
 
     fn retain_installed_authority_marker(directory: &TempDir) -> std::path::PathBuf {
@@ -17129,6 +17441,43 @@ mod tests {
         assert_eq!(viewed.external_references, replayed.external_references);
     }
 
+    #[test]
+    fn current_workspace_projection_preserves_live_facts_but_cannot_be_persisted_as_a_full_section()
+    {
+        let store = build_synthetic_history_store(3, 8, 1, 3);
+        let lease = store.manager.read_authority();
+        let workspace = &lease.metadata().workspaces[0];
+        let full = resolve_workspace_base_graph_snapshot(
+            lease.snapshot(),
+            lease.metadata(),
+            workspace.base_target.as_ref(),
+            WorkspaceBaseHistory::Omitted,
+        )
+        .unwrap();
+        let projected = resolve_workspace_base_graph_snapshot(
+            lease.snapshot(),
+            lease.metadata(),
+            workspace.base_target.as_ref(),
+            WorkspaceBaseHistory::CurrentProjection,
+        )
+        .unwrap();
+        assert!(!full.entity_revisions.is_empty());
+        assert!(projected.entity_revisions.is_empty());
+        assert!(projected.changes.is_empty());
+        assert_eq!(projected.entities, full.entities);
+        assert_eq!(projected.relations, full.relations);
+        assert_eq!(projected.external_references, full.external_references);
+        assert_eq!(projected.resolved_tree, full.resolved_tree);
+        assert!(resolve_workspace_base_graph_snapshot_capturing(
+            lease.snapshot(),
+            lease.metadata(),
+            workspace.base_target.as_ref(),
+            WorkspaceBaseHistory::CurrentProjection,
+            WorkspaceBaseCapture::Retain,
+        )
+        .is_err());
+    }
+
     use crate::storage::format::MATERIALIZED_GRAPH_SCHEMA_VERSION;
 
     /// Resolve one workspace base and report which arm answered.
@@ -17788,7 +18137,7 @@ mod tests {
 
     #[test]
     fn authority_history_view_fails_closed_outside_replay() {
-        let changes = HashMap::new();
+        let changes = ChangeMap::new();
         let view = AuthorityHistoryView { changes: &changes };
 
         let missing_head = SemanticChangeId::from_hash(Hash256::from_bytes([7; 32]));
@@ -19759,6 +20108,48 @@ mod tests {
         assert_eq!(base_bytes as usize, full.payload_bytes);
         assert_eq!(frames, 1);
         assert_eq!(journal_bytes as usize, frame.payload_bytes);
+    }
+
+    #[test]
+    fn a_native_commit_keeps_reopened_history_on_disk() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, seeded) = framed_local_repository(&directory);
+        drop(seeded);
+        let manager = reopen(&directory);
+        let before = manager.read_authority();
+        let history_len = before.snapshot().changes.len();
+        assert!(history_len > 0);
+        assert!(!before.snapshot().changes.is_decoded());
+        let decodes = crate::storage::change_map::change_maps_decoded_on_this_thread();
+        let (removal, _) = remove_compose_transaction(&manager, 0xf2_2347_2200);
+        let change_id = removal.changes[0].id;
+        let outcome = manager.commit_repository_transaction(removal).unwrap();
+        let after = manager.read_authority();
+        assert_eq!(after.snapshot().changes.len(), history_len + 1);
+        assert!(after
+            .snapshot()
+            .changes
+            .read_change(&change_id)
+            .unwrap()
+            .is_some());
+        assert!(!before.snapshot().changes.is_decoded());
+        assert!(!after.snapshot().changes.is_decoded());
+        assert_eq!(
+            crate::storage::change_map::change_maps_decoded_on_this_thread(),
+            decodes,
+            "a native commit must not materialize the shared base history"
+        );
+        let reopened = reopen(&directory);
+        let durable = reopened.read_authority();
+        assert_eq!(durable.roots(), &outcome.roots_after);
+        assert_eq!(durable.snapshot().changes.len(), history_len + 1);
+        assert!(durable
+            .snapshot()
+            .changes
+            .read_change(&change_id)
+            .unwrap()
+            .is_some());
+        assert!(!durable.snapshot().changes.is_decoded());
     }
 
     #[test]
@@ -22351,9 +22742,10 @@ mod tests {
             "the control: this open has no record to trust"
         );
         let lease = reopened.read_authority();
+        lease.snapshot().changes.decoded().unwrap();
         assert!(
             lease.snapshot().changes.is_decoded(),
-            "the control: an unproven open holds its history in memory"
+            "the control explicitly materializes history before workspace resolution"
         );
         let workspace_id = lease.metadata().workspaces[0].workspace_id;
         let base = lease
@@ -22368,7 +22760,7 @@ mod tests {
     }
 
     #[test]
-    fn an_open_without_a_verified_record_decodes_eagerly_and_validates_in_full() {
+    fn an_open_without_a_verified_record_streams_and_validates_in_full() {
         let directory = TempDir::new().unwrap();
         drop(committed_local_repository(&directory));
         let mut record = read_authority_json(directory.path());
@@ -22382,8 +22774,8 @@ mod tests {
         let reopened = reopen(&directory);
         assert!(!reopened.opened_by_history_validation());
         assert!(
-            reopened.read_authority().snapshot().changes.is_decoded(),
-            "with no record to trust, the open validates the whole history and holds it"
+            !reopened.read_authority().snapshot().changes.is_decoded(),
+            "with no record to trust, the open validates the whole history without retaining bodies"
         );
     }
 
@@ -23606,7 +23998,7 @@ mod clockhalf_git_origin {
             order.push(change.id);
             snapshot.changes.insert(change.id, change);
         }
-        snapshot.change_children = derive_change_children(&snapshot.changes);
+        snapshot.change_children = derive_change_children(&snapshot.changes).unwrap();
         GitHistory {
             snapshot,
             targets,
@@ -23646,7 +24038,7 @@ mod clockhalf_git_origin {
             println!("[git] commits={commits} files={files} churn={churn}");
 
             lap("derive_change_children_ms", || {
-                let children = derive_change_children(&history.snapshot.changes);
+                let children = derive_change_children(&history.snapshot.changes).unwrap();
                 assert_eq!(children.len(), commits.saturating_sub(1));
             });
 
