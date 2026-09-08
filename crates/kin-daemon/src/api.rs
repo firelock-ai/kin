@@ -46136,6 +46136,51 @@ mod tests {
     #[tokio::test]
     async fn context_endpoint_uses_live_graph() {
         let state = test_state();
+        let source = "def handler():\n    return 42";
+        install_repository_file(&state, "src/lib.py", source.as_bytes());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/context")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "handler",
+                            "budget": "8k",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let result: kin_cli::commands::context::ContextResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            result.pack.as_ref().unwrap().focal_entities[0].content,
+            source
+        );
+        assert!(
+            result
+                .lines
+                .iter()
+                .any(|line| line.contains("Context pack for 'handler'")),
+            "context response should identify the daemon graph entity"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_endpoint_refuses_unpublished_source() {
+        let state = test_state();
         let entity = test_entity("handler", "src/lib.py");
         state.graph.upsert_entity(&entity).unwrap();
         state
@@ -46158,19 +46203,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
             .await
             .unwrap();
-        let result: kin_cli::commands::context::ContextResponse =
-            serde_json::from_slice(&body).unwrap();
-        assert!(
-            result
-                .lines
-                .iter()
-                .any(|line| line.contains("Context pack for 'handler'")),
-            "context response should identify the daemon graph entity"
-        );
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(String::from_utf8_lossy(&body).contains("is not in workspace"));
     }
 
     /// The daemon half of the cancellation chain.
