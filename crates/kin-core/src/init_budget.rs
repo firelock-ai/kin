@@ -43,10 +43,13 @@
 //! numbers do not capture, and the machine's free memory moves while the
 //! conversion runs.
 //!
-//! That asymmetry is deliberate. A refusal that fires wrongly costs a user a
-//! conversion that would have worked, and the only way back is an environment
-//! variable. A refusal that fails to fire costs nothing that is not already
-//! being paid today, because dying mid-ladder is the behaviour it replaces.
+//! That asymmetry is deliberate, and it decides where the refusal sits. A
+//! refusal that fires wrongly costs a user a conversion that would have worked,
+//! and the way back is one environment variable. A refusal that fails to fire
+//! costs that user the run itself, killed partway with no message, which is the
+//! behaviour this module replaces. The refusal is therefore drawn at the
+//! ceiling rather than past it: see [`REFUSE_MULTIPLE`], which used to allow
+//! half a machine of slack and no longer needs to.
 
 use std::path::Path;
 
@@ -82,15 +85,21 @@ const BYTES_PER_COMMIT: u64 = 700_000;
 /// Every blob reachable from HEAD is a file version the enrichment fold reads
 /// and diffs, and the store that is written and then opened whole carries what
 /// those diffs produced, so the peak tracks this volume more closely than it
-/// tracks the commit count. Measured on the frontier walk across three
+/// tracks the commit count. Measured on the frontier walk across four
 /// repositories, resident bytes held at the whole-run peak per reachable blob
 /// byte: hiredis 55.5 (27,715,552 bytes of history, 1,538,834,432 held),
 /// requests 49.5 (112,476,293 against 5,568,004,096), kin 19.6 (1,400,991,245
-/// against 27,428,945,920). Nineteen is the floor of that spread, so a
-/// requests-shaped history can hold two to three times this forecast, and kin
-/// holds it almost exactly; the spread is what makes this a floor and not a
-/// prediction.
-const BYTES_PER_HISTORY_BYTE: u64 = 19;
+/// against 27,428,945,920), react 18.1 (2,187,539,173 against 39,584,645,120).
+/// Eighteen is the floor of that spread, so a hiredis-shaped history can hold
+/// three times this forecast and react holds it almost exactly; the spread is
+/// what makes this a floor and not a prediction.
+///
+/// React is why this reads 18 and not 19. Nineteen floored the first three
+/// subjects, and the fourth conversion measured came in under it at 18.0955,
+/// which is what a floor read off a sample does when the sample grows. It is
+/// lowered rather than kept, because a coefficient that one measured
+/// conversion undercuts is a prediction wearing a floor's name.
+const BYTES_PER_HISTORY_BYTE: u64 = 18;
 
 /// Bytes the repository daemon holds for each commit of the store it loads.
 ///
@@ -119,14 +128,27 @@ const TIGHT_FRACTION: f64 = 0.7;
 /// How far past the ceiling a forecast has to reach before the conversion is
 /// refused rather than warned about.
 ///
-/// Not 1.0, and the reason is the measurement rather than timidity. The
-/// per-unit demand behind these coefficients varies by 1.7x across the measured
-/// per-commit term and by at least 2.5x across the per-artifact term, so a
-/// refusal decided at exactly the ceiling would be decided inside the noise of
-/// its own calibration. A false refusal costs a user a conversion that would
-/// have worked and sends them to an environment variable; a warning costs them
-/// a line of text and tells them the same thing.
-const REFUSE_MULTIPLE: f64 = 1.5;
+/// One, which is to say the ceiling itself. This read 1.5 while the forecast
+/// still carried a term that over-claimed: commits multiplied by files put a
+/// normal clone of facebook/react at 582.5 GB against the 36.9 GiB it turned
+/// out to hold, and slack was the only thing between that arithmetic and a
+/// refusal of work that would have finished. That term is gone. Every term
+/// left is a floor read off a conversion that ran, checked over every measured
+/// row by `the_forecast_is_a_floor_on_every_conversion_it_was_measured_against`,
+/// so a forecast above the ceiling now says the least this conversion needs is
+/// already more than the machine has. Starting there is the case this module
+/// exists to end: no refusal, a few phase lines, and a shell that prints
+/// `Killed`.
+///
+/// The calibration's spread has not gone away, it has moved to where an
+/// operator can act on it. Per-unit demand still varies by 1.7x across the
+/// measured per-commit term, by at least 2.5x across the per-artifact term and
+/// by 3.1x across the per-history-byte term, so a conversion refused here may
+/// well have fitted. It is refused with its own forecast, the ceiling beside it
+/// and [`INIT_MEMORY_CEILING_ENV`] named, which costs an operator who disagrees
+/// one command. [`TIGHT_FRACTION`] keeps a band below the ceiling, so a
+/// conversion that fits and only just still hears about it.
+const REFUSE_MULTIPLE: f64 = 1.0;
 
 /// Bytes a conversion holds for each artifact in the head tree it admits.
 ///
@@ -316,13 +338,15 @@ impl BudgetVerdict {
         else {
             return None;
         };
-        // One sentence for the whole band, because the band spans both sides of
-        // the ceiling: a forecast at 91 percent of the limit and one at 130
-        // percent are both cases where the conversion probably runs and might
-        // not, and wording that read "N of the M allowed" would be nonsense on
-        // the second. So it states both figures and lets the reader compare
-        // them, and it carries the remedy, because being warned and given
-        // nothing to do is most of the way back to being told nothing.
+        // One sentence for the whole band, which since the refusal moved to the
+        // ceiling lies wholly under it: a forecast between 70 and 100 percent of
+        // the limit. It still states both figures rather than reading "N of the
+        // M allowed", because the two are not the same kind of number. The
+        // forecast is a floor and the ceiling is what the machine reported, so a
+        // percentage of one against the other would read as a measured fraction
+        // of a known budget, which it is not. And it carries the remedy, because
+        // being warned and given nothing to do is most of the way back to being
+        // told nothing.
         Some(format!(
             "  this conversion is expected to hold about {}, against the {} this {} allows, \
              because {} commits over {} tracked files is a large history. It will probably \
@@ -431,6 +455,19 @@ impl BudgetVerdict {
             return Vec::new();
         };
         let times = *forecast_bytes / (*ceiling_bytes).max(1);
+        // Below twice the ceiling the multiple says nothing the two figures do
+        // not already say, and "about 1 times" is not a sentence. That band
+        // used to be unreachable, because a refusal began at 1.5x; since
+        // [`REFUSE_MULTIPLE`] moved to the ceiling it is where most refusals
+        // land.
+        let against = if times >= 2 {
+            format!(
+                ", about {times} times the {} here",
+                human_bytes(*ceiling_bytes)
+            )
+        } else {
+            format!(", against the {} here", human_bytes(*ceiling_bytes))
+        };
         let decided = match survey.forecast().1 {
             DecidingTerm::HistoryBytes => "the bytes of history decide it",
             DecidingTerm::Commits => "the commit count decides it",
@@ -438,12 +475,10 @@ impl BudgetVerdict {
         };
         vec![
             format!(
-                "this conversion needs more memory than this {} has: at least {}, about {} times \
-                 the {} here",
+                "this conversion needs more memory than this {} has: at least {}{}",
                 ceiling_noun(),
                 human_bytes(*forecast_bytes),
-                times.max(1),
-                human_bytes(*ceiling_bytes),
+                against,
             ),
             format!(
                 "  {} commits over {} tracked files carrying {} of history is what drives it, and \
@@ -1178,13 +1213,19 @@ mod tests {
         }
     }
 
-    /// The three measured frontier-walk conversions, as the survey would have
+    /// The four measured frontier-walk conversions, as the survey would have
     /// counted them: commits from HEAD, tracked files, reachable blob bytes,
     /// and the whole-run resident peak.
-    const MEASURED_HISTORIES: [(&str, u64, u64, u64, u64); 3] = [
+    ///
+    /// React is the deepest history measured and the row the history term is
+    /// read off tightest, at 18.0955 bytes held per history byte. It ran to
+    /// completion in 1 h 47 min on a 128 GB host and was not killed, so its
+    /// peak is a held figure like the other three.
+    const MEASURED_HISTORIES: [(&str, u64, u64, u64, u64); 4] = [
         ("hiredis", 1_141, 79, 27_715_552, 1_538_834_432),
         ("requests", 6_493, 130, 112_476_293, 5_568_004_096),
         ("kin", 2_924, 1_033, 1_400_991_245, 27_428_945_920),
+        ("react", 21_679, 7_213, 2_187_539_173, 39_584_645_120),
     ];
 
     /// The history term is the one that decides kin, and it decides it the
@@ -1201,7 +1242,7 @@ mod tests {
         let (forecast, term) = kin.forecast();
         assert_eq!(term, DecidingTerm::HistoryBytes);
         assert!(
-            forecast > 26 * 1000 * 1000 * 1000,
+            forecast > 25 * 1000 * 1000 * 1000 && forecast < 26 * 1000 * 1000 * 1000,
             "kin forecast {forecast}"
         );
         for gb in [8u64, 16] {
@@ -1224,9 +1265,11 @@ mod tests {
             ),
             "kin on 32 GB is close and says so"
         );
-        // And the term does not make the two repositories that fit speak.
+        // And the term does not make the repositories that fit speak. React is
+        // skipped beside kin: it is the other history-heavy subject, it is
+        // refused on 16 GB too, and the test below is where that is pinned.
         for (name, commits, files, bytes, _) in MEASURED_HISTORIES {
-            if name == "kin" {
+            if name == "kin" || name == "react" {
                 continue;
             }
             let verdict = verdict_for(history(commits, files, bytes), 16 * 1024 * 1024 * 1024);
@@ -1239,6 +1282,11 @@ mod tests {
 
     /// The history term has to be a floor on every conversion it was read
     /// off, including the one it was read off tightest.
+    ///
+    /// That is react, and the margin is half a percent: 18 against the 18.0955
+    /// it held. This test is what refused 19, which floored the other three
+    /// and forecast react at 41,563,244,287 bytes against the 39,584,645,120
+    /// it really took.
     #[test]
     fn the_history_term_floors_every_measured_history() {
         for (name, commits, files, bytes, held) in MEASURED_HISTORIES {
@@ -1252,22 +1300,37 @@ mod tests {
     }
 
     /// facebook/react at its September 2026 pin, as the survey would count it
-    /// on a normal clone: refused on 16 GB, spoken about on 32, and admitted
-    /// where the machine has room, in place of a 582.5 GB refusal everywhere.
+    /// on a normal clone: refused on 16 and 32 GB, and admitted where the
+    /// machine has room, in place of a 582.5 GB refusal everywhere.
+    ///
+    /// This row is no longer only a forecast. The conversion has since run to
+    /// completion on a 128 GB host, holding 39,584,645,120 bytes at its peak
+    /// over 1 h 47 min, so the assertion that the forecast sits under what it
+    /// held is a fact about a run rather than about arithmetic. The 64 and
+    /// 128 GB cases are the daemon band, not silence: 21,679 commits load a
+    /// store past any share one repository daemon is allowed.
     #[test]
     fn react_is_forecast_from_its_history_rather_than_refused_everywhere() {
+        const REACT_HELD_BYTES: u64 = 39_584_645_120;
         let react = history(21_679, 7_213, 2_187_539_173);
         let (forecast, term) = react.forecast();
         assert_eq!(term, DecidingTerm::HistoryBytes);
         assert!(
-            forecast > 41 * 1000 * 1000 * 1000 && forecast < 42 * 1000 * 1000 * 1000,
+            forecast > 39 * 1000 * 1000 * 1000 && forecast < 40 * 1000 * 1000 * 1000,
             "react forecast {forecast}"
         );
-        assert!(verdict_for(react, 16 * 1024 * 1024 * 1024).refuses());
-        assert!(matches!(
-            verdict_for(react, 32 * 1024 * 1024 * 1024),
-            BudgetVerdict::Tight { .. }
-        ));
+        assert!(
+            forecast <= REACT_HELD_BYTES,
+            "react forecast {forecast} exceeds the {REACT_HELD_BYTES} its conversion held"
+        );
+        for gb in [16u64, 32] {
+            let verdict = verdict_for(react, gb * 1024 * 1024 * 1024);
+            assert!(
+                verdict.refuses(),
+                "react must be refused on {gb} GB, got {verdict:?}"
+            );
+        }
+        assert!(!verdict_for(react, 64 * 1024 * 1024 * 1024).refuses());
         assert!(!verdict_for(react, 128 * 1024 * 1024 * 1024).refuses());
     }
 
@@ -1318,33 +1381,46 @@ mod tests {
         );
     }
 
-    /// A forecast OVER the ceiling but under the refusal multiple warns and
-    /// carries on.
+    /// A forecast just OVER the ceiling refuses rather than warning.
     ///
-    /// This is the band the coefficients' own spread buys, and it needs its own
-    /// guard because it is invisible to every other test here: raising the
-    /// refusal back to the ceiling leaves the refusal tests green, the floor
-    /// test green and the calibration test green, and only this one goes red.
-    /// A conversion this close is one the calibration cannot resolve, so it is
-    /// told what to expect rather than stopped.
+    /// This case used to warn, and it is the whole of what moving
+    /// [`REFUSE_MULTIPLE`] from 1.5 to 1.0 changed for a repository nobody has
+    /// measured. It needs its own guard because it is invisible to every other
+    /// test in this module: restoring 1.5 leaves the refusal tests, the floor
+    /// test and the calibration tests green, and turns exactly this one and
+    /// kin's 16 GB case red. A forecast of 3.5 GB against a 2.8 GB machine is
+    /// a statement that the least this conversion needs is more than the
+    /// machine has, and starting it spends minutes to arrive at `Killed`.
     #[test]
-    fn a_forecast_just_over_the_ceiling_warns_rather_than_refusing() {
+    fn a_forecast_just_over_the_ceiling_refuses_rather_than_warning() {
         let survey = survey(4_000, 1_000);
         let forecast = survey.forecast_peak_bytes();
         let ceiling = forecast - forecast / 5; // forecast is 1.25x this ceiling
         let verdict = verdict_for(survey, ceiling);
         assert!(
-            !verdict.refuses(),
-            "a forecast 1.25x the ceiling is inside the calibration's own spread and must not \
-             refuse, got {verdict:?}"
+            verdict.refuses(),
+            "a forecast 1.25x the ceiling is the least this conversion needs and must refuse, \
+             got {verdict:?}"
         );
-        let line = verdict
-            .advisory_line()
-            .expect("a conversion over its ceiling has to say so before it starts");
-        assert!(line.contains("expected to hold about"), "line was: {line}");
+        let text = verdict.refusal_lines().join("\n");
+        assert!(text.contains("needs more memory"), "text was:\n{text}");
         assert!(
-            line.contains("give it more than"),
-            "a warning with no remedy is most of the way back to silence: {line}"
+            text.contains("give it more than"),
+            "a refusal with no remedy is most of the way back to silence: {text}"
+        );
+        assert!(
+            !text.contains("about 1 times"),
+            "a refusal just over the ceiling multiplied by one: {text}"
+        );
+        assert!(
+            text.contains("against the"),
+            "a refusal under twice the ceiling states the ceiling plainly: {text}"
+        );
+        // And the byte below it is the last one that warns, so the boundary is
+        // a boundary rather than a slope.
+        assert!(
+            matches!(verdict_for(survey, forecast), BudgetVerdict::Tight { .. }),
+            "a ceiling exactly at the forecast is the top of the tight band"
         );
     }
 
@@ -1453,7 +1529,7 @@ mod tests {
     /// floor on the demand is all this assertion needs. The fourth is kin
     /// 0.7.3 on a 128 GB host with the resident set sampled from outside the
     /// process once a second, which is the row [`BYTES_PER_COMMIT`] was read
-    /// off, and the last three are the frontier walk itself on the same host
+    /// off, and the last four are the frontier walk itself on the same host
     /// and method, which is what lets this test fail on the binary it ships
     /// in rather than only on a predecessor's. prometheus, 18,514 commits over
     /// 1,676 files, was killed at phase 4 under 0.6.0 on the tree structures
@@ -1498,6 +1574,16 @@ mod tests {
                 1_400_991_245,
                 27_428_945_920,
             ),
+            // A normal clone of facebook/react at its September 2026 pin: the
+            // deepest history measured, run to completion rather than killed,
+            // and the row the history term is read off tightest.
+            (
+                "react frontier walk",
+                21_679,
+                7_213,
+                2_187_539_173,
+                39_584_645_120,
+            ),
         ];
         for (name, commits, artifacts, history_bytes, held_bytes) in measured {
             let survey = history(commits, artifacts, history_bytes);
@@ -1507,13 +1593,14 @@ mod tests {
                 "{name}: forecast {forecast} exceeds the {held_bytes} it really held, so the \
                  forecast is not a floor"
             );
-            // Every row converted, and every row but kin fits an 8 GiB
-            // ceiling; kin's row is the one the history term exists to refuse
-            // there, since it held 25.5 GiB.
+            // Every row converted, and every row but the two history-heavy
+            // ones fits an 8 GiB ceiling; kin and react are the rows the
+            // history term exists to refuse there, since they held 25.5 GiB
+            // and 36.9 GiB.
             let verdict = verdict_for(survey, CEILING);
             assert_eq!(
                 verdict.refuses(),
-                name == "kin frontier walk",
+                matches!(name, "kin frontier walk" | "react frontier walk"),
                 "{name}: refuses() is {} under 8 GiB, got {verdict:?}",
                 verdict.refuses()
             );
