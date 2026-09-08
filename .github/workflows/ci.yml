@@ -1039,6 +1039,9 @@ jobs:
       - name: Test acceptance fixture cleanup safety
         run: python3 scripts/acceptance/test_fixture_shutdown.py
 
+      - name: Test bounded brownfield trace witnesses
+        run: python3 scripts/acceptance/test_brownfield_trace_witness.py
+
       # Here rather than in `check`, for the reason the step above records: a
       # script step in `check` is a gate `bin/kin-precheck` enumerates and must
       # classify by name, and one wired there without the matching umbrella

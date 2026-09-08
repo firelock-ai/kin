@@ -1217,6 +1217,96 @@ def check_3(suite):
     return res
 
 
+def complete_trace_clips(suite, repo, payload, steps):
+    """Bound only depth-one fanout gaps with complete graph-owned witnesses.
+
+    The original trace remains the assertion surface. A neighborhood can prove
+    its omitted candidates harmless, but a forbidden raw edge needs a focused
+    trace before it can establish a counted-flow failure.
+    """
+    if (budget_cut(payload) or (payload.get("_kin") or {}).get("response", {}).get("bounded")
+            or payload.get("steps_omitted")
+            or payload.get("fanout_narrowed") or len(steps) >= 200):
+        raise ProbeError("trace output or total-step budget lost rows")
+    clips = payload.get("clipped_steps") or []
+    if not payload.get("truncated") and not clips:
+        return [], []
+    if not clips:
+        raise ProbeError("truncated trace has no bounded fanout disclosure")
+    confirmations, receipts = [], []
+    for clip in clips:
+        index = clip.get("step")
+        if (not isinstance(index, int) or index <= 0 or index > len(steps)
+                or steps[index - 1].get("depth") != 1
+                or clip.get("limit_per_step") != 25
+                or clip.get("dropped_callers") != 0
+                or not isinstance(clip.get("dropped_callees"), int)
+                or clip["dropped_callees"] <= 0):
+            raise ProbeError("unsupported trace clip: %r" % clip)
+        focal = clip.get("entity_id")
+        if not focal or steps[index - 1].get("entity_id") != focal:
+            raise ProbeError("clip does not identify its original trace step")
+        hood = suite.cached(repo, "graph_neighborhood",
+                            {"entity_id": focal, "depth": 1,
+                             "direction": "out", "limit": 50, "max_chars": 60000})
+        entities, relations = hood.get("entities"), hood.get("relations")
+        if (hood.get("focal_id") != focal or hood.get("depth") != 1
+                or hood.get("direction") != "out" or hood.get("truncated")
+                or budget_cut(hood) or (hood.get("_kin") or {}).get("response", {}).get("bounded")
+                or not isinstance(entities, list)
+                or not isinstance(relations, list)
+                or len(entities) != hood.get("entity_count")
+                or len(relations) != hood.get("relation_count")):
+            raise ProbeError("incomplete or mismatched neighborhood for %s" % focal)
+        by_id = {e.get("id"): e for e in entities if isinstance(e, dict)}
+        if (len(by_id) != len(entities) or focal not in by_id
+                or any(not e.get("id") or not e.get("name") for e in entities)):
+            raise ProbeError("unresolved neighborhood entity metadata")
+        eligible = set()
+        for relation in relations:
+            if not isinstance(relation, dict):
+                raise ProbeError("malformed neighborhood relation")
+            source, destination = relation.get("src"), relation.get("dst")
+            if not isinstance(source, dict) or not isinstance(destination, dict):
+                raise ProbeError("malformed neighborhood endpoint")
+            src, dst = source.get("Entity"), destination.get("Entity")
+            if (src != focal or dst not in by_id or relation.get("direction") != "outgoing"
+                    or relation.get("from") != focal
+                    or relation.get("resolution") not in ("type_resolved", "import_scoped", "name_only")):
+                raise ProbeError("unresolved neighborhood endpoint or resolution")
+            if relation.get("kind") not in ("Calls", "Imports", "References", "UsesType"):
+                continue
+            eligible.add(dst)
+            if relation["resolution"] == "name_only":
+                continue
+            name = by_id[dst]["name"]
+            if not any(name_matches(name, bad) for bad in APP_HANDLE_FABRICATED):
+                continue
+            focused = suite.cached(repo, "trace_data_flow",
+                                   {"focal": focal, "target": dst, "direction": "calls",
+                                    "depth": 1, "include_body": False,
+                                    "limit_per_step": 25, "max_chars": 200000})
+            focused_steps = trace_steps(focused)
+            if (budget_cut(focused) or focused_steps is None
+                    or focused.get("focal_id") != focal
+                    or focused.get("depth") != 1 or focused.get("direction") != "calls"
+                    or (focused.get("_kin") or {}).get("response", {}).get("bounded")):
+                raise ProbeError("focused forbidden-candidate trace unreadable")
+            matched = [row for row in focused_steps if row.get("entity_id") == dst]
+            if not matched:
+                raise ProbeError("forbidden raw candidate absent from focused confirmation")
+            confirmations.extend(row for row in matched
+                                 if row.get("resolution") != "name_only"
+                                 and row.get("proven") is not False
+                                 and row.get("unproven") is not True)
+        if len(eligible) < 25 + clip["dropped_callees"]:
+            raise ProbeError("neighborhood does not cover disclosed trace fanout")
+        receipts.append("%s: complete depth=1/out/limit=50/max_chars=60000 witness, %d entities, "
+                        "%d relations, %d trace-eligible destinations"
+                        % (focal, len(entities), len(relations), len(eligible)))
+    return confirmations, receipts
+
+
 def check_4(suite):
     """FIR-2464: express cross-file edges are real, and the one that matters is there.
 
@@ -1256,11 +1346,15 @@ def check_4(suite):
         res.unknown("trace_data_flow on %s returned zero steps, so neither the real "
                     "edges nor the fabricated ones can be judged" % APP_HANDLE)
         return res
-    if payload.get("truncated") or payload.get("clipped_steps"):
-        res.unknown("the walk came back truncated (truncated=%r, clipped_steps=%r), "
-                    "so an absent edge cannot be told from a dropped one"
-                    % (payload.get("truncated"), payload.get("clipped_steps")))
-        return res
+    complete = True
+    confirmed = []
+    try:
+        confirmed, receipts = complete_trace_clips(suite, repo, payload, steps)
+        for receipt in receipts:
+            res.ok(receipt)
+    except ProbeError as exc:
+        complete = False
+        res.unknown(str(exc))
 
     def step_name(step):
         if not isinstance(step, dict):
@@ -1318,6 +1412,8 @@ def check_4(suite):
     fabricated_counted = sorted({"%s (%s)" % (n, descent(s)) for n, s in counted
                                  if any(name_matches(n, f)
                                         for f in APP_HANDLE_FABRICATED)})
+    fabricated_counted.extend("%s (focused trace confirmation)" % step_name(row)
+                              for row in confirmed)
     if fabricated_counted:
         res.bad("counted steps include fabricated callees %s; %d of %d steps counted, "
                 "unproven_steps=%r"
@@ -1329,16 +1425,15 @@ def check_4(suite):
     missing_real = [want for want in APP_HANDLE_REAL_CALLEES
                     if not any(name_matches(n, want) for n in all_names)]
     if missing_real:
-        res.bad("the real callees %s are absent from the walk; steps are %s"
+        (res.bad if complete else res.unknown)("the real callees %s are absent from the walk; steps are %s"
                 % (", ".join(missing_real), all_names[:12]))
     else:
         res.ok("both real callees %s are present"
                % ", ".join(APP_HANDLE_REAL_CALLEES))
-    if any(name_matches(n, APP_HANDLE_MISSING_CALLEE)
-           or basename_of(n) == "handle" for n in all_names):
+    if any(name_matches(n, APP_HANDLE_MISSING_CALLEE) for n in all_names):
         res.ok("the hand-off %s is in the walk" % APP_HANDLE_MISSING_CALLEE)
     else:
-        res.bad("the hand-off this.router.handle at %s:177, the last line of "
+        (res.bad if complete else res.unknown)("the hand-off this.router.handle at %s:177, the last line of "
                 "app.handle and the edge the question is about, is absent from the "
                 "walk; steps are %s" % (APP_HANDLE_FILE, all_names[:12]))
     return res
