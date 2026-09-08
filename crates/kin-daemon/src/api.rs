@@ -19093,7 +19093,7 @@ pub fn bind_api_listener(
     port: u16,
 ) -> std::io::Result<(tokio::net::TcpListener, u16)> {
     let bind_host = bind_host_from_env();
-    let auth_present = resolve_serve_auth_token(layout).is_some();
+    let auth_present = resolve_serve_auth_token(layout)?.is_some();
     let listener = bind_listener(&bind_host, port, auth_present)?;
     let bound_port = listener.local_addr()?.port();
     Ok((listener, bound_port))
@@ -19114,7 +19114,7 @@ pub fn bind_api_listener_pair(
     port: u16,
 ) -> std::io::Result<(tokio::net::TcpListener, tokio::net::TcpListener, u16)> {
     let bind_host = bind_host_from_env();
-    let auth_present = resolve_serve_auth_token(layout).is_some();
+    let auth_present = resolve_serve_auth_token(layout)?.is_some();
     let bound = bind_std_listener(&bind_host, port, auth_present)?;
     // Both handles share one bound socket and one listen queue, but only on
     // Unix does the dup share status flags. On Windows, WSA socket duplication
@@ -19221,13 +19221,7 @@ pub async fn serve_bound_with_shutdown(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let publication_control_auth_token = publication_control_auth_token_from_env();
-    let tokens = resolve_serve_rotation_tokens(&state.layout).map_err(|error| {
-        // A refusal here stops the daemon starting, which is deliberate: the two
-        // refused configurations both mean the operator believes a rotation
-        // window is open when it is not, and serving anyway would make that
-        // belief look correct until the moment traffic is dropped.
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-    })?;
+    let tokens = resolve_serve_rotation_tokens(&state.layout)?;
     let app =
         router_with_rotation_tokens(state, tokens, publication_control_auth_token, shutdown_tx);
     let port = listener
@@ -19366,21 +19360,18 @@ fn loopback_token_enforced() -> bool {
 /// `KIN_DAEMON_AUTH_TOKEN` override always wins. Otherwise the per-install
 /// loopback token is auto-provisioned under `.kin/` (so local clients can adopt
 /// it) and returned for enforcement unless `KIN_DAEMON_REQUIRE_TOKEN` is set to
-/// a falsy value (the opt-out escape hatch). If provisioning fails the daemon
-/// still starts (loopback Host/Origin validation remains active) but logs a
-/// warning.
-fn resolve_serve_auth_token(layout: &kin_core::KinLayout) -> Option<String> {
+/// a falsy value (the opt-out escape hatch). Provisioning failure refuses
+/// startup when enforcement is enabled.
+fn resolve_serve_auth_token(layout: &kin_core::KinLayout) -> std::io::Result<Option<String>> {
     if let Some(env_token) = auth_token_from_env() {
-        return Some(env_token);
+        return Ok(Some(env_token));
     }
     match ensure_loopback_token(layout) {
-        Ok(token) => loopback_token_enforced().then_some(token),
+        Ok(token) => Ok(loopback_token_enforced().then_some(token)),
+        Err(error) if loopback_token_enforced() => Err(error),
         Err(error) => {
-            tracing::warn!(
-                %error,
-                "failed to provision loopback auth token; daemon will run without bearer auth"
-            );
-            None
+            tracing::warn!(%error, "failed to provision token while bearer authentication is explicitly disabled");
+            Ok(None)
         }
     }
 }
@@ -19393,9 +19384,9 @@ fn resolve_serve_auth_token(layout: &kin_core::KinLayout) -> Option<String> {
 /// quietly reappeared would hold one open past its own policy.
 fn resolve_serve_rotation_tokens(
     layout: &kin_core::KinLayout,
-) -> Result<crate::auth_rotation::RotationTokens, crate::auth_rotation::RotationConfigError> {
+) -> std::io::Result<crate::auth_rotation::RotationTokens> {
     crate::auth_rotation::RotationTokens::new(
-        resolve_serve_auth_token(layout),
+        resolve_serve_auth_token(layout)?,
         previous_auth_token_from_env(),
         DAEMON_AUTH_TOKEN_ENV,
         DAEMON_AUTH_TOKEN_PREVIOUS_ENV,
@@ -19403,8 +19394,12 @@ fn resolve_serve_rotation_tokens(
         crate::auth_rotation::RotationBounds::from_env(
             DAEMON_AUTH_ROTATION_WINDOW_SECS_ENV,
             DAEMON_AUTH_ROTATION_MAX_ACCEPTS_ENV,
-        )?,
+        )
+        .map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?,
     )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()))
 }
 
 fn parse_bind_host(bind_host: &str) -> std::io::Result<IpAddr> {
@@ -54321,6 +54316,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_provisioning_failure_refuses_bind_and_serve() {
+        let _env = env_test_lock();
+        let mut env = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_AUTH_TOKEN")
+            .without("KIN_DAEMON_REQUIRE_TOKEN")
+            .with("KIN_DAEMON_BIND_HOST", "127.0.0.1");
+        let scratch = tempfile::tempdir().unwrap();
+        let invalid_parent = scratch.path().join("not-a-directory");
+        std::fs::write(&invalid_parent, "fixture").unwrap();
+        let layout = kin_core::KinLayout::new(invalid_parent);
+        assert!(resolve_serve_auth_token(&layout).is_err());
+        assert!(bind_api_listener(&layout, 0).is_err());
+        assert!(bind_api_listener_pair(&layout, 0).is_err());
+
+        let state = test_state();
+        let (listener, _) = bind_api_listener(&state.layout, 0).unwrap();
+        let token_path = loopback_token_path(&state.layout);
+        std::fs::remove_file(&token_path).unwrap();
+        std::fs::create_dir(&token_path).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            serve_bound_with_shutdown(state, listener, None, rx),
+        )
+        .await
+        .expect("serving must refuse before accepting requests");
+        assert!(result.is_err());
+
+        env.apply("KIN_DAEMON_REQUIRE_TOKEN", Some("off"));
+        assert_eq!(resolve_serve_auth_token(&layout).unwrap(), None);
+        assert!(bind_api_listener(&layout, 0).is_ok());
+        env.apply("KIN_DAEMON_AUTH_TOKEN", Some("explicit-test-token"));
+        assert_eq!(
+            resolve_serve_auth_token(&layout).unwrap().as_deref(),
+            Some("explicit-test-token")
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_serve_auth_token_gates_enforcement() {
         let _env = env_test_lock();
         let mut tokens = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_AUTH_TOKEN")
@@ -54333,6 +54366,7 @@ mod tests {
         // Default (no env configured at all): enforcement is ON, so a fresh
         // install requires the auto-provisioned token out of the box.
         let provisioned_default = resolve_serve_auth_token(&layout)
+            .unwrap()
             .expect("fresh install must enforce the auto-provisioned token by default");
         let provisioned = std::fs::read_to_string(loopback_token_path(&layout)).unwrap();
         assert!(!provisioned.trim().is_empty());
@@ -54342,14 +54376,14 @@ mod tests {
         // for a local client that cannot yet send the header — while the file
         // stays provisioned.
         tokens.apply("KIN_DAEMON_REQUIRE_TOKEN", Some("0"));
-        assert!(resolve_serve_auth_token(&layout).is_none());
+        assert!(resolve_serve_auth_token(&layout).unwrap().is_none());
         tokens.apply("KIN_DAEMON_REQUIRE_TOKEN", Some("false"));
-        assert!(resolve_serve_auth_token(&layout).is_none());
+        assert!(resolve_serve_auth_token(&layout).unwrap().is_none());
 
         // Explicit truthy values are equivalent to the default.
         tokens.apply("KIN_DAEMON_REQUIRE_TOKEN", Some("1"));
         assert_eq!(
-            resolve_serve_auth_token(&layout).as_deref(),
+            resolve_serve_auth_token(&layout).unwrap().as_deref(),
             Some(provisioned.trim())
         );
         tokens.apply::<_, &str>("KIN_DAEMON_REQUIRE_TOKEN", None);
@@ -54359,7 +54393,7 @@ mod tests {
         tokens.apply("KIN_DAEMON_REQUIRE_TOKEN", Some("0"));
         tokens.apply("KIN_DAEMON_AUTH_TOKEN", Some("explicit-override"));
         assert_eq!(
-            resolve_serve_auth_token(&layout).as_deref(),
+            resolve_serve_auth_token(&layout).unwrap().as_deref(),
             Some("explicit-override")
         );
     }

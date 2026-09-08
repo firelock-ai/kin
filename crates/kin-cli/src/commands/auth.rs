@@ -609,6 +609,7 @@ fn prompt_for_code() -> Result<String> {
 }
 
 pub(crate) fn load_saved_bearer_token(base_url: &str) -> Option<String> {
+    kin_remote::http_transport::validate_credential_url(base_url).ok()?;
     load_credential(base_url, true)
         .ok()
         .flatten()
@@ -654,13 +655,20 @@ pub(crate) fn default_cli_actor_id(base_url: &str) -> String {
     )
 }
 
+fn credential_http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
 pub async fn login(
     base_url: Option<String>,
     no_browser: bool,
     provider: AuthProvider,
 ) -> Result<()> {
     let base_url = normalized_base_url(base_url);
-    let client = reqwest::Client::new();
+    kin_remote::http_transport::validate_credential_url(&base_url).map_err(anyhow::Error::msg)?;
+    let client = credential_http_client()?;
     let code_verifier = random_token(32);
     let code_challenge = pkce_challenge(&code_verifier);
 
@@ -837,9 +845,10 @@ pub async fn status(base_url: Option<String>) -> Result<()> {
 
 pub async fn whoami(base_url: Option<String>) -> Result<()> {
     let base_url = normalized_base_url(base_url);
+    kin_remote::http_transport::validate_credential_url(&base_url).map_err(anyhow::Error::msg)?;
     let credential = load_credential(&base_url, true)?
         .ok_or_else(|| anyhow::anyhow!("no KinLab auth credential stored for {}", base_url))?;
-    let response = reqwest::Client::new()
+    let response = credential_http_client()?
         .get(format!("{}/api/session", base_url))
         .bearer_auth(&credential.token)
         .send()
@@ -928,12 +937,16 @@ fn logout_lines(
     lines
 }
 
-pub async fn logout(base_url: Option<String>) -> Result<()> {
-    let base_url = normalized_base_url(base_url);
-    let revocation = match load_credential(&base_url, true)? {
+async fn revoke_saved_session(base_url: &str) -> Result<RevocationOutcome> {
+    if let Err(reason) = kin_remote::http_transport::validate_credential_url(base_url) {
+        return Ok(RevocationOutcome::NotRevoked(format!(
+            "network revocation skipped: {reason}"
+        )));
+    }
+    let revocation = match load_credential(base_url, true)? {
         None => None,
         Some(credential) => Some(
-            match reqwest::Client::new()
+            match credential_http_client()?
                 .post(format!("{}/api/cli/auth/logout", base_url))
                 .bearer_auth(&credential.token)
                 .send()
@@ -944,7 +957,12 @@ pub async fn logout(base_url: Option<String>) -> Result<()> {
             },
         ),
     };
-    let outcome = revocation_outcome(revocation);
+    Ok(revocation_outcome(revocation))
+}
+
+pub async fn logout(base_url: Option<String>) -> Result<()> {
+    let base_url = normalized_base_url(base_url);
+    let outcome = revoke_saved_session(&base_url).await?;
 
     // Local removal runs whatever the server said. A session this machine
     // cannot revoke is still a session this machine should not keep the key to.
@@ -963,6 +981,138 @@ pub async fn logout(base_url: Option<String>) -> Result<()> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[tokio::test]
+    async fn credential_commands_refuse_insecure_urls_before_store_access() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().join("credentials");
+        let _root = TestCredentialRoot::set(&root);
+        for base in [
+            "http://localhost:1",
+            "http://example.com",
+            "http://127.0.0.1.example.com",
+            "ftp://127.0.0.1",
+        ] {
+            let login_error = login(Some(base.into()), true, AuthProvider::default())
+                .await
+                .unwrap_err();
+            let whoami_error = whoami(Some(base.into())).await.unwrap_err();
+            for error in [login_error, whoami_error] {
+                assert!(error.to_string().contains("requires HTTPS"), "{error}");
+            }
+            assert!(load_saved_bearer_token(base).is_none());
+        }
+        assert!(
+            !root.exists(),
+            "refusal must precede credential store access"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn logout_removes_legacy_insecure_credentials_without_network_revocation() {
+        let scratch = tempfile::tempdir().unwrap();
+        let _root = TestCredentialRoot::set(&scratch.path().join("auth"));
+        let _env = kin_core::test_env::EnvVarGuard::unset("KINLAB_AUTH_PASSPHRASE");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+        let other = "https://other.example.com";
+        store_credential(&base, &test_credential(&base)).unwrap();
+        store_credential(other, &test_credential(other)).unwrap();
+        let legacy = fallback_credential_path(&base)
+            .unwrap()
+            .with_extension("json");
+        assert!(legacy.exists());
+        tokio::time::timeout(Duration::from_secs(1), logout(Some(base.clone())))
+            .await
+            .expect("local logout must not wait on an unsafe endpoint")
+            .unwrap();
+        assert!(!legacy.exists());
+        assert!(load_credential(other, false).unwrap().is_some());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let outcome = revoke_saved_session(&base).await.unwrap();
+        assert!(
+            matches!(outcome, RevocationOutcome::NotRevoked(reason) if reason.contains("network revocation skipped"))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn logout_revokes_on_allowed_transport_and_removes_local_credentials() {
+        let scratch = tempfile::tempdir().unwrap();
+        let _root = TestCredentialRoot::set(&scratch.path().join("auth"));
+        let _env = kin_core::test_env::EnvVarGuard::unset("KINLAB_AUTH_PASSPHRASE");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        store_credential(&base, &test_credential(&base)).unwrap();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let (mut connection, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("expected revocation request: {error}"),
+                }
+            };
+            connection
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buffer = [0; 4096];
+            let n = connection.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
+            assert!(request.starts_with("post /api/cli/auth/logout "));
+            assert!(request.contains("authorization: bearer not-a-real-token"));
+            connection
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        logout(Some(base.clone())).await.unwrap();
+        server.join().unwrap();
+        assert!(load_credential(&base, false).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn credential_http_client_does_not_follow_body_preserving_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buffer = [0; 4096];
+            let n = connection.read(&mut buffer).unwrap();
+            assert!(n > 0);
+            connection.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/forwarded\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        kin_remote::http_transport::validate_credential_url(&base).unwrap();
+        let response = credential_http_client()
+            .unwrap()
+            .post(&base)
+            .bearer_auth("fixture-token")
+            .json(&serde_json::json!({"codeVerifier": "fixture"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        server.join().unwrap();
+        let exact = "https://EXAMPLE.com:443/prefix";
+        assert_eq!(normalized_base_url(Some(exact.into())), exact);
+        assert_ne!(
+            account_key(exact),
+            account_key("https://example.com/prefix")
+        );
+    }
 
     /// FIR-3257. A logout removes every persisted form of the credential it
     /// just logged out of.

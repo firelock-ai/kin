@@ -18,6 +18,64 @@ use std::time::Duration;
 use tracing::{debug, warn};
 use ureq::Agent;
 
+/// Require TLS for credentials except on literal loopback development endpoints.
+/// Validation does not rewrite the URL used to key saved credentials.
+pub fn validate_credential_url(raw: &str) -> Result<(), &'static str> {
+    let url = url::Url::parse(raw).map_err(|_| "invalid credential endpoint URL")?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host().is_none()
+    {
+        return Err("credential endpoint must not contain userinfo, a query, or a fragment");
+    }
+    match url.scheme() {
+        "https" => Ok(()),
+        "http"
+            if matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
+                || matches!(url.host(), Some(url::Host::Ipv6(ip)) if ip.is_loopback()) =>
+        {
+            Ok(())
+        }
+        _ => Err("credential endpoint requires HTTPS or a literal loopback HTTP address"),
+    }
+}
+
+#[cfg(test)]
+mod credential_url_tests {
+    use super::validate_credential_url;
+
+    #[test]
+    fn credential_urls_require_tls_except_loopback() {
+        for raw in [
+            "https://example.com",
+            "https://example.com/prefix/",
+            "http://127.0.0.1:4219",
+            "http://127.42.0.2",
+            "http://[::1]:4219",
+        ] {
+            assert!(validate_credential_url(raw).is_ok(), "{raw}");
+        }
+        for raw in [
+            "http://example.com",
+            "http://localhost",
+            "http://127.0.0.1.example.com",
+            "http://[::ffff:127.0.0.1]",
+            "http://0.0.0.0",
+            "http://192.168.1.1",
+            "ftp://127.0.0.1",
+            "file:///tmp/a",
+            "https://user:password@example.com",
+            "https://example.com?x=y",
+            "https://example.com#fragment",
+            "not a URL",
+        ] {
+            assert!(validate_credential_url(raw).is_err(), "{raw}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -55,6 +113,7 @@ impl HttpConfig {
     fn build_agent(&self) -> Agent {
         Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(self.timeout_secs)))
+            .max_redirects(0)
             .build()
             .into()
     }
@@ -119,6 +178,8 @@ fn map_ureq_error_to_push(err: ureq::Error) -> MutationPushError {
 
 impl DeltaPuller for HttpDeltaPuller {
     fn pull_delta(&self, entity_id: &str) -> Result<SemanticDelta, PullError> {
+        validate_credential_url(&self.config.base_url)
+            .map_err(|message| PullError::Protocol(message.to_string()))?;
         let url = format!(
             "{}/api/sync/delta?entity_id={}",
             self.config.base_url,
@@ -144,6 +205,8 @@ impl DeltaPuller for HttpDeltaPuller {
     }
 
     fn pull_deltas_since(&self, since: DateTime<Utc>) -> Result<Vec<SemanticDelta>, PullError> {
+        validate_credential_url(&self.config.base_url)
+            .map_err(|message| PullError::Protocol(message.to_string()))?;
         let url = format!(
             "{}/api/sync/delta?since={}",
             self.config.base_url,
@@ -196,6 +259,8 @@ impl std::fmt::Debug for HttpMutationPusher {
 
 impl MutationPusher for HttpMutationPusher {
     fn push_mutations(&self, mutations: &[LocalMutation]) -> Result<PushResult, MutationPushError> {
+        validate_credential_url(&self.config.base_url)
+            .map_err(|message| MutationPushError::Protocol(message.to_string()))?;
         let url = format!("{}/api/sync/push", self.config.base_url);
         debug!(count = mutations.len(), url = %url, "pushing mutations");
 
@@ -268,8 +333,112 @@ const HEX_UPPER: [u8; 16] = *b"0123456789ABCDEF";
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn serve_once(response: String) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "no fixture request");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (url, thread)
+    }
+
+    #[test]
+    fn sync_credentials_refuse_insecure_endpoints_before_network() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+        let config = HttpConfig::new(url)
+            .with_auth("fixture-token")
+            .with_timeout(1);
+        let puller = HttpDeltaPuller::new(config.clone());
+        assert!(
+            matches!(puller.pull_delta("entity:1"), Err(PullError::Protocol(message)) if message.contains("requires HTTPS"))
+        );
+        assert!(
+            matches!(puller.pull_deltas_since(Utc::now()), Err(PullError::Protocol(message)) if message.contains("requires HTTPS"))
+        );
+        let pusher = HttpMutationPusher::new(config);
+        assert!(
+            matches!(pusher.push_mutations(&[]), Err(MutationPushError::Protocol(message)) if message.contains("requires HTTPS"))
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn sync_credentials_allow_literal_loopback_and_refuse_redirects() {
+        let delta = serde_json::json!({"entity_id":"entity:1","before_hash":null,"after_hash":"hash","change_set":[],"timestamp":"2026-09-08T00:00:00Z","actor_id":"fixture"});
+        let bodies = [
+            delta.to_string(),
+            format!("[{delta}]"),
+            r#"{"Accepted":{"accepted_count":0,"new_remote_head":"hash"}}"#.to_owned(),
+        ];
+        for (operation, body) in bodies.into_iter().enumerate() {
+            for redirect in [false, true] {
+                let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                target.set_nonblocking(true).unwrap();
+                let response = if redirect {
+                    format!("HTTP/1.1 302 Found\r\nLocation: http://{}/redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", target.local_addr().unwrap())
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let (url, server) = serve_once(response);
+                let config = HttpConfig::new(url)
+                    .with_auth("fixture-token")
+                    .with_timeout(1);
+                let success = match operation {
+                    0 => HttpDeltaPuller::new(config).pull_delta("entity:1").is_ok(),
+                    1 => HttpDeltaPuller::new(config)
+                        .pull_deltas_since(Utc::now())
+                        .is_ok(),
+                    _ => HttpMutationPusher::new(config).push_mutations(&[]).is_ok(),
+                };
+                let request = server.join().unwrap();
+                assert!(request
+                    .to_lowercase()
+                    .contains("authorization: bearer fixture-token"));
+                assert_eq!(
+                    success, !redirect,
+                    "operation={operation} redirect={redirect}"
+                );
+                assert_eq!(
+                    target.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+        }
+    }
 
     #[test]
     fn http_config_builder() {

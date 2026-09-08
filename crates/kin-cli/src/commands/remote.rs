@@ -130,8 +130,18 @@ where
 }
 
 pub(crate) fn native_remote_bearer_token(base_url: &str) -> Option<String> {
-    resolve_native_remote_bearer_token_with(|key| std::env::var(key).ok())
-        .or_else(|| auth::load_saved_bearer_token(base_url))
+    credential_for_endpoint(base_url, || {
+        resolve_native_remote_bearer_token_with(|key| std::env::var(key).ok())
+            .or_else(|| auth::load_saved_bearer_token(base_url))
+    })
+}
+
+fn credential_for_endpoint(
+    base_url: &str,
+    load: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    kin_remote::http_transport::validate_credential_url(base_url).ok()?;
+    load()
 }
 
 /// The refusal both `kin remote` session pre-flights print when no bearer token
@@ -1619,6 +1629,65 @@ mod tests {
             message.contains("KIN_REMOTE_BEARER_TOKEN=$(cat <peer>/.kin/daemon.token)"),
             "the refusal must still carry the recipe that fixes it: {message}"
         );
+    }
+
+    #[test]
+    fn credential_endpoint_refusal_precedes_token_lookup() {
+        for base in [
+            "http://example.com",
+            "http://127.0.0.1.example.com",
+            "http://localhost",
+            "ftp://127.0.0.1",
+        ] {
+            let mut lookups = 0;
+            let token = super::credential_for_endpoint(base, || {
+                lookups += 1;
+                Some("fixture-token".into())
+            });
+            assert!(token.is_none(), "{base}");
+            assert_eq!(lookups, 0, "{base}");
+        }
+        for base in [
+            "https://example.com",
+            "http://127.0.0.1:4219",
+            "http://[::1]:4219",
+        ] {
+            let mut lookups = 0;
+            let token = super::credential_for_endpoint(base, || {
+                lookups += 1;
+                Some("fixture-token".into())
+            });
+            assert_eq!(token.as_deref(), Some("fixture-token"));
+            assert_eq!(lookups, 1);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn credential_endpoint_refusal_prevents_bearer_attachment() {
+        let _env = kin_core::test_env::EnvVarGuard::set("KIN_REMOTE_BEARER_TOKEN", "fixture-token");
+        let client = reqwest::Client::new();
+        for base in ["http://localhost", "http://localhost:4219"] {
+            let request = super::attach_native_remote_auth(client.get(base), base)
+                .build()
+                .unwrap();
+            assert!(!request
+                .headers()
+                .contains_key(reqwest::header::AUTHORIZATION));
+        }
+        for base in [
+            "https://example.com",
+            "http://127.0.0.1:4219",
+            "http://[::1]:4219",
+        ] {
+            let request = super::attach_native_remote_auth(client.get(base), base)
+                .build()
+                .unwrap();
+            assert_eq!(
+                request.headers()[reqwest::header::AUTHORIZATION],
+                "Bearer fixture-token"
+            );
+        }
     }
 
     #[test]
