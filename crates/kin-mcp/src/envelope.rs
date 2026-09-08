@@ -2721,6 +2721,15 @@ pub fn finalize_bounded(
     budget: &ResponseBudget,
 ) -> ToolCallResult {
     let payload = first_payload_value(&result);
+    let context_limit = matches!(tool_name, "get_context_pack" | "trace_computation")
+        .then(|| {
+            payload
+                .as_ref()?
+                .get("token_budget")?
+                .as_u64()
+                .map(|value| value as usize)
+        })
+        .flatten();
     let mut envelope = match &payload {
         Some(payload) => base.with_payload_metadata(payload),
         None => base,
@@ -2759,14 +2768,73 @@ pub fn finalize_bounded(
             envelope.verdict = Some(verdict.to_value());
         }
     }
-    annotate_inner(
+    let annotated = annotate_inner(
         result,
         &envelope,
         negative.as_ref(),
         tool_name,
         budget,
         &edge_coverage_limits,
-    )
+    );
+    match context_limit {
+        Some(limit) if annotated.is_error != Some(true) => {
+            fit_context_output(annotated, tool_name, budget, limit)
+        }
+        _ => annotated,
+    }
+}
+
+fn fit_context_output(
+    mut result: ToolCallResult,
+    tool: &str,
+    budget: &ResponseBudget,
+    token_limit: usize,
+) -> ToolCallResult {
+    for block in &mut result.content {
+        let ContentBlock::Text { text } = block;
+        let Ok(mut payload) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        loop {
+            apply_response_budget(&mut payload, tool, budget);
+            let mut settled = false;
+            for _ in 0..16 {
+                let rendered = crate::budget::render(&payload).expect("JSON value serialization");
+                let tokens = kin_context::estimate_tokens(&rendered);
+                let bytes = rendered.len();
+                if payload.get("tokens_used").and_then(Value::as_u64) == Some(tokens as u64)
+                    && payload
+                        .pointer("/_kin/response/chars_after_budget")
+                        .and_then(Value::as_u64)
+                        == Some(bytes as u64)
+                {
+                    settled = true;
+                    break;
+                }
+                payload["tokens_used"] = serde_json::json!(tokens);
+                payload[ENVELOPE_KEY]["response"]["chars_after_budget"] = serde_json::json!(bytes);
+            }
+            if !settled {
+                return ToolCallResult::error("context response accounting did not converge");
+            }
+            let rendered = crate::budget::render(&payload).expect("JSON value serialization");
+            if rendered.len() <= budget.max_chars
+                && kin_context::estimate_tokens(&rendered) <= token_limit
+            {
+                *text = rendered;
+                break;
+            }
+            let reason = if rendered.len() > budget.max_chars {
+                crate::budget::ELISION_REASON_BUDGET
+            } else {
+                crate::budget::ELISION_REASON_TOKEN_BUDGET
+            };
+            if !crate::budget::trim_context_output_once(&mut payload, reason) {
+                return ToolCallResult::error(format!("context metadata cannot fit the effective {token_limit} token and {} byte limits; request fewer focals or a larger budget", budget.max_chars));
+            }
+        }
+    }
+    result
 }
 
 /// Write the verdict's qualifiers onto the `edge_coverage` block.
@@ -4282,6 +4350,75 @@ mod tests {
             !reasons.contains(&crate::budget::RESTATEMENT_POINTED_REASON),
             "nothing was shortened and the response says it was: {reasons:?}"
         );
+    }
+
+    #[test]
+    fn context_final_ceiling_counts_envelope_and_preserves_named_route() {
+        let mut payload = serde_json::json!({
+            "token_budget": 8000, "tokens_used": 0,
+            "entities": [
+                {"id": "start", "name": "start", "section": "focal", "projection": "FullBody", "body_complete": true, "body": "execute();\n".repeat(1800)},
+                {"id": "middle", "name": "middle", "section": "route", "projection": "SignatureOnly"},
+                {"id": "end", "name": "end", "section": "focal", "projection": "SignatureOnly"}
+            ],
+            "focals": [{"entity_id": "start", "projection": "full_body"}, {"entity_id": "end", "projection": "signature_only"}],
+            "routes": [{"from": "start", "to": "end", "via": ["middle"], "edges": [{"kind": "Calls"}]}],
+            "lines": ["execute(); ".repeat(1800)]
+        });
+        for index in 0..30 {
+            payload["entities"].as_array_mut().unwrap().insert(1, serde_json::json!({"id": format!("neighbor{index}"), "section": "dependencies", "signature": "argument: type; ".repeat(40)}));
+        }
+        for max_chars in [60000, 8000] {
+            let result = finalize_bounded(
+                ToolCallResult::text(payload.to_string()),
+                ready_daemon_envelope(),
+                "get_context_pack",
+                &ResponseBudget {
+                    max_chars,
+                    ..ResponseBudget::default()
+                },
+            );
+            assert_ne!(result.is_error, Some(true));
+            let text = first_message_text(&result).unwrap();
+            let output: Value = serde_json::from_str(text).unwrap();
+            let tokens = kin_context::estimate_tokens(text);
+            assert!(tokens <= 8000, "{tokens}");
+            assert_eq!(output["tokens_used"], tokens);
+            assert_eq!(
+                output.pointer("/_kin/response/chars_after_budget").unwrap(),
+                text.len()
+            );
+            assert!(output["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == "middle"));
+            assert_eq!(output["routes"][0]["edges"][0]["kind"], "Calls");
+            assert!(text.len() <= max_chars);
+            assert_eq!(output["_kin"]["response"]["bounded"], true);
+            for id in ["start", "middle", "end"] {
+                assert!(
+                    output["entities"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["id"] == id),
+                    "named focal and route remain: {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn context_final_ceiling_refuses_an_impossible_metadata_floor() {
+        let payload = serde_json::json!({"token_budget": 1, "tokens_used": 0, "focal_entity": {"id": "start", "name": "start"}});
+        let result = finalize(
+            ToolCallResult::text(payload.to_string()),
+            ready_daemon_envelope(),
+            "get_context_pack",
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_message_text(&result).unwrap().contains("cannot fit"));
     }
 
     fn ready_daemon_envelope() -> Envelope {

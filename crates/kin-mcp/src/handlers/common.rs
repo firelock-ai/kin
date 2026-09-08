@@ -2633,6 +2633,90 @@ pub fn read_entity_source_exact<G: GraphStore>(
     Ok(Some(source))
 }
 
+pub type ContextSourceFields =
+    std::rc::Rc<std::cell::RefCell<HashMap<EntityId, serde_json::Map<String, serde_json::Value>>>>;
+
+pub struct ContextSourceProvider<'a, 'store, G: GraphStore> {
+    pub held: &'a HeldSourceAuthority<'store, G>,
+    pub fields: ContextSourceFields,
+}
+
+impl<G: GraphStore> kin_context::ContextProjectionProvider for ContextSourceProvider<'_, '_, G> {
+    fn full_body(
+        &mut self,
+        entity: &Entity,
+        limits: kin_context::ProjectionLimits,
+    ) -> kin_context::Result<kin_context::BodyCandidate> {
+        let resolved = match resolve_entity_source_authority(
+            self.held,
+            entity,
+            EntitySourceScope::WorkspaceHead,
+        ) {
+            Ok(source) => source,
+            Err(error) if is_absent_at_generation(&error) => {
+                return Ok(kin_context::BodyCandidate::Unavailable {
+                    reason: error.to_string(),
+                })
+            }
+            Err(error) => return Err(kin_context::ContextError::Other(error.to_string())),
+        };
+        let Some((source, bytes, span)) = resolved else {
+            return Ok(kin_context::BodyCandidate::Unavailable {
+                reason: entity_body_gap_reason(entity),
+            });
+        };
+        let mut fields = source_provenance_fields(&source);
+        fields.insert(
+            "source".into(),
+            serde_json::json!(LAST_READ_SOURCE.with(|value| value.get())),
+        );
+        self.fields.borrow_mut().insert(entity.id, fields);
+        let body = &bytes[span.start_byte..span.end_byte];
+        let body_text = std::str::from_utf8(body).map_err(|error| {
+            kin_context::ContextError::Other(format!("source span is not valid UTF-8: {error}"))
+        })?;
+        if body.len() > limits.max_candidate_bytes.min(limits.max_retained_bytes) {
+            if let Some(fields) = self.fields.borrow_mut().get_mut(&entity.id) {
+                fields.insert("body_bytes".into(), serde_json::json!(body.len()));
+                fields.insert(
+                    "body_budget_remaining_bytes".into(),
+                    serde_json::json!(limits.max_retained_bytes),
+                );
+            }
+            return Ok(kin_context::BodyCandidate::OverLimit {
+                body_bytes: body.len(),
+            });
+        }
+        Ok(kin_context::BodyCandidate::Exact {
+            body: body_text.to_owned(),
+        })
+    }
+}
+
+pub fn attach_context_projection(
+    entry: &kin_model::ContextEntry,
+    fields: &ContextSourceFields,
+    report: &kin_context::ProjectionReport,
+    row: &mut serde_json::Value,
+) {
+    row["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
+    if let Some(metadata) = fields.borrow().get(&entry.entity_id) {
+        if let Some(object) = row.as_object_mut() {
+            object.extend(metadata.clone());
+        }
+    }
+    if report.full_bodies.contains(&entry.entity_id) {
+        row["body"] = serde_json::json!(entry.content);
+        row["body_complete"] = serde_json::json!(true);
+    } else if let Some(reason) = report.downgrades.get(&entry.entity_id) {
+        downgrade_context_body(row, reason);
+        row["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
+        if report.budget_withheld.contains(&entry.entity_id) {
+            row["body_elided"] = serde_json::json!(["body"]);
+        }
+    }
+}
+
 /// Limits additional inline body allocations across one context request.
 /// The authority cache owns artifact bytes separately; this bounds copied spans.
 pub struct ContextBodyBudget {

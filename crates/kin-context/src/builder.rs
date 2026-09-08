@@ -552,6 +552,174 @@ where
     build_context_pack_with_provenance(graph, focal_id, opts).map(|(pack, _)| pack)
 }
 
+/// Independent byte limits for probing and retaining complete source spans.
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectionLimits {
+    pub max_candidate_bytes: usize,
+    pub max_retained_bytes: usize,
+}
+
+impl Default for ProjectionLimits {
+    fn default() -> Self {
+        Self {
+            max_candidate_bytes: 60_000,
+            max_retained_bytes: 60_000,
+        }
+    }
+}
+
+pub enum BodyCandidate {
+    Exact { body: String },
+    Unavailable { reason: String },
+    OverLimit { body_bytes: usize },
+}
+
+/// A provider must use one pinned source generation for probes and reads.
+pub trait ContextProjectionProvider {
+    fn full_body(&mut self, entity: &Entity, limits: ProjectionLimits) -> Result<BodyCandidate>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProjectionReport {
+    pub full_bodies: HashSet<EntityId>,
+    pub downgrades: HashMap<EntityId, String>,
+    pub budget_withheld: HashSet<EntityId>,
+}
+
+pub(crate) fn source_projection(
+    provider: &mut dyn ContextProjectionProvider,
+    entity: &Entity,
+    limits: ProjectionLimits,
+    remaining_tokens: usize,
+    report: &mut ProjectionReport,
+) -> Result<Option<String>> {
+    let reason = match provider.full_body(entity, limits)? {
+        BodyCandidate::Exact { body } => {
+            if body.len() > limits.max_candidate_bytes.min(limits.max_retained_bytes) {
+                return Err(ContextError::Other(
+                    "source provider exceeded its byte allowance".into(),
+                ));
+            }
+            if estimate_tokens(&body) <= remaining_tokens {
+                report.full_bodies.insert(entity.id);
+                report.downgrades.remove(&entity.id);
+                report.budget_withheld.remove(&entity.id);
+                return Ok(Some(body));
+            }
+            "whole source body exceeds its token allowance".to_string()
+        }
+        BodyCandidate::Unavailable { reason } => {
+            report.downgrades.insert(entity.id, reason);
+            report.budget_withheld.remove(&entity.id);
+            return Ok(None);
+        }
+        BodyCandidate::OverLimit { body_bytes } => {
+            format!(
+                "whole graph-owned span of {body_bytes} bytes exceeds its inline byte allowance"
+            )
+        }
+    };
+    report.downgrades.insert(entity.id, reason);
+    report.budget_withheld.insert(entity.id);
+    Ok(None)
+}
+
+/// Price graph-owned bodies before admission, then fit the caller's rendering.
+pub fn build_context_pack_with_provider<G: GraphStore>(
+    graph: &G,
+    focal_id: &EntityId,
+    opts: &ContextOptions,
+    provider: &mut dyn ContextProjectionProvider,
+    limits: ProjectionLimits,
+    dependency_bodies: bool,
+    mut measure: impl FnMut(&ContextPack, &DependencySelection, &ProjectionReport) -> Result<usize>,
+) -> Result<(ContextPack, DependencySelection, ProjectionReport)> {
+    let (mut pack, mut selection, mut projections) = build_context_pack_inner(
+        graph,
+        focal_id,
+        opts,
+        Some(provider),
+        limits,
+        dependency_bodies,
+    )?;
+    let focal = graph
+        .get_entity(focal_id)
+        .map_err(|e| ContextError::Graph(e.to_string()))?
+        .ok_or_else(|| ContextError::EntityNotFound(focal_id.to_string()))?;
+    loop {
+        let mut settled = None;
+        for _ in 0..16 {
+            let measured = measure(&pack, &selection, &projections)?;
+            if pack.actual_tokens == measured {
+                settled = Some(measured);
+                break;
+            }
+            pack.actual_tokens = measured;
+        }
+        let measured = settled.ok_or_else(|| {
+            ContextError::Other("context response accounting did not converge".into())
+        })?;
+        if measured <= opts.budget.max_tokens() {
+            pack.actual_tokens = measured;
+            return Ok((pack, selection, projections));
+        }
+        if let Some(entry) = pack.annotations.pop() {
+            let _ = entry;
+            selection.refuse(group::ANNOTATIONS, *focal_id);
+            continue;
+        }
+        if pack.work_items.pop().is_some() {
+            selection.refuse(group::WORK_ITEMS, *focal_id);
+            continue;
+        }
+        let removed = if let Some(entry) = pack.tests.pop() {
+            Some((group::TESTS, entry))
+        } else if let Some(entry) = pack.contracts.pop() {
+            Some((group::CONTRACTS, entry))
+        } else if let Some(entry) = pack.transitive_deps.pop() {
+            Some((group::TRANSITIVE_DEPS, entry))
+        } else {
+            pack.dependency_signatures.pop().map(|entry| {
+                let group = if selection.relation_for(&entry.entity_id)
+                    == DependencyRelation::DependentEdge
+                {
+                    group::DEPENDENTS
+                } else {
+                    group::DEPENDENCIES
+                };
+                (group, entry)
+            })
+        };
+        if let Some((group, entry)) = removed {
+            selection.refuse(group, entry.entity_id);
+            projections.full_bodies.remove(&entry.entity_id);
+            continue;
+        }
+        let entry = &mut pack.focal_entities[0];
+        entry.content = match entry.projection_level {
+            ProjectionLevel::FullBody => project_signature_only(&focal),
+            ProjectionLevel::SignatureOnly => project_name_and_kind(&focal),
+            _ => {
+                return Err(ContextError::BudgetExceeded {
+                    actual: measured,
+                    budget: opts.budget.max_tokens(),
+                })
+            }
+        };
+        entry.projection_level = if entry.projection_level == ProjectionLevel::FullBody {
+            ProjectionLevel::SignatureOnly
+        } else {
+            ProjectionLevel::NameAndKind
+        };
+        projections.full_bodies.remove(focal_id);
+        projections.budget_withheld.insert(*focal_id);
+        projections.downgrades.insert(
+            *focal_id,
+            "projection reduced to fit the complete rendered response".into(),
+        );
+    }
+}
+
 /// Build a context pack and report how its dependency section was selected.
 ///
 /// The pack itself cannot carry that: `dependency_signatures` is a flat list of
@@ -567,6 +735,27 @@ pub fn build_context_pack_with_provenance<G>(
 where
     G: GraphStore,
 {
+    build_context_pack_inner(
+        graph,
+        focal_id,
+        opts,
+        None,
+        ProjectionLimits::default(),
+        false,
+    )
+    .map(|(pack, selection, _)| (pack, selection))
+}
+
+fn build_context_pack_inner<G: GraphStore>(
+    graph: &G,
+    focal_id: &EntityId,
+    opts: &ContextOptions,
+    mut provider: Option<&mut dyn ContextProjectionProvider>,
+    limits: ProjectionLimits,
+    dependency_bodies: bool,
+) -> Result<(ContextPack, DependencySelection, ProjectionReport)> {
+    let mut projections = ProjectionReport::default();
+    let mut retained_body_bytes = 0usize;
     let mut selection = DependencySelection::default();
     let budget_max = opts.budget.max_tokens();
     let mut total_tokens = 0;
@@ -584,13 +773,25 @@ where
         .map_err(|e| ContextError::Graph(e.to_string()))?
         .ok_or_else(|| ContextError::EntityNotFound(focal_id.to_string()))?;
 
-    let focal_content = project_full_body(&focal);
+    let (focal_content, focal_level) = if let Some(source) = provider.as_deref_mut() {
+        match source_projection(source, &focal, limits, budget_max, &mut projections)? {
+            Some(body) => {
+                retained_body_bytes += body.len();
+                (body, ProjectionLevel::FullBody)
+            }
+            None => (
+                project_signature_only(&focal),
+                ProjectionLevel::SignatureOnly,
+            ),
+        }
+    } else {
+        (project_full_body(&focal), ProjectionLevel::FullBody)
+    };
     let focal_tokens = estimate_tokens(&focal_content);
     total_tokens += focal_tokens;
-
     let focal_entry = ContextEntry {
         entity_id: focal.id,
-        projection_level: ProjectionLevel::FullBody,
+        projection_level: focal_level,
         content: focal_content,
     };
 
@@ -784,7 +985,35 @@ where
             sorted_entities.iter().map(classify).collect()
         };
 
-    for candidate in candidates.into_iter().flatten() {
+    for mut candidate in candidates.into_iter().flatten() {
+        if dependency_bodies {
+            if let Some(source) = provider.as_deref_mut() {
+                if let Some(entity) = subgraph.entities.get(&candidate.entity_id) {
+                    let remaining = ProjectionLimits {
+                        max_retained_bytes: limits
+                            .max_retained_bytes
+                            .saturating_sub(retained_body_bytes),
+                        ..limits
+                    };
+                    if let Some(body) = source_projection(
+                        source,
+                        entity,
+                        remaining,
+                        match candidate.section {
+                            AssemblySection::Transitive => budget_max
+                                .saturating_sub(total_tokens)
+                                .min(transitive_budget.saturating_sub(transitive_tokens)),
+                            _ => budget_max.saturating_sub(total_tokens),
+                        },
+                        &mut projections,
+                    )? {
+                        candidate.tokens = estimate_tokens(&body);
+                        candidate.content = body;
+                        candidate.projection_level = ProjectionLevel::FullBody;
+                    }
+                }
+            }
+        }
         let AssemblyCandidate {
             entity_id,
             section,
@@ -832,7 +1061,11 @@ where
         // reported, because `actual_tokens` is measured rather than assumed.
         if !fits && admitted_groups.contains(target_group) {
             selection.refuse(target_group, entity_id);
+            projections.full_bodies.remove(&entity_id);
             continue;
+        }
+        if projections.full_bodies.contains(&entity_id) {
+            retained_body_bytes += content.len();
         }
         admitted_groups.insert(target_group);
         total_tokens += tokens;
@@ -979,6 +1212,7 @@ where
             actual_tokens: total_tokens,
         },
         selection,
+        projections,
     ))
 }
 
@@ -1505,6 +1739,87 @@ fn normalize_entity_name(name: &str) -> String {
 mod tests {
     use super::*;
     use kin_model::*;
+
+    struct BoundedProvider {
+        calls: Vec<usize>,
+    }
+    impl ContextProjectionProvider for BoundedProvider {
+        fn full_body(
+            &mut self,
+            _: &Entity,
+            limits: ProjectionLimits,
+        ) -> crate::Result<BodyCandidate> {
+            self.calls.push(limits.max_retained_bytes);
+            if limits.max_candidate_bytes.min(limits.max_retained_bytes) < 150 {
+                return Ok(BodyCandidate::OverLimit { body_bytes: 150 });
+            }
+            Ok(BodyCandidate::Exact {
+                body: "x".repeat(150),
+            })
+        }
+    }
+
+    #[test]
+    fn provider_admission_bounds_retained_bodies_and_keeps_dependency_identities() {
+        let (store, focal) = calling_store(4);
+        let mut provider = BoundedProvider { calls: Vec::new() };
+        let (pack, _, report) = build_context_pack_with_provider(
+            &store,
+            &focal.id,
+            &ContextOptions::default(),
+            &mut provider,
+            ProjectionLimits {
+                max_candidate_bytes: 150,
+                max_retained_bytes: 300,
+            },
+            true,
+            |pack, _, _| Ok(estimate_tokens(&serde_json::to_string(pack).unwrap())),
+        )
+        .unwrap();
+        assert_eq!(report.full_bodies.len(), 2);
+        assert_eq!(pack.dependency_signatures.len(), 4);
+        let retained: usize = pack
+            .focal_entities
+            .iter()
+            .chain(&pack.dependency_signatures)
+            .filter(|entry| report.full_bodies.contains(&entry.entity_id))
+            .map(|entry| entry.content.len())
+            .sum();
+        assert_eq!(retained, 300);
+        assert_eq!(provider.calls, [300, 150, 0, 0, 0]);
+        assert_eq!(report.downgrades.len(), 3);
+    }
+
+    #[test]
+    fn provider_contract_refuses_an_oversized_materialization() {
+        struct InvalidProvider;
+        impl ContextProjectionProvider for InvalidProvider {
+            fn full_body(
+                &mut self,
+                _: &Entity,
+                _: ProjectionLimits,
+            ) -> crate::Result<BodyCandidate> {
+                Ok(BodyCandidate::Exact {
+                    body: "x".repeat(151),
+                })
+            }
+        }
+        let (store, focal) = calling_store(0);
+        let error = build_context_pack_with_provider(
+            &store,
+            &focal.id,
+            &ContextOptions::default(),
+            &mut InvalidProvider,
+            ProjectionLimits {
+                max_candidate_bytes: 150,
+                max_retained_bytes: 300,
+            },
+            false,
+            |_, _, _| Ok(0),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("byte allowance"));
+    }
 
     fn admit_test_artifact(
         store: &kin_db::InMemoryGraph,

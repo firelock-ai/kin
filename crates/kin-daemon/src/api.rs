@@ -8992,8 +8992,14 @@ async fn context(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let result = kin_cli::commands::context::build_context_response(graph.as_ref(), &req)
-        .map_err(internal_error)?;
+    let repository_authority =
+        require_mcp_command_repository_authority(&state).map_err(internal_error)?;
+    let result = kin_cli::commands::context::build_context_response_with_authority(
+        graph.as_ref(),
+        &req,
+        &repository_authority,
+    )
+    .map_err(internal_error)?;
     Ok(Json(result))
 }
 
@@ -14522,6 +14528,7 @@ fn bound_mcp_tool_result(
     if !kin_mcp::budget::is_budgeted(tool) {
         return result;
     }
+    let mut is_error = result.is_error;
     let content = result
         .content
         .into_iter()
@@ -14534,6 +14541,10 @@ fn bound_mcp_tool_result(
                 return kin_mcp::ContentBlock::Text { text };
             }
             kin_mcp::budget::enforce(&mut payload, tool, budget);
+            if !kin_mcp::budget::fit_context_payload(&mut payload, tool, budget) {
+                is_error = Some(true);
+                payload = serde_json::json!({"error": "context metadata cannot fit the effective token and byte limits; request fewer focals or a larger budget"});
+            }
             if tool == "trace_data_flow" {
                 reconcile_trace_body_presence(&mut payload);
             }
@@ -14543,10 +14554,7 @@ fn bound_mcp_tool_result(
             }
         })
         .collect();
-    kin_mcp::ToolCallResult {
-        content,
-        is_error: result.is_error,
-    }
+    kin_mcp::ToolCallResult { content, is_error }
 }
 
 /// Keep the trace's body-presence claim aligned with what survives the common
@@ -58291,6 +58299,28 @@ mod tests {
         );
         let payload: serde_json::Value = serde_json::from_str(&bounded).unwrap();
         assert_eq!(payload["total_upstream"], json!(400));
+    }
+
+    #[test]
+    fn the_raw_route_settles_context_tokens_and_refuses_the_metadata_floor() {
+        let budget = kin_mcp::budget::ResponseBudget {
+            max_chars: 60000,
+            ..Default::default()
+        };
+        let payload = serde_json::json!({"token_budget": 8000, "tokens_used": 0, "focal_entity": {"id": "focal", "name": "focal", "body": "execute();\n".repeat(2400), "projection": "FullBody"}});
+        let result = bound_mcp_tool_result(
+            kin_mcp::ToolCallResult::text(payload.to_string()),
+            "get_context_pack",
+            &budget,
+        );
+        assert_ne!(result.is_error, Some(true));
+        let kin_mcp::ContentBlock::Text { text } = &result.content[0];
+        let output: serde_json::Value = serde_json::from_str(text).unwrap();
+        let tokens = output["tokens_used"].as_u64().unwrap();
+        assert!(tokens > 0 && tokens <= 8000);
+        assert!(output["focal_entity"]["body"].is_null());
+        let refusal = bound_mcp_tool_result(kin_mcp::ToolCallResult::text(serde_json::json!({"token_budget": 1, "tokens_used": 0, "focal_entity": {"id": "focal", "name": "focal"}}).to_string()), "get_context_pack", &budget);
+        assert_eq!(refusal.is_error, Some(true));
     }
 
     #[test]

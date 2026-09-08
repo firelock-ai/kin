@@ -2749,6 +2749,29 @@ mod tests {
             focal["start_line"].is_null(),
             "a spanless entity has no line to report"
         );
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let args = HashMap::from([
+            (
+                "entity_id".into(),
+                serde_json::json!(spanless.id.to_string()),
+            ),
+            ("max_chars".into(), serde_json::json!(60000)),
+        ]);
+        let payload = tool_result_json(
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap(),
+        );
+        assert!(payload["focal_entity"]["body_unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("no source span"));
+        assert!(payload["focal_entity"].get("body_elided").is_none());
+        assert!(
+            payload
+                .get("elisions")
+                .and_then(|value| value.get("body"))
+                .is_none(),
+            "source absence is not a budget cut: {payload}"
+        );
     }
 
     /// The MULTI-focal path serves the same body the single-focal one does.
@@ -3957,6 +3980,42 @@ mod tests {
     }
 
     #[test]
+    fn context_requested_4000_keeps_the_effective_8000_tier_and_exact_final_cost() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let source = make_source_backed_entity("fn exact() {\r\n    execute();\r\n}");
+        let entity = &source.entity;
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let args = HashMap::from([
+            ("entity_id".into(), serde_json::json!(entity.id.to_string())),
+            ("token_budget".into(), serde_json::json!(4000)),
+        ]);
+        let raw =
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap();
+        let result =
+            crate::envelope::finalize(raw, crate::envelope::Envelope::daemon(), "get_context_pack");
+        assert_ne!(result.is_error, Some(true));
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["token_budget"], 8000);
+        assert_eq!(value["tokens_used"], kin_context::estimate_tokens(text));
+        assert!(kin_context::estimate_tokens(text) <= 8000);
+        assert_eq!(
+            value["focal_entity"]["body"],
+            "fn exact() {\r\n    execute();\r\n}"
+        );
+    }
+
+    #[test]
     fn context_full_body_omits_an_oversized_single_line_without_clipping() {
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
@@ -4160,6 +4219,22 @@ mod tests {
         install_empty_store_exact_tree(&mut store, source._dir.path());
         let authority = test_repository_authority(source._dir.path());
         let error = focal_context_json(&store, entity, Some(&authority)).unwrap_err();
+        assert!(error.to_string().contains("not valid UTF-8"));
+        let held = HeldSourceAuthority::new(&store, Some(&authority));
+        let mut provider = ContextSourceProvider {
+            held: &held,
+            fields: ContextSourceFields::default(),
+        };
+        let error = kin_context::ContextProjectionProvider::full_body(
+            &mut provider,
+            entity,
+            kin_context::ProjectionLimits {
+                max_candidate_bytes: 0,
+                max_retained_bytes: 0,
+            },
+        )
+        .err()
+        .expect("invalid UTF-8 remains an error even above the byte allowance");
         assert!(error.to_string().contains("not valid UTF-8"));
     }
 

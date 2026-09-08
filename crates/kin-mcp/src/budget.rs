@@ -1051,6 +1051,145 @@ pub fn is_budgeted(tool: &str) -> bool {
 /// through `get_entity_source`. Only then are hits themselves withheld, from the
 /// tail of the least important array first, which is the only cut that removes
 /// an answer rather than a description of one.
+pub fn fit_context_payload(payload: &mut Value, tool: &str, budget: &ResponseBudget) -> bool {
+    if !matches!(tool, "get_context_pack" | "trace_computation") {
+        return true;
+    }
+    let Some(limit) = payload.get("token_budget").and_then(Value::as_u64) else {
+        return true;
+    };
+    loop {
+        let mut settled = false;
+        for _ in 0..16 {
+            let tokens =
+                kin_context::estimate_tokens(&render(payload).expect("JSON serialization"));
+            if payload.get("tokens_used").and_then(Value::as_u64) == Some(tokens as u64) {
+                settled = true;
+                break;
+            }
+            payload["tokens_used"] = json!(tokens);
+        }
+        if !settled {
+            return false;
+        }
+        let output = render(payload).expect("JSON serialization");
+        if output.len() <= budget.max_chars
+            && kin_context::estimate_tokens(&output) <= limit as usize
+        {
+            return true;
+        }
+        let reason = if output.len() > budget.max_chars {
+            ELISION_REASON_BUDGET
+        } else {
+            ELISION_REASON_TOKEN_BUDGET
+        };
+        if !trim_context_output_once(payload, reason) {
+            return false;
+        }
+    }
+}
+
+pub(crate) fn trim_context_output_once(payload: &mut Value, reason: &str) -> bool {
+    let before = measure(payload);
+    if !trim_context_output_inner(payload, reason) {
+        return false;
+    }
+    mark_context_cut(payload, before);
+    true
+}
+
+pub(crate) fn mark_context_cut(payload: &mut Value, before: usize) {
+    let entry = json!({"component": "response_budget", "reason": BOUNDED_REASON, "chars_before_budget": before, "detail": "complete context output was reduced to fit its effective token or byte limit; elisions identify the withheld projections"});
+    let entries = payload
+        .as_object_mut()
+        .expect("context object")
+        .entry("degradations")
+        .or_insert_with(|| json!([]));
+    if let Some(entries) = entries.as_array_mut() {
+        if !entries
+            .iter()
+            .any(|entry| entry.get("reason").and_then(Value::as_str) == Some(BOUNDED_REASON))
+        {
+            entries.push(entry);
+        }
+    }
+}
+
+fn trim_context_output_inner(payload: &mut Value, reason: &str) -> bool {
+    if payload.get("lines").is_some() {
+        payload
+            .as_object_mut()
+            .expect("context object")
+            .remove("lines");
+        payload["lines_note"] =
+            json!("rendered lines withheld to fit the final response; structured entities remain");
+        record_elision_for(payload, "lines", 0, 1, reason);
+        return true;
+    }
+    let shape = shape_for("get_context_pack").expect("context shape");
+    let carrying = rows_carrying(payload, &shape, shape.body_keys);
+    let stripped = strip_keys_marking(payload, &shape, shape.body_keys, &[], true);
+    if stripped > 0 {
+        record_elision_for(
+            payload,
+            "body",
+            carrying.saturating_sub(stripped),
+            stripped,
+            reason,
+        );
+        payload["projection_measurement_scope"] = json!("focal and neighborhood token contributions were measured before final response projection cuts");
+        return true;
+    }
+    for key in [
+        "annotations",
+        "work_items",
+        "contracts",
+        "tests",
+        "transitive_deps",
+        "dependents",
+        "dependencies",
+        "entities",
+    ] {
+        let Some(rows) = payload.get_mut(key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let index = if key == "entities" {
+            rows.iter().rposition(|row| {
+                !matches!(
+                    row.get("section").and_then(Value::as_str),
+                    Some("focal" | "route")
+                )
+            })
+        } else {
+            rows.len().checked_sub(1)
+        };
+        let Some(index) = index else {
+            continue;
+        };
+        rows.remove(index);
+        let kept = rows.len();
+        record_elision_for(payload, key, kept, 1, reason);
+        let count = payload
+            .get(format!("{key}_withheld"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        payload[format!("{key}_withheld")] = json!(count + 1);
+        if let Some(selection) = payload.get_mut("dependency_selection") {
+            let field = if key == "dependents" {
+                "dependents_returned"
+            } else {
+                "returned"
+            };
+            if matches!(key, "dependencies" | "dependents") {
+                selection[field] = json!(kept);
+            }
+        }
+        payload["projection_measurement_scope"] = json!("focal and neighborhood contributions describe admission before final response cuts; elisions report withheld output rows");
+        return true;
+    }
+    false
+}
+
 pub fn enforce(
     payload: &mut Value,
     tool: &str,
@@ -1184,6 +1323,17 @@ fn run_ladder(
     // before deciding whether any unique content needs to be withheld.
     point_restated_limiting_factor(payload, budget);
     if measure(payload) <= budget.max_chars {
+        return;
+    }
+
+    if matches!(tool, "get_context_pack" | "trace_computation")
+        && payload.get("token_budget").is_some()
+    {
+        while measure(payload) > budget.max_chars
+            && trim_context_output_once(payload, ELISION_REASON_BUDGET)
+        {
+            accounting.bounded = true;
+        }
         return;
     }
 
