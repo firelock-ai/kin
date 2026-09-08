@@ -2246,8 +2246,8 @@ fn repo_init_check_for(
     }
 
     let local_kin = cwd.join(".kin");
-    let is_managed_toolchain =
-        managed_kin_dir.is_some_and(|managed| same_path(managed, &local_kin));
+    let is_managed_toolchain = kin_core::layout::is_managed_kin_home(&local_kin)
+        || managed_kin_dir.is_some_and(|managed| same_path(managed, &local_kin));
     if local_kin.exists() && !is_managed_toolchain {
         return HealthCheck::new(
             "repo_init",
@@ -2259,7 +2259,8 @@ fn repo_init_check_for(
             ),
         )
         .with_manual_fix(
-            "re-run `kin init .`; if it keeps refusing, remove the partial `.kin` directory first",
+            "keep this .kin directory intact; inspect it with the Kin version that created it \
+             and preserve a complete backup outside .kin before attempting recovery",
         );
     }
 
@@ -9426,6 +9427,25 @@ mod tests {
             "~/.kin is the toolchain dir, not a failed repository, got {:?}",
             toolchain_home.status
         );
+    }
+
+    #[test]
+    fn doctor_recognizes_another_homes_managed_installation() {
+        let scratch = tempfile::tempdir().unwrap();
+        let owner = scratch.path().join("owner");
+        let managed = owner.join(".kin");
+        std::fs::create_dir_all(managed.join("bin")).unwrap();
+        std::fs::create_dir_all(managed.join("lib")).unwrap();
+        let other_home = scratch.path().join("other/.kin");
+        let check = repo_init_check_for(&owner, None, Some(&other_home));
+        assert!(matches!(check.status, HealthStatus::Unsupported));
+        assert!(!check.manual_fix.unwrap_or_default().contains("remove"));
+
+        let partial = scratch.path().join("partial");
+        std::fs::create_dir_all(partial.join(".kin")).unwrap();
+        let check = repo_init_check_for(&partial, None, Some(&other_home));
+        assert!(matches!(check.status, HealthStatus::Missing));
+        assert!(!check.manual_fix.unwrap_or_default().contains("remove"));
     }
 
     /// Kin owns one key inside an AI client's config, never the file. A config
