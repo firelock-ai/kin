@@ -1667,7 +1667,7 @@ mod tests {
     fn credential_endpoint_refusal_prevents_bearer_attachment() {
         let _env = kin_core::test_env::EnvVarGuard::set("KIN_REMOTE_BEARER_TOKEN", "fixture-token");
         let client = reqwest::Client::new();
-        for base in ["http://example.com", "http://127.0.0.1.example.com"] {
+        for base in ["http://localhost", "http://localhost:4219"] {
             let request = super::attach_native_remote_auth(client.get(base), base)
                 .build()
                 .unwrap();

@@ -937,10 +937,13 @@ fn logout_lines(
     lines
 }
 
-pub async fn logout(base_url: Option<String>) -> Result<()> {
-    let base_url = normalized_base_url(base_url);
-    kin_remote::http_transport::validate_credential_url(&base_url).map_err(anyhow::Error::msg)?;
-    let revocation = match load_credential(&base_url, true)? {
+async fn revoke_saved_session(base_url: &str) -> Result<RevocationOutcome> {
+    if let Err(reason) = kin_remote::http_transport::validate_credential_url(base_url) {
+        return Ok(RevocationOutcome::NotRevoked(format!(
+            "network revocation skipped: {reason}"
+        )));
+    }
+    let revocation = match load_credential(base_url, true)? {
         None => None,
         Some(credential) => Some(
             match credential_http_client()?
@@ -954,7 +957,12 @@ pub async fn logout(base_url: Option<String>) -> Result<()> {
             },
         ),
     };
-    let outcome = revocation_outcome(revocation);
+    Ok(revocation_outcome(revocation))
+}
+
+pub async fn logout(base_url: Option<String>) -> Result<()> {
+    let base_url = normalized_base_url(base_url);
+    let outcome = revoke_saved_session(&base_url).await?;
 
     // Local removal runs whatever the server said. A session this machine
     // cannot revoke is still a session this machine should not keep the key to.
@@ -989,8 +997,7 @@ mod tests {
                 .await
                 .unwrap_err();
             let whoami_error = whoami(Some(base.into())).await.unwrap_err();
-            let logout_error = logout(Some(base.into())).await.unwrap_err();
-            for error in [login_error, whoami_error, logout_error] {
+            for error in [login_error, whoami_error] {
                 assert!(error.to_string().contains("requires HTTPS"), "{error}");
             }
             assert!(load_saved_bearer_token(base).is_none());
@@ -999,6 +1006,79 @@ mod tests {
             !root.exists(),
             "refusal must precede credential store access"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn logout_removes_legacy_insecure_credentials_without_network_revocation() {
+        let scratch = tempfile::tempdir().unwrap();
+        let _root = TestCredentialRoot::set(&scratch.path().join("auth"));
+        let _env = kin_core::test_env::EnvVarGuard::unset("KINLAB_AUTH_PASSPHRASE");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+        let other = "https://other.example.com";
+        store_credential(&base, &test_credential(&base)).unwrap();
+        store_credential(other, &test_credential(other)).unwrap();
+        let legacy = fallback_credential_path(&base)
+            .unwrap()
+            .with_extension("json");
+        assert!(legacy.exists());
+        tokio::time::timeout(Duration::from_secs(1), logout(Some(base.clone())))
+            .await
+            .expect("local logout must not wait on an unsafe endpoint")
+            .unwrap();
+        assert!(!legacy.exists());
+        assert!(load_credential(other, false).unwrap().is_some());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let outcome = revoke_saved_session(&base).await.unwrap();
+        assert!(
+            matches!(outcome, RevocationOutcome::NotRevoked(reason) if reason.contains("network revocation skipped"))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn logout_revokes_on_allowed_transport_and_removes_local_credentials() {
+        let scratch = tempfile::tempdir().unwrap();
+        let _root = TestCredentialRoot::set(&scratch.path().join("auth"));
+        let _env = kin_core::test_env::EnvVarGuard::unset("KINLAB_AUTH_PASSPHRASE");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        store_credential(&base, &test_credential(&base)).unwrap();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let (mut connection, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("expected revocation request: {error}"),
+                }
+            };
+            connection
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buffer = [0; 4096];
+            let n = connection.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
+            assert!(request.starts_with("post /api/cli/auth/logout "));
+            assert!(request.contains("authorization: bearer not-a-real-token"));
+            connection
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        logout(Some(base.clone())).await.unwrap();
+        server.join().unwrap();
+        assert!(load_credential(&base, false).unwrap().is_none());
     }
 
     #[tokio::test]
