@@ -737,6 +737,35 @@ async fn drain_embed_flush(
     }
 }
 
+/// Stop an embedding worker whose retained hosted binding has refused writes.
+///
+/// The worker checks this only at its own checkpoint, after awaiting any
+/// in-flight flush. That ordering lets a started artifact write finish before
+/// the pass halts, then releases vectors that arrived after the refusal and
+/// cannot become durable on the unchanged binding.
+pub(crate) async fn stop_if_hosted_vector_binding_refused(
+    state: &DaemonState,
+    pending: &mut Option<tokio::task::JoinHandle<Result<usize>>>,
+    embedded: &mut u64,
+    pass: &crate::background_work::BackgroundPass,
+) -> bool {
+    let Some(reason) = state.hosted_vector_binding_refusal() else {
+        return false;
+    };
+    drain_embed_flush(pending, embedded, pass).await;
+    release_stopped_embed_worker_vectors(state);
+    pass.halt(format!(
+        "the background embedding worker stopped because nothing it embeds can be \
+         persisted against the hosted vector binding this daemon holds, and \
+         retrying on the same binding would repeat the refusal: {reason}"
+    ));
+    error!(
+        reason = %reason,
+        "embedding worker stopped: durable vector persistence is refused against the retained hosted binding; the daemon keeps serving"
+    );
+    true
+}
+
 /// Ceiling on the wait between retries of a refused vector checkpoint.
 const DEFERRED_CHECKPOINT_RETRY_MAX: Duration = Duration::from_secs(300);
 
@@ -4914,18 +4943,14 @@ pub async fn run_with_authority_on(
                 // matched against the installed binding, so a rebind after the
                 // next graph commit retires it and a later wake may drain
                 // again; this is a stand-down on one binding, not on the store.
-                if let Some(reason) = embed_state.hosted_vector_binding_refusal() {
-                    drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass)
-                        .await;
-                    embed_pass.halt(format!(
-                        "the background embedding worker stopped because nothing it embeds can be \
-                         persisted against the hosted vector binding this daemon holds, and \
-                         retrying on the same binding would repeat the refusal: {reason}"
-                    ));
-                    error!(
-                        reason = %reason,
-                        "embedding worker stopped: durable vector persistence is refused against the retained hosted binding; the daemon keeps serving"
-                    );
+                if stop_if_hosted_vector_binding_refused(
+                    &embed_state,
+                    &mut pending_flush,
+                    &mut embedded_since_flush,
+                    &embed_pass,
+                )
+                .await
+                {
                     break 'wake;
                 }
                 if embed_state.background_embed_paused() {
