@@ -1832,6 +1832,16 @@ pub(crate) fn graph_source_record_from(
     workspace: &kin_model::WorkspaceState,
     entity: &Entity,
 ) -> Result<GraphSourceRecord> {
+    graph_source_record_bounded_from(authority, workspace, entity, usize::MAX)?
+        .ok_or_else(|| anyhow::anyhow!("source body exceeds the allocation limit"))
+}
+
+pub(crate) fn graph_source_record_bounded_from(
+    authority: &super::repository_authority::ActiveRepositoryAuthority,
+    workspace: &kin_model::WorkspaceState,
+    entity: &Entity,
+    max_bytes: usize,
+) -> Result<Option<GraphSourceRecord>> {
     let file_origin = entity
         .file_origin
         .as_ref()
@@ -1871,16 +1881,18 @@ pub(crate) fn graph_source_record_from(
         );
     }
 
-    let body = std::str::from_utf8(&bytes[span.start_byte..span.end_byte])
-        .with_context(|| {
-            format!(
-                "entity '{}' source span {}..{} in '{}' is not valid UTF-8",
-                entity.name, span.start_byte, span.end_byte, file_origin.0
-            )
-        })?
-        .to_string();
+    let body = std::str::from_utf8(&bytes[span.start_byte..span.end_byte]).with_context(|| {
+        format!(
+            "entity '{}' source span {}..{} in '{}' is not valid UTF-8",
+            entity.name, span.start_byte, span.end_byte, file_origin.0
+        )
+    })?;
+    if body.len() > max_bytes {
+        return Ok(None);
+    }
+    let body = body.to_string();
     let (start_line, end_line) = presentation_span_lines(span);
-    Ok(GraphSourceRecord {
+    Ok(Some(GraphSourceRecord {
         id: entity.id.to_string(),
         name: entity.name.clone(),
         kind: format!("{:?}", entity.kind),
@@ -1893,7 +1905,7 @@ pub(crate) fn graph_source_record_from(
         signature: entity.signature.clone(),
         body,
         span_coherence: span_coherence.label().to_string(),
-    })
+    }))
 }
 
 pub(crate) fn read_entity_file_bytes_from_graph(
@@ -1921,6 +1933,25 @@ pub(crate) fn read_entity_file_bytes_with_digest(
     read_entity_file_bytes_with_digest_from(&authority, &workspace, entity)
 }
 
+/// An entity path absent from the selected workspace tree.
+#[derive(Debug)]
+pub(crate) struct WorkspaceAbsentSource(String);
+
+impl std::fmt::Display for WorkspaceAbsentSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorkspaceAbsentSource {}
+
+/// True when this error is the workspace-absent case above, at any wrapping depth.
+pub(crate) fn is_workspace_absent_source(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<WorkspaceAbsentSource>())
+}
+
 /// The same read against an authority and workspace the caller already holds.
 ///
 /// Split from [`read_entity_file_bytes_with_digest`] so a caller reading many
@@ -1945,12 +1976,10 @@ pub(crate) fn read_entity_file_bytes_with_digest_from(
         )
     })?;
     let artifact = workspace.tree.artifact_at_path(&path).ok_or_else(|| {
-        anyhow::anyhow!(
+        anyhow::Error::new(WorkspaceAbsentSource(format!(
             "entity source '{}' is not in workspace {} at generation {}",
-            file_id.0,
-            workspace.workspace_id,
-            workspace.generation
-        )
+            file_id.0, workspace.workspace_id, workspace.generation
+        )))
     })?;
     let kin_model::TreeEntry::Blob { hash, .. } = artifact.entry else {
         anyhow::bail!(
@@ -4755,6 +4784,42 @@ mod tests {
 
     fn commit_source_entity(fixture: &GraphSourceFixture, entity: &Entity) {
         fixture.graph.upsert_entity(entity).unwrap();
+    }
+
+    #[test]
+    fn bounded_graph_source_validates_before_refusing_allocation() {
+        let text = "fn target() {\r\n    execute();\r\n}";
+        let fixture = graph_source_fixture(Some(text.as_bytes()));
+        let entity = source_entity("target", fixture.file_id.clone(), 0, text.len());
+        commit_source_entity(&fixture, &entity);
+        let authority = fixture.authority().open().unwrap();
+        let workspace = authority.workspace().unwrap();
+        assert!(
+            graph_source_record_bounded_from(&authority, &workspace, &entity, text.len() - 1)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            graph_source_record_bounded_from(&authority, &workspace, &entity, text.len())
+                .unwrap()
+                .unwrap()
+                .body,
+            text
+        );
+        let mut invalid = entity.clone();
+        invalid.span.as_mut().unwrap().end_byte = 100_000;
+        assert!(
+            graph_source_record_bounded_from(&authority, &workspace, &invalid, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("out of bounds")
+        );
+        let mut stale = entity.clone();
+        stale
+            .metadata
+            .extra
+            .insert("blob_hash".into(), serde_json::json!("ff".repeat(32)));
+        assert!(graph_source_record_bounded_from(&authority, &workspace, &stale, 1).is_err());
     }
 
     #[test]

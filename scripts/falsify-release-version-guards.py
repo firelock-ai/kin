@@ -47,6 +47,9 @@ PROOF_SUITE = "scripts/check-release-proof-artifacts.test.mjs"
 COPIED = (
     INTENT,
     INTENT_SUITE,
+    "scripts/resolve-release-intent.mjs",
+    "scripts/resolve-release-intent.test.mjs",
+    "scripts/release-intent-attestations.json",
     VERSION,
     VERSION_SUITE,
     PREPARE,
@@ -273,6 +276,16 @@ PROBES: tuple[tuple[str, str, str, Callable[[Path], None]], ...] = (
 def main() -> int:
     lines: list[str] = []
     try:
+        with tempfile.TemporaryDirectory() as temp:
+            tree = probe_tree(Path(temp))
+            for suite in dict.fromkeys(probe[1] for probe in PROBES):
+                result = run_suite(tree, suite)
+                if result.returncode != 0:
+                    raise FalsificationError(
+                        f"unmodified probe suite {suite} failed; mutations cannot "
+                        "be graded without a passing baseline\n"
+                        + f"{result.stdout}{result.stderr}"[-4000:]
+                    )
         for label, suite, expected, mutate in PROBES:
             lines.append(expect_failure(label, suite, expected, mutate))
     except FalsificationError as error:

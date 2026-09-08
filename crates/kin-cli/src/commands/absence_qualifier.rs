@@ -285,10 +285,9 @@ fn only_unconfigured_federation(negative: &serde_json::Value) -> bool {
         .filter(|clause| !clause.is_empty())
         .collect();
     !clauses.is_empty()
-        && clauses.iter().all(|clause| {
-            clause.starts_with("cross_repo_not_configured")
-                || clause.starts_with("cross_repo_authority_missing")
-        })
+        && clauses
+            .iter()
+            .all(|clause| clause.starts_with("cross_repo_not_configured"))
 }
 
 /// The verdict's own leading reason, in the words it published.
@@ -429,5 +428,57 @@ fn edge_class_noun(class: &str) -> &'static str {
         "calls" => "call",
         "imports" => "import",
         _ => "reference",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn missing_federation_authority_is_not_an_unconfigured_scope() {
+        for reason in [
+            "cross_repo_authority_missing: no authority observation",
+            "cross_repo_not_configured; cross_repo_authority_missing",
+            "cross_repo_unavailable: lookup failed",
+        ] {
+            assert!(!only_unconfigured_federation(
+                &json!({"trust_reason": reason})
+            ));
+        }
+        assert!(only_unconfigured_federation(&json!({
+            "trust_reason": "cross_repo_not_configured: local repository"
+        })));
+    }
+
+    #[test]
+    fn empty_references_distinguish_missing_authority_from_local_scope() {
+        let envelope = kin_mcp::Envelope::daemon().with_health(&json!({
+            "initialized": true, "graph_loaded": true, "graph_generation": 1
+        }));
+        let mut payload = json!({
+            "focal_entity": {"id": "00000000-0000-0000-0000-000000000001",
+                             "kind": "Function", "name": "unused"},
+            "focal_resolution": {"addressed_by": "name", "same_name_candidates": 1},
+            "references": [],
+            "edge_coverage": {
+                "scope": "language", "language": "Rust",
+                "requested_classes": ["calls", "imports", "references"],
+                "classes": {"calls": "present", "imports": "present", "references": "present"},
+                "cross_file_classes": ["calls", "imports", "references"],
+                "reference_enrichment": "available", "budget_exhausted": false,
+                "entities_examined": 2
+            }
+        });
+        let lines = qualify("find_references", &payload, &envelope, "");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("find_references did not report cross-repo authority")),
+            "{lines:?}"
+        );
+        payload["cross_repo"] = json!({"status": "not_configured"});
+        assert!(qualify("find_references", &payload, &envelope, "").is_empty());
     }
 }

@@ -209,10 +209,9 @@ pub struct ContextResponse {
     /// packs with (`kin_context::estimate_tokens`, a structure-aware count with
     /// a 15 percent margin).
     ///
-    /// Reported on every pack, including the single-focal one, which can exceed
-    /// its budget by design: every section there keeps a row whatever the
-    /// budget says. A caller subtracting a pack from its own context window
-    /// needs the number the bytes cost, not the number it asked for.
+    /// Source-aware responses report the greater cost of complete JSON and
+    /// rendered text, including their accounting fields. Header-only compatibility
+    /// callers retain their rendered-text measurement.
     #[serde(default)]
     pub measured_tokens: usize,
     /// Focal tokens that resolved to nothing, in the caller's own spelling.
@@ -325,12 +324,95 @@ async fn run_daemon_context(
         .context("daemon context failed")
 }
 
+struct GraphContextProvider {
+    authority: std::sync::Arc<super::repository_authority::ActiveRepositoryAuthority>,
+    workspace: kin_model::WorkspaceState,
+}
+
+impl kin_context::ContextProjectionProvider for GraphContextProvider {
+    fn full_body(
+        &mut self,
+        entity: &Entity,
+        limits: kin_context::ProjectionLimits,
+    ) -> kin_context::Result<kin_context::BodyCandidate> {
+        if entity.file_origin.is_none() || entity.span.is_none() {
+            return Ok(kin_context::BodyCandidate::Unavailable {
+                reason: "graph source coordinates are unavailable".into(),
+            });
+        }
+        let limit = limits.max_candidate_bytes.min(limits.max_retained_bytes);
+        let record = match super::graph::graph_source_record_bounded_from(
+            &self.authority,
+            &self.workspace,
+            entity,
+            limit,
+        ) {
+            Ok(record) => record,
+            // A historical entity may be absent from the current workspace.
+            // Withhold only its body, preserving the rest of the context pack.
+            Err(error) if super::graph::is_workspace_absent_source(&error) => {
+                return Ok(kin_context::BodyCandidate::Unavailable {
+                    reason: error.to_string(),
+                })
+            }
+            Err(error) => return Err(kin_context::ContextError::Other(error.to_string())),
+        };
+        Ok(match record {
+            Some(record) => kin_context::BodyCandidate::Exact { body: record.body },
+            None => kin_context::BodyCandidate::OverLimit {
+                body_bytes: entity
+                    .span
+                    .as_ref()
+                    .map_or(0, |span| span.end_byte.saturating_sub(span.start_byte)),
+            },
+        })
+    }
+}
+
+pub fn build_context_response_with_authority(
+    graph: &kin_db::InMemoryGraph,
+    request: &ContextRequest,
+    repository_authority: &super::repository_authority::RequestRepositoryAuthority,
+) -> Result<ContextResponse> {
+    let authority = repository_authority.open()?;
+    let workspace = authority.workspace()?;
+    let mut provider = GraphContextProvider {
+        authority,
+        workspace,
+    };
+    build_context_response_inner(graph, request, Some(&mut provider))
+}
+
+fn measure_response(response: &mut ContextResponse) -> kin_context::Result<usize> {
+    for _ in 0..16 {
+        let text = kin_context::estimate_tokens(&response.lines.join("\n"));
+        let json = serde_json::to_string_pretty(response)
+            .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
+        let measured = text.max(kin_context::estimate_tokens(&json));
+        if measured == response.measured_tokens {
+            return Ok(measured);
+        }
+        response.measured_tokens = measured;
+    }
+    Err(kin_context::ContextError::Other(
+        "context output accounting did not converge".into(),
+    ))
+}
+
 pub fn build_context_response(
     graph: &kin_db::InMemoryGraph,
     request: &ContextRequest,
 ) -> Result<ContextResponse> {
+    build_context_response_inner(graph, request, None)
+}
+
+fn build_context_response_inner(
+    graph: &kin_db::InMemoryGraph,
+    request: &ContextRequest,
+    provider: Option<&mut dyn kin_context::ContextProjectionProvider>,
+) -> Result<ContextResponse> {
     if request.is_multi_focal() {
-        return build_multi_focal_response(graph, request);
+        return build_multi_focal_response(graph, request, provider);
     }
     let token_budget = parse_budget(&request.budget)?;
 
@@ -364,8 +446,51 @@ pub fn build_context_response(
         assistant_hint,
     };
 
+    if let Some(provider) = provider {
+        let (pack, selection, projections) = kin_context::build_context_pack_with_provider(
+            graph,
+            &target.id,
+            &opts,
+            provider,
+            kin_context::ProjectionLimits::default(),
+            false,
+            |pack, selection, projections| {
+                let mut response = render_single_response(
+                    graph,
+                    &target,
+                    token_budget,
+                    pack.clone(),
+                    selection,
+                    Some(projections),
+                )
+                .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
+                measure_response(&mut response)
+            },
+        )?;
+        let mut response = render_single_response(
+            graph,
+            &target,
+            token_budget,
+            pack,
+            &selection,
+            Some(&projections),
+        )?;
+        measure_response(&mut response)?;
+        return Ok(response);
+    }
     let (pack, selection) =
         kin_context::build_context_pack_with_provenance(graph, &target.id, &opts)?;
+    render_single_response(graph, &target, token_budget, pack, &selection, None)
+}
+
+fn render_single_response(
+    graph: &kin_db::InMemoryGraph,
+    target: &Entity,
+    token_budget: TokenBudget,
+    pack: kin_model::ContextPack,
+    selection: &kin_context::DependencySelection,
+    projections: Option<&kin_context::ProjectionReport>,
+) -> Result<ContextResponse> {
     let dependents_returned = count_dependents(&pack, &selection);
     let dependencies_returned = pack.dependency_signatures.len() - dependents_returned;
 
@@ -484,6 +609,16 @@ pub fn build_context_response(
         ))
     ));
 
+    if let Some(projections) = projections {
+        for entry in &pack.focal_entities {
+            if let Some(reason) = projections.downgrades.get(&entry.entity_id) {
+                lines.push(format!(
+                    "  Source body withheld for {}: {reason}",
+                    entry.entity_id
+                ));
+            }
+        }
+    }
     lines.push(String::new());
     lines.push("--- Context Pack ---".to_string());
 
@@ -930,6 +1065,7 @@ impl FocalSet {
 fn build_multi_focal_response(
     graph: &kin_db::InMemoryGraph,
     request: &ContextRequest,
+    provider: Option<&mut dyn kin_context::ContextProjectionProvider>,
 ) -> Result<ContextResponse> {
     let token_budget = parse_budget(&request.budget)?;
     let limit = request
@@ -1029,16 +1165,73 @@ fn build_multi_focal_response(
         resolutions: focals.resolutions,
         coverage,
     };
+    if let Some(provider) = provider {
+        let (pack, report, projections) = kin_context::build_multi_focal_pack_with_provider(
+            graph,
+            &focals.ids,
+            &opts,
+            provider,
+            kin_context::ProjectionLimits::default(),
+            |pack, report, projections| {
+                let mut response = render_multi_response(
+                    pack.clone(),
+                    report.clone(),
+                    &focals.targets,
+                    &guidance,
+                    &unresolved,
+                    Some(projections),
+                );
+                measure_response(&mut response)
+            },
+        )?;
+        let mut response = render_multi_response(
+            pack,
+            report,
+            &focals.targets,
+            &guidance,
+            &unresolved,
+            Some(&projections),
+        );
+        measure_response(&mut response)?;
+        return Ok(response);
+    }
     let (pack, report) = kin_context::build_multi_focal_pack(graph, &focals.ids, &opts)?;
+    Ok(render_multi_response(
+        pack,
+        report,
+        &focals.targets,
+        &guidance,
+        &unresolved,
+        None,
+    ))
+}
 
+fn render_multi_response(
+    pack: kin_model::ContextPack,
+    report: kin_context::MultiFocalReport,
+    targets: &[ContextTarget],
+    guidance: &[String],
+    unresolved: &[String],
+    projections: Option<&kin_context::ProjectionReport>,
+) -> ContextResponse {
     let mut lines = kin_context::render_multi_focal_lines(&pack, &report);
     if !guidance.is_empty() {
         // The misses go after the pack, so a reader sees the answer first and
         // then what it does not cover.
         lines.push(String::new());
-        lines.extend(guidance);
+        lines.extend_from_slice(guidance);
     }
 
+    if let Some(projections) = projections {
+        for entry in &pack.focal_entities {
+            if let Some(reason) = projections.downgrades.get(&entry.entity_id) {
+                lines.push(format!(
+                    "Source body withheld for {}: {reason}",
+                    entry.entity_id
+                ));
+            }
+        }
+    }
     let budget_elisions = report
         .elisions
         .iter()
@@ -1055,19 +1248,19 @@ fn build_multi_focal_response(
         })
         .collect();
 
-    Ok(ContextResponse {
+    ContextResponse {
         error: None,
         lines,
         schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
-        target: focals.targets.first().cloned(),
+        target: targets.first().cloned(),
         pack: Some(pack),
         dependency_selection: None,
         budget_elisions,
-        focals: focals.targets,
+        focals: targets.to_vec(),
         measured_tokens: report.measured_tokens,
         multi_focal: Some(report),
-        unresolved,
-    })
+        unresolved: unresolved.to_vec(),
+    }
 }
 
 /// The report a multi-focal request that resolved no focal still carries, so a
@@ -1114,6 +1307,114 @@ mod tests {
         EntityId, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256,
         LanguageId, SemanticFingerprint, Visibility,
     };
+
+    struct FixtureBodyProvider {
+        bytes: usize,
+        reads: usize,
+    }
+    impl kin_context::ContextProjectionProvider for FixtureBodyProvider {
+        fn full_body(
+            &mut self,
+            entity: &Entity,
+            limits: kin_context::ProjectionLimits,
+        ) -> kin_context::Result<kin_context::BodyCandidate> {
+            self.reads += 1;
+            let body = format!(
+                "fn {}() {{\r\n{}\r\n}}",
+                entity.name,
+                "execute();\n".repeat(self.bytes / 11)
+            );
+            if body.len() > limits.max_candidate_bytes.min(limits.max_retained_bytes) {
+                return Ok(kin_context::BodyCandidate::OverLimit {
+                    body_bytes: body.len(),
+                });
+            }
+            Ok(kin_context::BodyCandidate::Exact { body })
+        }
+    }
+
+    #[test]
+    fn native_4000_prices_bodies_and_both_complete_output_modes() {
+        let (graph, chain) = linked_store();
+        for bytes in [220, 2200, 22000, 62000] {
+            let mut provider = FixtureBodyProvider { bytes, reads: 0 };
+            let request = ContextRequest {
+                entity: "handleKeyboardInput".into(),
+                entities: vec!["TextDocument".into()],
+                budget: "4000".into(),
+                ..Default::default()
+            };
+            let response =
+                build_context_response_inner(&graph, &request, Some(&mut provider)).unwrap();
+            let serialized = serde_json::to_string_pretty(&response).unwrap();
+            let measured = kin_context::estimate_tokens(&serialized)
+                .max(kin_context::estimate_tokens(&response.lines.join("\n")));
+            assert_eq!(response.measured_tokens, measured);
+            assert!(measured <= 4000, "{bytes}: {measured}");
+            let pack = response.pack.as_ref().unwrap();
+            assert!(pack
+                .focal_entities
+                .iter()
+                .any(|entry| entry.entity_id == chain[0].id));
+            assert!(pack
+                .focal_entities
+                .iter()
+                .any(|entry| entry.entity_id == chain[3].id));
+            let report = response.multi_focal.as_ref().unwrap();
+            assert!(report
+                .routes
+                .iter()
+                .any(|route| route.via_names.contains(&"applyEdits".into())
+                    && !route.edges.is_empty()));
+            for entry in &pack.focal_entities {
+                if entry.projection_level == kin_model::ProjectionLevel::FullBody {
+                    assert!(entry.content.contains("execute();"));
+                    assert!(entry.content.ends_with("\r\n}"));
+                }
+            }
+            if bytes == 220 {
+                assert!(pack
+                    .focal_entities
+                    .iter()
+                    .all(|entry| entry.projection_level == kin_model::ProjectionLevel::FullBody));
+            }
+            if bytes >= 22000 {
+                assert!(response
+                    .lines
+                    .iter()
+                    .any(|line| line.contains("Source body withheld")));
+            }
+            assert!(provider.reads <= 4, "measurement must not reread source");
+        }
+    }
+
+    #[test]
+    fn native_single_prices_exact_body_and_refuses_an_impossible_metadata_floor() {
+        let (graph, _) = linked_store();
+        let mut provider = FixtureBodyProvider {
+            bytes: 220,
+            reads: 0,
+        };
+        let response = build_context_response_inner(
+            &graph,
+            &ContextRequest::one("applyEdits", "4000"),
+            Some(&mut provider),
+        )
+        .unwrap();
+        assert!(response.pack.as_ref().unwrap().focal_entities[0]
+            .content
+            .contains("execute();"));
+        assert!(
+            kin_context::estimate_tokens(&serde_json::to_string_pretty(&response).unwrap()) <= 4000
+        );
+        assert_eq!(provider.reads, 1);
+        assert!(build_context_response_inner(
+            &graph,
+            &ContextRequest::one("applyEdits", "1"),
+            Some(&mut provider)
+        )
+        .is_err());
+    }
 
     #[test]
     fn context_not_found_guidance_keeps_signal_and_offers_discovery() {

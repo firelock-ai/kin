@@ -2721,6 +2721,15 @@ pub fn finalize_bounded(
     budget: &ResponseBudget,
 ) -> ToolCallResult {
     let payload = first_payload_value(&result);
+    let context_limit = matches!(tool_name, "get_context_pack" | "trace_computation")
+        .then(|| {
+            payload
+                .as_ref()?
+                .get("token_budget")?
+                .as_u64()
+                .map(|value| value as usize)
+        })
+        .flatten();
     let mut envelope = match &payload {
         Some(payload) => base.with_payload_metadata(payload),
         None => base,
@@ -2759,14 +2768,73 @@ pub fn finalize_bounded(
             envelope.verdict = Some(verdict.to_value());
         }
     }
-    annotate_inner(
+    let annotated = annotate_inner(
         result,
         &envelope,
         negative.as_ref(),
         tool_name,
         budget,
         &edge_coverage_limits,
-    )
+    );
+    match context_limit {
+        Some(limit) if annotated.is_error != Some(true) => {
+            fit_context_output(annotated, tool_name, budget, limit)
+        }
+        _ => annotated,
+    }
+}
+
+fn fit_context_output(
+    mut result: ToolCallResult,
+    tool: &str,
+    budget: &ResponseBudget,
+    token_limit: usize,
+) -> ToolCallResult {
+    for block in &mut result.content {
+        let ContentBlock::Text { text } = block;
+        let Ok(mut payload) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        loop {
+            apply_response_budget(&mut payload, tool, budget);
+            let mut settled = false;
+            for _ in 0..16 {
+                let rendered = crate::budget::render(&payload).expect("JSON value serialization");
+                let tokens = kin_context::estimate_tokens(&rendered);
+                let bytes = rendered.len();
+                if payload.get("tokens_used").and_then(Value::as_u64) == Some(tokens as u64)
+                    && payload
+                        .pointer("/_kin/response/chars_after_budget")
+                        .and_then(Value::as_u64)
+                        == Some(bytes as u64)
+                {
+                    settled = true;
+                    break;
+                }
+                payload["tokens_used"] = serde_json::json!(tokens);
+                payload[ENVELOPE_KEY]["response"]["chars_after_budget"] = serde_json::json!(bytes);
+            }
+            if !settled {
+                return ToolCallResult::error("context response accounting did not converge");
+            }
+            let rendered = crate::budget::render(&payload).expect("JSON value serialization");
+            if rendered.len() <= budget.max_chars
+                && kin_context::estimate_tokens(&rendered) <= token_limit
+            {
+                *text = rendered;
+                break;
+            }
+            let reason = if rendered.len() > budget.max_chars {
+                crate::budget::ELISION_REASON_BUDGET
+            } else {
+                crate::budget::ELISION_REASON_TOKEN_BUDGET
+            };
+            if !crate::budget::trim_context_output_once(&mut payload, reason) {
+                return ToolCallResult::error(format!("context metadata cannot fit the effective {token_limit} token and {} byte limits; request fewer focals or a larger budget", budget.max_chars));
+            }
+        }
+    }
+    result
 }
 
 /// Write the verdict's qualifiers onto the `edge_coverage` block.
@@ -2844,8 +2912,7 @@ fn annotate_block(
     };
     let mut annotated = annotated;
     apply_response_budget(&mut annotated, tool_name, budget);
-    let rendered =
-        serde_json::to_string_pretty(&annotated).unwrap_or_else(|_| annotated.to_string());
+    let rendered = crate::budget::render(&annotated).unwrap_or_else(|_| annotated.to_string());
     ContentBlock::Text { text: rendered }
 }
 
@@ -3012,7 +3079,7 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
 }
 
 /// Write `_kin.response` until its `chars_after_budget` field equals the exact
-/// pretty-serialized size of the object that contains it.
+/// serialized size of the object that contains it.
 fn settle_response_accounting(
     annotated: &mut Value,
     accounting: &mut crate::budget::BudgetAccounting,
@@ -4109,7 +4176,13 @@ mod tests {
         })
     }
 
-    fn belt_bounded_deep_trace() -> Value {
+    /// The bytes the belt ships, and the answer parsed out of them.
+    ///
+    /// Both, because the size that ships is the length of those bytes and
+    /// nothing else. Re-measuring the parsed value asks the serializer to guess
+    /// a format it was never told, and the guess is wrong for any response the
+    /// budget compacted.
+    fn belt_bounded_deep_trace() -> (String, Value) {
         let budget = ResponseBudget {
             max_chars: crate::agent_belt::AGENT_DEFAULT_RESPONSE_MAX_CHARS as usize,
             ..ResponseBudget::default()
@@ -4120,7 +4193,8 @@ mod tests {
             "trace_data_flow",
             &budget,
         );
-        annotated_value(&annotated)
+        let ContentBlock::Text { text } = annotated.content.first().expect("one content block");
+        (text.clone(), annotated_value(&annotated))
     }
 
     /// The measured case, and the one the belt advertises a number for.
@@ -4148,8 +4222,8 @@ mod tests {
             "the fixture is {raw} characters, too small to reach the ceiling with an envelope"
         );
 
-        let final_payload = belt_bounded_deep_trace();
-        let shipped = crate::budget::measure(&final_payload);
+        let (text, final_payload) = belt_bounded_deep_trace();
+        let shipped = text.len();
         println!("deep trace ships {shipped} characters against a {CEILING} ceiling");
         assert!(
             shipped <= CEILING,
@@ -4283,6 +4357,75 @@ mod tests {
             !reasons.contains(&crate::budget::RESTATEMENT_POINTED_REASON),
             "nothing was shortened and the response says it was: {reasons:?}"
         );
+    }
+
+    #[test]
+    fn context_final_ceiling_counts_envelope_and_preserves_named_route() {
+        let mut payload = serde_json::json!({
+            "token_budget": 8000, "tokens_used": 0,
+            "entities": [
+                {"id": "start", "name": "start", "section": "focal", "projection": "FullBody", "body_complete": true, "body": "execute();\n".repeat(1800)},
+                {"id": "middle", "name": "middle", "section": "route", "projection": "SignatureOnly"},
+                {"id": "end", "name": "end", "section": "focal", "projection": "SignatureOnly"}
+            ],
+            "focals": [{"entity_id": "start", "projection": "full_body"}, {"entity_id": "end", "projection": "signature_only"}],
+            "routes": [{"from": "start", "to": "end", "via": ["middle"], "edges": [{"kind": "Calls"}]}],
+            "lines": ["execute(); ".repeat(1800)]
+        });
+        for index in 0..30 {
+            payload["entities"].as_array_mut().unwrap().insert(1, serde_json::json!({"id": format!("neighbor{index}"), "section": "dependencies", "signature": "argument: type; ".repeat(40)}));
+        }
+        for max_chars in [60000, 8000] {
+            let result = finalize_bounded(
+                ToolCallResult::text(payload.to_string()),
+                ready_daemon_envelope(),
+                "get_context_pack",
+                &ResponseBudget {
+                    max_chars,
+                    ..ResponseBudget::default()
+                },
+            );
+            assert_ne!(result.is_error, Some(true));
+            let text = first_message_text(&result).unwrap();
+            let output: Value = serde_json::from_str(text).unwrap();
+            let tokens = kin_context::estimate_tokens(text);
+            assert!(tokens <= 8000, "{tokens}");
+            assert_eq!(output["tokens_used"], tokens);
+            assert_eq!(
+                output.pointer("/_kin/response/chars_after_budget").unwrap(),
+                text.len()
+            );
+            assert!(output["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == "middle"));
+            assert_eq!(output["routes"][0]["edges"][0]["kind"], "Calls");
+            assert!(text.len() <= max_chars);
+            assert_eq!(output["_kin"]["response"]["bounded"], true);
+            for id in ["start", "middle", "end"] {
+                assert!(
+                    output["entities"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["id"] == id),
+                    "named focal and route remain: {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn context_final_ceiling_refuses_an_impossible_metadata_floor() {
+        let payload = serde_json::json!({"token_budget": 1, "tokens_used": 0, "focal_entity": {"id": "start", "name": "start"}});
+        let result = finalize(
+            ToolCallResult::text(payload.to_string()),
+            ready_daemon_envelope(),
+            "get_context_pack",
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_message_text(&result).unwrap().contains("cannot fit"));
     }
 
     fn ready_daemon_envelope() -> Envelope {
@@ -4650,6 +4793,572 @@ mod tests {
             .contains(&json!("edge_coverage:unreported")));
     }
 
+    fn conservative_reference_fixture() -> Value {
+        let mut payload: Value = serde_json::from_str(r#"{
+  "caller_arrival": {
+    "family_files": 3,
+    "family_measured": 3,
+    "state": "unaccounted",
+    "unaccounted_file_count": 3,
+    "unaccounted_files": [
+      {
+        "file": "packages/react-dom-bindings/src/client/ReactDOMInput.js",
+        "parsed_call_sites": 55,
+        "resolved_call_edges": 46,
+        "shortfall_is_floor": false,
+        "unaccounted_call_sites": 9
+      },
+      {
+        "file": "packages/react-dom-bindings/src/client/ReactDOMSelect.js",
+        "parsed_call_sites": 21,
+        "resolved_call_edges": 16,
+        "shortfall_is_floor": false,
+        "unaccounted_call_sites": 5
+      },
+      {
+        "file": "packages/react-dom-bindings/src/client/ReactDOMTextarea.js",
+        "parsed_call_sites": 15,
+        "resolved_call_edges": 13,
+        "shortfall_is_floor": false,
+        "unaccounted_call_sites": 2
+      }
+    ],
+    "unaccounted_files_truncated": false,
+    "unmeasured_reason": null
+  },
+  "candidates": [],
+  "counts": {
+    "counted": "referencing_entities",
+    "files": 3,
+    "known_reference_sites": 23,
+    "receiver_name_candidates": 0,
+    "reference_sites": 23,
+    "reference_sites_complete": true,
+    "referencing_entities": 11,
+    "upstream_including_unconfirmed": 11
+  },
+  "cross_repo": {
+    "code": "spine_root_stale",
+    "reason": "spine root mismatch for repository 8b3c2487-ed31-4fa8-bed9-c92187a823b7: live/session graph root 672f96cfa6a841c30019a72f9bc82b596a3479d35d330019329ee1529898dadf has advanced past the registered spine root 630b6617a21510112c14e068f87b97492e2b6b33c37988cd5b33268066a0b71a, so cross-repo authority is stale for other repositories and says nothing about references inside this one",
+    "status": "unavailable"
+  },
+  "degradations": [
+    {
+      "attempt_number": 1,
+      "component": "graph_authority",
+      "detail": "a graph-authority write landed while this answer was being read, so the read was abandoned and retried; the answer served here is the second attempt and was confirmed current before it was returned. Every row in it is settled. What it also says is that this store was being written while it was queried, so an absence measured here is an absence measured under contention.",
+      "reason": "retry"
+    }
+  ],
+  "edge_coverage": {
+    "budget_exhausted": false,
+    "classes": {
+      "calls": "present",
+      "imports": "present",
+      "references": "present"
+    },
+    "cross_file_classes": [
+      "calls",
+      "imports",
+      "references"
+    ],
+    "entities_examined": 8,
+    "language": "JavaScript",
+    "limits": [
+      "absence_gate:inconclusive",
+      "cross_repo:inconclusive",
+      "degradations:inconclusive"
+    ],
+    "reference_enrichment": "available",
+    "requested_classes": [
+      "calls",
+      "imports",
+      "references"
+    ],
+    "scan": "ran",
+    "scope": "language",
+    "unproduced_evidence": null,
+    "witnessed_by_answer": [
+      "calls",
+      "imports"
+    ]
+  },
+  "focal_entity": {
+    "file_path": "packages/react-dom-bindings/src/client/ToStringValue.js",
+    "id": "8052d132-596d-4f63-9613-77f5e8f67a44",
+    "kind": "function",
+    "name": "getToStringValue",
+    "signature": "function getToStringValue(value: mixed): ToStringValue"
+  },
+  "focal_resolution": {
+    "addressed_by": "name",
+    "matched": "query_name_pattern",
+    "other_candidates": [],
+    "same_name_candidates": 1
+  },
+  "relation_kinds": [
+    "calls",
+    "imports",
+    "references"
+  ],
+  "total_upstream": 11,
+  "unconfirmed_candidates": 0
+}"#).unwrap();
+        let rows: &[(&str, &str, u64, &[u64], bool)] = &[
+            (
+                "ReactDOMInput",
+                "packages/react-dom-bindings/src/client/ReactDOMInput.js",
+                1,
+                &[14],
+                true,
+            ),
+            (
+                "ReactDOMSelect",
+                "packages/react-dom-bindings/src/client/ReactDOMSelect.js",
+                1,
+                &[13],
+                true,
+            ),
+            (
+                "ReactDOMTextarea",
+                "packages/react-dom-bindings/src/client/ReactDOMTextarea.js",
+                1,
+                &[13],
+                true,
+            ),
+            (
+                "hydrateInput",
+                "packages/react-dom-bindings/src/client/ReactDOMInput.js",
+                363,
+                &[373, 375],
+                false,
+            ),
+            (
+                "initInput",
+                "packages/react-dom-bindings/src/client/ReactDOMInput.js",
+                222,
+                &[258, 260, 277, 278],
+                false,
+            ),
+            (
+                "updateInput",
+                "packages/react-dom-bindings/src/client/ReactDOMInput.js",
+                88,
+                &[133, 135, 136, 149, 170, 172, 175, 216],
+                false,
+            ),
+            (
+                "hydrateSelect",
+                "packages/react-dom-bindings/src/client/ReactDOMSelect.js",
+                161,
+                &[194],
+                false,
+            ),
+            (
+                "updateOptions",
+                "packages/react-dom-bindings/src/client/ReactDOMSelect.js",
+                63,
+                &[90],
+                false,
+            ),
+            (
+                "hydrateTextarea",
+                "packages/react-dom-bindings/src/client/ReactDOMTextarea.js",
+                152,
+                &[168],
+                false,
+            ),
+            (
+                "initTextarea",
+                "packages/react-dom-bindings/src/client/ReactDOMTextarea.js",
+                93,
+                &[130],
+                false,
+            ),
+            (
+                "updateTextarea",
+                "packages/react-dom-bindings/src/client/ReactDOMTextarea.js",
+                64,
+                &[73, 87],
+                false,
+            ),
+        ];
+        payload["references"] = rows
+            .iter()
+            .enumerate()
+            .map(|(index, (name, file, start, lines, import))| {
+                json!({
+                    "entity_id": format!("00000000-0000-4000-8000-{index:012}"),
+                    "file_path": file, "kind": if *import { "Module" } else { "Function" },
+                    "name": name, "reference_line_count": lines.len(), "reference_lines": lines,
+                    "reference_lines_absent_reason": null, "reference_lines_partial_reason": null,
+                    "relation_kinds": [if *import { "imports" } else { "calls" }],
+                    "resolution": "type_resolved", "role": "source", "start_line": start,
+                    "via_override_of": null,
+                })
+            })
+            .collect();
+        payload
+    }
+
+    // A separate synthetic row shape under the same conservative authority
+    // conditions, sized to isolate whitespace savings from qualification pointers.
+    fn concise_reference_fixture() -> Value {
+        let mut payload = conservative_reference_fixture();
+        for row in payload["references"].as_array_mut().unwrap() {
+            let file = row["file_path"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .trim_start_matches("ReactDOM")
+                .to_string();
+            *row = json!({
+                "entity_id": row["entity_id"], "name": row["name"],
+                "file_path": file, "reference_lines": row["reference_lines"],
+                "relation_kinds": row["relation_kinds"],
+            });
+        }
+        payload
+    }
+
+    #[test]
+    fn finalized_context_cannot_claim_full_bodies_after_elision() {
+        for multi in [false, true] {
+            let row = json!({"id": "focal", "body": "body ".repeat(4000),
+                "projection": "FullBody", "body_complete": true, "signature": "fn focal()"});
+            let raw = if multi {
+                json!({"entities": [row], "focals": [{"entity_id": "focal", "projection": "full_body"}]})
+            } else {
+                json!({"focal_entity": row, "dependencies": []})
+            };
+            let budget = ResponseBudget {
+                max_chars: 12000,
+                ..ResponseBudget::default()
+            };
+            let result = finalize_bounded(
+                ToolCallResult::text(raw.to_string()),
+                Envelope::daemon(),
+                "get_context_pack",
+                &budget,
+            );
+            let payload = annotated_value(&result);
+            let row = if multi {
+                &payload["entities"][0]
+            } else {
+                &payload["focal_entity"]
+            };
+            assert!(row["body"].is_null());
+            assert_eq!(row["projection"], "SignatureOnly");
+            assert_eq!(row["body_complete"], false);
+            assert_eq!(row["body_elided"], json!(["body"]));
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            assert!(text.len() <= budget.max_chars);
+            assert_eq!(
+                payload["_kin"]["response"]["chars_after_budget"],
+                text.len()
+            );
+            assert_eq!(payload["_kin"]["response"]["bounded"], true);
+        }
+    }
+
+    fn conservative_reference_envelope() -> Envelope {
+        let mut envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true, "graph_loaded": true,
+            "reconciliation_status": "clean", "graph_entity_count": 31909,
+            "graph_relation_count": 57917, "durable_entity_count": 31909,
+            "durable_relation_count": 47848,
+        }));
+        envelope.degraded.memory_pressure = Some(true);
+        envelope
+    }
+
+    fn roomy_reference_response(raw: &Value) -> Value {
+        annotated_value(&finalize_bounded(
+            ToolCallResult::text(raw.to_string()),
+            conservative_reference_envelope(),
+            "find_references",
+            &ResponseBudget {
+                max_chars: 60_000,
+                ..ResponseBudget::default()
+            },
+        ))
+    }
+
+    #[test]
+    fn exact_reference_restatements_are_pointed_before_rows_are_withheld() {
+        let raw = conservative_reference_fixture();
+        let full = roomy_reference_response(&raw);
+        let budget = ResponseBudget {
+            max_chars: 12_000,
+            ..ResponseBudget::default()
+        };
+        let before = crate::budget::measure(&full);
+        assert!(
+            before > budget.max_chars,
+            "fixture must exceed the complete response ceiling"
+        );
+        let mut pointed = full.clone();
+        pointed["_kin_json_format"] = json!("compact");
+        assert!(
+            crate::budget::measure(&pointed) > budget.max_chars,
+            "whitespace alone must not fit the qualification-heavy fixture"
+        );
+        assert_eq!(
+            crate::budget::point_restated_limiting_factor(&mut pointed, &budget),
+            3
+        );
+        let compacted = crate::budget::measure(&pointed);
+        assert!(
+            compacted <= budget.max_chars,
+            "disclosed pointers must fit: {compacted}"
+        );
+
+        let result = finalize_bounded(
+            ToolCallResult::text(raw.to_string()),
+            conservative_reference_envelope(),
+            "find_references",
+            &budget,
+        );
+        let final_payload = annotated_value(&result);
+        let rows = final_payload["references"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            11,
+            "lossless compaction must retain all eleven references"
+        );
+        assert_eq!(final_payload["references"], raw["references"]);
+        assert!(rows[..3]
+            .iter()
+            .all(|row| row["relation_kinds"] == json!(["imports"])));
+        assert_eq!(final_payload["caller_arrival"], full["caller_arrival"]);
+        assert_eq!(final_payload["edge_coverage"], full["edge_coverage"]);
+        assert_eq!(final_payload["cross_repo"], full["cross_repo"]);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["relation_kinds"] == json!(["imports"]))
+                .count(),
+            3
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["relation_kinds"] == json!(["calls"]))
+                .count(),
+            8
+        );
+        assert_eq!(
+            final_payload["_kin"]["verdict"]["limiting_factor"],
+            full["_kin"]["verdict"]["limiting_factor"]
+        );
+        assert_eq!(
+            final_payload["negative"]["trust_reason"],
+            full["negative"]["trust_reason"]
+        );
+        assert_eq!(final_payload["negative"]["safe_to_conclude_absent"], false);
+        assert_eq!(
+            final_payload["_kin"]["verdict"]["safe_to_conclude_absent"],
+            false
+        );
+        assert_eq!(final_payload["_kin"]["response"]["bounded"], false);
+        assert!(final_payload.get("elisions").is_none());
+        assert!(final_payload["degradations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["reason"] == crate::budget::RESTATEMENT_POINTED_REASON));
+        let mut expanded = final_payload.clone();
+        for (path, owner) in [
+            ("/_kin/verdict/note", "/_kin/verdict/limiting_factor"),
+            ("/negative/advice", "/negative/trust_reason"),
+            ("/_kin/completeness/note", "/_kin/verdict/limiting_factor"),
+        ] {
+            let name = owner.trim_start_matches('/').replace('/', ".");
+            let original = full.pointer(owner).unwrap().as_str().unwrap();
+            let replacement = original.trim_end_matches('.');
+            let text = expanded
+                .pointer(path)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .replace(&format!("see `{name}`"), replacement);
+            *expanded.pointer_mut(path).unwrap() = json!(text);
+        }
+        expanded["_kin"].as_object_mut().unwrap().remove("response");
+        expanded["degradations"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|entry| entry["reason"] != crate::budget::RESTATEMENT_POINTED_REASON);
+        let mut original = full.clone();
+        original["_kin"].as_object_mut().unwrap().remove("response");
+        assert_eq!(
+            expanded, original,
+            "every pointed field must reconstruct exactly"
+        );
+        let ContentBlock::Text { text } = &result.content[0];
+        assert_eq!(
+            final_payload["_kin"]["response"]["chars_after_budget"],
+            text.len()
+        );
+        assert!(text.len() <= budget.max_chars);
+        println!(
+            "eleven reference rows: before={before} pointed={compacted} shipped={}",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn reference_whitespace_compaction_preserves_the_complete_json_answer() {
+        let raw = concise_reference_fixture();
+        let mut full = roomy_reference_response(&raw);
+        assert!(crate::budget::measure(&full) > 12_000);
+        let result = finalize_bounded(
+            ToolCallResult::text(raw.to_string()),
+            conservative_reference_envelope(),
+            "find_references",
+            &ResponseBudget {
+                max_chars: 12_000,
+                ..ResponseBudget::default()
+            },
+        );
+        let mut payload = annotated_value(&result);
+        assert_eq!(payload["references"].as_array().unwrap().len(), 11);
+        // The switch chose the format and did not ride out on the answer.
+        assert!(
+            payload.get("_kin_json_format").is_none(),
+            "the serialization control field must not ship: {payload}"
+        );
+        assert_eq!(payload["_kin"]["response"]["bounded"], false);
+        let ContentBlock::Text { text } = &result.content[0];
+        // Positive control on that absence: the response really IS compact, so
+        // the switch was set and read. Without this the absence assertion above
+        // would pass on a response that was never compacted at all.
+        assert!(!text.contains('\n'), "the shipped response is compact");
+        assert_eq!(
+            payload["_kin"]["response"]["chars_after_budget"],
+            text.len()
+        );
+        // Re-serializing the parsed answer compactly reproduces the shipped
+        // bytes exactly, so the only thing compaction removed was whitespace.
+        assert_eq!(serde_json::to_string(&payload).unwrap(), *text);
+        assert!(text.len() <= 12_000);
+        // And the switch is genuinely consumed rather than merely hidden: this
+        // payload, read back without it, measures as pretty.
+        assert!(
+            crate::budget::measure(&payload) > text.len(),
+            "the format choice does not survive the round trip"
+        );
+        payload["_kin"].as_object_mut().unwrap().remove("response");
+        full["_kin"].as_object_mut().unwrap().remove("response");
+        assert_eq!(payload, full);
+    }
+
+    #[test]
+    fn unique_reference_content_still_requires_truthful_suffix_elisions() {
+        let mut raw = conservative_reference_fixture();
+        for (index, row) in raw["references"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            row["unique_detail"] = json!(format!(
+                "reference {index}: {}",
+                "unique site qualification ".repeat(35)
+            ));
+        }
+        let full = roomy_reference_response(&raw);
+        let budget = ResponseBudget {
+            max_chars: 12_000,
+            ..ResponseBudget::default()
+        };
+        println!(
+            "full reference JSON before pointers: compact={}",
+            serde_json::to_string(&full).unwrap().len()
+        );
+        let mut pointed = full.clone();
+        pointed["_kin_json_format"] = json!("compact");
+        assert_eq!(
+            crate::budget::point_restated_limiting_factor(&mut pointed, &budget),
+            3
+        );
+        assert!(crate::budget::measure(&pointed) > budget.max_chars);
+        println!(
+            "complete reference JSON: pretty={} compact={}",
+            crate::budget::measure(&pointed),
+            serde_json::to_string(&pointed).unwrap().len()
+        );
+        let result = finalize_bounded(
+            ToolCallResult::text(raw.to_string()),
+            conservative_reference_envelope(),
+            "find_references",
+            &budget,
+        );
+        let payload = annotated_value(&result);
+        let rows = payload["references"].as_array().unwrap();
+        assert!(!rows.is_empty() && rows.len() < 11);
+        assert_eq!(rows, &raw["references"].as_array().unwrap()[..rows.len()]);
+        assert_eq!(payload["elisions"]["references"]["kept"], rows.len());
+        assert_eq!(payload["elisions"]["references"]["elided"], 11 - rows.len());
+        assert_eq!(payload["references_withheld"], 11 - rows.len());
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["_kin"]["response"]["bounded"], true);
+        assert_eq!(payload["negative"]["safe_to_conclude_absent"], false);
+        assert_eq!(payload["_kin"]["completeness"]["bound"], "at_least");
+        assert!(payload["degradations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["reason"] == "response_bounded"
+                && entry["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("from the end of the list")));
+        let ContentBlock::Text { text } = &result.content[0];
+        assert_eq!(
+            payload["_kin"]["response"]["chars_after_budget"],
+            text.len()
+        );
+        assert!(text.len() <= budget.max_chars);
+        println!(
+            "unique reference overflow: before={} pointed={} retained={} shipped={}",
+            crate::budget::measure(&full),
+            crate::budget::measure(&pointed),
+            rows.len(),
+            text.len()
+        );
+    }
+
+    #[test]
+    fn nonmatching_reference_qualifications_are_never_pointed() {
+        let mut payload = roomy_reference_response(&conservative_reference_fixture());
+        for field in [
+            "/_kin/verdict/note",
+            "/negative/advice",
+            "/_kin/completeness/note",
+        ] {
+            let text = payload
+                .pointer(field)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            *payload.pointer_mut(field).unwrap() =
+                json!(format!("{text} An additional unique qualification."));
+        }
+        let before = payload.clone();
+        let budget = ResponseBudget {
+            max_chars: 12_000,
+            ..ResponseBudget::default()
+        };
+        assert!(crate::budget::measure(&payload) > budget.max_chars);
+        assert_eq!(
+            crate::budget::point_restated_limiting_factor(&mut payload, &budget),
+            0
+        );
+        assert_eq!(payload, before);
+    }
+
     /// The budget removes rows on purpose, and a response it shortened is
     /// partial by exactly the definition this object uses. The cut happens after
     /// the verdict is built, so the downgrade has to be applied to the
@@ -4709,10 +5418,9 @@ mod tests {
 
         let ContentBlock::Text { text } = annotated.content.first().unwrap();
         let final_payload: Value = serde_json::from_str(text).unwrap();
-        let final_chars = crate::budget::measure(&final_payload);
         assert_eq!(
             envelope["response"]["chars_after_budget"],
-            json!(final_chars),
+            json!(text.len()),
             "accounting is measured after the downgrade and every disclosure: {final_payload}"
         );
         let residual = final_payload
@@ -4725,7 +5433,7 @@ mod tests {
                 })
             });
         assert!(
-            final_chars <= budget.max_chars || residual,
+            text.len() <= budget.max_chars || residual,
             "a response over the caller ceiling must disclose the residual: {final_payload}"
         );
         assert_eq!(
