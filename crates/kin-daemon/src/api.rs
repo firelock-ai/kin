@@ -40,6 +40,13 @@ use uuid::Uuid;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static EXACT_SOURCE_ARCHIVE_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static HOSTED_REPOSITORY_HYDRATIONS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+fn hosted_repository_hydrations() -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(
+        HOSTED_REPOSITORY_HYDRATIONS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2))),
+    )
+}
 
 fn exact_source_archive_exports() -> Arc<tokio::sync::Semaphore> {
     Arc::clone(
@@ -12766,6 +12773,37 @@ fn open_hosted_repository_mcp_view_blocking(
     unreachable!("bounded hosted authority open either returns or reports its second race")
 }
 
+async fn run_hosted_repository_hydration<T: Send + 'static>(
+    slots: Arc<tokio::sync::Semaphore>,
+    repo_id: &str,
+    hydrate: impl FnOnce() -> std::result::Result<T, RepoScopedMcpFailure> + Send + 'static,
+) -> std::result::Result<T, RepoScopedMcpFailure> {
+    let permit = slots.try_acquire_owned().map_err(|_| {
+        RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_hydration_busy",
+            "repository hydration capacity is busy; retry later",
+            true,
+        )
+    })?;
+    let error_repo_id = repo_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        // Cancellation of the request cannot stop a running blocking worker.
+        // Admission belongs to that worker until hydration and retries finish.
+        let _permit = permit;
+        hydrate()
+    })
+    .await
+    .map_err(|error| {
+        RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_authority_unavailable",
+            format!("repository {error_repo_id} authority worker failed: {error}"),
+            true,
+        )
+    })?
+}
+
 async fn load_hosted_repository_mcp_view(
     state: &Arc<DaemonState>,
     repo_id: &str,
@@ -12852,22 +12890,18 @@ async fn load_hosted_repository_mcp_view(
     let worker_repository_id = repository_id;
     let worker_repo_id = repo_id.to_string();
     let error_repo_id = worker_repo_id.clone();
-    let view = tokio::task::spawn_blocking(move || {
-        open_hosted_repository_mcp_view_blocking(
-            worker_backend,
-            worker_repository_id,
-            worker_repo_id,
-        )
-    })
-    .await
-    .map_err(|error| {
-        RepoScopedMcpFailure::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "repo_authority_unavailable",
-            format!("repository {error_repo_id} authority worker failed: {error}"),
-            true,
-        )
-    })??;
+    let view = run_hosted_repository_hydration(
+        hosted_repository_hydrations(),
+        &error_repo_id,
+        move || {
+            open_hosted_repository_mcp_view_blocking(
+                worker_backend,
+                worker_repository_id,
+                worker_repo_id,
+            )
+        },
+    )
+    .await?;
     if let Some(detail) = state.derived_views_stale.read().await.clone() {
         return Err(RepoScopedMcpFailure::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -25621,6 +25655,146 @@ mod tests {
             faults.cursor_probes(&repo_id) > cursor_probes,
             "the warm hit must still prove the backend publication cursor"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hosted_hydration_cancelled_requests_retain_worker_admission() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut resumes = Vec::new();
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            resumes.push(resume_tx);
+            let slots = Arc::clone(&slots);
+            let starts = Arc::clone(&starts);
+            requests.push(tokio::spawn(async move {
+                run_hosted_repository_hydration(slots, "fixture", move || {
+                    starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    resume_rx.blocking_recv().unwrap();
+                    Ok(())
+                })
+                .await
+            }));
+            started_rx.await.unwrap();
+        }
+        for request in requests {
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(slots.available_permits(), 0);
+        let third_starts = Arc::clone(&starts);
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_hosted_repository_hydration(Arc::clone(&slots), "third", move || {
+                third_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .await
+        .expect("busy admission must not wait for a worker")
+        .unwrap_err();
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.code, "repo_hydration_busy");
+        assert!(refused.retryable);
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        resumes.remove(0).send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while slots.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        run_hosted_repository_hydration(Arc::clone(&slots), "successor", || Ok(()))
+            .await
+            .unwrap();
+        resumes.remove(0).send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while slots.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_hydration_errors_panics_and_retries_release_admission() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let held = Arc::clone(&slots).try_acquire_owned().unwrap();
+        let observed = Arc::clone(&slots);
+        let error = run_hosted_repository_hydration(Arc::clone(&slots), "error", move || {
+            // Both attempts belong to one admitted hydration, not new workers.
+            for _ in 0..2 {
+                assert_eq!(observed.available_permits(), 0);
+            }
+            Err::<(), _>(RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_semantic_unready",
+                "fixture retry exhausted",
+                true,
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "repo_semantic_unready");
+        assert_eq!(slots.available_permits(), 1);
+        let panic = run_hosted_repository_hydration::<()>(Arc::clone(&slots), "panic", || {
+            panic!("fixture hydration panic")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(panic.code, "repo_authority_unavailable");
+        assert!(panic.retryable);
+        assert_eq!(slots.available_permits(), 1);
+        run_hosted_repository_hydration(Arc::clone(&slots), "retry", || Ok(()))
+            .await
+            .unwrap();
+        drop(held);
+        assert_eq!(slots.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn hosted_hydration_warm_cache_bypasses_busy_cold_admission() {
+        let slots = hosted_repository_hydrations();
+        assert!(Arc::ptr_eq(&slots, &hosted_repository_hydrations()));
+        assert_eq!(slots.available_permits(), 2);
+        let repo_id = format!("repo-hydration-warm-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8ef1,
+            "publish warm admission fixture",
+            &[("warm_symbol", "src/warm.rs", "fn warm_symbol() {}\n")],
+        );
+        let first = load_hosted_repository_mcp_view(&state, &repo_id)
+            .await
+            .unwrap();
+        let held = Arc::clone(&slots).try_acquire_many_owned(2).unwrap();
+        let warm = load_hosted_repository_mcp_view(&state, &repo_id)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &warm));
+        state.repo_semantic_views.write().await.clear();
+        let refused = load_hosted_repository_mcp_view(&state, &repo_id)
+            .await
+            .err()
+            .expect("a cold request must refuse occupied hydration slots");
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.code, "repo_hydration_busy");
+        assert!(refused.retryable);
+        drop(held);
+        load_hosted_repository_mcp_view(&state, &repo_id)
+            .await
+            .unwrap();
+        assert_eq!(slots.available_permits(), 2);
     }
 
     #[tokio::test]
