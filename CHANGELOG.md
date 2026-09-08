@@ -21,6 +21,7 @@ A store admitted before this release keeps the edges it already has, because tho
 
 ### Changed
 
+- Admit a Git history one commit at a time instead of holding every commit's resolved tree. `kin init` now resolves each commit's tree from its first parent's and the paths that differ, keeps a hash and a content observation in the tree's place, and drops the tree once nothing later resolves against it, so a conversion's memory no longer follows commits multiplied by files: a normal clone of facebook/react, 21,679 commits over 7,213 files, was refused everywhere with "at least 582.5 GB" and now converts in 1 hour 47 minutes at a 36.9 GB peak. The phase-1 forecast follows the same model, taking the largest of the commit count, the tree width and the bytes of history reachable from HEAD, each a floor read off a conversion that ran, and the refusal names which of the three decided it. Because every term is a floor rather than an over-estimate, the refusal now fires at the machine's own memory ceiling instead of half again past it, and stores are unchanged on disk: one admitted by an earlier release opens as before.
 - Fix quickstart paste boundaries and repository selection (FIR-3348) (#1581)
 
 

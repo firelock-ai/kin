@@ -47,7 +47,7 @@ pub use fingerprint::{
 };
 pub use history::{
     derive_historical_semantic_deltas, is_external_reference_target, placeholder_target_entity,
-    HistoricalSemanticDelta,
+    HistoricalSemanticDelta, HistoricalSemanticFold,
 };
 pub use linker::{
     bare_entity_name, build_projection_derived_relations_for_file,

@@ -1171,8 +1171,8 @@ mod tests {
         .unwrap();
         let authority = build_git_external_authority(&snapshot, &store).unwrap();
         let imported_change = imported.changes.last().unwrap().clone();
-        let base_tree = imported
-            .commit_trees
+        let commit_trees = crate::semantic_import::derive_commit_trees(&snapshot, &store).unwrap();
+        let base_tree = commit_trees
             .get(&match imported_change.origin {
                 ChangeOrigin::GitCommit { oid } => oid,
                 ChangeOrigin::Native => panic!("fixture import produced a native change"),
