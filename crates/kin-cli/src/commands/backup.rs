@@ -11,55 +11,90 @@ use sha2::{Digest, Sha256};
 /// Schema token stamped on every `kin backup list --json` answer.
 pub const BACKUP_LIST_SCHEMA: &str = "kin.backup.list.v1";
 
-/// `kin backup create` — Create a timestamped backup of the graph snapshot.
-pub async fn create(tag: Option<String>) -> Result<()> {
-    let layout = discover_layout()?;
-    let snapshot_path = layout.kindb_snapshot_path();
-
-    if !snapshot_path.exists() {
-        anyhow::bail!("no graph snapshot found at {}", snapshot_path.display());
+/// Restore complete native authority without replacing an existing repository.
+pub async fn restore_carrier(carrier: PathBuf, destination: PathBuf) -> Result<()> {
+    super::recovery_carrier::ensure_platform()?;
+    let destination = std::path::absolute(destination)?;
+    if destination.file_name() != Some(std::ffi::OsStr::new(".kin")) {
+        anyhow::bail!("restore --target must name an absent .kin directory in the destination working directory");
     }
-
-    let backups_dir = layout.backups_dir();
-    fs::create_dir_all(&backups_dir).with_context(|| {
-        format!(
-            "failed to create backups directory {}",
-            backups_dir.display()
-        )
-    })?;
-
-    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let backup_name = match &tag {
-        Some(t) => format!("graph-{}-{}.kndb", timestamp, sanitize_tag(t)),
-        None => format!("graph-{}.kndb", timestamp),
-    };
-    let backup_path = backups_dir.join(&backup_name);
-
-    let data = fs::read(&snapshot_path)
-        .with_context(|| format!("failed to read snapshot {}", snapshot_path.display()))?;
-
-    let checksum = Sha256::digest(&data);
-    let size = data.len();
-
-    fs::write(&backup_path, &data)
-        .with_context(|| format!("failed to write backup {}", backup_path.display()))?;
-
-    println!("Backup created: {}", backup_name);
-    println!("  Size: {} bytes", size);
-    println!("  SHA-256: {}", hex::encode(checksum));
-    println!("  Path: {}", backup_path.display());
-
+    let carrier = carrier.canonicalize().context("resolve recovery carrier")?;
+    let destination = destination
+        .parent()
+        .context("restore target needs a working directory")?
+        .canonicalize()
+        .context("resolve destination working directory")?
+        .join(".kin");
+    super::recovery_carrier::restore(&carrier, &destination, |_, _| Ok(()))?;
+    println!("Restored native repository: {}", destination.display());
     Ok(())
+}
+
+/// Create a complete carrier beside, never inside, the repository state.
+pub async fn create(tag: Option<String>, output: Option<PathBuf>) -> Result<()> {
+    super::recovery_carrier::ensure_platform()?;
+    let layout = discover_layout()?;
+    let destination = match output {
+        Some(path) => path,
+        None => {
+            let backups = backups_directory(&layout)?;
+            fs::create_dir_all(&backups)?;
+            let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%f");
+            let suffix = tag
+                .as_deref()
+                .map(sanitize_tag)
+                .unwrap_or_else(|| "native".into());
+            backups.join(format!("{timestamp}-{suffix}"))
+        }
+    };
+    create_carrier_at(&layout, &destination)?;
+    println!("Native recovery backup created: {}", destination.display());
+    Ok(())
+}
+
+pub(super) fn create_carrier_at(
+    layout: &kin_core::KinLayout,
+    destination: &std::path::Path,
+) -> Result<()> {
+    super::recovery_carrier::ensure_platform()?;
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
+    let backend = kin_db::LocalFileBackend::new(layout.kindb_dir());
+    let frozen = kin_db::LocalRepositoryAuthorityFreeze::open_existing_read_only(
+        binding.repository_id().clone(),
+        &backend,
+    )?;
+    if !frozen
+        .authority()
+        .metadata()
+        .workspaces
+        .iter()
+        .any(|workspace| workspace.workspace_id == binding.workspace_id())
+    {
+        anyhow::bail!("repository authority does not contain its manifest workspace");
+    }
+    let manifest = super::recovery_carrier::Manifest {
+        schema: String::new(),
+        source_root: layout.root().to_path_buf(),
+        repository_id: binding.repository_id().to_string(),
+        workspace_id: binding.workspace_id().to_string(),
+        layout_version: layout.read_version()?,
+        roots: frozen.roots().clone(),
+        files: Default::default(),
+    };
+    super::recovery_carrier::publish(layout.root(), destination, manifest)
 }
 
 /// One backup on disk, as both the table and the JSON surface describe it.
 #[derive(Debug, Serialize)]
 pub struct BackupEntry {
-    /// Backup filename, the token `kin backup restore` matches against.
+    /// Exact carrier directory name.
     pub name: String,
-    /// Absolute path to the backup file.
+    /// Path to the complete carrier directory.
     pub path: String,
     pub size_bytes: u64,
+    pub valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,32 +104,59 @@ pub struct BackupListJson {
     pub backups: Vec<BackupEntry>,
 }
 
-/// The backups directory's contents, projected for display.
-///
-/// Reads the same `list_backup_entries` walk the text path has always used, so
-/// the two surfaces cannot report different sets.
+fn backups_directory(layout: &kin_core::KinLayout) -> Result<PathBuf> {
+    let identity = kin_core::KinManifest::load(&layout.manifest_path())?;
+    let directory = layout
+        .root()
+        .parent()
+        .and_then(|working| working.parent())
+        .context("default backups need a parent outside the working directory; use --output")?
+        .join(format!(
+            ".kin-backups-{}",
+            hex::encode(Sha256::digest(identity.repo_id.as_bytes()))
+        ));
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            anyhow::bail!("default recovery backup directory must be a real directory, not a link")
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    Ok(directory)
+}
+
 fn collect_backups(backups_dir: &PathBuf) -> Result<Vec<BackupEntry>> {
+    if !backups_dir.exists() {
+        return Ok(Vec::new());
+    }
     let mut backups = Vec::new();
-    for path in list_backup_entries(backups_dir)? {
-        let meta = fs::metadata(&path)
-            .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    for entry in fs::read_dir(backups_dir)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let result = super::recovery_carrier::inspect(&path).and_then(|manifest| {
+            manifest.files.values().try_fold(0u64, |size, file| {
+                size.checked_add(file.size).context("backup size overflow")
+            })
+        });
+        let (size_bytes, error) = match result {
+            Ok(size) => (size, None),
+            Err(error) => (0, Some(format!("{error:#}"))),
+        };
         backups.push(BackupEntry {
-            name: path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default(),
+            name: entry.file_name().to_string_lossy().into_owned(),
             path: path.display().to_string(),
-            size_bytes: meta.len(),
+            size_bytes,
+            valid: error.is_none(),
+            error,
         });
     }
+    backups.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(backups)
 }
 
-/// The envelope `--json` prints, built in one place so a test can gate it.
-///
-/// The runtime must not assemble this inline: a test that built its own copy
-/// would keep passing while the printed document drifted, which is the shape of
-/// a check that cannot fail.
 fn backup_list_payload(backups: Vec<BackupEntry>) -> BackupListJson {
     BackupListJson {
         schema: BACKUP_LIST_SCHEMA,
@@ -103,232 +165,71 @@ fn backup_list_payload(backups: Vec<BackupEntry>) -> BackupListJson {
     }
 }
 
-/// `kin backup list` — List available backups.
-pub async fn list(json: bool) -> Result<()> {
-    let layout = discover_layout()?;
-    let backups_dir = layout.backups_dir();
-
-    let backups = collect_backups(&backups_dir)?;
-
-    // An empty set is an ANSWER, not an absence, so `--json` emits the same
-    // stamped envelope with a zero count rather than the prose the table shows.
-    // A caller parsing this must never have to distinguish "no backups" from
-    // "not JSON".
+/// List complete carriers in the default directory outside repository state.
+pub async fn list(json: bool, directory: Option<PathBuf>) -> Result<()> {
+    let directory = match directory {
+        Some(path) => path.canonicalize().context("resolve backup directory")?,
+        None => backups_directory(&discover_layout()?)?,
+    };
+    let backups = collect_backups(&directory)?;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&backup_list_payload(backups))?
         );
-        return Ok(());
-    }
-
-    if backups.is_empty() {
-        println!("No backups found.");
-        return Ok(());
-    }
-
-    println!("{} backup(s):", backups.len());
-    for entry in &backups {
-        println!("  {} ({} bytes)", entry.name, entry.size_bytes);
-    }
-
-    Ok(())
-}
-
-/// `kin backup restore` — Restore a graph snapshot from a backup.
-pub async fn restore(name: Option<String>, latest: bool) -> Result<()> {
-    let layout = discover_layout()?;
-    require_explicit_offline_restore(&layout)?;
-    let backups_dir = layout.backups_dir();
-    let snapshot_path = layout.kindb_snapshot_path();
-
-    let entries = list_backup_entries(&backups_dir)?;
-
-    if entries.is_empty() {
-        anyhow::bail!("no backups found in {}", backups_dir.display());
-    }
-
-    let backup_path = if latest {
-        // Entries are sorted ascending by name (timestamp-based), so last is most recent.
-        entries.last().unwrap().clone()
-    } else if let Some(ref name) = name {
-        // Allow specifying a partial or full backup filename.
-        let matched: Vec<_> = entries
-            .iter()
-            .filter(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().contains(name.as_str()))
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        match matched.len() {
-            0 => anyhow::bail!("no backup matching '{}'", name),
-            1 => matched[0].clone(),
-            _ => {
-                println!("Multiple backups match '{}':", name);
-                for m in &matched {
-                    println!("  {}", m.file_name().unwrap_or_default().to_string_lossy());
-                }
-                anyhow::bail!("specify a more precise name to disambiguate");
-            }
-        }
+    } else if backups.is_empty() {
+        println!("No recovery backups found.");
     } else {
-        anyhow::bail!("specify --latest or provide a backup name");
-    };
-
-    let backup_name = backup_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    // Validate the backup file before restoring.
-    let data = fs::read(&backup_path)
-        .with_context(|| format!("failed to read backup {}", backup_path.display()))?;
-
-    kin_db::GraphSnapshot::from_bytes(&data)
-        .map_err(|e| anyhow::anyhow!("backup is corrupt or invalid: {e}"))?;
-
-    // Back up the current snapshot before overwriting (safety net).
-    if snapshot_path.exists() {
-        let safety_name = format!(
-            "graph-pre-restore-{}.kndb",
-            chrono::Utc::now().format("%Y%m%d-%H%M%S")
-        );
-        let safety_path = backups_dir.join(&safety_name);
-        fs::copy(&snapshot_path, &safety_path).with_context(|| {
-            format!(
-                "failed to safety-copy current snapshot to {}",
-                safety_path.display()
-            )
-        })?;
-        println!("Current snapshot saved as: {}", safety_name);
+        for backup in backups {
+            if let Some(error) = backup.error {
+                println!("{} INVALID: {}", backup.path, error);
+                continue;
+            }
+            println!(
+                "{} ({} payload bytes) {}",
+                backup.name, backup.size_bytes, backup.path
+            );
+        }
     }
-
-    // Atomic restore: write to tmp, fsync, rename.
-    let tmp_path = snapshot_path.with_extension("kndb.restore-tmp");
-    {
-        use std::io::Write;
-        let mut file = fs::File::create(&tmp_path)
-            .with_context(|| format!("failed to create tmp file {}", tmp_path.display()))?;
-        file.write_all(&data)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp_path, &snapshot_path).with_context(|| {
-        format!(
-            "failed to rename {} → {}",
-            tmp_path.display(),
-            snapshot_path.display()
-        )
-    })?;
-
-    println!("Restored from: {}", backup_name);
-    println!("  Size: {} bytes", data.len());
-
     Ok(())
 }
 
-/// `kin backup delete` — Delete a specific backup.
+/// Legacy graph-only files cannot replace complete native authority safely.
+pub async fn restore(_name: Option<String>, _latest: bool) -> Result<()> {
+    anyhow::bail!("graph-only in-place restore is unsupported; preserve the repository and legacy backup intact. Restore a complete carrier with --from <carrier> --target <fresh-working-directory>/.kin. A Git export or graph snapshot does not retain all native state")
+}
+
+/// Delete one explicitly named, validated carrier from the default directory.
 pub async fn delete(name: String) -> Result<()> {
     let layout = discover_layout()?;
-    let backups_dir = layout.backups_dir();
-
-    let entries = list_backup_entries(&backups_dir)?;
-    let matched: Vec<_> = entries
-        .iter()
-        .filter(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().contains(name.as_str()))
-                .unwrap_or(false)
-        })
-        .collect();
-
-    match matched.len() {
-        0 => anyhow::bail!("no backup matching '{}'", name),
-        1 => {
-            let path = matched[0];
-            let file_name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            fs::remove_file(path)
-                .with_context(|| format!("failed to delete {}", path.display()))?;
-            println!("Deleted backup: {}", file_name);
-        }
-        _ => {
-            println!("Multiple backups match '{}':", name);
-            for m in &matched {
-                println!("  {}", m.file_name().unwrap_or_default().to_string_lossy());
-            }
-            anyhow::bail!("specify a more precise name to disambiguate");
-        }
+    let directory = backups_directory(&layout)?;
+    let mut components = std::path::Path::new(&name).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        anyhow::bail!("backup delete requires one exact carrier directory name");
     }
-
+    super::recovery_carrier::validate(&directory.join(&name))?;
+    let parent = cap_std::fs::Dir::open_ambient_dir(&directory, cap_std::ambient_authority())?;
+    parent.remove_dir_all(&name)?;
+    println!("Permanently deleted recovery backup: {}", name);
     Ok(())
 }
-
-// -- Helpers --
 
 fn discover_layout() -> Result<kin_core::KinLayout> {
     crate::commands::require_repository_layout()
 }
 
-fn require_explicit_offline_restore(layout: &kin_core::KinLayout) -> Result<()> {
-    if let Some(url) = crate::daemon_client::resolve_daemon_url_if_running(layout) {
-        anyhow::bail!(
-            "refusing to restore a graph snapshot while the Kin daemon is running at {url}; \
-             stop the daemon first so restore cannot race daemon-owned graph state"
-        );
-    }
-
-    let allowed = std::env::var("KIN_ALLOW_OFFLINE_RESTORE")
-        .ok()
-        .map(|value| offline_restore_env_allowed(&value))
-        .unwrap_or(false);
-    if !allowed {
-        anyhow::bail!(
-            "offline backup restore is an emergency repair path; set \
-             KIN_ALLOW_OFFLINE_RESTORE=1 after confirming no Kin daemon is running"
-        );
-    }
-
-    Ok(())
-}
-
-fn offline_restore_env_allowed(value: &str) -> bool {
-    matches!(value, "1" | "true" | "TRUE" | "yes" | "YES")
-}
-
-fn list_backup_entries(backups_dir: &PathBuf) -> Result<Vec<PathBuf>> {
-    if !backups_dir.exists() {
-        return Ok(vec![]);
-    }
-
-    let mut entries: Vec<PathBuf> = fs::read_dir(backups_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension().is_some_and(|ext| ext == "kndb")
-                && p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with("graph-"))
-        })
-        .collect();
-
-    entries.sort();
-    Ok(entries)
-}
-
-/// Sanitize a user-provided tag for use in filenames.
 fn sanitize_tag(tag: &str) -> String {
     tag.chars()
+        .take(64)
         .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                 c
             } else {
                 '_'
             }
         })
-        .take(64)
         .collect()
 }
 
@@ -336,179 +237,87 @@ fn sanitize_tag(tag: &str) -> String {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn create_and_list_backup() {
-        let dir = tempfile::tempdir().unwrap();
-        kin_core::init(dir.path()).unwrap();
-        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-
-        // Create a valid snapshot file.
-        let snapshot = kin_db::GraphSnapshot::empty();
-        let bytes = snapshot.to_bytes().unwrap();
-        fs::create_dir_all(layout.kindb_dir()).unwrap();
-        fs::write(layout.kindb_snapshot_path(), &bytes).unwrap();
-
-        // Run backup create (uses cwd, so we need to change the discover).
-        let backups_dir = layout.backups_dir();
-        fs::create_dir_all(&backups_dir).unwrap();
-
-        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-        let backup_name = format!("graph-{}.kndb", timestamp);
-        let backup_path = backups_dir.join(&backup_name);
-        fs::write(&backup_path, &bytes).unwrap();
-
-        let entries = list_backup_entries(&backups_dir).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0]
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("graph-"));
-    }
-
-    /// An empty backups directory is an answer, so the envelope still goes out
-    /// stamped with a zero count.
-    ///
-    /// This is the property the whole flag exists for: a caller must never have
-    /// to tell "no backups" apart from "not JSON", which is exactly what the
-    /// text path's `No backups found.` forces it to do.
     #[test]
     fn the_json_surface_answers_an_empty_directory_with_a_stamped_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        let backups = collect_backups(&dir.path().to_path_buf()).unwrap();
-        assert!(backups.is_empty());
-
-        let value = serde_json::to_value(backup_list_payload(backups)).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let value = serde_json::to_value(backup_list_payload(
+            collect_backups(&scratch.path().to_path_buf()).unwrap(),
+        ))
+        .unwrap();
         assert_eq!(value["schema"], BACKUP_LIST_SCHEMA);
-        assert_eq!(value["count"].as_u64().unwrap(), 0);
-        assert!(
-            value["backups"].is_array(),
-            "the list must be present and empty, never absent"
-        );
-    }
-
-    /// Sizes and names are read off the files rather than restated, and the
-    /// count matches the list it describes.
-    #[test]
-    fn the_json_surface_reports_the_backups_on_disk_with_their_real_sizes() {
-        let dir = tempfile::tempdir().unwrap();
-        let backups_dir = dir.path().to_path_buf();
-        fs::write(backups_dir.join("graph-20260101-000000.kndb"), b"abcde").unwrap();
-        fs::write(backups_dir.join("graph-20260102-000000.kndb"), b"xy").unwrap();
-        // Neither the extension nor the prefix matches, so neither may appear.
-        fs::write(backups_dir.join("graph-notes.txt"), b"ignored").unwrap();
-        fs::write(backups_dir.join("other-20260103-000000.kndb"), b"ignored").unwrap();
-
-        let backups = collect_backups(&backups_dir).unwrap();
-        let names: Vec<&str> = backups.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["graph-20260101-000000.kndb", "graph-20260102-000000.kndb"]
-        );
-        assert_eq!(backups[0].size_bytes, 5);
-        assert_eq!(backups[1].size_bytes, 2);
-        assert!(backups[0].path.ends_with("graph-20260101-000000.kndb"));
-
-        let value = serde_json::to_value(backup_list_payload(backups)).unwrap();
-        assert_eq!(
-            value["count"].as_u64().unwrap() as usize,
-            value["backups"].as_array().unwrap().len()
-        );
+        assert_eq!(value["count"], 0);
+        assert_eq!(value["backups"], serde_json::json!([]));
     }
 
     #[test]
-    fn sanitize_tag_strips_special_chars() {
-        assert_eq!(sanitize_tag("v1.0-beta"), "v1_0-beta");
-        assert_eq!(sanitize_tag("pre release!"), "pre_release_");
-        assert_eq!(sanitize_tag("normal_tag"), "normal_tag");
-    }
-
-    #[test]
-    fn sanitize_tag_truncates_long_input() {
-        let long = "a".repeat(100);
-        assert_eq!(sanitize_tag(&long).len(), 64);
-    }
-
-    #[tokio::test]
-    async fn restore_validates_backup() {
-        let dir = tempfile::tempdir().unwrap();
-        kin_core::init(dir.path()).unwrap();
-        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-
-        let backups_dir = layout.backups_dir();
-        fs::create_dir_all(&backups_dir).unwrap();
-
-        // Write an invalid backup file.
-        let bad_path = backups_dir.join("graph-20260101-000000.kndb");
-        fs::write(&bad_path, b"not a valid snapshot").unwrap();
-
-        // Attempting to restore should fail validation.
-        let entries = list_backup_entries(&backups_dir).unwrap();
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox"
+    ))]
+    fn the_json_surface_lists_actual_current_format_carriers() {
+        let scratch = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let source = scratch.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let initialized = kin_core::init(&source).unwrap();
+        let backups = backups_directory(&initialized.layout).unwrap();
+        fs::create_dir(&backups).unwrap();
+        create_carrier_at(&initialized.layout, &backups.join("first")).unwrap();
+        let entries = collect_backups(&backups).unwrap();
         assert_eq!(entries.len(), 1);
-
-        let data = fs::read(&entries[0]).unwrap();
-        let result = kin_db::GraphSnapshot::from_bytes(&data);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn offline_restore_requires_explicit_env_value() {
-        assert!(offline_restore_env_allowed("1"));
-        assert!(offline_restore_env_allowed("true"));
-        assert!(offline_restore_env_allowed("YES"));
-        assert!(!offline_restore_env_allowed(""));
-        assert!(!offline_restore_env_allowed("0"));
-        assert!(!offline_restore_env_allowed("false"));
+        assert_eq!(entries[0].name, "first");
+        assert!(entries[0].size_bytes > 0);
+        assert!(entries[0].path.ends_with("/first"));
+        assert!(!backups.starts_with(&source));
+        let value = serde_json::to_value(backup_list_payload(entries)).unwrap();
+        assert_eq!(value["count"], value["backups"].as_array().unwrap().len());
+        fs::write(backups.join("first/COMPLETE"), b"invalid").unwrap();
+        create_carrier_at(&initialized.layout, &backups.join("second")).unwrap();
+        let entries = collect_backups(&backups).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(!entries[0].valid);
+        assert!(entries[0].error.is_some());
+        assert!(entries[1].valid);
     }
 
     #[tokio::test]
-    async fn restore_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        kin_core::init(dir.path()).unwrap();
-        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox"
+    ))]
+    async fn explicit_listing_survives_loss_of_the_original_kin_directory() {
+        let scratch = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let source = scratch.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let initialized = kin_core::init(&source).unwrap();
+        let backups = backups_directory(&initialized.layout).unwrap();
+        fs::create_dir(&backups).unwrap();
+        create_carrier_at(&initialized.layout, &backups.join("saved")).unwrap();
+        fs::rename(
+            initialized.layout.root(),
+            scratch.path().join("original-state-preserved"),
+        )
+        .unwrap();
+        list(true, Some(backups.clone())).await.unwrap();
+        assert!(collect_backups(&backups).unwrap()[0].valid);
+    }
 
-        // Create a valid snapshot with some data.
-        let mut snapshot = kin_db::GraphSnapshot::empty();
-        let artifact_id = kin_model::ArtifactId::new();
-        let artifact_path = kin_model::RepoPath::from_utf8("main.rs").unwrap();
-        snapshot.resolved_tree =
-            kin_model::ResolvedTree::from_artifacts([kin_model::ResolvedArtifact::new(
-                artifact_id,
-                artifact_path.clone(),
-                kin_model::TreeEntry::blob(kin_model::Hash256::from_bytes([42; 32]), false),
-            )])
-            .unwrap();
-        let bytes = snapshot.to_bytes().unwrap();
-        fs::create_dir_all(layout.kindb_dir()).unwrap();
-        fs::write(layout.kindb_snapshot_path(), &bytes).unwrap();
+    #[tokio::test]
+    async fn legacy_restore_refuses_without_discovering_or_mutating_a_repository() {
+        let error = restore(Some("old-snapshot".into()), false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("preserve"));
+        assert!(error.to_string().contains("--from"));
+    }
 
-        // Create a backup.
-        let backups_dir = layout.backups_dir();
-        fs::create_dir_all(&backups_dir).unwrap();
-        let backup_path = backups_dir.join("graph-20260325-120000.kndb");
-        fs::write(&backup_path, &bytes).unwrap();
-
-        // Overwrite snapshot with an empty one.
-        let empty = kin_db::GraphSnapshot::empty().to_bytes().unwrap();
-        fs::write(layout.kindb_snapshot_path(), &empty).unwrap();
-
-        // Verify it's empty now.
-        let current = fs::read(layout.kindb_snapshot_path()).unwrap();
-        let loaded = kin_db::GraphSnapshot::from_bytes(&current).unwrap();
-        assert!(loaded.resolved_tree.is_empty());
-
-        // Restore from backup (simulate the restore logic).
-        let backup_data = fs::read(&backup_path).unwrap();
-        kin_db::GraphSnapshot::from_bytes(&backup_data).unwrap(); // validation
-        fs::write(layout.kindb_snapshot_path(), &backup_data).unwrap();
-
-        // Verify restoration.
-        let restored_data = fs::read(layout.kindb_snapshot_path()).unwrap();
-        let restored = kin_db::GraphSnapshot::from_bytes(&restored_data).unwrap();
-        assert_eq!(restored.resolved_tree.len(), 1);
-        assert_eq!(
-            restored.resolved_tree.artifact_id_at_path(&artifact_path),
-            Some(artifact_id)
-        );
+    #[test]
+    fn tags_are_bounded_filename_components() {
+        assert_eq!(sanitize_tag("../pre release!"), "___pre_release_");
+        assert_eq!(sanitize_tag("a-b_c"), "a-b_c");
+        assert_eq!(sanitize_tag(&"a".repeat(100)).len(), 64);
     }
 }

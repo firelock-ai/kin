@@ -2489,7 +2489,7 @@ kin cache gc [options]
 
 ### `kin backup`
 
-Backup and restore graph snapshots
+Create and restore complete native recovery carriers.
 
 ```
 kin backup <subcommand>
@@ -2499,7 +2499,9 @@ Subcommands:
 
 #### `kin backup create`
 
-Create a backup of the current graph snapshot
+Create a complete current-format carrier outside `.kin`. The destination must
+not exist. Without `--output`, a repository-specific backup directory outside
+the working tree is used.
 
 ```
 kin backup create [options]
@@ -2508,34 +2510,37 @@ kin backup create [options]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `-t, --tag <tag>` |  | Optional tag to label the backup |
+| `--output <path>` |  | Absent destination in an existing directory |
 
 #### `kin backup list`
 
 List available backups
 
 ```
-kin backup list
+kin backup list [--json] [--directory <path>]
 ```
+
+Use `--directory` to list carriers after the original repository is lost.
+Invalid or incomplete entries are reported without hiding healthy carriers.
 
 #### `kin backup restore`
 
-Restore the graph from a backup
+Restore native identity, history and metadata into a fresh location. The target
+must be an absent `.kin` directory in an existing working directory at a different
+path from the original repository. Existing
+destinations are never replaced. Old daemon runtime endpoints are not restored.
 
 ```
-kin backup restore [name] [options]
+kin backup restore --from <carrier> --target <working-directory>/.kin
 ```
 
-| Argument | Required | Description |
-| --- | --- | --- |
-| `[name]` | no | Backup name (partial match supported) |
-
-| Flag | Default | Description |
-| --- | --- | --- |
-| `--latest` |  | Restore from the most recent backup |
+Legacy named or `--latest` in-place graph restore is refused without changing
+the repository or old backup. Corrupt, incomplete or unsupported carriers and
+pending path-bound reconciliation journals also refuse safely.
 
 #### `kin backup delete`
 
-Delete a specific backup
+Permanently delete one complete carrier from the default backup directory.
 
 ```
 kin backup delete <name>
@@ -2543,7 +2548,7 @@ kin backup delete <name>
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<name>` | yes | Backup name (partial match supported) |
+| `<name>` | yes | Exact carrier directory name; no partial matching |
 
 ### `kin resources`
 
@@ -2976,4 +2981,3 @@ kin completions <shell>
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<shell>` | yes | Shell to generate completions for |
-

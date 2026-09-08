@@ -964,7 +964,7 @@ enum Command {
         #[arg(long)]
         scope: Option<String>,
     },
-    /// Backup and restore graph snapshots
+    /// Back up and restore complete native repository state
     Backup {
         #[command(subcommand)]
         action: BackupAction,
@@ -1574,29 +1574,41 @@ enum BranchAction {
 
 #[derive(Subcommand)]
 enum BackupAction {
-    /// Create a backup of the current graph snapshot
+    /// Create a complete native recovery backup outside .kin
     Create {
         /// Optional tag to label the backup
         #[arg(short, long)]
         tag: Option<String>,
+        /// Absent carrier directory with an existing parent
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// List available backups
     List {
         /// Output machine-readable JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Carrier directory to list even if the original repository was lost
+        #[arg(long)]
+        directory: Option<PathBuf>,
     },
-    /// Restore the graph from a backup
+    /// Restore a complete recovery carrier into a fresh .kin directory
     Restore {
-        /// Backup name (partial match supported)
+        /// Legacy graph-only name, retained to report safe recovery guidance
         name: Option<String>,
-        /// Restore from the most recent backup
+        /// Legacy in-place restore, retained to report safe recovery guidance
         #[arg(long)]
         latest: bool,
+        /// Complete recovery carrier directory
+        #[arg(long, requires = "target", conflicts_with_all = ["name", "latest"])]
+        from: Option<PathBuf>,
+        /// Absent .kin directory inside an existing destination working directory
+        #[arg(long, requires = "from")]
+        target: Option<PathBuf>,
     },
     /// Delete a specific backup
     Delete {
-        /// Backup name (partial match supported)
+        /// Exact recovery carrier name from backup list
         name: String,
     },
 }
@@ -3921,11 +3933,24 @@ fn run() -> Result<()> {
                     .await
                 }
                 Command::Backup { action } => match action {
-                    BackupAction::Create { tag } => commands::backup::create(tag).await,
-                    BackupAction::List { json } => commands::backup::list(json).await,
-                    BackupAction::Restore { name, latest } => {
-                        commands::backup::restore(name, latest).await
+                    BackupAction::Create { tag, output } => {
+                        commands::backup::create(tag, output).await
                     }
+                    BackupAction::List { json, directory } => {
+                        commands::backup::list(json, directory).await
+                    }
+                    BackupAction::Restore {
+                        name,
+                        latest,
+                        from,
+                        target,
+                    } => match (from, target) {
+                        (Some(carrier), Some(destination)) => {
+                            commands::backup::restore_carrier(carrier, destination).await
+                        }
+                        (None, None) => commands::backup::restore(name, latest).await,
+                        _ => anyhow::bail!("--from and --target must be supplied together"),
+                    },
                     BackupAction::Delete { name } => commands::backup::delete(name).await,
                 },
                 Command::Approvals { action } => match action {
@@ -4688,6 +4713,65 @@ fn default_filter_directives(command: &str) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn recovery_restore_requires_a_complete_fresh_target_pair() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                assert!(
+                    Cli::try_parse_from(["kin", "backup", "create", "--output", "backup"]).is_ok()
+                );
+                assert!(Cli::try_parse_from([
+                    "kin",
+                    "backup",
+                    "list",
+                    "--directory",
+                    "backups",
+                    "--json"
+                ])
+                .is_ok());
+                assert!(Cli::try_parse_from([
+                    "kin",
+                    "backup",
+                    "restore",
+                    "--from",
+                    "/backup",
+                    "--target",
+                    "/fresh/.kin"
+                ])
+                .is_ok());
+                for args in [
+                    vec!["kin", "backup", "restore", "--from", "/backup"],
+                    vec!["kin", "backup", "restore", "--target", "/fresh/.kin"],
+                    vec![
+                        "kin",
+                        "backup",
+                        "restore",
+                        "--latest",
+                        "--from",
+                        "/backup",
+                        "--target",
+                        "/fresh/.kin",
+                    ],
+                    vec![
+                        "kin",
+                        "backup",
+                        "restore",
+                        "old-name",
+                        "--from",
+                        "/backup",
+                        "--target",
+                        "/fresh/.kin",
+                    ],
+                ] {
+                    assert!(Cli::try_parse_from(args).is_err());
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     /// Every flag a doctor fix line tells a user to type must exist.
     ///
