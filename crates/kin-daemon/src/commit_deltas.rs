@@ -2700,7 +2700,7 @@ mod tests {
             assert_eq!(
                 actual.expected_tree,
                 ResolvedTree::default()
-                    .apply(&[tree_delta.clone()])
+                    .apply(std::slice::from_ref(&tree_delta))
                     .unwrap()
             );
             assert!(!snapshot.changes.is_decoded());
