@@ -808,22 +808,25 @@ pub fn handle_get_entity_sources<G: GraphStore>(
 const CERTIFIED_DEPENDENTS_MAX: usize = 24;
 
 pub const GET_CONTEXT_PACK_DESC: &str = "\
-Assemble a focused, ready-to-read context bundle around one entity, fitted to a token \
-budget. Starting from a focal entity ID, Kin walks the relation graph to gather the \
-nearby code you'd actually need to understand or change it — the focal body plus its \
-direct dependencies (signatures), and optionally transitive deps, linked tests, \
-contracts, work items, and annotations — and returns it all in a single structured \
+Assemble a focused context bundle around one entity, fitted to a token budget. \
+Starting from a focal entity ID, Kin walks the relation graph to gather its body, \
+direct dependency signatures, and optional transitive dependencies, linked tests, \
+contracts, work items and annotations. It returns them in one structured \
 response with the token accounting included. Reach for it when a question is about a \
 unit of code in context (\"what does X do and what does it touch?\") rather than a single \
-isolated body. Its value is that it replaces an open-ended chain of \
-get_entity_source / find_references calls — which burns round-trips and easily blows \
-your context window — with one budgeted call. `token_budget` bounds the content the pack \
-selects, and it cannot bound the envelope that content travels in, so read `tokens_used`, \
-which measures the serialized response this call returns, as what the call costs you. \
-`focal_entity.body` in the response IS the focal entity's exact source text, so this one \
-call already answers \"show me the code\": no follow-up read is needed, and it is the body \
-to edit and stage back, in compact mode too, which drops the dependency bodies and \
-projection levels but never the focal body. The two directions are separate groups, because they answer opposite questions: \
+isolated body. It replaces an open-ended chain of get_entity_source and find_references \
+calls with one pack. `token_budget` and `max_response_chars` bound the \
+serialized context payload, including its envelope. `tokens_used` reports the estimated \
+token cost of that complete payload. \
+`focal_entity.body`, when `body_complete` is true, is the exact graph-owned source span, \
+byte for byte, in compact mode too. A span that cannot be served is absent, never clipped \
+or reconstructed past its recorded boundary. Check `body_complete` and the row's \
+`body_unavailable` reason before relying on a body. `body_elided` containing \
+\"body\" identifies a budget cut; a removed FullBody projection becomes SignatureOnly \
+and `projection_downgraded_from` records that change. Source-sizing metadata such as \
+`body_bytes` is included when available. For a budget cut, raise `max_response_chars` \
+and `token_budget`, or request the source separately with get_entity_source. A missing \
+graph span needs corrected graph coverage. The two directions are separate groups: \
 `dependencies` is what the focal needs to run, and `dependents` is what breaks if you \
 change it. Every row also says why it is there: `relation: \"dependency_edge\"` is an \
 edge leaving the focal, `relation: \"dependent_edge\"` is an edge arriving at it, and \
@@ -1014,7 +1017,7 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
                 "start_line": entity_presentation_start_line(entity),
                 "end_line": entity_presentation_end_line(entity),
             });
-            attach_context_projection(entry, fields, projections, &mut row);
+            attach_context_projection(entry, fields, projections, &mut row, true);
             row
         } else {
             serde_json::Value::Null
@@ -1046,7 +1049,7 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
                 }
                 if !compact {
                     obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
-                    attach_context_projection(entry, fields, projections, &mut obj);
+                    attach_context_projection(entry, fields, projections, &mut obj, true);
                 }
                 Ok(obj)
             } else {
@@ -1203,8 +1206,10 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
         // builder's token budget, or missed by its subgraph walk -- is exactly the
         // shape this defect had. Recovering it here is what makes the group's
         // membership a property of the answer rather than of how much budget was
-        // left, and the recovered rows carry the same shape as the projected ones so
-        // a reader cannot tell which path produced them.
+        // left.
+        //
+        // The projection provider has not read these recovered rows.
+        // attach_context_projection names their missing bodies explicitly.
         let mut dependents_withheld = 0usize;
         for id in certified_ids {
             if packed.contains(id) {
@@ -1648,7 +1653,13 @@ fn render_multi_context<G: GraphStore>(
                 "section": section,
                 "projection": format!("{:?}", entry.projection_level),
             });
-            attach_context_projection(entry, fields, projections, &mut obj);
+            attach_context_projection(
+                entry,
+                fields,
+                projections,
+                &mut obj,
+                entry.projection_level == kin_model::context::ProjectionLevel::FullBody,
+            );
             Ok(obj)
         };
 

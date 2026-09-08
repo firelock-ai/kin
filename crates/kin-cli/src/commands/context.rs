@@ -341,13 +341,22 @@ impl kin_context::ContextProjectionProvider for GraphContextProvider {
             });
         }
         let limit = limits.max_candidate_bytes.min(limits.max_retained_bytes);
-        let record = super::graph::graph_source_record_bounded_from(
+        let record = match super::graph::graph_source_record_bounded_from(
             &self.authority,
             &self.workspace,
             entity,
             limit,
-        )
-        .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
+        ) {
+            Ok(record) => record,
+            // A historical entity may be absent from the current workspace.
+            // Withhold only its body, preserving the rest of the context pack.
+            Err(error) if super::graph::is_workspace_absent_source(&error) => {
+                return Ok(kin_context::BodyCandidate::Unavailable {
+                    reason: error.to_string(),
+                })
+            }
+            Err(error) => return Err(kin_context::ContextError::Other(error.to_string())),
+        };
         Ok(match record {
             Some(record) => kin_context::BodyCandidate::Exact { body: record.body },
             None => kin_context::BodyCandidate::OverLimit {

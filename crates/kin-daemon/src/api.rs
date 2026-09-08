@@ -14336,7 +14336,7 @@ fn disclose_mcp_local_clamps(
         Some(existing) => existing.extend(entries),
         None => payload["degradations"] = serde_json::Value::Array(entries),
     }
-    match serde_json::to_string_pretty(&payload) {
+    match kin_mcp::budget::render(&payload) {
         Ok(rendered) => kin_mcp::ToolCallResult {
             content: vec![kin_mcp::ContentBlock::Text { text: rendered }],
             is_error: result.is_error,
@@ -14445,11 +14445,10 @@ async fn mcp_tools_call(
         ),
         None => None,
     };
-    Ok(Json(disclose_outside_graph(
-        graph.as_deref(),
-        question.as_deref(),
-        disclosed,
-    )))
+    // Clamp and outside-graph disclosures add bytes after the first fit.
+    // Enforce the ceiling again against the complete emitted payload.
+    let disclosed = disclose_outside_graph(graph.as_deref(), question.as_deref(), disclosed);
+    Ok(Json(bound_mcp_tool_result(disclosed, &tool, &budget)))
 }
 
 /// Disclose an identifier the question named that this graph holds no
@@ -14501,7 +14500,8 @@ fn disclose_outside_graph(
                 kin_mcp::outside_graph::OUTSIDE_GRAPH_KEY.to_string(),
                 block.clone(),
             );
-            match serde_json::to_string_pretty(&payload) {
+            // The caller re-fits after this disclosure adds its bytes.
+            match kin_mcp::budget::render(&payload) {
                 Ok(rendered) => kin_mcp::ContentBlock::Text { text: rendered },
                 Err(_) => kin_mcp::ContentBlock::Text { text },
             }
@@ -46178,8 +46178,9 @@ mod tests {
         );
     }
 
+    /// A missing workspace body preserves the context pack and names the gap.
     #[tokio::test]
-    async fn context_endpoint_refuses_unpublished_source() {
+    async fn context_endpoint_withholds_an_unpublished_source_body_and_answers() {
         let state = test_state();
         let entity = test_entity("handler", "src/lib.py");
         state.graph.upsert_entity(&entity).unwrap();
@@ -46207,8 +46208,30 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
             .await
             .unwrap();
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(String::from_utf8_lossy(&body).contains("is not in workspace"));
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let result: kin_cli::commands::context::ContextResponse =
+            serde_json::from_slice(&body).unwrap();
+        let withheld: Vec<&String> = result
+            .lines
+            .iter()
+            .filter(|line| line.contains("Source body withheld"))
+            .collect();
+        assert_eq!(withheld.len(), 1, "{:#?}", result.lines);
+        assert!(
+            withheld[0].contains("is not in workspace"),
+            "the row names the graph gap it hit: {}",
+            withheld[0]
+        );
+        // The rest of the answer survives the missing body.
+        assert!(
+            result
+                .lines
+                .iter()
+                .any(|line| line.contains("Context pack for 'handler'")),
+            "{:#?}",
+            result.lines
+        );
+        assert!(result.pack.is_some());
     }
 
     /// The daemon half of the cancellation chain.
@@ -58383,15 +58406,18 @@ mod tests {
             &budget,
         );
         let text = mcp_result_text(&response);
-        let mut parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["references"], payload["references"]);
-        assert_eq!(kin_mcp::budget::measure(&parsed), text.len());
-        assert_eq!(serde_json::to_string(&parsed).unwrap(), text);
         assert!(text.len() <= budget.max_chars);
-        assert_eq!(
-            parsed.as_object_mut().unwrap().remove("_kin_json_format"),
-            Some(json!("compact"))
-        );
+        // Compact, and compact ONLY by whitespace: re-serializing the parsed
+        // answer reproduces the shipped bytes exactly, so nothing was dropped
+        // to make it fit.
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), text);
+        assert!(!text.contains('\n'), "the shipped response is compact");
+        // The serialization control field chose that format and did not ship.
+        // Equality with the untouched payload is the assertion: any extra key
+        // at all, this one included, fails it.
+        assert!(parsed.get("_kin_json_format").is_none(), "{parsed}");
         assert_eq!(parsed, payload);
 
         let roomy = kin_mcp::budget::ResponseBudget {

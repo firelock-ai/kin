@@ -389,14 +389,17 @@ pub fn record_elision_for(
     }
 }
 
-/// The wire-format choice is carried with the payload so every emitter and
-/// accounting pass agrees, even after later cuts make pretty JSON fit again.
+/// Internal format choice retained across budget passes and omitted on emission.
 const JSON_FORMAT_KEY: &str = "_kin_json_format";
 
-/// Serialize a response in the format selected while enforcing its budget.
+/// Serialize in the budget-selected format without emitting its control field.
 pub fn render(value: &Value) -> serde_json::Result<String> {
     if value.get(JSON_FORMAT_KEY).and_then(Value::as_str) == Some("compact") {
-        serde_json::to_string(value)
+        let mut emitted = value.clone();
+        if let Some(object) = emitted.as_object_mut() {
+            object.remove(JSON_FORMAT_KEY);
+        }
+        serde_json::to_string(&emitted)
     } else {
         serde_json::to_string_pretty(value)
     }

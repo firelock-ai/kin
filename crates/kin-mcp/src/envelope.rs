@@ -4176,7 +4176,13 @@ mod tests {
         })
     }
 
-    fn belt_bounded_deep_trace() -> Value {
+    /// The bytes the belt ships, and the answer parsed out of them.
+    ///
+    /// Both, because the size that ships is the length of those bytes and
+    /// nothing else. Re-measuring the parsed value asks the serializer to guess
+    /// a format it was never told, and the guess is wrong for any response the
+    /// budget compacted.
+    fn belt_bounded_deep_trace() -> (String, Value) {
         let budget = ResponseBudget {
             max_chars: crate::agent_belt::AGENT_DEFAULT_RESPONSE_MAX_CHARS as usize,
             ..ResponseBudget::default()
@@ -4187,7 +4193,8 @@ mod tests {
             "trace_data_flow",
             &budget,
         );
-        annotated_value(&annotated)
+        let ContentBlock::Text { text } = annotated.content.first().expect("one content block");
+        (text.clone(), annotated_value(&annotated))
     }
 
     /// The measured case, and the one the belt advertises a number for.
@@ -4215,8 +4222,8 @@ mod tests {
             "the fixture is {raw} characters, too small to reach the ceiling with an envelope"
         );
 
-        let final_payload = belt_bounded_deep_trace();
-        let shipped = crate::budget::measure(&final_payload);
+        let (text, final_payload) = belt_bounded_deep_trace();
+        let shipped = text.len();
         println!("deep trace ships {shipped} characters against a {CEILING} ceiling");
         assert!(
             shipped <= CEILING,
@@ -5177,7 +5184,6 @@ mod tests {
                 .replace(&format!("see `{name}`"), replacement);
             *expanded.pointer_mut(path).unwrap() = json!(text);
         }
-        expanded.as_object_mut().unwrap().remove("_kin_json_format");
         expanded["_kin"].as_object_mut().unwrap().remove("response");
         expanded["degradations"]
             .as_array_mut()
@@ -5194,7 +5200,6 @@ mod tests {
             final_payload["_kin"]["response"]["chars_after_budget"],
             text.len()
         );
-        assert_eq!(text.len(), crate::budget::measure(&final_payload));
         assert!(text.len() <= budget.max_chars);
         println!(
             "eleven reference rows: before={before} pointed={compacted} shipped={}",
@@ -5218,17 +5223,31 @@ mod tests {
         );
         let mut payload = annotated_value(&result);
         assert_eq!(payload["references"].as_array().unwrap().len(), 11);
-        assert_eq!(payload["_kin_json_format"], "compact");
+        // The switch chose the format and did not ride out on the answer.
+        assert!(
+            payload.get("_kin_json_format").is_none(),
+            "the serialization control field must not ship: {payload}"
+        );
         assert_eq!(payload["_kin"]["response"]["bounded"], false);
         let ContentBlock::Text { text } = &result.content[0];
+        // Positive control on that absence: the response really IS compact, so
+        // the switch was set and read. Without this the absence assertion above
+        // would pass on a response that was never compacted at all.
+        assert!(!text.contains('\n'), "the shipped response is compact");
         assert_eq!(
             payload["_kin"]["response"]["chars_after_budget"],
             text.len()
         );
-        assert_eq!(crate::budget::measure(&payload), text.len());
+        // Re-serializing the parsed answer compactly reproduces the shipped
+        // bytes exactly, so the only thing compaction removed was whitespace.
         assert_eq!(serde_json::to_string(&payload).unwrap(), *text);
         assert!(text.len() <= 12_000);
-        payload.as_object_mut().unwrap().remove("_kin_json_format");
+        // And the switch is genuinely consumed rather than merely hidden: this
+        // payload, read back without it, measures as pretty.
+        assert!(
+            crate::budget::measure(&payload) > text.len(),
+            "the format choice does not survive the round trip"
+        );
         payload["_kin"].as_object_mut().unwrap().remove("response");
         full["_kin"].as_object_mut().unwrap().remove("response");
         assert_eq!(payload, full);
@@ -5300,7 +5319,6 @@ mod tests {
             payload["_kin"]["response"]["chars_after_budget"],
             text.len()
         );
-        assert_eq!(text.len(), crate::budget::measure(&payload));
         assert!(text.len() <= budget.max_chars);
         println!(
             "unique reference overflow: before={} pointed={} retained={} shipped={}",
@@ -5400,10 +5418,9 @@ mod tests {
 
         let ContentBlock::Text { text } = annotated.content.first().unwrap();
         let final_payload: Value = serde_json::from_str(text).unwrap();
-        let final_chars = crate::budget::measure(&final_payload);
         assert_eq!(
             envelope["response"]["chars_after_budget"],
-            json!(final_chars),
+            json!(text.len()),
             "accounting is measured after the downgrade and every disclosure: {final_payload}"
         );
         let residual = final_payload
@@ -5416,7 +5433,7 @@ mod tests {
                 })
             });
         assert!(
-            final_chars <= budget.max_chars || residual,
+            text.len() <= budget.max_chars || residual,
             "a response over the caller ceiling must disclose the residual: {final_payload}"
         );
         assert_eq!(

@@ -1933,6 +1933,25 @@ pub(crate) fn read_entity_file_bytes_with_digest(
     read_entity_file_bytes_with_digest_from(&authority, &workspace, entity)
 }
 
+/// An entity path absent from the selected workspace tree.
+#[derive(Debug)]
+pub(crate) struct WorkspaceAbsentSource(String);
+
+impl std::fmt::Display for WorkspaceAbsentSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorkspaceAbsentSource {}
+
+/// True when this error is the workspace-absent case above, at any wrapping depth.
+pub(crate) fn is_workspace_absent_source(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<WorkspaceAbsentSource>())
+}
+
 /// The same read against an authority and workspace the caller already holds.
 ///
 /// Split from [`read_entity_file_bytes_with_digest`] so a caller reading many
@@ -1957,12 +1976,10 @@ pub(crate) fn read_entity_file_bytes_with_digest_from(
         )
     })?;
     let artifact = workspace.tree.artifact_at_path(&path).ok_or_else(|| {
-        anyhow::anyhow!(
+        anyhow::Error::new(WorkspaceAbsentSource(format!(
             "entity source '{}' is not in workspace {} at generation {}",
-            file_id.0,
-            workspace.workspace_id,
-            workspace.generation
-        )
+            file_id.0, workspace.workspace_id, workspace.generation
+        )))
     })?;
     let kin_model::TreeEntry::Blob { hash, .. } = artifact.entry else {
         anyhow::bail!(

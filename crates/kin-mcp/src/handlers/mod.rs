@@ -3979,6 +3979,201 @@ mod tests {
         }
     }
 
+    /// A caller reached through a proven override is recovered without a body claim.
+    #[test]
+    fn a_recovered_unpriced_row_discloses_its_body_gap_on_the_context_surface() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut fixture = pack_provenance_fixture();
+        let sender = fixture.sender.clone();
+        let base = fixture.reader.clone();
+        fixture
+            .store
+            .insert_test_relation(RelationKind::Overrides, &sender, &base);
+
+        let opts = kin_context::ContextOptions::default();
+        let (pack, _) =
+            kin_context::build_context_pack_with_provenance(&fixture.store, &sender.id, &opts)
+                .unwrap();
+        assert!(pack
+            .dependency_signatures
+            .iter()
+            .any(|row| row.entity_id == base.id));
+        assert!(
+            !pack
+                .dependency_signatures
+                .iter()
+                .any(|row| row.entity_id == fixture.renderer.id),
+            "the caller must be absent from the builder so the handler recovers it"
+        );
+        let references = collect_graph_reference_rows(
+            &fixture.store,
+            &sender.id,
+            &default_reference_kinds(),
+            Some(&fixture.authority),
+        )
+        .unwrap();
+        assert!(
+            references.iter().any(|row| row.entity_id.as_deref()
+                == Some(fixture.renderer.id.to_string().as_str())
+                && !row.receiver_name_guess),
+            "the override must certify the recovered caller"
+        );
+
+        let direct = tool_result_json(
+            entities::handle_get_entity_source(
+                &HashMap::from([(
+                    "entity_id".into(),
+                    serde_json::json!(fixture.renderer.id.to_string()),
+                )]),
+                &fixture.store,
+                Some(&fixture.authority),
+            )
+            .unwrap(),
+        );
+        assert!(
+            direct["body"].as_str().is_some(),
+            "the recovered caller has readable source: {direct}"
+        );
+        let value = context_pack_json(&fixture, &sender, false);
+        let row = value["dependents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == fixture.renderer.id.to_string())
+            .expect("the context response retains the certified caller");
+        assert_eq!(row.get("body"), Some(&serde_json::Value::Null));
+        assert_eq!(row["body_complete"], false);
+        assert!(row["body_unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("not priced"));
+        assert!(row.get("body_elided").is_none(), "{row}");
+        assert!(row.get("projection_downgraded_from").is_none(), "{row}");
+    }
+
+    /// Unpriced rows disclose missing bodies only when their position promises one.
+    #[test]
+    fn an_unpriced_row_that_promised_a_body_says_none_was_read() {
+        let entry = kin_model::context::ContextEntry {
+            entity_id: EntityId::new(),
+            projection_level: kin_model::context::ProjectionLevel::SignatureOnly,
+            content: String::new(),
+        };
+        let report = kin_context::ProjectionReport::default();
+        assert!(!report.full_bodies.contains(&entry.entity_id));
+        assert!(!report.downgrades.contains_key(&entry.entity_id));
+
+        let mut promised = serde_json::json!({"id": entry.entity_id, "name": "recovered"});
+        attach_context_projection(
+            &entry,
+            &ContextSourceFields::default(),
+            &report,
+            &mut promised,
+            true,
+        );
+        assert!(promised["body"].is_null());
+        assert!(
+            promised.get("body").is_some(),
+            "the key is present and null"
+        );
+        assert_eq!(promised["body_complete"], false);
+        assert!(promised["body_unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("not priced"));
+        // Nothing was downgraded and no budget withheld anything, so it claims
+        // neither. `disclose_projection_bodies` reads `body_elided` to count a
+        // withheld body, and this row is not one.
+        assert!(promised.get("projection_downgraded_from").is_none());
+        assert!(promised.get("body_elided").is_none());
+
+        let mut unpromised = serde_json::json!({"id": entry.entity_id, "name": "neighbour"});
+        attach_context_projection(
+            &entry,
+            &ContextSourceFields::default(),
+            &report,
+            &mut unpromised,
+            false,
+        );
+        assert!(unpromised.get("body").is_none(), "{unpromised}");
+        assert!(unpromised.get("body_complete").is_none(), "{unpromised}");
+        assert!(unpromised.get("body_unavailable").is_none(), "{unpromised}");
+    }
+
+    /// Source and single/multi-focal context return the recorded signature span,
+    /// even when the graph-owned artifact contains a larger function body.
+    #[test]
+    fn context_serves_a_signature_only_span_without_reconstructing_the_block() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "def validate_probe_range_f0cc1f1d(value: float, min_val: float, max_val: float) -> bool:\n    return min_val <= value and value <= max_val\n";
+        let source = make_signature_only_python_entity(content);
+        let entity = &source.entity;
+        let span = entity.span.as_ref().unwrap();
+        let recorded = &content[span.start_byte..span.end_byte];
+        // The fixture is only worth anything if the span really is short.
+        assert!(!recorded.contains("value <= max_val"), "{recorded}");
+        assert!(content.contains("value <= max_val"));
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+
+        let direct = tool_result_json(
+            entities::handle_get_entity_source(
+                &HashMap::from([("entity_id".into(), serde_json::json!(entity.id.to_string()))]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap(),
+        );
+        assert_eq!(direct["body"].as_str(), Some(recorded));
+        assert!(!direct["body"]
+            .as_str()
+            .unwrap()
+            .contains("value <= max_val"));
+
+        for multi in [false, true] {
+            let mut args = HashMap::from([
+                ("token_budget".into(), serde_json::json!(8000)),
+                ("max_chars".into(), serde_json::json!(60000)),
+            ]);
+            if multi {
+                args.insert(
+                    "question_focals".into(),
+                    serde_json::json!([{"entity_id": entity.id.to_string(), "route": "id"}]),
+                );
+            } else {
+                args.insert("entity_id".into(), serde_json::json!(entity.id.to_string()));
+            }
+            let value = tool_result_json(
+                entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority))
+                    .unwrap(),
+            );
+            let row = if multi {
+                &value["entities"][0]
+            } else {
+                &value["focal_entity"]
+            };
+            let body = row["body"].as_str().unwrap_or_default();
+            assert_eq!(body, recorded, "multi={multi}");
+            assert!(!body.contains("value <= max_val"), "multi={multi}: {body}");
+            assert!(!body.contains("[truncated]"), "multi={multi}: {body}");
+            assert_eq!(row["projection"], "FullBody", "multi={multi}");
+            assert_eq!(row["body_complete"], true, "multi={multi}");
+        }
+    }
+
     #[test]
     fn context_requested_4000_keeps_the_effective_8000_tier_and_exact_final_cost() {
         let _lock = ENV_MUTEX

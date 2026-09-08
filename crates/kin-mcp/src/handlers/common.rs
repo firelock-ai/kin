@@ -2693,11 +2693,14 @@ impl<G: GraphStore> kin_context::ContextProjectionProvider for ContextSourceProv
     }
 }
 
+/// Attach the source projection result. Rows promising a body must name any gap;
+/// signature-only neighborhood and route rows make no such promise.
 pub fn attach_context_projection(
     entry: &kin_model::ContextEntry,
     fields: &ContextSourceFields,
     report: &kin_context::ProjectionReport,
     row: &mut serde_json::Value,
+    body_expected: bool,
 ) {
     row["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
     if let Some(metadata) = fields.borrow().get(&entry.entity_id) {
@@ -2714,6 +2717,14 @@ pub fn attach_context_projection(
         if report.budget_withheld.contains(&entry.entity_id) {
             row["body_elided"] = serde_json::json!(["body"]);
         }
+    } else if body_expected {
+        // Recovered dependents were not priced by the projection provider.
+        // Name the gap without claiming a budget cut or a projection downgrade.
+        row["body"] = serde_json::Value::Null;
+        row["body_complete"] = serde_json::json!(false);
+        row["body_unavailable"] = serde_json::json!(
+            "no source body was read for this row: it was not priced by this request's source projection; read it with get_entity_source"
+        );
     }
 }
 
