@@ -29,11 +29,11 @@
 //!
 //! A path alone cannot say whether the debt is still real. The working copy
 //! moves on, other writers publish over the same path, and a commit lands. A
-//! path plus the body the parse is owed for answers all three: an entry whose
-//! tree entry no longer names that body has been overtaken by a later
-//! transition, and the admission that observed that transition already enriched
-//! it. Settling those costs nothing and re-parsing them would be waste that
-//! grows with the age of the store.
+//! path plus the body the parse is owed for answers all three. An entry whose
+//! tree no longer names that body describes either an overtaken transition or
+//! an unpublished proposal. Standalone publication records its proposal before
+//! authority moves, retaining the current owed body beside it. Only the exact
+//! identity that the tree no longer owes can be settled.
 //!
 //! # Why a file under the store root
 //!
@@ -52,6 +52,7 @@
 //! would clear the record for a parse the next crash could still lose.
 
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::PathBuf;
 
 use kin_model::{RepoPath, TreeEntry};
@@ -121,6 +122,62 @@ pub(crate) fn record(state: &DaemonState, owed: &[SemanticDebt]) {
     write(state, &entries);
 }
 
+/// Prepare recoverable semantics before a standalone tree publication.
+///
+/// The current body remains owed until authority moves. Keep it beside the
+/// proposed body so a refused or interrupted publication cannot erase an
+/// earlier unpaid parse. Other paths retain their existing records.
+pub(crate) fn record_before_standalone_publication(
+    state: &DaemonState,
+    owed: &[SemanticDebt],
+) -> std::io::Result<()> {
+    if owed.is_empty() {
+        return Ok(());
+    }
+    let marker = marker_path(state);
+    let mut entries: Vec<SemanticDebt> = match std::fs::read(&marker) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let (_, spent) = partition_against_tree(state, &entries);
+    entries.retain(|entry| {
+        !owed.iter().any(|fresh| fresh.path == entry.path) || !spent.contains(entry)
+    });
+    for entry in owed {
+        if !entries.contains(entry) {
+            entries.push(entry.clone());
+        }
+    }
+    write_checked(state, &entries)
+}
+
+fn write_checked(state: &DaemonState, entries: &[SemanticDebt]) -> std::io::Result<()> {
+    let marker = marker_path(state);
+    let bytes = serde_json::to_vec(entries).map_err(std::io::Error::other)?;
+    let temporary = state
+        .layout
+        .root()
+        .join(format!(".semantic-debt-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &marker)?;
+        crate::state::sync_directory_metadata(state.layout.root())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// Read the record. An unreadable or unparseable one is treated as empty and
 /// said out loud, because the alternative is refusing every commit on the store.
 pub(crate) fn outstanding(state: &DaemonState) -> Vec<SemanticDebt> {
@@ -145,18 +202,19 @@ pub(crate) fn outstanding(state: &DaemonState) -> Vec<SemanticDebt> {
 /// Split a record into what is still owed and what a later transition overtook.
 ///
 /// Owed means the tree still names the exact body the debt was recorded for. A
-/// path the tree no longer carries, or carries at a different body, has been
-/// through an admission that enriched it, and the entry is spent.
+/// path the tree no longer carries, or carries at a different body, does not
+/// owe that parse. The entry may describe an overtaken body or a proposal that
+/// never reached authority; only that exact debt identity is spent.
 pub(crate) fn partition_against_tree(
     state: &DaemonState,
     entries: &[SemanticDebt],
-) -> (BTreeSet<RepoPath>, Vec<String>) {
+) -> (BTreeSet<RepoPath>, Vec<SemanticDebt>) {
     let tree = state.graph.resolved_tree();
     let mut owed = BTreeSet::new();
     let mut spent = Vec::new();
     for entry in entries {
         let Ok(repo_path) = RepoPath::from_utf8(entry.path.clone()) else {
-            spent.push(entry.path.clone());
+            spent.push(entry.clone());
             continue;
         };
         let still_owed =
@@ -168,20 +226,20 @@ pub(crate) fn partition_against_tree(
         if still_owed {
             owed.insert(repo_path);
         } else {
-            spent.push(entry.path.clone());
+            spent.push(entry.clone());
         }
     }
     (owed, spent)
 }
 
-/// Drop the named paths from the record and rewrite it.
-pub(crate) fn settle(state: &DaemonState, paths: &[String]) {
-    if paths.is_empty() {
+/// Drop exact debt identities, retaining another owed body at the same path.
+pub(crate) fn settle(state: &DaemonState, spent: &[SemanticDebt]) {
+    if spent.is_empty() {
         return;
     }
     let mut entries = outstanding(state);
     let before = entries.len();
-    entries.retain(|entry| !paths.contains(&entry.path));
+    entries.retain(|entry| !spent.contains(entry));
     if entries.len() == before {
         return;
     }
@@ -218,18 +276,11 @@ fn write(state: &DaemonState, entries: &[SemanticDebt]) {
         settle_all(state);
         return;
     }
-    let marker = marker_path(state);
-    match serde_json::to_vec(entries) {
-        Ok(bytes) => {
-            if let Err(error) = std::fs::write(&marker, bytes) {
-                warn!(
-                    marker = %marker.display(),
-                    error = %error,
-                    "could not persist the semantic-debt record, so a daemon restart before the \
-                     next commit would leave these paths answering at their previous positions"
-                );
-            }
-        }
-        Err(error) => warn!(error = %error, "could not encode the semantic-debt record"),
+    if let Err(error) = write_checked(state, entries) {
+        warn!(
+            error = %error,
+            "could not persist the semantic-debt record, so a daemon restart before the \
+             next commit would leave these paths answering at their previous positions"
+        );
     }
 }
