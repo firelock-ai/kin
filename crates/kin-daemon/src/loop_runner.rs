@@ -3832,6 +3832,15 @@ pub async fn run_loop_armed(
                                 session_id: None,
                             });
                         }
+                        if should_apply {
+                            for event in crate::state::relation_change_events(
+                                &delta,
+                                Some(path.to_string_lossy().as_ref()),
+                            ) {
+                                pass_delta.count(&event);
+                                state.emit_event(event);
+                            }
+                        }
                         if reconciled_graph_changed || tree_changed {
                             state.bump_version();
                         }

@@ -12,6 +12,86 @@ use crate::extract::{ExtractedEntity, ExtractedRelation, FileImport, ImportedNam
 
 pub struct CAdapter;
 
+/// A direct call whose complete syntax and callee position are known.
+#[derive(Debug, Clone)]
+pub struct PartialCallSite {
+    pub callee: String,
+    pub expression: String,
+    pub call_span: kin_model::SourceSpan,
+    pub callee_span: kin_model::SourceSpan,
+}
+
+/// Direct calls inside a complete declaration, excluding names shadowed by
+/// local bindings or defined macros. The enclosing full-file proof is required.
+pub fn partial_call_sites(
+    tree: &Tree,
+    source: &[u8],
+    declaration: &kin_model::SourceSpan,
+) -> Option<Vec<PartialCallSite>> {
+    partial_function_context(tree, source, declaration.start_byte, declaration.end_byte)?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let function = root.children(&mut cursor).find(|node| {
+        node.kind() == "function_definition"
+            && node.start_byte() == declaration.start_byte
+            && node.end_byte() == declaration.end_byte
+    })?;
+    let mut unavailable = std::collections::HashSet::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "preproc_def" | "preproc_function_def") {
+            if let Some(name) = node.child_by_field_name("name") {
+                unavailable.insert(name.utf8_text(source).ok()?.to_owned());
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    let mut pending = vec![function];
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "declaration" | "parameter_declaration") {
+            let mut cursor = node.walk();
+            for (index, child) in node.children(&mut cursor).enumerate() {
+                if node.field_name_for_child(index as u32) != Some("declarator") {
+                    continue;
+                }
+                let mut names = vec![child];
+                while let Some(name) = names.pop() {
+                    if name.kind() == "init_declarator" {
+                        names.push(name.child_by_field_name("declarator")?);
+                    } else if name.kind() == "identifier" {
+                        unavailable.insert(name.utf8_text(source).ok()?.to_owned());
+                    } else {
+                        let mut cursor = name.walk();
+                        names.extend(name.named_children(&mut cursor));
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    let mut sites = Vec::new();
+    let mut pending = vec![function];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "call_expression" {
+            let callee = node.child_by_field_name("function")?;
+            let name = callee.utf8_text(source).ok()?;
+            if callee.kind() == "identifier" && !unavailable.contains(name) {
+                sites.push(PartialCallSite {
+                    callee: name.to_owned(),
+                    expression: node.utf8_text(source).ok()?.to_owned(),
+                    call_span: span_from_node(&node, &declaration.file),
+                    callee_span: span_from_node(&callee, &declaration.file),
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    Some(sites)
+}
+
 /// Context that must remain identical before refreshing one declaration in an
 /// incomplete C file. Only direct, complete function definitions qualify. The
 /// full-file tree, including zero-width recovery nodes at either boundary, is

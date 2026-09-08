@@ -1603,6 +1603,13 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
                     continue;
                 }
                 if current {
+                    let held_relations = kin_model::EntityStore::traverse(
+                        graph,
+                        &kin_model::GraphNodeId::Entity(entity.id),
+                        &[],
+                        1,
+                    )?
+                    .relations;
                     // A partial admission claims only this declaration. Recheck
                     // the old CAS context and the exact new payload, not a
                     // complete-set equality over an incomplete file.
@@ -1650,7 +1657,18 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
                                                 "error_ranges": error_ranges,
                                             }),
                                         );
-                                        expected == *entity
+                                        let mut original = originals[0].clone();
+                                        original.id = entity.id;
+                                        let declaration = candidates[0].span.as_ref()?;
+                                        expected == *entity && held_relations.iter().all(|relation| {
+                                            let associated = relation.evidence.iter().filter_map(|e| e.source_span.as_ref()).any(|span| {
+                                                span.file == declaration.file && (relation.src == kin_model::GraphNodeId::Entity(entity.id)
+                                                    || (declaration.start_line <= span.start_line && span.end_line <= declaration.end_line))
+                                            });
+                                            !associated || pipeline.verifies_partial_relation(
+                                                &original, candidates[0], previous.body(), content, relation, &held,
+                                            )
+                                        })
                                     },
                             )
                         })
@@ -1668,12 +1686,44 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
                     if let Some(previous) = previous.and_then(|previous| {
                         read_publishable_source(blobs, authority, previous).ok()
                     }) {
+                        let relations = kin_model::EntityStore::traverse(
+                            graph,
+                            &kin_model::GraphNodeId::Entity(entity.id),
+                            &[],
+                            1,
+                        )?
+                        .relations;
                         stale |= pipeline.supports_partial_refresh(
                             entity,
                             candidates[0],
                             previous.body(),
                             content,
-                        );
+                        ) && relations.iter().all(|relation| {
+                            let associated = entity.span.as_ref().is_some_and(|declaration| {
+                                relation
+                                    .evidence
+                                    .iter()
+                                    .filter_map(|e| e.source_span.as_ref())
+                                    .any(|span| {
+                                        span.file == declaration.file
+                                            && (relation.src
+                                                == kin_model::GraphNodeId::Entity(entity.id)
+                                                || (declaration.start_line <= span.start_line
+                                                    && span.end_line <= declaration.end_line))
+                                    })
+                            });
+                            !associated
+                                || pipeline
+                                    .rebase_partial_relation(
+                                        entity,
+                                        candidates[0],
+                                        previous.body(),
+                                        content,
+                                        relation,
+                                        &held,
+                                    )
+                                    .is_some()
+                        });
                     }
                 }
             }
@@ -4875,6 +4925,160 @@ mod tests {
             .summary_lines()
             .join("\n")
             .contains("retained_last_good_parse"));
+    }
+
+    #[test]
+    fn partial_c_call_evidence_commits_and_reopens_at_the_current_call_site() {
+        let before = "int helper(void) { return 7; }\nint good(void) {\n  int value=1;\n  return helper();\n}\nint bad(void) { test_cond(1) }\n";
+        let site = |source: &str, zero_bytes: bool| {
+            let start = source.find("helper()").unwrap();
+            let end = start + "helper".len();
+            let line = source[..start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count() as u32;
+            let column = start - source[..start].rfind('\n').map_or(0, |offset| offset + 1);
+            kin_model::SourceSpan {
+                file: kin_model::FilePathId::new("test.c"),
+                start_byte: if zero_bytes { 0 } else { start },
+                end_byte: if zero_bytes { 0 } else { end },
+                start_line: line,
+                end_line: line,
+                start_col: column as u32,
+                end_col: (column + end - start) as u32,
+            }
+        };
+        for (prefix, unsupported) in [(true, false), (false, false), (true, true)] {
+            let parent = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir_in(parent.path()).unwrap();
+            let init = kin_core::init(root.path()).unwrap();
+            let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+            let graph = kin_db::InMemoryGraph::new();
+            let artifact = add_artifact(&graph, &blobs, b"test.c", before.as_bytes(), |hash| {
+                TreeEntry::blob(hash, false)
+            });
+            let held = derive_entities_into_graph(&graph, &blobs, "test.c", before.as_bytes());
+            let caller = held.iter().find(|entity| entity.name == "good").unwrap();
+            let callee = held.iter().find(|entity| entity.name == "helper").unwrap();
+            let mut relation = kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 0.75,
+                origin: kin_model::RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+                evidence: vec![kin_model::RelationEvidence {
+                    source_span: Some(site(before, prefix)),
+                    ..Default::default()
+                }],
+            };
+            if unsupported {
+                relation.evidence[0].source_span = caller.span.clone();
+            }
+            graph.upsert_relation(&relation).unwrap();
+            let plan = || {
+                plan_native_commit(
+                    &init.layout,
+                    &graph,
+                    &blobs,
+                    OperationId::new(),
+                    fixed_timestamp(),
+                    AuthorId::new("tests"),
+                    "Record current call evidence".into(),
+                )
+            };
+            commit_native_plan_with_projection(&init.layout, &blobs, plan().unwrap()).unwrap();
+            let after = if prefix {
+                format!("// prefix\n{before}")
+            } else {
+                before.replace("int value=1;", "int renamed=1;\n\n")
+            };
+            update_artifact_bytes(&graph, &blobs, &artifact, after.as_bytes());
+            let indexed = kin_index::IndexPipeline::new()
+                .index_file_content_with_tests(
+                    &kin_model::FilePathId::new("test.c"),
+                    after.as_bytes(),
+                    blobs.write(after.as_bytes()).unwrap(),
+                )
+                .unwrap()
+                .indexed_file;
+            let mut reconciler = kin_reconcile::Reconciler::new(root.path().to_path_buf());
+            let result = reconciler
+                .reconcile_indexed_content(&indexed, &blobs, &graph)
+                .unwrap();
+            assert!(
+                matches!(&result.outcome, kin_reconcile::ReconcileOutcome::PartiallyUpdated { modified, .. } if modified.contains(&caller.id) != unsupported),
+                "{:?}",
+                result.outcome
+            );
+            crate::loop_runner::persist_partial_observation(&init.layout, &result.outcome).unwrap();
+            graph.apply_transaction_delta(&result.delta).unwrap();
+            if unsupported {
+                assert_eq!(graph.get_entity(&caller.id).unwrap().as_ref(), Some(caller));
+                commit_native_plan_with_projection(&init.layout, &blobs, plan().unwrap()).unwrap();
+                let authority = reopen(&init);
+                let lease = authority.read_authority();
+                let snapshot = lease
+                    .workspace_graph_snapshot(&init.workspace_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(snapshot.entities.get(&caller.id), Some(caller));
+                assert_eq!(snapshot.relations.get(&relation.id), Some(&relation));
+                assert_eq!(
+                    kin_core::retained_parse::read(&init.layout).errors_for("test.c"),
+                    Some(1)
+                );
+                continue;
+            }
+            let mut expected = relation.clone();
+            expected.evidence[0].source_span = Some(site(&after, false));
+            let updated = graph
+                .get_all_relations_for_entity(&caller.id)
+                .unwrap()
+                .into_iter()
+                .find(|held| held.id == relation.id)
+                .unwrap();
+            assert_eq!(
+                updated, expected,
+                "the partial transaction must move the existing call evidence"
+            );
+            graph.upsert_relation(&relation).unwrap();
+            assert!(
+                plan().is_err(),
+                "commit accepted retained old call-site coordinates for a current caller"
+            );
+            graph.upsert_relation(&updated).unwrap();
+            commit_native_plan_with_projection(&init.layout, &blobs, plan().unwrap()).unwrap();
+            let authority = reopen(&init);
+            let lease = authority.read_authority();
+            let snapshot = lease
+                .workspace_graph_snapshot(&init.workspace_id)
+                .unwrap()
+                .unwrap();
+            let current = snapshot.entities.get(&caller.id).unwrap();
+            assert_eq!(
+                current.metadata.extra["blob_hash"],
+                kin_blobs::digest(after.as_bytes()).to_string()
+            );
+            let reopened = snapshot.relations.get(&relation.id).unwrap();
+            assert_eq!(reopened, &expected);
+            let lines = kin_mcp::handlers::common::relation_reference_lines(
+                reopened,
+                Some(&kin_model::FilePathId::new("test.c")),
+            );
+            assert_eq!(lines.lines, vec![site(&after, false).start_line + 1]);
+            assert!(after
+                .lines()
+                .nth(lines.lines[0] as usize - 1)
+                .unwrap()
+                .contains("helper()"));
+            assert_eq!(
+                kin_core::retained_parse::read(&init.layout).errors_for("test.c"),
+                Some(1)
+            );
+        }
     }
 
     /// A commit must not seal a tree delta over a path whose graph entities a
