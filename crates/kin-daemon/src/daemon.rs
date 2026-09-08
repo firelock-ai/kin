@@ -6410,11 +6410,15 @@ pub(crate) fn spawn_background_embedding_worker(
                 // does not become writable by trying again: the refusal is a
                 // property of the binding, so every batch after it spends the
                 // CPU and the memory of a hosted container to produce vectors
-                // nothing can write. Stand down here, at the worker's own
-                // checkpoint, and say why on the pass surface. The record is
-                // matched against the installed binding, so a rebind after the
-                // next graph commit retires it and a later wake may drain
-                // again; this is a stand-down on one binding, not on the store.
+                // nothing can write. Park here, at the worker's own checkpoint,
+                // and let the drain go.
+                //
+                // Park rather than halt, and the difference is the whole point.
+                // The record is matched against the binding currently
+                // installed, so a rebind after the next graph commit retires it
+                // by itself; a halt would exit this worker for the life of the
+                // process and no later wake could ever notice. This is a pause
+                // on one binding, not a stop on the store.
                 if pause_if_hosted_vector_binding_refused(
                     &embed_state,
                     &mut pending_flush,
