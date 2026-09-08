@@ -5086,7 +5086,7 @@ mod tests {
 
         let (detail, fix) =
             stranded_stage_doctor_row(&survey).expect("a stranded stage is a finding");
-        assert!(detail.contains("1.5 GB"), "{detail}");
+        assert!(detail.contains("1.5 GiB"), "{detail}");
         assert!(
             detail.contains("/scratchpad/.kin.init-62f59472-4ba7-41ec-bb31-b55ad3feec9e"),
             "{detail}"
@@ -5139,10 +5139,10 @@ mod tests {
             detail.contains("its filesystem identity is not provable"),
             "{detail}"
         );
-        assert!(detail.contains("4.0 KB"), "{detail}");
+        assert!(detail.contains("4.0 KiB"), "{detail}");
         // The reclaimable one is still the headline, and the declined one is
         // not counted into the number that comes back.
-        assert!(detail.contains("1.5 GB of staging"), "{detail}");
+        assert!(detail.contains("1.5 GiB of staging"), "{detail}");
         assert_eq!(survey.reclaimable_bytes(), 1_610_612_736);
     }
 
