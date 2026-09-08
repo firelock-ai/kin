@@ -443,7 +443,7 @@ impl BudgetVerdict {
                     .to_string(),
                 format!(
                     "  set it to a byte count, for example {INIT_MEMORY_CEILING_ENV}=17179869184 \
-                     for 16 GB, or unset it to let Kin measure this machine"
+                     for 16 GiB, or unset it to let Kin measure this machine"
                 ),
             ];
         }
@@ -1259,7 +1259,7 @@ mod tests {
                 "kin must be refused on {gb} GB, got {verdict:?}"
             );
             let text = verdict.refusal_lines().join("\n");
-            assert!(text.contains("1.3 GB of history"), "text was:\n{text}");
+            assert!(text.contains("1.3 GiB of history"), "text was:\n{text}");
             assert!(
                 text.contains("the bytes of history decide it"),
                 "the refusal has to name the term that decided it: {text}"
@@ -1642,7 +1642,7 @@ mod tests {
             text.contains("the commit count decides it"),
             "the refusal has to name the term that decided it: {text}"
         );
-        assert!(text.contains("8.0 GB"), "text was:\n{text}");
+        assert!(text.contains("8.0 GiB"), "text was:\n{text}");
         assert!(
             text.contains("entity and relation deltas"),
             "the refusal has to name what a conversion holds per commit: {text}"
