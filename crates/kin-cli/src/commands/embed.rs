@@ -4,6 +4,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::byte_fmt::human_bytes;
+
 /// Default embed command batch.
 ///
 /// The embedder already groups individual texts by token budget inside each
@@ -348,16 +350,6 @@ fn lost_the_daemon_mid_request(rendered: &str) -> bool {
     LOST_CONNECTION_MARKERS
         .iter()
         .any(|marker| rendered.contains(marker))
-}
-
-fn human_bytes(bytes: u64) -> String {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const MIB: u64 = 1024 * 1024;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else {
-        format!("{} MiB", bytes / MIB)
-    }
 }
 
 /// Guidance for an embed that lost the daemon under memory pressure, or `None`

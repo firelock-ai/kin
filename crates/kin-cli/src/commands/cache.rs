@@ -36,10 +36,10 @@ use kin_db::embed::cache_admin::{
     self, AgeBucket, CacheStats, GcOptions, GcReport, SchemaVersionStats,
 };
 
-/// Render a byte count as a short human-readable string.
+/// Render a binary byte count with IEC unit labels.
 #[cfg(feature = "embeddings")]
 fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut value = bytes as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit < UNITS.len() - 1 {
@@ -643,8 +643,8 @@ mod tests {
     #[test]
     fn human_bytes_formats_units() {
         assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(1536), "1.5 KB");
-        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GiB");
     }
 
     #[test]
