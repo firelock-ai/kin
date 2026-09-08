@@ -245,9 +245,10 @@ impl FileWatcher {
         let observed = async {
             // Registration can precede backend delivery. Retry only this private
             // probe; repository source is never rewritten to manufacture readiness.
-            let mut retry = tokio::time::interval(std::time::Duration::from_millis(100));
+            let retry_period = std::time::Duration::from_millis(100);
+            let mut retry =
+                tokio::time::interval_at(tokio::time::Instant::now() + retry_period, retry_period);
             retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            retry.tick().await;
             let mut sequence = 0_u64;
             loop {
                 tokio::select! {
