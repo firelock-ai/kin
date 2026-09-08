@@ -110,3 +110,90 @@ test('only first-parent history is evidence', () => {
   git(root, ['merge', '--quiet', '--no-ff', '-m', 'merge side', 'side']);
   assert.equal(resolveReleaseIntent({ root, baseRef: 'v1.2.3' }).intent, 'patch');
 });
+
+const malformed = 'change\n\nKin-Release-Intent: patch\n\n---------\n\nSigned-off-by: Test <test@example.invalid>\n';
+function attested(root, changes = {}) {
+  return { schema: 'kin.release-intent-attestations.v1', attestations: [{
+    sha: git(root, ['rev-parse', 'HEAD']).trim(), intent: 'patch',
+    reason: 'The recorded patch intent precedes the footer divider.', ...changes,
+  }] };
+}
+
+test('an explicit full-SHA attestation resolves the divider case and records its reason', () => {
+  const root = repository([malformed]);
+  const attestations = attested(root);
+  const result = resolveReleaseIntent({ root, baseRef: 'v1.2.3', attestations });
+  assert.equal(result.intent, 'patch');
+  assert.deepEqual(result.evidence, [{ commit: attestations.attestations[0].sha,
+    intent: 'patch', source: 'attestation', reason: attestations.attestations[0].reason }]);
+  assert.throws(() => resolveReleaseIntent({ root, baseRef: 'v1.2.3' }), /malformed or non-footer/);
+});
+
+test('attestations cannot replace readable, duplicate, invalid or absent intent', () => {
+  for (const message of [
+    'change\n\nKin-Release-Intent: major\n',
+    'change\n\nKin-Release-Intent: patch\nKin-Release-Intent: minor\n',
+    'change\n\nKin-Release-Intent: enormous\n',
+    'change without any intent mention',
+    'Kin-Release-Intent: patch in prose\n\nbody\n\nKin-Release-Intent: major\n',
+  ]) {
+    const root = repository([message]);
+    assert.throws(() => resolveReleaseIntent({ root, baseRef: 'v1.2.3',
+      attestations: attested(root) }), /attestation requires unreadable trailer evidence/);
+  }
+});
+
+test('attestation schema, full SHA, intent, reason and uniqueness are required', () => {
+  const root = repository([malformed]);
+  for (const change of [{ sha: 'bffd6adda' }, { sha: 'x'.repeat(40) },
+    { intent: 'enormous' }, { reason: '' }, { reason: '   ' }]) {
+    assert.throws(() => resolveReleaseIntent({ root, baseRef: 'v1.2.3',
+      attestations: attested(root, change) }), /attestation requires/);
+  }
+  const document = attested(root);
+  document.attestations.push(document.attestations[0]);
+  assert.throws(() => resolveReleaseIntent({ root, baseRef: 'v1.2.3', attestations: document }), /duplicate attestation/);
+  assert.throws(() => resolveReleaseIntent({ root, baseRef: 'v1.2.3', attestations: {} }), /invalid release intent attestation document/);
+});
+
+test('an attestation for another commit does not repair unreadable evidence', () => {
+  const root = repository([malformed]);
+  assert.throws(() => resolveReleaseIntent({ root, baseRef: 'v1.2.3',
+    attestations: attested(root, { sha: 'a'.repeat(40) }) }), /malformed or non-footer/);
+});
+
+test('a repaired patch does not lower a readable major in the same range', () => {
+  const root = repository([malformed]);
+  const attestations = attested(root);
+  git(root, ['commit', '--allow-empty', '--quiet', '-F', '-'], 'change\n\nKin-Release-Intent: major\n');
+  assert.equal(resolveReleaseIntent({ root, baseRef: 'v1.2.3', attestations }).intent, 'major');
+});
+
+test('the committed historical attestation binds only the recorded full SHA', () => {
+  const document = JSON.parse(fs.readFileSync(new URL('./release-intent-attestations.json', import.meta.url), 'utf8'));
+  assert.equal(document.schema, 'kin.release-intent-attestations.v1');
+  for (const expected of [
+    'bffd6adda2eb46a37d0481a8b1aba8ef8759ce54',
+    '72414aa80531e7adee1ab360eacb28d56a621c6a',
+    '9e45cc6c89b12c72e519c86517ac38a8a79a7cea',
+    'c67efaa2c737ab0b7ac15d0057c8a3ec5a8041cc',
+  ]) {
+    const entry = document.attestations.find(({ sha }) => sha === expected);
+    assert.equal(entry?.intent, 'patch', expected);
+    assert.match(entry.reason, /FIR-3412/);
+  }
+});
+
+test('attestation cannot invent, change or disambiguate malformed raw intent', () => {
+  for (const message of [
+    malformed.replace('Intent: patch', 'Intent: enormous'),
+    malformed.replace('Intent: patch', 'Intent: major'),
+    malformed.replace('Intent: patch', 'Intent: patch\nKin-Release-Intent: minor'),
+    malformed.replace('Intent: patch', 'Intent: patch\nKin-Release-Intent: patch'),
+    malformed.replace('Intent: patch', 'Intent patch'),
+  ]) {
+    const root = repository([message]);
+    assert.throws(() => resolveReleaseIntent({ root, baseRef: 'v1.2.3', attestations: attested(root) }),
+      /attestation requires one explicit valid intent/);
+  }
+});
