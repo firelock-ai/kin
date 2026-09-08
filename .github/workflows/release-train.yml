@@ -58,7 +58,7 @@ jobs:
       # reads exactly like one that never came, which is the reading that keeps
       # the alarm quiet. The artifact stays, because later cycles need this run
       # to be readable from outside it.
-      marker: ${{ steps.plan.outputs.marker }}
+      marker: ${{ steps.report.outputs.marker }}
     steps:
       - name: Mint repository-scoped release branch token
         id: app-token
@@ -359,8 +359,12 @@ jobs:
           intent_policy="$RUNNER_TEMP/resolve-release-intent.mjs"
           git show "refs/remotes/origin/main:scripts/resolve-release-intent.mjs" \
             > "$intent_policy"
+          attestations="$RUNNER_TEMP/release-intent-attestations.json"
+          git show "refs/remotes/origin/main:scripts/release-intent-attestations.json" \
+            > "$attestations"
           bump="$(
             node "$intent_policy" \
+              --attestations "$attestations" \
               --base-ref "$tag" \
               --head-ref refs/remotes/origin/main \
               | jq -er .intent
@@ -801,6 +805,35 @@ jobs:
             echo "- merge: armed only after protected checks"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Record this cycle's final outcome
+        id: report
+        if: always()
+        env:
+          RECONCILE_STATUS: ${{ job.status }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          marker="$RUNNER_TEMP/release-hold-marker.json"
+          if [ "$RECONCILE_STATUS" = failure ]; then
+            # A later failed step supersedes an earlier all-clear. This also
+            # covers failures before checkout or before drift can be measured.
+            jq -n \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg run_url "${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}" \
+              '{schema: "kin.release-hold.v1", state: "failed",
+                reason: "reconcile_failed", drift: null,
+                detail: "Release reconciliation exited nonzero; inspect the failed step in this run.",
+                run_id: $run_id, run_url: $run_url,
+                observed_at: (now | todateiso8601)}' > "$marker"
+          fi
+          if [ -s "$marker" ]; then
+            {
+              echo "marker<<KIN_RELEASE_HOLD_MARKER"
+              jq -c . "$marker"
+              echo "KIN_RELEASE_HOLD_MARKER"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
       # Uploaded on every path, including the ones that stood down and the ones
       # that failed. Later cycles read this to learn what this cycle saw, and a
       # cycle that uploaded nothing is read as an observation that could not be
@@ -829,9 +862,8 @@ jobs:
   hold-alarm:
     name: Report a held rail
     needs: reconcile
-    # Runs when the reconcile job ran, whatever it concluded. A failed train run
-    # is already loud, and its absent marker reads as unreadable here, which
-    # neither opens an alarm nor closes one.
+    # Runs when reconciliation ran, including a nonzero exit. The final marker
+    # makes that failure actionable even if no drift could be measured.
     #
     # It deliberately stands down when reconcile was SKIPPED, and that condition
     # is load-bearing rather than tidiness. The workflow_run trigger fires on

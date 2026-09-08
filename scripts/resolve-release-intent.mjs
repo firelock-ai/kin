@@ -53,7 +53,25 @@ function git(args, options = {}) {
   });
 }
 
-function commitIntent(root, commit) {
+function validateAttestations(document) {
+  if (document?.schema !== 'kin.release-intent-attestations.v1' ||
+      !Array.isArray(document.attestations)) {
+    throw new Error('invalid release intent attestation document');
+  }
+  const byCommit = new Map();
+  for (const entry of document.attestations) {
+    if (!entry || !/^[0-9a-f]{40}$/.test(entry.sha ?? '') ||
+        !RANK.has(entry.intent) || typeof entry.reason !== 'string' ||
+        !entry.reason.trim()) {
+      throw new Error('attestation requires a full 40-character SHA, valid intent and reason');
+    }
+    if (byCommit.has(entry.sha)) throw new Error(`duplicate attestation for ${entry.sha}`);
+    byCommit.set(entry.sha, entry);
+  }
+  return byCommit;
+}
+
+function commitIntent(root, commit, attestation) {
   const message = git(['show', '-s', '--format=%B', commit], { root });
   const mentions = message.match(RAW_MENTION) ?? [];
   const parsed = execFileSync('git', ['interpret-trailers', '--parse'], {
@@ -69,7 +87,11 @@ function commitIntent(root, commit) {
     return match ? [match[1].toLowerCase()] : [];
   });
 
+  if (attestation && (intents.length !== 0 || mentions.length === 0)) {
+    throw new Error(`${commit} attestation requires unreadable trailer evidence; readable or absent evidence cannot be overridden`);
+  }
   if (mentions.length !== intents.length) {
+    if (attestation) return attestation.intent;
     throw new Error(`${commit} has malformed or non-footer ${TRAILER_KEY} evidence`);
   }
   if (intents.length > 1) {
@@ -84,7 +106,9 @@ function commitIntent(root, commit) {
   return intent;
 }
 
-export function resolveReleaseIntent({ root = process.cwd(), baseRef, headRef = 'HEAD' }) {
+export function resolveReleaseIntent({ root = process.cwd(), baseRef, headRef = 'HEAD',
+  attestations = { schema: 'kin.release-intent-attestations.v1', attestations: [] } }) {
+  const byCommit = validateAttestations(attestations);
   const ancestor = spawnSync(
     'git',
     ['--no-replace-objects', 'merge-base', '--is-ancestor', baseRef, headRef],
@@ -105,9 +129,11 @@ export function resolveReleaseIntent({ root = process.cwd(), baseRef, headRef = 
   const evidence = [];
   let intent = 'patch';
   for (const commit of commits) {
-    const found = commitIntent(root, commit);
+    const attestation = byCommit.get(commit);
+    const found = commitIntent(root, commit, attestation);
     if (found === null) continue;
-    evidence.push({ commit, intent: found });
+    evidence.push({ commit, intent: found,
+      ...(attestation ? { source: 'attestation', reason: attestation.reason } : {}) });
     if (RANK.get(found) > RANK.get(intent)) intent = found;
   }
   return { baseRef, headRef, intent, evidence };
@@ -127,7 +153,10 @@ function main() {
   const baseRef = args.get('base-ref');
   const headRef = args.get('head-ref') ?? 'HEAD';
   if (!baseRef) throw new Error('--base-ref is required');
-  const result = resolveReleaseIntent({ baseRef, headRef });
+  const attestationPath = args.get('attestations');
+  const attestations = attestationPath
+    ? JSON.parse(fs.readFileSync(attestationPath, 'utf8')) : undefined;
+  const result = resolveReleaseIntent({ baseRef, headRef, attestations });
   emitOutputs(result);
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
