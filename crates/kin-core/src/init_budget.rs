@@ -87,9 +87,10 @@ const BYTES_PER_COMMIT: u64 = 700_000;
 /// those diffs produced, so the peak tracks this volume more closely than it
 /// tracks the commit count. Measured on the frontier walk across four
 /// repositories, resident bytes held at the whole-run peak per reachable blob
-/// byte: hiredis 55.5 (27,715,552 bytes of history, 1,538,834,432 held),
-/// requests 49.5 (112,476,293 against 5,568,004,096), kin 19.6 (1,400,991,245
-/// against 27,428,945,920), react 18.1 (2,187,539,173 against 39,584,645,120).
+/// byte reachable from HEAD: hiredis 57.91 (26,570,319 bytes of history,
+/// 1,538,834,432 held), requests 49.51 (112,474,615 against 5,568,004,096),
+/// kin 19.81 (1,384,861,259 against 27,428,945,920), react 18.0955
+/// (2,187,539,173 against 39,584,645,120).
 /// Eighteen is the floor of that spread, so a hiredis-shaped history can hold
 /// three times this forecast and react holds it almost exactly; the spread is
 /// what makes this a floor and not a prediction.
@@ -1228,9 +1229,9 @@ mod tests {
     /// completion in 1 h 47 min on a 128 GB host and was not killed, so its
     /// peak is a held figure like the other three.
     const MEASURED_HISTORIES: [(&str, u64, u64, u64, u64); 4] = [
-        ("hiredis", 1_141, 79, 27_715_552, 1_538_834_432),
-        ("requests", 6_493, 130, 112_476_293, 5_568_004_096),
-        ("kin", 2_924, 1_033, 1_400_991_245, 27_428_945_920),
+        ("hiredis", 1_141, 79, 26_570_319, 1_538_834_432),
+        ("requests", 6_493, 130, 112_474_615, 5_568_004_096),
+        ("kin", 2_924, 1_033, 1_384_861_259, 27_428_945_920),
         ("react", 21_679, 7_213, 2_187_539_173, 39_584_645_120),
     ];
 
@@ -1762,21 +1763,21 @@ mod tests {
                 "requests frontier walk",
                 6_493,
                 130,
-                112_476_293,
+                112_474_615,
                 5_568_004_096,
             ),
             (
                 "hiredis frontier walk",
                 1_141,
                 79,
-                27_715_552,
+                26_570_319,
                 1_538_834_432,
             ),
             (
                 "kin frontier walk",
                 2_924,
                 1_033,
-                1_400_991_245,
+                1_384_861_259,
                 27_428_945_920,
             ),
             // A normal clone of facebook/react at its September 2026 pin: the
