@@ -123,6 +123,40 @@ fn record_outside_root(
     }
 }
 
+/// An excluded control-file event proves delivery through this watcher's callback.
+struct DeliveryProbe {
+    relative_path: PathBuf,
+    acknowledged: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl DeliveryProbe {
+    fn observe(&mut self, event: &Event, roots: &RepositoryRoots) {
+        if !event.need_rescan()
+            && matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
+            && event
+                .paths
+                .iter()
+                .any(|path| roots.relative(path).as_ref() == Some(&self.relative_path))
+        {
+            if let Some(acknowledged) = self.acknowledged.take() {
+                let _ = acknowledged.send(());
+            }
+        }
+    }
+}
+
+struct OwnedProbeFile(PathBuf);
+
+impl Drop for OwnedProbeFile {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(path = %self.0.display(), %error, "could not remove watcher readiness probe");
+            }
+        }
+    }
+}
+
 /// File watcher that monitors a directory for source file changes.
 pub struct FileWatcher {
     _watcher: RecommendedWatcher,
@@ -137,6 +171,89 @@ impl FileWatcher {
     /// report Compose/config files, lockfiles, unsupported languages, binaries,
     /// and symlinks just as reliably as parser-backed source files.
     pub fn new(root: &Path) -> Result<Self> {
+        Self::new_with_delivery_probe(root, None)
+    }
+
+    /// Register the watcher and prove callback delivery before returning it.
+    /// The probe is excluded control IO, never repository source or graph truth.
+    /// Ordinary source events remain queued while the acknowledgment is pending.
+    pub async fn new_ready(root: &Path, bound: std::time::Duration) -> Result<Self> {
+        Self::new_ready_for_path(root, bound, None).await
+    }
+
+    async fn new_ready_for_path(
+        root: &Path,
+        bound: std::time::Duration,
+        expected_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|error| IndexError::Watcher(error.to_string()))?;
+        let control_dir = root.join(".kin");
+        let canonical_control = control_dir
+            .canonicalize()
+            .map_err(|error| IndexError::Watcher(error.to_string()))?;
+        if canonical_control == canonical_root || !canonical_control.starts_with(&canonical_root) {
+            return Err(IndexError::Watcher(
+                "watcher readiness control directory is outside the watched root".into(),
+            ));
+        }
+        let probe_name = format!("watcher-ready-{}", uuid::Uuid::new_v4());
+        let relative_path = canonical_control
+            .strip_prefix(&canonical_root)
+            .expect("the control directory is inside the watched root")
+            .join(&probe_name);
+        let probe_path = canonical_control.join(&probe_name);
+        let (acknowledged, received) = tokio::sync::oneshot::channel();
+        let probe = Arc::new(Mutex::new(DeliveryProbe {
+            relative_path: expected_path.unwrap_or(relative_path),
+            acknowledged: Some(acknowledged),
+        }));
+        let watcher = Self::new_with_delivery_probe(root, Some(probe))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+            .map_err(|error| {
+                IndexError::Watcher(format!("could not create watcher readiness probe: {error}"))
+            })?;
+        let _owned_probe = OwnedProbeFile(probe_path);
+        std::io::Write::write_all(&mut file, b"watcher readiness\n").map_err(|error| {
+            IndexError::Watcher(format!("could not write watcher readiness probe: {error}"))
+        })?;
+        let mut received = received;
+        let observed = async {
+            // Registration can precede backend delivery. Retry only this private
+            // probe; repository source is never rewritten to manufacture readiness.
+            let mut retry = tokio::time::interval(std::time::Duration::from_millis(100));
+            retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            retry.tick().await;
+            let mut sequence = 0_u64;
+            loop {
+                tokio::select! {
+                    acknowledgment = &mut received => {
+                        return acknowledgment.map_err(|_| IndexError::Watcher(
+                            "watcher readiness callback closed before acknowledgment".into()));
+                    }
+                    _ = retry.tick() => {
+                        sequence = sequence.wrapping_add(1);
+                        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))
+                            .and_then(|_| std::io::Write::write_all(&mut file, &sequence.to_le_bytes()))
+                            .map_err(|error| IndexError::Watcher(format!("could not retry watcher readiness probe: {error}")))?;
+                    }
+                }
+            }
+        };
+        match tokio::time::timeout(bound, observed).await {
+            Ok(result) => result.map(|()| watcher),
+            Err(_) => Err(IndexError::Watcher("watcher did not acknowledge its readiness probe; filesystem edits are not known to be observed".into())),
+        }
+    }
+
+    fn new_with_delivery_probe(
+        root: &Path,
+        delivery_probe: Option<Arc<Mutex<DeliveryProbe>>>,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let root = root.to_path_buf();
         // Resolved once here rather than per event. The root does not move
@@ -150,7 +267,14 @@ impl FileWatcher {
         let mut watcher =
             notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
                 match res {
-                    Ok(event) => {
+                    Ok(mut event) => {
+                        if let Some(probe) = &delivery_probe {
+                            let mut probe = probe.lock().unwrap_or_else(PoisonError::into_inner);
+                            probe.observe(&event, &event_roots);
+                            event.paths.retain(|path| {
+                                event_roots.relative(path).as_ref() != Some(&probe.relative_path)
+                            });
+                        }
                         let events = classify_event(&event, &event_roots, &event_outside_root);
                         for fe in events {
                             if tx.send(fe).is_err() {
@@ -434,6 +558,113 @@ mod tests {
             Some(outside_path),
             "the drop names the path it dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_the_exact_control_callback() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".kin")).unwrap();
+        let result = FileWatcher::new_ready_for_path(
+            repo.path(),
+            std::time::Duration::from_millis(100),
+            Some(PathBuf::from(".kin/control-that-was-never-written")),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(IndexError::Watcher(ref message)) if message.contains("did not acknowledge")),
+            "unrelated callbacks must not make the watcher ready"
+        );
+        assert_eq!(
+            std::fs::read_dir(repo.path().join(".kin")).unwrap().count(),
+            0,
+            "a failed readiness attempt cleans only its owned probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_pending_readiness_removes_its_probe() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".kin")).unwrap();
+        let root = repo.path().to_path_buf();
+        let pending = tokio::spawn(async move {
+            FileWatcher::new_ready_for_path(
+                &root,
+                std::time::Duration::from_secs(60),
+                Some(PathBuf::from(".kin/never-written")),
+            )
+            .await
+            .map(|_| ())
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while std::fs::read_dir(repo.path().join(".kin")).unwrap().count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the pending watcher must own a probe before cancellation");
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            std::fs::read_dir(repo.path().join(".kin")).unwrap().count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_delivery_observes_one_immediate_edit_and_excludes_the_probe() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".kin")).unwrap();
+        let source = repo.path().join("tracked.rs");
+        std::fs::write(&source, "pub fn old() {}\n").unwrap();
+        let watcher = FileWatcher::new_ready(repo.path(), std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(repo.path().join(".kin")).unwrap().count(),
+            0
+        );
+        assert!(watcher.drain().iter().all(|event| matches!(event, FileEvent::Changed(path) | FileEvent::Removed(path) if !path.components().any(|part| part.as_os_str() == ".kin"))));
+        std::fs::write(&source, "pub fn changed() {}\n").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if watcher.drain().iter().any(|event| matches!(event, FileEvent::Changed(path) if path.file_name() == source.file_name())) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("one write after readiness must reach the callback queue");
+    }
+
+    #[test]
+    fn readiness_ignores_unrelated_and_rescan_events_and_preserves_source_paths() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".kin")).unwrap();
+        let relative = PathBuf::from(".kin/probe");
+        let source = repo.path().join("source.rs");
+        std::fs::write(&source, "pub fn source() {}\n").unwrap();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut probe = DeliveryProbe {
+            relative_path: relative.clone(),
+            acknowledged: Some(tx),
+        };
+        let roots = RepositoryRoots::bind(repo.path());
+        probe.observe(&content_change(vec![source.clone()]), &roots);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let mut rescan = content_change(vec![repo.path().join(&relative)]);
+        rescan.attrs.set_flag(notify::event::Flag::Rescan);
+        probe.observe(&rescan, &roots);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let mixed = content_change(vec![repo.path().join(&relative), source.clone()]);
+        probe.observe(&mixed, &roots);
+        assert_eq!(rx.try_recv(), Ok(()));
+        let events = classify_event(&mixed, &roots, &Mutex::new(EventsOutsideRoot::default()));
+        assert!(matches!(events.as_slice(), [FileEvent::Changed(path)] if path == &source));
     }
 
     /// A repository reached through a symlink must report writes through it.
