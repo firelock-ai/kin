@@ -61,6 +61,18 @@ const BIND_PHASE: &str = "kin.init.bind_historical_semantics";
 /// 0 bytes clean, and one whole history under the mutant.
 const BIND_PEAK_GROWTH_DIVISOR: usize = 4;
 
+/// Share of one materialized history a streaming phase may still be holding
+/// when it ends.
+///
+/// Named rather than written inline at each assertion, because the acceptance
+/// suite grades the ceiling this guard PRINTS. A number that appears twice is a
+/// number that can disagree with itself, and the disagreement would be a suite
+/// grading a ceiling this guard no longer uses.
+const RETENTION_DIVISOR: usize = 4;
+
+/// Share of one materialized history the bootstrap build may add to the peak.
+const BUILD_PEAK_GROWTH_DIVISOR: usize = 2;
+
 /// Consuming the disk-backed plan need not produce a measurable heap drop.
 const RELEASE_PHASE: &str = "kin.init.release_plan_bodies";
 
@@ -210,14 +222,27 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
     );
     println!("{phase_table}");
     println!("explicit history materialization retained {materialized_history_bytes} bytes");
+    // One line per graded assertion, each carrying the ceiling it is graded
+    // against. `scripts/acceptance/init_memory_repro.py` parses these lines and
+    // grades what this guard prints rather than ceilings of its own, so a
+    // ceiling moved here moves there with no second edit and nothing to drift.
+    // The lines are also what an operator reads when a run goes red, which is
+    // why each names its phase rather than its position.
+    let bind_growth_ceiling = materialized_history_bytes / BIND_PEAK_GROWTH_DIVISOR;
+    let build_growth_ceiling = materialized_history_bytes / BUILD_PEAK_GROWTH_DIVISOR;
+    let retention_ceiling = materialized_history_bytes / RETENTION_DIVISOR;
     println!(
-        "{PROOF_PHASE} peak growth: {proof_growth} bytes; \
-         {BUILD_PHASE} peak growth: {build_growth} bytes; \
-         {BIND_PHASE} peak growth: {bind_growth} bytes"
+        "{PROOF_PHASE} peak growth: {proof_growth} bytes, ceiling \
+         {PROOF_PEAK_GROWTH_CEILING} bytes"
+    );
+    println!("{BIND_PHASE} peak growth: {bind_growth} bytes, ceiling {bind_growth_ceiling} bytes");
+    println!(
+        "{BUILD_PHASE} peak growth: {build_growth} bytes, ceiling {build_growth_ceiling} bytes"
     );
     println!(
         "retained bytes: {BIND_PHASE}={bind_retained}, \
-         {ADMIT_PHASE}={admit_retained}, {SUMMARY_PHASE}={summary_retained}"
+         {ADMIT_PHASE}={admit_retained}, {SUMMARY_PHASE}={summary_retained}, \
+         ceiling {retention_ceiling} bytes"
     );
 
     assert!(
@@ -231,14 +256,14 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
         (SUMMARY_PHASE, summary_retained),
     ] {
         assert!(
-            retained < materialized_history_bytes / 4,
+            retained < retention_ceiling,
             "{name} retained {retained} bytes, at or over one quarter of the \
              {materialized_history_bytes} bytes retained by explicit history materialization. \
              The phase must stream history with bounded residency.\n\n{phase_table}"
         );
     }
     assert!(
-        bind_growth < materialized_history_bytes / BIND_PEAK_GROWTH_DIVISOR,
+        bind_growth < bind_growth_ceiling,
         "{BIND_PHASE} added {bind_growth} bytes to the peak, at or over one quarter of the \
          {materialized_history_bytes} bytes retained by explicit history materialization. That \
          phase derives one set of deltas per commit and hands each straight to the spool, so \
@@ -248,7 +273,7 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
          this history is far under the total backstop.\n\n{phase_table}"
     );
     assert!(
-        build_growth < materialized_history_bytes / 2,
+        build_growth < build_growth_ceiling,
         "{BUILD_PHASE} added {build_growth} bytes to the peak, at or over one half of the \
          {materialized_history_bytes} bytes retained by explicit history materialization. \
          Bootstrap construction must avoid whole-history materialization.\n\n{phase_table}"
