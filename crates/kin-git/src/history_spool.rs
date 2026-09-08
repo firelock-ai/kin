@@ -381,13 +381,30 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn spool_refuses_missing_truncated_tampered_and_appended_bodies() {
-        for mode in 0..4 {
+    fn spool_refuses_removed_path() {
+        let spool = SemanticChangeSpool::from_changes(spool_dir(), [change(1)]).unwrap();
+        std::fs::remove_file(spool.0.file.path()).unwrap();
+        assert!(spool.read_at(0).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spool_reads_authenticated_handle_after_path_removal() {
+        let original = change(1);
+        let spool = SemanticChangeSpool::from_changes(spool_dir(), [original.clone()]).unwrap();
+        std::fs::remove_file(spool.0.file.path()).unwrap();
+        assert_eq!(spool.read_at(0).unwrap(), Some(original));
+        spool.0.file.as_file().set_len(1).unwrap();
+        assert!(spool.read_at(0).is_err());
+    }
+
+    #[test]
+    fn spool_refuses_truncated_tampered_and_appended_bodies() {
+        for mode in 1..4 {
             let spool = SemanticChangeSpool::from_changes(spool_dir(), [change(1)]).unwrap();
-            let path = spool.0.file.path();
             match mode {
-                0 => std::fs::remove_file(path).unwrap(),
                 1 => spool.0.file.as_file().set_len(1).unwrap(),
                 2 => {
                     let mut file = spool.0.file.reopen().unwrap();

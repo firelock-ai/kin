@@ -1,0 +1,25 @@
+{
+  "schema": "kin.release-intent-attestations.v1",
+  "attestations": [
+    {
+      "sha": "bffd6adda2eb46a37d0481a8b1aba8ef8759ce54",
+      "intent": "patch",
+      "reason": "FIR-3412: The immutable squash commit records Kin-Release-Intent: patch in its Landing section before a divider. Git parses only Signed-off-by as the footer. Attest that explicit patch intent without changing history or inferring intent from prose."
+    },
+    {
+      "sha": "72414aa80531e7adee1ab360eacb28d56a621c6a",
+      "intent": "patch",
+      "reason": "FIR-3412: This immutable squash commit explicitly records Kin-Release-Intent: patch before the footer divider. Git parses only Signed-off-by. Attest the recorded patch intent so resolution can traverse the complete release range without guessing or editing history."
+    },
+    {
+      "sha": "9e45cc6c89b12c72e519c86517ac38a8a79a7cea",
+      "intent": "patch",
+      "reason": "FIR-3412: This immutable squash commit explicitly records Kin-Release-Intent: patch before the footer divider. Git parses only Signed-off-by. Attest the recorded patch intent so resolution can traverse the complete release range without guessing or editing history."
+    },
+    {
+      "sha": "c67efaa2c737ab0b7ac15d0057c8a3ec5a8041cc",
+      "intent": "patch",
+      "reason": "FIR-3412: This immutable squash commit explicitly records Kin-Release-Intent: patch before the footer divider. Git parses only Signed-off-by. Attest the recorded patch intent so resolution can traverse the complete release range without guessing or editing history."
+    }
+  ]
+}
