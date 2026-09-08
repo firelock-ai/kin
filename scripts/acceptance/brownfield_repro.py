@@ -1223,6 +1223,15 @@ def complete_trace_clips(suite, repo, payload, steps):
     The original trace remains the assertion surface. A neighborhood can prove
     its omitted candidates harmless, but a forbidden raw edge needs a focused
     trace before it can establish a counted-flow failure.
+
+    Returns (confirmations, receipts, witnessed). `witnessed` is every
+    destination name the witnesses enumerated, and the caller must search it
+    beside the walk. A witness that answers only the forbidden-callee question
+    cannot license a verdict on an absent required one: the rows the cap dropped
+    are inside that same neighborhood, so a required edge among them reads as
+    absent from the walk while the graph carries it. That is the exact
+    distinction FIR-2593's allowance says this check cannot make, and returning
+    the names is what lets it.
     """
     if (budget_cut(payload) or (payload.get("_kin") or {}).get("response", {}).get("bounded")
             or payload.get("steps_omitted")
@@ -1230,10 +1239,10 @@ def complete_trace_clips(suite, repo, payload, steps):
         raise ProbeError("trace output or total-step budget lost rows")
     clips = payload.get("clipped_steps") or []
     if not payload.get("truncated") and not clips:
-        return [], []
+        return [], [], []
     if not clips:
         raise ProbeError("truncated trace has no bounded fanout disclosure")
-    confirmations, receipts = [], []
+    confirmations, receipts, witnessed = [], [], []
     for clip in clips:
         index = clip.get("step")
         if (not isinstance(index, int) or index <= 0 or index > len(steps)
@@ -1277,9 +1286,14 @@ def complete_trace_clips(suite, repo, payload, steps):
             if relation.get("kind") not in ("Calls", "Imports", "References", "UsesType"):
                 continue
             eligible.add(dst)
+            name = by_id[dst]["name"]
+            # Recorded before the name_only skip below, because the walk's own
+            # all_names carries name_only steps too. The positive assertions ask
+            # whether Kin surfaced an edge at all, not whether it counted it, so
+            # the witness has to answer on the same terms the walk does.
+            witnessed.append(name)
             if relation["resolution"] == "name_only":
                 continue
-            name = by_id[dst]["name"]
             if not any(name_matches(name, bad) for bad in APP_HANDLE_FABRICATED):
                 continue
             focused = suite.cached(repo, "trace_data_flow",
@@ -1304,7 +1318,7 @@ def complete_trace_clips(suite, repo, payload, steps):
         receipts.append("%s: complete depth=1/out/limit=50/max_chars=60000 witness, %d entities, "
                         "%d relations, %d trace-eligible destinations"
                         % (focal, len(entities), len(relations), len(eligible)))
-    return confirmations, receipts
+    return confirmations, receipts, witnessed
 
 
 def check_4(suite):
@@ -1348,8 +1362,9 @@ def check_4(suite):
         return res
     complete = True
     confirmed = []
+    witnessed = []
     try:
-        confirmed, receipts = complete_trace_clips(suite, repo, payload, steps)
+        confirmed, receipts, witnessed = complete_trace_clips(suite, repo, payload, steps)
         for receipt in receipts:
             res.ok(receipt)
     except ProbeError as exc:
@@ -1422,20 +1437,40 @@ def check_4(suite):
     else:
         res.ok("no fabricated callee is counted (%d of %d steps counted)"
                % (len(counted), len(steps)))
+    # The walk is the assertion surface, and the witnesses extend it rather than
+    # replace it. A clip drops rows out of the walk and the witness re-supplies
+    # exactly those rows, so an absence read over the walk ALONE while a witness
+    # licensed the verdict is an absence nobody looked for. Searching both is
+    # what earns the FAIL: the required edge is then absent from the walk and
+    # from the complete neighborhood the cap dropped it into.
+    surfaced = all_names + witnessed
+
+    def surfaced_by(wanted):
+        """Where a required name was found, or None. The walk answers first."""
+        if any(name_matches(n, wanted) for n in all_names):
+            return "the walk"
+        if any(name_matches(n, wanted) for n in witnessed):
+            return "the clip's complete witness, which the walk dropped"
+        return None
+
     missing_real = [want for want in APP_HANDLE_REAL_CALLEES
-                    if not any(name_matches(n, want) for n in all_names)]
+                    if surfaced_by(want) is None]
     if missing_real:
-        (res.bad if complete else res.unknown)("the real callees %s are absent from the walk; steps are %s"
-                % (", ".join(missing_real), all_names[:12]))
+        (res.bad if complete else res.unknown)(
+            "the real callees %s are absent from the walk and from every witness; "
+            "steps are %s" % (", ".join(missing_real), all_names[:12]))
     else:
         res.ok("both real callees %s are present"
                % ", ".join(APP_HANDLE_REAL_CALLEES))
-    if any(name_matches(n, APP_HANDLE_MISSING_CALLEE) for n in all_names):
-        res.ok("the hand-off %s is in the walk" % APP_HANDLE_MISSING_CALLEE)
+    found_in = surfaced_by(APP_HANDLE_MISSING_CALLEE)
+    if found_in:
+        res.ok("the hand-off %s is in %s" % (APP_HANDLE_MISSING_CALLEE, found_in))
     else:
-        (res.bad if complete else res.unknown)("the hand-off this.router.handle at %s:177, the last line of "
-                "app.handle and the edge the question is about, is absent from the "
-                "walk; steps are %s" % (APP_HANDLE_FILE, all_names[:12]))
+        (res.bad if complete else res.unknown)(
+            "the hand-off this.router.handle at %s:177, the last line of "
+            "app.handle and the edge the question is about, is absent from the "
+            "walk and from the %d witnessed destination(s) the clips dropped; "
+            "steps are %s" % (APP_HANDLE_FILE, len(witnessed), all_names[:12]))
     return res
 
 
