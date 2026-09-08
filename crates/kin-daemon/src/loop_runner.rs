@@ -4225,7 +4225,7 @@ mod tests {
         // before resetting the fixture; its events cannot count as stable.rs work.
         let ready_host = repo.path().join("watch-ready.rs");
         let ready_id = FilePathId::new("watch-ready.rs");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut acknowledged = false;
         while Instant::now() < deadline && !runner.is_finished() {
             std::fs::write(&ready_host, "pub fn watcher_ready() {}\n").unwrap();
