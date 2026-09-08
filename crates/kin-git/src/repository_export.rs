@@ -610,10 +610,8 @@ where
             )));
         }
     }
-    let historical_deltas = rebuilt
-        .changes
-        .iter()
-        .map(|base_change| {
+    let rebuilt =
+        rebuilt.enrich_with_historical_semantics(&proof_store, &mut |base_change, _tree| {
             let ChangeOrigin::GitCommit { oid } = base_change.origin else {
                 unreachable!("the exact Git planner only emits Git-origin changes");
             };
@@ -622,27 +620,26 @@ where
                     "Git export omits imported semantic history for commit {oid}"
                 ))
             })?;
-            Ok(HistoricalSemanticBinding::borrowed(
+            Ok(HistoricalSemanticBinding::owned(
                 base_change.id,
-                &supplied.entity_deltas,
-                &supplied.relation_deltas,
+                supplied.entity_deltas.clone(),
+                supplied.relation_deltas.clone(),
             ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let rebuilt = rebuilt.with_historical_semantics(&proof_store, historical_deltas)?;
+        })?;
     let rebuilt = admit_semantic_git_import(&rebuilt, &proof_store)?;
-    let expected_changes = rebuilt
-        .changes
-        .into_iter()
-        .map(|change| (change.id, change))
-        .collect::<BTreeMap<_, _>>();
     let supplied_changes = plan
         .changes
         .iter()
         .filter(|change| matches!(change.origin, ChangeOrigin::GitCommit { .. }))
-        .cloned()
         .map(|change| (change.id, change))
         .collect::<BTreeMap<_, _>>();
+    let mut changes_match = supplied_changes.len() == rebuilt.changes.len();
+    for expected in rebuilt.changes.iter() {
+        let expected = expected?;
+        if supplied_changes.get(&expected.id).copied() != Some(&expected) {
+            changes_match = false;
+        }
+    }
     let expected_aliases = rebuilt
         .aliases
         .into_iter()
@@ -654,7 +651,7 @@ where
         .cloned()
         .map(|alias| (alias.oid, alias))
         .collect::<BTreeMap<_, _>>();
-    if supplied_changes != expected_changes || supplied_aliases != expected_aliases {
+    if !changes_match || supplied_aliases != expected_aliases {
         return Err(GitError::InvalidSnapshot(
             "imported semantic history does not rebuild exactly from stored Git authority"
                 .to_string(),
@@ -1170,7 +1167,11 @@ mod tests {
         )
         .unwrap();
         let authority = build_git_external_authority(&snapshot, &store).unwrap();
-        let imported_change = imported.changes.last().unwrap().clone();
+        let imported_change = imported
+            .changes
+            .read_at(imported.changes.len() - 1)
+            .unwrap()
+            .unwrap();
         let commit_trees = crate::semantic_import::derive_commit_trees(&snapshot, &store).unwrap();
         let base_tree = commit_trees
             .get(&match imported_change.origin {
@@ -1272,7 +1273,7 @@ mod tests {
             changes: imported
                 .changes
                 .iter()
-                .cloned()
+                .map(Result::unwrap)
                 .chain(std::iter::once(native.clone()))
                 .collect(),
             aliases: imported.aliases.clone(),
@@ -1406,7 +1407,7 @@ mod tests {
             "unexpected export proof error: {error}"
         );
 
-        let mut tampered_change = imported.changes[0].clone();
+        let mut tampered_change = imported.changes.read_at(0).unwrap().unwrap();
         tampered_change.message.push_str(" but not from raw Git");
         tampered_change.id = compute_semantic_change_id(&tampered_change).unwrap();
         let mut tampered_alias = imported.aliases[0].clone();

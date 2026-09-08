@@ -1101,6 +1101,18 @@
       "expiration": "2027-02-26"
     },
     {
+      "file": "crates/kin-git/src/history_spool.rs",
+      "reason": "Temporary Git ingestion storage, not a semantic answer path. The import owns this temporary file and appends only captured semantic change records. Each read checks the exact file length, record checksum and identity before admission. These single-occurrence pins cover the temporary-file type, its construction in the directory the caller owns, and the length probe only; they permit no repository walk, raw-file search or answer fallback. The construction pin moved from NamedTempFile::new() to tempfile_in on 2026-09-08: the default temporary directory is tmpfs on most Linux hosts, which put the spooled history back in RAM and defeated the whole point of spooling it, so the caller now names the directory.",
+      "owner": "kin-git",
+      "expiration": "2027-03-31",
+      "allow_match": [
+        "use tempfile::NamedTempFile;",
+        "file: NamedTempFile,",
+        ".tempfile_in(directory)",
+        ".metadata()"
+      ]
+    },
+    {
       "file": "crates/kin-git/src/lossless.rs",
       "reason": "The lossless Git migration boundary, per the module's own doc: it preserves Git as an exact external format without making it an authority path inside Kin. Capturing a Git repository from disk is the entire point of an import boundary. Migrated from BOUNDARY_DIRS on 2026-09-03, where this path carried no owner, no expiry and no reason field. Whole-file preserves exactly the scope it already had rather than re-arguing it; narrowing to expression pins is the follow-up, and the expiry is when that has to happen or the exemption has to be defended again.",
       "owner": "kin-git",

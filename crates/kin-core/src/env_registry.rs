@@ -231,6 +231,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_DAEMON_STARTUP_LOCK_TIMEOUT_SECS", kind: Kind::Secs, default: "", sensitivity: Sensitivity::Operational, summary: "how long to wait for the daemon startup lock" },
     EnvVarSpec { name: "KIN_DAEMON_BOOTSTRAP_TIMEOUT_SECS", kind: Kind::Secs, default: "", sensitivity: Sensitivity::Operational, summary: "timeout for daemon bootstrap-as-admin" },
     EnvVarSpec { name: "KIN_DAEMON_SCOPE_BUILD_TIMEOUT_SECS", kind: Kind::Secs, default: "", sensitivity: Sensitivity::Operational, summary: "timeout for a daemon-side scope graph build" },
+    EnvVarSpec { name: "KIN_DAEMON_HOSTED_HYDRATION_TIMEOUT_SECS", kind: Kind::Secs, default: "300", sensitivity: Sensitivity::Operational, summary: "budget for one cold hosted-repository hydration before its admission slot is reclaimed" },
     EnvVarSpec { name: "KIN_DAEMON_IDLE_FLUSH_SECS", kind: Kind::Secs, default: "2", sensitivity: Sensitivity::Operational, summary: "idle debounce before a full-graph persistence flush" },
     EnvVarSpec { name: "KIN_DAEMON_PERIODIC_FLUSH_SECS", kind: Kind::Secs, default: "30", sensitivity: Sensitivity::Operational, summary: "maximum interval before dirty graph state is flushed" },
     EnvVarSpec { name: "KIN_DAEMON_SHUTDOWN_GRACE_SECS", kind: Kind::Secs, default: "25", sensitivity: Sensitivity::Operational, summary: "grace before the shutdown watchdog force-exits; 0 escalates immediately" },

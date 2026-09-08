@@ -165,10 +165,12 @@ impl FileWatcher {
             })
             .map_err(|e| IndexError::Watcher(e.to_string()))?;
 
-        // Registered on the root as it was given. The backend resolves it or
-        // does not, and either way both forms are already held.
+        // FSEvents does not reliably deliver events when its registration path
+        // is a symlink. Register the resolved directory while retaining both
+        // spellings above for backends that report either form.
+        let watch_root = root.canonicalize().unwrap_or_else(|_| root.clone());
         watcher
-            .watch(&root, RecursiveMode::Recursive)
+            .watch(&watch_root, RecursiveMode::Recursive)
             .map_err(|e| IndexError::Watcher(e.to_string()))?;
 
         info!(root = %root.display(), "started file watcher");
@@ -434,8 +436,7 @@ mod tests {
         );
     }
 
-    /// FIR-2442, end to end through a real backend. A repository reached through
-    /// a symlink must report the writes made through it.
+    /// A repository reached through a symlink must report writes through it.
     #[cfg(unix)]
     #[test]
     fn a_watcher_bound_through_a_symlinked_root_reports_writes_through_it() {
@@ -446,27 +447,39 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let watcher = FileWatcher::new(&link).unwrap();
-        // The backend registers its watch asynchronously, so a write racing
-        // registration would prove nothing either way.
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        let ready_path = link.join("watch-ready.rs");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            std::fs::write(&ready_path, "// readiness probe\n").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            while let Some(event) = watcher.try_recv() {
+                if matches!(event, FileEvent::Changed(ref path) if path.file_name() == ready_path.file_name())
+                {
+                    ready = true;
+                }
+            }
+            if ready {
+                break;
+            }
+        }
+        assert!(ready, "watch backend never acknowledged a readiness probe");
         std::fs::write(link.join("added.rs"), "pub fn added() {}").unwrap();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut seen = Vec::new();
-        while std::time::Instant::now() < deadline && seen.is_empty() {
-            if let Some(event) = watcher.try_recv() {
-                seen.push(event);
+        let mut seen = false;
+        while std::time::Instant::now() < deadline && !seen {
+            // Drain each batch so delayed readiness events cannot keep the
+            // target write behind a fixed one-event-per-sleep backlog.
+            while let Some(event) = watcher.try_recv() {
+                seen |= matches!(event, FileEvent::Changed(ref path) if path == &link.join("added.rs") || path == &real.canonicalize().unwrap().join("added.rs"));
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
         assert!(
-            !seen.is_empty(),
-            "a write through the symlinked root {} produced no event in 30s; the watcher \
-             placed {} event(s) outside the root it is bound to (most recent {:?})",
-            link.display(),
-            watcher.events_outside_root().count,
-            watcher.events_outside_root().last_path,
+            seen,
+            "the ready backend did not report the exact added.rs write"
         );
         assert_eq!(
             watcher.events_outside_root().count,

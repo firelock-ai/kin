@@ -44,13 +44,14 @@ use crate::session_registry::SessionCoordinator;
 /// Repository-v6 snapshots intentionally leave their top-level graph domains
 /// empty. `ChangeStore::resolve_graph_at` needs only `get_change`, so borrowing
 /// the admitted change map avoids cloning the payload-heavy history into a
-/// throwaway graph before every hosted load.
+/// throwaway graph before every hosted load. Individual fallible reads preserve
+/// the map's lazy decoding instead of materializing the entire history.
 ///
 /// `pub(crate)` for the second caller with that same shape: the native commit
 /// planner resolves its baseline at the parent change and reads nothing else
 /// from the graph it was building for it (`commit_deltas.rs`).
 pub(crate) struct HostedAuthorityHistory<'a> {
-    pub(crate) changes: &'a HashMap<SemanticChangeId, SemanticChange>,
+    pub(crate) changes: &'a kin_db::storage::ChangeMap,
 }
 
 impl HostedAuthorityHistory<'_> {
@@ -68,7 +69,7 @@ impl ChangeStore for HostedAuthorityHistory<'_> {
         &self,
         id: &SemanticChangeId,
     ) -> std::result::Result<Option<SemanticChange>, Self::Error> {
-        Ok(self.changes.get(id).cloned())
+        self.changes.read_change(id)
     }
 
     fn get_entity_history(

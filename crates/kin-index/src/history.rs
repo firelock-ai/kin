@@ -171,9 +171,24 @@ impl HistoricalSemanticFold {
     /// taken from the whole history, which is why the fold has to see it
     /// before it enriches anything.
     pub fn new(changes: &[SemanticChange]) -> Result<Self> {
-        let mut pending = HashSet::with_capacity(changes.len());
+        Self::from_change_stream(changes.iter().map(Ok::<_, std::convert::Infallible>))
+    }
+
+    /// Inspect complete history one record at a time, retaining only identity
+    /// and parent-use metadata needed by the subsequent semantic fold.
+    pub fn from_change_stream<C, E>(
+        changes: impl IntoIterator<Item = std::result::Result<C, E>>,
+    ) -> Result<Self>
+    where
+        C: std::borrow::Borrow<SemanticChange>,
+        E: std::fmt::Display,
+    {
+        let mut pending = HashSet::new();
         let mut remaining_child_uses = BTreeMap::<SemanticChangeId, usize>::new();
         for change in changes {
+            let change =
+                change.map_err(|error| invalid(format!("read historical change: {error}")))?;
+            let change = change.borrow();
             if !matches!(change.origin, ChangeOrigin::GitCommit { .. }) {
                 return Err(invalid(format!(
                     "historical Git enrichment received native change {}",
@@ -936,8 +951,13 @@ mod tests {
         let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
         let trees = trees_by_change(&plan, &snapshot, &blob_store);
 
-        let first = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
-        let second = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
+        let changes = plan
+            .changes
+            .iter()
+            .collect::<kin_git::Result<Vec<_>>>()
+            .unwrap();
+        let first = derive_historical_semantic_deltas(&changes, &trees, &blob_store).unwrap();
+        let second = derive_historical_semantic_deltas(&changes, &trees, &blob_store).unwrap();
         assert_eq!(second, first);
         assert_eq!(first.len(), 2);
 
@@ -960,13 +980,13 @@ mod tests {
         admitted.validate(&blob_store).unwrap();
         assert_ne!(enriched.aliases, plan.aliases);
         assert_eq!(
-            enriched.changes[1].parents,
-            vec![enriched.changes[0].id],
+            enriched.changes.read_at(1).unwrap().unwrap().parents,
+            vec![enriched.changes.read_at(0).unwrap().unwrap().id],
             "semantic binding must reidentify parent edges"
         );
         assert_eq!(
-            admitted.changes[0].entity_deltas,
-            enriched.changes[0].entity_deltas
+            admitted.changes.read_at(0).unwrap().unwrap().entity_deltas,
+            enriched.changes.read_at(0).unwrap().unwrap().entity_deltas
         );
 
         let initial_entities = first[0]
@@ -1003,7 +1023,7 @@ mod tests {
         assert_eq!(modified_answer.0.id, initial_answer.id);
         assert_eq!(modified_answer.1.id, initial_answer.id);
 
-        let tip = trees.get(&plan.changes[1].id).unwrap();
+        let tip = trees.get(&changes[1].id).unwrap();
         assert!(tip
             .artifact_at_path(&kin_model::RepoPath::from_utf8("compose.yaml").unwrap())
             .is_some());
@@ -1055,7 +1075,12 @@ mod tests {
         .unwrap();
         let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
         let trees = trees_by_change(&plan, &snapshot, &blob_store);
-        let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
+        let changes = plan
+            .changes
+            .iter()
+            .collect::<kin_git::Result<Vec<_>>>()
+            .unwrap();
+        let deltas = derive_historical_semantic_deltas(&changes, &trees, &blob_store).unwrap();
 
         let feature_id = deltas
             .iter()
@@ -1067,7 +1092,7 @@ mod tests {
         let merge_index = plan
             .changes
             .iter()
-            .position(|change| change.parents.len() == 2)
+            .position(|change| change.unwrap().parents.len() == 2)
             .unwrap();
         let merged_feature = deltas[merge_index]
             .entity_deltas
@@ -1146,7 +1171,12 @@ mod tests {
         .unwrap();
         let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
         let trees = trees_by_change(&plan, &snapshot, &blob_store);
-        let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
+        let changes = plan
+            .changes
+            .iter()
+            .collect::<kin_git::Result<Vec<_>>>()
+            .unwrap();
+        let deltas = derive_historical_semantic_deltas(&changes, &trees, &blob_store).unwrap();
 
         let bindings = deltas
             .iter()
@@ -1164,15 +1194,18 @@ mod tests {
         enriched.validate(&blob_store).unwrap();
         let admitted = admit_semantic_git_import(&enriched, &blob_store).unwrap();
 
-        let entity_ids = admitted
+        let admitted_changes = admitted
             .changes
+            .iter()
+            .collect::<kin_git::Result<Vec<_>>>()
+            .unwrap();
+        let entity_ids = admitted_changes
             .iter()
             .flat_map(|change| &change.entity_deltas)
             .filter_map(EntityDelta::new_state)
             .map(|entity| entity.id)
             .collect::<HashSet<_>>();
-        let bound_relations = admitted
-            .changes
+        let bound_relations = admitted_changes
             .iter()
             .flat_map(|change| &change.relation_deltas)
             .filter_map(RelationDelta::new_state)
@@ -1188,8 +1221,7 @@ mod tests {
             .find(|relation| is_external_import_placeholder(relation))
             .expect("the cross-repo reference must survive admission as change-owned truth");
         let target = external.dst.as_entity().and_then(|id| {
-            admitted
-                .changes
+            admitted_changes
                 .iter()
                 .flat_map(|change| &change.entity_deltas)
                 .filter_map(EntityDelta::new_state)
@@ -1215,16 +1247,14 @@ mod tests {
         }
 
         let graph = kin_db::InMemoryGraph::new();
-        for change in &admitted.changes {
+        for change in &admitted_changes {
             graph.create_change(change).unwrap();
         }
-        let head = admitted
-            .changes
+        let head = admitted_changes
             .iter()
             .map(|change| change.id)
             .find(|candidate| {
-                !admitted
-                    .changes
+                !admitted_changes
                     .iter()
                     .any(|change| change.parents.contains(candidate))
             })
@@ -1308,7 +1338,12 @@ mod tests {
         .unwrap();
         let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
         let trees = trees_by_change(&plan, &snapshot, &blob_store);
-        let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
+        let changes = plan
+            .changes
+            .iter()
+            .collect::<kin_git::Result<Vec<_>>>()
+            .unwrap();
+        let deltas = derive_historical_semantic_deltas(&changes, &trees, &blob_store).unwrap();
 
         let tip = deltas
             .last()
@@ -1375,7 +1410,12 @@ mod tests {
         .unwrap();
         let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
         let trees = trees_by_change(&plan, &snapshot, &blob_store);
-        let reversed = plan.changes.iter().cloned().rev().collect::<Vec<_>>();
+        let mut reversed = plan
+            .changes
+            .iter()
+            .collect::<kin_git::Result<Vec<_>>>()
+            .unwrap();
+        reversed.reverse();
 
         let error = derive_historical_semantic_deltas(&reversed, &trees, &blob_store).unwrap_err();
         assert!(
@@ -1433,7 +1473,12 @@ mod tests {
             "src/sessions.py",
             b"def unrelated_checkout():\n    pass\n",
         );
-        let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
+        let changes = plan
+            .changes
+            .iter()
+            .collect::<kin_git::Result<Vec<_>>>()
+            .unwrap();
+        let deltas = derive_historical_semantic_deltas(&changes, &trees, &blob_store).unwrap();
         assert_eq!(deltas.len(), 3);
         let mut entities = BTreeMap::new();
         for delta in &deltas {
@@ -1512,7 +1557,10 @@ mod tests {
             .unwrap();
         let admitted = admit_semantic_git_import(&enriched, &blob_store).unwrap();
         admitted.validate(&blob_store).unwrap();
-        assert_eq!(admitted.changes[1].entity_deltas, deltas[1].entity_deltas);
+        assert_eq!(
+            admitted.changes.read_at(1).unwrap().unwrap().entity_deltas,
+            deltas[1].entity_deltas
+        );
     }
 
     fn trees_by_change(

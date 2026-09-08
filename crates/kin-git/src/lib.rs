@@ -26,6 +26,8 @@ pub mod admission_history;
 pub mod authority;
 pub mod error;
 pub mod global_config;
+pub mod history_spool;
+pub use history_spool::SemanticChangeSpool;
 pub mod lossless;
 pub mod preflight;
 pub mod repository_export;

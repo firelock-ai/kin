@@ -236,11 +236,13 @@ fn baseline_by_building_a_graph(snapshot: &GraphSnapshot, head: &SemanticChangeI
 #[test]
 fn resolving_a_commit_baseline_does_not_pay_for_a_graph_it_drops() {
     let (snapshot, head) = authority_like_snapshot();
+    assert!(!snapshot.changes.is_decoded());
 
     reset_peak();
     let before = live();
     let folded = resolve_authority_baseline(&snapshot, &head).expect("baseline");
     let borrowed_peak = peak() - before;
+    assert!(!snapshot.changes.is_decoded());
     assert_eq!(
         folded.entities.len(),
         ENTITIES,
@@ -257,7 +259,35 @@ fn resolving_a_commit_baseline_does_not_pay_for_a_graph_it_drops() {
         "the control must resolve the same graph, or it is not a control"
     );
 
-    eprintln!("borrowed_peak_bytes={borrowed_peak} graph_peak_bytes={graph_peak}");
+    let graph = InMemoryGraph::from_snapshot(snapshot.clone()).expect("live comparison graph");
+    reset_peak();
+    let before = live();
+    let deltas = kin_daemon::commit_deltas::compute_deltas_vs_repository_authority(
+        &graph,
+        &snapshot,
+        Some(&head),
+    )
+    .expect("ordinary commit comparison");
+    let comparison_peak = peak() - before;
+    assert!(deltas.entity_deltas.is_empty());
+    assert!(deltas.relation_deltas.is_empty());
+    assert!(deltas.tree_deltas.is_empty());
+    assert!(!snapshot.changes.is_decoded());
+
+    eprintln!(
+        "borrowed_peak_bytes={borrowed_peak} graph_peak_bytes={graph_peak} comparison_peak_bytes={comparison_peak}"
+    );
+
+    assert!(
+        comparison_peak < PEAK_HEAP_CEILING,
+        "ordinary comparison allocated {comparison_peak} bytes, over the unchanged \
+         {PEAK_HEAP_CEILING} ceiling; unused history or revision output is being copied"
+    );
+    assert!(
+        comparison_peak < borrowed_peak / 2,
+        "ordinary comparison allocated {comparison_peak} bytes against the full-state \
+         baseline control of {borrowed_peak}; private comparison must not retain revision output"
+    );
 
     assert!(
         borrowed_peak < PEAK_HEAP_CEILING,

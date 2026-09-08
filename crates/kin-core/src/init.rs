@@ -336,10 +336,29 @@ impl PreparedRepositoryInit {
         self.commit_bootstrap(transaction, None)
     }
 
+    /// Admit a complete captured Git history as one bootstrap operation while
+    /// keeping immutable change bodies in their disk-backed store.
+    pub fn commit_git_bootstrap_with_changes(
+        &mut self,
+        transaction: RepositoryTransaction,
+        changes: kin_db::storage::ChangeMap,
+    ) -> Result<&RepositoryBootstrap> {
+        self.commit_bootstrap_with_changes(transaction, None, Some(changes))
+    }
+
     fn commit_bootstrap(
         &mut self,
         transaction: RepositoryTransaction,
         receiver_case: Option<AdmissionCase>,
+    ) -> Result<&RepositoryBootstrap> {
+        self.commit_bootstrap_with_changes(transaction, receiver_case, None)
+    }
+
+    fn commit_bootstrap_with_changes(
+        &mut self,
+        transaction: RepositoryTransaction,
+        receiver_case: Option<AdmissionCase>,
+        changes: Option<kin_db::storage::ChangeMap>,
     ) -> Result<&RepositoryBootstrap> {
         verify_metadata_seal(&self.layout, &self.metadata_seal)?;
         let operation_id = transaction.operation_id;
@@ -360,9 +379,7 @@ impl PreparedRepositoryInit {
                 // The first-commit arm below never used the value and paid for it
                 // on every init, and it also validated twice, once here and once
                 // in `validate_bootstrap_transaction`.
-                let transaction_hash = transaction
-                    .transaction_hash()
-                    .map_err(|error| KinError::Other(error.to_string()))?;
+                let transaction_hash = bootstrap_transaction_hash(&transaction, changes.as_ref())?;
                 if bootstrap.receipt.transaction_hash != transaction_hash
                     || bootstrap.receipt.operation_id != operation_id
                 {
@@ -377,17 +394,19 @@ impl PreparedRepositoryInit {
                 {
                     crate::report_admission_progress("validating transaction");
                     let _span = info_span!("kin.init.commit.validate_bootstrap").entered();
-                    validate_bootstrap_transaction(
+                    validate_bootstrap_transaction_with_changes(
                         &transaction,
+                        changes.as_ref(),
                         repository_id,
                         workspace_id,
                         default_ref,
                         initial_roots,
                     )?;
                 }
-                let bootstrap = commit_bootstrap_transaction(
+                let bootstrap = commit_bootstrap_transaction_with_changes(
                     authority,
                     transaction,
+                    changes,
                     repository_id,
                     workspace_id,
                     receiver_case,
@@ -1611,6 +1630,27 @@ fn commit_bootstrap_transaction<B>(
 where
     B: StorageBackend + 'static,
 {
+    commit_bootstrap_transaction_with_changes(
+        authority,
+        transaction,
+        None,
+        repository_id,
+        workspace_id,
+        receiver_case,
+    )
+}
+
+fn commit_bootstrap_transaction_with_changes<B>(
+    authority: &RepositoryAuthorityManager<B>,
+    transaction: RepositoryTransaction,
+    changes: Option<kin_db::storage::ChangeMap>,
+    repository_id: &RepositoryId,
+    workspace_id: WorkspaceId,
+    receiver_case: Option<AdmissionCase>,
+) -> Result<RepositoryBootstrap>
+where
+    B: StorageBackend + 'static,
+{
     // A bootstrap transaction carries every reachable external object and every
     // change in history, so on a repository with real history a copy taken to
     // satisfy the owned-parameter commit is a second whole-history allocation,
@@ -1630,22 +1670,33 @@ where
     // callback, so between entering this phase and leaving it the line would
     // otherwise sit unchanged for minutes, which reads as a hang. What kin-db
     // reports from inside its own replay arrives through the same sink.
+    let change_count = changes
+        .as_ref()
+        .map_or(transaction.changes.len(), |changes| changes.len());
     let receipt = {
         crate::report_admission_progress(&format!(
             "committing {} changes to authority",
-            transaction.changes.len()
+            change_count
         ));
         let _span = info_span!(
             "kin.init.commit.authority_commit",
             external_objects = transaction.external_objects.len(),
-            changes = transaction.changes.len()
+            changes = change_count
         )
         .entered();
-        match receiver_case {
-            Some(case) => {
+        match (receiver_case, changes) {
+            (Some(_), Some(_)) => {
+                return Err(KinError::Other(
+                    "streamed Git bootstrap cannot use transfer admission".into(),
+                ))
+            }
+            (None, Some(changes)) => {
+                authority.commit_git_bootstrap_with_changes(transaction, changes)
+            }
+            (Some(case), None) => {
                 authority.commit_transferred_repository_transaction(transaction, Some(case))
             }
-            None => authority.commit_repository_transaction(transaction),
+            (None, None) => authority.commit_repository_transaction(transaction),
         }
         .map_err(graph_error)?
     };
@@ -1696,9 +1747,49 @@ fn validate_bootstrap_transaction(
     default_ref: &RefName,
     initial_roots: &RootBundle,
 ) -> Result<()> {
-    transaction
-        .validate()
-        .map_err(|error| KinError::Other(error.to_string()))?;
+    validate_bootstrap_transaction_with_changes(
+        transaction,
+        None,
+        repository_id,
+        workspace_id,
+        default_ref,
+        initial_roots,
+    )
+}
+
+pub(crate) fn bootstrap_transaction_hash(
+    transaction: &RepositoryTransaction,
+    changes: Option<&kin_db::storage::ChangeMap>,
+) -> Result<kin_model::Hash256> {
+    match changes {
+        None => transaction.transaction_hash(),
+        Some(changes) => transaction.transaction_hash_with_changes(changes.len(), || {
+            Ok(changes.change_ids().into_iter().map(|id| {
+                changes
+                    .read_change(&id)
+                    .map_err(|error| kin_model::ModelError::InvalidOperation(error.to_string()))?
+                    .ok_or_else(|| kin_model::ModelError::ChangeNotFound(id.to_string()))
+            }))
+        }),
+    }
+    .map_err(|error| KinError::Other(error.to_string()))
+}
+
+fn validate_bootstrap_transaction_with_changes(
+    transaction: &RepositoryTransaction,
+    changes: Option<&kin_db::storage::ChangeMap>,
+    repository_id: &RepositoryId,
+    workspace_id: WorkspaceId,
+    default_ref: &RefName,
+    initial_roots: &RootBundle,
+) -> Result<()> {
+    if changes.is_some() {
+        bootstrap_transaction_hash(transaction, changes)?;
+    } else {
+        transaction
+            .validate()
+            .map_err(|error| KinError::Other(error.to_string()))?;
+    }
     if initial_roots.generation != 0
         || transaction.expected_generation != 0
         || &transaction.expected_roots != initial_roots
@@ -5086,7 +5177,7 @@ mod tests {
 
         let (detail, fix) =
             stranded_stage_doctor_row(&survey).expect("a stranded stage is a finding");
-        assert!(detail.contains("1.5 GB"), "{detail}");
+        assert!(detail.contains("1.5 GiB"), "{detail}");
         assert!(
             detail.contains("/scratchpad/.kin.init-62f59472-4ba7-41ec-bb31-b55ad3feec9e"),
             "{detail}"
@@ -5139,10 +5230,10 @@ mod tests {
             detail.contains("its filesystem identity is not provable"),
             "{detail}"
         );
-        assert!(detail.contains("4.0 KB"), "{detail}");
+        assert!(detail.contains("4.0 KiB"), "{detail}");
         // The reclaimable one is still the headline, and the declined one is
         // not counted into the number that comes back.
-        assert!(detail.contains("1.5 GB of staging"), "{detail}");
+        assert!(detail.contains("1.5 GiB of staging"), "{detail}");
         assert_eq!(survey.reclaimable_bytes(), 1_610_612_736);
     }
 

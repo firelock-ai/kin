@@ -498,9 +498,9 @@ pub(crate) fn occupied_bytes(metadata: &std::fs::Metadata) -> u64 {
 /// Render a byte count the way a person reads one.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [(&str, u64); 4] = [
-        ("GB", 1024 * 1024 * 1024),
-        ("MB", 1024 * 1024),
-        ("KB", 1024),
+        ("GiB", 1024 * 1024 * 1024),
+        ("MiB", 1024 * 1024),
+        ("KiB", 1024),
         ("bytes", 1),
     ];
     for (unit, scale) in UNITS {
@@ -1058,7 +1058,7 @@ mod tests {
             "elapsed to the last phase must be reported: {rendered}"
         );
         assert!(
-            rendered.contains("under a 12.0 GB memory ceiling, read from the container"),
+            rendered.contains("under a 12.0 GiB memory ceiling, read from the container"),
             "the measured ceiling must be named: {rendered}"
         );
         assert!(
@@ -1066,7 +1066,7 @@ mod tests {
             "a kill the kernel recorded must be named: {rendered}"
         );
         assert!(
-            rendered.contains("420.0 MB of staging"),
+            rendered.contains("420.0 MiB of staging"),
             "the reclaimable total must be named: {rendered}"
         );
         assert!(
@@ -1193,7 +1193,7 @@ mod tests {
         );
         assert!(
             ceiling_advice(&record(), Some(&reading(Some(1))))
-                .is_some_and(|line| line.contains("12.0 GB")),
+                .is_some_and(|line| line.contains("12.0 GiB")),
             "advice quotes the measured ceiling"
         );
         assert!(
@@ -1506,7 +1506,7 @@ mod tests {
         );
 
         let all_gone = reclaim_lines(std::slice::from_ref(&freed)).join("\n");
-        assert!(all_gone.contains("reclaimed 1.0 KB"), "{all_gone}");
+        assert!(all_gone.contains("reclaimed 1.0 KiB"), "{all_gone}");
         assert!(
             !all_gone.contains("still on disk"),
             "a clean reclaim must not claim something was left: {all_gone}"
@@ -1518,14 +1518,14 @@ mod tests {
             "nothing was freed, so nothing may be reported as reclaimed: {none_gone}"
         );
         assert!(
-            none_gone.contains("2.0 KB is still on disk")
+            none_gone.contains("2.0 KiB is still on disk")
                 && none_gone.contains(&held_path.display().to_string()),
             "what stayed must be named with its size: {none_gone}"
         );
 
         let mixed = reclaim_lines(&[freed, held]).join("\n");
         assert!(
-            mixed.contains("reclaimed 1.0 KB") && mixed.contains("2.0 KB is still on disk"),
+            mixed.contains("reclaimed 1.0 KiB") && mixed.contains("2.0 KiB is still on disk"),
             "a partial reclaim must report both halves: {mixed}"
         );
 
@@ -1550,7 +1550,7 @@ mod tests {
             detail.contains("phase 13 of 17, commit bootstrap transaction"),
             "{detail}"
         );
-        assert!(detail.contains("420.0 MB"), "{detail}");
+        assert!(detail.contains("420.0 MiB"), "{detail}");
         assert!(fix.contains("kin init"), "{fix}");
         assert!(fix.contains("/work/.kin.init-22ef96e2.owner"), "{fix}");
 
@@ -1595,9 +1595,13 @@ mod tests {
     fn byte_and_second_rendering_reads_the_way_a_person_says_it() {
         assert_eq!(human_bytes(0), "0 bytes");
         assert_eq!(human_bytes(512), "512 bytes");
-        assert_eq!(human_bytes(2048), "2.0 KB");
-        assert_eq!(human_bytes(210 * 1024 * 1024), "210.0 MB");
-        assert_eq!(human_bytes(12 * 1024 * 1024 * 1024), "12.0 GB");
+        assert_eq!(human_bytes(1023), "1023 bytes");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(2048), "2.0 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(human_bytes(210 * 1024 * 1024), "210.0 MiB");
+        assert_eq!(human_bytes(12 * 1024 * 1024 * 1024), "12.0 GiB");
         assert_eq!(human_seconds(0), "0 s");
         assert_eq!(human_seconds(89), "89 s");
         assert_eq!(human_seconds(90), "1 min 30 s");

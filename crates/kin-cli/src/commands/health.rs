@@ -6297,7 +6297,7 @@ mod tests {
                 found.detail
             );
             assert!(
-                found.detail.contains(" KB of staging"),
+                found.detail.contains(" KiB of staging"),
                 "run {where_from}, the row must name the size in bytes it measured: {}",
                 found.detail
             );

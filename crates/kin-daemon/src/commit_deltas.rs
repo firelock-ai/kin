@@ -131,11 +131,9 @@ fn baseline_from_materialized_section<'a>(
 
 /// Fold the parent out of persisted history, borrowing the change map.
 ///
-/// `resolve_graph_at` reaches its store through `get_change` and nothing else
-/// (`kin_model::graph::collect_changes_first_parent`), so the graph this used to
-/// construct served one lookup loop. Borrowing does still decode the change map,
-/// because `ChangeMap` derefs through `force()`; what it drops is the throwaway
-/// graph, its lexical index, and the whole-history entity-revision derivation.
+/// Each lookup decodes one change through the fallible history reader. This
+/// public full-state path preserves revision output; ordinary commit comparison
+/// uses a current-state projection instead.
 fn baseline_from_history(
     authority_snapshot: &GraphSnapshot,
     parent: &SemanticChangeId,
@@ -158,19 +156,33 @@ pub fn compute_deltas_vs_repository_authority(
     authority_snapshot: &GraphSnapshot,
     parent: Option<&SemanticChangeId>,
 ) -> Result<CommitDeltas> {
-    let committed = match parent {
-        Some(parent) => resolve_authority_baseline(authority_snapshot, parent)?,
-        None => Cow::Owned(ResolvedGraphState {
-            entities: Default::default(),
-            relations: Default::default(),
-            entity_revisions: Default::default(),
-            tree: ResolvedTree::default(),
-            entity_tombstones: Default::default(),
-            relation_tombstones: Default::default(),
-            external_references: HashMap::new(),
-        }),
+    let Some(parent) = parent else {
+        return compute_deltas_from_current_state(
+            graph,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ResolvedTree::default(),
+        );
     };
-    compute_deltas_from_resolved_state(graph, &committed)
+    match baseline_from_materialized_section(authority_snapshot, parent) {
+        Ok(committed) => compute_deltas_from_resolved_state(graph, committed),
+        Err(refusal) => {
+            tracing::debug!(
+                %parent,
+                %refusal,
+                "folding the commit parent current state from history"
+            );
+            let committed =
+                kin_db::storage::resolve_current_graph(&authority_snapshot.changes, parent)
+                    .map_err(DaemonError::Graph)?;
+            compute_deltas_from_current_state(
+                graph,
+                &committed.entities,
+                &committed.relations,
+                &committed.tree,
+            )
+        }
+    }
 }
 
 /// Build the complete derived-graph transition for one selected-path checkout.
@@ -519,13 +531,27 @@ fn compute_deltas_from_resolved_state(
     graph: &InMemoryGraph,
     committed: &ResolvedGraphState,
 ) -> Result<CommitDeltas> {
+    compute_deltas_from_current_state(
+        graph,
+        &committed.entities,
+        &committed.relations,
+        &committed.tree,
+    )
+}
+
+fn compute_deltas_from_current_state(
+    graph: &InMemoryGraph,
+    committed_entities: &HashMap<EntityId, Entity>,
+    committed_relations: &HashMap<RelationId, Relation>,
+    committed_tree: &ResolvedTree,
+) -> Result<CommitDeltas> {
     // One coherent live snapshot keeps entity, relation, and exact-tree deltas
     // on the same graph generation.
-    let current = graph.to_snapshot();
+    let current = graph.workspace_graph_facts();
 
     let mut entity_deltas = Vec::new();
     for entity in current.entities.values() {
-        match committed.entities.get(&entity.id) {
+        match committed_entities.get(&entity.id) {
             None => {
                 entity_deltas.push(EntityDelta::Added {
                     new: entity.clone(),
@@ -552,7 +578,7 @@ fn compute_deltas_from_resolved_state(
             _ => {}
         }
     }
-    for (entity_id, entity) in &committed.entities {
+    for (entity_id, entity) in committed_entities {
         if !current.entities.contains_key(entity_id) {
             entity_deltas.push(EntityDelta::Removed {
                 old: entity.clone(),
@@ -563,7 +589,7 @@ fn compute_deltas_from_resolved_state(
 
     let mut relation_deltas = Vec::new();
     for relation in current.relations.values() {
-        match committed.relations.get(&relation.id) {
+        match committed_relations.get(&relation.id) {
             None => relation_deltas.push(RelationDelta::Added {
                 new: relation.clone(),
             }),
@@ -576,7 +602,7 @@ fn compute_deltas_from_resolved_state(
             _ => {}
         }
     }
-    for (relation_id, relation) in &committed.relations {
+    for (relation_id, relation) in committed_relations {
         if !current.relations.contains_key(relation_id) {
             relation_deltas.push(RelationDelta::Removed {
                 old: relation.clone(),
@@ -586,7 +612,7 @@ fn compute_deltas_from_resolved_state(
     relation_deltas.sort_by_key(RelationDelta::target_id);
 
     let expected_tree = current.resolved_tree;
-    let tree_deltas = kin_core::exact_tree_correction(&committed.tree, &expected_tree)?;
+    let tree_deltas = kin_core::exact_tree_correction(committed_tree, &expected_tree)?;
 
     Ok(CommitDeltas {
         entity_deltas,
@@ -2617,6 +2643,70 @@ mod tests {
             resolved_at,
             state,
         }
+    }
+
+    #[test]
+    fn ordinary_commit_projection_matches_the_full_state_delta_oracle() {
+        let (mut snapshot, head) = authority_like_snapshot(8);
+        let graph = InMemoryGraph::from_snapshot(snapshot.clone()).unwrap();
+        let original = snapshot.entities.values().next().unwrap().clone();
+        let mut changed = original.clone();
+        changed.signature.push_str(" changed");
+        graph.upsert_entity(&changed).unwrap();
+        let added_relation = relation(
+            RelationId::new(),
+            GraphNodeId::Entity(changed.id),
+            GraphNodeId::Entity(changed.id),
+            RelationKind::Calls,
+        );
+        let relation_delta = RelationDelta::Added {
+            new: added_relation,
+        };
+        let tree_delta = TreeDelta::Added {
+            artifact_id: ArtifactId::new(),
+            new: LocatedEntry::new(
+                RepoPath::from_utf8("new.bin").unwrap(),
+                TreeEntry::blob(Hash256::from_bytes([0x72; 32]), true),
+            ),
+        };
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                relation_deltas: vec![relation_delta.clone()],
+                tree_deltas: vec![tree_delta.clone()],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        let full = baseline_from_history(&snapshot, &head).unwrap();
+        assert!(!full.entity_revisions.is_empty());
+        let stale = SemanticChangeId::from_hash(Hash256::from_bytes([0x5a; 32]));
+        for section_target in [None, Some(head), Some(stale)] {
+            snapshot.materialized_graph =
+                section_target.map(|target| Arc::new(marked_section(target, full.clone())));
+            let baseline = resolve_authority_baseline(&snapshot, &head).unwrap();
+            let expected = compute_deltas_from_resolved_state(&graph, &baseline).unwrap();
+            let actual =
+                compute_deltas_vs_repository_authority(&graph, &snapshot, Some(&head)).unwrap();
+            assert!(!actual.entity_deltas.is_empty());
+            assert_eq!(actual.entity_deltas, expected.entity_deltas);
+            assert_eq!(actual.relation_deltas, expected.relation_deltas);
+            assert_eq!(actual.tree_deltas, expected.tree_deltas);
+            assert_eq!(actual.expected_tree, expected.expected_tree);
+            assert!(actual.entity_deltas.contains(&EntityDelta::Modified {
+                old: original.clone(),
+                new: changed.clone(),
+            }));
+            assert_eq!(actual.relation_deltas, vec![relation_delta.clone()]);
+            assert_eq!(actual.tree_deltas, vec![tree_delta.clone()]);
+            assert_eq!(
+                actual.expected_tree,
+                ResolvedTree::default()
+                    .apply(std::slice::from_ref(&tree_delta))
+                    .unwrap()
+            );
+            assert!(!snapshot.changes.is_decoded());
+        }
+        snapshot.materialized_graph = None;
+        assert!(compute_deltas_vs_repository_authority(&graph, &snapshot, Some(&stale)).is_err());
     }
 
     #[test]
