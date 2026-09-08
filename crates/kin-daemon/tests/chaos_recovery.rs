@@ -128,6 +128,38 @@ fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> 
         .expect("failed to spawn contained kin-daemon")
 }
 
+fn decode_ready_health(body: &[u8]) -> Result<Option<HealthResponse>, serde_json::Error> {
+    let payload: serde_json::Value = serde_json::from_slice(body)?;
+    if payload.get("status").and_then(serde_json::Value::as_str) == Some("warming") {
+        return Ok(None);
+    }
+    let health: HealthResponse = serde_json::from_value(payload)?;
+    Ok((health.status == "ok").then_some(health))
+}
+
+#[test]
+fn health_decoder_waits_for_warming_then_strict_ready() {
+    let warming = br#"{"status":"warming","process_alive":true,"reader_admitted":false,"ready":false,"warming":true}"#;
+    assert!(decode_ready_health(warming).unwrap().is_none());
+    let ready = br#"{"status":"ok","version":"test","uptime_seconds":0,"graph_loaded":true,"reconciliation_status":"idle","repo_id":"fixture","repo_root":"fixture","pid":1,"build":{"sha":"fixture","dirty":false,"built_at":"fixture"}}"#;
+    let health = decode_ready_health(ready).unwrap().expect("ready response");
+    assert_eq!(health.version, "test");
+}
+
+#[test]
+fn health_decoder_rejects_malformed_and_incomplete_ready() {
+    for body in [
+        b"not json".as_slice(),
+        br#"{"status":"ok"}"#,
+        br#"{"status":"unknown"}"#,
+    ] {
+        assert!(
+            decode_ready_health(body).is_err(),
+            "invalid response accepted"
+        );
+    }
+}
+
 async fn wait_for_health(child: &mut DaemonChild, port: u16) -> HealthResponse {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/health");
@@ -137,8 +169,8 @@ async fn wait_for_health(child: &mut DaemonChild, port: u16) -> HealthResponse {
     loop {
         if let Ok(response) = client.get(&url).send().await {
             if response.status().is_success() {
-                let health = response.json::<HealthResponse>().await.unwrap();
-                if health.status == "ok" {
+                let body = response.bytes().await.expect("health response body");
+                if let Some(health) = decode_ready_health(&body).expect("valid health response") {
                     return health;
                 }
             }
