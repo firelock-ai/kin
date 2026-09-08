@@ -2175,6 +2175,60 @@ pub struct LocalRepositoryAuthorityFreeze {
 }
 
 impl LocalRepositoryAuthorityFreeze {
+    /// Open and fully validate existing authority without changing storage.
+    ///
+    /// The existing exclusive namespace lock is retained through validation
+    /// and until this guard is dropped. Missing authority fails; retired
+    /// quarantines and superseded snapshots are validated or preserved, never
+    /// cleaned up. No generation-zero repository is constructed.
+    pub fn open_existing_read_only(
+        repository_id: RepositoryId,
+        backend: &LocalFileBackend,
+    ) -> Result<Self, KinDbError> {
+        let locked = backend.freeze_existing_authority_read_only(repository_id.as_str())?;
+        Self::from_locked_authority(&repository_id, backend, locked)
+    }
+
+    fn from_locked_authority(
+        repository_id: &RepositoryId,
+        backend: &LocalFileBackend,
+        locked: LocalAuthorityFreezeLock,
+    ) -> Result<Self, KinDbError> {
+        // A freeze validates the complete acknowledged head regardless of
+        // cached history proofs, while the retained lock excludes writers.
+        let snapshot = crate::storage::backend::recover_snapshot_from_state(
+            repository_id.as_str(),
+            locked.authority(),
+            locked.frames(),
+            None,
+            crate::storage::backend::HistoryDecode::Eager,
+        )?
+        .recovered
+        .snapshot;
+        let metadata = snapshot.repository_authority.as_ref().ok_or_else(|| {
+            storage(format!(
+                "repository {repository_id} frozen snapshot has no v13 authority envelope"
+            ))
+        })?;
+        if &metadata.repository_id != repository_id {
+            return Err(storage(format!(
+                "frozen snapshot authority belongs to {}, not {repository_id}",
+                metadata.repository_id
+            )));
+        }
+        snapshot.validate_storage_admission()?;
+        validate_history_replay(&snapshot, snapshot.changes.values())?;
+        let body_backend = FrozenLocalBodyBackend {
+            backend,
+            freeze: &locked,
+        };
+        validate_all_authority_bodies(&body_backend, repository_id, &snapshot)?;
+        Ok(Self {
+            state: RepositoryAuthorityState::from_validated_snapshot(snapshot),
+            _lock: locked,
+        })
+    }
+
     /// Exact persisted authority reloaded after the exclusive lock was held.
     pub fn authority(&self) -> &RepositoryAuthorityState {
         &self.state
@@ -3326,51 +3380,19 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
         let locked = self
             .backend
             .freeze_existing_authority(self.repository_id.as_str())?;
-        // The frozen head is the base plus every acknowledged frame the lock
-        // captured, put back together by the same recovery core an open uses,
-        // and validated in full here regardless of any durable proof: a freeze
-        // is the gate a namespace transition trusts.
-        let snapshot = crate::storage::backend::recover_snapshot_from_state(
-            self.repository_id.as_str(),
-            locked.authority(),
-            locked.frames(),
-            None,
-            crate::storage::backend::HistoryDecode::Eager,
-        )?
-        .recovered
-        .snapshot;
-        let metadata = snapshot.repository_authority.as_ref().ok_or_else(|| {
-            storage(format!(
-                "repository {} frozen snapshot has no v13 authority envelope",
-                self.repository_id
-            ))
-        })?;
-        if metadata.repository_id != self.repository_id {
-            return Err(storage(format!(
-                "frozen snapshot authority belongs to {}, not {}",
-                metadata.repository_id, self.repository_id
-            )));
-        }
-        snapshot.validate_storage_admission()?;
-        validate_history_replay(&snapshot, snapshot.changes.values())?;
-        let body_backend = FrozenLocalBodyBackend {
-            backend: self.backend.as_ref(),
-            freeze: &locked,
-        };
-        validate_all_authority_bodies(&body_backend, &self.repository_id, &snapshot)?;
-
-        let state = RepositoryAuthorityState::from_validated_snapshot(snapshot);
-        if state.roots() != expected.roots() {
+        let freeze = LocalRepositoryAuthorityFreeze::from_locked_authority(
+            &self.repository_id,
+            self.backend.as_ref(),
+            locked,
+        )?;
+        if freeze.roots() != expected.roots() {
             return Err(ModelError::Conflict(format!(
                 "repository {} persisted authority moved from the expected root bundle while local freeze was acquired",
                 self.repository_id
             ))
             .into());
         }
-        Ok(LocalRepositoryAuthorityFreeze {
-            state,
-            _lock: locked,
-        })
+        Ok(freeze)
     }
 }
 
@@ -8598,7 +8620,10 @@ impl DomainRoot {
 /// purpose. On a whole-repository leaf the tree cost fifteen times the bytes it
 /// produced, and a bootstrap hands this function the entire Git object closure
 /// as a single leaf (FIR-2665).
-fn canonical_leaf_hash<T: Serialize>(domain: &str, value: &T) -> Result<[u8; 32], KinDbError> {
+pub(crate) fn canonical_leaf_hash<T: Serialize>(
+    domain: &str,
+    value: &T,
+) -> Result<[u8; 32], KinDbError> {
     let mut hasher = Sha256::new();
     hasher.update(b"kin-repository-root-leaf-v1\0");
     hasher.update((domain.len() as u64).to_le_bytes());
@@ -15732,6 +15757,175 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.read_authority().generation(), 1);
+    }
+
+    #[test]
+    fn local_read_only_freeze_preserves_storage_and_holds_journal_head() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_3091, 0x62))
+            .unwrap();
+        assert_eq!(acknowledged_frame_count(&directory), 1);
+        let expected = manager.read_authority();
+        let marker = retain_installed_authority_marker(&directory);
+        let before = freeze_storage_bytes(directory.path());
+        let frozen = LocalRepositoryAuthorityFreeze::open_existing_read_only(
+            repository_id(),
+            backend.as_ref(),
+        )
+        .unwrap();
+        assert_same_authority(&expected, frozen.authority(), "read-only frozen journal");
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+        assert!(backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+        drop(frozen);
+        assert!(!backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+        RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .expect("normal open must confirm the installed authority");
+        assert!(
+            !marker.exists(),
+            "normal open must clean the retained marker"
+        );
+    }
+
+    fn retain_installed_authority_marker(directory: &TempDir) -> std::path::PathBuf {
+        let authority = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("authority.json");
+        let bytes = std::fs::read(&authority).unwrap();
+        crate::storage::mmap::write_recovery_candidate_bytes(&authority, &bytes).unwrap();
+        std::fs::remove_file(crate::storage::mmap::recovery_tmp_path(&authority)).unwrap();
+        crate::storage::mmap::recovery_marker_path(&authority)
+    }
+
+    #[test]
+    fn local_read_only_freeze_rejects_staged_authority_without_changing_storage() {
+        let directory = TempDir::new().unwrap();
+        let (backend, _manager) = framed_local_repository(&directory);
+        let authority = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("authority.json");
+        let bytes = std::fs::read(&authority).unwrap();
+        crate::storage::mmap::write_recovery_candidate_bytes(&authority, &bytes).unwrap();
+        let before = freeze_storage_bytes(directory.path());
+        let error = LocalRepositoryAuthorityFreeze::open_existing_read_only(
+            repository_id(),
+            backend.as_ref(),
+        )
+        .expect_err("a staged candidate must not be confirmed as installed");
+        assert!(error.to_string().contains("still staged"), "{error}");
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+    }
+
+    fn freeze_storage_bytes(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn visit(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            entries: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+        ) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    entries.push((path.strip_prefix(root).unwrap().to_path_buf(), Vec::new()));
+                    visit(root, &path, entries);
+                } else {
+                    entries.push((
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn local_read_only_freeze_missing_authority_creates_nothing() {
+        let directory = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let before = freeze_storage_bytes(directory.path());
+        assert!(
+            LocalRepositoryAuthorityFreeze::open_existing_read_only(repository_id(), &backend,)
+                .is_err()
+        );
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+    }
+
+    #[test]
+    fn local_read_only_freeze_missing_existing_lock_creates_nothing() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        drop(manager);
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(repository_id().as_str())
+                .join(".lock"),
+        )
+        .unwrap();
+        let backend = LocalFileBackend::new(directory.path());
+        let before = freeze_storage_bytes(directory.path());
+        let error =
+            LocalRepositoryAuthorityFreeze::open_existing_read_only(repository_id(), &backend)
+                .expect_err("existing-only freeze must not recreate a missing lock");
+        assert!(error.to_string().contains("lock"), "{error}");
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+    }
+
+    #[test]
+    fn local_read_only_freeze_rejects_corrupt_cas_without_changing_storage() {
+        let directory = TempDir::new().unwrap();
+        let (backend, _manager) = framed_local_repository(&directory);
+        retain_installed_authority_marker(&directory);
+        let hash = hex::encode(digest(b"pub fn kin() {}\n").as_bytes());
+        let path = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("source-blobs/sha256")
+            .join(&hash[..2])
+            .join(&hash);
+        std::fs::write(path, b"pub fn bad() {}\n").unwrap();
+        let before = freeze_storage_bytes(directory.path());
+        let error = LocalRepositoryAuthorityFreeze::open_existing_read_only(
+            repository_id(),
+            backend.as_ref(),
+        )
+        .expect_err("a freeze must revalidate required CAS bodies");
+        assert!(error.to_string().contains("digest"), "{error}");
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+        assert!(!backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+    }
+
+    #[test]
+    fn local_read_only_freeze_rejects_corrupt_frame_without_changing_storage() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_3092, 0x63))
+            .unwrap();
+        std::fs::write(frame_path(&directory, 2), b"corrupt frame").unwrap();
+        let before = freeze_storage_bytes(directory.path());
+        assert!(LocalRepositoryAuthorityFreeze::open_existing_read_only(
+            repository_id(),
+            backend.as_ref(),
+        )
+        .is_err());
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
     }
 
     #[test]

@@ -1982,6 +1982,7 @@ pub(crate) fn confirm_installed_write_at(
     directory: &cap_std::fs::Dir,
     relative: &Path,
     display_root: &Path,
+    cleanup: bool,
 ) -> Result<bool, KinDbError> {
     let display = capability_display_path(display_root, relative);
     let marker_path = recovery_marker_path(relative);
@@ -2042,6 +2043,9 @@ pub(crate) fn confirm_installed_write_at(
             display.display(),
             marker_display.display()
         )));
+    }
+    if !cleanup {
+        return Ok(true);
     }
     sync_parent_dir_at(directory, relative, display_root)?;
     run_confirm_before_marker_claim_hook();
