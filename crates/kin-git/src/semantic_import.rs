@@ -368,7 +368,7 @@ impl SemanticGitImportPlan {
             },
         )?;
         comparison.finish(&derived)?;
-        apply_historical_semantic_deltas_unchecked(self, bindings)
+        apply_historical_semantic_deltas_unchecked(self, blob_store, bindings)
     }
 }
 
@@ -382,7 +382,7 @@ fn enrich_with_historical_semantics(
 ) -> Result<SemanticGitImportPlan> {
     let snapshot = plan.raw_snapshot();
     let mut comparison = HeldPlanComparison::new(&plan, Enrichment::None, EXACT_UNENRICHED)?;
-    let mut changes = SemanticChangeSpoolWriter::new()?;
+    let mut changes = SemanticChangeSpoolWriter::new_in(blob_store.root())?;
     let mut aliases = Vec::with_capacity(plan.aliases.len());
     let mut old_to_new = BTreeMap::new();
     let derived = derive_semantic_git_history(
@@ -538,6 +538,7 @@ pub(crate) fn derive_enriched_semantic_git_history(
 
 fn apply_historical_semantic_deltas_unchecked(
     mut plan: SemanticGitImportPlan,
+    blob_store: &BlobStore,
     bindings: Vec<HistoricalSemanticBinding<'_>>,
 ) -> Result<SemanticGitImportPlan> {
     let mut delta_by_change = BTreeMap::new();
@@ -562,7 +563,7 @@ fn apply_historical_semantic_deltas_unchecked(
     }
 
     let mut old_to_new = BTreeMap::<SemanticChangeId, SemanticChangeId>::new();
-    let mut changes = SemanticChangeSpoolWriter::new()?;
+    let mut changes = SemanticChangeSpoolWriter::new_in(blob_store.root())?;
     let mut aliases = Vec::with_capacity(plan.changes.len());
     for change in plan.changes.iter() {
         let mut change = change?;
@@ -1111,7 +1112,7 @@ fn build_semantic_git_import_plan(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
 ) -> Result<SemanticGitImportPlan> {
-    let mut changes = SemanticChangeSpoolWriter::new()?;
+    let mut changes = SemanticChangeSpoolWriter::new_in(blob_store.root())?;
     let mut aliases = Vec::new();
     let derived = derive_semantic_git_history(
         snapshot,
@@ -2236,7 +2237,7 @@ mod tests {
             } else {
                 records.swap(0, 1);
             }
-            malformed.changes = SemanticChangeSpool::from_changes(records).unwrap();
+            malformed.changes = SemanticChangeSpool::from_changes(fixture.blob_store.root(), records).unwrap();
             assert!(malformed.validate(&fixture.blob_store).is_err());
 
             let mut malformed = admitted.clone();
@@ -2250,7 +2251,7 @@ mod tests {
             } else {
                 records.swap(0, 1);
             }
-            malformed.changes = SemanticChangeSpool::from_changes(records).unwrap();
+            malformed.changes = SemanticChangeSpool::from_changes(fixture.blob_store.root(), records).unwrap();
             assert!(malformed.validate(&fixture.blob_store).is_err());
         }
     }
@@ -2785,7 +2786,7 @@ mod tests {
         let mut mutated = plan.clone();
         let mut changes = mutated.changes.iter().collect::<Result<Vec<_>>>().unwrap();
         changes[0].message.push_str("tampered");
-        mutated.changes = SemanticChangeSpool::from_changes(changes).unwrap();
+        mutated.changes = SemanticChangeSpool::from_changes(blob_store.root(), changes).unwrap();
         assert!(matches!(
             mutated.validate(&blob_store),
             Err(GitError::InvalidSnapshot(_))

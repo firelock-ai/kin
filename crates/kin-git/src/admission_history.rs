@@ -449,7 +449,7 @@ fn build_admitted_semantic_git_import_plan(
     plan: &SemanticGitImportPlan,
     blob_store: &BlobStore,
 ) -> Result<AdmittedSemanticGitImportPlan> {
-    let mut changes = SemanticChangeSpoolWriter::new()?;
+    let mut changes = SemanticChangeSpoolWriter::new_in(blob_store.root())?;
     let mut aliases = Vec::with_capacity(plan.aliases.len());
     let derived =
         derive_admitted_semantic_git_history(plan, blob_store, &mut |_oid, admitted, alias| {

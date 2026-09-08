@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use kin_model::{ChangeOrigin, GitObjectId, SemanticChange, SemanticChangeId};
@@ -12,6 +13,14 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::error::{GitError, Result};
+
+/// Names a spool on disk for whoever finds one a kill left behind.
+///
+/// `NamedTempFile` unlinks on drop and a `SIGKILL` runs no destructor, so the
+/// file this prefix names is exactly what an out-of-memory kill strands. The
+/// kill this whole spool exists to prevent is the one that strands it, so the
+/// name has to be legible without a process to ask.
+const SPOOL_PREFIX: &str = ".kin-history-spool-";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Record {
@@ -111,8 +120,14 @@ impl SemanticChangeSpool {
         Ok(Some(change))
     }
     /// Explicit compatibility adapter for callers which already own a history.
-    pub fn from_changes(changes: impl IntoIterator<Item = SemanticChange>) -> Result<Self> {
-        let mut writer = SemanticChangeSpoolWriter::new()?;
+    ///
+    /// `directory` is where the spool file is written, and it carries the same
+    /// requirement [`SemanticChangeSpoolWriter::new_in`] states.
+    pub fn from_changes(
+        directory: &Path,
+        changes: impl IntoIterator<Item = SemanticChange>,
+    ) -> Result<Self> {
+        let mut writer = SemanticChangeSpoolWriter::new_in(directory)?;
         for change in changes {
             writer.append(change)?;
         }
@@ -123,10 +138,33 @@ impl SemanticChangeSpool {
 pub(crate) struct SemanticChangeSpoolWriter(Storage);
 
 impl SemanticChangeSpoolWriter {
-    pub(crate) fn new() -> Result<Self> {
+    /// Spool into `directory`, which the caller chooses and owns.
+    ///
+    /// Deliberately not `std::env::temp_dir()`. This spool exists to keep a
+    /// history off the heap, and on a host where `/tmp` is tmpfs, which is the
+    /// default on most Linux distributions and inside most containers, writing
+    /// it there puts every byte back in RAM and undoes the change. The caller
+    /// knows which filesystem it is converting on; this constructor does not,
+    /// and guessing is what makes the defect invisible. The bodies are also the
+    /// size of the history being imported, so a small `/tmp` is a second way to
+    /// fail on a conversion that would otherwise succeed.
+    ///
+    /// Every caller inside this crate passes its blob store's root, which for
+    /// a `kin init` conversion is the per-init `.kin-git-capture-<uuid>`
+    /// staging directory beside the source repository. That puts the spool on
+    /// the repository's own filesystem and inside the one tree the next init's
+    /// reap and `kin doctor --reclaim-staging` already scan by name, so a
+    /// conversion the kernel kills strands nothing invisible.
+    ///
+    /// A blob store's root is safe to write into: it addresses content under
+    /// two-hex-character shard directories and documents that every other
+    /// top-level entry is ignored, by enumeration and by compaction alike.
+    pub(crate) fn new_in(directory: &Path) -> Result<Self> {
         Ok(Self(Storage {
-            file: NamedTempFile::new()
-                .map_err(|error| GitError::io(std::env::temp_dir(), error))?,
+            file: tempfile::Builder::new()
+                .prefix(SPOOL_PREFIX)
+                .tempfile_in(directory)
+                .map_err(|error| GitError::io(directory, error))?,
             records: Vec::new(),
             by_id: BTreeMap::new(),
             by_oid: BTreeMap::new(),
@@ -185,6 +223,16 @@ mod tests {
     use super::*;
     use kin_model::{AuthorId, Hash256, Timestamp};
 
+    /// One spool directory for this module's cases, alive for the whole binary.
+    ///
+    /// A `TempDir` bound to the call would be removed the moment the statement
+    /// ended, and `read_at` reopens the spool by path, so every later read
+    /// would fail on a directory that is no longer there.
+    fn spool_dir() -> &'static Path {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| tempfile::tempdir().unwrap()).path()
+    }
+
     fn change(seed: u8) -> SemanticChange {
         SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([seed; 32])),
@@ -207,10 +255,47 @@ mod tests {
         }
     }
 
+    /// The spool goes where the caller said, and says so on disk.
+    ///
+    /// The default `std::env::temp_dir()` this replaced was two defects at
+    /// once. On a host where `/tmp` is tmpfs, spooling a history there puts it
+    /// straight back in RAM, which is the exact cost this spool exists to
+    /// avoid, and it is invisible: every test passes and the conversion simply
+    /// runs out of memory on the machine it was meant to fit. And a
+    /// `NamedTempFile` unlinks on drop, which `SIGKILL` never runs, so an
+    /// out-of-memory kill strands a history-sized file under a name
+    /// `kin doctor --reclaim-staging` does not scan for.
+    ///
+    /// Breaking it: put `NamedTempFile::new()` back in `new_in` and this fails
+    /// on an empty directory.
+    #[test]
+    fn a_spool_is_written_where_its_caller_put_it_and_is_named_for_a_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let spool = SemanticChangeSpool::from_changes(directory.path(), [change(1)]).unwrap();
+
+        let names = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names.len(),
+            1,
+            "the spool must be the one thing in the directory it was given: {names:?}"
+        );
+        assert!(
+            names[0].starts_with(SPOOL_PREFIX),
+            "a stranded spool has to be identifiable by name alone: {}",
+            names[0]
+        );
+        // Named where the caller put it AND still readable from there, so this
+        // cannot pass on a file the spool no longer uses.
+        assert_eq!(spool.read_at(0).unwrap(), Some(change(1)));
+    }
+
     #[test]
     fn spool_preserves_owned_records_order_and_indexes() {
         let records = vec![change(1), change(2)];
-        let spool = SemanticChangeSpool::from_changes(records.clone()).unwrap();
+        let spool = SemanticChangeSpool::from_changes(spool_dir(), records.clone()).unwrap();
         assert_eq!(spool.iter().collect::<Result<Vec<_>>>().unwrap(), records);
         assert_eq!(
             spool.ids().collect::<Vec<_>>(),
@@ -230,16 +315,16 @@ mod tests {
 
     #[test]
     fn spool_refuses_duplicate_ids_and_duplicate_oids() {
-        assert!(SemanticChangeSpool::from_changes([change(1), change(1)]).is_err());
+        assert!(SemanticChangeSpool::from_changes(spool_dir(), [change(1), change(1)]).is_err());
         let mut duplicate_oid = change(2);
         duplicate_oid.origin = change(1).origin;
-        assert!(SemanticChangeSpool::from_changes([change(1), duplicate_oid]).is_err());
+        assert!(SemanticChangeSpool::from_changes(spool_dir(), [change(1), duplicate_oid]).is_err());
     }
 
     #[test]
     fn spool_refuses_valid_same_length_message_tampering() {
         let original = change(1);
-        let spool = SemanticChangeSpool::from_changes([original.clone()]).unwrap();
+        let spool = SemanticChangeSpool::from_changes(spool_dir(), [original.clone()]).unwrap();
         assert_eq!(spool.read_at(0).unwrap(), Some(original.clone()));
         let mut tampered = original;
         tampered.message = "9".to_string();
@@ -263,7 +348,7 @@ mod tests {
     fn spool_refuses_index_identity_corruption_with_intact_digest() {
         for corrupt_oid in [false, true] {
             let original = change(1);
-            let mut spool = SemanticChangeSpool::from_changes([original.clone()]).unwrap();
+            let mut spool = SemanticChangeSpool::from_changes(spool_dir(), [original.clone()]).unwrap();
             assert_eq!(spool.read_at(0).unwrap(), Some(original.clone()));
             let storage = Arc::get_mut(&mut spool.0).unwrap();
             let record = &mut storage.records[0];
@@ -296,7 +381,7 @@ mod tests {
     #[test]
     fn spool_refuses_missing_truncated_tampered_and_appended_bodies() {
         for mode in 0..4 {
-            let spool = SemanticChangeSpool::from_changes([change(1)]).unwrap();
+            let spool = SemanticChangeSpool::from_changes(spool_dir(), [change(1)]).unwrap();
             let path = spool.0.file.path();
             match mode {
                 0 => std::fs::remove_file(path).unwrap(),
@@ -313,7 +398,7 @@ mod tests {
 
     #[test]
     fn spool_refuses_reordered_record_bytes() {
-        let spool = SemanticChangeSpool::from_changes([change(1), change(2)]).unwrap();
+        let spool = SemanticChangeSpool::from_changes(spool_dir(), [change(1), change(2)]).unwrap();
         let mut file = spool.0.file.reopen().unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
