@@ -1501,6 +1501,7 @@ impl Reconciler {
         let mut delta = TransactionDelta::default();
         let mut modified = Vec::new();
         let mut old_sources = HashMap::new();
+        let mut held_relations = HashMap::new();
         for candidate in &indexed.entities {
             if validate_entity(candidate).is_some() {
                 continue;
@@ -1534,6 +1535,49 @@ impl Reconciler {
             {
                 continue;
             }
+            let declaration = old
+                .span
+                .as_ref()
+                .expect("the source proof checked the span");
+            let mut relation_changes = Vec::new();
+            let mut evidence_verified = true;
+            for relation in
+                relations_held_at(graph, &mut held_relations, GraphNodeId::Entity(old.id))?.values()
+            {
+                let associated = relation
+                    .evidence
+                    .iter()
+                    .filter_map(|e| e.source_span.as_ref())
+                    .any(|span| {
+                        span.file == declaration.file
+                            && (relation.src == GraphNodeId::Entity(old.id)
+                                || (declaration.start_line <= span.start_line
+                                    && span.end_line <= declaration.end_line))
+                    });
+                if !associated {
+                    continue;
+                }
+                let Some(updated) = self.pipeline.rebase_partial_relation(
+                    old,
+                    candidate,
+                    &old_sources[hash],
+                    &source,
+                    relation,
+                    &existing,
+                ) else {
+                    evidence_verified = false;
+                    break;
+                };
+                if updated != *relation {
+                    relation_changes.push(RelationDelta::Modified {
+                        old: relation.clone(),
+                        new: updated,
+                    });
+                }
+            }
+            if !evidence_verified {
+                continue;
+            }
             let mut new = candidate.clone();
             new.id = old.id;
             new.lineage_parent = old.lineage_parent;
@@ -1555,6 +1599,7 @@ impl Reconciler {
                 continue;
             }
             modified.push(old.id);
+            delta.relation_deltas.extend(relation_changes);
             delta.entity_deltas.push(EntityDelta::Modified {
                 old: old.clone(),
                 new,
@@ -1584,8 +1629,8 @@ impl Reconciler {
             },
             delta,
         )?;
-        // No layout, link-universe, or relation retirement: this pass has no
-        // complete-file enumeration or verified resolution dependencies.
+        // No layout, link-universe, or relation retirement: only exact call
+        // locations with stable same-file resolution were refreshed.
         for change in &result.delta.entity_deltas {
             if let EntityDelta::Modified { new, .. } = change {
                 self.lkg.record(new);
@@ -2896,6 +2941,170 @@ mod tests {
             &after[span.start_byte..span.end_byte],
             "int good(void) { int longer_name = 1; return longer_name; }"
         );
+    }
+
+    const PARTIAL_CALL_C: &str = "int helper(void) { return 7; }\nint good(void) {\n  int value=1;\n  return helper();\n}\nint bad(void) { test_cond(1) }\n";
+
+    fn partial_call_span(source: &str, whole: bool, zero_bytes: bool) -> kin_model::SourceSpan {
+        let start = source.find("helper()").unwrap();
+        let end = start
+            + if whole {
+                "helper()".len()
+            } else {
+                "helper".len()
+            };
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u32;
+        let column = start - source[..start].rfind('\n').map_or(0, |offset| offset + 1);
+        kin_model::SourceSpan {
+            file: FilePathId::new("test.c"),
+            start_byte: if zero_bytes { 0 } else { start },
+            end_byte: if zero_bytes { 0 } else { end },
+            start_line: line,
+            end_line: line,
+            start_col: column as u32,
+            end_col: (column + end - start) as u32,
+        }
+    }
+
+    fn partial_enriched_call(
+        graph: &kin_db::InMemoryGraph,
+        source: &str,
+        whole: bool,
+        zero_bytes: bool,
+    ) -> (Entity, Relation) {
+        let entities = graph.list_all_entities().unwrap();
+        let caller = entities
+            .iter()
+            .find(|entity| entity.name == "good")
+            .unwrap()
+            .clone();
+        let callee = entities
+            .iter()
+            .find(|entity| entity.name == "helper")
+            .unwrap();
+        let mut relation = relation_of(kin_model::RelationOrigin::Lsp);
+        relation.src = GraphNodeId::Entity(caller.id);
+        relation.dst = GraphNodeId::Entity(callee.id);
+        relation.confidence = 0.75;
+        relation.evidence = vec![kin_model::RelationEvidence {
+            source_span: Some(partial_call_span(source, whole, zero_bytes)),
+            ..Default::default()
+        }];
+        graph.upsert_relation(&relation).unwrap();
+        (caller, relation)
+    }
+
+    #[test]
+    fn partial_c_rebases_unique_call_evidence_without_changing_relation_identity() {
+        for (whole, zero_bytes) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (_dir, blobs, graph, mut reconciler) = partial_fixture(PARTIAL_CALL_C);
+            let (caller, relation) =
+                partial_enriched_call(&graph, PARTIAL_CALL_C, whole, zero_bytes);
+            let after = format!(
+                "// prefix\n{}",
+                PARTIAL_CALL_C.replace("int value=1;", "int renamed=1;\n\n")
+            );
+            let result = partial_pass(&mut reconciler, &blobs, &graph, &after);
+            assert!(
+                matches!(&result.outcome, ReconcileOutcome::PartiallyUpdated { modified, .. } if modified.contains(&caller.id)),
+                "{:?}",
+                result.outcome
+            );
+            assert!(result
+                .delta
+                .relation_deltas
+                .iter()
+                .all(|delta| matches!(delta, RelationDelta::Modified { .. })));
+            graph.apply_transaction_delta(&result.delta).unwrap();
+            let actual = graph
+                .get_all_relations_for_entity(&caller.id)
+                .unwrap()
+                .into_iter()
+                .find(|held| held.id == relation.id)
+                .unwrap();
+            let mut expected = relation.clone();
+            expected.evidence[0].source_span = Some(partial_call_span(&after, whole, false));
+            assert_eq!(actual, expected, "only the proven coordinates may change");
+            assert_eq!(
+                graph
+                    .get_entity(&caller.id)
+                    .unwrap()
+                    .unwrap()
+                    .metadata
+                    .extra["blob_hash"],
+                kin_blobs::digest(after.as_bytes()).to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn partial_c_refuses_ambiguous_or_unsupported_located_evidence_atomically() {
+        for failure in [
+            "duplicate",
+            "range",
+            "coordinates",
+            "multiple",
+            "kind",
+            "binding",
+        ] {
+            let before = if failure == "duplicate" {
+                PARTIAL_CALL_C.replace("return helper();", "helper(); return helper();")
+            } else {
+                PARTIAL_CALL_C.into()
+            };
+            let (_dir, blobs, graph, mut reconciler) = partial_fixture(&before);
+            let (caller, mut relation) = partial_enriched_call(&graph, &before, false, false);
+            match failure {
+                "range" => relation.evidence[0].source_span = caller.span.clone(),
+                "coordinates" => relation.evidence[0].source_span.as_mut().unwrap().start_col += 1,
+                "multiple" => relation.evidence.push(kin_model::RelationEvidence {
+                    source_span: caller.span.clone(),
+                    ..Default::default()
+                }),
+                "kind" => relation.kind = RelationKind::References,
+                _ => {}
+            }
+            graph.upsert_relation(&relation).unwrap();
+            let after = format!(
+                "// prefix\n{}",
+                if failure == "binding" {
+                    before.replace("int value=1;", "int helper=1;")
+                } else {
+                    before.replace("int value=1;", "int renamed=1;\n\n")
+                }
+            );
+            let result = partial_pass(&mut reconciler, &blobs, &graph, &after);
+            assert!(
+                !result
+                    .delta
+                    .entity_deltas
+                    .iter()
+                    .any(|delta| delta.target_id() == caller.id),
+                "{failure}: {:?}",
+                result.outcome
+            );
+            assert!(
+                !result
+                    .delta
+                    .relation_deltas
+                    .iter()
+                    .any(|delta| delta.target_id() == relation.id),
+                "{failure}"
+            );
+            graph.apply_transaction_delta(&result.delta).unwrap();
+            assert_eq!(graph.get_entity(&caller.id).unwrap(), Some(caller));
+            assert_eq!(
+                graph
+                    .get_all_relations_for_entity(&relation.src.as_entity().unwrap())
+                    .unwrap()
+                    .into_iter()
+                    .find(|held| held.id == relation.id),
+                Some(relation)
+            );
+        }
     }
 
     #[test]

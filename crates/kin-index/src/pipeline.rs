@@ -158,6 +158,196 @@ impl IndexPipeline {
         true
     }
 
+    /// Move only uniquely identified direct-call evidence through a proven
+    /// partial declaration refresh. Resolution must name one stable, complete
+    /// function in this same file; all other located evidence refuses admission.
+    pub fn rebase_partial_relation(
+        &self,
+        old: &Entity,
+        new: &Entity,
+        old_source: &[u8],
+        source: &[u8],
+        relation: &Relation,
+        file_entities: &[Entity],
+    ) -> Option<Relation> {
+        self.partial_relation_evidence(old, new, old_source, source, relation, file_entities, false)
+    }
+
+    /// Verify the coordinates persisted for an already admitted declaration.
+    pub fn verifies_partial_relation(
+        &self,
+        old: &Entity,
+        new: &Entity,
+        old_source: &[u8],
+        source: &[u8],
+        relation: &Relation,
+        file_entities: &[Entity],
+    ) -> bool {
+        self.partial_relation_evidence(old, new, old_source, source, relation, file_entities, true)
+            .is_some_and(|expected| expected == *relation)
+    }
+
+    fn partial_relation_evidence(
+        &self,
+        old: &Entity,
+        new: &Entity,
+        old_source: &[u8],
+        source: &[u8],
+        relation: &Relation,
+        file_entities: &[Entity],
+        current: bool,
+    ) -> Option<Relation> {
+        use kin_parser::adapter::LanguageAdapter;
+        let was = old.span.as_ref()?;
+        let now = new.span.as_ref()?;
+        if !relation
+            .evidence
+            .iter()
+            .any(|e| e.source_span.as_ref().is_some_and(|s| s.file == was.file))
+        {
+            return Some(relation.clone());
+        }
+        if relation.src.as_entity() != Some(old.id)
+            || relation.kind != kin_model::RelationKind::Calls
+            || !self.supports_partial_refresh(old, new, old_source, source)
+        {
+            return None;
+        }
+        let target_id = relation.dst.as_entity()?;
+        let target = file_entities.iter().find(|entity| entity.id == target_id)?;
+        if target.kind != kin_model::EntityKind::Function || target.span.as_ref()?.file != was.file
+        {
+            return None;
+        }
+        let adapter = kin_parser::languages::CAdapter;
+        let before = adapter.parse(old_source).ok()?;
+        let after = adapter.parse(source).ok()?;
+        let old_sites =
+            kin_parser::languages::c_lang::partial_call_sites(&before, old_source, was)?;
+        let new_sites = kin_parser::languages::c_lang::partial_call_sites(&after, source, now)?;
+        let before_entities: Vec<_> = adapter
+            .extract(&before, old_source, &was.file)
+            .ok()?
+            .entities
+            .into_iter()
+            .map(|entity| {
+                entity.into_entity_with_source(LanguageId::C, &was.file, Some(old_source))
+            })
+            .collect();
+        let after_entities: Vec<_> = adapter
+            .extract(&after, source, &was.file)
+            .ok()?
+            .entities
+            .into_iter()
+            .map(|entity| entity.into_entity_with_source(LanguageId::C, &was.file, Some(source)))
+            .collect();
+        for entities in [
+            file_entities,
+            before_entities.as_slice(),
+            after_entities.as_slice(),
+        ] {
+            let matched: Vec<_> = entities
+                .iter()
+                .filter(|entity| entity.name == target.name && entity.kind == target.kind)
+                .collect();
+            if matched.len() != 1 || matched[0].signature != target.signature {
+                return None;
+            }
+        }
+        for (tree, bytes, entities) in [
+            (&before, old_source, &before_entities),
+            (&after, source, &after_entities),
+        ] {
+            let declaration = entities
+                .iter()
+                .find(|entity| entity.name == target.name && entity.kind == target.kind)?
+                .span
+                .as_ref()?;
+            kin_parser::languages::c_lang::partial_function_context(
+                tree,
+                bytes,
+                declaration.start_byte,
+                declaration.end_byte,
+            )?;
+        }
+        let span_matches =
+            |observed: &kin_model::SourceSpan, syntax: &kin_model::SourceSpan, bytes: &[u8]| {
+                if observed.start_byte != 0 || observed.end_byte != 0 {
+                    return observed == syntax;
+                }
+                let coordinates_match = observed.file == syntax.file
+                    && observed.start_line == syntax.start_line
+                    && observed.end_line == syntax.end_line
+                    && observed.start_col == syntax.start_col
+                    && observed.end_col == syntax.end_col;
+                // Zero-byte LSP positions can use UTF-16 columns. ASCII prefixes
+                // make that representation identical to parser byte columns.
+                coordinates_match
+                    && [
+                        (syntax.start_line, syntax.start_col),
+                        (syntax.end_line, syntax.end_col),
+                    ]
+                    .iter()
+                    .all(|(line, column)| {
+                        bytes
+                            .split(|byte| *byte == b'\n')
+                            .nth(*line as usize)
+                            .and_then(|line| line.get(..*column as usize))
+                            .is_some_and(|prefix| prefix.is_ascii())
+                    })
+            };
+        let mut updated = relation.clone();
+        for evidence in &mut updated.evidence {
+            let Some(span) = evidence.source_span.as_ref() else {
+                continue;
+            };
+            if span.file != was.file {
+                continue;
+            }
+            let (sites, bytes) = if current {
+                (&new_sites, source)
+            } else {
+                (&old_sites, old_source)
+            };
+            let matched: Vec<_> = sites
+                .iter()
+                .filter_map(|site| {
+                    if span_matches(span, &site.call_span, bytes) {
+                        Some((site, true))
+                    } else if span_matches(span, &site.callee_span, bytes) {
+                        Some((site, false))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if matched.len() != 1 {
+                return None;
+            }
+            let (site, whole_call) = matched[0];
+            if site.callee != target.name {
+                return None;
+            }
+            let same_call = |candidate: &&kin_parser::languages::c_lang::PartialCallSite| {
+                candidate.callee == site.callee && candidate.expression == site.expression
+            };
+            if old_sites.iter().filter(same_call).count() != 1
+                || new_sites.iter().filter(same_call).count() != 1
+            {
+                return None;
+            }
+            let placed = new_sites.iter().find(|candidate| {
+                candidate.callee == site.callee && candidate.expression == site.expression
+            })?;
+            evidence.source_span = Some(if whole_call {
+                placed.call_span.clone()
+            } else {
+                placed.callee_span.clone()
+            });
+        }
+        Some(updated)
+    }
+
     pub fn new() -> Self {
         Self {
             registry: AdapterRegistry::new(),
