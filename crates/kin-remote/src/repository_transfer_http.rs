@@ -157,6 +157,7 @@ impl HttpRepositoryTransferTransport {
     pub fn new(endpoint: RepositoryTransferEndpoint) -> Self {
         let agent: Agent = Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(endpoint.timeout_secs)))
+            .max_redirects(0)
             // A repository-v6 refusal carries the violated invariant in its
             // response body. Keep the response available so this layer can
             // preserve that reason while mapping the status to the right
@@ -487,6 +488,42 @@ mod tests {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    fn transfer_credentials_allow_loopback_and_refuse_redirects() {
+        for post in [false, true] {
+            for redirect in [false, true] {
+                let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                target.set_nonblocking(true).unwrap();
+                let response = if redirect {
+                    format!("HTTP/1.1 302 Found\r\nLocation: http://{}/redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", target.local_addr().unwrap())
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_owned()
+                };
+                let (url, server) = crate::http_transport::tests::serve_once(response);
+                let transport = HttpRepositoryTransferTransport::new(
+                    RepositoryTransferEndpoint::new(&url)
+                        .with_auth("fixture-token")
+                        .with_timeout(1),
+                );
+                let id = RepositoryId::new("kin").unwrap();
+                let result: Result<serde_json::Value> = if post {
+                    transport.post_json(&id, &url, &serde_json::json!({}), "fixture")
+                } else {
+                    transport.get_json(&id, &url, "fixture")
+                };
+                assert_eq!(result.is_ok(), !redirect, "post={post} redirect={redirect}");
+                let request = server.join().unwrap();
+                assert!(request
+                    .to_lowercase()
+                    .contains("authorization: bearer fixture-token"));
+                assert_eq!(
+                    target.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+        }
     }
 
     #[test]
