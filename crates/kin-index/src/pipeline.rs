@@ -73,6 +73,91 @@ pub struct IndexPipeline {
 }
 
 impl IndexPipeline {
+    /// Verify a conservative refresh against both complete, digest-bound C
+    /// inputs. This proves only one existing declaration, never file coverage.
+    pub fn supports_partial_refresh(
+        &self,
+        old: &Entity,
+        new: &Entity,
+        old_source: &[u8],
+        source: &[u8],
+    ) -> bool {
+        use kin_parser::adapter::LanguageAdapter;
+        if old.language != LanguageId::C
+            || new.language != LanguageId::C
+            || old.kind != kin_model::EntityKind::Function
+            || new.kind != old.kind
+            || old.name != new.name
+            || old.signature != new.signature
+            || old.file_origin != new.file_origin
+        {
+            return false;
+        }
+        let (Some(was), Some(now)) = (&old.span, &new.span) else {
+            return false;
+        };
+        if was.file != now.file {
+            return false;
+        }
+        let digest_matches = |entity: &Entity, bytes: &[u8]| {
+            entity
+                .metadata
+                .extra
+                .get("blob_hash")
+                .and_then(|v| v.as_str())
+                == Some(kin_blobs::digest(bytes).to_string().as_str())
+        };
+        if !digest_matches(old, old_source) || !digest_matches(new, source) {
+            return false;
+        }
+        let adapter = kin_parser::languages::CAdapter;
+        let (Ok(before), Ok(after)) = (adapter.parse(old_source), adapter.parse(source)) else {
+            return false;
+        };
+        let before_context = kin_parser::languages::c_lang::partial_function_context(
+            &before,
+            old_source,
+            was.start_byte,
+            was.end_byte,
+        );
+        let after_context = kin_parser::languages::c_lang::partial_function_context(
+            &after,
+            source,
+            now.start_byte,
+            now.end_byte,
+        );
+        if before_context.is_none() || before_context != after_context {
+            return false;
+        }
+        // Old graph identity must actually describe its claimed source, rather
+        // than a stale span coincidentally landing on another declaration.
+        for (tree, bytes, entity) in [(&before, old_source, old), (&after, source, new)] {
+            let Ok(parsed) = adapter.extract(tree, bytes, &was.file) else {
+                return false;
+            };
+            let matches: Vec<_> = parsed
+                .entities
+                .into_iter()
+                .filter(|e| e.name == entity.name && e.kind == entity.kind)
+                .collect();
+            if matches.len() != 1 {
+                return false;
+            }
+            let verified = matches.into_iter().next().unwrap().into_entity_with_source(
+                LanguageId::C,
+                &was.file,
+                Some(bytes),
+            );
+            if verified.span != entity.span
+                || verified.signature != entity.signature
+                || verified.fingerprint.behavior_hash != entity.fingerprint.behavior_hash
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn new() -> Self {
         Self {
             registry: AdapterRegistry::new(),
