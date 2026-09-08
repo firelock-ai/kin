@@ -20,6 +20,13 @@ embeddings = ["kin-db/embeddings"]
 # kin-infer/metal backend on Linux too. The real `kin-db/metal` activation is in the
 # `[target.'cfg(target_os = "macos")'.dependencies]` block below (additive via unification).
 metal = ["embeddings"]
+# Hosted object-store publication for `kin hosted-publication`. Not default: the
+# public binary release.yml builds is a laptop CLI that never publishes into a
+# hosted bucket, and a GCP client in every download is dependency weight and
+# attack surface for a capability only the hosted worker uses. The worker is the
+# container image, and `Dockerfile` already builds `--bin kin` under
+# `--features kin-daemon/gcs`, whose feature list forwards this one on.
+gcs = ["kin-remote/gcs"]
 
 [[bin]]
 name = "kin"

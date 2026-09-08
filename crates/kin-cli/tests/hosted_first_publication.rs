@@ -820,18 +820,107 @@ fn an_intent_recording_another_publication_is_never_replaced() {
     );
 }
 
-#[test]
-fn a_gcs_destination_is_refused_by_name() {
-    let case = Case::new();
-    let mut manifest = native_manifest(&case.path("destination"), "trunk");
-    manifest["destination"] = json!({ "kind": "gcs", "bucket": "kin-graph", "prefix": "hosted" });
-    write_manifest(&case.path("manifest.json"), &manifest);
+/// A manifest whose destination is a bucket rather than a directory.
+///
+/// Only the build without the object-store client uses it. The build with one
+/// has its own suite, in `hosted_publication_object_store.rs`, because a
+/// feature-gated case inside this ungated binary would be compiled by clippy
+/// and executed by no test job.
+#[cfg(not(feature = "gcs"))]
+fn object_store_manifest(bucket: &str, prefix: &str) -> serde_json::Value {
+    let mut manifest = native_manifest(Path::new("/unused"), "trunk");
+    manifest["destination"] = json!({ "kind": "gcs", "bucket": bucket, "prefix": prefix });
+    manifest
+}
 
-    let error = run_publish(case.publish_args("native-empty"))
-        .expect_err("an object-store destination is not implemented by this build");
+/// Without the client, the destination is refused, and the refusal says which
+/// half is missing.
+///
+/// Every value in the destination was still validated before this point, so the
+/// message names them. An operator who reads it learns their configuration was
+/// fine and their binary was not, which is a different fix from the one a bare
+/// capability refusal sends them looking for.
+#[cfg(not(feature = "gcs"))]
+#[test]
+fn an_object_store_destination_is_refused_by_a_build_without_the_client() {
+    use kin_cli::commands::hosted_publication::{run_publish_with_env, DestinationEnv};
+
+    let case = Case::new();
+    write_manifest(
+        &case.path("manifest.json"),
+        &object_store_manifest("kin-graph", "hosted"),
+    );
+
+    let error = run_publish_with_env(
+        case.publish_args("native-empty"),
+        &DestinationEnv::default(),
+    )
+    .expect_err("an object-store destination needs a client this build does not carry");
+    let rendered = format!("{error:#}");
     assert!(
-        format!("{error:#}").contains("destination_backend_unavailable"),
-        "the refusal names the missing capability: {error:#}"
+        rendered.contains("destination_backend_unavailable"),
+        "the refusal names the missing capability: {rendered}"
+    );
+    assert!(
+        rendered.contains("gcs:kin-graph/hosted"),
+        "the refusal names the destination it refused: {rendered}"
+    );
+    assert!(
+        rendered.contains("production-adc"),
+        "the refusal names the service it would have used: {rendered}"
+    );
+}
+
+/// A filesystem run's record gains nothing from the object-store wiring.
+///
+/// The hosted control plane's decoder refuses an unknown top-level field, so a
+/// record that grew one would be refused at the store rather than read. The
+/// exact encoding is frozen by a unit test in the module itself; this is the
+/// same guarantee over a real publication's output.
+#[test]
+fn a_filesystem_publication_records_no_destination_service() {
+    let case = Case::new();
+    write_manifest(
+        &case.path("manifest.json"),
+        &native_manifest(&case.path("destination"), "trunk"),
+    );
+    assert_eq!(
+        run_publish(case.publish_args("native-empty")).expect("publish"),
+        0
+    );
+
+    let raw = fs::read_to_string(case.path("evidence.json")).expect("read evidence");
+    assert!(
+        !raw.contains("destination_service"),
+        "a filesystem record carries no service field: {raw}"
+    );
+    let rendered: serde_json::Value = serde_json::from_str(&raw).expect("decode evidence");
+    let keys: Vec<&str> = rendered
+        .as_object()
+        .expect("the record is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    // The exact set, not a subset and not one derived from the record itself.
+    // A published run carries no differences and no detail, both of which are
+    // skipped when empty, so this is every key such a record has ever had.
+    //
+    // Sorted, because a decoded `serde_json::Value` holds its object in a
+    // BTreeMap and cannot report the order the bytes carried. Order is asserted
+    // where it can be, over the encoder itself, by
+    // `a_filesystem_evidence_record_is_byte_identical_to_what_this_adapter_has_always_written`
+    // in the module's own tests.
+    assert_eq!(
+        keys,
+        [
+            "echoed",
+            "measured",
+            "operation",
+            "outcome",
+            "repository_id",
+            "schema"
+        ],
+        "the top-level shape is exactly what it was before object-store publication"
     );
 }
 

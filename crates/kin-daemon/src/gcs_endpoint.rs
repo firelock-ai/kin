@@ -54,7 +54,7 @@ pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct ResolvedEndpoint {
     /// Normalized base URL, scheme included and no trailing slash.
     pub url: String,
-    /// Host as written, for the probe and for error messages.
+    /// Host without IPv6 brackets, suitable for socket address resolution.
     pub host: String,
     /// Port, defaulted from the scheme when the value omitted one.
     pub port: u16,
@@ -97,60 +97,24 @@ pub fn resolve(
 /// that the Google clients also accept for `STORAGE_EMULATOR_HOST`, defaulting
 /// a missing scheme to `http` and a missing port to the scheme's own.
 fn parse_endpoint(value: &str, source: &'static str) -> Result<ResolvedEndpoint, String> {
-    let (scheme, rest) = match value.split_once("://") {
-        None => ("http", value),
-        Some((scheme, rest)) => {
-            let scheme = match scheme.to_ascii_lowercase().as_str() {
-                "http" => "http",
-                "https" => "https",
-                other => {
-                    return Err(format!(
-                        "its scheme {other:?} is not supported (expected http or https)"
-                    ))
-                }
-            };
-            (scheme, rest)
-        }
-    };
-
-    // A base URL is an origin. Anything past the authority would be silently
-    // dropped or silently prepended depending on the caller, so refuse it here
-    // where the operator can still see which variable to fix.
-    let authority = match rest.split_once('/') {
-        None => rest,
-        Some((authority, "")) => authority,
-        Some((_, path)) => {
-            return Err(format!(
-                "it carries a path (/{path}); an endpoint must be scheme, host and port only"
-            ))
-        }
-    };
-
-    if authority.is_empty() {
-        return Err("it has no host".to_string());
-    }
-
-    let (host, port) = match authority.rsplit_once(':') {
-        None => (authority, if scheme == "https" { 443_u16 } else { 80_u16 }),
-        Some((host, port_text)) => {
-            let port = port_text
-                .parse::<u16>()
-                .map_err(|_| format!("its port {port_text:?} is not a number in 1..=65535"))?;
-            if port == 0 {
-                return Err("its port is 0, which cannot be connected to".to_string());
-            }
-            (host, port)
-        }
-    };
-
-    if host.is_empty() {
-        return Err("it has no host".to_string());
-    }
-
+    let validated = kin_remote::first_publication_gcs::GcsEndpointOverride::parse(value, source)
+        .map_err(|error| error.to_string())?;
+    let url = validated.url();
+    // The shared parser always emits a scheme and an explicit numeric port.
+    let (_, authority) = url
+        .split_once("://")
+        .expect("validated endpoint has a scheme");
+    let (host, port) = authority
+        .rsplit_once(':')
+        .expect("validated endpoint has a port");
+    let probe_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     Ok(ResolvedEndpoint {
-        url: format!("{scheme}://{host}:{port}"),
-        host: host.to_string(),
-        port,
+        url: url.to_owned(),
+        host: probe_host.to_owned(),
+        port: port.parse().expect("validated endpoint has a numeric port"),
         source,
     })
 }
@@ -502,6 +466,34 @@ mod tests {
             .expect("load reaches the emulator")
             .expect("the snapshot just written must be there");
         assert_eq!(loaded, payload, "round trip must preserve the bytes");
+    }
+
+    #[test]
+    fn bracketed_ipv6_endpoint_resolves_and_reaches_a_listener() {
+        let listener = TcpListener::bind("[::1]:0").expect("bind IPv6 loopback");
+        let port = listener.local_addr().expect("address").port();
+        let endpoint = resolve(Some(&format!("http://[::1]:{port}")), None)
+            .expect("parse IPv6 endpoint")
+            .expect("explicit emulator");
+        assert_eq!(endpoint.url, format!("http://[::1]:{port}"));
+        assert_eq!(endpoint.probe_reachable(Duration::from_secs(2)), Ok(()));
+        let default_port = resolve(Some("https://[::1]"), None)
+            .expect("parse IPv6 without port")
+            .expect("explicit emulator");
+        assert_eq!(default_port.url, "https://[::1]:443");
+    }
+
+    #[test]
+    fn malformed_brackets_and_credentials_never_fall_through() {
+        for bad in [
+            "http://[::1",
+            "http://[::1]x:4443",
+            "http://user:pass@host:4443",
+        ] {
+            let error = resolve(Some(bad), Some("http://localhost:4443"))
+                .expect_err("invalid first lever must refuse instead of falling through");
+            assert!(error.contains(KIN_ENDPOINT_VAR), "{error}");
+        }
     }
 
     #[test]
