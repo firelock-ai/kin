@@ -246,13 +246,13 @@ memory while it runs.
 while that happens:
 
 ```
-  [ 1/17] check admission blockers 0.2s
-  [ 2/17] capture Git repository 1.4s
-  [ 3/17] build Git authority 0.2s
-  [ 4/17] plan semantic import 3.1s
-  [ 5/17] derive semantic history 41.7s
+  [ 1/16] check admission blockers 0.2s
+  [ 2/16] capture Git repository 1.4s
+  [ 3/16] build Git authority 0.2s
+  [ 4/16] plan semantic import 3.1s
+  [ 5/16] derive semantic history 41.7s
   ...
-  [17/17] seal published content 12.9s
+  [16/16] seal published content 12.9s
   admitted exact Git repository in 118.3s
 ```
 
