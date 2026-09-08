@@ -4011,6 +4011,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    include!("loop_runner_startup_diagnostics.rs");
+
     fn open_test_state(repo: &tempfile::TempDir) -> Arc<DaemonState> {
         let init = kin_core::init(repo.path()).unwrap();
         Arc::new(DaemonState::open(init.layout).unwrap())
