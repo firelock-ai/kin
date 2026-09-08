@@ -1103,14 +1103,22 @@
     },
     {
       "file": "crates/kin-git/src/history_spool.rs",
-      "reason": "Temporary Git ingestion storage, not a semantic answer path. The import owns this temporary file and appends only captured semantic change records. Each read checks the exact file length, record checksum and identity before admission. These single-occurrence pins cover the temporary-file type, its construction in the directory the caller owns, and the length probe only; they permit no repository walk, raw-file search or answer fallback. The construction pin moved from NamedTempFile::new() to tempfile_in on 2026-09-08: the default temporary directory is tmpfs on most Linux hosts, which put the spooled history back in RAM and defeated the whole point of spooling it, so the caller now names the directory.",
+      "reason": "Temporary Git ingestion storage, not a semantic answer path. The import owns this temporary file and appends only captured semantic change records. Reads verify pathname identity, file length, record checksum and record identity before admission. Exact occurrence-counted pins cover the temporary-file type and construction, the pathname and held-descriptor metadata checks, and platform-specific file traits and parameters for positioned reads. Function bodies remain scanned: these pins permit no repository walk, raw-file search or answer fallback. The caller chooses the spool directory so the history is not silently placed on a RAM-backed temporary filesystem.",
       "owner": "kin-git",
       "expiration": "2027-03-31",
       "allow_match": [
         "use tempfile::NamedTempFile;",
         "file: NamedTempFile,",
         ".tempfile_in(directory)",
-        ".metadata()"
+        ".metadata()",
+        "std::fs::metadata(path)",
+        "use std::os::unix::fs::MetadataExt;",
+        {
+          "expr": "file: &std::fs::File",
+          "count": 2
+        },
+        "use std::os::unix::fs::FileExt;",
+        "use std::os::windows::fs::FileExt;"
       ]
     },
     {
