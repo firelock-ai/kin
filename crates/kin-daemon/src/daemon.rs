@@ -7187,6 +7187,39 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn watch_arming_failure_refuses_before_endpoint_publication() {
+        use tracing_subscriber::layer::SubscriberExt;
+        struct Publications(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Publications {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Published(bool);
+                impl tracing::field::Visit for Published {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message"
+                            && format!("{value:?}").contains("published the daemon endpoint")
+                        {
+                            self.0 = true;
+                        }
+                    }
+                }
+                let mut published = Published(false);
+                event.record(&mut published);
+                if published.0 {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let publications = Arc::new(AtomicUsize::new(0));
+        let _capture = crate::capture_events_on_this_thread(
+            tracing_subscriber::registry().with(Publications(Arc::clone(&publications))),
+        );
         let repo = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let initialized = kin_core::init(repo.path()).unwrap();
@@ -7211,6 +7244,11 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            publications.load(Ordering::Relaxed),
+            0,
+            "a failed probe must never publish, even if shutdown later removes the endpoint files"
+        );
         assert!(
             matches!(result, Err(crate::error::DaemonError::Index(ref error)) if error.to_string().contains("outside the watched root")),
             "a refused delivery probe must fail startup with its actual cause: {result:?}"

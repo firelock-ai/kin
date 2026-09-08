@@ -566,7 +566,7 @@ mod tests {
         std::fs::create_dir(repo.path().join(".kin")).unwrap();
         let result = FileWatcher::new_ready_for_path(
             repo.path(),
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(3),
             Some(PathBuf::from(".kin/control-that-was-never-written")),
         )
         .await;
