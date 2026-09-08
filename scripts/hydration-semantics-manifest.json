@@ -81,15 +81,22 @@
     },
     {
       "file": "crates/kin-git/src/semantic_import.rs",
+      "function": "enrich_with_historical_semantics",
+      "digest": "sha256:55c0a72caa42c1e3007ae05e585218b937f9e0a98725292af2c16d9f9749bae7",
+      "reason": "Authors streamed historical changes by assigning derived entity and relation deltas, remapping ordered parents and recomputing each change identity before appending it to the immutable import spool.",
+      "owner": "kin-git"
+    },
+    {
+      "file": "crates/kin-git/src/semantic_import.rs",
       "function": "apply_historical_semantic_deltas_unchecked",
-      "digest": "sha256:00011e7492e9b4ef835399341902828cd7f2b2d6a9c9acd6ed9cb30736740599",
+      "digest": "sha256:081473c61df5a77661c8a568040bb68df6fd98f651ac6c86010e2d5907a08bda",
       "reason": "Writes the derived deltas onto the imported changes and recomputes their identities. This is the step that makes replayed semantics the persisted historical record.",
       "owner": "kin-git"
     },
     {
       "file": "crates/kin-git/src/semantic_import.rs",
       "function": "build_semantic_git_import_plan",
-      "digest": "sha256:ed93f0f407020066a009c3199882636dfd58f5c970e249241e0719beb341f875",
+      "digest": "sha256:2ed27a40851d26425c5611377b624fadf1417ba575c8d8eb567dc3f6c768e803",
       "reason": "Builds the parent-first change sequence replay consumes, walking under frontier retention so a tree is held only while a later commit still resolves against it. Its ordering and tree selection decide the baseline every historical delta is computed against.",
       "owner": "kin-git"
     },
