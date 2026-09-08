@@ -2190,6 +2190,76 @@ mod tests {
         }
     }
 
+    /// Deterministic historical semantics for one change, so the two
+    /// enrichment paths can be handed exactly the same deltas.
+    ///
+    /// Empty deltas cannot tell those paths apart. `entity_deltas` and
+    /// `relation_deltas` are part of what `compute_semantic_change_id` seals,
+    /// so a comparison that leaves both empty grades every id as an
+    /// unenriched change's id and proves nothing about enrichment itself.
+    /// These carry real content, and the ids fall out of it.
+    #[cfg(unix)]
+    fn historical_deltas_for(index: usize) -> (Vec<EntityDelta>, Vec<RelationDelta>) {
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId,
+            FingerprintAlgorithm, GraphNodeId, LanguageId, Relation, RelationId, RelationKind,
+            RelationOrigin, SemanticFingerprint, Visibility,
+        };
+
+        let file = format!("src/commit_{index}.rs");
+        let entity = |name: &str, line: u32, seed: u8| Entity {
+            id: EntityId::from_content(&file, name, "function", line),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([seed; 32]),
+                signature_hash: Hash256::from_bytes([seed ^ 0x11; 32]),
+                behavior_hash: Hash256::from_bytes([seed ^ 0x22; 32]),
+                equivalence_hash: Hash256::from_bytes([seed ^ 0x33; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(file.clone())),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Private,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+
+        let seed = u8::try_from(index).unwrap_or(u8::MAX);
+        let added = entity("added", 1, 0x10 ^ seed);
+        let before = entity("edited", 9, 0x40);
+        let after = entity("edited", 9, 0x50 ^ seed);
+        let relation = Relation {
+            id: RelationId::from_content(&added.id.to_string(), &after.id.to_string(), "calls"),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(added.id),
+            dst: GraphNodeId::Entity(after.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+
+        (
+            vec![
+                EntityDelta::Added { new: added },
+                EntityDelta::Modified {
+                    old: before,
+                    new: after,
+                },
+            ],
+            vec![RelationDelta::Added { new: relation }],
+        )
+    }
+
     #[cfg(unix)]
     #[test]
     fn spooled_history_preserves_enrichment_and_refuses_missing_or_reordered_records() {
@@ -2201,10 +2271,24 @@ mod tests {
         )
         .unwrap();
         let plan = plan_semantic_git_import(&snapshot, &fixture.blob_store).unwrap();
-        let bindings = plan
+        // Keyed by change id, not by position, so the whole-plan arm and the
+        // streaming arm bind the same deltas to the same change however each
+        // one reaches it.
+        let deltas_by_change = plan
             .changes
             .ids()
-            .map(|id| HistoricalSemanticBinding::owned(id, Vec::new(), Vec::new()))
+            .enumerate()
+            .map(|(index, id)| (id, historical_deltas_for(index)))
+            .collect::<BTreeMap<_, _>>();
+        let bindings = deltas_by_change
+            .iter()
+            .map(|(id, (entity_deltas, relation_deltas))| {
+                HistoricalSemanticBinding::owned(
+                    *id,
+                    entity_deltas.clone(),
+                    relation_deltas.clone(),
+                )
+            })
             .collect();
         let legacy = plan
             .clone()
@@ -2213,14 +2297,29 @@ mod tests {
         let streamed = plan
             .clone()
             .enrich_with_historical_semantics(&fixture.blob_store, &mut |change, _tree| {
+                let (entity_deltas, relation_deltas) = deltas_by_change
+                    .get(&change.id)
+                    .expect("every held change was given deltas")
+                    .clone();
                 Ok(HistoricalSemanticBinding::owned(
                     change.id,
-                    Vec::new(),
-                    Vec::new(),
+                    entity_deltas,
+                    relation_deltas,
                 ))
             })
             .unwrap();
         assert_eq!(streamed, legacy);
+        // The equality above is only worth its name while the deltas it
+        // compares are real. Without this, a future edit that empties them
+        // leaves a green test grading the unenriched case again.
+        for change in streamed.changes.iter() {
+            let change = change.unwrap();
+            assert!(
+                !change.entity_deltas.is_empty() && !change.relation_deltas.is_empty(),
+                "change {} was compared without enrichment",
+                change.id
+            );
+        }
         streamed.validate(&fixture.blob_store).unwrap();
         let admitted = admit_semantic_git_import(&streamed, &fixture.blob_store).unwrap();
         admitted.validate(&fixture.blob_store).unwrap();
