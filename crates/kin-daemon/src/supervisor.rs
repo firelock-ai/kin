@@ -1111,9 +1111,9 @@ fn previous_auth_token_from_env() -> Option<String> {
 /// token is environment-only with no on-disk fallback.
 fn resolve_serve_rotation_tokens(
     dir: &Path,
-) -> Result<crate::auth_rotation::RotationTokens, crate::auth_rotation::RotationConfigError> {
+) -> std::io::Result<crate::auth_rotation::RotationTokens> {
     crate::auth_rotation::RotationTokens::new(
-        resolve_serve_auth_token(dir),
+        resolve_serve_auth_token(dir)?,
         previous_auth_token_from_env(),
         SUPERVISOR_AUTH_TOKEN_ENV,
         SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV,
@@ -1121,8 +1121,12 @@ fn resolve_serve_rotation_tokens(
         crate::auth_rotation::RotationBounds::from_env(
             SUPERVISOR_AUTH_ROTATION_WINDOW_SECS_ENV,
             SUPERVISOR_AUTH_ROTATION_MAX_ACCEPTS_ENV,
-        )?,
+        )
+        .map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?,
     )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()))
 }
 
 /// Load the per-install supervisor loopback token, generating and persisting one
@@ -1206,20 +1210,18 @@ fn with_supervisor_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBui
 /// Resolve the auth token the serving supervisor enforces: an explicit
 /// `KIN_SUPERVISOR_AUTH_TOKEN` override always wins. Otherwise the per-install
 /// loopback token is auto-provisioned under `.kin/` (so local clients can adopt
-/// it) but only returned for enforcement when `KIN_SUPERVISOR_REQUIRE_TOKEN`
-/// is set. Mirrors `api::resolve_serve_auth_token`.
-fn resolve_serve_auth_token(dir: &Path) -> Option<String> {
+/// it) and enforced unless `KIN_SUPERVISOR_REQUIRE_TOKEN` explicitly opts out.
+/// Provisioning failure refuses startup when enforcement is enabled. Mirrors `api::resolve_serve_auth_token`.
+fn resolve_serve_auth_token(dir: &Path) -> std::io::Result<Option<String>> {
     if let Some(env_token) = auth_token_from_env() {
-        return Some(env_token);
+        return Ok(Some(env_token));
     }
     match ensure_loopback_token(dir) {
-        Ok(token) => loopback_token_enforced().then_some(token),
+        Ok(token) => Ok(loopback_token_enforced().then_some(token)),
+        Err(error) if loopback_token_enforced() => Err(error),
         Err(error) => {
-            warn!(
-                %error,
-                "failed to provision supervisor loopback auth token; supervisor will run without bearer auth"
-            );
-            None
+            tracing::warn!(%error, "failed to provision token while bearer authentication is explicitly disabled");
+            Ok(None)
         }
     }
 }
@@ -1478,6 +1480,25 @@ async fn deregister_daemon(
     }))
 }
 
+async fn bind_supervisor_listener(
+    dir: &Path,
+    addr: SocketAddr,
+) -> std::io::Result<(
+    tokio::net::TcpListener,
+    crate::auth_rotation::RotationTokens,
+)> {
+    let tokens = resolve_serve_rotation_tokens(dir)?;
+    if !addr.ip().is_loopback() && !tokens.is_enforced() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "KIN_SUPERVISOR_AUTH_TOKEN (or KIN_SUPERVISOR_REQUIRE_TOKEN) is required when binding the supervisor to a non-loopback host",
+        ));
+    }
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    Ok((listener, tokens))
+}
+
 pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::io::Result<()> {
     let state_dir = supervisor_dir();
     let startup = kin_cli::daemon_client::validate_supervisor_runtime_startup(&state_dir)?;
@@ -1499,17 +1520,7 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
     // which rejects a non-loopback daemon bind that has no auth token. The
     // Host/Origin guard is always active; the token is the second layer for
     // non-browser local/LAN callers.
-    let tokens = resolve_serve_rotation_tokens(&supervisor_dir()).map_err(|error| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-    })?;
-    if !addr.ip().is_loopback() && !tokens.is_enforced() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "KIN_SUPERVISOR_AUTH_TOKEN (or KIN_SUPERVISOR_REQUIRE_TOKEN) is required when binding the supervisor to a non-loopback host",
-        ));
-    }
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let (listener, tokens) = bind_supervisor_listener(&state_dir, addr).await?;
     let bound_port = listener.local_addr()?.port();
     write_supervisor_endpoint_files(&state_dir, &supervisor_lock, bound_port)?;
     if let Err(error) = startup.acknowledge() {
@@ -3616,6 +3627,35 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn token_provisioning_failure_refuses_supervisor_auth_resolution() {
+        let _env = env_test_lock();
+        let mut env = kin_core::test_env::EnvVarGuard::unset("KIN_SUPERVISOR_AUTH_TOKEN")
+            .without("KIN_SUPERVISOR_REQUIRE_TOKEN")
+            .without("KIN_SUPERVISOR_AUTH_TOKEN_PREVIOUS");
+        let scratch = tempfile::tempdir().unwrap();
+        let invalid_parent = scratch.path().join("not-a-directory");
+        std::fs::write(&invalid_parent, "fixture").unwrap();
+        assert!(resolve_serve_auth_token(&invalid_parent).is_err());
+        assert!(resolve_serve_rotation_tokens(&invalid_parent).is_err());
+        let addr = "127.0.0.1:0".parse().unwrap();
+        assert!(bind_supervisor_listener(&invalid_parent, addr)
+            .await
+            .is_err());
+        env.apply("KIN_SUPERVISOR_REQUIRE_TOKEN", Some("off"));
+        assert_eq!(resolve_serve_auth_token(&invalid_parent).unwrap(), None);
+        assert!(bind_supervisor_listener(&invalid_parent, addr)
+            .await
+            .is_ok());
+        env.apply("KIN_SUPERVISOR_AUTH_TOKEN", Some("explicit-test-token"));
+        assert_eq!(
+            resolve_serve_auth_token(&invalid_parent)
+                .unwrap()
+                .as_deref(),
+            Some("explicit-test-token")
+        );
+    }
+
     /// Serialize tests that mutate process-global `KIN_SUPERVISOR_*` env so they
     /// cannot race. Shares one lock with every other env-mutating test in this
     /// binary (see `crate::test_env_lock`).
@@ -4159,7 +4199,7 @@ mod tests {
         // provisioned token is returned and required, so the machine-wide
         // control plane is not readable by every local process.
         assert_eq!(
-            resolve_serve_auth_token(&dir).as_deref(),
+            resolve_serve_auth_token(&dir).unwrap().as_deref(),
             Some(token.as_str()),
             "the supervisor must enforce its loopback token by default"
         );
@@ -4167,7 +4207,7 @@ mod tests {
         // A truthy KIN_SUPERVISOR_REQUIRE_TOKEN is the same as the default.
         tokens.apply("KIN_SUPERVISOR_REQUIRE_TOKEN", Some("1"));
         assert_eq!(
-            resolve_serve_auth_token(&dir).as_deref(),
+            resolve_serve_auth_token(&dir).unwrap().as_deref(),
             Some(token.as_str())
         );
 
@@ -4176,7 +4216,7 @@ mod tests {
         for opted_out in ["0", "false", "no", "off", " OFF "] {
             tokens.apply("KIN_SUPERVISOR_REQUIRE_TOKEN", Some(opted_out));
             assert!(
-                resolve_serve_auth_token(&dir).is_none(),
+                resolve_serve_auth_token(&dir).unwrap().is_none(),
                 "{opted_out:?} must opt out of supervisor bearer auth"
             );
         }
@@ -4185,7 +4225,7 @@ mod tests {
         // An explicit KIN_SUPERVISOR_AUTH_TOKEN override always wins.
         tokens.apply("KIN_SUPERVISOR_AUTH_TOKEN", Some("explicit-override"));
         assert_eq!(
-            resolve_serve_auth_token(&dir).as_deref(),
+            resolve_serve_auth_token(&dir).unwrap().as_deref(),
             Some("explicit-override")
         );
     }

@@ -18,6 +18,64 @@ use std::time::Duration;
 use tracing::{debug, warn};
 use ureq::Agent;
 
+/// Require TLS for credentials except on literal loopback development endpoints.
+/// Validation does not rewrite the URL used to key saved credentials.
+pub fn validate_credential_url(raw: &str) -> Result<(), &'static str> {
+    let url = url::Url::parse(raw).map_err(|_| "invalid credential endpoint URL")?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host().is_none()
+    {
+        return Err("credential endpoint must not contain userinfo, a query, or a fragment");
+    }
+    match url.scheme() {
+        "https" => Ok(()),
+        "http"
+            if matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
+                || matches!(url.host(), Some(url::Host::Ipv6(ip)) if ip.is_loopback()) =>
+        {
+            Ok(())
+        }
+        _ => Err("credential endpoint requires HTTPS or a literal loopback HTTP address"),
+    }
+}
+
+#[cfg(test)]
+mod credential_url_tests {
+    use super::validate_credential_url;
+
+    #[test]
+    fn credential_urls_require_tls_except_loopback() {
+        for raw in [
+            "https://example.com",
+            "https://example.com/prefix/",
+            "http://127.0.0.1:4219",
+            "http://127.42.0.2",
+            "http://[::1]:4219",
+        ] {
+            assert!(validate_credential_url(raw).is_ok(), "{raw}");
+        }
+        for raw in [
+            "http://example.com",
+            "http://localhost",
+            "http://127.0.0.1.example.com",
+            "http://[::ffff:127.0.0.1]",
+            "http://0.0.0.0",
+            "http://192.168.1.1",
+            "ftp://127.0.0.1",
+            "file:///tmp/a",
+            "https://user:password@example.com",
+            "https://example.com?x=y",
+            "https://example.com#fragment",
+            "not a URL",
+        ] {
+            assert!(validate_credential_url(raw).is_err(), "{raw}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------

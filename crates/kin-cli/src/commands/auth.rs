@@ -609,6 +609,7 @@ fn prompt_for_code() -> Result<String> {
 }
 
 pub(crate) fn load_saved_bearer_token(base_url: &str) -> Option<String> {
+    kin_remote::http_transport::validate_credential_url(base_url).ok()?;
     load_credential(base_url, true)
         .ok()
         .flatten()
@@ -654,13 +655,20 @@ pub(crate) fn default_cli_actor_id(base_url: &str) -> String {
     )
 }
 
+fn credential_http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
 pub async fn login(
     base_url: Option<String>,
     no_browser: bool,
     provider: AuthProvider,
 ) -> Result<()> {
     let base_url = normalized_base_url(base_url);
-    let client = reqwest::Client::new();
+    kin_remote::http_transport::validate_credential_url(&base_url).map_err(anyhow::Error::msg)?;
+    let client = credential_http_client()?;
     let code_verifier = random_token(32);
     let code_challenge = pkce_challenge(&code_verifier);
 
@@ -837,9 +845,10 @@ pub async fn status(base_url: Option<String>) -> Result<()> {
 
 pub async fn whoami(base_url: Option<String>) -> Result<()> {
     let base_url = normalized_base_url(base_url);
+    kin_remote::http_transport::validate_credential_url(&base_url).map_err(anyhow::Error::msg)?;
     let credential = load_credential(&base_url, true)?
         .ok_or_else(|| anyhow::anyhow!("no KinLab auth credential stored for {}", base_url))?;
-    let response = reqwest::Client::new()
+    let response = credential_http_client()?
         .get(format!("{}/api/session", base_url))
         .bearer_auth(&credential.token)
         .send()
@@ -930,10 +939,11 @@ fn logout_lines(
 
 pub async fn logout(base_url: Option<String>) -> Result<()> {
     let base_url = normalized_base_url(base_url);
+    kin_remote::http_transport::validate_credential_url(&base_url).map_err(anyhow::Error::msg)?;
     let revocation = match load_credential(&base_url, true)? {
         None => None,
         Some(credential) => Some(
-            match reqwest::Client::new()
+            match credential_http_client()?
                 .post(format!("{}/api/cli/auth/logout", base_url))
                 .bearer_auth(&credential.token)
                 .send()
@@ -963,6 +973,66 @@ pub async fn logout(base_url: Option<String>) -> Result<()> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[tokio::test]
+    async fn credential_commands_refuse_insecure_urls_before_store_access() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().join("credentials");
+        let _root = TestCredentialRoot::set(&root);
+        for base in [
+            "http://localhost:1",
+            "http://example.com",
+            "http://127.0.0.1.example.com",
+            "ftp://127.0.0.1",
+        ] {
+            let login_error = login(Some(base.into()), true, AuthProvider::default())
+                .await
+                .unwrap_err();
+            let whoami_error = whoami(Some(base.into())).await.unwrap_err();
+            let logout_error = logout(Some(base.into())).await.unwrap_err();
+            for error in [login_error, whoami_error, logout_error] {
+                assert!(error.to_string().contains("requires HTTPS"), "{error}");
+            }
+            assert!(load_saved_bearer_token(base).is_none());
+        }
+        assert!(
+            !root.exists(),
+            "refusal must precede credential store access"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_http_client_does_not_follow_body_preserving_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buffer = [0; 4096];
+            let n = connection.read(&mut buffer).unwrap();
+            assert!(n > 0);
+            connection.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/forwarded\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        kin_remote::http_transport::validate_credential_url(&base).unwrap();
+        let response = credential_http_client()
+            .unwrap()
+            .post(&base)
+            .bearer_auth("fixture-token")
+            .json(&serde_json::json!({"codeVerifier": "fixture"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        server.join().unwrap();
+        let exact = "https://EXAMPLE.com:443/prefix";
+        assert_eq!(normalized_base_url(Some(exact.into())), exact);
+        assert_ne!(
+            account_key(exact),
+            account_key("https://example.com/prefix")
+        );
+    }
 
     /// FIR-3257. A logout removes every persisted form of the credential it
     /// just logged out of.
