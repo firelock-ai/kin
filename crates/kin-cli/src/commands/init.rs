@@ -1323,8 +1323,9 @@ fn existing_repository_refusal(dir: &Path) -> String {
     }
     format!(
         "Kin repository already exists at {}; `kin init` never rebuilds graph authority from the \
-         working tree. If this build cannot open that store, {} again to rebuild it from the \
-         repository's Git history.",
+         working tree. If this build cannot open that store, {}. Preserve a complete backup \
+         outside .kin/ before attempting recovery. Git history cannot recover native Kin \
+         changes, reviews, specs, workspace identity or remote configuration.",
         dir.display(),
         super::REBUILD_INCOMPATIBLE_STORE
     )
