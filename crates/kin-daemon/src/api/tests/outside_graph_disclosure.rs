@@ -31,7 +31,7 @@ use kin_model::entity::{
 use kin_model::graph::EntityStore as _;
 use kin_model::ids::{EntityId, FilePathId, Hash256, LanguageId};
 
-use crate::api::disclose_outside_graph;
+use crate::api::{bound_mcp_tool_result, disclose_outside_graph};
 
 /// The express question, verbatim from the run that found this.
 const EXPRESS_QUESTION: &str = "where router.param callbacks are registered and stored, and how a \
@@ -357,4 +357,156 @@ async fn a_question_under_either_argument_name_is_disclosed_on_the_route() {
             "{tool}: a question naming nothing outside the graph is served untouched: {local}"
         );
     }
+}
+
+/// Fitting a disclosed payload preserves its coverage block.
+#[test]
+fn a_disclosed_payload_is_refitted_rather_than_shipped_over_its_ceiling() {
+    let graph = express_graph();
+    let budget = kin_mcp::budget::ResponseBudget {
+        max_chars: 4_000,
+        ..kin_mcp::budget::ResponseBudget::default()
+    };
+    let payload = json!({
+        "total_upstream": 24,
+        "references": (0..24).map(|index| json!({
+            "entity_id": format!("reference-{index}"),
+            "name": format!("caller_{index}"),
+            "file_path": "lib/application.js",
+            "reference_lines": (0..40).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "degradations": [],
+        "counts": { "receiver_name_candidates": 0 },
+    });
+    let built = result_with(payload);
+    let kin_mcp::ContentBlock::Text { text: raw } =
+        built.content.first().expect("one content block");
+    assert!(
+        raw.len() > budget.max_chars,
+        "the fixture must start over its ceiling: {}",
+        raw.len()
+    );
+
+    let fitted = bound_mcp_tool_result(built, "find_references", &budget);
+    let kin_mcp::ContentBlock::Text { text: after_fit } =
+        fitted.content.first().expect("one content block");
+    assert!(after_fit.len() <= budget.max_chars, "{}", after_fit.len());
+
+    let disclosed = disclose_outside_graph(Some(&graph), Some(EXPRESS_QUESTION), fitted);
+    let block = payload_of(&disclosed);
+    assert!(
+        block.get("outside_graph").is_some(),
+        "the disclosure must fire, or the ceiling below is never pressured: {block}"
+    );
+
+    let emitted = bound_mcp_tool_result(disclosed, "find_references", &budget);
+    let kin_mcp::ContentBlock::Text { text } = emitted.content.first().expect("one content block");
+    assert!(
+        text.len() <= budget.max_chars,
+        "a disclosed response still fits its ceiling: {} > {}",
+        text.len(),
+        budget.max_chars
+    );
+    let shipped: Value = serde_json::from_str(text).expect("the emitted payload is JSON");
+    assert!(shipped.get("outside_graph").is_some(), "{shipped}");
+    assert!(
+        shipped.get("_kin_json_format").is_none(),
+        "the serialization control field does not ship: {shipped}"
+    );
+}
+
+/// The emitted HTTP payload includes the disclosure and still fits its ceiling.
+#[tokio::test]
+async fn a_disclosed_payload_is_refitted_on_the_http_route() {
+    let state = super::test_state();
+    seed_express_entities(&state.graph);
+    for index in 0..24 {
+        state
+            .graph
+            .upsert_entity(&entity(
+                &format!("router_param_callback_{index}"),
+                Some("lib/application.js"),
+                EntityRole::Source,
+                EntityKind::Function,
+            ))
+            .unwrap();
+    }
+    state
+        .is_initialized
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let tool = "semantic_locate";
+    let mut pressured = 0;
+    // Coverage metadata varies by host. Find a ceiling that refitting can meet,
+    // while proving the disclosure alone pushes the emitted payload over it.
+    for ceiling in (4_000..=12_000).step_by(100) {
+        let arguments: std::collections::HashMap<String, Value> = serde_json::from_value(json!({
+            "query": EXPRESS_QUESTION,
+            "max_response_chars": ceiling,
+            "limit": 24,
+        }))
+        .unwrap();
+        let budget = kin_mcp::budget::ResponseBudget::from_arguments(&arguments);
+        let axum::Json(raw) = crate::api::mcp_tools_call_inner(
+            axum::http::HeaderMap::new(),
+            axum::extract::State(state.clone()),
+            axum::Json(crate::api::McpToolCallRequest {
+                name: tool.into(),
+                arguments: arguments.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(raw.is_error, Some(true));
+        let fitted = bound_mcp_tool_result(raw, tool, &budget);
+        let kin_mcp::ContentBlock::Text { text: initial } = &fitted.content[0];
+        if initial.len() > ceiling {
+            continue;
+        }
+        let before_disclosure = payload_of(&fitted);
+        assert!(before_disclosure.get("outside_graph").is_none());
+        let disclosed =
+            disclose_outside_graph(Some(state.graph.as_ref()), Some(EXPRESS_QUESTION), fitted);
+        let block = payload_of(&disclosed);
+        assert!(block.get("outside_graph").is_some());
+        let kin_mcp::ContentBlock::Text { text: unfitted } = &disclosed.content[0];
+        if unfitted.len() <= ceiling {
+            continue;
+        }
+        let control = bound_mcp_tool_result(disclosed.clone(), tool, &budget);
+        let kin_mcp::ContentBlock::Text { text: fitted } = &control.content[0];
+        if fitted.len() > ceiling {
+            continue;
+        }
+        pressured += 1;
+        let request = axum::http::Request::post("/mcp/tools/call")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({"name":tool,"arguments":arguments}).to_string(),
+            ))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(crate::api::router(state.clone()), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let result: kin_mcp::ToolCallResult = serde_json::from_slice(&body).unwrap();
+        let kin_mcp::ContentBlock::Text { text } = &result.content[0];
+        assert_ne!(result.is_error, Some(true), "{text}");
+        assert!(
+            text.len() <= ceiling,
+            "HTTP payload is {} bytes against {ceiling}; without the final fit it was {}",
+            text.len(),
+            unfitted.len()
+        );
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert!(payload.get("outside_graph").is_some(), "{payload}");
+        assert!(payload.get("_kin_json_format").is_none());
+        break;
+    }
+    assert!(
+        pressured > 0,
+        "the fixture must exceed at least one ceiling after disclosure"
+    );
 }

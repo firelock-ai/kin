@@ -37,6 +37,7 @@ function classify(marker) {
   if (!marker || typeof marker !== "object") return "unreadable";
   if (marker.unreadable === true) return "unreadable";
   if (marker.schema !== MARKER_SCHEMA) return "unreadable";
+  if (marker.state === "failed" && marker.reason === "reconcile_failed") return "failed";
   if (marker.state === "clear") return "clear";
   if (marker.state !== "held") return "unreadable";
   if (!Number.isInteger(marker.drift) || marker.drift < 0) return "unreadable";
@@ -206,6 +207,18 @@ export function decide({ markers, issue, threshold = DEFAULT_THRESHOLD }) {
       detail:
         "The newest release-train hold marker could not be read, so the rail's " +
         "state is unknown. An unknown never opens an alarm and never closes one.",
+    };
+  }
+
+  if (state === "failed") {
+    return {
+      action: open ? "update" : "open",
+      reason: "reconcile_failed",
+      ...(open ? { issue: open.number } : {}),
+      title: ALARM_TITLE,
+      body: `Release reconciliation did not complete successfully. No release progress is established by this cycle.\n\n` +
+        `Inspect the failed step in ${newest.run_url || `run ${newest.run_id ?? "unknown"}`}.\n\n` +
+        `Repair that failure through the reviewed release workflow. This alarm does not authorize a new candidate, retry or tag abandonment.`,
     };
   }
 

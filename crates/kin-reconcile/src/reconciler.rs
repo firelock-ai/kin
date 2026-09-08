@@ -935,6 +935,17 @@ impl Reconciler {
             }
         }
 
+        // An incomplete parse cannot establish that an unmatched declaration
+        // was deleted. Refuse before deriving removals or changing projection
+        // state; the entrypoint restores the tentative LKG updates on error.
+        if matches!(indexed.parse_state, ParseState::Incomplete { .. }) {
+            if existing.iter().any(|entity| !claimed.contains(&entity.id)) {
+                return Err(ReconcileError::IncompleteParseWouldDelete {
+                    file_id: file_id.clone(),
+                });
+            }
+        }
+
         // Entities that existed before but are no longer in the file -> removed.
         // Claiming as we go keeps one delta per entity even if graph truth
         // handed back the same entity twice, and walking `existing` rather than

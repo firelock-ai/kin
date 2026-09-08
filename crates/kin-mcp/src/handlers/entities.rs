@@ -420,13 +420,10 @@ pub fn handle_get_entity_source<G: GraphStore>(
 
     match store.get_entity(&entity_id).map_err(McpError::graph)? {
         Some(entity) => {
-            let exact_source = read_entity_source_excerpt_detailed(
-                store,
+            let exact_source = read_entity_source_exact(
+                &HeldSourceAuthority::new(store, repository_authority),
                 &entity,
-                10_000,
                 1_000_000,
-                repository_authority,
-                EntitySourceScope::WorkspaceHead,
             )?
             .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
             let source = LAST_READ_SOURCE.with(|f| f.get());
@@ -811,22 +808,25 @@ pub fn handle_get_entity_sources<G: GraphStore>(
 const CERTIFIED_DEPENDENTS_MAX: usize = 24;
 
 pub const GET_CONTEXT_PACK_DESC: &str = "\
-Assemble a focused, ready-to-read context bundle around one entity, fitted to a token \
-budget. Starting from a focal entity ID, Kin walks the relation graph to gather the \
-nearby code you'd actually need to understand or change it — the focal body plus its \
-direct dependencies (signatures), and optionally transitive deps, linked tests, \
-contracts, work items, and annotations — and returns it all in a single structured \
+Assemble a focused context bundle around one entity, fitted to a token budget. \
+Starting from a focal entity ID, Kin walks the relation graph to gather its body, \
+direct dependency signatures, and optional transitive dependencies, linked tests, \
+contracts, work items and annotations. It returns them in one structured \
 response with the token accounting included. Reach for it when a question is about a \
 unit of code in context (\"what does X do and what does it touch?\") rather than a single \
-isolated body. Its value is that it replaces an open-ended chain of \
-get_entity_source / find_references calls — which burns round-trips and easily blows \
-your context window — with one budgeted call. `token_budget` bounds the content the pack \
-selects, and it cannot bound the envelope that content travels in, so read `tokens_used`, \
-which measures the serialized response this call returns, as what the call costs you. \
-`focal_entity.body` in the response IS the focal entity's exact source text, so this one \
-call already answers \"show me the code\": no follow-up read is needed, and it is the body \
-to edit and stage back, in compact mode too, which drops the dependency bodies and \
-projection levels but never the focal body. The two directions are separate groups, because they answer opposite questions: \
+isolated body. It replaces an open-ended chain of get_entity_source and find_references \
+calls with one pack. `token_budget` and `max_response_chars` bound the \
+serialized context payload, including its envelope. `tokens_used` reports the estimated \
+token cost of that complete payload. \
+`focal_entity.body`, when `body_complete` is true, is the exact graph-owned source span, \
+byte for byte, in compact mode too. A span that cannot be served is absent, never clipped \
+or reconstructed past its recorded boundary. Check `body_complete` and the row's \
+`body_unavailable` reason before relying on a body. `body_elided` containing \
+\"body\" identifies a budget cut; a removed FullBody projection becomes SignatureOnly \
+and `projection_downgraded_from` records that change. Source-sizing metadata such as \
+`body_bytes` is included when available. For a budget cut, raise `max_response_chars` \
+and `token_budget`, or request the source separately with get_entity_source. A missing \
+graph span needs corrected graph coverage. The two directions are separate groups: \
 `dependencies` is what the focal needs to run, and `dependents` is what breaks if you \
 change it. Every row also says why it is there: `relation: \"dependency_edge\"` is an \
 edge leaving the focal, `relation: \"dependent_edge\"` is an edge arriving at it, and \
@@ -867,9 +867,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
     sessions: &SessionRegistry,
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
-    use kin_context::{
-        build_context_pack_with_traffic_and_provenance, ContextOptions, DependencyRelation,
-    };
+    use kin_context::{build_context_pack_with_traffic_and_provenance, ContextOptions};
     use kin_model::context::TokenBudget;
 
     // Several focals, or a question the daemon already resolved into them, take
@@ -908,416 +906,523 @@ pub fn handle_get_context_pack<G: GraphStore>(
         vec![]
     };
 
-    let (pack, selection) =
+    let (traffic_pack, _) =
         build_context_pack_with_traffic_and_provenance(store, &entity_id, &opts, &nearby_intents)
             .map_err(|e| McpError::Context(e.to_string()))?;
-
-    // Build structured response JSON. The pack still has to have projected a
-    // focal entry for the focal entity to be worth serializing, but the body
-    // comes from graph truth rather than from that entry.
-    let focal_entry = pack.focal_entities.first();
-    let focal_entity = store.get_entity(&entity_id).map_err(McpError::graph)?;
-
-    // One held authority for the whole pack. A pack projects the focal entity
-    // and then a body per dependency it carries, so deriving authority per
-    // projection multiplies a full recovery by the pack's size.
     let held = HeldSourceAuthority::new(store, repository_authority);
-
-    let focal_json = if let (Some(_), Some(entity)) = (focal_entry, &focal_entity) {
-        focal_context_json_held(&held, entity)?
-    } else {
-        serde_json::json!(null)
+    let fields = ContextSourceFields::default();
+    let mut provider = ContextSourceProvider {
+        held: &held,
+        fields: fields.clone(),
     };
-
-    // `relation` is what keeps a same-file neighbour from reading as a
-    // dependency. The builder tags the fallback inside `entry.content`, which
-    // this handler does not serialize, so without the selection travelling
-    // alongside the pack the two are indistinguishable on the wire. Rows in the
-    // sections that are not dependencies (transitive, tests, contracts) pass
-    // `None` and carry no relation at all.
-    let project_dep = |entry: &kin_model::context::ContextEntry,
-                       relation: Option<DependencyRelation>|
-     -> Result<serde_json::Value> {
-        // Look up the entity for structured fields.
-        if let Some(e) = store
-            .get_entity(&entry.entity_id)
-            .map_err(McpError::graph)?
-        {
-            let mut obj = serde_json::json!({
-                "id": e.id,
-                "name": e.name,
-                "kind": e.kind,
-                "signature": e.signature,
-                "file_path": e.file_origin.as_ref().map(|p| p.to_string()),
-                "read_path": entity_read_path(&e),
-                "start_line": entity_presentation_start_line(&e),
-                "end_line": entity_presentation_end_line(&e),
-            });
-            if let Some(relation) = relation {
-                obj["relation"] = serde_json::json!(relation.as_str());
-            }
-            if !compact {
-                obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
-                // A dependency whose file the current workspace does not contain
-                // is still a dependency graph truth asserts, so it stays in the
-                // pack and says why it has no body. Dropping it would shrink a
-                // structural answer silently, and failing here would lose the
-                // whole pack over one entity that history explains.
-                let (body, absent_reason) = match read_entity_source_excerpt_detailed_held(
-                    &held,
-                    &e,
-                    MCP_SOURCE_MAX_LINES,
-                    MCP_SOURCE_MAX_CHARS,
-                    EntitySourceScope::WorkspaceHead,
-                ) {
-                    Ok(body) => (body, None),
-                    Err(error) if is_absent_at_generation(&error) => {
-                        (None, Some(error.to_string()))
-                    }
-                    Err(error) => return Err(error),
-                };
-                let source = LAST_READ_SOURCE.with(|f| f.get());
-                obj["source"] = serde_json::json!(source);
-                // Same rule as the focal body: a dependency's `body` is the
-                // graph-owned projection or null. The pack's own `entry.content`
-                // is a token-accounting stub, and serving it here would hand an
-                // agent signature text shaped like an implementation.
-                match body {
-                    Some(source) => {
-                        obj["body"] = serde_json::json!(source.body);
-                        if let Some(map) = obj.as_object_mut() {
-                            map.extend(source_provenance_fields(&source));
-                        }
-                    }
-                    None => {
-                        obj["body"] = serde_json::Value::Null;
-                        obj["body_unavailable"] = serde_json::json!(
-                            absent_reason.unwrap_or_else(|| entity_body_gap_reason(&e))
-                        );
-                    }
-                }
-            }
-            Ok(obj)
-        } else {
-            let mut obj = serde_json::json!({
-                "id": entry.entity_id.to_string(),
-                "content": entry.content,
-            });
-            if let Some(relation) = relation {
-                obj["relation"] = serde_json::json!(relation.as_str());
-            }
-            Ok(obj)
-        }
+    let bytes = crate::budget::ResponseBudget::from_arguments(args).max_chars;
+    let limits = kin_context::ProjectionLimits {
+        max_candidate_bytes: bytes,
+        max_retained_bytes: bytes,
     };
-
-    // Membership of the `dependents` group is decided by the edge authority
-    // `find_references` reads, on the same store, in the same request. The two
-    // surfaces answer the same question about the same entity, so a pack that
-    // decided it independently could disagree with the tool beside it, and it
-    // did: on expressjs/express `res.sendFile` packed `dependents: []` while
-    // `find_references` on that id returned `res.download`, which calls it.
-    //
-    // This is the same call `handle_find_references` makes, not a second
-    // implementation of it. Everything that decides what counts as a reference
-    // -- the allowed edge classes, the self-edge exclusion, composition over
-    // proven overrides, and dropping a caller the workspace no longer contains
-    // -- is that function's, so the two cannot drift apart by being edited
-    // separately.
-    let reference_kinds = default_reference_kinds();
-    let reference_rows =
-        collect_graph_reference_rows(store, &entity_id, &reference_kinds, repository_authority)?;
-    // Observed before the partition, because a candidate row still witnesses the
-    // edge class it arrived on. Same rule as the reference tool's, so the
-    // coverage the pack publishes is the coverage that tool would publish.
-    let witnessed = match &focal_entity {
-        Some(entity) => answer_witnessed_classes(store, entity, &reference_rows),
-        None => Vec::new(),
+    let render = SingleContextRender {
+        store,
+        repository_authority,
+        entity_id,
+        compact,
+        include_traffic,
+        budget,
+        traffic: std::cell::RefCell::new(traffic_pack.traffic),
+        traffic_withheld: std::cell::Cell::new(0),
+        entities: std::cell::RefCell::new(HashMap::new()),
+        references: std::cell::OnceCell::new(),
     };
-    // FIR-1552 again, in the direction that matters here: a row matched on a
-    // bare receiver name with nothing at the site proving the destination is a
-    // candidate, not a caller. `find_references` withholds it from its count,
-    // so a pack that promoted it to a dependent would be certifying what the
-    // reference surface declined to.
-    let mut certified_rows: Vec<ReferenceRow> = reference_rows
-        .into_iter()
-        .filter(|row| !row.receiver_name_guess)
-        .collect();
-    certified_rows.sort_by(|left, right| {
-        left.file_path
-            .cmp(&right.file_path)
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.entity_id.cmp(&right.entity_id))
-    });
-    let certified_ids: Vec<kin_model::ids::EntityId> = certified_rows
-        .iter()
-        .filter_map(|row| row.entity_id.as_deref())
-        .filter_map(|id| parse_entity_id(id).ok())
-        .collect();
-    let certified: std::collections::HashSet<kin_model::ids::EntityId> =
-        certified_ids.iter().copied().collect();
-    // What the graph can structurally answer over the classes the group was
-    // built from. An empty `dependents` is only evidence about the code when
-    // this says the focal's language links those classes across files, and
-    // nothing else in a pack reports it.
-    let edge_coverage = match &focal_entity {
-        Some(entity) => crate::edge_coverage::observe_cross_file_reference_coverage_witnessed(
-            store,
-            entity,
-            &reference_kinds,
-            &witnessed,
-        ),
-        None => serde_json::Value::Null,
-    };
-    // Whether a caller could have reached this focal through a call the linker
-    // recorded no edge for (FIR-2775), read exactly as `find_references` reads
-    // it and published under the same key.
-    //
-    // A pack's `dependents` group is built by the same collector over the same
-    // edges, so it inherits the same gap and has to report it the same way. The
-    // method gate beside this one is shared for precisely that reason: gating a
-    // shared gap on the tool name alone was how two surfaces over one graph came
-    // to answer opposite things about one entity, the tool that refused to
-    // certify and the tool that published `[]` reading the identical incomplete
-    // call graph. Adding a new gap to one surface and not the other would
-    // rebuild that disagreement from scratch.
-    let caller_arrival = match &focal_entity {
-        Some(entity) => crate::caller_arrival::observe_caller_arrival(store, entity).to_json(),
-        None => serde_json::Value::Null,
-    };
-
-    // The dependency section carries both directions, so it is served as two
-    // groups named for what they are. Serving it as one list called
-    // `dependencies` reported a focal's callers as things the focal depends on,
-    // which is the opposite claim and the one an agent acts on when it decides
-    // what it may safely change. The builder has already ordered the section so
-    // real dependencies precede dependents and fallback neighbours, and that
-    // order survives the partition.
-    let mut dependencies: Vec<serde_json::Value> = Vec::new();
-    let mut dependents: Vec<serde_json::Value> = Vec::new();
-    let mut packed: std::collections::HashSet<kin_model::ids::EntityId> =
-        std::collections::HashSet::new();
-    for entry in &pack.dependency_signatures {
-        let packed_relation = selection.relation_for(&entry.entity_id);
-        // The union, never the intersection. A certified caller is a dependent
-        // whatever the pack's own section made of it, and an arriving edge of a
-        // class the reference surface does not read -- `UsesType`, `Implements`,
-        // `Extends` -- is still a dependent the pack can see and that surface
-        // cannot. Taking either one alone would drop real blast radius.
-        let relation = if certified.contains(&entry.entity_id) {
-            DependencyRelation::DependentEdge
-        } else {
-            packed_relation
-        };
-        let mut row = project_dep(entry, Some(relation))?;
-        match relation {
-            DependencyRelation::DependentEdge => {
-                // Nothing is lost when a pair is joined both ways. The pack used
-                // to resolve that by calling the neighbour a dependency, which
-                // on a JavaScript object literal spends a weak leaving
-                // `References` edge to erase a real arriving `Calls` -- and
-                // every sibling method has that shape, so a focal lost its whole
-                // caller set at once. The group is decided by the arriving edge
-                // and the other direction is stated on the row.
-                if packed_relation == DependencyRelation::DependencyEdge {
-                    row["bidirectional"] = serde_json::json!(true);
-                }
-                packed.insert(entry.entity_id);
-                dependents.push(row);
-            }
-            DependencyRelation::DependencyEdge | DependencyRelation::SameFileNeighbor => {
-                dependencies.push(row)
-            }
-        }
-    }
-    // A certified caller the pack's own section never reached -- shed by the
-    // builder's token budget, or missed by its subgraph walk -- is exactly the
-    // shape this defect had. Recovering it here is what makes the group's
-    // membership a property of the answer rather than of how much budget was
-    // left, and the recovered rows carry the same shape as the projected ones so
-    // a reader cannot tell which path produced them.
-    let mut dependents_withheld = 0usize;
-    for id in &certified_ids {
-        if packed.contains(id) {
-            continue;
-        }
-        if dependents.len() >= CERTIFIED_DEPENDENTS_MAX {
-            dependents_withheld += 1;
-            continue;
-        }
-        let entry = kin_model::context::ContextEntry {
-            entity_id: *id,
-            projection_level: kin_model::context::ProjectionLevel::SignatureOnly,
-            content: String::new(),
-        };
-        dependents.push(project_dep(
-            &entry,
-            Some(DependencyRelation::DependentEdge),
-        )?);
-        packed.insert(*id);
-    }
-    let transitive: Vec<_> = pack
-        .transitive_deps
-        .iter()
-        .map(|entry| project_dep(entry, None))
-        .collect::<Result<Vec<_>>>()?;
-
-    // The cap and the fallback are both invisible in the rows themselves: six
-    // neighbours out of twenty-four look exactly like six dependencies. This
-    // says which selection ran and what it dropped, in every mode, because a
-    // caller deciding whether to ask again needs it most when the answer is
-    // small.
-    let returned = dependencies.len();
-    let dependents_returned = dependents.len();
-    let mut result = serde_json::json!({
-        "focal_entity": focal_json,
-        "dependencies": dependencies,
-        // Always present, empty included. "no dependents" and "this build does
-        // not report dependents" are different answers, and a group that
-        // appears only when populated cannot tell them apart. What separates
-        // them now is `edge_coverage` and the response's `negative` verdict:
-        // an empty group on a graph that demonstrably links this language's
-        // edges across files is an answer, and an empty group on one that does
-        // not is a gap, and both used to serialize as `[]`.
-        "dependents": dependents,
-        "dependency_selection": {
-            "source": selection.source().as_str(),
-            "returned": returned,
-            "dependents_returned": dependents_returned,
-            // What the reference authority certified, stated beside what the
-            // group returned so the two can be compared. They differ when the
-            // pack sees an arriving edge of a class that authority does not
-            // read, and when the cap below withholds one.
-            "certified_dependents": certified_ids.len(),
-            // The cap's own number, and only the cap's. The top-level
-            // `dependents_withheld` counts every cause together, because a
-            // caller asking "how many rows am I not seeing" wants one answer;
-            // this one stays because a caller already reading it must not have
-            // its meaning changed underneath it.
-            "dependents_withheld": dependents_withheld,
-            "same_file_candidates": selection.same_file_candidates(),
-            "same_file_dropped": selection.same_file_dropped(),
+    let (pack, selection, projections) = kin_context::build_context_pack_with_provider(
+        store,
+        &entity_id,
+        &opts,
+        &mut provider,
+        limits,
+        !compact,
+        |pack, selection, projections| {
+            let mut result = render
+                .render(pack, selection, projections, &fields)
+                .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
+            let json = serialize_with_measured_tokens(&mut result)
+                .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
+            Ok(kin_context::estimate_tokens(&json))
         },
-        // The substrate behind the `dependents` group, so an empty group is
-        // read against what this graph can structurally answer for the focal's
-        // language rather than as a bare fact. Computed by the same observer
-        // `find_references` uses, from the same witnesses.
-        crate::edge_coverage::EDGE_COVERAGE_KEY: edge_coverage,
-        crate::caller_arrival::CALLER_ARRIVAL_KEY: caller_arrival,
-        "token_budget": budget.max_tokens(),
-        "tokens_used": pack.actual_tokens,
-    });
+    )
+    .map_err(|error| McpError::Context(error.to_string()))?;
+    let mut result = render.render(&pack, &selection, &projections, &fields)?;
+    Ok(ToolCallResult::text(serialize_with_measured_tokens(
+        &mut result,
+    )?))
+}
 
-    if !compact {
-        if !transitive.is_empty() {
-            result["transitive_deps"] = serde_json::json!(transitive);
+type ContextReferenceSnapshot = (
+    Vec<kin_model::EntityId>,
+    std::collections::HashSet<kin_model::EntityId>,
+    serde_json::Value,
+    serde_json::Value,
+);
+
+struct SingleContextRender<'a, G: GraphStore> {
+    store: &'a G,
+    repository_authority: Option<&'a RequestRepositoryAuthority>,
+    entity_id: kin_model::EntityId,
+    compact: bool,
+    include_traffic: bool,
+    budget: kin_model::TokenBudget,
+    traffic: std::cell::RefCell<Vec<kin_model::TrafficEntry>>,
+    traffic_withheld: std::cell::Cell<usize>,
+    entities: std::cell::RefCell<HashMap<kin_model::EntityId, Option<kin_model::Entity>>>,
+    references: std::cell::OnceCell<std::result::Result<ContextReferenceSnapshot, String>>,
+}
+
+impl<G: GraphStore> SingleContextRender<'_, G> {
+    fn entity(&self, id: &kin_model::EntityId) -> Result<Option<kin_model::Entity>> {
+        if let Some(entity) = self.entities.borrow().get(id) {
+            return Ok(entity.clone());
         }
-        let tests: Vec<_> = pack
-            .tests
+        let entity = self.store.get_entity(id).map_err(McpError::graph)?;
+        self.entities.borrow_mut().insert(*id, entity.clone());
+        Ok(entity)
+    }
+
+    fn render(
+        &self,
+        pack: &kin_model::ContextPack,
+        selection: &kin_context::DependencySelection,
+        projections: &kin_context::ProjectionReport,
+        fields: &ContextSourceFields,
+    ) -> Result<serde_json::Value> {
+        use kin_context::DependencyRelation;
+        let Self {
+            store,
+            repository_authority,
+            entity_id,
+            compact,
+            include_traffic,
+            budget,
+            ..
+        } = *self;
+        // Build structured response JSON. The pack still has to have projected a
+        // focal entry for the focal entity to be worth serializing, but the body
+        // comes from graph truth rather than from that entry.
+        let focal_entry = pack.focal_entities.first();
+        let focal_entity = self.entity(&entity_id)?;
+
+        let focal_json = if let (Some(entry), Some(entity)) = (focal_entry, &focal_entity) {
+            let mut row = serde_json::json!({
+                "id": entity.id, "name": entity.name, "kind": entity.kind,
+                "signature": entity.signature,
+                "file_path": entity.file_origin.as_ref().map(|path| path.to_string()),
+                "read_path": entity_read_path(entity),
+                "start_line": entity_presentation_start_line(entity),
+                "end_line": entity_presentation_end_line(entity),
+            });
+            attach_context_projection(entry, fields, projections, &mut row, true);
+            row
+        } else {
+            serde_json::Value::Null
+        };
+
+        // `relation` is what keeps a same-file neighbour from reading as a
+        // dependency. The builder tags the fallback inside `entry.content`, which
+        // this handler does not serialize, so without the selection travelling
+        // alongside the pack the two are indistinguishable on the wire. Rows in the
+        // sections that are not dependencies (transitive, tests, contracts) pass
+        // `None` and carry no relation at all.
+        let project_dep = |entry: &kin_model::context::ContextEntry,
+                           relation: Option<DependencyRelation>|
+         -> Result<serde_json::Value> {
+            // Look up the entity for structured fields.
+            if let Some(e) = self.entity(&entry.entity_id)? {
+                let mut obj = serde_json::json!({
+                    "id": e.id,
+                    "name": e.name,
+                    "kind": e.kind,
+                    "signature": e.signature,
+                    "file_path": e.file_origin.as_ref().map(|p| p.to_string()),
+                    "read_path": entity_read_path(&e),
+                    "start_line": entity_presentation_start_line(&e),
+                    "end_line": entity_presentation_end_line(&e),
+                });
+                if let Some(relation) = relation {
+                    obj["relation"] = serde_json::json!(relation.as_str());
+                }
+                if !compact {
+                    obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
+                    attach_context_projection(entry, fields, projections, &mut obj, true);
+                }
+                Ok(obj)
+            } else {
+                let mut obj = serde_json::json!({
+                    "id": entry.entity_id.to_string(),
+                    "content": entry.content,
+                });
+                if let Some(relation) = relation {
+                    obj["relation"] = serde_json::json!(relation.as_str());
+                }
+                Ok(obj)
+            }
+        };
+
+        let (certified_ids, certified, edge_coverage, caller_arrival) = self
+            .references
+            .get_or_init(|| {
+                (|| -> Result<ContextReferenceSnapshot> {
+                    // Membership of the `dependents` group is decided by the edge authority
+                    // `find_references` reads, on the same store, in the same request. The two
+                    // surfaces answer the same question about the same entity, so a pack that
+                    // decided it independently could disagree with the tool beside it, and it
+                    // did: on expressjs/express `res.sendFile` packed `dependents: []` while
+                    // `find_references` on that id returned `res.download`, which calls it.
+                    //
+                    // This is the same call `handle_find_references` makes, not a second
+                    // implementation of it. Everything that decides what counts as a reference
+                    // -- the allowed edge classes, the self-edge exclusion, composition over
+                    // proven overrides, and dropping a caller the workspace no longer contains
+                    // -- is that function's, so the two cannot drift apart by being edited
+                    // separately.
+                    let reference_kinds = default_reference_kinds();
+                    let reference_rows = collect_graph_reference_rows(
+                        store,
+                        &entity_id,
+                        &reference_kinds,
+                        repository_authority,
+                    )?;
+                    // Observed before the partition, because a candidate row still witnesses the
+                    // edge class it arrived on. Same rule as the reference tool's, so the
+                    // coverage the pack publishes is the coverage that tool would publish.
+                    let witnessed = match &focal_entity {
+                        Some(entity) => answer_witnessed_classes(store, entity, &reference_rows),
+                        None => Vec::new(),
+                    };
+                    // FIR-1552 again, in the direction that matters here: a row matched on a
+                    // bare receiver name with nothing at the site proving the destination is a
+                    // candidate, not a caller. `find_references` withholds it from its count,
+                    // so a pack that promoted it to a dependent would be certifying what the
+                    // reference surface declined to.
+                    let mut certified_rows: Vec<ReferenceRow> = reference_rows
+                        .into_iter()
+                        .filter(|row| !row.receiver_name_guess)
+                        .collect();
+                    certified_rows.sort_by(|left, right| {
+                        left.file_path
+                            .cmp(&right.file_path)
+                            .then_with(|| left.name.cmp(&right.name))
+                            .then_with(|| left.entity_id.cmp(&right.entity_id))
+                    });
+                    let certified_ids: Vec<kin_model::ids::EntityId> = certified_rows
+                        .iter()
+                        .filter_map(|row| row.entity_id.as_deref())
+                        .filter_map(|id| parse_entity_id(id).ok())
+                        .collect();
+                    let certified: std::collections::HashSet<kin_model::ids::EntityId> =
+                        certified_ids.iter().copied().collect();
+                    // What the graph can structurally answer over the classes the group was
+                    // built from. An empty `dependents` is only evidence about the code when
+                    // this says the focal's language links those classes across files, and
+                    // nothing else in a pack reports it.
+                    let edge_coverage = match &focal_entity {
+                        Some(entity) => {
+                            crate::edge_coverage::observe_cross_file_reference_coverage_witnessed(
+                                store,
+                                entity,
+                                &reference_kinds,
+                                &witnessed,
+                            )
+                        }
+                        None => serde_json::Value::Null,
+                    };
+                    // Whether a caller could have reached this focal through a call the linker
+                    // recorded no edge for (FIR-2775), read exactly as `find_references` reads
+                    // it and published under the same key.
+                    //
+                    // A pack's `dependents` group is built by the same collector over the same
+                    // edges, so it inherits the same gap and has to report it the same way. The
+                    // method gate beside this one is shared for precisely that reason: gating a
+                    // shared gap on the tool name alone was how two surfaces over one graph came
+                    // to answer opposite things about one entity, the tool that refused to
+                    // certify and the tool that published `[]` reading the identical incomplete
+                    // call graph. Adding a new gap to one surface and not the other would
+                    // rebuild that disagreement from scratch.
+                    let caller_arrival = match &focal_entity {
+                        Some(entity) => {
+                            crate::caller_arrival::observe_caller_arrival(store, entity).to_json()
+                        }
+                        None => serde_json::Value::Null,
+                    };
+
+                    Ok((certified_ids, certified, edge_coverage, caller_arrival))
+                })()
+                .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .map_err(|error| McpError::Context(error.clone()))?;
+
+        // The dependency section carries both directions, so it is served as two
+        // groups named for what they are. Serving it as one list called
+        // `dependencies` reported a focal's callers as things the focal depends on,
+        // which is the opposite claim and the one an agent acts on when it decides
+        // what it may safely change. The builder has already ordered the section so
+        // real dependencies precede dependents and fallback neighbours, and that
+        // order survives the partition.
+        let mut dependencies: Vec<serde_json::Value> = Vec::new();
+        let mut dependents: Vec<serde_json::Value> = Vec::new();
+        let mut packed: std::collections::HashSet<kin_model::ids::EntityId> =
+            std::collections::HashSet::new();
+        for entry in &pack.dependency_signatures {
+            let packed_relation = selection.relation_for(&entry.entity_id);
+            // The union, never the intersection. A certified caller is a dependent
+            // whatever the pack's own section made of it, and an arriving edge of a
+            // class the reference surface does not read -- `UsesType`, `Implements`,
+            // `Extends` -- is still a dependent the pack can see and that surface
+            // cannot. Taking either one alone would drop real blast radius.
+            let relation = if certified.contains(&entry.entity_id) {
+                DependencyRelation::DependentEdge
+            } else {
+                packed_relation
+            };
+            let mut row = project_dep(entry, Some(relation))?;
+            match relation {
+                DependencyRelation::DependentEdge => {
+                    // Nothing is lost when a pair is joined both ways. The pack used
+                    // to resolve that by calling the neighbour a dependency, which
+                    // on a JavaScript object literal spends a weak leaving
+                    // `References` edge to erase a real arriving `Calls` -- and
+                    // every sibling method has that shape, so a focal lost its whole
+                    // caller set at once. The group is decided by the arriving edge
+                    // and the other direction is stated on the row.
+                    if packed_relation == DependencyRelation::DependencyEdge {
+                        row["bidirectional"] = serde_json::json!(true);
+                    }
+                    packed.insert(entry.entity_id);
+                    dependents.push(row);
+                }
+                DependencyRelation::DependencyEdge | DependencyRelation::SameFileNeighbor => {
+                    dependencies.push(row)
+                }
+            }
+        }
+        // A certified caller the pack's own section never reached -- shed by the
+        // builder's token budget, or missed by its subgraph walk -- is exactly the
+        // shape this defect had. Recovering it here is what makes the group's
+        // membership a property of the answer rather than of how much budget was
+        // left.
+        //
+        // The projection provider has not read these recovered rows.
+        // attach_context_projection names their missing bodies explicitly.
+        let mut dependents_withheld = 0usize;
+        for id in certified_ids {
+            if packed.contains(id) {
+                continue;
+            }
+            if dependents.len() >= CERTIFIED_DEPENDENTS_MAX {
+                dependents_withheld += 1;
+                continue;
+            }
+            let entry = kin_model::context::ContextEntry {
+                entity_id: *id,
+                projection_level: kin_model::context::ProjectionLevel::SignatureOnly,
+                content: String::new(),
+            };
+            dependents.push(project_dep(
+                &entry,
+                Some(DependencyRelation::DependentEdge),
+            )?);
+            packed.insert(*id);
+        }
+        let transitive: Vec<_> = pack
+            .transitive_deps
             .iter()
             .map(|entry| project_dep(entry, None))
             .collect::<Result<Vec<_>>>()?;
-        if !tests.is_empty() {
-            result["tests"] = serde_json::json!(tests);
-        }
-        let contracts: Vec<_> = pack
-            .contracts
-            .iter()
-            .map(|entry| project_dep(entry, None))
-            .collect::<Result<Vec<_>>>()?;
-        if !contracts.is_empty() {
-            result["contracts"] = serde_json::json!(contracts);
-        }
-        if !pack.work_items.is_empty() {
-            result["work_items"] =
-                serde_json::to_value(&pack.work_items).map_err(McpError::Json)?;
-        }
-        if !pack.annotations.is_empty() {
-            result["annotations"] =
-                serde_json::to_value(&pack.annotations).map_err(McpError::Json)?;
-        }
-    }
 
-    if include_traffic && !pack.traffic.is_empty() {
-        result["nearby_traffic"] = serde_json::to_value(&pack.traffic).map_err(McpError::Json)?;
-    }
+        // The cap and the fallback are both invisible in the rows themselves: six
+        // neighbours out of twenty-four look exactly like six dependencies. This
+        // says which selection ran and what it dropped, in every mode, because a
+        // caller deciding whether to ask again needs it most when the answer is
+        // small.
+        let returned = dependencies.len();
+        let dependents_returned = dependents.len();
+        let mut result = serde_json::json!({
+            "focal_entity": focal_json,
+            "dependencies": dependencies,
+            // Always present, empty included. "no dependents" and "this build does
+            // not report dependents" are different answers, and a group that
+            // appears only when populated cannot tell them apart. What separates
+            // them now is `edge_coverage` and the response's `negative` verdict:
+            // an empty group on a graph that demonstrably links this language's
+            // edges across files is an answer, and an empty group on one that does
+            // not is a gap, and both used to serialize as `[]`.
+            "dependents": dependents,
+            "dependency_selection": {
+                "source": selection.source().as_str(),
+                "returned": returned,
+                "dependents_returned": dependents_returned,
+                // What the reference authority certified, stated beside what the
+                // group returned so the two can be compared. They differ when the
+                // pack sees an arriving edge of a class that authority does not
+                // read, and when the cap below withholds one.
+                "certified_dependents": certified_ids.len(),
+                // The cap's own number, and only the cap's. The top-level
+                // `dependents_withheld` counts every cause together, because a
+                // caller asking "how many rows am I not seeing" wants one answer;
+                // this one stays because a caller already reading it must not have
+                // its meaning changed underneath it.
+                "dependents_withheld": dependents_withheld,
+                "same_file_candidates": selection.same_file_candidates(),
+                "same_file_dropped": selection.same_file_dropped(),
+            },
+            // The substrate behind the `dependents` group, so an empty group is
+            // read against what this graph can structurally answer for the focal's
+            // language rather than as a bare fact. Computed by the same observer
+            // `find_references` uses, from the same witnesses.
+            crate::edge_coverage::EDGE_COVERAGE_KEY: edge_coverage,
+            crate::caller_arrival::CALLER_ARRIVAL_KEY: caller_arrival,
+            "token_budget": budget.max_tokens(),
+            "tokens_used": pack.actual_tokens,
+        });
 
-    // What the pack's own token budget refused, in the map the response budget
-    // already publishes its cuts to.
-    //
-    // Two budgets cut this answer and only one of them was ever visible. The
-    // token budget runs first, inside the builder, and a dependency section it
-    // trimmed from twelve rows to six serialized exactly like a focal with six:
-    // `returned: 6` beside six rows, and nothing anywhere saying a row had been
-    // a candidate. That is the reading kin#1062 removed from the list case and
-    // kin#1068 from the impact case, arriving here through the earlier budget.
-    //
-    // One map, keyed by the group, with the cause named on each entry: a caller
-    // raises `token_budget` for these and `max_chars` for the response budget's,
-    // and being told the wrong lever costs a round trip that cannot help.
-    let recovered = |id: &kin_model::ids::EntityId| packed.contains(id);
-    let mut budget_groups: Vec<&str> = vec![
-        kin_context::group::DEPENDENCIES,
-        kin_context::group::DEPENDENTS,
-    ];
-    if !compact {
-        // A section `compact` never serves cannot be misread as an empty one,
-        // because dropping it is the documented shape of that mode. A section
-        // this mode does serve is absent only when it holds nothing, which is
-        // exactly the reading a budget cut must not produce.
-        budget_groups.extend([
-            kin_context::group::TRANSITIVE_DEPS,
-            kin_context::group::TESTS,
-            kin_context::group::CONTRACTS,
-            kin_context::group::WORK_ITEMS,
-            kin_context::group::ANNOTATIONS,
-        ]);
-    }
-    for group in budget_groups {
-        let elided = selection.budget_elided_unrecovered(group, recovered);
-        if elided == 0 {
-            continue;
+        if !compact {
+            if !transitive.is_empty() {
+                result["transitive_deps"] = serde_json::json!(transitive);
+            }
+            let tests: Vec<_> = pack
+                .tests
+                .iter()
+                .map(|entry| project_dep(entry, None))
+                .collect::<Result<Vec<_>>>()?;
+            if !tests.is_empty() {
+                result["tests"] = serde_json::json!(tests);
+            }
+            let contracts: Vec<_> = pack
+                .contracts
+                .iter()
+                .map(|entry| project_dep(entry, None))
+                .collect::<Result<Vec<_>>>()?;
+            if !contracts.is_empty() {
+                result["contracts"] = serde_json::json!(contracts);
+            }
+            if !pack.work_items.is_empty() {
+                result["work_items"] =
+                    serde_json::to_value(&pack.work_items).map_err(McpError::Json)?;
+            }
+            if !pack.annotations.is_empty() {
+                result["annotations"] =
+                    serde_json::to_value(&pack.annotations).map_err(McpError::Json)?;
+            }
         }
-        let kept = result
-            .get(group)
-            .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len);
-        // The scalar beside the map, written here so the response budget's own
-        // later cut of the same list adds to it rather than replacing it.
-        result[format!("{group}_withheld")] = serde_json::json!(elided);
-        crate::budget::record_elision_for(
-            &mut result,
-            group,
-            kept,
-            elided,
-            crate::budget::ELISION_REASON_TOKEN_BUDGET,
-        );
-    }
-    // The certified-dependents cap is the third cutter on this payload, and it
-    // was disclosed only as a nested counter inside `dependency_selection`,
-    // which is the sibling-counter shape that saved nobody in the stranger
-    // session kin#1062 was filed from. It carries its own reason because no
-    // budget parameter recovers it.
-    if dependents_withheld > 0 {
-        let kept = result
-            .get("dependents")
-            .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len);
-        let prior = result
-            .get("dependents_withheld")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as usize;
-        result["dependents_withheld"] = serde_json::json!(prior + dependents_withheld);
-        crate::budget::record_elision_for(
-            &mut result,
-            "dependents",
-            kept,
-            dependents_withheld,
-            crate::budget::ELISION_REASON_DEPENDENTS_CAP,
-        );
-    }
 
-    let json = serialize_with_measured_tokens(&mut result)?;
-    Ok(ToolCallResult::text(json))
+        if include_traffic && !self.traffic.borrow().is_empty() {
+            result["nearby_traffic"] =
+                serde_json::to_value(&*self.traffic.borrow()).map_err(McpError::Json)?;
+        }
+        if self.traffic_withheld.get() > 0 {
+            crate::budget::record_elision_for(
+                &mut result,
+                "nearby_traffic",
+                self.traffic.borrow().len(),
+                self.traffic_withheld.get(),
+                crate::budget::ELISION_REASON_TOKEN_BUDGET,
+            );
+        }
+
+        // What the pack's own token budget refused, in the map the response budget
+        // already publishes its cuts to.
+        //
+        // Two budgets cut this answer and only one of them was ever visible. The
+        // token budget runs first, inside the builder, and a dependency section it
+        // trimmed from twelve rows to six serialized exactly like a focal with six:
+        // `returned: 6` beside six rows, and nothing anywhere saying a row had been
+        // a candidate. That is the reading kin#1062 removed from the list case and
+        // kin#1068 from the impact case, arriving here through the earlier budget.
+        //
+        // One map, keyed by the group, with the cause named on each entry: a caller
+        // raises `token_budget` for these and `max_chars` for the response budget's,
+        // and being told the wrong lever costs a round trip that cannot help.
+        let recovered = |id: &kin_model::ids::EntityId| packed.contains(id);
+        let mut budget_groups: Vec<&str> = vec![
+            kin_context::group::DEPENDENCIES,
+            kin_context::group::DEPENDENTS,
+        ];
+        if !compact {
+            // A section `compact` never serves cannot be misread as an empty one,
+            // because dropping it is the documented shape of that mode. A section
+            // this mode does serve is absent only when it holds nothing, which is
+            // exactly the reading a budget cut must not produce.
+            budget_groups.extend([
+                kin_context::group::TRANSITIVE_DEPS,
+                kin_context::group::TESTS,
+                kin_context::group::CONTRACTS,
+                kin_context::group::WORK_ITEMS,
+                kin_context::group::ANNOTATIONS,
+            ]);
+        }
+        for group in budget_groups {
+            let elided = selection.budget_elided_unrecovered(group, recovered);
+            if elided == 0 {
+                continue;
+            }
+            let kept = result
+                .get(group)
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            // The scalar beside the map, written here so the response budget's own
+            // later cut of the same list adds to it rather than replacing it.
+            result[format!("{group}_withheld")] = serde_json::json!(elided);
+            crate::budget::record_elision_for(
+                &mut result,
+                group,
+                kept,
+                elided,
+                crate::budget::ELISION_REASON_TOKEN_BUDGET,
+            );
+        }
+        // The certified-dependents cap is the third cutter on this payload, and it
+        // was disclosed only as a nested counter inside `dependency_selection`,
+        // which is the sibling-counter shape that saved nobody in the stranger
+        // session kin#1062 was filed from. It carries its own reason because no
+        // budget parameter recovers it.
+        if dependents_withheld > 0 {
+            let kept = result
+                .get("dependents")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            let prior = result
+                .get("dependents_withheld")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            result["dependents_withheld"] = serde_json::json!(prior + dependents_withheld);
+            crate::budget::record_elision_for(
+                &mut result,
+                "dependents",
+                kept,
+                dependents_withheld,
+                crate::budget::ELISION_REASON_DEPENDENTS_CAP,
+            );
+        }
+
+        disclose_projection_bodies(&mut result);
+        loop {
+            let rendered = serialize_with_measured_tokens(&mut result)?;
+            if kin_context::estimate_tokens(&rendered) <= budget.max_tokens()
+                || self.traffic.borrow().is_empty()
+            {
+                break;
+            }
+            self.traffic.borrow_mut().pop();
+            self.traffic_withheld.set(self.traffic_withheld.get() + 1);
+            result["nearby_traffic"] =
+                serde_json::to_value(&*self.traffic.borrow()).map_err(McpError::Json)?;
+            crate::budget::record_elision_for(
+                &mut result,
+                "nearby_traffic",
+                self.traffic.borrow().len(),
+                1,
+                crate::budget::ELISION_REASON_TOKEN_BUDGET,
+            );
+        }
+        Ok(result)
+    }
 }
 
 /// The token budget a pack request names, in the tiers the builder takes.
@@ -1471,30 +1576,70 @@ fn multi_focal_pack_result<G: GraphStore>(
         resolutions,
         coverage: get_optional_string_param(args, "coverage"),
     };
-    let (pack, mut report) = kin_context::build_multi_focal_pack(store, &ids, &opts)
-        .map_err(|error| McpError::Context(error.to_string()))?;
-
-    // Bodies come from graph-owned repository authority, exactly as the
-    // single-focal path below reads them. The pack's own focal content is
-    // `kin_context::builder::project_full_body`, which that function's doc
-    // comment says is a HEADER and must never be surfaced as a body, and this
-    // path used to publish it under `projection: "FullBody"` with nothing said.
-    // Measured on psf/requests at v0.7.2: `Session.merge_environment_settings`
-    // came back `FullBody` carrying 85 tokens for a 38-line method, while
-    // `kin graph source` on the same id returned the whole body. It was never a
-    // body gap; it was a path that did not ask.
     let held = HeldSourceAuthority::new(store, repository_authority);
+    let fields = ContextSourceFields::default();
+    let mut provider = ContextSourceProvider {
+        held: &held,
+        fields: fields.clone(),
+    };
+    let bytes = crate::budget::ResponseBudget::from_arguments(args).max_chars;
+    let limits = kin_context::ProjectionLimits {
+        max_candidate_bytes: bytes,
+        max_retained_bytes: bytes,
+    };
+    let (pack, report, projections) = kin_context::build_multi_focal_pack_with_provider(
+        store,
+        &ids,
+        &opts,
+        &mut provider,
+        limits,
+        |pack, report, projections| {
+            let mut result = render_multi_context(
+                store,
+                pack,
+                report.clone(),
+                &unresolved,
+                &fields,
+                projections,
+            )
+            .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
+            let json = serialize_with_measured_tokens(&mut result)
+                .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
+            Ok(kin_context::estimate_tokens(&json))
+        },
+    )
+    .map_err(|error| McpError::Context(error.to_string()))?;
+    let mut result =
+        render_multi_context(store, &pack, report, &unresolved, &fields, &projections)?;
+    Ok(Some(ToolCallResult::text(serialize_with_measured_tokens(
+        &mut result,
+    )?)))
+}
+
+fn render_multi_context<G: GraphStore>(
+    store: &G,
+    pack: &kin_model::ContextPack,
+    report: kin_context::MultiFocalReport,
+    unresolved: &[serde_json::Value],
+    fields: &ContextSourceFields,
+    projections: &kin_context::ProjectionReport,
+) -> Result<serde_json::Value> {
     let row =
         |entry: &kin_model::context::ContextEntry, section: &str| -> Result<serde_json::Value> {
             let entity = store
                 .get_entity(&entry.entity_id)
                 .map_err(McpError::graph)?;
             let Some(entity) = entity else {
-                return Ok(serde_json::json!({
+                let mut row = serde_json::json!({
                     "id": entry.entity_id,
                     "section": section,
                     "projection": format!("{:?}", entry.projection_level),
-                }));
+                });
+                if entry.projection_level == kin_model::context::ProjectionLevel::FullBody {
+                    downgrade_context_body(&mut row, "entity is unavailable in graph truth");
+                    row["projection"] = serde_json::Value::Null;
+                }
+                return Ok(row);
             };
             let mut obj = serde_json::json!({
                 "id": entity.id,
@@ -1508,51 +1653,13 @@ fn multi_focal_pack_result<G: GraphStore>(
                 "section": section,
                 "projection": format!("{:?}", entry.projection_level),
             });
-            // Only a row CLAIMING a body has to produce one. A signature-only
-            // dependency already says what it is, and reading a body for every row
-            // in the pack would spend the request's IO on material the caller did
-            // not ask for.
-            if entry.projection_level != kin_model::context::ProjectionLevel::FullBody {
-                return Ok(obj);
-            }
-            let (body, absent_reason) = match read_entity_source_excerpt_detailed_held(
-                &held,
-                &entity,
-                MCP_SOURCE_MAX_LINES,
-                MCP_SOURCE_MAX_CHARS,
-                EntitySourceScope::WorkspaceHead,
-            ) {
-                Ok(body) => (body, None),
-                Err(error) if is_absent_at_generation(&error) => (None, Some(error.to_string())),
-                Err(error) => return Err(error),
-            };
-            // Which authority answered, under the same key the single-focal path
-            // publishes it, so a caller reading one surface is not learning two
-            // vocabularies for one fact.
-            obj["source"] = serde_json::json!(LAST_READ_SOURCE.with(|f| f.get()));
-            match body {
-                Some(source) => {
-                    obj["body"] = serde_json::json!(source.body);
-                    if let Some(map) = obj.as_object_mut() {
-                        map.extend(source_provenance_fields(&source));
-                    }
-                }
-                None => {
-                    // The claim goes with the body. A row that cannot produce one
-                    // reports the level it actually carries, so the label and the
-                    // content cannot disagree the way they did on v0.7.2.
-                    obj["projection"] = serde_json::json!(format!(
-                        "{:?}",
-                        kin_model::context::ProjectionLevel::SignatureOnly
-                    ));
-                    obj["projection_downgraded_from"] =
-                        serde_json::json!(format!("{:?}", entry.projection_level));
-                    obj["body"] = serde_json::Value::Null;
-                    obj["body_unavailable"] = serde_json::json!(
-                        absent_reason.unwrap_or_else(|| entity_body_gap_reason(&entity))
-                    );
-                }
-            }
+            attach_context_projection(
+                entry,
+                fields,
+                projections,
+                &mut obj,
+                entry.projection_level == kin_model::context::ProjectionLevel::FullBody,
+            );
             Ok(obj)
         };
 
@@ -1578,33 +1685,6 @@ fn multi_focal_pack_result<G: GraphStore>(
         entities.push(row(entry, kin_context::group::CONTRACTS)?);
     }
 
-    // `focals[]` is the PACK's account of what it rendered, which is a header
-    // either way, so it went on saying `header_and_signature` about a focal
-    // this response had just served a real body for. One focal described two
-    // ways that disagree is the same class of defect as the label this change
-    // exists to fix, one level up.
-    //
-    // Read back off the rows rather than tracked in parallel while building
-    // them: the correction is then derived from the value that was actually
-    // published, and cannot drift from it.
-    let served_bodies: std::collections::HashSet<String> = entities
-        .iter()
-        .filter(|row| {
-            row.get("section").and_then(serde_json::Value::as_str) == Some("focal")
-                && row.get("body").is_some_and(|body| !body.is_null())
-        })
-        .filter_map(|row| {
-            row.get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-        .collect();
-    for contribution in report.focals.iter_mut() {
-        if served_bodies.contains(&contribution.entity_id) {
-            contribution.projection = kin_context::SERVED_BODY_PROJECTION_NAME.to_string();
-        }
-    }
-
     let mut result = serde_json::json!({
         "method": report.method,
         "focals": serde_json::to_value(&report.focals).map_err(McpError::Json)?,
@@ -1612,24 +1692,11 @@ fn multi_focal_pack_result<G: GraphStore>(
         "route_search": serde_json::to_value(&report.route_search).map_err(McpError::Json)?,
         "neighborhood_depth": report.neighborhood_depth,
         "token_budget": report.budget_tokens,
-        // What the rendered pack costs, which is the number a caller subtracts
-        // from its own window. `tokens_used` below is what this JSON payload
-        // costs, and the two are deliberately different measurements of
-        // different bytes.
         "measured_tokens": report.measured_tokens,
+        "measurement_scope": "complete context payload before envelope and response-budget cuts; tokens_used measures the final output",
         "entities": entities,
         "lines": kin_context::render_multi_focal_lines(&pack, &report),
-        // The rendered pack, and what `measured_tokens` counts. It is the
-        // header projection throughout, because kin-context cannot read source;
-        // a focal that served a real body carries it on its own `entities[]`
-        // row and not here. Said out loud, because a reader who finds a header
-        // in `lines` beside a body on the row is otherwise left to guess which
-        // one the response means.
-        "lines_note": format!(
-            "rendered pack at the {} projection kin-context can build; served bodies are on \
-             the entities[] rows",
-            kin_context::FULL_BODY_PROJECTION_NAME
-        ),
+        "lines_note": "rendered selected projections; whole graph source bodies appear only for FullBody entries",
         "tokens_used": 0,
     });
     if !unresolved.is_empty() {
@@ -1645,8 +1712,54 @@ fn multi_focal_pack_result<G: GraphStore>(
         );
     }
 
-    let json = serialize_with_measured_tokens(&mut result)?;
-    Ok(Some(ToolCallResult::text(json)))
+    disclose_projection_bodies(&mut result);
+    Ok(result)
+}
+
+fn disclose_projection_bodies(result: &mut serde_json::Value) {
+    let mut served = 0;
+    let mut withheld = 0;
+    fn visit(value: &serde_json::Value, served: &mut usize, withheld: &mut usize) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object
+                    .get("body_complete")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    *served += 1;
+                }
+                if object
+                    .get("body_elided")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|keys| keys.iter().any(|key| key.as_str() == Some("body")))
+                {
+                    *withheld += 1;
+                }
+                for child in object.values() {
+                    visit(child, served, withheld);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    visit(child, served, withheld);
+                }
+            }
+            _ => {}
+        }
+    }
+    visit(result, &mut served, &mut withheld);
+    if withheld > 0 {
+        crate::budget::record_elision_for(
+            result,
+            "body",
+            served,
+            withheld,
+            crate::budget::BODY_HYDRATION_REASON,
+        );
+        let before = crate::budget::measure(result);
+        crate::budget::mark_context_cut(result, before);
+    }
 }
 
 /// Passes allowed to settle `tokens_used` against the bytes carrying it.
