@@ -243,53 +243,91 @@ pub(crate) fn resolve_repository_target(
 pub(crate) fn materialize_hosted_repository_snapshot(
     mut snapshot: kin_db::GraphSnapshot,
 ) -> Result<(kin_db::GraphSnapshot, Option<SemanticChangeId>)> {
-    let Some(metadata) = snapshot.repository_authority.as_ref() else {
-        // Envelope-free hosted snapshots predate repository-v6 and own their
-        // top-level graph directly. Preserve that compatibility path exactly.
-        return Ok((snapshot, None));
-    };
-
-    let selected = select_repository_default_ref(metadata)
-        .map_err(DaemonError::Graph)?
-        .cloned();
-    let (resolved, head) = match selected {
-        Some(repository_ref) => {
-            let head = resolve_repository_target(metadata, &repository_ref.target)
+    let materialized = if let Some(metadata) = snapshot.repository_authority.as_ref() {
+        let selected = select_repository_default_ref(metadata)
+            .map_err(DaemonError::Graph)?
+            .cloned();
+        let (resolved, head) = match selected {
+            Some(repository_ref) => {
+                let head = resolve_repository_target(metadata, &repository_ref.target)
+                    .map_err(DaemonError::Graph)?;
+                let resolved = HostedAuthorityHistory {
+                    changes: &snapshot.changes,
+                }
+                .resolve_graph_at(&head)
                 .map_err(DaemonError::Graph)?;
-            let resolved = HostedAuthorityHistory {
-                changes: &snapshot.changes,
+                (Some(resolved), Some(head))
             }
-            .resolve_graph_at(&head)
-            .map_err(DaemonError::Graph)?;
-            (Some(resolved), Some(head))
-        }
-        None => (None, None),
+            None => (None, None),
+        };
+        Some((resolved, head))
+    } else {
+        None
     };
 
-    match resolved {
-        Some(resolved) => {
-            snapshot.entities = resolved.entities;
-            snapshot.relations = resolved.relations;
-            snapshot.entity_revisions = resolved.entity_revisions;
-            snapshot.resolved_tree = resolved.tree;
-            snapshot.external_references = resolved.external_references;
+    let head = if let Some((resolved, head)) = materialized {
+        match resolved {
+            Some(resolved) => {
+                snapshot.entities = resolved.entities;
+                snapshot.relations = resolved.relations;
+                snapshot.entity_revisions = resolved.entity_revisions;
+                snapshot.resolved_tree = resolved.tree;
+                snapshot.external_references = resolved.external_references;
+            }
+            None => {
+                snapshot.entities.clear();
+                snapshot.relations.clear();
+                snapshot.entity_revisions.clear();
+                snapshot.resolved_tree = ResolvedTree::default();
+                snapshot.external_references.clear();
+            }
         }
-        None => {
-            snapshot.entities.clear();
-            snapshot.relations.clear();
-            snapshot.entity_revisions.clear();
-            snapshot.resolved_tree = ResolvedTree::default();
-            snapshot.external_references.clear();
-        }
-    }
+        head
+    } else {
+        None
+    };
+    // Rebuild the entity adjacency this snapshot's graph will hold, rather than
+    // leaving it empty.
+    //
+    // The envelope's persisted copy describes the top-level domains a
+    // repository-v6 authority intentionally leaves empty, so it cannot be kept
+    // across the resolution above. Envelope-free snapshots can also omit these
+    // derived maps: `InMemoryGraph::from_snapshot` repairs either shape from
+    // relations. A binding must hash that repaired graph, never an input whose
+    // adjacency names a different object.
+    //
+    // Rebuilt here rather than read back off the built graph because a hosted
+    // daemon opens several stores under one memory cap, and a whole-graph clone
+    // per open is what that cap has no room for. The edge counts this produces
+    // are the ones kin-db's adjacency consistency check expects, so
+    // `from_snapshot` reuses these maps instead of rebuilding its own and the
+    // round trip is an identity. That is a claim about another crate, so a test
+    // holds it rather than this comment:
+    // `a_hosted_query_snapshot_hashes_as_the_graph_it_becomes`.
     snapshot.outgoing.clear();
     snapshot.incoming.clear();
+    for relation in snapshot.relations.values() {
+        if let Some(src) = relation.src.as_entity() {
+            snapshot.outgoing.entry(src).or_default().push(relation.id);
+        }
+        if let Some(dst) = relation.dst.as_entity() {
+            snapshot.incoming.entry(dst).or_default().push(relation.id);
+        }
+    }
     // This is a derived ref view. Publication authority remains owned by the
     // storage manager and must never be serialized back out of the query graph.
     snapshot.repository_authority = None;
     Ok((snapshot, head))
 }
 
+/// Materialize a hosted authority snapshot and bind vector persistence to it.
+///
+/// The hash is the query snapshot's own, which is the graph this daemon is
+/// about to build and serve, because `materialize_hosted_repository_snapshot`
+/// leaves it holding the entity adjacency that graph will have. Nothing here
+/// reads the hash back off the built graph: that clones the whole graph,
+/// history included, at every hosted open, and a hosted daemon opens several
+/// stores under one memory cap.
 fn materialize_hosted_vector_binding(
     repo_id: &str,
     snapshot_cursor: kin_db::SnapshotCursor,
@@ -363,6 +401,20 @@ impl DurableVectorTestBackend {
     ) -> kin_db::Generation {
         let (bytes, _) = graph
             .serialize_snapshot_borrowed()
+            .expect("test graph snapshot must serialize");
+        self.inner
+            .save_snapshot(repo_id, &bytes, expected_generation)
+            .expect("test graph snapshot must publish")
+    }
+
+    pub(crate) fn publish_snapshot(
+        &self,
+        repo_id: &str,
+        snapshot: &kin_db::GraphSnapshot,
+        expected_generation: u64,
+    ) -> kin_db::Generation {
+        let bytes = snapshot
+            .to_bytes()
             .expect("test graph snapshot must serialize");
         self.inner
             .save_snapshot(repo_id, &bytes, expected_generation)
@@ -2907,6 +2959,19 @@ pub struct DaemonState {
     /// permanent repair wedge without letting an uncertain writer overwrite a
     /// winner it cannot identify.
     hosted_vector_persistence: Mutex<HostedVectorPersistenceState>,
+    /// The hosted binding a durable vector save was refused against, and why.
+    ///
+    /// A retrieval-authority mismatch is a property of the binding rather than
+    /// of the attempt, so retrying the same pass against the same binding can
+    /// only reproduce it. Recorded here with the binding it refused, so the
+    /// background embedding worker can stand down instead of embedding the
+    /// whole store again into memory nothing will ever write, and so a reader
+    /// of `/health` is told rather than left to infer it from a log line. The
+    /// record is compared against the binding currently installed rather than
+    /// cleared at every site that installs one: a rebind or a conflict reload
+    /// therefore retires it by construction, and no future call site can forget
+    /// to.
+    hosted_vector_binding_refusal: Mutex<Option<(kin_db::VectorArtifactBinding, String)>>,
     /// Whether the backend this daemon opened against already holds a
     /// repository-authority envelope.
     ///
@@ -4565,6 +4630,7 @@ impl DaemonState {
         )
     }
 
+    #[cfg(feature = "vector")]
     fn rebind_hosted_vector_after_graph_commit(
         &self,
         backend: &dyn StorageBackend,
@@ -4605,8 +4671,7 @@ impl DaemonState {
                 .map_err(|error| error.to_string())?;
             let retrieval_authority_hash =
                 kin_db::storage::compute_retrieval_authority_hash(&query_snapshot);
-            let live_retrieval_authority_hash =
-                kin_db::storage::compute_retrieval_authority_hash(&self.graph.to_snapshot());
+            let live_retrieval_authority_hash = self.graph.retrieval_authority_hash();
             if retrieval_authority_hash != live_retrieval_authority_hash {
                 return Err(format!(
                     "committed retrieval authority {} is not the live served authority {}; vector persistence stays closed until the next coherent graph checkpoint",
@@ -5419,6 +5484,7 @@ impl DaemonState {
             storage_backend: None,
             publication_control: None,
             hosted_vector_persistence: Mutex::new(HostedVectorPersistenceState::NotHosted),
+            hosted_vector_binding_refusal: Mutex::new(None),
             hosted_authority_envelope: false,
             hosted_authority_flush_refusals: AtomicU64::new(0),
             local_repository_backend: Some(local_repository_backend),
@@ -5801,6 +5867,7 @@ impl DaemonState {
             storage_backend: Some(backend),
             publication_control,
             hosted_vector_persistence: Mutex::new(hosted_vector_persistence),
+            hosted_vector_binding_refusal: Mutex::new(None),
             hosted_authority_envelope,
             hosted_authority_flush_refusals: AtomicU64::new(0),
             local_repository_backend: None,
@@ -9822,6 +9889,21 @@ impl DaemonState {
                 }
             }
         };
+        // A binding that a save has already been refused against is writable in
+        // classification and unusable in fact, and every counter above would
+        // keep reporting it as `empty` with a cursor and a hash. Say so on the
+        // one surface an operator reads, or the daemon publishes a state that
+        // looks like ordinary backfill while nothing it embeds can ever be
+        // written.
+        drop(state);
+        let health = match self.hosted_vector_binding_refusal() {
+            Some(reason) => HostedVectorPersistenceHealth {
+                status: "refused".to_string(),
+                detail: Some(reason),
+                ..health
+            },
+            None => health,
+        };
         Some(health)
     }
 
@@ -10402,6 +10484,90 @@ impl DaemonState {
         Ok(())
     }
 
+    /// Record that a durable vector save was refused against `binding`, log it
+    /// once, and let go of the vectors the refusal stranded.
+    ///
+    /// Logged once because the record is a statement of the daemon's current
+    /// state rather than an event: the second identical refusal against the
+    /// same binding tells a reader nothing the first did not, and the worker
+    /// this arms is standing down anyway.
+    ///
+    /// The release is not tidiness. Every vector this process embedded against
+    /// a binding it cannot write is memory it can never turn into anything, and
+    /// on the hosted fleet a pass that kept embedding into it walked a container
+    /// into its cgroup limit. The on-disk sidecar is untouched by
+    /// `reset_vector_index`, and the next binding this daemon establishes
+    /// reloads the durable artifact through `load_hosted_vector_artifact`, so
+    /// what is dropped here is recoverable and what is kept is not.
+    #[cfg(feature = "vector")]
+    fn record_hosted_vector_binding_refusal(
+        &self,
+        binding: kin_db::VectorArtifactBinding,
+        reason: &str,
+    ) {
+        let Ok(mut refusal) = self.hosted_vector_binding_refusal.lock() else {
+            return;
+        };
+        let already_recorded = refusal
+            .as_ref()
+            .is_some_and(|(recorded, _)| *recorded == binding);
+        if !already_recorded {
+            *refusal = Some((binding, reason.to_string()));
+        }
+        drop(refusal);
+        let released = self.release_stranded_embedded_vectors();
+        if already_recorded {
+            return;
+        }
+        warn!(
+            repo_id = %self.cached_repo_id,
+            released_vectors = released,
+            reason,
+            "hosted vector persistence refused this binding; the embedding worker stands down and the vectors it was holding are released"
+        );
+    }
+
+    /// Let go of embedded vectors this process holds that no durable artifact
+    /// holds, and report how many were released.
+    ///
+    /// Answers 0 and touches nothing when everything in memory is already
+    /// durable. A vector index is all-or-nothing, so dropping one to reclaim
+    /// nothing would cost this daemon its vector search for the length of a
+    /// stall and buy back no memory at all. When part of it IS stranded the
+    /// durable part goes with it, and that asymmetry is the right way round:
+    /// the durable part is reloaded from the backend artifact by the next
+    /// binding this daemon establishes, and the stranded part can never be
+    /// reloaded by anything.
+    ///
+    /// A daemon with no storage backend strands nothing here. Its local sidecar
+    /// is written by `flush_embed_progress` before any hosted step can refuse,
+    /// so its memory and its disk already agree.
+    pub fn release_stranded_embedded_vectors(&self) -> usize {
+        let in_memory = self.graph.embedding_status().indexed;
+        if in_memory == 0 || self.storage_backend.is_none() {
+            return 0;
+        }
+        if self.hosted_durable_indexed_count() >= in_memory {
+            return 0;
+        }
+        self.graph.reset_vector_index();
+        in_memory
+    }
+
+    /// How many vectors the hosted artifact this daemon is bound to actually
+    /// holds. Zero when no artifact has been committed, which is the state a
+    /// store that has never been embedded is in.
+    fn hosted_durable_indexed_count(&self) -> usize {
+        self.hosted_vector_persistence
+            .lock()
+            .ok()
+            .map(|state| match &*state {
+                HostedVectorPersistenceState::Ready { indexed_count, .. } => *indexed_count,
+                _ => 0,
+            })
+            .unwrap_or(0)
+    }
+
     #[cfg(feature = "vector")]
     fn persist_hosted_vector_artifact(&self, generation: kin_db::Generation) -> Result<()> {
         let Some(backend) = self.storage_backend.as_ref() else {
@@ -10433,15 +10599,21 @@ impl DaemonState {
                 ),
             )));
         }
-        let live_retrieval_hash =
-            kin_db::storage::compute_retrieval_authority_hash(&self.graph.to_snapshot());
+        let live_retrieval_hash = self.graph.retrieval_authority_hash();
         if live_retrieval_hash != hosted.binding.retrieval_authority_hash {
+            let refusal = format!(
+                "refusing durable vector artifact save: live retrieval authority {} does not match retained binding {}",
+                hex::encode(live_retrieval_hash),
+                hex::encode(hosted.binding.retrieval_authority_hash)
+            );
+            // A mismatch is a property of this binding, not of this attempt, so
+            // it is recorded against the binding it refused. Retrying the same
+            // pass against the same binding can only produce this same refusal,
+            // and doing so is what spent a hosted container's whole memory
+            // budget on vectors nothing could ever write.
+            self.record_hosted_vector_binding_refusal(hosted.binding, &refusal);
             return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                format!(
-                    "refusing durable vector artifact save: live retrieval authority {} does not match retained binding {}",
-                    hex::encode(live_retrieval_hash),
-                    hex::encode(hosted.binding.retrieval_authority_hash)
-                ),
+                refusal,
             )));
         }
         Self::require_current_hosted_snapshot_cursor(
@@ -10835,6 +11007,7 @@ impl DaemonState {
         // receipt that may arrive while derived-index I/O is finishing.
         if self.storage_backend.is_some() {
             self.snapshot_generation.store(new_gen, Ordering::SeqCst);
+            #[cfg(feature = "vector")]
             if committed && new_gen != expected_gen {
                 if let Some(backend) = self.storage_backend.as_ref() {
                     // Retire the old binding immediately, then establish the
@@ -11726,6 +11899,33 @@ impl DaemonState {
         self.can_persist_embed_progress_locally()
             && !self.embed_worker_failed.load(Ordering::Relaxed)
             && !self.background_embed_paused()
+            && self.hosted_vector_binding_refusal().is_none()
+    }
+
+    /// Why a durable vector save was refused against the binding this daemon
+    /// currently holds, while that refusal still stands.
+    ///
+    /// `Some` means every vector this process embeds is unwritable until the
+    /// binding is replaced, so a worker that kept draining would spend the
+    /// machine and the memory budget to produce nothing. The record is matched
+    /// against the installed binding rather than cleared by whoever replaces
+    /// one, so a rebind after a graph commit and a conflict reload both retire
+    /// it without knowing it exists. A poisoned lock answers `None`: an
+    /// unreadable record is not evidence of a refusal.
+    pub fn hosted_vector_binding_refusal(&self) -> Option<String> {
+        let refused = self
+            .hosted_vector_binding_refusal
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|(binding, reason)| (*binding, reason.clone()))?;
+        let installed = self
+            .hosted_vector_persistence
+            .lock()
+            .ok()?
+            .writable_authority()
+            .map(|authority| authority.binding)?;
+        (installed == refused.0).then_some(refused.1)
     }
 
     /// Mark a daemon-side embed pass as in flight for the lifetime of the
@@ -12241,6 +12441,610 @@ mod tests {
         assert!(
             state.background_embed_worker_can_drain(),
             "the background worker must not be disabled when progress is durable"
+        );
+    }
+
+    /// Publish one repository-v6 authority into `storage` the way the product
+    /// does, and answer its repository id and the entity a vector will be bound
+    /// to.
+    ///
+    /// Committed through `RepositoryAuthorityManager::commit_repository_transaction`
+    /// rather than assembled by hand. The envelope carries roots, receipts and
+    /// per-change admission state that only a real commit computes, and
+    /// `GraphSnapshot::to_bytes` refuses a hand-built one, so a fixture that
+    /// wrote its own envelope would be testing a shape no store ever has.
+    ///
+    /// The change carries an entity-to-entity edge on purpose. The entity
+    /// adjacency is what `materialize_hosted_repository_snapshot` rebuilds and
+    /// what the retrieval authority folds, and a store with no edges has an
+    /// empty one either way and can tell the two apart from nothing.
+    fn publish_hosted_repository_v6_store(
+        storage: &std::path::Path,
+        label: &str,
+    ) -> (String, Entity) {
+        let repository_id =
+            RepositoryId::new(format!("{label}-{}", uuid::Uuid::new_v4().simple())).unwrap();
+        let repo_id = repository_id.as_str().to_string();
+        let authority = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(LocalFileBackend::new(storage.to_path_buf())),
+        )
+        .unwrap();
+        let caller = test_entity("hosted_caller", "src/caller.rs");
+        let callee = test_entity("hosted_callee", "src/callee.rs");
+        let relation = relation_between(caller.id, callee.id, kin_model::RelationKind::Calls);
+        let change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: vec![],
+            author: kin_model::AuthorId::new("hosted-repository-v6-fixture"),
+            message: "publish a hosted repository authority with an edge".to_string(),
+            timestamp: kin_model::Timestamp::now(),
+            entity_deltas: vec![
+                kin_model::EntityDelta::Added {
+                    new: caller.clone(),
+                },
+                kin_model::EntityDelta::Added {
+                    new: callee.clone(),
+                },
+            ],
+            relation_deltas: vec![kin_model::RelationDelta::Added { new: relation }],
+            tree_deltas: vec![],
+            admission_policy_delta: None,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            external_reference_deltas: vec![],
+        };
+        let change = kin_model::SemanticChange {
+            id: kin_core::compute_semantic_change_id(&change).unwrap(),
+            ..change
+        };
+        let head = change.id;
+        let main = kin_model::RefName::branch(b"main").unwrap();
+        let transaction = {
+            let lease = authority.read_authority();
+            kin_model::RepositoryTransaction {
+                schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+                operation_id: kin_model::OperationId::from_uuid(uuid::Uuid::new_v4()),
+                repository_id,
+                expected_generation: lease.roots().generation,
+                expected_roots: lease.roots().clone(),
+                actor: kin_model::AuthorId::new("hosted-repository-v6-fixture"),
+                reason: "publish a hosted repository authority with an edge".to_string(),
+                external_objects: Vec::new(),
+                git_authority_delta: None,
+                changes: vec![change],
+                aliases: Vec::new(),
+                ref_mutations: vec![kin_model::RefMutation {
+                    name: main.clone(),
+                    expected: kin_model::RefExpectation::MustNotExist,
+                    new_target: Some(kin_model::RefTarget::change(head)),
+                    policy: kin_model::RefUpdatePolicy::FastForwardOnly,
+                }],
+                default_ref_mutation: Some(kin_model::DefaultRefMutation {
+                    expected: kin_model::DefaultRefExpectation::MustBeUnset,
+                    new_default: Some(main),
+                }),
+                workspace_mutation: None,
+                local_overlay_delta: None,
+                merge_transaction_delta: None,
+                sealed_observation: None,
+                collaboration_delta: None,
+            }
+        };
+        transaction
+            .validate()
+            .expect("the fixture transaction must be well formed");
+        authority
+            .commit_repository_transaction(transaction)
+            .expect("the fixture repository authority must commit");
+        (repo_id, caller)
+    }
+
+    /// Load one vector for `entity` into `state`'s graph and leave nothing on
+    /// disk, so the next flush has an index to publish and no sidecar to
+    /// shortcut through. The shape every hosted persistence test here uses.
+    #[cfg(feature = "embeddings")]
+    fn load_one_vector_into(state: &DaemonState, layout: &KinLayout, entity: &Entity) {
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        vectors
+            .upsert_retrievable_with_producers(
+                entity.id.into(),
+                &[1.0, 0.0, 0.0, 0.0],
+                &admitted_hosted_producers(),
+            )
+            .unwrap();
+        vectors.save(&layout.kindb_vector_index_path()).unwrap();
+        assert!(
+            matches!(
+                state
+                    .graph
+                    .load_vector_index_compatible(&layout.kindb_vector_index_path(), &descriptor),
+                kin_db::vector::VectorIndexLoad::Loaded(1)
+            ),
+            "the fixture index must load, or this test is measuring the wrong thing"
+        );
+        std::fs::remove_file(layout.kindb_vector_index_path()).unwrap();
+    }
+
+    /// Exercise hosted vector persistence through the daemon's open and flush.
+    ///
+    /// A hosted store published as a repository-v6 envelope carrying one
+    /// entity-to-entity edge has to be able to write a vector artifact. Before
+    /// the fix the binding was hashed from a query snapshot whose adjacency
+    /// `materialize_hosted_repository_snapshot` had just cleared, while every
+    /// flush hashed the graph built from it, whose adjacency
+    /// `InMemoryGraph::from_snapshot` had rebuilt. The two could never be equal
+    /// on a store with an edge, so this save was refused for the life of every
+    /// hosted process and no store on the fleet ever held a vector.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn a_hosted_repository_v6_store_with_an_edge_can_persist_its_vector_artifact() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let (repo_id, caller) =
+            publish_hosted_repository_v6_store(storage.path(), "hosted-v6-vector-save");
+        let backend = DurableVectorTestBackend::new(storage.path());
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(backend.clone()),
+            &repo_id,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            state.graph.relation_count(),
+            1,
+            "the fixture store must have resolved its edge, or the adjacency this test is about \
+             does not exist"
+        );
+        load_one_vector_into(&state, &layout, &caller);
+
+        state
+            .flush_embed_progress()
+            .expect("a hosted repository-v6 store must be able to publish its vector artifact");
+        assert_eq!(
+            backend.vector_save_count(),
+            1,
+            "the artifact must reach the backend"
+        );
+        assert!(
+            state.hosted_vector_binding_refusal().is_none(),
+            "a save that committed must leave no standing refusal"
+        );
+        assert!(
+            state.background_embed_worker_can_drain(),
+            "a store that can persist must keep its embedding worker"
+        );
+    }
+
+    /// A legacy hosted store may carry its top-level graph without persisted
+    /// derived adjacency. The graph loader repairs that shape, so the binding
+    /// must normalize it before hashing or an edge makes every flush refuse.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn a_legacy_hosted_store_with_missing_adjacency_can_persist_its_vector_artifact() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "durable-legacy-hosted-vector-save";
+        let graph = kin_db::InMemoryGraph::new();
+        let caller = test_entity("legacy_hosted_caller", "src/caller.rs");
+        let callee = test_entity("legacy_hosted_callee", "src/callee.rs");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&relation_between(
+                caller.id,
+                callee.id,
+                kin_model::RelationKind::Calls,
+            ))
+            .unwrap();
+        let mut snapshot = graph.to_snapshot();
+        snapshot.outgoing.clear();
+        snapshot.incoming.clear();
+        assert!(snapshot.repository_authority.is_none());
+        backend.publish_snapshot(repo_id, &snapshot, 0);
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        assert_eq!(state.graph.relation_count(), 1);
+        load_one_vector_into(&state, &layout, &caller);
+
+        state
+            .flush_embed_progress()
+            .expect("a legacy hosted store must bind vectors to the graph it serves");
+        assert_eq!(backend.vector_save_count(), 1);
+    }
+
+    /// A refusal against the binding this daemon holds stops the pass rather
+    /// than feeding it.
+    ///
+    /// The refusal is a property of the binding, so a worker that kept draining
+    /// would embed the whole store into memory nothing can write. What the
+    /// daemon owes instead: record it against the binding it refused, close the
+    /// worker's drain gate, let go of the vectors the refusal stranded, and put
+    /// nothing on the backend. Then retire all of it when the binding is
+    /// replaced.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn a_refused_hosted_binding_stands_the_worker_down_and_releases_its_stranded_vectors() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "durable-hosted-vector-standing-refusal";
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("standing_refusal_vector", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        backend.publish_graph(repo_id, &graph, 0);
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        load_one_vector_into(&state, &layout, &entity);
+        assert_eq!(state.graph.embedding_status().indexed, 1);
+
+        // Move the served graph without committing it, so the retained binding
+        // stops describing what a flush would be publishing. This is the exact
+        // condition the guard exists for, and the one the hosted fleet was in
+        // from the moment it opened.
+        state
+            .graph
+            .upsert_entity(&test_entity("moved_after_binding", "src/moved.rs"))
+            .unwrap();
+
+        let refusal = state
+            .flush_embed_progress()
+            .expect_err("a save against a binding that no longer describes the graph must refuse")
+            .to_string();
+        assert!(
+            refusal.contains("does not match retained binding"),
+            "the refusal must name the binding mismatch, not some other coincidental failure: \
+             {refusal}"
+        );
+        assert_eq!(
+            backend.vector_save_count(),
+            0,
+            "a refused artifact must never reach the backend"
+        );
+        let recorded = state
+            .hosted_vector_binding_refusal()
+            .expect("the refusal must be recorded against the binding it refused");
+        assert!(
+            refusal.contains(&recorded),
+            "the recorded refusal must be the one the caller saw: recorded {recorded}, returned \
+             {refusal}"
+        );
+        assert!(
+            !state.background_embed_worker_can_drain(),
+            "a worker whose progress cannot be persisted must stand down rather than keep embedding"
+        );
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            0,
+            "the vectors the refusal stranded must be released, not held for the life of the process"
+        );
+        assert_eq!(
+            state
+                .hosted_vector_persistence_health()
+                .map(|health| health.status),
+            Some("refused".to_string()),
+            "/health must say the binding is refused rather than report ordinary empty coverage"
+        );
+
+        // Committing the graph rebinds, and the record is matched against the
+        // installed binding rather than cleared by hand, so it retires itself.
+        state.save_snapshot().unwrap();
+        assert!(
+            state.hosted_vector_binding_refusal().is_none(),
+            "a rebind must retire a refusal recorded against the binding it replaced"
+        );
+        assert!(
+            state.background_embed_worker_can_drain(),
+            "the worker must be allowed to drain again once a writable binding exists"
+        );
+    }
+
+    /// A second persistence attempt can reach binding validation after the
+    /// first refusal released its index and overlap loaded another batch. The
+    /// repeated refusal must release that later batch too, even though it does
+    /// not repeat the warning.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn a_repeated_hosted_binding_refusal_releases_late_vectors() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "durable-hosted-vector-repeat-refusal";
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("repeat_refusal_vector", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        backend.publish_graph(repo_id, &graph, 0);
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        state
+            .graph
+            .upsert_entity(&test_entity("moved_after_binding", "src/moved.rs"))
+            .unwrap();
+
+        load_one_vector_into(&state, &layout, &entity);
+        state
+            .flush_embed_progress()
+            .expect_err("the first binding mismatch must refuse");
+        assert_eq!(state.graph.embedding_status().indexed, 0);
+        assert!(
+            state.hosted_vector_binding_refusal().is_some(),
+            "the first refusal must remain attached to the unchanged binding"
+        );
+
+        load_one_vector_into(&state, &layout, &entity);
+        assert_eq!(state.graph.embedding_status().indexed, 1);
+        assert!(
+            state.hosted_vector_binding_refusal().is_some(),
+            "loading a later batch must not retire a refusal without a rebind"
+        );
+        let generation = state
+            .snapshot_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let repeated = state
+            .persist_hosted_vector_artifact(generation)
+            .expect_err("the repeated binding mismatch must still refuse");
+        assert!(repeated
+            .to_string()
+            .contains("does not match retained binding"));
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            0,
+            "a repeated refusal must release vectors that arrived after the first refusal"
+        );
+        assert_eq!(backend.vector_save_count(), 0);
+    }
+
+    #[test]
+    fn hosted_vector_digest_paths_do_not_export_the_live_graph() {
+        let source = include_str!("state.rs");
+        for name in [
+            "rebind_hosted_vector_after_graph_commit",
+            "persist_hosted_vector_artifact",
+        ] {
+            let signature = format!("    fn {name}(");
+            let body = source
+                .split_once(&signature)
+                .expect("the production digest path must exist")
+                .1
+                .split("\n    fn ")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("self.graph.retrieval_authority_hash()"),
+                "{name} must use the direct served-graph digest"
+            );
+            assert!(
+                !body.contains(".to_snapshot()"),
+                "{name} must not copy unrelated graph stores to compare a vector binding"
+            );
+        }
+    }
+
+    /// A vector batch can finish after a refusal is recorded and before the
+    /// background worker reaches its next checkpoint. That checkpoint must
+    /// release the late batch and park the drain instead of leaving the batch
+    /// resident for the process lifetime.
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn a_hosted_worker_refusal_releases_a_late_vector_at_its_checkpoint() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "durable-hosted-vector-worker-refusal";
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("worker_refusal_vector", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        backend.publish_graph(repo_id, &graph, 0);
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        state
+            .graph
+            .upsert_entity(&test_entity("moved_after_binding", "src/moved.rs"))
+            .unwrap();
+
+        load_one_vector_into(&state, &layout, &entity);
+        state
+            .flush_embed_progress()
+            .expect_err("the first binding mismatch must refuse");
+        assert_eq!(state.graph.embedding_status().indexed, 0);
+
+        load_one_vector_into(&state, &layout, &entity);
+        assert_eq!(state.graph.embedding_status().indexed, 1);
+        let pass = state.background_work.pass("hosted-vector-refusal-fixture");
+        let mut pending_flush = None;
+        let mut embedded_since_flush = 0;
+        assert!(
+            crate::daemon::pause_if_hosted_vector_binding_refused(
+                &state,
+                &mut pending_flush,
+                &mut embedded_since_flush,
+                &pass,
+            )
+            .await,
+            "the worker must recognize the retained refusal at its checkpoint"
+        );
+        assert!(
+            !pass.halted(),
+            "a binding refusal must not permanently halt the pass"
+        );
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            0,
+            "the worker checkpoint must release vectors that arrived after the refusal"
+        );
+        assert_eq!(backend.vector_save_count(), 0);
+    }
+
+    /// The real worker task must survive a refused binding, observe a rebind,
+    /// and continue waking. Explicit pause keeps this lifecycle test independent
+    /// of a model or accelerator while the refusal checkpoint still executes.
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn a_hosted_worker_survives_refusal_and_observes_rebind() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "hosted-worker-rebind-lifecycle";
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("worker_rebind", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        backend.publish_graph(repo_id, &graph, 0);
+        let state = Arc::new(
+            DaemonState::open_with_backend(
+                layout.clone(),
+                Box::new(backend.clone()),
+                repo_id,
+                None,
+            )
+            .unwrap(),
+        );
+        state
+            .graph
+            .upsert_entity(&test_entity("after_binding", "src/next.rs"))
+            .unwrap();
+        load_one_vector_into(&state, &layout, &entity);
+        state
+            .flush_embed_progress()
+            .expect_err("the fixture must establish a refusal");
+        load_one_vector_into(&state, &layout, &entity);
+        state.pause_background_embed();
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        let worker = crate::daemon::spawn_background_embedding_worker(
+            Arc::clone(&state),
+            std::time::Duration::from_millis(10),
+            1,
+            false,
+            receiver,
+        );
+        let pass = state
+            .background_work
+            .pass(crate::background_work::PASS_EMBED);
+        let wait_for_state = |expected: &'static str| {
+            let state = Arc::clone(&state);
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        if state
+                            .background_work
+                            .reports(std::time::Instant::now())
+                            .iter()
+                            .any(|row| {
+                                row.name == crate::background_work::PASS_EMBED
+                                    && row.state == expected
+                            })
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("worker must reach the expected lifecycle state");
+            }
+        };
+        wait_for_state("waiting_deferred").await;
+        assert!(
+            !worker.is_finished(),
+            "a refused binding must not terminate the worker task"
+        );
+        assert!(!pass.halted());
+        assert_eq!(state.graph.embedding_status().indexed, 0);
+        assert_eq!(backend.vector_save_count(), 0);
+
+        state.save_snapshot().unwrap();
+        assert!(state.hosted_vector_binding_refusal().is_none());
+        wait_for_state("idle").await;
+        assert!(
+            !worker.is_finished(),
+            "the same worker must survive and observe the rebind"
+        );
+        assert!(!pass.halted());
+        cancel.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+            .await
+            .expect("the surviving worker must honor cancellation")
+            .unwrap();
+    }
+
+    /// The release is not unconditional. A vector index is all-or-nothing, so
+    /// dropping one that is already durable would cost this daemon its vector
+    /// search and reclaim nothing.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn releasing_stranded_vectors_leaves_an_index_the_artifact_already_holds() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "durable-hosted-vector-release-guard";
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("durable_release_guard", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        backend.publish_graph(repo_id, &graph, 0);
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        load_one_vector_into(&state, &layout, &entity);
+        state
+            .flush_embed_progress()
+            .expect("the fixture vector must be published before this test means anything");
+        assert_eq!(backend.vector_save_count(), 1);
+
+        assert_eq!(
+            state.release_stranded_embedded_vectors(),
+            0,
+            "nothing is stranded when the artifact already holds what memory holds"
+        );
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            1,
+            "a durable index must survive a release pass"
         );
     }
 
@@ -13133,11 +13937,144 @@ mod tests {
         );
     }
 
+    /// Peak RSS through a hosted open on a production-shaped store.
+    ///
+    /// Not a gate. `#[ignore]`d and run by hand, because it exists to put a
+    /// number in a pull request rather than to hold a behaviour. Run it with
+    /// `cargo test -p kin-daemon --lib measure_hosted_open_peak_rss --
+    /// --ignored --nocapture` on each side of a change and compare the lines.
+    ///
+    /// Shaped like the hosted kin store read from production on 2026-09-08:
+    /// 27987 entities and 75325 relations resolved out of one change behind a
+    /// repository-v6 envelope.
+    #[cfg(unix)]
     #[test]
-    fn hosted_vector_binding_uses_materialized_query_authority_and_typed_repository_cursor() {
+    #[ignore]
+    fn measure_hosted_open_peak_rss() {
+        fn peak_rss_bytes() -> u64 {
+            // ru_maxrss is bytes on macOS and kibibytes on Linux, so the label
+            // says which reading this is rather than pretending to one unit.
+            let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+            assert_eq!(rc, 0, "getrusage must answer");
+            let raw = usage.ru_maxrss as u64;
+            if cfg!(target_os = "macos") {
+                raw
+            } else {
+                raw * 1024
+            }
+        }
+        fn mib(bytes: u64) -> f64 {
+            bytes as f64 / (1024.0 * 1024.0)
+        }
+
+        const ENTITIES: usize = 27987;
+        const RELATIONS: usize = 75325;
+        let mut metadata = empty_repository_metadata("hosted-open-rss");
+        let repo_id = metadata.repository_id.as_str().to_string();
+        let entities: Vec<Entity> = (0..ENTITIES)
+            .map(|i| test_entity(&format!("rss_entity_{i}"), &format!("src/rss_{i}.rs")))
+            .collect();
+        let relation_deltas: Vec<kin_model::RelationDelta> = (0..RELATIONS)
+            .map(|i| kin_model::RelationDelta::Added {
+                new: relation_between(
+                    entities[i % ENTITIES].id,
+                    entities[(i * 7 + 1) % ENTITIES].id,
+                    kin_model::RelationKind::Calls,
+                ),
+            })
+            .collect();
+        let change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: vec![],
+            author: kin_model::AuthorId::new("hosted-open-rss"),
+            message: "a production-shaped hosted store".to_string(),
+            timestamp: kin_model::Timestamp::now(),
+            entity_deltas: entities
+                .iter()
+                .map(|entity| kin_model::EntityDelta::Added {
+                    new: entity.clone(),
+                })
+                .collect(),
+            relation_deltas,
+            tree_deltas: vec![],
+            admission_policy_delta: None,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            external_reference_deltas: vec![],
+        };
+        let change = kin_model::SemanticChange {
+            id: kin_core::compute_semantic_change_id(&change).unwrap(),
+            ..change
+        };
+        let main = kin_model::RefName::branch(b"main").unwrap();
+        metadata.ref_state.default_ref = Some(main.clone());
+        metadata.ref_state.refs.push(kin_model::RepositoryRef {
+            repository_id: metadata.repository_id.clone(),
+            name: main,
+            target: kin_model::RefTarget::change(change.id),
+        });
+        let mut raw = kin_db::InMemoryGraph::new().to_snapshot();
+        raw.changes.insert(change.id, change);
+        raw.repository_authority = Some(metadata);
+
+        let before = peak_rss_bytes();
+        eprintln!("RSS entities={ENTITIES} relations={RELATIONS}");
+        eprintln!("RSS peak_before_materialize_mib={:.1}", mib(before));
+        let snapshot_cursor = kin_db::SnapshotCursor::from_backend_generation(41);
+        let (query_snapshot, _head, binding) =
+            materialize_hosted_vector_binding(&repo_id, snapshot_cursor, raw).unwrap();
+        let after_materialize = peak_rss_bytes();
+        eprintln!(
+            "RSS peak_after_materialize_and_bind_mib={:.1}",
+            mib(after_materialize)
+        );
+        let text_index = tempfile::tempdir().unwrap();
+        let graph = kin_db::InMemoryGraph::from_snapshot_with_text_index(
+            query_snapshot,
+            text_index.path().join("text-index"),
+        )
+        .unwrap();
+        let after_build = peak_rss_bytes();
+        eprintln!("RSS peak_after_graph_build_mib={:.1}", mib(after_build));
+        eprintln!(
+            "RSS bind_hash={} entities={} relations={}",
+            hex::encode(binding.retrieval_authority_hash),
+            graph.entity_count(),
+            graph.relation_count()
+        );
+    }
+
+    /// A hosted query snapshot must hash exactly as the graph it becomes.
+    ///
+    /// This is the adjacency invariant, and it is the claim the whole binding
+    /// rests on. The binding is taken from the snapshot rather than read back
+    /// off the built graph, because reading it back clones the graph, history
+    /// included, at every hosted open; so the snapshot has to BE the graph.
+    ///
+    /// Both directions are asserted, because the first alone passes on a
+    /// fixture that cannot tell the two apart. The fixture carries an
+    /// entity-to-entity edge, and the same snapshot with its adjacency cleared
+    /// must hash differently: an adjacency-free snapshot is exactly what the
+    /// daemon used to bind, and a fixture in which that hashed the same would
+    /// prove nothing. The predecessor of this test had one entity and no
+    /// relations, so it could make neither assertion, and it stayed green while
+    /// every hosted store on the fleet refused every vector save it attempted.
+    ///
+    /// It also holds a claim about another crate: that
+    /// `InMemoryGraph::from_snapshot` reuses the adjacency this snapshot
+    /// carries rather than rebuilding its own. The day kin-db changes that
+    /// rule, this goes red instead of the fleet going quiet.
+    #[test]
+    fn a_hosted_query_snapshot_hashes_as_the_graph_it_becomes() {
         let mut metadata = empty_repository_metadata("vector-binding-materialized");
         let repo_id = metadata.repository_id.as_str().to_string();
-        let entity = test_entity("materialized_vector_target", "src/materialized.rs");
+        let caller = test_entity("materialized_vector_target", "src/materialized.rs");
+        let callee = test_entity("materialized_vector_callee", "src/callee.rs");
+        let relation = relation_between(caller.id, callee.id, kin_model::RelationKind::Calls);
         let change = kin_model::SemanticChange {
             id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
             origin: ChangeOrigin::Native,
@@ -13145,10 +14082,17 @@ mod tests {
             author: kin_model::AuthorId::new("hosted-vector-binding-test"),
             message: "materialize hosted query authority".to_string(),
             timestamp: kin_model::Timestamp::now(),
-            entity_deltas: vec![kin_model::EntityDelta::Added {
-                new: entity.clone(),
+            entity_deltas: vec![
+                kin_model::EntityDelta::Added {
+                    new: caller.clone(),
+                },
+                kin_model::EntityDelta::Added {
+                    new: callee.clone(),
+                },
+            ],
+            relation_deltas: vec![kin_model::RelationDelta::Added {
+                new: relation.clone(),
             }],
-            relation_deltas: vec![],
             tree_deltas: vec![],
             admission_policy_delta: None,
             projected_files: vec![],
@@ -13174,18 +14118,80 @@ mod tests {
         raw.repository_authority = Some(metadata);
         let raw_hash = kin_db::storage::compute_retrieval_authority_hash(&raw);
         let snapshot_cursor = kin_db::SnapshotCursor::from_backend_generation(41);
-        let (materialized, head, binding) =
+        let (query_snapshot, head, binding) =
             materialize_hosted_vector_binding(&repo_id, snapshot_cursor, raw).unwrap();
-        let materialized_hash = kin_db::storage::compute_retrieval_authority_hash(&materialized);
+        let query_hash = kin_db::storage::compute_retrieval_authority_hash(&query_snapshot);
 
-        assert_eq!(head, materialized.changes.keys().next().copied());
-        assert!(materialized.entities.contains_key(&entity.id));
+        assert_eq!(head, query_snapshot.changes.keys().next().copied());
+        assert!(query_snapshot.entities.contains_key(&caller.id));
+        assert!(query_snapshot.relations.contains_key(&relation.id));
         assert_ne!(
-            raw_hash, materialized_hash,
+            raw_hash, query_hash,
             "the fixture must distinguish the raw repository envelope from the served default-ref graph"
         );
+
+        let text_index = tempfile::tempdir().unwrap();
+        let served = kin_db::InMemoryGraph::from_snapshot_with_text_index(
+            query_snapshot.clone(),
+            text_index.path().join("text-index"),
+        )
+        .unwrap();
+        let served_snapshot = served.to_snapshot();
+        #[cfg(feature = "vector")]
+        assert_eq!(
+            served.retrieval_authority_hash(),
+            query_hash,
+            "the direct digest must retain the materialized binding's adjacency semantics"
+        );
+        assert_eq!(
+            query_snapshot.outgoing, served_snapshot.outgoing,
+            "the query snapshot must carry the exact outgoing adjacency the graph serves"
+        );
+        assert_eq!(
+            query_snapshot.incoming, served_snapshot.incoming,
+            "the query snapshot must carry the exact incoming adjacency the graph serves"
+        );
+        assert_eq!(
+            query_snapshot.outgoing.get(&caller.id),
+            Some(&vec![relation.id]),
+            "the caller must own its outgoing edge, not merely one arbitrary adjacency entry"
+        );
+        assert_eq!(
+            query_snapshot.incoming.get(&callee.id),
+            Some(&vec![relation.id]),
+            "the callee must own its incoming edge, not merely one arbitrary adjacency entry"
+        );
+        assert!(
+            !query_snapshot.outgoing.contains_key(&callee.id)
+                && !query_snapshot.incoming.contains_key(&caller.id),
+            "the fixture must prove both adjacency directions are keyed by the relation endpoints"
+        );
+        assert_eq!(
+            kin_db::storage::compute_retrieval_authority_hash(&served_snapshot),
+            query_hash,
+            "the query snapshot must hash as the graph it becomes, or a binding retained from it \
+             names an object no daemon ever serves"
+        );
+
+        // Second direction, and the reason the first is not vacuous: this
+        // fixture's hash MOVES when the adjacency goes, so the equality above
+        // is a fact about the fixture rather than about two objects that could
+        // never differ.
+        let mut adjacency_free = query_snapshot;
+        adjacency_free.outgoing.clear();
+        adjacency_free.incoming.clear();
+        assert_ne!(
+            kin_db::storage::compute_retrieval_authority_hash(&adjacency_free),
+            query_hash,
+            "the fixture must carry an edge the retrieval authority folds, or this test cannot \
+             tell a snapshot that describes the served graph from one that does not"
+        );
+
         assert_eq!(binding.snapshot_cursor, snapshot_cursor);
-        assert_eq!(binding.retrieval_authority_hash, materialized_hash);
+        assert_eq!(
+            binding.retrieval_authority_hash, query_hash,
+            "the retained binding must name the graph this daemon serves"
+        );
         binding.validate_for_repository(&repo_id).unwrap();
         assert!(
             binding
