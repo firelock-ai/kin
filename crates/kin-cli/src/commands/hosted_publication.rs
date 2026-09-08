@@ -2293,8 +2293,7 @@ mod tests {
         // Positive control: one byte under the same shape resolves, so the
         // refusal is about the length rather than about the prefix's contents.
         let composed = format!(
-            "{ARTIFACT_ID_PREFIX}:gcs:{BUCKET}/{}/{RESERVED}@{}",
-            "p".repeat(1),
+            "{ARTIFACT_ID_PREFIX}:gcs:{BUCKET}/p/{RESERVED}@{}",
             u64::MAX
         );
         let room = ARTIFACT_ID_MAX_BYTES - (composed.len() - 1);
