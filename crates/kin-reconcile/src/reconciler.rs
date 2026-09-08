@@ -246,6 +246,15 @@ pub enum ReconcileOutcome {
         /// Collision warnings from the traffic checker (soft locks).
         collision_warnings: Vec<IntentSummary>,
     },
+    /// Only independently verified existing declarations were refreshed. The
+    /// file remains incomplete and every other entity and relation is retained.
+    PartiallyUpdated {
+        file_id: FilePathId,
+        modified: Vec<EntityId>,
+        retained: Vec<EntityId>,
+        error_ranges: Vec<(usize, usize)>,
+        collision_warnings: Vec<IntentSummary>,
+    },
     /// File had parse errors; LKG state retained, no graph changes.
     BrokenAst {
         file_id: FilePathId,
@@ -566,37 +575,6 @@ impl Reconciler {
 
         let result_file_id = indexed.file_id.clone();
 
-        // Check for broken AST — behavior depends on policy.
-        if let ParseState::Incomplete { error_ranges } = &indexed.parse_state {
-            match self.policy.broken_ast_behavior {
-                BrokenAstBehavior::Reject => {
-                    warn!(
-                        file = %path.display(),
-                        errors = error_ranges.len(),
-                        "broken AST rejected by policy"
-                    );
-                    return Err(ReconcileError::BrokenAstRejected {
-                        file_id: result_file_id,
-                        error_ranges: error_ranges.clone(),
-                    });
-                }
-                BrokenAstBehavior::FallbackToLkg => {
-                    warn!(
-                        file = %path.display(),
-                        errors = error_ranges.len(),
-                        "broken AST, retaining LKG state"
-                    );
-                    // Still cache the tree even on broken AST — it's valid for
-                    // incremental parse even if the content has errors.
-                    self.tree_cache.insert(file_id, tree);
-                    return ReconcileResult::unchanged(ReconcileOutcome::BrokenAst {
-                        file_id: result_file_id,
-                        error_ranges: error_ranges.clone(),
-                    });
-                }
-            }
-        }
-
         // RACE CONDITION HARDENING: Verify the file hasn't changed since we
         // indexed it. If modified mid-reconcile, defer to the next tick.
         match std::fs::read(path) {
@@ -633,7 +611,7 @@ impl Reconciler {
         let lkg_snapshot = self.lkg.clone();
 
         let result =
-            self.reconcile_file_edit_inner(&indexed, &result_file_id, path, blob_store, graph);
+            self.reconcile_observed_edit(&indexed, &result_file_id, path, blob_store, graph);
 
         // On error, restore LKG to its pre-reconcile state.
         if result.is_err() {
@@ -660,34 +638,6 @@ impl Reconciler {
             .pipeline
             .index_file_relative(path, blob_store, &self.working_dir)?;
         let file_id = indexed.file_id.clone();
-
-        // Check for broken AST — behavior depends on policy.
-        if let ParseState::Incomplete { error_ranges } = &indexed.parse_state {
-            match self.policy.broken_ast_behavior {
-                BrokenAstBehavior::Reject => {
-                    warn!(
-                        file = %path.display(),
-                        errors = error_ranges.len(),
-                        "broken AST rejected by policy"
-                    );
-                    return Err(ReconcileError::BrokenAstRejected {
-                        file_id,
-                        error_ranges: error_ranges.clone(),
-                    });
-                }
-                BrokenAstBehavior::FallbackToLkg => {
-                    warn!(
-                        file = %path.display(),
-                        errors = error_ranges.len(),
-                        "broken AST, retaining LKG state"
-                    );
-                    return ReconcileResult::unchanged(ReconcileOutcome::BrokenAst {
-                        file_id,
-                        error_ranges: error_ranges.clone(),
-                    });
-                }
-            }
-        }
 
         // RACE CONDITION HARDENING: Verify the file hasn't changed since we
         // indexed it. If the file was modified between the index read and now,
@@ -732,7 +682,7 @@ impl Reconciler {
         // partially advanced reconcile state.
         let lkg_snapshot = self.lkg.clone();
 
-        let result = self.reconcile_file_edit_inner(&indexed, &file_id, path, blob_store, graph);
+        let result = self.reconcile_observed_edit(&indexed, &file_id, path, blob_store, graph);
 
         // On error, restore LKG to its pre-reconcile state and drop this file
         // from the cross-file universe. Cloning the universe per write to undo
@@ -770,6 +720,33 @@ impl Reconciler {
             self.cross_file.forget_file(&file_id.0);
         }
         result
+    }
+
+    /// Apply partial admission to observed filesystem edits. Indexed-content
+    /// transactions use a separate path that requires a complete file layout.
+    fn reconcile_observed_edit<G: GraphStore>(
+        &mut self,
+        indexed: &kin_index::IndexedFile,
+        file_id: &FilePathId,
+        path: &Path,
+        blob_store: &BlobStore,
+        graph: &G,
+    ) -> Result<ReconcileResult> {
+        let ParseState::Incomplete { error_ranges } = &indexed.parse_state else {
+            return self.reconcile_file_edit_inner(indexed, file_id, path, blob_store, graph);
+        };
+        if matches!(self.policy.broken_ast_behavior, BrokenAstBehavior::Reject) {
+            warn!(
+                file = %path.display(),
+                errors = error_ranges.len(),
+                "broken AST rejected by policy"
+            );
+            return Err(ReconcileError::BrokenAstRejected {
+                file_id: file_id.clone(),
+                error_ranges: error_ranges.clone(),
+            });
+        }
+        self.reconcile_partial(indexed, blob_store, graph, error_ranges)
     }
 
     /// Inner implementation of reconcile_file_edit, separated so the caller
@@ -1527,6 +1504,156 @@ impl Reconciler {
             "reconciled file edit"
         );
 
+        Ok(result)
+    }
+
+    fn reconcile_partial<G: GraphStore>(
+        &mut self,
+        indexed: &kin_index::IndexedFile,
+        blobs: &BlobStore,
+        graph: &G,
+        error_ranges: &[(usize, usize)],
+    ) -> Result<ReconcileResult> {
+        let existing = self.get_file_entities(graph, &indexed.file_id)?;
+        let source = blobs.read(&indexed.blob_hash)?;
+        let mut delta = TransactionDelta::default();
+        let mut modified = Vec::new();
+        let mut old_sources = HashMap::new();
+        let mut held_relations = HashMap::new();
+        for candidate in &indexed.entities {
+            if validate_entity(candidate).is_some() {
+                continue;
+            }
+            let same_identity =
+                |entity: &&Entity| entity.name == candidate.name && entity.kind == candidate.kind;
+            let mut previous = existing.iter().filter(same_identity);
+            let Some(old) = previous.next() else {
+                continue;
+            };
+            if previous.next().is_some()
+                || indexed.entities.iter().filter(same_identity).count() != 1
+            {
+                continue;
+            }
+            let Some(hash) = old.metadata.extra.get("blob_hash").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !old_sources.contains_key(hash) {
+                let Ok(digest) = kin_blobs::Hash256::from_hex(hash) else {
+                    continue;
+                };
+                let Ok(bytes) = blobs.read(&digest) else {
+                    continue;
+                };
+                old_sources.insert(hash.to_owned(), bytes);
+            }
+            if !self
+                .pipeline
+                .supports_partial_refresh(old, candidate, &old_sources[hash], &source)
+            {
+                continue;
+            }
+            let declaration = old
+                .span
+                .as_ref()
+                .expect("the source proof checked the span");
+            let mut relation_changes = Vec::new();
+            let mut evidence_verified = true;
+            for relation in
+                relations_held_at(graph, &mut held_relations, GraphNodeId::Entity(old.id))?.values()
+            {
+                let associated = relation
+                    .evidence
+                    .iter()
+                    .filter_map(|e| e.source_span.as_ref())
+                    .any(|span| {
+                        span.file == declaration.file
+                            && (relation.src == GraphNodeId::Entity(old.id)
+                                || (declaration.start_line <= span.start_line
+                                    && span.end_line <= declaration.end_line))
+                    });
+                if !associated {
+                    continue;
+                }
+                let Some(updated) = self.pipeline.rebase_partial_relation(
+                    old,
+                    candidate,
+                    &old_sources[hash],
+                    &source,
+                    relation,
+                    &existing,
+                ) else {
+                    evidence_verified = false;
+                    break;
+                };
+                if updated != *relation {
+                    relation_changes.push(RelationDelta::Modified {
+                        old: relation.clone(),
+                        new: updated,
+                    });
+                }
+            }
+            if !evidence_verified {
+                continue;
+            }
+            let mut new = candidate.clone();
+            new.id = old.id;
+            new.lineage_parent = old.lineage_parent;
+            new.created_in = old.created_in;
+            new.metadata.extra.insert(
+                "partial_parse_admission".into(),
+                serde_json::json!({
+                    "previous_blob_hash": hash,
+                    "source_blob_hash": indexed.blob_hash.to_string(),
+                    "error_ranges": error_ranges,
+                }),
+            );
+            // Retrying the same incomplete bytes does not mint another proof
+            // chain or dirty an already admitted declaration.
+            if old.metadata.extra.get("blob_hash") == candidate.metadata.extra.get("blob_hash")
+                && old.span == candidate.span
+                && old.fingerprint == candidate.fingerprint
+            {
+                continue;
+            }
+            modified.push(old.id);
+            delta.relation_deltas.extend(relation_changes);
+            delta.entity_deltas.push(EntityDelta::Modified {
+                old: old.clone(),
+                new,
+            });
+        }
+        if modified.is_empty() {
+            return ReconcileResult::unchanged(ReconcileOutcome::BrokenAst {
+                file_id: indexed.file_id.clone(),
+                error_ranges: error_ranges.to_vec(),
+            });
+        }
+        let mut scopes: Vec<_> = modified.iter().copied().map(IntentScope::Entity).collect();
+        scopes.push(IntentScope::Artifact(indexed.file_id.clone()));
+        let collision_warnings = self.check_scopes(&scopes)?;
+        let retained = existing
+            .iter()
+            .filter(|e| !modified.contains(&e.id))
+            .map(|e| e.id)
+            .collect();
+        let result = ReconcileResult::validated(
+            ReconcileOutcome::PartiallyUpdated {
+                file_id: indexed.file_id.clone(),
+                modified,
+                retained,
+                error_ranges: error_ranges.to_vec(),
+                collision_warnings,
+            },
+            delta,
+        )?;
+        // No layout, link-universe, or relation retirement: only exact call
+        // locations with stable same-file resolution were refreshed.
+        for change in &result.delta.entity_deltas {
+            if let EntityDelta::Modified { new, .. } = change {
+                self.lkg.record(new);
+            }
+        }
         Ok(result)
     }
 
@@ -2559,6 +2686,488 @@ mod tests {
         EntityKind, EntityMetadata, EntityRole, EntityStore, FingerprintAlgorithm, Hash256,
         LanguageId, SemanticFingerprint, Visibility,
     };
+
+    const PARTIAL_C: &str =
+        "int good(void) { int value = 1; return value; }\nint bad(void) { test_cond(1) }\n";
+
+    fn partial_tree(graph: &kin_db::InMemoryGraph, bytes: &[u8]) {
+        let path = kin_model::RepoPath::from_utf8("test.c").unwrap();
+        let entry = kin_model::TreeEntry::blob(
+            kin_model::Hash256::from_bytes(kin_blobs::digest(bytes).0),
+            false,
+        );
+        let tree = graph.resolved_tree();
+        let change = match tree.artifact_at_path(&path) {
+            Some(old) if old.entry == entry => return,
+            Some(old) => kin_model::TreeDelta::Updated {
+                artifact_id: old.artifact_id,
+                old: kin_model::LocatedEntry::new(path.clone(), old.entry),
+                new: kin_model::LocatedEntry::new(path, entry),
+            },
+            None => kin_model::TreeDelta::Added {
+                artifact_id: kin_model::ArtifactId::new(),
+                new: kin_model::LocatedEntry::new(path, entry),
+            },
+        };
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![change],
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    fn partial_fixture(
+        before: &str,
+    ) -> (
+        tempfile::TempDir,
+        BlobStore,
+        kin_db::InMemoryGraph,
+        Reconciler,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let indexed = IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("test.c"),
+                before.as_bytes(),
+                blobs.write(before.as_bytes()).unwrap(),
+            )
+            .unwrap()
+            .indexed_file;
+        partial_tree(&graph, before.as_bytes());
+        for entity in &indexed.entities {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for relation in &indexed.relations {
+            graph.upsert_relation(relation).unwrap();
+        }
+        let reconciler = Reconciler::new(dir.path().to_path_buf());
+        (dir, blobs, graph, reconciler)
+    }
+
+    fn partial_pass(
+        reconciler: &mut Reconciler,
+        blobs: &BlobStore,
+        graph: &kin_db::InMemoryGraph,
+        source: &str,
+    ) -> ReconcileResult {
+        let indexed = IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("test.c"),
+                source.as_bytes(),
+                blobs.write(source.as_bytes()).unwrap(),
+            )
+            .unwrap()
+            .indexed_file;
+        partial_tree(graph, source.as_bytes());
+        // Through the entrypoint the daemon's watcher uses, because that is
+        // where the broken-AST decision is taken. `reconcile_indexed_content`
+        // beside it reaches the inner reconcile without passing that decision,
+        // and the commit paths behind it keep their full re-derive, so driving
+        // these tests through it would grade code the watcher never runs.
+        let host = reconciler.working_dir.join("test.c");
+        std::fs::write(&host, source).unwrap();
+        let _ = indexed;
+        reconciler
+            .reconcile_file_change(&kin_index::FileEvent::Changed(host), blobs, graph)
+            .unwrap()
+    }
+
+    #[test]
+    fn partial_c_refreshes_retained_hiredis_identity_from_full_cas() {
+        let before = include_str!("../../kin-parser/tests/fixtures/c/hiredis-sds.c");
+        let after = before.replacen("reqlen", "required_len", 3);
+        let (_dir, blobs, graph, mut reconciler) = partial_fixture(before);
+        let old = graph.list_all_entities().unwrap();
+        let target = old.iter().find(|e| e.name == "sdsMakeRoomFor").unwrap();
+        let result = partial_pass(&mut reconciler, &blobs, &graph, &after);
+        let ReconcileOutcome::PartiallyUpdated {
+            modified,
+            error_ranges,
+            retained,
+            ..
+        } = &result.outcome
+        else {
+            panic!("{:?}", result.outcome);
+        };
+        assert!(modified.contains(&target.id));
+        assert_eq!(error_ranges.len(), 25);
+        assert!(!retained.is_empty());
+        assert!(result.delta.relation_deltas.is_empty());
+        assert!(result
+            .delta
+            .entity_deltas
+            .iter()
+            .all(|d| matches!(d, EntityDelta::Modified { .. })));
+        graph.apply_transaction_delta(&result.delta).unwrap();
+        let updated = graph.get_entity(&target.id).unwrap().unwrap();
+        let span = updated.span.as_ref().unwrap();
+        assert!(after[span.start_byte..span.end_byte].contains("required_len"));
+        assert_eq!(
+            updated.metadata.extra["blob_hash"],
+            blobs.write(after.as_bytes()).unwrap().to_string()
+        );
+        for entity in old.iter().filter(|e| retained.contains(&e.id)) {
+            assert_eq!(graph.get_entity(&entity.id).unwrap().unwrap(), *entity);
+        }
+        assert!(reconciler
+            .projection()
+            .get_layout(&FilePathId::new("test.c"))
+            .is_none());
+        let repeat = partial_pass(&mut reconciler, &blobs, &graph, &after);
+        assert!(repeat.delta.entity_deltas.is_empty());
+    }
+
+    #[test]
+    fn partial_c_rejects_body_recovery_boundaries_and_macro_context_changes() {
+        for after in [
+            PARTIAL_C.replace("return value;", "return value"),
+            PARTIAL_C.replace("return value; }", "return value;"),
+            format!(
+                "#if CHOICE\n{}\n#endif\n",
+                PARTIAL_C.replace("value", "next")
+            ),
+            PARTIAL_C
+                .replace("int good", "API int good")
+                .replace("value", "next"),
+            PARTIAL_C.replace("return value;", "test_cond(value) return value;"),
+        ] {
+            let (_dir, blobs, graph, mut reconciler) = partial_fixture(PARTIAL_C);
+            let result = partial_pass(&mut reconciler, &blobs, &graph, &after);
+            assert!(
+                result.delta.entity_deltas.is_empty(),
+                "unexpected admission for {after}: {:?}",
+                result.delta
+            );
+        }
+    }
+
+    #[test]
+    fn partial_c_error_count_equality_never_authorizes_affected_body() {
+        let before = "int good(void) { return 1; }\nint bad(void) { test_cond(1) }\n";
+        let after = "int good(void) { test_cond(1) }\nint bad(void) { return 1; }\n";
+        let (_dir, blobs, graph, mut reconciler) = partial_fixture(before);
+        let pipeline = IndexPipeline::new();
+        let errors = |source: &str| match pipeline
+            .index_file_content_with_tests(
+                &FilePathId::new("test.c"),
+                source.as_bytes(),
+                kin_blobs::digest(source.as_bytes()),
+            )
+            .unwrap()
+            .indexed_file
+            .parse_state
+        {
+            ParseState::Incomplete { error_ranges } => error_ranges.len(),
+            _ => 0,
+        };
+        assert_eq!(errors(before), errors(after));
+        let result = partial_pass(&mut reconciler, &blobs, &graph, after);
+        assert!(result.delta.entity_deltas.is_empty());
+    }
+
+    #[test]
+    fn partial_c_ambiguous_and_omitted_declarations_are_retained() {
+        let (_dir, blobs, graph, mut reconciler) = partial_fixture(PARTIAL_C);
+        let mut duplicate = graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "good")
+            .unwrap();
+        duplicate.id = EntityId::new();
+        graph.upsert_entity(&duplicate).unwrap();
+        let result = partial_pass(
+            &mut reconciler,
+            &blobs,
+            &graph,
+            &PARTIAL_C.replace("value", "next"),
+        );
+        assert!(result.delta.entity_deltas.is_empty());
+        let after = "int bad(void) { test_cond(1) }\n";
+        let result = partial_pass(&mut reconciler, &blobs, &graph, after);
+        assert!(result.delta.entity_deltas.is_empty());
+        assert_eq!(graph.list_all_entities().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn partial_c_never_admits_macro_or_broken_call_regions() {
+        for before in [
+            "#define test_cond(x) do { (void)(x); } while (0);\nint good(void) { test_cond(1) return 0; }\n",
+            "void test_cond(int);\nint good(void) { test_cond(1) return 0; }\n",
+        ] {
+            let (_dir, blobs, graph, mut reconciler) = partial_fixture(before);
+            let result = partial_pass(&mut reconciler, &blobs, &graph, &before.replace("return 0", "return 2"));
+            assert!(result.delta.entity_deltas.is_empty());
+        }
+    }
+
+    #[test]
+    fn partial_c_macro_dependencies_and_nonlocal_names_cannot_change() {
+        for before in [
+            "#define selected 1\nint good(void) { return selected; }\nint bad(void) { test_cond(1) }\n",
+            "#include <macros.h>\nint good(void) { return selected; }\nint bad(void) { test_cond(1) }\n",
+            "void setup(void) {\n#define selected 1\n}\nint good(void) { int local = 1; return selected + local; }\nint bad(void) { test_cond(1) }\n",
+        ] {
+            let (_dir, blobs, graph, mut reconciler) = partial_fixture(before);
+            let after = if before.contains("void setup") { before.replace("selected 1", "selected 2").replace("local = 1", "local = 3") } else { before.replace("return selected", "return other") };
+            let result = partial_pass(&mut reconciler, &blobs, &graph, &after);
+            assert!(result.delta.entity_deltas.is_empty(), "{:?}", result.outcome);
+        }
+    }
+
+    #[test]
+    fn partial_c_local_bindings_respect_scope_and_declaration_order() {
+        for before in [
+            "int selected; int other;\nint good(void) { selected++; { int selected=0; int other=0; } return 0; }\nint bad(void) { test_cond(1) }\n",
+            "int selected; int other;\nint good(void) { { int selected=0; int other=0; } selected++; return 0; }\nint bad(void) { test_cond(1) }\n",
+            "int selected; int other;\nint good(void) { selected++; int selected=0; int other=0; return 0; }\nint bad(void) { test_cond(1) }\n",
+        ] {
+            let (_dir, blobs, graph, mut reconciler) = partial_fixture(before);
+            let after = before.replace("selected++", "other++");
+            let result = partial_pass(&mut reconciler, &blobs, &graph, &after);
+            assert!(result.delta.entity_deltas.is_empty(), "{:?}", result.outcome);
+        }
+    }
+
+    #[test]
+    fn partial_c_external_bindings_members_and_declarator_bounds_are_not_locals() {
+        for (before, from, to) in [
+            ("int good(void) { extern int selected; extern int other; return selected; }\nint bad(void) { test_cond(1) }\n", "return selected", "return other"),
+            ("struct item { int first; int second; };\nint good(void) { struct item local; return local.first; }\nint bad(void) { test_cond(1) }\n", "local.first", "local.second"),
+            ("int selected; int other;\nint good(void) { int selected[sizeof selected]; int other; return 0; }\nint bad(void) { test_cond(1) }\n", "sizeof selected", "sizeof other"),
+        ] {
+            let (_dir, blobs, graph, mut reconciler) = partial_fixture(before);
+            let result = partial_pass(&mut reconciler, &blobs, &graph, &before.replace(from, to));
+            assert!(result.delta.entity_deltas.is_empty(), "{:?}", result.outcome);
+        }
+    }
+
+    #[test]
+    fn partial_c_moved_declaration_keeps_identity_and_uses_current_span() {
+        let (_dir, blobs, graph, mut reconciler) = partial_fixture(PARTIAL_C);
+        let old = graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "good")
+            .unwrap();
+        let after = format!("// prefix\n{}", PARTIAL_C.replace("value", "longer_name"));
+        let result = partial_pass(&mut reconciler, &blobs, &graph, &after);
+        assert!(
+            matches!(&result.outcome, ReconcileOutcome::PartiallyUpdated { modified, .. } if modified.contains(&old.id))
+        );
+        graph.apply_transaction_delta(&result.delta).unwrap();
+        let current = graph.get_entity(&old.id).unwrap().unwrap();
+        let span = current.span.as_ref().unwrap();
+        assert!(span.start_byte > old.span.as_ref().unwrap().start_byte);
+        assert_eq!(
+            &after[span.start_byte..span.end_byte],
+            "int good(void) { int longer_name = 1; return longer_name; }"
+        );
+    }
+
+    const PARTIAL_CALL_C: &str = "int helper(void) { return 7; }\nint good(void) {\n  int value=1;\n  return helper();\n}\nint bad(void) { test_cond(1) }\n";
+
+    fn partial_call_span(source: &str, whole: bool, zero_bytes: bool) -> kin_model::SourceSpan {
+        let start = source.find("helper()").unwrap();
+        let end = start
+            + if whole {
+                "helper()".len()
+            } else {
+                "helper".len()
+            };
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u32;
+        let column = start - source[..start].rfind('\n').map_or(0, |offset| offset + 1);
+        kin_model::SourceSpan {
+            file: FilePathId::new("test.c"),
+            start_byte: if zero_bytes { 0 } else { start },
+            end_byte: if zero_bytes { 0 } else { end },
+            start_line: line,
+            end_line: line,
+            start_col: column as u32,
+            end_col: (column + end - start) as u32,
+        }
+    }
+
+    fn partial_enriched_call(
+        graph: &kin_db::InMemoryGraph,
+        source: &str,
+        whole: bool,
+        zero_bytes: bool,
+    ) -> (Entity, Relation) {
+        let entities = graph.list_all_entities().unwrap();
+        let caller = entities
+            .iter()
+            .find(|entity| entity.name == "good")
+            .unwrap()
+            .clone();
+        let callee = entities
+            .iter()
+            .find(|entity| entity.name == "helper")
+            .unwrap();
+        let mut relation = relation_of(kin_model::RelationOrigin::Lsp);
+        relation.src = GraphNodeId::Entity(caller.id);
+        relation.dst = GraphNodeId::Entity(callee.id);
+        relation.confidence = 0.75;
+        relation.evidence = vec![kin_model::RelationEvidence {
+            source_span: Some(partial_call_span(source, whole, zero_bytes)),
+            ..Default::default()
+        }];
+        graph.upsert_relation(&relation).unwrap();
+        (caller, relation)
+    }
+
+    #[test]
+    fn partial_c_rebases_unique_call_evidence_without_changing_relation_identity() {
+        for (whole, zero_bytes) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (_dir, blobs, graph, mut reconciler) = partial_fixture(PARTIAL_CALL_C);
+            let (caller, relation) =
+                partial_enriched_call(&graph, PARTIAL_CALL_C, whole, zero_bytes);
+            let after = format!(
+                "// prefix\n{}",
+                PARTIAL_CALL_C.replace("int value=1;", "int renamed=1;\n\n")
+            );
+            let result = partial_pass(&mut reconciler, &blobs, &graph, &after);
+            assert!(
+                matches!(&result.outcome, ReconcileOutcome::PartiallyUpdated { modified, .. } if modified.contains(&caller.id)),
+                "{:?}",
+                result.outcome
+            );
+            assert!(result
+                .delta
+                .relation_deltas
+                .iter()
+                .all(|delta| matches!(delta, RelationDelta::Modified { .. })));
+            graph.apply_transaction_delta(&result.delta).unwrap();
+            let actual = graph
+                .get_all_relations_for_entity(&caller.id)
+                .unwrap()
+                .into_iter()
+                .find(|held| held.id == relation.id)
+                .unwrap();
+            let mut expected = relation.clone();
+            expected.evidence[0].source_span = Some(partial_call_span(&after, whole, false));
+            assert_eq!(actual, expected, "only the proven coordinates may change");
+            assert_eq!(
+                graph
+                    .get_entity(&caller.id)
+                    .unwrap()
+                    .unwrap()
+                    .metadata
+                    .extra["blob_hash"],
+                kin_blobs::digest(after.as_bytes()).to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn partial_c_refuses_ambiguous_or_unsupported_located_evidence_atomically() {
+        for failure in [
+            "duplicate",
+            "range",
+            "coordinates",
+            "multiple",
+            "kind",
+            "binding",
+        ] {
+            let before = if failure == "duplicate" {
+                PARTIAL_CALL_C.replace("return helper();", "helper(); return helper();")
+            } else {
+                PARTIAL_CALL_C.into()
+            };
+            let (_dir, blobs, graph, mut reconciler) = partial_fixture(&before);
+            let (caller, mut relation) = partial_enriched_call(&graph, &before, false, false);
+            match failure {
+                "range" => relation.evidence[0].source_span = caller.span.clone(),
+                "coordinates" => relation.evidence[0].source_span.as_mut().unwrap().start_col += 1,
+                "multiple" => relation.evidence.push(kin_model::RelationEvidence {
+                    source_span: caller.span.clone(),
+                    ..Default::default()
+                }),
+                "kind" => relation.kind = RelationKind::References,
+                _ => {}
+            }
+            graph.upsert_relation(&relation).unwrap();
+            let after = format!(
+                "// prefix\n{}",
+                if failure == "binding" {
+                    before.replace("int value=1;", "int helper=1;")
+                } else {
+                    before.replace("int value=1;", "int renamed=1;\n\n")
+                }
+            );
+            let result = partial_pass(&mut reconciler, &blobs, &graph, &after);
+            assert!(
+                !result
+                    .delta
+                    .entity_deltas
+                    .iter()
+                    .any(|delta| delta.target_id() == caller.id),
+                "{failure}: {:?}",
+                result.outcome
+            );
+            assert!(
+                !result
+                    .delta
+                    .relation_deltas
+                    .iter()
+                    .any(|delta| delta.target_id() == relation.id),
+                "{failure}"
+            );
+            graph.apply_transaction_delta(&result.delta).unwrap();
+            assert_eq!(graph.get_entity(&caller.id).unwrap(), Some(caller));
+            assert_eq!(
+                graph
+                    .get_all_relations_for_entity(&relation.src.as_entity().unwrap())
+                    .unwrap()
+                    .into_iter()
+                    .find(|held| held.id == relation.id),
+                Some(relation)
+            );
+        }
+    }
+
+    #[test]
+    fn partial_c_clean_followup_removes_omitted_entities_and_restores_layout() {
+        let (_dir, blobs, graph, mut reconciler) = partial_fixture(PARTIAL_C);
+        let partial = partial_pass(
+            &mut reconciler,
+            &blobs,
+            &graph,
+            &PARTIAL_C.replace("value", "next"),
+        );
+        assert!(matches!(
+            partial.outcome,
+            ReconcileOutcome::PartiallyUpdated { .. }
+        ));
+        graph.apply_transaction_delta(&partial.delta).unwrap();
+        let clean = partial_pass(
+            &mut reconciler,
+            &blobs,
+            &graph,
+            "int good(void) { return 2; }\n",
+        );
+        assert!(
+            matches!(&clean.outcome, ReconcileOutcome::Updated { removed, .. } if removed.len() == 1)
+        );
+        graph.apply_transaction_delta(&clean.delta).unwrap();
+        let held = graph.list_all_entities().unwrap();
+        assert_eq!(held.len(), 1);
+        assert!(!held[0]
+            .metadata
+            .extra
+            .contains_key("partial_parse_admission"));
+        assert!(reconciler
+            .projection()
+            .get_layout(&FilePathId::new("test.c"))
+            .is_some());
+    }
 
     fn make_entity(name: &str, file: &str) -> Entity {
         Entity {
