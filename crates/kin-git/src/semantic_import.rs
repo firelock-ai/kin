@@ -2336,7 +2336,8 @@ mod tests {
             } else {
                 records.swap(0, 1);
             }
-            malformed.changes = SemanticChangeSpool::from_changes(fixture.blob_store.root(), records).unwrap();
+            malformed.changes =
+                SemanticChangeSpool::from_changes(fixture.blob_store.root(), records).unwrap();
             assert!(malformed.validate(&fixture.blob_store).is_err());
 
             let mut malformed = admitted.clone();
@@ -2350,7 +2351,8 @@ mod tests {
             } else {
                 records.swap(0, 1);
             }
-            malformed.changes = SemanticChangeSpool::from_changes(fixture.blob_store.root(), records).unwrap();
+            malformed.changes =
+                SemanticChangeSpool::from_changes(fixture.blob_store.root(), records).unwrap();
             assert!(malformed.validate(&fixture.blob_store).is_err());
         }
     }

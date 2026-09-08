@@ -318,7 +318,9 @@ mod tests {
         assert!(SemanticChangeSpool::from_changes(spool_dir(), [change(1), change(1)]).is_err());
         let mut duplicate_oid = change(2);
         duplicate_oid.origin = change(1).origin;
-        assert!(SemanticChangeSpool::from_changes(spool_dir(), [change(1), duplicate_oid]).is_err());
+        assert!(
+            SemanticChangeSpool::from_changes(spool_dir(), [change(1), duplicate_oid]).is_err()
+        );
     }
 
     #[test]
@@ -348,7 +350,8 @@ mod tests {
     fn spool_refuses_index_identity_corruption_with_intact_digest() {
         for corrupt_oid in [false, true] {
             let original = change(1);
-            let mut spool = SemanticChangeSpool::from_changes(spool_dir(), [original.clone()]).unwrap();
+            let mut spool =
+                SemanticChangeSpool::from_changes(spool_dir(), [original.clone()]).unwrap();
             assert_eq!(spool.read_at(0).unwrap(), Some(original.clone()));
             let storage = Arc::get_mut(&mut spool.0).unwrap();
             let record = &mut storage.records[0];

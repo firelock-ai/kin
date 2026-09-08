@@ -42,6 +42,25 @@ const PROOF_PEAK_GROWTH_CEILING: usize = 16 * 1024 * 1024;
 /// Historical semantics must be spooled without retaining decoded history.
 const BIND_PHASE: &str = "kin.init.bind_historical_semantics";
 
+/// Share of one materialized history the binding phase may add to the peak.
+///
+/// This is `BIND_PEAK_GROWTH_PERCENT_OF_RETAINED` restored on a denominator
+/// that still means something. The old ceiling compared the phase's growth
+/// against what the phase retained, and that worked while binding kept one copy
+/// of every commit's deltas: two copies alive at once measured 218 percent and
+/// one measured 118, so the gate sat at 175 between them. Binding now spools
+/// each commit and drops it, so it retains 0.1 MiB on this fixture instead of a
+/// history, and a ratio against that denominator would refuse every clean run.
+///
+/// The class that ceiling caught is still real and nothing else here grades it:
+/// the derived deltas alive beside the copy, transiently, dropped before the
+/// phase ends. The retention check below cannot see it, precisely because it is
+/// dropped, and the 900 MiB backstop cannot see it either, because one copy of
+/// this fixture's history is 87 MiB. So growth is graded against the same
+/// materialized history the retention checks use. Measured release on one host:
+/// 0 bytes clean, and one whole history under the mutant.
+const BIND_PEAK_GROWTH_DIVISOR: usize = 4;
+
 /// Consuming the disk-backed plan need not produce a measurable heap drop.
 const RELEASE_PHASE: &str = "kin.init.release_plan_bodies";
 
@@ -151,7 +170,7 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
             })
     };
     let (proof_growth, _) = phase(PROOF_PHASE);
-    let (_, bind_retained) = phase(BIND_PHASE);
+    let (bind_growth, bind_retained) = phase(BIND_PHASE);
     let (build_growth, _) = phase(BUILD_PHASE);
     let (_, admit_retained) = phase(ADMIT_PHASE);
     let (_, summary_retained) = phase(SUMMARY_PHASE);
@@ -193,7 +212,8 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
     println!("explicit history materialization retained {materialized_history_bytes} bytes");
     println!(
         "{PROOF_PHASE} peak growth: {proof_growth} bytes; \
-         {BUILD_PHASE} peak growth: {build_growth} bytes"
+         {BUILD_PHASE} peak growth: {build_growth} bytes; \
+         {BIND_PHASE} peak growth: {bind_growth} bytes"
     );
     println!(
         "retained bytes: {BIND_PHASE}={bind_retained}, \
@@ -217,6 +237,16 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
              The phase must stream history with bounded residency.\n\n{phase_table}"
         );
     }
+    assert!(
+        bind_growth < materialized_history_bytes / BIND_PEAK_GROWTH_DIVISOR,
+        "{BIND_PHASE} added {bind_growth} bytes to the peak, at or over one quarter of the \
+         {materialized_history_bytes} bytes retained by explicit history materialization. That \
+         phase derives one set of deltas per commit and hands each straight to the spool, so \
+         growth on the order of a history means the derived set and the spooled copy are alive at \
+         the same time. On a real conversion that is gigabytes, and nothing else here sees it: a \
+         copy dropped before the phase ends never moves the phase's retention, and one copy of \
+         this history is far under the total backstop.\n\n{phase_table}"
+    );
     assert!(
         build_growth < materialized_history_bytes / 2,
         "{BUILD_PHASE} added {build_growth} bytes to the peak, at or over one half of the \
