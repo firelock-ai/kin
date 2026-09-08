@@ -11970,13 +11970,11 @@ def main() -> None:
         "must also fail its run",
         lambda: assert_release_hold_marker_contract(
             release_train.replace(
-                '              echo "::error::The release rail has held with releasable drift '
-                'for $(jq -er .consecutive "$decision") consecutive cycles. Opened the tracking '
-                'issue that names the blocking tag and the two ways out."\n'
+                '              echo "::error::Release rail requires attention (${reason}). '
+                'Opened the tracking issue with the observed failure or hold and its recovery path."\n'
                 "              exit 1\n",
-                '              echo "::error::The release rail has held with releasable drift '
-                'for $(jq -er .consecutive "$decision") consecutive cycles. Opened the tracking '
-                'issue that names the blocking tag and the two ways out."\n',
+                '              echo "::error::Release rail requires attention (${reason}). '
+                'Opened the tracking issue with the observed failure or hold and its recovery path."\n',
                 1,
             ),
             release_sentinel,
