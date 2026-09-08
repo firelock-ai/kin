@@ -12828,7 +12828,7 @@ mod tests {
 
     /// A vector batch can finish after a refusal is recorded and before the
     /// background worker reaches its next checkpoint. That checkpoint must
-    /// release the late batch and halt the worker instead of leaving the batch
+    /// release the late batch and park the drain instead of leaving the batch
     /// resident for the process lifetime.
     #[cfg(feature = "embeddings")]
     #[tokio::test]
@@ -12867,7 +12867,7 @@ mod tests {
         let mut pending_flush = None;
         let mut embedded_since_flush = 0;
         assert!(
-            crate::daemon::stop_if_hosted_vector_binding_refused(
+            crate::daemon::pause_if_hosted_vector_binding_refused(
                 &state,
                 &mut pending_flush,
                 &mut embedded_since_flush,
@@ -12876,11 +12876,9 @@ mod tests {
             .await,
             "the worker must recognize the retained refusal at its checkpoint"
         );
-        assert!(pass.halted());
         assert!(
-            pass.halt_reason()
-                .is_some_and(|reason| reason.contains("hosted vector binding")),
-            "the pass halt must name the durable binding refusal"
+            !pass.halted(),
+            "a binding refusal must not permanently halt the pass"
         );
         assert_eq!(
             state.graph.embedding_status().indexed,
@@ -12888,6 +12886,98 @@ mod tests {
             "the worker checkpoint must release vectors that arrived after the refusal"
         );
         assert_eq!(backend.vector_save_count(), 0);
+    }
+
+    /// The real worker task must survive a refused binding, observe a rebind,
+    /// and continue waking. Explicit pause keeps this lifecycle test independent
+    /// of a model or accelerator while the refusal checkpoint still executes.
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn a_hosted_worker_survives_refusal_and_observes_rebind() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "hosted-worker-rebind-lifecycle";
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("worker_rebind", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        backend.publish_graph(repo_id, &graph, 0);
+        let state = Arc::new(
+            DaemonState::open_with_backend(
+                layout.clone(),
+                Box::new(backend.clone()),
+                repo_id,
+                None,
+            )
+            .unwrap(),
+        );
+        state
+            .graph
+            .upsert_entity(&test_entity("after_binding", "src/next.rs"))
+            .unwrap();
+        load_one_vector_into(&state, &layout, &entity);
+        state
+            .flush_embed_progress()
+            .expect_err("the fixture must establish a refusal");
+        load_one_vector_into(&state, &layout, &entity);
+        state.pause_background_embed();
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        let worker = crate::daemon::spawn_background_embedding_worker(
+            Arc::clone(&state),
+            std::time::Duration::from_millis(10),
+            1,
+            false,
+            receiver,
+        );
+        let pass = state
+            .background_work
+            .pass(crate::background_work::PASS_EMBED);
+        let wait_for_state = |expected: &'static str| {
+            let state = Arc::clone(&state);
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        if state
+                            .background_work
+                            .reports(std::time::Instant::now())
+                            .iter()
+                            .any(|row| {
+                                row.name == crate::background_work::PASS_EMBED
+                                    && row.state == expected
+                            })
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("worker must reach the expected lifecycle state");
+            }
+        };
+        wait_for_state("waiting_deferred").await;
+        assert!(
+            !worker.is_finished(),
+            "a refused binding must not terminate the worker task"
+        );
+        assert!(!pass.halted());
+        assert_eq!(state.graph.embedding_status().indexed, 0);
+        assert_eq!(backend.vector_save_count(), 0);
+
+        state.save_snapshot().unwrap();
+        assert!(state.hosted_vector_binding_refusal().is_none());
+        wait_for_state("idle").await;
+        assert!(
+            !worker.is_finished(),
+            "the same worker must survive and observe the rebind"
+        );
+        assert!(!pass.halted());
+        cancel.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+            .await
+            .expect("the surviving worker must honor cancellation")
+            .unwrap();
     }
 
     /// The release is not unconditional. A vector index is all-or-nothing, so

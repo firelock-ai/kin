@@ -700,14 +700,11 @@ async fn drain_pending_flush(pending: &mut Option<tokio::task::JoinHandle<Result
     }
 }
 
-/// Let go of what a stopping embedding worker embedded and could not persist.
+/// Release vectors a stopped or deferred embedding worker cannot persist.
 ///
-/// Called where the worker observes its own halt, which is the only place it
-/// knows it is leaving for the life of the process. A pass the supervisor
-/// stopped for holding the CPU without recording progress made nothing durable
-/// in that stretch, so what it is holding is memory nothing will read again and
-/// that a hosted container's cgroup limit is still counting. Silent when
-/// nothing was stranded, because a release that reclaimed nothing is not news.
+/// Used at supervisor stops and binding-refusal checkpoints. A later rebind
+/// reloads durable vectors; stranded vectors can be recomputed after the worker
+/// resumes. Silent when no vectors were released.
 fn release_stopped_embed_worker_vectors(state: &DaemonState) {
     let released = state.release_stranded_embedded_vectors();
     if released > 0 {
@@ -737,32 +734,31 @@ async fn drain_embed_flush(
     }
 }
 
-/// Stop an embedding worker whose retained hosted binding has refused writes.
+/// Park the current drain while its retained hosted binding refuses writes.
 ///
 /// The worker checks this only at its own checkpoint, after awaiting any
 /// in-flight flush. That ordering lets a started artifact write finish before
-/// the pass halts, then releases vectors that arrived after the refusal and
-/// cannot become durable on the unchanged binding.
-pub(crate) async fn stop_if_hosted_vector_binding_refused(
+/// the pass parks, then releases vectors that arrived after the refusal and
+/// cannot become durable on the unchanged binding. The worker remains alive
+/// and checks the binding again on its next wake.
+pub(crate) async fn pause_if_hosted_vector_binding_refused(
     state: &DaemonState,
     pending: &mut Option<tokio::task::JoinHandle<Result<usize>>>,
     embedded: &mut u64,
     pass: &crate::background_work::BackgroundPass,
 ) -> bool {
-    let Some(reason) = state.hosted_vector_binding_refusal() else {
+    if state.hosted_vector_binding_refusal().is_none() {
+        pass.set_deferred(false, Instant::now());
         return false;
-    };
+    }
     drain_embed_flush(pending, embedded, pass).await;
+    if state.hosted_vector_binding_refusal().is_none() {
+        pass.set_deferred(false, Instant::now());
+        return false;
+    }
     release_stopped_embed_worker_vectors(state);
-    pass.halt(format!(
-        "the background embedding worker stopped because nothing it embeds can be \
-         persisted against the hosted vector binding this daemon holds, and \
-         retrying on the same binding would repeat the refusal: {reason}"
-    ));
-    error!(
-        reason = %reason,
-        "embedding worker stopped: durable vector persistence is refused against the retained hosted binding; the daemon keeps serving"
-    );
+    pass.idle();
+    pass.set_deferred(true, Instant::now());
     true
 }
 
@@ -4791,531 +4787,13 @@ pub async fn run_with_authority_on(
     // Spawn the background embedding worker.
     // Periodically drains the embedding queue, generating vector embeddings
     // for newly added/modified entities. Non-blocking to the reconcile loop.
-    let embed_state = Arc::clone(&state);
-    let embed_interval = config.embed_interval;
-    let embed_batch_size = config.embed_batch_size;
-    let embed_pipeline_overlap = config.embed_pipeline_overlap;
-    let mut embed_cancel = cancel_rx.clone();
-    let embed_handle = tokio::spawn(async move {
-        if !embed_state.can_persist_embed_progress_locally() {
-            retire_embed_pressure_for_unavailable_persistence(&embed_state);
-            warn!(
-                "background embedding worker disabled: durable vector-artifact capability or its compare-and-swap cursor is unavailable; graph serving remains available"
-            );
-            return;
-        }
-        // Wait for the daemon to finish its first reconciliation cycle
-        // before starting embedding work — no point embedding an empty graph.
-        while !embed_state
-            .is_initialized
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
-                _ = embed_cancel.changed() => return,
-            }
-        }
-        info!("embedding worker started");
-        start_or_defer_background_embed(&embed_state);
-        // Register with the self-limit supervisor. Registration is what makes
-        // this worker's CPU accountable: from here it declares when it is
-        // working, credits what it persists, and is stopped and announced if
-        // those two ever come apart.
-        let embed_pass = embed_state
-            .background_work
-            .pass(crate::background_work::PASS_EMBED);
-        let embed_retry_budget = crate::background_work::configured_retry_budget();
-        let mut consecutive_panics: u32 = 0;
-        const MAX_CONSECUTIVE_PANICS: u32 = 3;
-        // Recovery + backoff state for vector-index errors (e.g. a stale on-disk
-        // index dimension vs the live embedder). We trigger the kin-db
-        // reset/re-queue contract exactly ONCE; if the error persists, we back
-        // off exponentially so the worker can never busy-spin requeuing a batch
-        // that keeps failing — the 100% CPU / 5s requeue-fail loop class.
-        let mut index_reset_triggered = false;
-        let mut error_backoff: Option<Duration> = None;
-        const EMBED_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(60);
-        // The coverage gap this worker last re-queued, so a gap it cannot close
-        // is reported once instead of re-queued every interval. Cleared by any
-        // batch that embeds something, since progress makes the next gap a new
-        // question.
-        let mut backfilled_gap: Option<usize> = None;
-        // A refused vector checkpoint outlives the batch that hit it, so its
-        // retry schedule lives out here with the wake loop rather than inside
-        // the drain that produced the refusal.
-        let mut deferred_checkpoint_backoff: Option<Duration> = None;
-        let mut deferred_checkpoint_due: Option<Instant> = None;
-        // The pressure level this worker has already spoken about. Held so a
-        // machine that stays critical is disclosed once rather than on every
-        // wake: the record is a statement of the current state, and rewriting
-        // it every few seconds would turn a disclosure into a log.
-        let mut announced_pressure: Option<kin_core::memory_pressure::PressureLevel> = None;
-        // What a refusal for memory has measured so far, and whether this worker
-        // has ever finished a batch in this process. Together they are what lets
-        // a tree that has SETTLED above its budget keep converging while a tree
-        // that is still growing stays refused. See
-        // `kin_core::memory_pressure::admit_refused_embed`.
-        let mut refusal_state = kin_core::memory_pressure::RefusedEmbedState::default();
-        let mut completed_a_batch = false;
-        'wake: loop {
-            // Between wakes this worker is genuinely doing nothing, so the
-            // working stretch ends here. A wedged drain never reaches this
-            // point, which is precisely why the stretch it started keeps
-            // accumulating and becomes observable.
-            embed_pass.idle();
-            // While an embed/index error is being retried, sleep for the current
-            // backoff instead of the normal idle interval (no tight-spin).
-            let idle = error_backoff.unwrap_or(embed_interval);
-            tokio::select! {
-                _ = tokio::time::sleep(idle) => {}
-                _ = embed_cancel.changed() => {
-                    info!("embedding worker shutting down");
-                    break;
-                }
-            }
-            if *embed_cancel.borrow() {
-                break;
-            }
-            if embed_pass.halted() {
-                release_stopped_embed_worker_vectors(&embed_state);
-                break;
-            }
-
-            // Before anything this tick might embed, land what the last tick
-            // already embedded and could not checkpoint. A drained queue never
-            // reaches the flush below, so this is the only path that closes a
-            // refusal once there is nothing left to embed, which is the state
-            // the regression was found in.
-            retry_deferred_vector_checkpoint(
-                &embed_state,
-                &mut deferred_checkpoint_backoff,
-                &mut deferred_checkpoint_due,
-                embed_interval,
-            )
-            .await;
-
-            // Drain the pending backlog continuously within this wake rather than
-            // one batch per `embed_interval`. A fresh central-graph embed (or an
-            // explicit `kin embed --rebuild`) enqueues thousands of entities;
-            // trickling a single batch per interval would cap throughput at
-            // `embed_batch_size / embed_interval` no
-            // matter how fast the GPU runs. We yield between batches so locate,
-            // persistence, and cancellation stay responsive, then fall back to the
-            // idle sleep once the queue is empty. Incremental trickle (a handful of
-            // newly-reconciled entities) drains in a single pass and is unchanged.
-            // At most one batch's flush is in flight at a time. Under the
-            // throughput profile its flush stays here while the next batch's
-            // prep + GPU forward runs, so the accelerator is never idle during a
-            // persist; it is drained before the next flush is scheduled and at
-            // every loop exit so two flushes never interleave and the tail is
-            // always awaited.
-            let mut pending_flush: Option<tokio::task::JoinHandle<Result<usize>>> = None;
-            // Entities embedded by batches whose flush has not been awaited yet.
-            // Credited to the pass only once that flush reports it reached disk.
-            let mut embedded_since_flush: u64 = 0;
-            loop {
-                if *embed_cancel.borrow() {
-                    drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass)
-                        .await;
-                    break 'wake;
-                }
-                // The supervisor's verdict is enforced here, at the worker's own
-                // checkpoint, so an in-flight batch and its flush finish rather
-                // than being torn out from under the vector sidecar.
-                if embed_pass.halted() {
-                    drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass)
-                        .await;
-                    // A pass the supervisor stopped for holding the CPU without
-                    // recording progress recorded nothing durable in that
-                    // stretch, and this worker is leaving for the life of the
-                    // process. Whatever it embedded that no artifact holds is
-                    // memory nothing will ever read again, and on a hosted
-                    // container it is memory the cgroup limit is counting.
-                    release_stopped_embed_worker_vectors(&embed_state);
-                    break 'wake;
-                }
-                // A durable save refused against the binding this daemon holds
-                // does not become writable by trying again: the refusal is a
-                // property of the binding, so every batch after it spends the
-                // CPU and the memory of a hosted container to produce vectors
-                // nothing can write. Stand down here, at the worker's own
-                // checkpoint, and say why on the pass surface. The record is
-                // matched against the installed binding, so a rebind after the
-                // next graph commit retires it and a later wake may drain
-                // again; this is a stand-down on one binding, not on the store.
-                if stop_if_hosted_vector_binding_refused(
-                    &embed_state,
-                    &mut pending_flush,
-                    &mut embedded_since_flush,
-                    &embed_pass,
-                )
-                .await
-                {
-                    break 'wake;
-                }
-                if embed_state.background_embed_paused() {
-                    debug!("embedding worker paused after bounded explicit embed");
-                    break;
-                }
-                if embed_state.embed_pass_active() {
-                    debug!("embedding worker yielding to explicit embed pass");
-                    break;
-                }
-                let pending = embed_state.graph.pending_embeddings();
-                let pending_artifacts = embed_state.graph.pending_artifact_embeddings();
-                if pending == 0 && pending_artifacts == 0 {
-                    // An empty queue is not the same fact as whole coverage,
-                    // and the difference is what let every commit cost a store
-                    // part of its memory in silence. A change mints a HEAD
-                    // revision key per touched entity, and anything that puts a
-                    // retrievable key into truth without queueing it leaves the
-                    // worker nothing to do and no reason to say so. Ask coverage
-                    // before believing the drain.
-                    let status = embed_state.graph.embedding_status();
-                    let missing = status.total.saturating_sub(status.indexed);
-                    let coverage_verdict = coverage_drain_verdict(missing, backfilled_gap);
-                    match coverage_verdict {
-                        CoverageDrainVerdict::Backfill { missing } => {
-                            if !queue_embedding_backfill_under_pressure(
-                                &embed_state,
-                                &mut announced_pressure,
-                                || {
-                                    #[cfg(feature = "embeddings")]
-                                    embed_state.graph.queue_missing_for_embedding();
-                                    embed_state.graph.queue_missing_artifacts_for_embedding();
-                                },
-                            ) {
-                                break;
-                            }
-                            warn!(
-                                missing,
-                                indexed = status.indexed,
-                                total = status.total,
-                                "embedding queue drained while coverage is short; re-queueing the missing keys"
-                            );
-                            // This latch means a re-queue was actually tried.
-                            // A pressure refusal above tried nothing and must
-                            // remain eligible on the next wake.
-                            backfilled_gap = Some(missing);
-                            if embed_state.graph.pending_embeddings() > 0
-                                || embed_state.graph.pending_artifact_embeddings() > 0
-                            {
-                                continue;
-                            }
-                            warn!(
-                                missing,
-                                "no retrievable key could be queued for the missing coverage"
-                            );
-                            break;
-                        }
-                        CoverageDrainVerdict::Stalled { missing } => {
-                            debug!(
-                                missing,
-                                "embedding coverage is short and re-queueing it changed nothing"
-                            );
-                            break;
-                        }
-                        CoverageDrainVerdict::Complete => {
-                            // Coverage is whole here, so this is where the
-                            // has-ever-completed marker is published. Recording
-                            // it on the side that did the work keeps the claim
-                            // off a reader that only saw a quiet queue.
-                            let completed_work = coverage_verdict
-                                .completed_pressure_work()
-                                .expect("complete coverage names its completed pressure work");
-                            let retired_refusal =
-                                clear_pressure_refusal_for_work(&embed_state, completed_work);
-                            announced_pressure = pressure_announcement_after_retirement(
-                                announced_pressure,
-                                retired_refusal,
-                            );
-                            embed_state.record_embedding_coverage_complete();
-                            break;
-                        }
-                    }
-                }
-                // Everything below spends the machine, so the machine is
-                // asked first. A refusal leaves the queue exactly as it is and
-                // goes back to the idle wake, which is what makes this a
-                // back-off rather than a loss: the work is still owed, and the
-                // next wake takes it when there is room.
-                let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
-                publish_footprint_standing(&embed_state, &call);
-                let pressure_changed = announced_pressure != Some(call.level);
-                // A refusal is still disclosed exactly as before; what it no
-                // longer always does is stop the drain. A tree that has not
-                // grown since its refusal was anchored runs a floor-size batch,
-                // because refusing it for ever cannot reclaim the memory that
-                // put it over: that memory is the model the next batch reuses.
-                let observation = budget_observation(&call);
-                let (next_refusal_state, admission) =
-                    kin_core::memory_pressure::admit_refused_embed(
-                        refusal_state,
-                        observation,
-                        call.host_level,
-                        completed_a_batch,
-                        kin_core::memory_pressure::REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
-                    );
-                refusal_state = next_refusal_state;
-                // Called for its record-publishing side effect before anything
-                // decides to stop, so a refusal is disclosed on the wake that
-                // produced it whatever this worker then does about it.
-                let refused_now = disclose_embed_pressure_refusal_if_needed(
-                    &embed_state,
-                    &mut announced_pressure,
-                    &call,
-                );
-                let decision = embed_wake_decision(
-                    refused_now,
-                    admission,
-                    refusal_state,
-                    &call.verdict,
-                    embed_batch_size,
-                );
-                let batch = match decision {
-                    EmbedWakeDecision::Hold => break,
-                    EmbedWakeDecision::Run(batch) => batch,
-                };
-                if pressure_changed {
-                    match &call.verdict {
-                        kin_core::memory_pressure::Verdict::Shrink { reason } => {
-                            warn!(
-                                pressure = call.level.as_str(),
-                                batch = embed_batch_under_pressure(embed_batch_size, &call.verdict),
-                                configured = embed_batch_size,
-                                "{reason}"
-                            );
-                        }
-                        kin_core::memory_pressure::Verdict::Proceed => {}
-                        kin_core::memory_pressure::Verdict::Refuse { .. } => {}
-                    }
-                    announced_pressure = Some(call.level);
-                }
-                // From here to the next `idle` this worker is spending the
-                // machine. Latched, so a drain that never finishes keeps one
-                // stretch rather than restarting it every batch.
-                embed_pass.working(Instant::now());
-                let state_for_embed = Arc::clone(&embed_state);
-                let is_artifact = pending == 0;
-                let reset_on_index_error = !index_reset_triggered;
-                let label = if is_artifact {
-                    "embedded artifacts"
-                } else {
-                    "embedded entities"
-                };
-                let remaining = if is_artifact {
-                    pending_artifacts
-                } else {
-                    pending
-                };
-
-                let embed_result = tokio::task::spawn_blocking(move || {
-                    run_background_embedding_batch(
-                        &state_for_embed,
-                        reset_on_index_error,
-                        |state| {
-                            if is_artifact {
-                                state.graph.process_artifact_embedding_queue(batch)
-                            } else {
-                                state.graph.process_embedding_queue(batch)
-                            }
-                        },
-                    )
-                })
-                .await;
-
-                match embed_result {
-                    Ok(BackgroundEmbeddingBatchOutcome::Completed(count)) if count > 0 => {
-                        consecutive_panics = 0;
-                        // A successful batch means the index now matches the
-                        // embedder — clear any error backoff / reset latch.
-                        index_reset_triggered = false;
-                        error_backoff = None;
-                        // Progress makes the next coverage gap a new question,
-                        // so a gap that once looked unclosable gets asked again.
-                        backfilled_gap = None;
-                        // This worker has now established a settled footprint to
-                        // anchor against, which is what a later refusal for
-                        // memory needs before it may admit anything.
-                        completed_a_batch = true;
-                        embed_pass.reset_retries();
-                        info!(count, remaining = remaining.saturating_sub(count), label);
-                        // Serialize successive flushes: the previous batch's
-                        // flush — which may still be running concurrently with
-                        // this batch's prep + GPU forward under the throughput
-                        // profile — must finish before this batch's flush starts.
-                        // This guarantees at most one persist runs at a time, so
-                        // two flushes never interleave and the persisted
-                        // generation cursor advances monotonically.
-                        drain_embed_flush(
-                            &mut pending_flush,
-                            &mut embedded_since_flush,
-                            &embed_pass,
-                        )
-                        .await;
-                        embedded_since_flush = count as u64;
-                        // Persist the vector index under the shared persist lock so
-                        // this kvec write can never interleave with a snapshot save
-                        // running in the persistence loop or idle-shutdown flush.
-                        // Run inside spawn_blocking so the std persist Mutex is held
-                        // only across the synchronous write, never across an await.
-                        let state_for_persist = Arc::clone(&embed_state);
-                        // Flush this batch incrementally — the vector
-                        // sidecar plus any concurrent LSP-enrichment graph delta —
-                        // instead of relying on the periodic full-graph save that
-                        // re-serializes the whole ~1 GB graph each tick. The method
-                        // holds the persist lock and advances the generation cursor
-                        // (mirrors save_snapshot), so the two paths never tear.
-                        let flush = tokio::task::spawn_blocking(move || {
-                            state_for_persist.flush_embed_progress()
-                        });
-                        pending_flush = Some(flush);
-                        // Throughput leaves the flush in flight and loops straight
-                        // to the next batch so the GPU is fed while the persist
-                        // runs; proof/serial blocks on it now so the persisted
-                        // order is fully deterministic.
-                        if !embed_pipeline_overlap {
-                            drain_embed_flush(
-                                &mut pending_flush,
-                                &mut embedded_since_flush,
-                                &embed_pass,
-                            )
-                            .await;
-                        }
-                    }
-                    Ok(BackgroundEmbeddingBatchOutcome::Completed(_)) => {
-                        // Queue drained out from under us (e.g. an explicit
-                        // `/embed` request raced ahead). Stop draining and return
-                        // to the idle sleep.
-                        consecutive_panics = 0;
-                        index_reset_triggered = false;
-                        error_backoff = None;
-                        embed_pass.reset_retries();
-                        break;
-                    }
-                    Ok(BackgroundEmbeddingBatchOutcome::ResetAfterIndexError(e)) => {
-                        warn!(
-                            error = %e,
-                            "embedding worker hit a vector-index error — reset vector index and re-queued once"
-                        );
-                        index_reset_triggered = true;
-                        error_backoff = None;
-                        error!(
-                            error = %e,
-                            "embedding worker error — reset vector index, retrying next interval"
-                        );
-                        break;
-                    }
-                    Ok(BackgroundEmbeddingBatchOutcome::Failed(e)) => {
-                        // Distinguish a persistent vector-index error (a stale
-                        // loaded index dimension vs the live embedder) from a
-                        // transient one. The first IndexError was recovered
-                        // inside the failed batch's critical section above. If
-                        // it persists (reset already attempted) or it is some
-                        // other error, back off exponentially so the worker
-                        // never busy-spins. A stale vector index is NOT a reason
-                        // to block the graph snapshot flush — it self-heals on
-                        // load — so shutdown persistence is left untouched
-                        // here; the graph anti-wipe guard is keyed on
-                        // entity-count collapse, not on embed errors.
-                        let next = next_embed_error_backoff(
-                            error_backoff,
-                            embed_interval,
-                            EMBED_ERROR_BACKOFF_MAX,
-                        );
-                        error_backoff = Some(next);
-                        error!(
-                            error = %e,
-                            backoff_s = next.as_secs(),
-                            "embedding worker error — backing off"
-                        );
-                        // Backoff bounds how fast this ladder retries and not how
-                        // long it retries for, so a failure that never clears
-                        // retries at the ceiling until the process dies. Charging
-                        // each delay against a cumulative budget puts an end on
-                        // it: the work parks with a reason a user can read
-                        // instead of retrying out of sight forever.
-                        if !embed_pass.charge_retry(
-                            next,
-                            embed_retry_budget,
-                            "the background embedding worker",
-                        ) {
-                            error!(
-                                budget_s = embed_retry_budget.as_secs(),
-                                "embedding worker parked — cumulative retry budget exhausted (see /health background_passes)"
-                            );
-                        }
-                        break;
-                    }
-                    Err(e) => {
-                        consecutive_panics += 1;
-                        if consecutive_panics >= MAX_CONSECUTIVE_PANICS {
-                            // Mark the derived-index worker as permanently failed
-                            // so /health surfaces the degraded state LOUDLY. The
-                            // daemon keeps serving graph/locate/reconcile — the
-                            // worker exiting must NOT take the whole process down
-                            // (that was the exit(0) "silent death", #11).
-                            embed_state
-                                .embed_worker_failed
-                                .store(true, std::sync::atomic::Ordering::Relaxed);
-                            // Say it on the pass surface too. A reader looking at
-                            // background passes must not see this worker sitting
-                            // at `idle` when it is never coming back.
-                            embed_pass.halt(format!(
-                                "the embedding worker panicked {consecutive_panics} times in a row \
-                                 and stopped; the vector index will not advance until the daemon \
-                                 restarts and the daemon keeps serving graph, locate and reconcile"
-                            ));
-                            error!(
-                                error = %e,
-                                consecutive_panics,
-                                "embedding worker permanently failed — vector index will not update until daemon restart; daemon continues in embed-degraded mode (see /health embed_worker_failed)"
-                            );
-                            drain_embed_flush(
-                                &mut pending_flush,
-                                &mut embedded_since_flush,
-                                &embed_pass,
-                            )
-                            .await;
-                            break 'wake;
-                        }
-                        error!(
-                            error = %e,
-                            consecutive_panics,
-                            "embedding task panicked, respawning after 1s"
-                        );
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        break;
-                    }
-                }
-
-                // Cooperative cancellation: a shutdown signalled mid-drain must
-                // not linger in the pacing sleep or loop back for another batch.
-                // Break promptly the moment cancel is observed so only the single
-                // in-flight blocking batch (which cannot itself observe the
-                // signal) is left for the bounded teardown to handle.
-                if *embed_cancel.borrow() {
-                    info!("embedding worker stopping mid-drain on shutdown");
-                    drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass)
-                        .await;
-                    break 'wake;
-                }
-
-                // Cooperative pause: let locate, persistence, and explicit
-                // `/embed` requests acquire the embedding lock between background
-                // batches during a long drain. A plain yield can let this worker
-                // immediately reacquire and starve foreground benchmark backfill.
-                tokio::task::yield_now().await;
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            // Drain the tail flush at every drain-loop exit (pause, queue empty,
-            // transient error, or panic respawn) so a persist started under the
-            // throughput profile is always awaited before the worker idles or
-            // re-enters the next wake — no flush outlives the loop unobserved.
-            drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass).await;
-        }
-        embed_pass.idle();
-    });
+    let embed_handle = spawn_background_embedding_worker(
+        Arc::clone(&state),
+        config.embed_interval,
+        config.embed_batch_size,
+        config.embed_pipeline_overlap,
+        cancel_rx.clone(),
+    );
 
     // Order the cold sweep behind the embedding backfill.
     //
@@ -6778,6 +6256,538 @@ async fn select_with_signals(
     )
     .await;
     result
+}
+
+/// Spawn the embedding worker independently of the daemon's API and watcher tasks.
+pub(crate) fn spawn_background_embedding_worker(
+    embed_state: Arc<DaemonState>,
+    embed_interval: Duration,
+    embed_batch_size: usize,
+    embed_pipeline_overlap: bool,
+    mut embed_cancel: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if !embed_state.can_persist_embed_progress_locally() {
+            retire_embed_pressure_for_unavailable_persistence(&embed_state);
+            warn!(
+                "background embedding worker disabled: durable vector-artifact capability or its compare-and-swap cursor is unavailable; graph serving remains available"
+            );
+            return;
+        }
+        // Wait for the daemon to finish its first reconciliation cycle
+        // before starting embedding work — no point embedding an empty graph.
+        while !embed_state
+            .is_initialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                _ = embed_cancel.changed() => return,
+            }
+        }
+        info!("embedding worker started");
+        start_or_defer_background_embed(&embed_state);
+        // Register with the self-limit supervisor. Registration is what makes
+        // this worker's CPU accountable: from here it declares when it is
+        // working, credits what it persists, and is stopped and announced if
+        // those two ever come apart.
+        let embed_pass = embed_state
+            .background_work
+            .pass(crate::background_work::PASS_EMBED);
+        let embed_retry_budget = crate::background_work::configured_retry_budget();
+        let mut consecutive_panics: u32 = 0;
+        const MAX_CONSECUTIVE_PANICS: u32 = 3;
+        // Recovery + backoff state for vector-index errors (e.g. a stale on-disk
+        // index dimension vs the live embedder). We trigger the kin-db
+        // reset/re-queue contract exactly ONCE; if the error persists, we back
+        // off exponentially so the worker can never busy-spin requeuing a batch
+        // that keeps failing — the 100% CPU / 5s requeue-fail loop class.
+        let mut index_reset_triggered = false;
+        let mut error_backoff: Option<Duration> = None;
+        const EMBED_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(60);
+        // The coverage gap this worker last re-queued, so a gap it cannot close
+        // is reported once instead of re-queued every interval. Cleared by any
+        // batch that embeds something, since progress makes the next gap a new
+        // question.
+        let mut backfilled_gap: Option<usize> = None;
+        // A refused vector checkpoint outlives the batch that hit it, so its
+        // retry schedule lives out here with the wake loop rather than inside
+        // the drain that produced the refusal.
+        let mut deferred_checkpoint_backoff: Option<Duration> = None;
+        let mut deferred_checkpoint_due: Option<Instant> = None;
+        // The pressure level this worker has already spoken about. Held so a
+        // machine that stays critical is disclosed once rather than on every
+        // wake: the record is a statement of the current state, and rewriting
+        // it every few seconds would turn a disclosure into a log.
+        let mut announced_pressure: Option<kin_core::memory_pressure::PressureLevel> = None;
+        // What a refusal for memory has measured so far, and whether this worker
+        // has ever finished a batch in this process. Together they are what lets
+        // a tree that has SETTLED above its budget keep converging while a tree
+        // that is still growing stays refused. See
+        // `kin_core::memory_pressure::admit_refused_embed`.
+        let mut refusal_state = kin_core::memory_pressure::RefusedEmbedState::default();
+        let mut completed_a_batch = false;
+        'wake: loop {
+            // Between wakes this worker is genuinely doing nothing, so the
+            // working stretch ends here. A wedged drain never reaches this
+            // point, which is precisely why the stretch it started keeps
+            // accumulating and becomes observable.
+            embed_pass.idle();
+            // While an embed/index error is being retried, sleep for the current
+            // backoff instead of the normal idle interval (no tight-spin).
+            let idle = error_backoff.unwrap_or(embed_interval);
+            tokio::select! {
+                _ = tokio::time::sleep(idle) => {}
+                _ = embed_cancel.changed() => {
+                    info!("embedding worker shutting down");
+                    break;
+                }
+            }
+            if *embed_cancel.borrow() {
+                break;
+            }
+            if embed_pass.halted() {
+                release_stopped_embed_worker_vectors(&embed_state);
+                break;
+            }
+
+            // Before anything this tick might embed, land what the last tick
+            // already embedded and could not checkpoint. A drained queue never
+            // reaches the flush below, so this is the only path that closes a
+            // refusal once there is nothing left to embed, which is the state
+            // the regression was found in.
+            if embed_state.hosted_vector_binding_refusal().is_none() {
+                retry_deferred_vector_checkpoint(
+                    &embed_state,
+                    &mut deferred_checkpoint_backoff,
+                    &mut deferred_checkpoint_due,
+                    embed_interval,
+                )
+                .await;
+            }
+
+            // Drain the pending backlog continuously within this wake rather than
+            // one batch per `embed_interval`. A fresh central-graph embed (or an
+            // explicit `kin embed --rebuild`) enqueues thousands of entities;
+            // trickling a single batch per interval would cap throughput at
+            // `embed_batch_size / embed_interval` no
+            // matter how fast the GPU runs. We yield between batches so locate,
+            // persistence, and cancellation stay responsive, then fall back to the
+            // idle sleep once the queue is empty. Incremental trickle (a handful of
+            // newly-reconciled entities) drains in a single pass and is unchanged.
+            // At most one batch's flush is in flight at a time. Under the
+            // throughput profile its flush stays here while the next batch's
+            // prep + GPU forward runs, so the accelerator is never idle during a
+            // persist; it is drained before the next flush is scheduled and at
+            // every loop exit so two flushes never interleave and the tail is
+            // always awaited.
+            let mut pending_flush: Option<tokio::task::JoinHandle<Result<usize>>> = None;
+            // Entities embedded by batches whose flush has not been awaited yet.
+            // Credited to the pass only once that flush reports it reached disk.
+            let mut embedded_since_flush: u64 = 0;
+            loop {
+                if *embed_cancel.borrow() {
+                    drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass)
+                        .await;
+                    break 'wake;
+                }
+                // The supervisor's verdict is enforced here, at the worker's own
+                // checkpoint, so an in-flight batch and its flush finish rather
+                // than being torn out from under the vector sidecar.
+                if embed_pass.halted() {
+                    drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass)
+                        .await;
+                    // A pass the supervisor stopped for holding the CPU without
+                    // recording progress recorded nothing durable in that
+                    // stretch, and this worker is leaving for the life of the
+                    // process. Whatever it embedded that no artifact holds is
+                    // memory nothing will ever read again, and on a hosted
+                    // container it is memory the cgroup limit is counting.
+                    release_stopped_embed_worker_vectors(&embed_state);
+                    break 'wake;
+                }
+                // A durable save refused against the binding this daemon holds
+                // does not become writable by trying again: the refusal is a
+                // property of the binding, so every batch after it spends the
+                // CPU and the memory of a hosted container to produce vectors
+                // nothing can write. Stand down here, at the worker's own
+                // checkpoint, and say why on the pass surface. The record is
+                // matched against the installed binding, so a rebind after the
+                // next graph commit retires it and a later wake may drain
+                // again; this is a stand-down on one binding, not on the store.
+                if pause_if_hosted_vector_binding_refused(
+                    &embed_state,
+                    &mut pending_flush,
+                    &mut embedded_since_flush,
+                    &embed_pass,
+                )
+                .await
+                {
+                    break;
+                }
+                if embed_state.background_embed_paused() {
+                    debug!("embedding worker paused after bounded explicit embed");
+                    break;
+                }
+                if embed_state.embed_pass_active() {
+                    debug!("embedding worker yielding to explicit embed pass");
+                    break;
+                }
+                let pending = embed_state.graph.pending_embeddings();
+                let pending_artifacts = embed_state.graph.pending_artifact_embeddings();
+                if pending == 0 && pending_artifacts == 0 {
+                    // An empty queue is not the same fact as whole coverage,
+                    // and the difference is what let every commit cost a store
+                    // part of its memory in silence. A change mints a HEAD
+                    // revision key per touched entity, and anything that puts a
+                    // retrievable key into truth without queueing it leaves the
+                    // worker nothing to do and no reason to say so. Ask coverage
+                    // before believing the drain.
+                    let status = embed_state.graph.embedding_status();
+                    let missing = status.total.saturating_sub(status.indexed);
+                    let coverage_verdict = coverage_drain_verdict(missing, backfilled_gap);
+                    match coverage_verdict {
+                        CoverageDrainVerdict::Backfill { missing } => {
+                            if !queue_embedding_backfill_under_pressure(
+                                &embed_state,
+                                &mut announced_pressure,
+                                || {
+                                    #[cfg(feature = "embeddings")]
+                                    embed_state.graph.queue_missing_for_embedding();
+                                    embed_state.graph.queue_missing_artifacts_for_embedding();
+                                },
+                            ) {
+                                break;
+                            }
+                            warn!(
+                                missing,
+                                indexed = status.indexed,
+                                total = status.total,
+                                "embedding queue drained while coverage is short; re-queueing the missing keys"
+                            );
+                            // This latch means a re-queue was actually tried.
+                            // A pressure refusal above tried nothing and must
+                            // remain eligible on the next wake.
+                            backfilled_gap = Some(missing);
+                            if embed_state.graph.pending_embeddings() > 0
+                                || embed_state.graph.pending_artifact_embeddings() > 0
+                            {
+                                continue;
+                            }
+                            warn!(
+                                missing,
+                                "no retrievable key could be queued for the missing coverage"
+                            );
+                            break;
+                        }
+                        CoverageDrainVerdict::Stalled { missing } => {
+                            debug!(
+                                missing,
+                                "embedding coverage is short and re-queueing it changed nothing"
+                            );
+                            break;
+                        }
+                        CoverageDrainVerdict::Complete => {
+                            // Coverage is whole here, so this is where the
+                            // has-ever-completed marker is published. Recording
+                            // it on the side that did the work keeps the claim
+                            // off a reader that only saw a quiet queue.
+                            let completed_work = coverage_verdict
+                                .completed_pressure_work()
+                                .expect("complete coverage names its completed pressure work");
+                            let retired_refusal =
+                                clear_pressure_refusal_for_work(&embed_state, completed_work);
+                            announced_pressure = pressure_announcement_after_retirement(
+                                announced_pressure,
+                                retired_refusal,
+                            );
+                            embed_state.record_embedding_coverage_complete();
+                            break;
+                        }
+                    }
+                }
+                // Everything below spends the machine, so the machine is
+                // asked first. A refusal leaves the queue exactly as it is and
+                // goes back to the idle wake, which is what makes this a
+                // back-off rather than a loss: the work is still owed, and the
+                // next wake takes it when there is room.
+                let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
+                publish_footprint_standing(&embed_state, &call);
+                let pressure_changed = announced_pressure != Some(call.level);
+                // A refusal is still disclosed exactly as before; what it no
+                // longer always does is stop the drain. A tree that has not
+                // grown since its refusal was anchored runs a floor-size batch,
+                // because refusing it for ever cannot reclaim the memory that
+                // put it over: that memory is the model the next batch reuses.
+                let observation = budget_observation(&call);
+                let (next_refusal_state, admission) =
+                    kin_core::memory_pressure::admit_refused_embed(
+                        refusal_state,
+                        observation,
+                        call.host_level,
+                        completed_a_batch,
+                        kin_core::memory_pressure::REFUSED_EMBED_GROWTH_TOLERANCE_BYTES,
+                    );
+                refusal_state = next_refusal_state;
+                // Called for its record-publishing side effect before anything
+                // decides to stop, so a refusal is disclosed on the wake that
+                // produced it whatever this worker then does about it.
+                let refused_now = disclose_embed_pressure_refusal_if_needed(
+                    &embed_state,
+                    &mut announced_pressure,
+                    &call,
+                );
+                let decision = embed_wake_decision(
+                    refused_now,
+                    admission,
+                    refusal_state,
+                    &call.verdict,
+                    embed_batch_size,
+                );
+                let batch = match decision {
+                    EmbedWakeDecision::Hold => break,
+                    EmbedWakeDecision::Run(batch) => batch,
+                };
+                if pressure_changed {
+                    match &call.verdict {
+                        kin_core::memory_pressure::Verdict::Shrink { reason } => {
+                            warn!(
+                                pressure = call.level.as_str(),
+                                batch = embed_batch_under_pressure(embed_batch_size, &call.verdict),
+                                configured = embed_batch_size,
+                                "{reason}"
+                            );
+                        }
+                        kin_core::memory_pressure::Verdict::Proceed => {}
+                        kin_core::memory_pressure::Verdict::Refuse { .. } => {}
+                    }
+                    announced_pressure = Some(call.level);
+                }
+                // From here to the next `idle` this worker is spending the
+                // machine. Latched, so a drain that never finishes keeps one
+                // stretch rather than restarting it every batch.
+                embed_pass.working(Instant::now());
+                let state_for_embed = Arc::clone(&embed_state);
+                let is_artifact = pending == 0;
+                let reset_on_index_error = !index_reset_triggered;
+                let label = if is_artifact {
+                    "embedded artifacts"
+                } else {
+                    "embedded entities"
+                };
+                let remaining = if is_artifact {
+                    pending_artifacts
+                } else {
+                    pending
+                };
+
+                let embed_result = tokio::task::spawn_blocking(move || {
+                    run_background_embedding_batch(
+                        &state_for_embed,
+                        reset_on_index_error,
+                        |state| {
+                            if is_artifact {
+                                state.graph.process_artifact_embedding_queue(batch)
+                            } else {
+                                state.graph.process_embedding_queue(batch)
+                            }
+                        },
+                    )
+                })
+                .await;
+
+                match embed_result {
+                    Ok(BackgroundEmbeddingBatchOutcome::Completed(count)) if count > 0 => {
+                        consecutive_panics = 0;
+                        // A successful batch means the index now matches the
+                        // embedder — clear any error backoff / reset latch.
+                        index_reset_triggered = false;
+                        error_backoff = None;
+                        // Progress makes the next coverage gap a new question,
+                        // so a gap that once looked unclosable gets asked again.
+                        backfilled_gap = None;
+                        // This worker has now established a settled footprint to
+                        // anchor against, which is what a later refusal for
+                        // memory needs before it may admit anything.
+                        completed_a_batch = true;
+                        embed_pass.reset_retries();
+                        info!(count, remaining = remaining.saturating_sub(count), label);
+                        // Serialize successive flushes: the previous batch's
+                        // flush — which may still be running concurrently with
+                        // this batch's prep + GPU forward under the throughput
+                        // profile — must finish before this batch's flush starts.
+                        // This guarantees at most one persist runs at a time, so
+                        // two flushes never interleave and the persisted
+                        // generation cursor advances monotonically.
+                        drain_embed_flush(
+                            &mut pending_flush,
+                            &mut embedded_since_flush,
+                            &embed_pass,
+                        )
+                        .await;
+                        embedded_since_flush = count as u64;
+                        // Persist the vector index under the shared persist lock so
+                        // this kvec write can never interleave with a snapshot save
+                        // running in the persistence loop or idle-shutdown flush.
+                        // Run inside spawn_blocking so the std persist Mutex is held
+                        // only across the synchronous write, never across an await.
+                        let state_for_persist = Arc::clone(&embed_state);
+                        // Flush this batch incrementally — the vector
+                        // sidecar plus any concurrent LSP-enrichment graph delta —
+                        // instead of relying on the periodic full-graph save that
+                        // re-serializes the whole ~1 GB graph each tick. The method
+                        // holds the persist lock and advances the generation cursor
+                        // (mirrors save_snapshot), so the two paths never tear.
+                        let flush = tokio::task::spawn_blocking(move || {
+                            state_for_persist.flush_embed_progress()
+                        });
+                        pending_flush = Some(flush);
+                        // Throughput leaves the flush in flight and loops straight
+                        // to the next batch so the GPU is fed while the persist
+                        // runs; proof/serial blocks on it now so the persisted
+                        // order is fully deterministic.
+                        if !embed_pipeline_overlap {
+                            drain_embed_flush(
+                                &mut pending_flush,
+                                &mut embedded_since_flush,
+                                &embed_pass,
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(BackgroundEmbeddingBatchOutcome::Completed(_)) => {
+                        // Queue drained out from under us (e.g. an explicit
+                        // `/embed` request raced ahead). Stop draining and return
+                        // to the idle sleep.
+                        consecutive_panics = 0;
+                        index_reset_triggered = false;
+                        error_backoff = None;
+                        embed_pass.reset_retries();
+                        break;
+                    }
+                    Ok(BackgroundEmbeddingBatchOutcome::ResetAfterIndexError(e)) => {
+                        warn!(
+                            error = %e,
+                            "embedding worker hit a vector-index error — reset vector index and re-queued once"
+                        );
+                        index_reset_triggered = true;
+                        error_backoff = None;
+                        error!(
+                            error = %e,
+                            "embedding worker error — reset vector index, retrying next interval"
+                        );
+                        break;
+                    }
+                    Ok(BackgroundEmbeddingBatchOutcome::Failed(e)) => {
+                        // Distinguish a persistent vector-index error (a stale
+                        // loaded index dimension vs the live embedder) from a
+                        // transient one. The first IndexError was recovered
+                        // inside the failed batch's critical section above. If
+                        // it persists (reset already attempted) or it is some
+                        // other error, back off exponentially so the worker
+                        // never busy-spins. A stale vector index is NOT a reason
+                        // to block the graph snapshot flush — it self-heals on
+                        // load — so shutdown persistence is left untouched
+                        // here; the graph anti-wipe guard is keyed on
+                        // entity-count collapse, not on embed errors.
+                        let next = next_embed_error_backoff(
+                            error_backoff,
+                            embed_interval,
+                            EMBED_ERROR_BACKOFF_MAX,
+                        );
+                        error_backoff = Some(next);
+                        error!(
+                            error = %e,
+                            backoff_s = next.as_secs(),
+                            "embedding worker error — backing off"
+                        );
+                        // Backoff bounds how fast this ladder retries and not how
+                        // long it retries for, so a failure that never clears
+                        // retries at the ceiling until the process dies. Charging
+                        // each delay against a cumulative budget puts an end on
+                        // it: the work parks with a reason a user can read
+                        // instead of retrying out of sight forever.
+                        if !embed_pass.charge_retry(
+                            next,
+                            embed_retry_budget,
+                            "the background embedding worker",
+                        ) {
+                            error!(
+                                budget_s = embed_retry_budget.as_secs(),
+                                "embedding worker parked — cumulative retry budget exhausted (see /health background_passes)"
+                            );
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        consecutive_panics += 1;
+                        if consecutive_panics >= MAX_CONSECUTIVE_PANICS {
+                            // Mark the derived-index worker as permanently failed
+                            // so /health surfaces the degraded state LOUDLY. The
+                            // daemon keeps serving graph/locate/reconcile — the
+                            // worker exiting must NOT take the whole process down
+                            // (that was the exit(0) "silent death", #11).
+                            embed_state
+                                .embed_worker_failed
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            // Say it on the pass surface too. A reader looking at
+                            // background passes must not see this worker sitting
+                            // at `idle` when it is never coming back.
+                            embed_pass.halt(format!(
+                                "the embedding worker panicked {consecutive_panics} times in a row \
+                                 and stopped; the vector index will not advance until the daemon \
+                                 restarts and the daemon keeps serving graph, locate and reconcile"
+                            ));
+                            error!(
+                                error = %e,
+                                consecutive_panics,
+                                "embedding worker permanently failed — vector index will not update until daemon restart; daemon continues in embed-degraded mode (see /health embed_worker_failed)"
+                            );
+                            drain_embed_flush(
+                                &mut pending_flush,
+                                &mut embedded_since_flush,
+                                &embed_pass,
+                            )
+                            .await;
+                            break 'wake;
+                        }
+                        error!(
+                            error = %e,
+                            consecutive_panics,
+                            "embedding task panicked, respawning after 1s"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        break;
+                    }
+                }
+
+                // Cooperative cancellation: a shutdown signalled mid-drain must
+                // not linger in the pacing sleep or loop back for another batch.
+                // Break promptly the moment cancel is observed so only the single
+                // in-flight blocking batch (which cannot itself observe the
+                // signal) is left for the bounded teardown to handle.
+                if *embed_cancel.borrow() {
+                    info!("embedding worker stopping mid-drain on shutdown");
+                    drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass)
+                        .await;
+                    break 'wake;
+                }
+
+                // Cooperative pause: let locate, persistence, and explicit
+                // `/embed` requests acquire the embedding lock between background
+                // batches during a long drain. A plain yield can let this worker
+                // immediately reacquire and starve foreground benchmark backfill.
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            // Drain the tail flush at every drain-loop exit (pause, queue empty,
+            // transient error, or panic respawn) so a persist started under the
+            // throughput profile is always awaited before the worker idles or
+            // re-enters the next wake — no flush outlives the loop unobserved.
+            drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass).await;
+        }
+        embed_pass.idle();
+    })
 }
 
 #[cfg(all(test, unix))]
