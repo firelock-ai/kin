@@ -157,6 +157,17 @@ impl Drop for OwnedProbeFile {
     }
 }
 
+type WatchCallback = Box<dyn FnMut(std::result::Result<Event, notify::Error>) + Send>;
+
+fn register_native_watcher(root: &Path, callback: WatchCallback) -> Result<RecommendedWatcher> {
+    let mut watcher = notify::recommended_watcher(callback)
+        .map_err(|error| IndexError::Watcher(error.to_string()))?;
+    watcher
+        .watch(root, RecursiveMode::Recursive)
+        .map_err(|error| IndexError::Watcher(error.to_string()))?;
+    Ok(watcher)
+}
+
 /// File watcher that monitors a directory for source file changes.
 pub struct FileWatcher {
     _watcher: RecommendedWatcher,
@@ -186,6 +197,15 @@ impl FileWatcher {
         bound: std::time::Duration,
         expected_path: Option<PathBuf>,
     ) -> Result<Self> {
+        Self::new_ready_using(root, bound, expected_path, register_native_watcher).await
+    }
+
+    async fn new_ready_using(
+        root: &Path,
+        bound: std::time::Duration,
+        expected_path: Option<PathBuf>,
+        register: impl FnOnce(&Path, WatchCallback) -> Result<RecommendedWatcher>,
+    ) -> Result<Self> {
         let canonical_root = root
             .canonicalize()
             .map_err(|error| IndexError::Watcher(error.to_string()))?;
@@ -209,7 +229,7 @@ impl FileWatcher {
             relative_path: expected_path.unwrap_or(relative_path),
             acknowledged: Some(acknowledged),
         }));
-        let watcher = Self::new_with_delivery_probe(root, Some(probe))?;
+        let watcher = Self::new_with_delivery_probe_using(root, Some(probe), register)?;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -254,6 +274,14 @@ impl FileWatcher {
         root: &Path,
         delivery_probe: Option<Arc<Mutex<DeliveryProbe>>>,
     ) -> Result<Self> {
+        Self::new_with_delivery_probe_using(root, delivery_probe, register_native_watcher)
+    }
+
+    fn new_with_delivery_probe_using(
+        root: &Path,
+        delivery_probe: Option<Arc<Mutex<DeliveryProbe>>>,
+        register: impl FnOnce(&Path, WatchCallback) -> Result<RecommendedWatcher>,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let root = root.to_path_buf();
         // Resolved once here rather than per event. The root does not move
@@ -264,38 +292,34 @@ impl FileWatcher {
         let outside_root = Arc::new(Mutex::new(EventsOutsideRoot::default()));
         let event_outside_root = Arc::clone(&outside_root);
 
-        let mut watcher =
-            notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
-                match res {
-                    Ok(mut event) => {
-                        if let Some(probe) = &delivery_probe {
-                            let mut probe = probe.lock().unwrap_or_else(PoisonError::into_inner);
-                            probe.observe(&event, &event_roots);
-                            event.paths.retain(|path| {
-                                event_roots.relative(path).as_ref() != Some(&probe.relative_path)
-                            });
-                        }
-                        let events = classify_event(&event, &event_roots, &event_outside_root);
-                        for fe in events {
-                            if tx.send(fe).is_err() {
-                                return;
-                            }
-                        }
+        let callback: WatchCallback = Box::new(
+            move |res: std::result::Result<Event, notify::Error>| match res {
+                Ok(mut event) => {
+                    if let Some(probe) = &delivery_probe {
+                        let mut probe = probe.lock().unwrap_or_else(PoisonError::into_inner);
+                        probe.observe(&event, &event_roots);
+                        event.paths.retain(|path| {
+                            event_roots.relative(path).as_ref() != Some(&probe.relative_path)
+                        });
                     }
-                    Err(e) => {
-                        error!(error = %e, "file watcher error");
+                    let events = classify_event(&event, &event_roots, &event_outside_root);
+                    for fe in events {
+                        if tx.send(fe).is_err() {
+                            return;
+                        }
                     }
                 }
-            })
-            .map_err(|e| IndexError::Watcher(e.to_string()))?;
+                Err(e) => {
+                    error!(error = %e, "file watcher error");
+                }
+            },
+        );
 
         // FSEvents does not reliably deliver events when its registration path
         // is a symlink. Register the resolved directory while retaining both
         // spellings above for backends that report either form.
         let watch_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-        watcher
-            .watch(&watch_root, RecursiveMode::Recursive)
-            .map_err(|e| IndexError::Watcher(e.to_string()))?;
+        let watcher = register(&watch_root, callback)?;
 
         info!(root = %root.display(), "started file watcher");
 
@@ -561,23 +585,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_requires_the_exact_control_callback() {
+    async fn readiness_requires_the_exact_control_callback_and_preserves_pending_source() {
+        use std::future::Future;
+        use std::task::Poll;
+
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir(repo.path().join(".kin")).unwrap();
-        let result = FileWatcher::new_ready_for_path(
+        let unrelated = repo.path().join("unrelated.rs");
+        let source = repo.path().join("during-readiness.rs");
+        std::fs::write(&unrelated, "pub fn unrelated() {}\n").unwrap();
+        std::fs::write(&source, "pub fn during_readiness() {}\n").unwrap();
+        let callback_slot = Arc::new(Mutex::new(None::<WatchCallback>));
+        let captured = Arc::clone(&callback_slot);
+        let mut startup = Box::pin(FileWatcher::new_ready_using(
             repo.path(),
-            std::time::Duration::from_secs(3),
-            Some(PathBuf::from(".kin/control-that-was-never-written")),
-        )
-        .await;
+            std::time::Duration::from_secs(10),
+            None,
+            move |_, callback| {
+                *captured.lock().unwrap() = Some(callback);
+                // The actual callback is driven below in a fixed order. This
+                // unregistered backend owns no host stream or filesystem watch.
+                notify::recommended_watcher(|_: std::result::Result<Event, notify::Error>| {})
+                    .map_err(|error| IndexError::Watcher(error.to_string()))
+            },
+        ));
         assert!(
-            matches!(result, Err(IndexError::Watcher(ref message)) if message.contains("did not acknowledge")),
-            "unrelated callbacks must not make the watcher ready"
+            std::future::poll_fn(|cx| Poll::Ready(startup.as_mut().poll(cx)))
+                .await
+                .is_pending()
         );
+        let probe = std::fs::read_dir(repo.path().join(".kin"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut callback = callback_slot.lock().unwrap().take().unwrap();
+        callback(Ok(content_change(vec![unrelated])));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(startup.as_mut().poll(cx)))
+                .await
+                .is_pending(),
+            "unrelated callback must not make readiness succeed"
+        );
+        let mut rescan = content_change(vec![probe.clone()]);
+        rescan.attrs.set_flag(notify::event::Flag::Rescan);
+        callback(Ok(rescan));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(startup.as_mut().poll(cx)))
+                .await
+                .is_pending(),
+            "a rescan callback is not verified delivery"
+        );
+        callback(Ok(content_change(vec![probe, source.clone()])));
+        let watcher = startup.await.unwrap();
+        let events = watcher.drain();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, FileEvent::Changed(path) if path == &source)),
+            "the mixed probe callback must preserve source in the returned watcher queue"
+        );
+        assert!(events.iter().all(|event| matches!(event, FileEvent::Changed(path) | FileEvent::Removed(path) if !path.components().any(|part| part.as_os_str() == ".kin"))));
         assert_eq!(
             std::fs::read_dir(repo.path().join(".kin")).unwrap().count(),
-            0,
-            "a failed readiness attempt cleans only its owned probe"
+            0
         );
     }
 
