@@ -149,12 +149,8 @@ pub(crate) enum EnrichmentFacet {
 /// What one reconcile outcome says about the path's current bytes, for the
 /// durable record every reporting surface reads.
 ///
-/// `BrokenAst` is the one outcome that means the graph has started answering
-/// about this path from an earlier parse: it derives nothing, retains what the
-/// last good parse left, and the daemon reconciles under
-/// `ReconcilePolicy::FallbackToLkg`, so it is the ordinary case rather than an
-/// edge. `Updated` and `FileRemoved` settle the path, because both re-derived
-/// from the bytes this pass just read.
+/// `BrokenAst` and `PartiallyUpdated` preserve incomplete file coverage. Only
+/// a clean `Updated` or a confirmed `FileRemoved` settles the path.
 ///
 /// `Conflict` also retains last-known-good state and is deliberately not
 /// recorded. It is a held merge rather than a file whose syntax is broken, it
@@ -163,7 +159,7 @@ pub(crate) enum EnrichmentFacet {
 ///
 /// A path the tree admits without a UTF-8 spelling yields nothing, because the
 /// record is keyed by the path string every reporting surface renders.
-fn observed_parse_of(
+pub(crate) fn observed_parse_of(
     repo_path: &RepoPath,
     outcome: &kin_reconcile::ReconcileOutcome,
 ) -> Option<kin_core::retained_parse::ObservedParse> {
@@ -171,7 +167,8 @@ fn observed_parse_of(
     use kin_reconcile::ReconcileOutcome;
     let path = repo_path.as_utf8()?;
     match outcome {
-        ReconcileOutcome::BrokenAst { error_ranges, .. } => {
+        ReconcileOutcome::BrokenAst { error_ranges, .. }
+        | ReconcileOutcome::PartiallyUpdated { error_ranges, .. } => {
             Some(ObservedParse::retained(path, error_ranges.len()))
         }
         ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. } => {
@@ -179,6 +176,38 @@ fn observed_parse_of(
         }
         ReconcileOutcome::Conflict(_) => None,
     }
+}
+
+/// Persist incomplete coverage before publishing a mixed entity transaction.
+/// Failure refuses partial admission instead of publishing fresh entities with
+/// a stale clean disclosure. A later clean pass settles the durable record.
+pub(crate) fn persist_partial_observation(
+    layout: &kin_core::KinLayout,
+    outcome: &kin_reconcile::ReconcileOutcome,
+) -> Result<()> {
+    let kin_reconcile::ReconcileOutcome::PartiallyUpdated {
+        file_id,
+        error_ranges,
+        ..
+    } = outcome
+    else {
+        return Ok(());
+    };
+    let previous = kin_core::retained_parse::read(layout);
+    if let kin_core::retained_parse::RetainedParseRead::Unreadable(reason) = &previous {
+        return Err(DaemonError::Io(std::io::Error::other(format!(
+            "partial admission cannot preserve incomplete coverage: {reason}"
+        ))));
+    }
+    let record = kin_core::retained_parse::fold(
+        previous.paths(),
+        &[kin_core::retained_parse::ObservedParse::retained(
+            &file_id.0,
+            error_ranges.len(),
+        )],
+        chrono::Utc::now(),
+    );
+    kin_core::retained_parse::write(layout, &record).map_err(DaemonError::Io)
 }
 
 #[derive(Debug, Default)]
@@ -3630,12 +3659,13 @@ pub async fn run_loop_armed(
                 Ok(result) => {
                     let (outcome, delta) = result.into_parts();
                     debug!(?outcome, "reconcile outcome");
-                    observed_parses.extend(observed_parse_of(&semantic_repo_path, &outcome));
 
                     use kin_reconcile::ReconcileOutcome;
                     let should_apply = matches!(
                         &outcome,
-                        ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. }
+                        ReconcileOutcome::Updated { .. }
+                            | ReconcileOutcome::PartiallyUpdated { .. }
+                            | ReconcileOutcome::FileRemoved { .. }
                     );
                     let mut reconciled_graph_changed = false;
                     if should_apply {
@@ -3670,6 +3700,10 @@ pub async fn run_loop_armed(
                             }
                         }
                         let derived_entities = !delta.entity_deltas.is_empty();
+                        if let Err(error) = persist_partial_observation(&state.layout, &outcome) {
+                            warn!(%error, "partial admission retained all entities because coverage could not persist");
+                            continue;
+                        }
                         let applied = match apply_reconcile_delta(&delta, |delta| {
                             state.graph.apply_transaction_delta(delta)
                         }) {
@@ -3702,6 +3736,8 @@ pub async fn run_loop_armed(
                         reconciled_graph_changed = applied || layout_changed;
                         graph_changed |= reconciled_graph_changed;
                     }
+
+                    observed_parses.extend(observed_parse_of(&semantic_repo_path, &outcome));
 
                     if let ReconcileOutcome::Updated {
                         file_id,
@@ -3784,6 +3820,29 @@ pub async fn run_loop_armed(
                                 pass_delta.count(&event);
                                 state.emit_event(event);
                             }
+                        }
+                    } else if let ReconcileOutcome::PartiallyUpdated { modified, .. } = &outcome {
+                        pass_delta.nodes_modified += modified.len();
+                        for id in modified {
+                            state.emit_event(DaemonEvent::EntityChanged {
+                                entity_id: *id,
+                                node: crate::state::graph_node_summary(state.graph.as_ref(), id),
+                                change_type: ChangeType::Modified,
+                                file_path: Some(path.to_string_lossy().to_string()),
+                                session_id: None,
+                            });
+                        }
+                        if should_apply {
+                            for event in crate::state::relation_change_events(
+                                &delta,
+                                Some(path.to_string_lossy().as_ref()),
+                            ) {
+                                pass_delta.count(&event);
+                                state.emit_event(event);
+                            }
+                        }
+                        if reconciled_graph_changed || tree_changed {
+                            state.bump_version();
                         }
                     } else if let ReconcileOutcome::FileRemoved {
                         removed, file_id, ..
@@ -3883,10 +3942,8 @@ pub async fn run_loop_armed(
             }
         }
 
-        // Drop write locks before rebuilding projection (it takes its own locks).
-        drop(reconciler);
-        drop(coordination);
-
+        // Register enrichment before a waiting commit can observe this pass complete.
+        // The sends are non-blocking and the worker takes its own graph locks.
         // Queue only changed entities for LSP enrichment.
         for (file_id, entity_ids) in lsp_changed {
             state.queue_lsp_enrichment(LspEnrichmentRequest {
@@ -3894,6 +3951,9 @@ pub async fn run_loop_armed(
                 changed_entity_ids: entity_ids,
             });
         }
+
+        drop(reconciler);
+        drop(coordination);
 
         // Persistence is handled by the background save task, so the reconcile
         // loop just marks the graph dirty.
@@ -4010,6 +4070,100 @@ fn take_file_event_batch(pending: &mut VecDeque<FileEvent>, batch_size: usize) -
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn partial_c_disclosure_persists_and_only_clean_outcomes_settle() {
+        let parent = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir_in(parent.path()).unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let file_id = FilePathId::new("test.c");
+        let outcome = kin_reconcile::ReconcileOutcome::PartiallyUpdated {
+            file_id: file_id.clone(),
+            modified: vec![EntityId::new()],
+            retained: vec![EntityId::new()],
+            error_ranges: vec![(12, 12)],
+            collision_warnings: vec![],
+        };
+        persist_partial_observation(&init.layout, &outcome).unwrap();
+        assert_eq!(
+            kin_core::retained_parse::read(&init.layout).errors_for("test.c"),
+            Some(1)
+        );
+        let clean = kin_reconcile::ReconcileOutcome::Updated {
+            file_id,
+            added: vec![],
+            modified: vec![],
+            removed: vec![],
+            collision_warnings: vec![],
+        };
+        let path = RepoPath::from_utf8("test.c").unwrap();
+        kin_core::retained_parse::record(
+            &init.layout,
+            &[observed_parse_of(&path, &clean).unwrap()],
+        );
+        assert_eq!(
+            kin_core::retained_parse::read(&init.layout).errors_for("test.c"),
+            None
+        );
+        std::fs::write(init.layout.kindb_retained_parse_path(), b"invalid").unwrap();
+        assert!(persist_partial_observation(&init.layout, &outcome).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn partial_c_readmission_preserves_unreadable_disclosure_before_apply() {
+        let parent = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir_in(parent.path()).unwrap();
+        let state = open_test_state(&repo);
+        state.is_initialized.store(true, Ordering::Relaxed);
+        let before =
+            "int good(void) { int value=1; return value; }\nint bad(void) { test_cond(1) }\n";
+        let after = before.replace("value", "next");
+        let host = state.layout.working_dir().join("test.c");
+        let paths = BTreeSet::from([RepoPath::from_utf8("test.c").unwrap()]);
+        std::fs::write(&host, before).unwrap();
+        ambient_admission_for_test(&state, &paths).unwrap();
+        let indexed = IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("test.c"),
+                before.as_bytes(),
+                state.blobs.write(before.as_bytes()).unwrap(),
+            )
+            .unwrap()
+            .indexed_file;
+        for entity in &indexed.entities {
+            state.graph.upsert_entity(entity).unwrap();
+        }
+        let old = indexed.entities.iter().find(|e| e.name == "good").unwrap();
+        std::fs::write(&host, &after).unwrap();
+        ambient_admission_for_test(&state, &paths).unwrap();
+        let record = state.layout.kindb_retained_parse_path();
+        std::fs::write(&record, b"invalid").unwrap();
+        let failed = readmit_semantics_for_paths(&state, &paths).await;
+        assert_eq!(failed.enriched, 0);
+        assert_eq!(failed.failed.len(), 1);
+        assert_eq!(state.graph.get_entity(&old.id).unwrap().as_ref(), Some(old));
+        assert_eq!(std::fs::read(&record).unwrap(), b"invalid");
+        kin_core::retained_parse::write(
+            &state.layout,
+            &kin_core::retained_parse::RetainedParse::new(chrono::Utc::now(), vec![]),
+        )
+        .unwrap();
+        let partial = readmit_semantics_for_paths(&state, &paths).await;
+        assert_eq!(
+            partial.enriched, 0,
+            "partial must never count as full-file enrichment"
+        );
+        assert_eq!(partial.failed.len(), 1);
+        let current = state.graph.get_entity(&old.id).unwrap().unwrap();
+        assert_eq!(
+            current.metadata.extra["blob_hash"],
+            kin_blobs::digest(after.as_bytes()).to_string()
+        );
+        assert!(kin_core::retained_parse::read(&state.layout)
+            .errors_for("test.c")
+            .is_some());
+    }
 
     fn open_test_state(repo: &tempfile::TempDir) -> Arc<DaemonState> {
         let init = kin_core::init(repo.path()).unwrap();
@@ -9801,10 +9955,21 @@ pub(crate) async fn readmit_semantics_for_paths(
         match reconciler.reconcile_file_change(&event, &state.blobs, state.graph.as_ref()) {
             Ok(result) => {
                 let (reconciled, delta) = result.into_parts();
+                if matches!(
+                    reconciled,
+                    kin_reconcile::ReconcileOutcome::BrokenAst { .. }
+                ) {
+                    if let Some(observation) = observed_parse_of(repo_path, &reconciled) {
+                        kin_core::retained_parse::record(&state.layout, &[observation]);
+                    }
+                }
+
                 use kin_reconcile::ReconcileOutcome;
                 let should_apply = matches!(
                     &reconciled,
-                    ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. }
+                    ReconcileOutcome::Updated { .. }
+                        | ReconcileOutcome::PartiallyUpdated { .. }
+                        | ReconcileOutcome::FileRemoved { .. }
                 );
                 // `BrokenAst` and `Conflict` retain last-known-good state and
                 // derive nothing, so the file keeps the spans its previous parse
@@ -9832,6 +9997,13 @@ pub(crate) async fn readmit_semantics_for_paths(
                 }
                 {
                     let derived_entities = !delta.entity_deltas.is_empty();
+                    if let Err(error) = persist_partial_observation(&state.layout, &reconciled) {
+                        warn!(%error, "partial admission retained all entities because coverage could not persist");
+                        outcome
+                            .failed
+                            .push(SemanticFailure::unresolved(file_id.0.clone()));
+                        continue;
+                    }
                     if let Err(error) = state.graph.apply_transaction_delta(&delta) {
                         warn!(
                             file = %file_id,
@@ -9843,6 +10015,9 @@ pub(crate) async fn readmit_semantics_for_paths(
                             .failed
                             .push(SemanticFailure::unresolved(file_id.0.clone()));
                         continue;
+                    }
+                    if let Some(observation) = observed_parse_of(repo_path, &reconciled) {
+                        kin_core::retained_parse::record(&state.layout, &[observation]);
                     }
                     if derived_entities {
                         mark_enrichment_unpublished(state, &file_id);
@@ -9878,7 +10053,13 @@ pub(crate) async fn readmit_semantics_for_paths(
                         }
                     }
                     graph_changed = true;
-                    outcome.enriched += 1;
+                    if matches!(reconciled, ReconcileOutcome::PartiallyUpdated { .. }) {
+                        outcome
+                            .failed
+                            .push(SemanticFailure::unparseable(file_id.0.clone()));
+                    } else {
+                        outcome.enriched += 1;
+                    }
                 }
             }
             Err(error) => {
@@ -10313,11 +10494,27 @@ async fn sync_filesystem_with_graph_publishing_inner(
         {
             Ok(result) => {
                 let (outcome, delta) = result.into_parts();
-                observed_parses.extend(observed_parse_of(&semantic_repo_path, &outcome));
+                // An outcome this pass will APPLY discloses after the apply
+                // lands, a few lines down, so a transaction the graph refused
+                // cannot leave a disclosure claiming it settled. Everything
+                // else discloses here, because nothing further will happen to
+                // it. `PartiallyUpdated` belongs on the applied side with the
+                // other two: recording it here as well would put the same path
+                // in `observed_parses` twice in one pass.
+                if !matches!(
+                    outcome,
+                    kin_reconcile::ReconcileOutcome::Updated { .. }
+                        | kin_reconcile::ReconcileOutcome::PartiallyUpdated { .. }
+                        | kin_reconcile::ReconcileOutcome::FileRemoved { .. }
+                ) {
+                    observed_parses.extend(observed_parse_of(&semantic_repo_path, &outcome));
+                }
                 use kin_reconcile::ReconcileOutcome;
                 let should_apply = matches!(
                     &outcome,
-                    ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. }
+                    ReconcileOutcome::Updated { .. }
+                        | ReconcileOutcome::PartiallyUpdated { .. }
+                        | ReconcileOutcome::FileRemoved { .. }
                 );
                 if should_apply {
                     if !host_entry_matches_graph(state, path, &semantic_repo_path)? {
@@ -10327,10 +10524,12 @@ async fn sync_filesystem_with_graph_publishing_inner(
                         ))));
                     }
                     let derived_entities = !delta.entity_deltas.is_empty();
+                    persist_partial_observation(&state.layout, &outcome)?;
                     if let Err(e) = state.graph.apply_transaction_delta(&delta) {
                         warn!(error = %e, "failed to apply synced transaction into primary graph");
                         continue;
                     }
+                    observed_parses.extend(observed_parse_of(&semantic_repo_path, &outcome));
                     // Marked here for the same reason as on the ambient tick.
                     // This seam runs under a commit as often as not, and a
                     // commit publishes what it derived, so most entries written

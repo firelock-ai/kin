@@ -4440,6 +4440,28 @@ mod tests {
         (state, rx)
     }
 
+    #[test]
+    fn accepted_sweep_is_not_idle_before_worker_receives_it() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let (state, mut rx) = enriching_state(init.layout);
+        assert!(state.queue_lsp_sweep());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::state::LspEnrichmentMessage::Sweep)
+        ));
+        assert!(
+            state
+                .lsp_sweep_running
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "an accepted sweep must stay non-idle before the worker starts"
+        );
+        assert!(
+            !state.queue_lsp_sweep(),
+            "accepted work must coalesce before receipt"
+        );
+    }
+
     // ── What a published merge does about the enrichment its result needs ──
     //
     // The composer publishes the three-way union of two committed graphs, and

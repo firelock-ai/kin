@@ -1689,6 +1689,63 @@ pub enum LspEnrichmentMessage {
     Sweep,
 }
 
+/// Completion accounting includes queue residence and server-start buffering.
+#[derive(Default)]
+pub struct LspWorkTracker {
+    pub pending: AtomicU64,
+    pub failed: AtomicU64,
+}
+
+pub(crate) struct LspWorkGuard {
+    tracker: Arc<LspWorkTracker>,
+    completed: bool,
+    transferred: bool,
+}
+
+impl LspWorkTracker {
+    pub(crate) fn reserve(self: &Arc<Self>) -> LspWorkGuard {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        self.resume()
+    }
+
+    pub(crate) fn resume(self: &Arc<Self>) -> LspWorkGuard {
+        LspWorkGuard {
+            tracker: Arc::clone(self),
+            completed: false,
+            transferred: false,
+        }
+    }
+}
+
+impl LspWorkGuard {
+    pub(crate) fn complete(&mut self) {
+        self.completed = true;
+    }
+
+    /// The queued or buffered message now owns the same reservation.
+    pub(crate) fn transfer(mut self) {
+        self.transferred = true;
+    }
+}
+
+impl Drop for LspWorkGuard {
+    fn drop(&mut self) {
+        if self.transferred {
+            return;
+        }
+        if !self.completed {
+            self.tracker.failed.fetch_add(1, Ordering::SeqCst);
+        }
+        let result =
+            self.tracker
+                .pending
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+                    pending.checked_sub(1)
+                });
+        debug_assert!(result.is_ok(), "enrichment completion without admission");
+    }
+}
+
 /// Maximum number of concurrent temporal scopes before LRU eviction.
 const MAX_CONCURRENT_SCOPES: usize = 5;
 
@@ -3364,6 +3421,8 @@ pub struct DaemonState {
     pub lsp_sweep_languages_skipped: std::sync::Mutex<Vec<SweepLanguageSkip>>,
     /// Set while a sweep is in flight.
     pub lsp_sweep_running: AtomicBool,
+    /// Accepted enrichment, including startup demand, queued and active work.
+    pub lsp_work: Arc<LspWorkTracker>,
     /// A sweep that was asked for while one was already running.
     ///
     /// The running pass lists every entity and builds its file grouping and its
@@ -5575,6 +5634,7 @@ impl DaemonState {
             lsp_sweep_languages_skipped: std::sync::Mutex::new(Vec::new()),
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
+            lsp_work: Arc::new(LspWorkTracker::default()),
             lsp_sweep_pending: AtomicBool::new(false),
             lsp_enriched_marker_epoch: AtomicU64::new(0),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -5958,6 +6018,7 @@ impl DaemonState {
             lsp_sweep_languages_skipped: std::sync::Mutex::new(Vec::new()),
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
+            lsp_work: Arc::new(LspWorkTracker::default()),
             lsp_sweep_pending: AtomicBool::new(false),
             lsp_enriched_marker_epoch: AtomicU64::new(0),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -12047,10 +12108,10 @@ impl DaemonState {
             return;
         }
         if let Some(ref tx) = self.lsp_enrichment_tx {
-            if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
-                tx.try_send(LspEnrichmentMessage::Incremental(request))
-            {
-                warn!("LSP enrichment channel full, incremental request dropped");
+            let work = self.lsp_work.reserve();
+            match tx.try_send(LspEnrichmentMessage::Incremental(request)) {
+                Ok(()) => work.transfer(),
+                Err(error) => warn!(%error, "LSP incremental request could not be queued"),
             }
         }
     }
@@ -12068,37 +12129,29 @@ impl DaemonState {
         if self.filesystem_reconcile_disabled() {
             return false;
         }
-        // One sweep at a time. The daemon queues one at startup and a caller may
-        // queue another, and two sweeps over one graph is not merely wasteful:
-        // a waiter that captured its baseline before the second was queued sees
-        // the FIRST one finish, returns, and hands back a graph the second is
-        // still mutating. That is what left `kin init` reporting a converged
-        // repository while a sweep ran on underneath it.
+        let Some(tx) = &self.lsp_enrichment_tx else {
+            return false;
+        };
+        // Reserve running before send so accepted work cannot still read idle.
         if self
             .lsp_sweep_running
-            .load(std::sync::atomic::Ordering::SeqCst)
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
         {
             return false;
         }
-        if let Some(ref tx) = self.lsp_enrichment_tx {
-            // Every arm named. `is_some` on the sender establishes that a
-            // sender exists, not that anything is left to receive, and matching
-            // only `Full` let a channel whose receiver a supervisor halt had
-            // already dropped fall through to `true`. A caller that took that
-            // answer reported a sweep it had not queued and could not queue.
-            return match tx.try_send(LspEnrichmentMessage::Sweep) {
-                Ok(()) => true,
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    warn!("LSP enrichment channel full, sweep request dropped");
-                    false
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    warn!("LSP enrichment worker is gone, sweep request dropped");
-                    false
-                }
-            };
+        let work = self.lsp_work.reserve();
+        match tx.try_send(LspEnrichmentMessage::Sweep) {
+            Ok(()) => {
+                work.transfer();
+                true
+            }
+            Err(error) => {
+                warn!(%error, "LSP sweep could not be queued");
+                self.lsp_sweep_running.store(false, Ordering::SeqCst);
+                false
+            }
         }
-        false
     }
 
     /// Ask for a sweep over the graph a merge just published, and answer

@@ -12,6 +12,292 @@ use crate::extract::{ExtractedEntity, ExtractedRelation, FileImport, ImportedNam
 
 pub struct CAdapter;
 
+/// A direct call whose complete syntax and callee position are known.
+#[derive(Debug, Clone)]
+pub struct PartialCallSite {
+    pub callee: String,
+    pub expression: String,
+    pub call_span: kin_model::SourceSpan,
+    pub callee_span: kin_model::SourceSpan,
+}
+
+/// Direct calls inside a complete declaration, excluding names shadowed by
+/// local bindings or defined macros. The enclosing full-file proof is required.
+pub fn partial_call_sites(
+    tree: &Tree,
+    source: &[u8],
+    declaration: &kin_model::SourceSpan,
+) -> Option<Vec<PartialCallSite>> {
+    partial_function_context(tree, source, declaration.start_byte, declaration.end_byte)?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let function = root.children(&mut cursor).find(|node| {
+        node.kind() == "function_definition"
+            && node.start_byte() == declaration.start_byte
+            && node.end_byte() == declaration.end_byte
+    })?;
+    let mut unavailable = std::collections::HashSet::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "preproc_def" | "preproc_function_def") {
+            if let Some(name) = node.child_by_field_name("name") {
+                unavailable.insert(name.utf8_text(source).ok()?.to_owned());
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    let mut pending = vec![function];
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "declaration" | "parameter_declaration") {
+            let mut cursor = node.walk();
+            for (index, child) in node.children(&mut cursor).enumerate() {
+                if node.field_name_for_child(index as u32) != Some("declarator") {
+                    continue;
+                }
+                let mut names = vec![child];
+                while let Some(name) = names.pop() {
+                    if name.kind() == "init_declarator" {
+                        names.push(name.child_by_field_name("declarator")?);
+                    } else if name.kind() == "identifier" {
+                        unavailable.insert(name.utf8_text(source).ok()?.to_owned());
+                    } else {
+                        let mut cursor = name.walk();
+                        names.extend(name.named_children(&mut cursor));
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    let mut sites = Vec::new();
+    let mut pending = vec![function];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "call_expression" {
+            let callee = node.child_by_field_name("function")?;
+            let name = callee.utf8_text(source).ok()?;
+            if callee.kind() == "identifier" && !unavailable.contains(name) {
+                sites.push(PartialCallSite {
+                    callee: name.to_owned(),
+                    expression: node.utf8_text(source).ok()?.to_owned(),
+                    call_span: span_from_node(&node, &declaration.file),
+                    callee_span: span_from_node(&callee, &declaration.file),
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    Some(sites)
+}
+
+/// Context that must remain identical before refreshing one declaration in an
+/// incomplete C file. Only direct, complete function definitions qualify. The
+/// full-file tree, including zero-width recovery nodes at either boundary, is
+/// authoritative; parsing an isolated body cannot establish this evidence.
+pub fn partial_function_context(
+    tree: &Tree,
+    source: &[u8],
+    start: usize,
+    end: usize,
+) -> Option<Vec<String>> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let node = root.children(&mut cursor).find(|node| {
+        node.kind() == "function_definition" && node.start_byte() == start && node.end_byte() == end
+    })?;
+    if node.has_error()
+        || collect_error_ranges(tree).iter().any(|&(a, b)| {
+            if a == b {
+                start <= a && a <= end
+            } else {
+                a < end && start < b
+            }
+        })
+    {
+        return None;
+    }
+    let body = node.child_by_field_name("body")?;
+    if body.kind() != "compound_statement"
+        || body.child(0)?.kind() != "{"
+        || body
+            .child(u32::try_from(body.child_count().checked_sub(1)?).ok()?)?
+            .kind()
+            != "}"
+    {
+        return None;
+    }
+    let mut context = Vec::new();
+    // Declaration and preprocessing context cannot change while its resolver
+    // dependencies are unavailable. Function bodies are independently scoped.
+    let mut cursor = root.walk();
+    for sibling in root.children(&mut cursor) {
+        if sibling.kind() == "comment" {
+            continue;
+        }
+        let stop = if sibling.kind() == "function_definition" {
+            sibling.child_by_field_name("body")?.start_byte()
+        } else {
+            sibling.end_byte()
+        };
+        context.push(
+            std::str::from_utf8(source.get(sibling.start_byte()..stop)?)
+                .ok()?
+                .to_owned(),
+        );
+    }
+    fn locals(
+        node: tree_sitter::Node<'_>,
+        body: tree_sitter::Node<'_>,
+        source: &[u8],
+        names: &mut std::collections::HashMap<String, (usize, usize, usize, usize)>,
+    ) -> Option<()> {
+        if matches!(node.kind(), "declaration" | "parameter_declaration") {
+            let mut scope = node;
+            while !matches!(
+                scope.kind(),
+                "compound_statement" | "for_statement" | "function_definition"
+            ) {
+                scope = scope.parent()?;
+            }
+            let mut cursor = node.walk();
+            if node.children(&mut cursor).any(|child| {
+                child.kind() == "storage_class_specifier"
+                    && child.utf8_text(source).ok() == Some("extern")
+            }) {
+                return None;
+            }
+            fn declaration_name(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+                if node.kind() == "identifier" {
+                    Some(node)
+                } else {
+                    declaration_name(node.child_by_field_name("declarator")?)
+                }
+            }
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                if has_function_declarator(&declarator) {
+                    return None;
+                }
+                let bare = if declarator.kind() == "init_declarator" {
+                    declarator.child_by_field_name("declarator")?
+                } else {
+                    declarator
+                };
+                let identifier = declaration_name(bare)?;
+                let name = identifier.utf8_text(source).ok()?.to_owned();
+                let start = if node.kind() == "parameter_declaration" {
+                    body.start_byte()
+                } else {
+                    bare.end_byte()
+                };
+                if is_all_caps_macro(&name)
+                    || names
+                        .insert(
+                            name,
+                            (
+                                start,
+                                scope.end_byte(),
+                                identifier.start_byte(),
+                                identifier.end_byte(),
+                            ),
+                        )
+                        .is_some()
+                {
+                    return None;
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            locals(child, body, source, names)?;
+        }
+        Some(())
+    }
+    let mut local_names = std::collections::HashMap::new();
+    locals(node, body, source, &mut local_names)?;
+    fn directives(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        names: &std::collections::HashMap<String, (usize, usize, usize, usize)>,
+        out: &mut Vec<String>,
+    ) -> Option<()> {
+        if node.kind().starts_with("preproc_") {
+            if node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .is_some_and(|name| names.contains_key(name))
+            {
+                return None;
+            }
+            out.push(node.utf8_text(source).ok()?.to_owned());
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            directives(child, source, names, out)?;
+        }
+        Some(())
+    }
+    directives(root, source, &local_names, &mut context)?;
+    fn dependencies(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        body_start: usize,
+        locals: &std::collections::HashMap<String, (usize, usize, usize, usize)>,
+        out: &mut Vec<String>,
+    ) -> Option<()> {
+        if node.kind().starts_with("preproc_") || node.kind() == "macro_type_specifier" {
+            return None;
+        }
+        let text = node.utf8_text(source).ok()?;
+        let is_local =
+            locals
+                .get(text)
+                .is_some_and(|&(start, end, declaration_start, declaration_end)| {
+                    (start <= node.start_byte() && node.end_byte() <= end)
+                        || (node.start_byte() == declaration_start
+                            && node.end_byte() == declaration_end)
+                });
+        if matches!(
+            node.kind(),
+            "call_expression"
+                | "type_identifier"
+                | "primitive_type"
+                | "field_identifier"
+                | "statement_identifier"
+        ) || (node.kind() == "identifier" && !is_local)
+        {
+            out.push(format!("{}:{text}", node.kind()));
+            if node.kind() == "identifier" && node.start_byte() >= body_start && !is_local {
+                let mut expression = node;
+                while let Some(parent) = expression.parent() {
+                    if matches!(
+                        parent.kind(),
+                        "compound_statement"
+                            | "if_statement"
+                            | "while_statement"
+                            | "for_statement"
+                            | "switch_statement"
+                            | "function_definition"
+                    ) {
+                        break;
+                    }
+                    expression = parent;
+                }
+                out.push(expression.utf8_text(source).ok()?.to_owned());
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            dependencies(child, source, body_start, locals, out)?;
+        }
+        Some(())
+    }
+    dependencies(node, source, body.start_byte(), &local_names, &mut context)?;
+    Some(context)
+}
+
 impl LanguageAdapter for CAdapter {
     fn language_id(&self) -> LanguageId {
         LanguageId::C
