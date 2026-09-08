@@ -42,13 +42,14 @@ fn a_real_repository_enriches_into_replayable_history() {
     )
     .unwrap();
     let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+    let commit_trees = kin_git::derive_commit_trees(&snapshot, &blob_store).unwrap();
     let trees = plan
         .aliases
         .iter()
         .map(|alias| {
             (
                 alias.change_id,
-                plan.commit_trees
+                commit_trees
                     .get(&alias.oid)
                     .expect("every imported commit has an exact resolved tree")
                     .clone(),

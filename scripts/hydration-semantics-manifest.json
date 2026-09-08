@@ -5,8 +5,15 @@
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "derive_historical_semantic_deltas",
-      "digest": "sha256:038396986f07f0d43e7efca1725066ade9ce3835d27d09d8b30dfa51e6235ab0",
-      "reason": "Drives the whole parent-first replay: it decides the per-change baseline, which trees are enriched, and the exact EntityDelta/RelationDelta payload persisted for every historical change.",
+      "digest": "sha256:e8d0c8dd56b317afd2c2fe7fed84d6a9e6e77ea7f4742a1f27d9b32b793e954b",
+      "reason": "The whole-map form of the parent-first replay, kept for callers that already hold a few trees: it checks the tree map against the change list and feeds the fold one change at a time. The per-change replay itself is enrich_historical_change.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "enrich_historical_change",
+      "digest": "sha256:079e84cb9d60b452f23d9a004fba6c51de1df10e91ec77276d89ef4be473dcc7",
+      "reason": "Drives the per-change replay for both the whole-map derivation and the streaming fold a conversion uses: it decides the baseline each change is diffed from, derives the tree's state against every parent, diffs entities and relations, and releases a parent state after its last child. Its output is the exact EntityDelta/RelationDelta payload persisted for every historical change.",
       "owner": "kin-index"
     },
     {
@@ -82,15 +89,15 @@
     {
       "file": "crates/kin-git/src/semantic_import.rs",
       "function": "build_semantic_git_import_plan",
-      "digest": "sha256:b6067ade4b7cf447d8db8040b32da85db5247d544b118df4fd909c67fdab9866",
-      "reason": "Builds the parent-first change sequence and tree map replay consumes. Its ordering and tree selection decide the baseline every historical delta is computed against.",
+      "digest": "sha256:ed93f0f407020066a009c3199882636dfd58f5c970e249241e0719beb341f875",
+      "reason": "Builds the parent-first change sequence replay consumes, walking under frontier retention so a tree is held only while a later commit still resolves against it. Its ordering and tree selection decide the baseline every historical delta is computed against.",
       "owner": "kin-git"
     },
     {
       "file": "crates/kin-git/src/semantic_import.rs",
-      "function": "assign_artifact_identities",
-      "digest": "sha256:fed7906995c0ecd2272309ec87d356fbb1cc29cc96cdeec44b4455dcedb3482a",
-      "reason": "Assigns the stable artifact identities trees and entities are keyed by across the imported history. Reassignment here silently repoints every historical file.",
+      "function": "resolve_tree_transition",
+      "digest": "sha256:975042e4e2bb219d78c9a84891e5d72fbf8cd7a440aff77c9dd36c4ce4c75b74",
+      "reason": "Assigns the stable artifact identities trees and entities are keyed by across the imported history, now from the leaves that differ between a commit's tree and its first parent's rather than from the whole tree, under the rule assign_artifact_identities applied. Reassignment here silently repoints every historical file.",
       "owner": "kin-git"
     },
     {

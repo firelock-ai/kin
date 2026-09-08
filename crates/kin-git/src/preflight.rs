@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use gix::bstr::ByteSlice;
 use kin_blobs::{digest, BlobStore};
 use kin_model::{
-    compute_resolved_tree_hash, ExternalObjectKind, GitObjectId, Hash256, RefTarget, RepoPath,
-    RepositoryId, RepositoryRefState, TreeEntry, WorkspaceHead,
+    ExternalObjectKind, GitObjectId, Hash256, RefTarget, RepoPath, RepositoryId,
+    RepositoryRefState, TreeEntry, WorkspaceHead,
 };
 
 use crate::admission_blockers::effective_hook_surface;
@@ -2792,10 +2792,13 @@ fn fingerprint_plan(plan: &impl ProvedPlanFacts) -> Result<Hash256> {
         hash.bytes(alias.oid.as_bytes());
         hash.bytes(alias.change_id.0.as_bytes());
     }
-    hash.u64(plan.proved_commit_trees().len() as u64);
-    for (oid, tree) in plan.proved_commit_trees().iter() {
+    // Each tree's canonical hash, which is what this hashed when the plan held
+    // the trees, so the fingerprint of a plan is unchanged by the plan no
+    // longer holding them.
+    hash.u64(plan.proved_commit_tree_hashes().len() as u64);
+    for (oid, tree_hash) in plan.proved_commit_tree_hashes() {
         hash.bytes(oid.as_bytes());
-        hash.bytes(compute_resolved_tree_hash(tree)?.as_bytes());
+        hash.bytes(tree_hash.as_bytes());
     }
     encode_head(&mut hash, &plan.proved_workspace_seed().head);
     encode_optional_ref_target(&mut hash, plan.proved_workspace_seed().base_target.as_ref());

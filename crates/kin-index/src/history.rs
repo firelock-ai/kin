@@ -105,39 +105,17 @@ struct SemanticTreeState {
 /// must not already contain semantic deltas: this is a single, explicit build
 /// phase, not a best-effort repair path.
 ///
-/// The map is generic over how its trees are held so a caller that already owns
-/// every exact tree can lend them rather than copy them. Enrichment only ever
-/// reads a tree, so requiring ownership here obliged the one caller that runs at
-/// whole-repository scale to deep-copy the largest structure a conversion holds
-/// purely to re-key it, and hold both copies at once for the whole phase.
+/// The map is generic over how its trees are held so a caller that already
+/// owns every exact tree can lend them rather than copy them. This is the
+/// whole-map form of [`HistoricalSemanticFold`], which a conversion no longer
+/// uses: it hands the fold each commit's tree as the history derivation
+/// resolves it, so no map of every tree is ever built. This form remains for
+/// callers that hold a few trees already, and it is the fold underneath.
 pub fn derive_historical_semantic_deltas<T: Borrow<ResolvedTree>>(
     changes: &[SemanticChange],
     trees: &BTreeMap<SemanticChangeId, T>,
     blob_store: &BlobStore,
 ) -> Result<Vec<HistoricalSemanticDelta>> {
-    let pipeline = IndexPipeline::new();
-    // An external target's fingerprint is a pure function of the import source
-    // and symbol its identity is derived from, so it is the same value in every
-    // tree that observes the import. The fold relinks the whole tree per change,
-    // which would otherwise recompute those digests once per commit for a value
-    // that cannot change.
-    let mut external_fingerprints = BTreeMap::<EntityId, SemanticFingerprint>::new();
-    let mut states = BTreeMap::<SemanticChangeId, SemanticTreeState>::new();
-    let mut known_changes = HashSet::with_capacity(changes.len());
-    let mut remaining_child_uses = BTreeMap::<SemanticChangeId, usize>::new();
-    let mut output = Vec::with_capacity(changes.len());
-
-    for change in changes {
-        if !known_changes.insert(change.id) {
-            return Err(invalid(format!(
-                "history repeats change identity {}",
-                change.id
-            )));
-        }
-        for parent in &change.parents {
-            *remaining_child_uses.entry(*parent).or_default() += 1;
-        }
-    }
     if trees.len() != changes.len() {
         return Err(invalid(format!(
             "semantic tree map contains {} entries for {} enriched changes",
@@ -145,85 +123,200 @@ pub fn derive_historical_semantic_deltas<T: Borrow<ResolvedTree>>(
             changes.len()
         )));
     }
-
+    let mut fold = HistoricalSemanticFold::new(changes)?;
+    let mut output = Vec::with_capacity(changes.len());
     for change in changes {
-        if !matches!(change.origin, ChangeOrigin::GitCommit { .. }) {
-            return Err(invalid(format!(
-                "historical Git enrichment received native change {}",
-                change.id
-            )));
-        }
-        if !change.entity_deltas.is_empty() || !change.relation_deltas.is_empty() {
-            return Err(invalid(format!(
-                "change {} already carries semantic deltas",
-                change.id
-            )));
-        }
-        let parent_states = change
-            .parents
-            .iter()
-            .map(|parent| {
-                states.get(parent).ok_or_else(|| {
-                    invalid(format!(
-                        "parent {} of change {} was not enriched first",
-                        parent, change.id
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let empty_parent = SemanticTreeState::default();
-        let first_parent = parent_states.first().copied().unwrap_or(&empty_parent);
         let tree = trees.get(&change.id).ok_or_else(|| {
             invalid(format!(
                 "change {} has no exact resolved tree for semantic enrichment",
                 change.id
             ))
         })?;
-        let current = semantic_state_for_tree(
-            tree.borrow(),
-            &parent_states,
-            blob_store,
-            &pipeline,
-            &mut external_fingerprints,
-        )?;
-        let entity_deltas = diff_entities(&first_parent.entities, &current.entities);
-        let relation_deltas = diff_relations(&first_parent.relations, &current.relations);
+        output.push(fold.enrich(change, tree.borrow(), blob_store)?);
+    }
+    fold.finish()?;
+    Ok(output)
+}
 
-        output.push(HistoricalSemanticDelta {
-            change_id: change.id,
-            entity_deltas,
-            relation_deltas,
-        });
+/// The historical enrichment fold, one commit at a time.
+///
+/// A fold is opened over the whole parent-first history so it knows how many
+/// children still need each commit's semantic state, then fed each change with
+/// its exact tree in that same order, and closed once every change has been
+/// enriched. It keeps the semantic state of a commit only while a later commit
+/// still folds against it, exactly as the whole-map derivation did; what it
+/// no longer needs is the whole map. The history derivation in `kin-git` hands
+/// it each tree while that tree is live for the same reason, so a conversion's
+/// enrichment holds the frontier of history rather than all of it.
+pub struct HistoricalSemanticFold {
+    pipeline: IndexPipeline,
+    /// An external target's fingerprint is a pure function of the import
+    /// source and symbol its identity is derived from, so it is the same value
+    /// in every tree that observes the import. The fold relinks the whole tree
+    /// per change, which would otherwise recompute those digests once per
+    /// commit for a value that cannot change.
+    external_fingerprints: BTreeMap<EntityId, SemanticFingerprint>,
+    states: BTreeMap<SemanticChangeId, SemanticTreeState>,
+    remaining_child_uses: BTreeMap<SemanticChangeId, usize>,
+    /// Changes opened over and not yet enriched.
+    pending: HashSet<SemanticChangeId>,
+}
 
-        drop(parent_states);
-        for parent in &change.parents {
-            let remaining = remaining_child_uses.get_mut(parent).ok_or_else(|| {
-                invalid(format!(
-                    "parent {} of change {} has no child-use accounting",
-                    parent, change.id
-                ))
-            })?;
-            *remaining = remaining.checked_sub(1).ok_or_else(|| {
-                invalid(format!(
-                    "parent {} of change {} has invalid child-use accounting",
-                    parent, change.id
-                ))
-            })?;
-            if *remaining == 0 {
-                states.remove(parent);
+impl HistoricalSemanticFold {
+    /// Open a fold over a complete parent-first history.
+    ///
+    /// Every change is checked here for what enrichment requires of it: a Git
+    /// origin, no semantic deltas already bound, and an identity that appears
+    /// once. The child-use count that lets a parent's state be dropped is
+    /// taken from the whole history, which is why the fold has to see it
+    /// before it enriches anything.
+    pub fn new(changes: &[SemanticChange]) -> Result<Self> {
+        let mut pending = HashSet::with_capacity(changes.len());
+        let mut remaining_child_uses = BTreeMap::<SemanticChangeId, usize>::new();
+        for change in changes {
+            if !matches!(change.origin, ChangeOrigin::GitCommit { .. }) {
+                return Err(invalid(format!(
+                    "historical Git enrichment received native change {}",
+                    change.id
+                )));
+            }
+            if !change.entity_deltas.is_empty() || !change.relation_deltas.is_empty() {
+                return Err(invalid(format!(
+                    "change {} already carries semantic deltas",
+                    change.id
+                )));
+            }
+            if !pending.insert(change.id) {
+                return Err(invalid(format!(
+                    "history repeats change identity {}",
+                    change.id
+                )));
+            }
+            for parent in &change.parents {
+                *remaining_child_uses.entry(*parent).or_default() += 1;
             }
         }
-        if remaining_child_uses.get(&change.id).copied().unwrap_or(0) > 0 {
-            states.insert(change.id, current);
-        }
+        Ok(Self {
+            pipeline: IndexPipeline::new(),
+            external_fingerprints: BTreeMap::new(),
+            states: BTreeMap::new(),
+            remaining_child_uses,
+            pending,
+        })
     }
 
-    if !states.is_empty() {
-        return Err(invalid(
-            "semantic history retained parent state after every child was enriched",
-        ));
+    /// Enrich one change against its exact tree.
+    ///
+    /// The change must be one the fold was opened over, must not have been
+    /// enriched yet, and every one of its parents must have been enriched
+    /// before it, which parent-first order guarantees. The replay itself is
+    /// [`enrich_historical_change`], a free function so the replay-semantics
+    /// guard can pin its source the way it pins every other function that
+    /// authors persisted history.
+    pub fn enrich(
+        &mut self,
+        change: &SemanticChange,
+        tree: &ResolvedTree,
+        blob_store: &BlobStore,
+    ) -> Result<HistoricalSemanticDelta> {
+        enrich_historical_change(self, change, tree, blob_store)
     }
-    Ok(output)
+
+    /// Close the fold, requiring every opened change to have been enriched and
+    /// no parent state to have outlived its last child.
+    pub fn finish(self) -> Result<()> {
+        if !self.pending.is_empty() {
+            return Err(invalid(format!(
+                "{} changes were opened for enrichment and never enriched",
+                self.pending.len()
+            )));
+        }
+        if !self.states.is_empty() {
+            return Err(invalid(
+                "semantic history retained parent state after every child was enriched",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Enrich one change of a parent-first history against its exact tree.
+///
+/// This is the per-change replay: it decides the baseline the change is
+/// diffed from (its first parent's semantic state, or nothing for a root),
+/// derives the tree's state against every parent so carried-forward parses
+/// are reused, diffs entities and relations, and then releases each parent
+/// state whose last child this was. The whole-map derivation and the streaming
+/// fold both run exactly this, once per change, in the same order.
+fn enrich_historical_change(
+    fold: &mut HistoricalSemanticFold,
+    change: &SemanticChange,
+    tree: &ResolvedTree,
+    blob_store: &BlobStore,
+) -> Result<HistoricalSemanticDelta> {
+    if !fold.pending.remove(&change.id) {
+        return Err(invalid(format!(
+            "change {} was not opened for enrichment, or was enriched twice",
+            change.id
+        )));
+    }
+    let parent_states = change
+        .parents
+        .iter()
+        .map(|parent| {
+            fold.states.get(parent).ok_or_else(|| {
+                invalid(format!(
+                    "parent {} of change {} was not enriched first",
+                    parent, change.id
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let empty_parent = SemanticTreeState::default();
+    let first_parent = parent_states.first().copied().unwrap_or(&empty_parent);
+    let current = semantic_state_for_tree(
+        tree,
+        &parent_states,
+        blob_store,
+        &fold.pipeline,
+        &mut fold.external_fingerprints,
+    )?;
+    let entity_deltas = diff_entities(&first_parent.entities, &current.entities);
+    let relation_deltas = diff_relations(&first_parent.relations, &current.relations);
+    let delta = HistoricalSemanticDelta {
+        change_id: change.id,
+        entity_deltas,
+        relation_deltas,
+    };
+
+    drop(parent_states);
+    for parent in &change.parents {
+        let remaining = fold.remaining_child_uses.get_mut(parent).ok_or_else(|| {
+            invalid(format!(
+                "parent {} of change {} has no child-use accounting",
+                parent, change.id
+            ))
+        })?;
+        *remaining = remaining.checked_sub(1).ok_or_else(|| {
+            invalid(format!(
+                "parent {} of change {} has invalid child-use accounting",
+                parent, change.id
+            ))
+        })?;
+        if *remaining == 0 {
+            fold.states.remove(parent);
+        }
+    }
+    if fold
+        .remaining_child_uses
+        .get(&change.id)
+        .copied()
+        .unwrap_or(0)
+        > 0
+    {
+        fold.states.insert(change.id, current);
+    }
+    Ok(delta)
 }
 
 fn semantic_state_for_tree(
@@ -841,7 +934,7 @@ mod tests {
         )
         .unwrap();
         let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
-        let trees = trees_by_change(&plan);
+        let trees = trees_by_change(&plan, &snapshot, &blob_store);
 
         let first = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
         let second = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
@@ -961,7 +1054,7 @@ mod tests {
         )
         .unwrap();
         let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
-        let trees = trees_by_change(&plan);
+        let trees = trees_by_change(&plan, &snapshot, &blob_store);
         let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
 
         let feature_id = deltas
@@ -1052,7 +1145,7 @@ mod tests {
         )
         .unwrap();
         let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
-        let trees = trees_by_change(&plan);
+        let trees = trees_by_change(&plan, &snapshot, &blob_store);
         let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
 
         let bindings = deltas
@@ -1214,7 +1307,7 @@ mod tests {
         )
         .unwrap();
         let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
-        let trees = trees_by_change(&plan);
+        let trees = trees_by_change(&plan, &snapshot, &blob_store);
         let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
 
         let tip = deltas
@@ -1281,7 +1374,7 @@ mod tests {
         )
         .unwrap();
         let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
-        let trees = trees_by_change(&plan);
+        let trees = trees_by_change(&plan, &snapshot, &blob_store);
         let reversed = plan.changes.iter().cloned().rev().collect::<Vec<_>>();
 
         let error = derive_historical_semantic_deltas(&reversed, &trees, &blob_store).unwrap_err();
@@ -1333,7 +1426,7 @@ mod tests {
         )
         .unwrap();
         let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
-        let trees = trees_by_change(&plan);
+        let trees = trees_by_change(&plan, &snapshot, &blob_store);
         // Enrichment must use the captured graph and CAS, even when a checkout differs.
         write(
             &repository,
@@ -1424,15 +1517,13 @@ mod tests {
 
     fn trees_by_change(
         plan: &kin_git::SemanticGitImportPlan,
+        snapshot: &kin_git::LosslessGitRepository,
+        blob_store: &BlobStore,
     ) -> BTreeMap<SemanticChangeId, ResolvedTree> {
+        let trees = kin_git::derive_commit_trees(snapshot, blob_store).unwrap();
         plan.aliases
             .iter()
-            .map(|alias| {
-                (
-                    alias.change_id,
-                    plan.commit_trees.get(&alias.oid).unwrap().clone(),
-                )
-            })
+            .map(|alias| (alias.change_id, trees.get(&alias.oid).unwrap().clone()))
             .collect()
     }
 
