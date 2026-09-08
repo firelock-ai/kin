@@ -28,3 +28,6 @@ pub use registry::{
     ProviderGap, ProviderGapReason, ProviderId, ProviderProbe, ProviderRegistry, RegistryConfig,
     RegistryConfigError, ResolvedProvider, SystemBinaryFinder,
 };
+
+#[cfg(test)]
+mod enrichment_integrity_tests;

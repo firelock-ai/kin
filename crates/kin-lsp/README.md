@@ -92,6 +92,11 @@ During `kin ingest` (or triggered by the daemon on file change), `kin` calls int
 
 Results are cached per file hash (`src/cache.rs`) so unchanged files skip re-enrichment.
 
+Query failures and malformed replies are returned as errors. Successful empty replies
+and unsupported capabilities remain valid empty answers. UsesType requires primary
+source text from the caller's graph-owned `DocumentProvider`; missing text is an
+explicit source gap, and projected files never supply its identifier positions.
+
 The origin tag is the only provenance this crate attaches on its own. A finer record of
 which provider, at which version, through which capability produced an edge exists as
 `LspProvenance` and `stamp_lsp_provenance`, which encode into `RelationEvidence` and
@@ -110,8 +115,10 @@ started fresh, used for the enrichment pass, and shut down cleanly (`shutdown` +
 cargo test
 ```
 
-That runs 35 unit tests across `src/`, which need nothing installed, plus 5 integration
-tests in `tests/` that drive a real `rust-analyzer`.
+That runs unit tests across `src/`, including a scripted JSON-RPC peer that requires
+`python3` on `PATH`, plus 5 integration tests in `tests/` that drive a real
+`rust-analyzer`. The scripted peer exercises error propagation, graph-source authority
+and cancellation-safe document cleanup without an installed language server.
 
 Every integration test looks for `rust-analyzer` on `PATH` first and returns early when
 it is missing. The three in `tests/rust_analyzer_integration.rs` also need a Rust
@@ -120,9 +127,9 @@ workspace, and skip when neither is there. The two in `tests/daemon_repro.rs` an
 `tests/max_enrichment_probe.rs` write a throwaway crate into the temp directory
 themselves, so a missing `rust-analyzer` is their only skip condition.
 
-A skip prints `SKIP` to stderr and passes. On a machine without `rust-analyzer`, a green
-`cargo test` has therefore exercised the unit tests and none of the LSP protocol path.
-Read the output before reading the pass as coverage.
+A skip prints `SKIP` to stderr and passes. Without `rust-analyzer`, the suite still
+exercises the framed JSON-RPC path through the scripted peer, but it has not verified
+a real language server. Read the output before reading the pass as that coverage.
 
 The ones that do run are slow by design, since a server has to index before it can
 answer. `daemon_repro` and `max_enrichment_probe` each wait 25 seconds for indexing and

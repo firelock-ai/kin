@@ -15,7 +15,7 @@ use std::path::Path;
 
 use tracing::debug;
 
-use crate::error::Result;
+use crate::error::{LspError, Result};
 use crate::file_enrichment::identifier_positions_in_line;
 use crate::lifecycle::LspServer;
 use crate::protocol::{
@@ -230,13 +230,7 @@ pub async fn enrich_entity_calls(
         )
         .await;
 
-    let items: Vec<CallHierarchyItem> = match prepare_result {
-        Ok(value) => serde_json::from_value(value).unwrap_or_default(),
-        Err(e) => {
-            debug!(entity = %caller.name, error = %e, "prepareCallHierarchy failed");
-            return Ok(Vec::new());
-        }
-    };
+    let items: Vec<CallHierarchyItem> = decode_optional_array(prepare_result?)?;
 
     if items.is_empty() {
         return Ok(Vec::new());
@@ -252,13 +246,8 @@ pub async fn enrich_entity_calls(
         )
         .await;
 
-    let outgoing: Vec<protocol::CallHierarchyOutgoingCall> = match outgoing_result {
-        Ok(value) => serde_json::from_value(value).unwrap_or_default(),
-        Err(e) => {
-            debug!(entity = %caller.name, error = %e, "outgoingCalls failed");
-            return Ok(Vec::new());
-        }
-    };
+    let outgoing: Vec<protocol::CallHierarchyOutgoingCall> =
+        decode_optional_array(outgoing_result?)?;
 
     // Step 3: Match each outgoing call target to a graph entity.
     let mut relations = Vec::new();
@@ -348,13 +337,7 @@ pub async fn enrich_entity_overrides(
         )
         .await;
 
-    let items: Vec<TypeHierarchyItem> = match prepare_result {
-        Ok(value) => serde_json::from_value(value).unwrap_or_default(),
-        Err(e) => {
-            debug!(entity = %method.name, error = %e, "prepareTypeHierarchy failed");
-            return Ok(Vec::new());
-        }
-    };
+    let items: Vec<TypeHierarchyItem> = decode_optional_array(prepare_result?)?;
 
     if items.is_empty() {
         return Ok(Vec::new());
@@ -370,13 +353,7 @@ pub async fn enrich_entity_overrides(
         )
         .await;
 
-    let supertypes: Vec<TypeHierarchyItem> = match supertypes_result {
-        Ok(value) => serde_json::from_value(value).unwrap_or_default(),
-        Err(e) => {
-            debug!(entity = %method.name, error = %e, "typeHierarchy/supertypes failed");
-            return Ok(Vec::new());
-        }
-    };
+    let supertypes: Vec<TypeHierarchyItem> = decode_optional_array(supertypes_result?)?;
 
     // Step 3: For each supertype, check if a method with the same name exists in the graph.
     let mut relations = Vec::new();
@@ -458,16 +435,63 @@ pub(crate) fn member_expression_at(line_text: &str, col: u32) -> Option<(String,
     ))
 }
 
-/// One location answer for a request at a position, flattened out of the two
-/// shapes a server may reply with.
+fn decode_optional_array<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+) -> Result<Vec<T>> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
+/// Decode the location and location-link shapes, preserving malformed replies
+/// as errors instead of certifying them as empty answers.
+pub(crate) fn decode_locations(value: serde_json::Value) -> Result<Vec<protocol::Location>> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LocationLink {
+        target_uri: String,
+        target_selection_range: protocol::Range,
+        #[serde(rename = "targetRange")]
+        _target_range: protocol::Range,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Answer {
+        Locations(Vec<protocol::Location>),
+        Location(protocol::Location),
+        Links(Vec<LocationLink>),
+    }
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    Ok(match serde_json::from_value(value)? {
+        Answer::Locations(locations) => locations,
+        Answer::Location(location) => vec![location],
+        Answer::Links(links) => links
+            .into_iter()
+            .map(|link| protocol::Location {
+                uri: link.target_uri,
+                range: link.target_selection_range,
+            })
+            .collect(),
+    })
+}
+
+/// One location answer for a request at a position.
 pub(crate) async fn locations_at(
     server: &LspServer,
     method: &'static str,
     uri: &str,
     line: u32,
     character: u32,
-) -> Vec<protocol::Location> {
-    let result = server
+) -> Result<Vec<protocol::Location>> {
+    if (method == "textDocument/definition" && !server.has_definition())
+        || (method == "textDocument/typeDefinition" && !server.has_type_definition())
+    {
+        return Ok(Vec::new());
+    }
+    let value = server
         .client
         .request(
             method,
@@ -478,15 +502,8 @@ pub(crate) async fn locations_at(
                 position: Position { line, character },
             },
         )
-        .await;
-    let Ok(value) = result else {
-        return Vec::new();
-    };
-    serde_json::from_value::<Vec<protocol::Location>>(value.clone()).unwrap_or_else(|_| {
-        serde_json::from_value::<protocol::Location>(value)
-            .map(|one| vec![one])
-            .unwrap_or_default()
-    })
+        .await?;
+    decode_locations(value)
 }
 
 /// Whether this receiver names a module rather than a value in this file.
@@ -594,28 +611,31 @@ impl<'a> ScopedDocuments<'a> {
 
     /// Hand `rel_path` to the server if it is not already open, and report
     /// whether the server now holds it.
-    pub(crate) async fn ensure_open(&mut self, rel_path: &str, uri: &str) -> bool {
+    pub(crate) async fn ensure_open(&mut self, rel_path: &str, uri: &str) -> Result<bool> {
         if self.open.contains(uri) {
-            return true;
+            return Ok(true);
         }
         let Some(provider) = self.provider else {
             debug!(
                 path = %rel_path,
                 "declined a cross-file query: no document provider was supplied"
             );
-            return false;
+            return Ok(false);
         };
         let Some(language_id) = lsp_language_id(rel_path) else {
             debug!(path = %rel_path, "declined a cross-file query: unknown language for this path");
-            return false;
+            return Ok(false);
         };
         let Some(text) = provider(rel_path) else {
             debug!(
                 path = %rel_path,
                 "declined a cross-file query: repository authority has no text for this path"
             );
-            return false;
+            return Ok(false);
         };
+        // Ownership precedes the notification await: the frame can reach the
+        // server even when its caller is cancelled before the write ack.
+        self.open.insert(uri.to_string());
         let notified = self
             .server
             .client
@@ -633,24 +653,33 @@ impl<'a> ScopedDocuments<'a> {
             .await;
         if let Err(error) = notified {
             debug!(path = %rel_path, error = %error, "failed to open a document for a cross-file query");
-            return false;
+            return Err(error);
         }
         debug!(path = %rel_path, "opened a graph-owned document for a cross-file query");
-        self.open.insert(uri.to_string());
-        true
+        Ok(true)
     }
 
-    /// Close every document this pass opened.
-    pub(crate) async fn close_all(&mut self) {
-        for uri in self.open.drain() {
+    /// Queue all closes before the first suspension, preserving cleanup if the
+    /// caller is cancelled while waiting for their write acknowledgment.
+    pub(crate) async fn close_all(&mut self) -> Result<()> {
+        if self.open.is_empty() {
+            return Ok(());
+        }
+        let done = self
+            .server
+            .client
+            .close_documents(self.open.drain().collect())?;
+        done.await.map_err(|_| LspError::ServerDied)?
+    }
+}
+
+impl Drop for ScopedDocuments<'_> {
+    fn drop(&mut self) {
+        if !self.open.is_empty() {
             let _ = self
                 .server
                 .client
-                .notify(
-                    "textDocument/didClose",
-                    serde_json::json!({ "textDocument": { "uri": uri } }),
-                )
-                .await;
+                .close_documents(self.open.drain().collect());
         }
     }
 }
@@ -706,7 +735,7 @@ pub(crate) async fn member_export_bindings<'a>(
     receiver_col: u32,
     member_col: u32,
     member_name: &str,
-) -> Vec<&'a EntityRef> {
+) -> Result<Vec<&'a EntityRef>> {
     let module_locations = locations_at(
         server,
         "textDocument/typeDefinition",
@@ -714,9 +743,9 @@ pub(crate) async fn member_export_bindings<'a>(
         line,
         receiver_col,
     )
-    .await;
+    .await?;
     let member_definitions =
-        locations_at(server, "textDocument/definition", uri, line, member_col).await;
+        locations_at(server, "textDocument/definition", uri, line, member_col).await?;
     let mut bound: Vec<&EntityRef> = Vec::new();
 
     for module_location in &module_locations {
@@ -732,7 +761,7 @@ pub(crate) async fn member_export_bindings<'a>(
             if candidate.file_path != enriched_file
                 && !documents
                     .ensure_open(&candidate.file_path, &candidate_uri)
-                    .await
+                    .await?
             {
                 continue;
             }
@@ -743,7 +772,7 @@ pub(crate) async fn member_export_bindings<'a>(
                 candidate.name_line,
                 candidate.name_col,
             )
-            .await;
+            .await?;
             if !candidate_is_proven(&candidate_definitions, &member_definitions) {
                 continue;
             }
@@ -753,16 +782,15 @@ pub(crate) async fn member_export_bindings<'a>(
             bound.push(candidate);
         }
     }
-    bound
+    Ok(bound)
 }
 
 /// Query type definitions for entities referenced in a function's signature/body.
 /// For each resolved type, find it in the graph index and emit UsesType relations.
 ///
-/// `documents` supplies graph-owned text for files this pass needs the server
-/// to hold besides the one being enriched. It is optional: without it the
-/// member-on-module join declines rather than binding, which is the behavior
-/// this pass had before a provider existed.
+/// `documents` supplies graph-owned text for the primary file and any
+/// cross-file join. Missing primary text is an explicit source gap; projected
+/// filesystem content never supplies the identifier positions for this pass.
 pub async fn enrich_entity_uses_type(
     server: &LspServer,
     entity: &EntityRef,
@@ -776,13 +804,14 @@ pub async fn enrich_entity_uses_type(
 
     let file_path = workspace_root.join(&entity.file_path);
     let uri = protocol::path_to_uri(&file_path);
-    let file_content = match std::fs::read_to_string(&file_path) {
-        Ok(content) => content,
-        Err(error) => {
-            debug!(entity = %entity.name, error = %error, "failed to read file for UsesType sampling");
-            return Ok(Vec::new());
-        }
-    };
+    let file_content = documents
+        .and_then(|provider| provider(&entity.file_path))
+        .ok_or_else(|| {
+            LspError::Protocol(format!(
+                "repository source unavailable for UsesType: {}",
+                entity.file_path
+            ))
+        })?;
     let lines: Vec<&str> = file_content.lines().collect();
 
     // Sample positions within the entity's span to discover type usages.
@@ -792,166 +821,162 @@ pub async fn enrich_entity_uses_type(
     let mut seen_targets = std::collections::HashSet::new();
     let mut scoped_documents = ScopedDocuments::new(server, documents);
 
-    for line in entity.start_line..=entity.end_line {
-        let Some(line_text) = lines.get(line as usize) else {
-            continue;
-        };
+    let result = async {
+        for line in entity.start_line..=entity.end_line {
+            let Some(line_text) = lines.get(line as usize) else {
+                continue;
+            };
 
-        for col in identifier_positions_in_line(line_text) {
-            // A member expression on a MODULE receiver is answered by its
-            // member, never by the receiver. `express.Router()` asked at
-            // `express` returns the module's own type, `lib/express.js:35`,
-            // which `find_at` reads as `createApplication`, so every file that
-            // so much as names `express` was recorded as using that one
-            // function: 50 inbound edges on express's default export and zero
-            // on `Router`, which has 32 real reference sites.
-            //
-            // Value receivers are untouched. `res` in `res.send(...)` genuinely
-            // tells the enclosing function it uses the Response type, and that
-            // edge is not this pass's mistake.
-            if let Some((_receiver, member_col, member_name)) = member_expression_at(line_text, col)
-            {
-                let receiver_definitions =
-                    locations_at(server, "textDocument/definition", &uri, line, col).await;
-                if receiver_names_a_module(&receiver_definitions, &entity.file_path) {
-                    for candidate in member_export_bindings(
-                        server,
-                        index,
-                        workspace_root,
-                        &mut scoped_documents,
-                        &entity.file_path,
-                        &uri,
-                        line,
-                        col,
-                        member_col,
-                        &member_name,
+            for col in identifier_positions_in_line(line_text) {
+                // A member expression on a MODULE receiver is answered by its
+                // member, never by the receiver. `express.Router()` asked at
+                // `express` returns the module's own type, `lib/express.js:35`,
+                // which `find_at` reads as `createApplication`, so every file that
+                // so much as names `express` was recorded as using that one
+                // function: 50 inbound edges on express's default export and zero
+                // on `Router`, which has 32 real reference sites.
+                //
+                // Value receivers are untouched. `res` in `res.send(...)` genuinely
+                // tells the enclosing function it uses the Response type, and that
+                // edge is not this pass's mistake.
+                if let Some((_receiver, member_col, member_name)) =
+                    member_expression_at(line_text, col)
+                {
+                    let receiver_definitions =
+                        locations_at(server, "textDocument/definition", &uri, line, col).await?;
+                    if receiver_names_a_module(&receiver_definitions, &entity.file_path) {
+                        for candidate in member_export_bindings(
+                            server,
+                            index,
+                            workspace_root,
+                            &mut scoped_documents,
+                            &entity.file_path,
+                            &uri,
+                            line,
+                            col,
+                            member_col,
+                            &member_name,
+                        )
+                        .await?
+                        {
+                            if candidate.id == entity.id || !seen_targets.insert(candidate.id) {
+                                continue;
+                            }
+                            relations.push(Relation {
+                                id: deterministic_relation_id(
+                                    RelationKind::UsesType,
+                                    entity.id,
+                                    candidate.id,
+                                ),
+                                kind: RelationKind::UsesType,
+                                src: GraphNodeId::Entity(entity.id),
+                                dst: GraphNodeId::Entity(candidate.id),
+                                confidence: 0.85,
+                                origin: RelationOrigin::Lsp,
+                                created_in: None,
+                                import_source: None,
+                                evidence: query_position_evidence(
+                                    "lsp_member_on_module",
+                                    &entity.file_path,
+                                    &protocol::Range {
+                                        start: Position {
+                                            line,
+                                            character: member_col,
+                                        },
+                                        end: Position {
+                                            line,
+                                            character: member_col,
+                                        },
+                                    },
+                                ),
+                            });
+                            debug!(
+                                entity = %entity.name,
+                                member = %member_name,
+                                uses_type = %candidate.name,
+                                "bound a member on a module receiver to its export"
+                            );
+                        }
+                        // The receiver's own type is not this entity's fact, whether
+                        // or not the member bound to anything. Declining here is
+                        // what makes the inflated attribution stop.
+                        continue;
+                    }
+                }
+
+                let type_def_result = server
+                    .client
+                    .request(
+                        "textDocument/typeDefinition",
+                        protocol::TextDocumentPositionParams {
+                            text_document: TextDocumentIdentifier { uri: uri.clone() },
+                            position: Position {
+                                line,
+                                character: col,
+                            },
+                        },
                     )
-                    .await
-                    {
-                        if candidate.id == entity.id || !seen_targets.insert(candidate.id) {
+                    .await;
+
+                let locations = decode_locations(type_def_result?)?;
+
+                for loc in &locations {
+                    let target_line = loc.range.start.line;
+                    // Position only. The old fallback took the FILE STEM and looked
+                    // that up by name, so a reference in `sessions.py` could be
+                    // attributed to whatever entity happened to be called
+                    // `sessions`, which is a guess wearing a proven label.
+                    let target = index.find_at(&loc.uri, target_line);
+
+                    if let Some(target_ref) = target {
+                        // Skip self-references and duplicates.
+                        if target_ref.id == entity.id || !seen_targets.insert(target_ref.id) {
                             continue;
                         }
+
                         relations.push(Relation {
                             id: deterministic_relation_id(
                                 RelationKind::UsesType,
                                 entity.id,
-                                candidate.id,
+                                target_ref.id,
                             ),
                             kind: RelationKind::UsesType,
                             src: GraphNodeId::Entity(entity.id),
-                            dst: GraphNodeId::Entity(candidate.id),
+                            dst: GraphNodeId::Entity(target_ref.id),
                             confidence: 0.85,
                             origin: RelationOrigin::Lsp,
                             created_in: None,
                             import_source: None,
+                            // The reference SITE the server reported, which is the
+                            // line a reader needs and what `reference_lines`
+                            // publishes.
                             evidence: query_position_evidence(
-                                "lsp_member_on_module",
+                                "lsp_references",
                                 &entity.file_path,
-                                &protocol::Range {
-                                    start: Position {
-                                        line,
-                                        character: member_col,
-                                    },
-                                    end: Position {
-                                        line,
-                                        character: member_col,
-                                    },
-                                },
+                                &loc.range,
                             ),
                         });
                         debug!(
                             entity = %entity.name,
-                            member = %member_name,
-                            uses_type = %candidate.name,
-                            "bound a member on a module receiver to its export"
+                            uses_type = %target_ref.name,
+                            "discovered UsesType relation"
                         );
                     }
-                    // The receiver's own type is not this entity's fact, whether
-                    // or not the member bound to anything. Declining here is
-                    // what makes the inflated attribution stop.
-                    continue;
-                }
-            }
-
-            let type_def_result = server
-                .client
-                .request(
-                    "textDocument/typeDefinition",
-                    protocol::TextDocumentPositionParams {
-                        text_document: TextDocumentIdentifier { uri: uri.clone() },
-                        position: Position {
-                            line,
-                            character: col,
-                        },
-                    },
-                )
-                .await;
-
-            let locations: Vec<protocol::Location> = match type_def_result {
-                Ok(value) => {
-                    // Response may be a single Location or an array of Locations.
-                    if let Ok(locs) =
-                        serde_json::from_value::<Vec<protocol::Location>>(value.clone())
-                    {
-                        locs
-                    } else if let Ok(loc) = serde_json::from_value::<protocol::Location>(value) {
-                        vec![loc]
-                    } else {
-                        continue;
-                    }
-                }
-                Err(_) => continue,
-            };
-
-            for loc in &locations {
-                let target_line = loc.range.start.line;
-                // Position only. The old fallback took the FILE STEM and looked
-                // that up by name, so a reference in `sessions.py` could be
-                // attributed to whatever entity happened to be called
-                // `sessions`, which is a guess wearing a proven label.
-                let target = index.find_at(&loc.uri, target_line);
-
-                if let Some(target_ref) = target {
-                    // Skip self-references and duplicates.
-                    if target_ref.id == entity.id || !seen_targets.insert(target_ref.id) {
-                        continue;
-                    }
-
-                    relations.push(Relation {
-                        id: deterministic_relation_id(
-                            RelationKind::UsesType,
-                            entity.id,
-                            target_ref.id,
-                        ),
-                        kind: RelationKind::UsesType,
-                        src: GraphNodeId::Entity(entity.id),
-                        dst: GraphNodeId::Entity(target_ref.id),
-                        confidence: 0.85,
-                        origin: RelationOrigin::Lsp,
-                        created_in: None,
-                        import_source: None,
-                        // The reference SITE the server reported, which is the
-                        // line a reader needs and what `reference_lines`
-                        // publishes.
-                        evidence: query_position_evidence(
-                            "lsp_references",
-                            &entity.file_path,
-                            &loc.range,
-                        ),
-                    });
-                    debug!(
-                        entity = %entity.name,
-                        uses_type = %target_ref.name,
-                        "discovered UsesType relation"
-                    );
                 }
             }
         }
+
+        Ok(relations)
     }
-
-    scoped_documents.close_all().await;
-
-    Ok(relations)
+    .await;
+    let closed = scoped_documents.close_all().await;
+    match result {
+        Ok(relations) => {
+            closed?;
+            Ok(relations)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Query textDocument/references for an entity to find all references to it.
@@ -985,13 +1010,7 @@ pub async fn enrich_entity_references(
         )
         .await;
 
-    let locations: Vec<protocol::Location> = match result {
-        Ok(value) => serde_json::from_value(value).unwrap_or_default(),
-        Err(e) => {
-            debug!(entity = %entity.name, error = %e, "references query failed");
-            return Ok(Vec::new());
-        }
-    };
+    let locations: Vec<protocol::Location> = decode_optional_array(result?)?;
 
     let mut relations = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1323,7 +1342,8 @@ mod member_on_module_tests {
         assert!(
             !without
                 .ensure_open("lib/express.js", "file:///w/lib/express.js")
-                .await,
+                .await
+                .unwrap(),
             "no provider means the join keeps declining, never a disk read"
         );
         assert!(without.open.is_empty());
@@ -1338,13 +1358,15 @@ mod member_on_module_tests {
         let mut with = ScopedDocuments::new(&server, Some(provider as DocumentProvider<'_>));
         assert!(
             with.ensure_open("lib/express.js", "file:///w/lib/express.js")
-                .await,
+                .await
+                .unwrap(),
             "a provider that answers hands the document to the server"
         );
         assert_eq!(with.open.len(), 1);
         assert!(
             with.ensure_open("lib/express.js", "file:///w/lib/express.js")
-                .await,
+                .await
+                .unwrap(),
             "a document already open stays open"
         );
         assert_eq!(
@@ -1356,16 +1378,20 @@ mod member_on_module_tests {
         assert!(
             !with
                 .ensure_open("lib/other.js", "file:///w/lib/other.js")
-                .await,
+                .await
+                .unwrap(),
             "a path repository authority has nothing for declines"
         );
         assert!(
-            !with.ensure_open("NOTICE", "file:///w/NOTICE").await,
+            !with
+                .ensure_open("NOTICE", "file:///w/NOTICE")
+                .await
+                .unwrap(),
             "a path whose language cannot be named declines"
         );
         assert_eq!(with.open.len(), 1);
 
-        with.close_all().await;
+        with.close_all().await.unwrap();
         assert!(
             with.open.is_empty(),
             "every document this pass opened is closed with it"

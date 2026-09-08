@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::enrichment::{deterministic_relation_id, enrich_entity_calls, EntityIndex};
-use crate::error::Result;
+use crate::error::{LspError, Result};
 use crate::lifecycle::LspServer;
 use crate::protocol;
 use kin_model::{EntityId, GraphNodeId, Relation, RelationKind, RelationOrigin};
@@ -105,225 +105,241 @@ pub async fn enrich_file_definitions(
     let mut positions_queried = 0usize;
     let mut scoped_documents = crate::enrichment::ScopedDocuments::new(server, documents);
 
-    // Scan each line for identifier positions.
-    for (line_num, line_text) in file_content.lines().enumerate() {
-        let line = line_num as u32;
-        let positions = identifier_positions_in_line(line_text);
-        positions_queried += positions.len();
+    let result = async {
+        // Unsupported definition queries contribute no positions; independent
+        // call hierarchy support still runs below.
+        if server.has_definition() {
+            // Scan each line for identifier positions.
+            for (line_num, line_text) in file_content.lines().enumerate() {
+                let line = line_num as u32;
+                let positions = identifier_positions_in_line(line_text);
+                positions_queried += positions.len();
 
-        // The relation source depends only on the line (never the column), and
-        // every relation emitted below requires it to be Some. Lines outside any
-        // known entity span can therefore never contribute a relation, so skip
-        // their per-identifier LSP round-trips. Output-identical: this removes
-        // only queries whose results were structurally guaranteed to be dropped.
-        let Some(source) = entity_index.find_at(&uri, line) else {
-            continue;
-        };
+                // The relation source depends only on the line (never the column), and
+                // every relation emitted below requires it to be Some. Lines outside any
+                // known entity span can therefore never contribute a relation, so skip
+                // their per-identifier LSP round-trips. Output-identical: this removes
+                // only queries whose results were structurally guaranteed to be dropped.
+                let Some(source) = entity_index.find_at(&uri, line) else {
+                    continue;
+                };
 
-        for col in positions {
-            // A member expression on a MODULE receiver is answered by its
-            // member. Asked at the receiver, the server returns the module, and
-            // `find_at` turns that into whichever entity holds the line, so
-            // every file that names `express` was recorded as referencing
-            // express's default export: 50 inbound edges on `createApplication`
-            // against 32 real reference sites on `Router`, which had none.
-            //
-            // Value receivers keep their edges. `res` in `res.send(...)`
-            // resolves to its own parameter in this file and says something
-            // true about the enclosing function. The two are told apart by
-            // where the server puts the receiver's definition, which is the
-            // server answering rather than this code guessing.
-            if let Some((_receiver, member_col, member_name)) =
-                crate::enrichment::member_expression_at(line_text, col)
-            {
-                let receiver_definitions = crate::enrichment::locations_at(
-                    server,
-                    "textDocument/definition",
-                    &uri,
-                    line,
-                    col,
-                )
-                .await;
-                if crate::enrichment::receiver_names_a_module(&receiver_definitions, &rel_path) {
-                    // Declining alone was not enough, and assuming otherwise is
-                    // what left a named export unreferenced. This pass used to
-                    // drop the receiver here reasoning that "the member's own
-                    // position is queried by this same loop on its next turn".
-                    // It is queried, and on express it answers
-                    // `node_modules/router`, outside the ingested tree, so
-                    // `find_at` finds nothing and no edge is minted. Removing
-                    // the wrong edge left nothing in its place, and the
-                    // reference surface reads this arm's `References` edges, so
-                    // `exports.Router` stayed at zero counted references against
-                    // 32 real call sites.
+                for col in positions {
+                    // A member expression on a MODULE receiver is answered by its
+                    // member. Asked at the receiver, the server returns the module, and
+                    // `find_at` turns that into whichever entity holds the line, so
+                    // every file that names `express` was recorded as referencing
+                    // express's default export: 50 inbound edges on `createApplication`
+                    // against 32 real reference sites on `Router`, which had none.
                     //
-                    // The same equivalence join the UsesType arm uses supplies
-                    // the right edge: two independently proven server answers
-                    // naming the same place, never a name match.
-                    for candidate in crate::enrichment::member_export_bindings(
-                        server,
-                        entity_index,
-                        workspace_root,
-                        &mut scoped_documents,
-                        &rel_path,
-                        &uri,
-                        line,
-                        col,
-                        member_col,
-                        &member_name,
-                    )
-                    .await
+                    // Value receivers keep their edges. `res` in `res.send(...)`
+                    // resolves to its own parameter in this file and says something
+                    // true about the enclosing function. The two are told apart by
+                    // where the server puts the receiver's definition, which is the
+                    // server answering rather than this code guessing.
+                    if let Some((_receiver, member_col, member_name)) =
+                        crate::enrichment::member_expression_at(line_text, col)
                     {
-                        if source.id == candidate.id
-                            || !seen.insert((source.id, candidate.id, "member_on_module"))
-                        {
+                        let receiver_definitions = crate::enrichment::locations_at(
+                            server,
+                            "textDocument/definition",
+                            &uri,
+                            line,
+                            col,
+                        )
+                        .await?;
+                        if crate::enrichment::receiver_names_a_module(
+                            &receiver_definitions,
+                            &rel_path,
+                        ) {
+                            // Declining alone was not enough, and assuming otherwise is
+                            // what left a named export unreferenced. This pass used to
+                            // drop the receiver here reasoning that "the member's own
+                            // position is queried by this same loop on its next turn".
+                            // It is queried, and on express it answers
+                            // `node_modules/router`, outside the ingested tree, so
+                            // `find_at` finds nothing and no edge is minted. Removing
+                            // the wrong edge left nothing in its place, and the
+                            // reference surface reads this arm's `References` edges, so
+                            // `exports.Router` stayed at zero counted references against
+                            // 32 real call sites.
+                            //
+                            // The same equivalence join the UsesType arm uses supplies
+                            // the right edge: two independently proven server answers
+                            // naming the same place, never a name match.
+                            for candidate in crate::enrichment::member_export_bindings(
+                                server,
+                                entity_index,
+                                workspace_root,
+                                &mut scoped_documents,
+                                &rel_path,
+                                &uri,
+                                line,
+                                col,
+                                member_col,
+                                &member_name,
+                            )
+                            .await?
+                            {
+                                if source.id == candidate.id
+                                    || !seen.insert((source.id, candidate.id, "member_on_module"))
+                                {
+                                    continue;
+                                }
+                                definitions_resolved += 1;
+                                relations.push(Relation {
+                                    id: deterministic_relation_id(
+                                        RelationKind::References,
+                                        source.id,
+                                        candidate.id,
+                                    ),
+                                    kind: RelationKind::References,
+                                    src: GraphNodeId::Entity(source.id),
+                                    dst: GraphNodeId::Entity(candidate.id),
+                                    confidence: 0.85,
+                                    origin: RelationOrigin::Lsp,
+                                    created_in: None,
+                                    import_source: None,
+                                    evidence: crate::enrichment::query_position_evidence(
+                                        "lsp_member_on_module",
+                                        &rel_path,
+                                        &protocol::Range {
+                                            start: protocol::Position {
+                                                line,
+                                                character: member_col,
+                                            },
+                                            end: protocol::Position {
+                                                line,
+                                                character: member_col,
+                                            },
+                                        },
+                                    ),
+                                });
+                                tracing::debug!(
+                                    entity = %source.name,
+                                    member = %member_name,
+                                    references = %candidate.name,
+                                    "bound a member on a module receiver to its export"
+                                );
+                            }
+                            // The receiver's own resolution is still not this entity's
+                            // fact, whether or not the member bound to anything.
                             continue;
                         }
-                        definitions_resolved += 1;
-                        relations.push(Relation {
-                            id: deterministic_relation_id(
-                                RelationKind::References,
-                                source.id,
-                                candidate.id,
-                            ),
-                            kind: RelationKind::References,
-                            src: GraphNodeId::Entity(source.id),
-                            dst: GraphNodeId::Entity(candidate.id),
-                            confidence: 0.85,
-                            origin: RelationOrigin::Lsp,
-                            created_in: None,
-                            import_source: None,
-                            evidence: crate::enrichment::query_position_evidence(
-                                "lsp_member_on_module",
-                                &rel_path,
-                                &protocol::Range {
-                                    start: protocol::Position {
-                                        line,
-                                        character: member_col,
-                                    },
-                                    end: protocol::Position {
-                                        line,
-                                        character: member_col,
-                                    },
+                    }
+
+                    let def_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        server.client.request(
+                            "textDocument/definition",
+                            protocol::TextDocumentPositionParams {
+                                text_document: protocol::TextDocumentIdentifier {
+                                    uri: uri.clone(),
                                 },
-                            ),
-                        });
-                        tracing::debug!(
-                            entity = %source.name,
-                            member = %member_name,
-                            references = %candidate.name,
-                            "bound a member on a module receiver to its export"
-                        );
-                    }
-                    // The receiver's own resolution is still not this entity's
-                    // fact, whether or not the member bound to anything.
-                    continue;
-                }
-            }
-
-            let def_result = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                server.client.request(
-                    "textDocument/definition",
-                    protocol::TextDocumentPositionParams {
-                        text_document: protocol::TextDocumentIdentifier { uri: uri.clone() },
-                        position: protocol::Position {
-                            line,
-                            character: col,
-                        },
-                    },
-                ),
-            )
-            .await;
-
-            if let Ok(Ok(value)) = def_result {
-                let locations: Vec<protocol::Location> =
-                    serde_json::from_value::<Vec<protocol::Location>>(value.clone())
-                        .unwrap_or_else(|_| {
-                            serde_json::from_value::<protocol::Location>(value)
-                                .map(|l| vec![l])
-                                .unwrap_or_default()
-                        });
-
-                for location in &locations {
-                    let target_line = location.range.start.line;
-                    let target_uri = &location.uri;
-                    let Some(dst) = entity_index.find_at(target_uri, target_line) else {
-                        continue;
-                    };
-
-                    if source.id == dst.id {
-                        continue;
-                    }
-
-                    definitions_resolved += 1;
-
-                    let kind_str = if target_uri.contains(&rel_path) {
-                        "same_file"
-                    } else {
-                        "cross_file"
-                    };
-
-                    if !seen.insert((source.id, dst.id, kind_str)) {
-                        continue;
-                    }
-
-                    relations.push(Relation {
-                        id: deterministic_relation_id(RelationKind::References, source.id, dst.id),
-                        kind: RelationKind::References,
-                        src: GraphNodeId::Entity(source.id),
-                        dst: GraphNodeId::Entity(dst.id),
-                        confidence: 0.95,
-                        origin: RelationOrigin::Lsp,
-                        created_in: None,
-                        import_source: None,
-                        // The identifier position this pass ASKED about, which
-                        // is the reference site in the source file: for
-                        // `adapter.send(...)` inside `Session.send` that is the
-                        // call line itself. Enrichment relations carried no
-                        // evidence at all, so every edge a language server
-                        // proved arrived with no reference site and consuming
-                        // surfaces reported `no_evidence_span` for it. The
-                        // position is already in hand, so this costs no extra
-                        // round trip.
-                        evidence: crate::enrichment::query_position_evidence(
-                            "lsp_definition",
-                            &rel_path,
-                            &protocol::Range {
-                                start: protocol::Position {
-                                    line,
-                                    character: col,
-                                },
-                                end: protocol::Position {
+                                position: protocol::Position {
                                     line,
                                     character: col,
                                 },
                             },
                         ),
-                    });
+                    )
+                    .await;
+
+                    let value = def_result.map_err(|_| LspError::Timeout)??;
+                    let locations = crate::enrichment::decode_locations(value)?;
+                    {
+                        for location in &locations {
+                            let target_line = location.range.start.line;
+                            let target_uri = &location.uri;
+                            let Some(dst) = entity_index.find_at(target_uri, target_line) else {
+                                continue;
+                            };
+
+                            if source.id == dst.id {
+                                continue;
+                            }
+
+                            definitions_resolved += 1;
+
+                            let kind_str = if target_uri.contains(&rel_path) {
+                                "same_file"
+                            } else {
+                                "cross_file"
+                            };
+
+                            if !seen.insert((source.id, dst.id, kind_str)) {
+                                continue;
+                            }
+
+                            relations.push(Relation {
+                                id: deterministic_relation_id(
+                                    RelationKind::References,
+                                    source.id,
+                                    dst.id,
+                                ),
+                                kind: RelationKind::References,
+                                src: GraphNodeId::Entity(source.id),
+                                dst: GraphNodeId::Entity(dst.id),
+                                confidence: 0.95,
+                                origin: RelationOrigin::Lsp,
+                                created_in: None,
+                                import_source: None,
+                                // The identifier position this pass ASKED about, which
+                                // is the reference site in the source file: for
+                                // `adapter.send(...)` inside `Session.send` that is the
+                                // call line itself. Enrichment relations carried no
+                                // evidence at all, so every edge a language server
+                                // proved arrived with no reference site and consuming
+                                // surfaces reported `no_evidence_span` for it. The
+                                // position is already in hand, so this costs no extra
+                                // round trip.
+                                evidence: crate::enrichment::query_position_evidence(
+                                    "lsp_definition",
+                                    &rel_path,
+                                    &protocol::Range {
+                                        start: protocol::Position {
+                                            line,
+                                            character: col,
+                                        },
+                                        end: protocol::Position {
+                                            line,
+                                            character: col,
+                                        },
+                                    },
+                                ),
+                            });
+                        }
+                    }
                 }
             }
         }
-    }
 
-    // Add entity-level call hierarchy for every entity in this file. The
-    // daemon already performs a per-entity pass, so we keep the relation IDs
-    // deterministic to make repeated discovery idempotent.
-    if server.has_call_hierarchy() {
-        for entity in entity_index.entities_in_file(&rel_path) {
-            let call_relations =
-                enrich_entity_calls(server, entity, entity_index, workspace_root).await?;
-            relations.extend(call_relations);
+        // Add entity-level call hierarchy for every entity in this file. The
+        // daemon already performs a per-entity pass, so we keep the relation IDs
+        // deterministic to make repeated discovery idempotent.
+        if server.has_call_hierarchy() {
+            for entity in entity_index.entities_in_file(&rel_path) {
+                let call_relations =
+                    enrich_entity_calls(server, entity, entity_index, workspace_root).await?;
+                relations.extend(call_relations);
+            }
         }
+
+        Ok(FileEnrichmentResult {
+            relations,
+            definitions_resolved,
+            positions_queried,
+        })
     }
-
-    scoped_documents.close_all().await;
-
-    Ok(FileEnrichmentResult {
-        relations,
-        definitions_resolved,
-        positions_queried,
-    })
+    .await;
+    let closed = scoped_documents.close_all().await;
+    match result {
+        Ok(answer) => {
+            closed?;
+            Ok(answer)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
