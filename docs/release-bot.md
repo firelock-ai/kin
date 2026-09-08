@@ -53,20 +53,22 @@ or updates one automation-owned PR.
 
 The SemVer bump is resolved only from `Kin-Release-Intent:` git trailers on the
 first-parent commits between the prior stable tag and `main`. Patch is the
-default, and the highest intent found in the range wins. Write the trailer as
-the last block of the pull-request body, adjacent to the actual author sign-off:
+default, and the highest intent found in the range wins. Ordinary patch changes
+can omit the optional intent line. For an explicit intent, the final commit must
+keep it in the same trailer block as any sign-off:
 
 ```
 Kin-Release-Intent: minor
 Signed-off-by: Author Name <author@example.com>
 ```
 
-Use the same sign-off as the signed commits. If the body omits it, GitHub can
-append the sign-off below a divider when squashing, leaving the intent outside
-the parsed trailer block. Keep both lines together with no divider or blank
-line between them. Check the final squash with `git show -s --format=%B <sha> |
-git interpret-trailers --parse`; both trailers must appear. A misplaced intent
-on an immutable commit requires the explicit SHA attestation below.
+Placing both lines together in the pull-request body does not guarantee that
+the merge path preserves that block. A separately appended sign-off, after a
+blank line or divider, leaves the earlier intent outside the parsed footer even
+if the body already contains a sign-off. Check the actual final squash with
+`git show -s --format=%B <sha> | git interpret-trailers --parse`; an explicit
+intent must appear there. A misplaced intent on an immutable commit requires
+the explicit SHA attestation below. Do not infer success from the body preview.
 
 Because the repository merges by squash with the pull-request body as the
 commit message, that line becomes part of the immutable commit on `main`. The
