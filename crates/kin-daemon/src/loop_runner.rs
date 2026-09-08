@@ -478,6 +478,10 @@ pub(crate) fn publish_exact_workspace_tree(
     state: &DaemonState,
     admitted: &crate::repository_commit::AdmittedWorkspaceTree,
 ) -> Result<Option<u64>> {
+    crate::semantic_debt::record_before_standalone_publication(
+        state,
+        &crate::semantic_debt::owed_by(&admitted.exact_deltas()?),
+    )?;
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
     let started = Instant::now();
@@ -1036,10 +1040,6 @@ fn exact_tree_admission(
             );
             return Ok(ExactTreeAdmission::yielded(policy));
         } else {
-            crate::semantic_debt::record_before_standalone_publication(
-                state,
-                &crate::semantic_debt::owed_by(&deltas),
-            )?;
             // The phase stays on the standalone path, which is the path that
             // still spends it. A deferring caller reports its own publication
             // instead, so a collapsed commit names no admission publication at
@@ -9546,12 +9546,20 @@ pub(crate) async fn sync_filesystem_with_graph_deferring_tree_publication(
 /// that makes a parse durable and a crash before one would otherwise clear the
 /// record for work nothing carried.
 pub(crate) async fn drain_semantic_debt(state: &DaemonState) -> Result<()> {
+    drain_semantic_debt_inner(state, false).await
+}
+
+async fn drain_semantic_debt_inner(state: &DaemonState, retain_spent: bool) -> Result<()> {
     let recorded = crate::semantic_debt::outstanding(state);
     if recorded.is_empty() {
         return Ok(());
     }
     let (owed, spent) = crate::semantic_debt::partition_against_tree(state, &recorded);
-    crate::semantic_debt::settle(state, &spent);
+    // A deferred tree has not displaced authority yet. Its older body may
+    // still be owed after publication refuses and the derived tree resets.
+    if !retain_spent {
+        crate::semantic_debt::settle(state, &spent);
+    }
     if owed.is_empty() {
         return Ok(());
     }
@@ -10106,7 +10114,7 @@ async fn sync_filesystem_with_graph_publishing_inner(
     // settles the whole record once its transaction reaches authority. Draining
     // only on the empty path would let one unrelated edit clear a debt nothing
     // had paid.
-    if let Err(error) = drain_semantic_debt(state).await {
+    if let Err(error) = drain_semantic_debt_inner(state, deferred_out.is_some()).await {
         drop(graph_mutation);
         return Err(error);
     }

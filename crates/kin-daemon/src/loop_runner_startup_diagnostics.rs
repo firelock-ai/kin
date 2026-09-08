@@ -308,27 +308,6 @@ async fn startup_diagnostic_full_loop_must_not_certify_the_missing_function() {
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // A distinct later event proves this real loop processes work after
-        // all startup planners have run; it does not modify the stranded file.
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            std::fs::write(
-                repo.path().join("sentinel.py"),
-                format!("def sentinel_ready():\n    return {attempt}\n"),
-            )
-            .unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if state
-                .graph
-                .query_entities(&EntityFilter::default())
-                .unwrap()
-                .iter()
-                .any(|entity| entity.name == "sentinel_ready")
-            {
-                break;
-            }
-        }
     })
     .await;
     startup_diagnostic_trace("full_loop_before_cancellation", &state);
@@ -363,7 +342,7 @@ async fn startup_diagnostic_full_loop_must_not_certify_the_missing_function() {
             || answer["file_coverage"]["certifies_enumeration"] != serde_json::json!(true),
         "the full startup loop must not certify an empty enumeration for a known admitted function"
     );
-    completed.expect("the full loop must recover orphan and process the later sentinel event");
+    completed.expect("the full loop must recover the known function from its startup queue");
     assert!(answer["entities"]
         .as_array()
         .unwrap()
@@ -527,6 +506,17 @@ fn startup_diagnostic_prepublication_keeps_current_and_proposed_bodies() {
         body: "0".repeat(64),
     };
     assert_ne!(old.body, proposed.body);
+    let concurrent = crate::semantic_debt::SemanticDebt {
+        path: "orphan.py".into(),
+        body: "2".repeat(64),
+    };
+    let mut outstanding = crate::semantic_debt::outstanding(&state);
+    outstanding.push(concurrent.clone());
+    std::fs::write(
+        state.layout.root().join("semantic-debt.json"),
+        serde_json::to_vec(&outstanding).unwrap(),
+    )
+    .unwrap();
     let generation = authority_generation(&state);
     crate::semantic_debt::record_before_standalone_publication(
         &state,
@@ -540,7 +530,11 @@ fn startup_diagnostic_prepublication_keeps_current_and_proposed_bodies() {
     );
     assert!(recorded.contains(&proposed));
     assert!(recorded.contains(&unrelated));
-    assert_eq!(recorded.len(), 3);
+    assert!(
+        recorded.contains(&concurrent),
+        "prepublication must retain a body a concurrent publication could make authoritative"
+    );
+    assert_eq!(recorded.len(), 4);
     assert_eq!(authority_generation(&state), generation);
     crate::semantic_debt::record_before_standalone_publication(
         &state,
@@ -619,4 +613,429 @@ fn startup_diagnostic_deferred_admission_keeps_recovery_with_its_caller() {
         crate::semantic_debt::outstanding(&state).is_empty(),
         "a caller-owned transaction must not create standalone recovery debt before it publishes"
     );
+}
+
+async fn startup_diagnostic_commit(state: &Arc<DaemonState>) -> (axum::http::StatusCode, String) {
+    let request = axum::http::Request::post("/commands/commit")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "operation_id": kin_model::OperationId::new(),
+                "timestamp": kin_model::Timestamp::now(),
+                "author": "Test Author <test@example.invalid>",
+                "message": "record the source change",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(crate::api::router(Arc::clone(state)), request)
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+fn startup_diagnostic_orphan(state: &DaemonState) -> kin_model::Entity {
+    state
+        .graph
+        .query_entities(&EntityFilter::default())
+        .unwrap()
+        .into_iter()
+        .find(|entity| entity.name == "orphan" && entity.kind == kin_model::EntityKind::Function)
+        .expect("the fixture must contain the function, not only its module")
+}
+
+async fn startup_diagnostic_committed_orphan(repo: &tempfile::TempDir) -> Arc<DaemonState> {
+    let state = open_test_state(repo);
+    std::fs::write(
+        repo.path().join("orphan.py"),
+        b"def orphan():\n    return 7\n",
+    )
+    .unwrap();
+    let (status, body) = startup_diagnostic_commit(&state).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert!(crate::semantic_debt::outstanding(&state).is_empty());
+    state
+}
+
+fn startup_diagnostic_lease_orphan(state: &DaemonState) {
+    let entity = startup_diagnostic_orphan(state);
+    let session = state
+        .coordinator
+        .register_session(
+            "test",
+            "lease owner",
+            kin_model::SessionTransport::Mcp,
+            None,
+            state.layout.working_dir().to_path_buf(),
+            kin_model::SessionCapabilities {
+                can_write: true,
+                can_commit: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        state
+            .coordinator
+            .register_intent(
+                &session,
+                vec![kin_model::session::IntentScope::Entity(entity.id)],
+                kin_model::session::LockType::Hard,
+                "protected function",
+                None,
+            )
+            .unwrap(),
+        crate::session_registry::IntentRegistrationResult::Registered { .. }
+    ));
+}
+
+#[tokio::test]
+#[serial_test::serial(commit_phase_capture)]
+async fn startup_diagnostic_refused_commit_retains_fallback_debt_and_recovers_after_reopen() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = startup_diagnostic_committed_orphan(&repo).await;
+    let original_line = startup_diagnostic_orphan(&state).span.unwrap().start_line;
+    let original_changes = state.graph.to_snapshot().changes.len();
+    let generation = authority_generation(&state);
+    startup_diagnostic_lease_orphan(&state);
+    std::fs::write(
+        repo.path().join("orphan.py"),
+        format!("{}def orphan():\n    return 8\n", "\n".repeat(17)),
+    )
+    .unwrap();
+    let (status, refusal) = startup_diagnostic_commit(&state).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refusal}");
+    assert!(refusal.contains("semantics_behind_tree"), "{refusal}");
+    assert_eq!(
+        authority_generation(&state),
+        generation + 1,
+        "the fallback must actually publish"
+    );
+    assert_eq!(state.graph.resolved_tree(), authority_tree(&state));
+    assert_eq!(
+        state.graph.to_snapshot().changes.len(),
+        original_changes,
+        "the refused commit must not create a semantic change"
+    );
+    let body = state
+        .graph
+        .get_tree_entry(&FilePathId::new("orphan.py"))
+        .unwrap()
+        .unwrap()
+        .blob_identity()
+        .unwrap()
+        .to_string();
+    let layout = state.layout.clone();
+    drop(state);
+    let restarted = Arc::new(DaemonState::open(layout).unwrap());
+    let before = startup_diagnostic_orphan(&restarted)
+        .span
+        .unwrap()
+        .start_line;
+    assert_eq!(before, original_line, "the derived parse was not committed");
+    drain_semantic_debt(&restarted).await.unwrap();
+    let after = startup_diagnostic_orphan(&restarted)
+        .span
+        .unwrap()
+        .start_line;
+    let recorded = crate::semantic_debt::outstanding(&restarted);
+    let owes_exact_body = recorded
+        .iter()
+        .any(|entry| entry.path == "orphan.py" && entry.body == body);
+    println!(
+        "STARTUP_FALLBACK {}",
+        serde_json::json!({"before": before, "after": after, "expected": original_line + 17, "debt": recorded})
+    );
+    assert_eq!(
+        (owes_exact_body, after),
+        (true, original_line + 17),
+        "a successful fallback must retain and recover its exact uncommitted parse"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(commit_phase_capture)]
+async fn startup_diagnostic_refused_commit_resets_when_fallback_debt_cannot_be_written() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = startup_diagnostic_committed_orphan(&repo).await;
+    let previous = authority_tree(&state);
+    let generation = authority_generation(&state);
+    startup_diagnostic_lease_orphan(&state);
+    let content = b"\n\ndef orphan():\n    return 8\n";
+    std::fs::write(repo.path().join("orphan.py"), content).unwrap();
+    let marker = state.layout.root().join("semantic-debt.json");
+    std::fs::create_dir(&marker).unwrap();
+    let (status, refusal) = startup_diagnostic_commit(&state).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refusal}");
+    assert!(refusal.contains("semantics_behind_tree"), "{refusal}");
+    assert_eq!(
+        authority_generation(&state),
+        generation,
+        "unrecorded fallback bytes must not reach authority"
+    );
+    assert_eq!(authority_tree(&state), previous);
+    assert_eq!(
+        state.graph.resolved_tree(),
+        previous,
+        "the refused fallback must reset the derived tree"
+    );
+    assert!(marker.is_dir());
+    assert_eq!(
+        std::fs::read(repo.path().join("orphan.py")).unwrap(),
+        content
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(commit_phase_capture)]
+async fn startup_diagnostic_deferred_drain_keeps_the_previous_authority_body_owed() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = startup_diagnostic_committed_orphan(&repo).await;
+    std::fs::write(
+        repo.path().join("orphan.py"),
+        b"\ndef orphan():\n    return 8\n",
+    )
+    .unwrap();
+    exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+    let previous = authority_tree(&state);
+    let old = crate::semantic_debt::outstanding(&state)
+        .into_iter()
+        .find(|entry| entry.path == "orphan.py")
+        .unwrap();
+    std::fs::write(
+        repo.path().join("orphan.py"),
+        b"\n\ndef orphan():\n    return 9\n",
+    )
+    .unwrap();
+    let deferred = sync_filesystem_with_graph_deferring_tree_publication(&state)
+        .await
+        .unwrap();
+    assert!(deferred.is_some());
+    assert_eq!(authority_tree(&state), previous);
+    assert_ne!(state.graph.resolved_tree(), previous);
+    assert!(
+        crate::semantic_debt::outstanding(&state).contains(&old),
+        "a deferred drain must not retire the body authority still owes"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(commit_phase_capture)]
+async fn startup_diagnostic_refused_publication_retains_both_bodies() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = startup_diagnostic_committed_orphan(&repo).await;
+    std::fs::write(
+        repo.path().join("orphan.py"),
+        b"\ndef orphan():\n    return 8\n",
+    )
+    .unwrap();
+    exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+    let previous = authority_tree(&state);
+    let generation = authority_generation(&state);
+    let old = crate::semantic_debt::outstanding(&state)
+        .into_iter()
+        .find(|e| e.path == "orphan.py")
+        .unwrap();
+    std::fs::write(
+        repo.path().join("orphan.py"),
+        b"\n\ndef orphan():\n    return 9\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join("secret.py"),
+        br#"def connect():
+    password = "s3cret-notekeeper-value"
+    return password
+"#,
+    )
+    .unwrap();
+    let deferred = sync_filesystem_with_graph_deferring_tree_publication(&state)
+        .await
+        .unwrap()
+        .unwrap();
+    let proposed = crate::semantic_debt::SemanticDebt {
+        path: "orphan.py".into(),
+        body: state
+            .graph
+            .get_tree_entry(&FilePathId::new("orphan.py"))
+            .unwrap()
+            .unwrap()
+            .blob_identity()
+            .unwrap()
+            .to_string(),
+    };
+    assert_ne!(old, proposed);
+    let error = publish_exact_workspace_tree(&state, &deferred).unwrap_err();
+    assert!(
+        error.to_string().contains("CredentialAssignment"),
+        "{error}"
+    );
+    publish_deferred_tree_after_failure(&state, &deferred);
+    assert_eq!(authority_generation(&state), generation);
+    assert_eq!(authority_tree(&state), previous);
+    assert_eq!(state.graph.resolved_tree(), previous);
+    let recorded = crate::semantic_debt::outstanding(&state);
+    assert!(
+        recorded.contains(&old) && recorded.contains(&proposed),
+        "a refused publication retains both authority and proposed debt: {recorded:?}"
+    );
+    let error = drain_semantic_debt(&state)
+        .await
+        .expect_err("the host still holds the refused proposal, so re-admission must wait");
+    assert!(matches!(error, DaemonError::SemanticReadmissionFailed(_)));
+    let remaining = crate::semantic_debt::outstanding(&state);
+    assert!(remaining.contains(&old));
+    assert!(!remaining.contains(&proposed));
+}
+
+#[tokio::test]
+#[serial_test::serial(commit_phase_capture)]
+async fn startup_diagnostic_deferred_drain_still_repairs_unrelated_owed_paths() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = startup_diagnostic_committed_orphan(&repo).await;
+    let original_line = startup_diagnostic_orphan(&state).span.unwrap().start_line;
+    std::fs::write(
+        repo.path().join("orphan.py"),
+        b"\n\ndef orphan():\n    return 8\n",
+    )
+    .unwrap();
+    exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+    assert_eq!(
+        startup_diagnostic_orphan(&state).span.unwrap().start_line,
+        original_line
+    );
+    std::fs::write(
+        repo.path().join("target.py"),
+        b"def target():\n    return 1\n",
+    )
+    .unwrap();
+    let deferred = sync_filesystem_with_graph_deferring_tree_publication(&state)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        startup_diagnostic_orphan(&state).span.unwrap().start_line,
+        original_line + 2,
+        "a deferral must still drain unrelated owed paths"
+    );
+    publish_deferred_tree_after_failure(&state, &deferred);
+}
+
+async fn startup_diagnostic_purge(state: &Arc<DaemonState>) -> (axum::http::StatusCode, String) {
+    use tower::ServiceExt;
+    let response = crate::api::router(Arc::clone(state))
+        .oneshot(
+            axum::http::Request::post("/commands/purge-ignored")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "confirm": true,
+                        "confirm_mass_deletion": true,
+                        "operation_id": kin_model::OperationId::new(),
+                        "actor": "test",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+async fn startup_diagnostic_purge_fixture(repo: &tempfile::TempDir) -> Arc<DaemonState> {
+    let state = startup_diagnostic_committed_orphan(repo).await;
+    std::fs::write(
+        repo.path().join("retired.py"),
+        b"def retired():\n    return 1\n",
+    )
+    .unwrap();
+    let (status, body) = startup_diagnostic_commit(&state).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert!(crate::semantic_debt::outstanding(&state).is_empty());
+    std::fs::write(repo.path().join(".kinignore"), b"retired.py\n").unwrap();
+    std::fs::write(
+        repo.path().join("orphan.py"),
+        format!("{}def orphan():\n    return 8\n", "\n".repeat(17)),
+    )
+    .unwrap();
+    state
+}
+
+#[tokio::test]
+#[serial_test::serial(commit_phase_capture)]
+async fn startup_diagnostic_purge_records_changed_body_for_reopen() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = startup_diagnostic_purge_fixture(&repo).await;
+    let original_line = startup_diagnostic_orphan(&state).span.unwrap().start_line;
+    let generation = authority_generation(&state);
+    let (status, body) = startup_diagnostic_purge(&state).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(response["mutated"], serde_json::json!(true));
+    assert_eq!(authority_generation(&state), generation + 1);
+    assert!(authority_tree(&state)
+        .artifact_at_path(&test_repo_path("retired.py"))
+        .is_none());
+    let hash = state
+        .graph
+        .get_tree_entry(&FilePathId::new("orphan.py"))
+        .unwrap()
+        .unwrap()
+        .blob_identity()
+        .unwrap()
+        .to_string();
+    let layout = state.layout.clone();
+    drop(state);
+    let reopened = Arc::new(DaemonState::open(layout).unwrap());
+    assert_eq!(
+        startup_diagnostic_orphan(&reopened)
+            .span
+            .unwrap()
+            .start_line,
+        original_line
+    );
+    drain_semantic_debt(&reopened).await.unwrap();
+    let owed = crate::semantic_debt::outstanding(&reopened)
+        .iter()
+        .any(|entry| entry.path == "orphan.py" && entry.body == hash);
+    let after = startup_diagnostic_orphan(&reopened)
+        .span
+        .unwrap()
+        .start_line;
+    assert_eq!(
+        (owed, after),
+        (true, original_line + 17),
+        "purge must retain and recover the changed body its complete observation published"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(commit_phase_capture)]
+async fn startup_diagnostic_purge_refuses_unrecorded_changed_body() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = startup_diagnostic_purge_fixture(&repo).await;
+    let previous = authority_tree(&state);
+    let generation = authority_generation(&state);
+    let marker = state.layout.root().join("semantic-debt.json");
+    assert!(!marker.exists());
+    std::fs::create_dir(&marker).unwrap();
+    let (status, body) = startup_diagnostic_purge(&state).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        authority_generation(&state),
+        generation,
+        "purge cannot publish a changed body without durable recovery debt"
+    );
+    assert_eq!(authority_tree(&state), previous);
+    assert_eq!(state.graph.resolved_tree(), previous);
+    assert!(marker.is_dir());
 }

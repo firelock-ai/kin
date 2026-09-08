@@ -126,7 +126,9 @@ pub(crate) fn record(state: &DaemonState, owed: &[SemanticDebt]) {
 ///
 /// The current body remains owed until authority moves. Keep it beside the
 /// proposed body so a refused or interrupted publication cannot erase an
-/// earlier unpaid parse. Other paths retain their existing records.
+/// earlier unpaid parse. Do not retire any identity here: another publisher
+/// can move authority between this write and the publication compare-and-swap.
+/// The next drain or a successful semantic commit settles obsolete records.
 pub(crate) fn record_before_standalone_publication(
     state: &DaemonState,
     owed: &[SemanticDebt],
@@ -141,10 +143,6 @@ pub(crate) fn record_before_standalone_publication(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(error),
     };
-    let (_, spent) = partition_against_tree(state, &entries);
-    entries.retain(|entry| {
-        !owed.iter().any(|fresh| fresh.path == entry.path) || !spent.contains(entry)
-    });
     for entry in owed {
         if !entries.contains(entry) {
             entries.push(entry.clone());
