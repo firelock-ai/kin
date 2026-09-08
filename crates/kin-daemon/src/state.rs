@@ -13050,6 +13050,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "vector")]
     #[test]
     fn hosted_graph_commit_rebinds_vectors_to_the_exact_successor_snapshot_cursor() {
         let working = tempfile::tempdir().unwrap();
