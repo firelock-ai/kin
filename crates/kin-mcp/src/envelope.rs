@@ -2844,8 +2844,7 @@ fn annotate_block(
     };
     let mut annotated = annotated;
     apply_response_budget(&mut annotated, tool_name, budget);
-    let rendered =
-        serde_json::to_string_pretty(&annotated).unwrap_or_else(|_| annotated.to_string());
+    let rendered = crate::budget::render(&annotated).unwrap_or_else(|_| annotated.to_string());
     ContentBlock::Text { text: rendered }
 }
 
@@ -3012,7 +3011,7 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
 }
 
 /// Write `_kin.response` until its `chars_after_budget` field equals the exact
-/// pretty-serialized size of the object that contains it.
+/// serialized size of the object that contains it.
 fn settle_response_accounting(
     annotated: &mut Value,
     accounting: &mut crate::budget::BudgetAccounting,
@@ -4648,6 +4647,521 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("edge_coverage:unreported")));
+    }
+
+    fn conservative_reference_fixture() -> Value {
+        let mut payload: Value = serde_json::from_str(r#"{
+  "caller_arrival": {
+    "family_files": 3,
+    "family_measured": 3,
+    "state": "unaccounted",
+    "unaccounted_file_count": 3,
+    "unaccounted_files": [
+      {
+        "file": "packages/react-dom-bindings/src/client/ReactDOMInput.js",
+        "parsed_call_sites": 55,
+        "resolved_call_edges": 46,
+        "shortfall_is_floor": false,
+        "unaccounted_call_sites": 9
+      },
+      {
+        "file": "packages/react-dom-bindings/src/client/ReactDOMSelect.js",
+        "parsed_call_sites": 21,
+        "resolved_call_edges": 16,
+        "shortfall_is_floor": false,
+        "unaccounted_call_sites": 5
+      },
+      {
+        "file": "packages/react-dom-bindings/src/client/ReactDOMTextarea.js",
+        "parsed_call_sites": 15,
+        "resolved_call_edges": 13,
+        "shortfall_is_floor": false,
+        "unaccounted_call_sites": 2
+      }
+    ],
+    "unaccounted_files_truncated": false,
+    "unmeasured_reason": null
+  },
+  "candidates": [],
+  "counts": {
+    "counted": "referencing_entities",
+    "files": 3,
+    "known_reference_sites": 23,
+    "receiver_name_candidates": 0,
+    "reference_sites": 23,
+    "reference_sites_complete": true,
+    "referencing_entities": 11,
+    "upstream_including_unconfirmed": 11
+  },
+  "cross_repo": {
+    "code": "spine_root_stale",
+    "reason": "spine root mismatch for repository 8b3c2487-ed31-4fa8-bed9-c92187a823b7: live/session graph root 672f96cfa6a841c30019a72f9bc82b596a3479d35d330019329ee1529898dadf has advanced past the registered spine root 630b6617a21510112c14e068f87b97492e2b6b33c37988cd5b33268066a0b71a, so cross-repo authority is stale for other repositories and says nothing about references inside this one",
+    "status": "unavailable"
+  },
+  "degradations": [
+    {
+      "attempt_number": 1,
+      "component": "graph_authority",
+      "detail": "a graph-authority write landed while this answer was being read, so the read was abandoned and retried; the answer served here is the second attempt and was confirmed current before it was returned. Every row in it is settled. What it also says is that this store was being written while it was queried, so an absence measured here is an absence measured under contention.",
+      "reason": "retry"
+    }
+  ],
+  "edge_coverage": {
+    "budget_exhausted": false,
+    "classes": {
+      "calls": "present",
+      "imports": "present",
+      "references": "present"
+    },
+    "cross_file_classes": [
+      "calls",
+      "imports",
+      "references"
+    ],
+    "entities_examined": 8,
+    "language": "JavaScript",
+    "limits": [
+      "absence_gate:inconclusive",
+      "cross_repo:inconclusive",
+      "degradations:inconclusive"
+    ],
+    "reference_enrichment": "available",
+    "requested_classes": [
+      "calls",
+      "imports",
+      "references"
+    ],
+    "scan": "ran",
+    "scope": "language",
+    "unproduced_evidence": null,
+    "witnessed_by_answer": [
+      "calls",
+      "imports"
+    ]
+  },
+  "focal_entity": {
+    "file_path": "packages/react-dom-bindings/src/client/ToStringValue.js",
+    "id": "8052d132-596d-4f63-9613-77f5e8f67a44",
+    "kind": "function",
+    "name": "getToStringValue",
+    "signature": "function getToStringValue(value: mixed): ToStringValue"
+  },
+  "focal_resolution": {
+    "addressed_by": "name",
+    "matched": "query_name_pattern",
+    "other_candidates": [],
+    "same_name_candidates": 1
+  },
+  "relation_kinds": [
+    "calls",
+    "imports",
+    "references"
+  ],
+  "total_upstream": 11,
+  "unconfirmed_candidates": 0
+}"#).unwrap();
+        let rows: &[(&str, &str, u64, &[u64], bool)] = &[
+            (
+                "ReactDOMInput",
+                "packages/react-dom-bindings/src/client/ReactDOMInput.js",
+                1,
+                &[14],
+                true,
+            ),
+            (
+                "ReactDOMSelect",
+                "packages/react-dom-bindings/src/client/ReactDOMSelect.js",
+                1,
+                &[13],
+                true,
+            ),
+            (
+                "ReactDOMTextarea",
+                "packages/react-dom-bindings/src/client/ReactDOMTextarea.js",
+                1,
+                &[13],
+                true,
+            ),
+            (
+                "hydrateInput",
+                "packages/react-dom-bindings/src/client/ReactDOMInput.js",
+                363,
+                &[373, 375],
+                false,
+            ),
+            (
+                "initInput",
+                "packages/react-dom-bindings/src/client/ReactDOMInput.js",
+                222,
+                &[258, 260, 277, 278],
+                false,
+            ),
+            (
+                "updateInput",
+                "packages/react-dom-bindings/src/client/ReactDOMInput.js",
+                88,
+                &[133, 135, 136, 149, 170, 172, 175, 216],
+                false,
+            ),
+            (
+                "hydrateSelect",
+                "packages/react-dom-bindings/src/client/ReactDOMSelect.js",
+                161,
+                &[194],
+                false,
+            ),
+            (
+                "updateOptions",
+                "packages/react-dom-bindings/src/client/ReactDOMSelect.js",
+                63,
+                &[90],
+                false,
+            ),
+            (
+                "hydrateTextarea",
+                "packages/react-dom-bindings/src/client/ReactDOMTextarea.js",
+                152,
+                &[168],
+                false,
+            ),
+            (
+                "initTextarea",
+                "packages/react-dom-bindings/src/client/ReactDOMTextarea.js",
+                93,
+                &[130],
+                false,
+            ),
+            (
+                "updateTextarea",
+                "packages/react-dom-bindings/src/client/ReactDOMTextarea.js",
+                64,
+                &[73, 87],
+                false,
+            ),
+        ];
+        payload["references"] = rows
+            .iter()
+            .enumerate()
+            .map(|(index, (name, file, start, lines, import))| {
+                json!({
+                    "entity_id": format!("00000000-0000-4000-8000-{index:012}"),
+                    "file_path": file, "kind": if *import { "Module" } else { "Function" },
+                    "name": name, "reference_line_count": lines.len(), "reference_lines": lines,
+                    "reference_lines_absent_reason": null, "reference_lines_partial_reason": null,
+                    "relation_kinds": [if *import { "imports" } else { "calls" }],
+                    "resolution": "type_resolved", "role": "source", "start_line": start,
+                    "via_override_of": null,
+                })
+            })
+            .collect();
+        payload
+    }
+
+    // A separate synthetic row shape under the same conservative authority
+    // conditions. The full row shape above still needs suffix elisions.
+    fn concise_reference_fixture() -> Value {
+        let mut payload = conservative_reference_fixture();
+        for row in payload["references"].as_array_mut().unwrap() {
+            let file = row["file_path"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .trim_start_matches("ReactDOM")
+                .to_string();
+            *row = json!({
+                "entity_id": row["entity_id"], "name": row["name"],
+                "file_path": file, "reference_lines": row["reference_lines"],
+                "relation_kinds": row["relation_kinds"],
+            });
+        }
+        payload
+    }
+
+    fn conservative_reference_envelope() -> Envelope {
+        let mut envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true, "graph_loaded": true,
+            "reconciliation_status": "clean", "graph_entity_count": 31909,
+            "graph_relation_count": 57917, "durable_entity_count": 31909,
+            "durable_relation_count": 47848,
+        }));
+        envelope.degraded.memory_pressure = Some(true);
+        envelope
+    }
+
+    fn roomy_reference_response(raw: &Value) -> Value {
+        annotated_value(&finalize_bounded(
+            ToolCallResult::text(raw.to_string()),
+            conservative_reference_envelope(),
+            "find_references",
+            &ResponseBudget {
+                max_chars: 60_000,
+                ..ResponseBudget::default()
+            },
+        ))
+    }
+
+    #[test]
+    fn exact_reference_restatements_are_pointed_before_rows_are_withheld() {
+        let raw = conservative_reference_fixture();
+        let full = roomy_reference_response(&raw);
+        let budget = ResponseBudget {
+            max_chars: 12_000,
+            ..ResponseBudget::default()
+        };
+        let before = crate::budget::measure(&full);
+        assert!(
+            before > budget.max_chars,
+            "fixture must exceed the complete response ceiling"
+        );
+        let mut pointed = full.clone();
+        pointed["_kin_json_format"] = json!("compact");
+        assert!(
+            crate::budget::measure(&pointed) > budget.max_chars,
+            "whitespace alone must not fit the qualification-heavy fixture"
+        );
+        assert_eq!(
+            crate::budget::point_restated_limiting_factor(&mut pointed, &budget),
+            3
+        );
+        let compacted = crate::budget::measure(&pointed);
+        assert!(
+            compacted <= budget.max_chars,
+            "disclosed pointers must fit: {compacted}"
+        );
+
+        let result = finalize_bounded(
+            ToolCallResult::text(raw.to_string()),
+            conservative_reference_envelope(),
+            "find_references",
+            &budget,
+        );
+        let final_payload = annotated_value(&result);
+        let rows = final_payload["references"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            11,
+            "lossless compaction must retain all eleven references"
+        );
+        assert_eq!(final_payload["references"], raw["references"]);
+        assert!(rows[..3]
+            .iter()
+            .all(|row| row["relation_kinds"] == json!(["imports"])));
+        assert_eq!(final_payload["caller_arrival"], full["caller_arrival"]);
+        assert_eq!(final_payload["edge_coverage"], full["edge_coverage"]);
+        assert_eq!(final_payload["cross_repo"], full["cross_repo"]);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["relation_kinds"] == json!(["imports"]))
+                .count(),
+            3
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["relation_kinds"] == json!(["calls"]))
+                .count(),
+            8
+        );
+        assert_eq!(
+            final_payload["_kin"]["verdict"]["limiting_factor"],
+            full["_kin"]["verdict"]["limiting_factor"]
+        );
+        assert_eq!(
+            final_payload["negative"]["trust_reason"],
+            full["negative"]["trust_reason"]
+        );
+        assert_eq!(final_payload["negative"]["safe_to_conclude_absent"], false);
+        assert_eq!(
+            final_payload["_kin"]["verdict"]["safe_to_conclude_absent"],
+            false
+        );
+        assert_eq!(final_payload["_kin"]["response"]["bounded"], false);
+        assert!(final_payload.get("elisions").is_none());
+        assert!(final_payload["degradations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["reason"] == crate::budget::RESTATEMENT_POINTED_REASON));
+        let mut expanded = final_payload.clone();
+        for (path, owner) in [
+            ("/_kin/verdict/note", "/_kin/verdict/limiting_factor"),
+            ("/negative/advice", "/negative/trust_reason"),
+            ("/_kin/completeness/note", "/_kin/verdict/limiting_factor"),
+        ] {
+            let name = owner.trim_start_matches('/').replace('/', ".");
+            let original = full.pointer(owner).unwrap().as_str().unwrap();
+            let replacement = original.trim_end_matches('.');
+            let text = expanded
+                .pointer(path)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .replace(&format!("see `{name}`"), replacement);
+            *expanded.pointer_mut(path).unwrap() = json!(text);
+        }
+        expanded.as_object_mut().unwrap().remove("_kin_json_format");
+        expanded["_kin"].as_object_mut().unwrap().remove("response");
+        expanded["degradations"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|entry| entry["reason"] != crate::budget::RESTATEMENT_POINTED_REASON);
+        let mut original = full.clone();
+        original["_kin"].as_object_mut().unwrap().remove("response");
+        assert_eq!(
+            expanded, original,
+            "every pointed field must reconstruct exactly"
+        );
+        let ContentBlock::Text { text } = &result.content[0];
+        assert_eq!(
+            final_payload["_kin"]["response"]["chars_after_budget"],
+            text.len()
+        );
+        assert_eq!(text.len(), crate::budget::measure(&final_payload));
+        assert!(text.len() <= budget.max_chars);
+        println!(
+            "eleven reference rows: before={before} pointed={compacted} shipped={}",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn reference_whitespace_compaction_preserves_the_complete_json_answer() {
+        let raw = concise_reference_fixture();
+        let mut full = roomy_reference_response(&raw);
+        assert!(crate::budget::measure(&full) > 12_000);
+        let result = finalize_bounded(
+            ToolCallResult::text(raw.to_string()),
+            conservative_reference_envelope(),
+            "find_references",
+            &ResponseBudget {
+                max_chars: 12_000,
+                ..ResponseBudget::default()
+            },
+        );
+        let mut payload = annotated_value(&result);
+        assert_eq!(payload["references"].as_array().unwrap().len(), 11);
+        assert_eq!(payload["_kin_json_format"], "compact");
+        assert_eq!(payload["_kin"]["response"]["bounded"], false);
+        let ContentBlock::Text { text } = &result.content[0];
+        assert_eq!(
+            payload["_kin"]["response"]["chars_after_budget"],
+            text.len()
+        );
+        assert_eq!(crate::budget::measure(&payload), text.len());
+        assert_eq!(serde_json::to_string(&payload).unwrap(), *text);
+        assert!(text.len() <= 12_000);
+        payload.as_object_mut().unwrap().remove("_kin_json_format");
+        payload["_kin"].as_object_mut().unwrap().remove("response");
+        full["_kin"].as_object_mut().unwrap().remove("response");
+        assert_eq!(payload, full);
+    }
+
+    #[test]
+    fn unique_reference_content_still_requires_truthful_suffix_elisions() {
+        let mut raw = conservative_reference_fixture();
+        for (index, row) in raw["references"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            row["unique_detail"] = json!(format!(
+                "reference {index}: {}",
+                "unique site qualification ".repeat(35)
+            ));
+        }
+        let full = roomy_reference_response(&raw);
+        let budget = ResponseBudget {
+            max_chars: 12_000,
+            ..ResponseBudget::default()
+        };
+        println!(
+            "full reference JSON before pointers: compact={}",
+            serde_json::to_string(&full).unwrap().len()
+        );
+        let mut pointed = full.clone();
+        pointed["_kin_json_format"] = json!("compact");
+        assert_eq!(
+            crate::budget::point_restated_limiting_factor(&mut pointed, &budget),
+            3
+        );
+        assert!(crate::budget::measure(&pointed) > budget.max_chars);
+        println!(
+            "complete reference JSON: pretty={} compact={}",
+            crate::budget::measure(&pointed),
+            serde_json::to_string(&pointed).unwrap().len()
+        );
+        let result = finalize_bounded(
+            ToolCallResult::text(raw.to_string()),
+            conservative_reference_envelope(),
+            "find_references",
+            &budget,
+        );
+        let payload = annotated_value(&result);
+        let rows = payload["references"].as_array().unwrap();
+        assert!(!rows.is_empty() && rows.len() < 11);
+        assert_eq!(rows, &raw["references"].as_array().unwrap()[..rows.len()]);
+        assert_eq!(payload["elisions"]["references"]["kept"], rows.len());
+        assert_eq!(payload["elisions"]["references"]["elided"], 11 - rows.len());
+        assert_eq!(payload["references_withheld"], 11 - rows.len());
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["_kin"]["response"]["bounded"], true);
+        assert_eq!(payload["negative"]["safe_to_conclude_absent"], false);
+        assert_eq!(payload["_kin"]["completeness"]["bound"], "at_least");
+        assert!(payload["degradations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["reason"] == "response_bounded"
+                && entry["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("from the end of the list")));
+        let ContentBlock::Text { text } = &result.content[0];
+        assert_eq!(
+            payload["_kin"]["response"]["chars_after_budget"],
+            text.len()
+        );
+        assert_eq!(text.len(), crate::budget::measure(&payload));
+        assert!(text.len() <= budget.max_chars);
+        println!(
+            "unique reference overflow: before={} pointed={} retained={} shipped={}",
+            crate::budget::measure(&full),
+            crate::budget::measure(&pointed),
+            rows.len(),
+            text.len()
+        );
+    }
+
+    #[test]
+    fn nonmatching_reference_qualifications_are_never_pointed() {
+        let mut payload = roomy_reference_response(&conservative_reference_fixture());
+        for field in [
+            "/_kin/verdict/note",
+            "/negative/advice",
+            "/_kin/completeness/note",
+        ] {
+            let text = payload
+                .pointer(field)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            *payload.pointer_mut(field).unwrap() =
+                json!(format!("{text} An additional unique qualification."));
+        }
+        let before = payload.clone();
+        let budget = ResponseBudget {
+            max_chars: 12_000,
+            ..ResponseBudget::default()
+        };
+        assert!(crate::budget::measure(&payload) > budget.max_chars);
+        assert_eq!(
+            crate::budget::point_restated_limiting_factor(&mut payload, &budget),
+            0
+        );
+        assert_eq!(payload, before);
     }
 
     /// The budget removes rows on purpose, and a response it shortened is

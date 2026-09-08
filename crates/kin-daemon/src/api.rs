@@ -14537,7 +14537,7 @@ fn bound_mcp_tool_result(
             if tool == "trace_data_flow" {
                 reconcile_trace_body_presence(&mut payload);
             }
-            match serde_json::to_string_pretty(&payload) {
+            match kin_mcp::budget::render(&payload) {
                 Ok(rendered) => kin_mcp::ContentBlock::Text { text: rendered },
                 Err(_) => kin_mcp::ContentBlock::Text { text },
             }
@@ -58291,6 +58291,66 @@ mod tests {
         );
         let payload: serde_json::Value = serde_json::from_str(&bounded).unwrap();
         assert_eq!(payload["total_upstream"], json!(400));
+    }
+
+    #[test]
+    fn the_raw_route_compacts_whitespace_before_withholding_reference_rows() {
+        let payload = json!({
+            "total_upstream": 11,
+            "references": (0..11).map(|index| json!({
+                "entity_id": format!("reference-{index}"),
+                "name": format!("caller_{index}"),
+                "reference_lines": (0..60).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        });
+        let original = serde_json::to_string_pretty(&payload).unwrap();
+        let budget = kin_mcp::budget::ResponseBudget {
+            max_chars: 4_000,
+            ..kin_mcp::budget::ResponseBudget::default()
+        };
+        assert!(original.len() > budget.max_chars);
+        let response = bound_mcp_tool_result(
+            kin_mcp::ToolCallResult::text(original.clone()),
+            "find_references",
+            &budget,
+        );
+        let text = mcp_result_text(&response);
+        let mut parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["references"], payload["references"]);
+        assert_eq!(kin_mcp::budget::measure(&parsed), text.len());
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), text);
+        assert!(text.len() <= budget.max_chars);
+        assert_eq!(
+            parsed.as_object_mut().unwrap().remove("_kin_json_format"),
+            Some(json!("compact"))
+        );
+        assert_eq!(parsed, payload);
+
+        let roomy = kin_mcp::budget::ResponseBudget {
+            max_chars: 60_000,
+            ..budget
+        };
+        let fitting = bound_mcp_tool_result(
+            kin_mcp::ToolCallResult::text(original.clone()),
+            "find_references",
+            &roomy,
+        );
+        assert_eq!(mcp_result_text(&fitting), original);
+
+        let annotated = kin_mcp::envelope::finalize_bounded(
+            response,
+            kin_mcp::envelope::Envelope::daemon(),
+            "find_references",
+            &roomy,
+        );
+        let emitted = mcp_result_text(&annotated);
+        let final_payload: serde_json::Value = serde_json::from_str(&emitted).unwrap();
+        assert_eq!(final_payload["references"], payload["references"]);
+        assert_eq!(
+            final_payload["_kin"]["response"]["chars_after_budget"],
+            emitted.len()
+        );
+        assert_eq!(kin_mcp::budget::measure(&final_payload), emitted.len());
     }
 
     /// A tool the budget does not govern is returned exactly as built. A source
