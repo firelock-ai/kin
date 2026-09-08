@@ -11226,3 +11226,93 @@ mod shutdown_vector_checkpoint_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod lsp_dependency_integrity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn inner_rpc_failure_reaches_the_daemon_counter() {
+        let root = tempfile::tempdir().unwrap();
+        let source = kin_lsp::EntityRef {
+            id: kin_model::EntityId::new(),
+            name: "caller".into(),
+            file_path: "source.py".into(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            name_line: 0,
+            name_col: 0,
+        };
+        let target = kin_lsp::EntityRef {
+            id: kin_model::EntityId::new(),
+            name: "target".into(),
+            file_path: "target.py".into(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            name_line: 1,
+            name_col: 0,
+        };
+        let index = kin_lsp::EntityIndex::new(vec![source.clone(), target.clone()]);
+        let range = |line| serde_json::json!({"start": {"line": line, "character": 0}, "end": {"line": line, "character": 6}});
+        let item = |entity: &kin_lsp::EntityRef| {
+            serde_json::json!({
+                "name": entity.name, "kind": 12,
+                "uri": kin_lsp::protocol::path_to_uri(&root.path().join(&entity.file_path)),
+                "range": range(entity.start_line), "selectionRange": range(entity.start_line),
+            })
+        };
+        for fail in [false, true] {
+            let mut responses = serde_json::json!({
+                "initialize": {"result": {"capabilities": {"callHierarchyProvider": true}}},
+                "textDocument/prepareCallHierarchy": {"result": [item(&source)]},
+                "callHierarchy/outgoingCalls": {"result": [{"to": item(&target), "fromRanges": [range(0)]}]},
+            });
+            if fail {
+                responses["textDocument/prepareCallHierarchy"] = serde_json::json!({"error": {"code": -32603, "message": "injected dependency failure"}});
+            }
+            let text = responses.to_string();
+            let server = kin_lsp::lifecycle::LspServer::start(
+                "python3",
+                &["-u", "-c", include_str!("lsp_integrity_peer.py"), &text],
+                root.path(),
+                None,
+            )
+            .await
+            .unwrap();
+            let (relations, failures) =
+                enrich_single_entity(&server, &source, &index, root.path(), None).await;
+            let seen = server
+                .client
+                .request("test/seen", serde_json::Value::Null)
+                .await
+                .unwrap();
+            assert_eq!(
+                seen.as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|message| message["method"] == "textDocument/prepareCallHierarchy")
+                    .count(),
+                1
+            );
+            if fail {
+                assert_eq!(
+                    failures, 1,
+                    "an inner dependency RPC error must reach daemon failure accounting"
+                );
+                assert!(relations.is_empty());
+            } else {
+                assert_eq!(failures, 0);
+                assert!(
+                    relations
+                        .iter()
+                        .any(|relation| relation.kind == kin_model::RelationKind::Calls
+                            && relation.src == kin_model::GraphNodeId::Entity(source.id)
+                            && relation.dst == kin_model::GraphNodeId::Entity(target.id)),
+                    "successful dependency control must retain the named call edge"
+                );
+            }
+        }
+    }
+}
