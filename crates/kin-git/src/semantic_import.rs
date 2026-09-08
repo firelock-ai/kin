@@ -25,6 +25,7 @@ use kin_model::{
 use uuid::Uuid;
 
 use crate::error::{GitError, Result};
+use crate::history_spool::{SemanticChangeSpool, SemanticChangeSpoolWriter};
 use crate::lossless::{validate_snapshot, GitObjectFormat, LosslessGitRepository};
 use crate::sealed_observation::{AdmittedContentSummary, SealedTreeObservation};
 
@@ -59,14 +60,9 @@ pub struct GitWorkspaceSeed {
 
 /// One imported change's historical semantics, owned or lent.
 ///
-/// The deltas exist twice at the moment they are bound: once in whatever
-/// derived them and once in the plan they are written into. Both callers that
-/// run at whole-repository scale used to pay for that, and they cannot pay for
-/// it the same way. The enrichment fold owns what it derived and never reads it
-/// again, so it can hand the deltas over; the admitted plan's self-check reads
-/// them out of the very structure it is checking, so it must lend them and must
-/// not copy the structure to do it. `Cow` is what lets one signature serve both
-/// with exactly one copy where there were two.
+/// Streaming enrichment moves owned deltas into one change before it is
+/// spooled. The compatibility binding API also accepts borrowed deltas from
+/// callers that already hold a history.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoricalSemanticBinding<'a> {
     pub change_id: SemanticChangeId,
@@ -114,7 +110,7 @@ pub struct SemanticGitImportPlan {
     pub repository_id: RepositoryId,
     pub object_format: GitObjectFormat,
     pub external_objects: Vec<ExternalObjectRecord>,
-    pub changes: Vec<SemanticChange>,
+    pub changes: SemanticChangeSpool,
     pub aliases: Vec<ExternalChangeAlias>,
     /// The canonical identity of every imported commit's exact tree, keyed by
     /// commit: thirty-two bytes where a conversion used to hold the tree
@@ -174,7 +170,7 @@ impl ProvedPlanFacts for SemanticGitImportPlan {
         self.changes.len()
     }
     fn proved_change_ids(&self) -> impl Iterator<Item = SemanticChangeId> + '_ {
-        self.changes.iter().map(|change| change.id)
+        self.changes.ids()
     }
     fn proved_aliases(&self) -> &[ExternalChangeAlias] {
         &self.aliases
@@ -236,7 +232,7 @@ impl ProvedImportClosure {
     /// dropped at this call instead of living on beside a copy of everything
     /// else.
     pub fn from_proved_plan(plan: SemanticGitImportPlan) -> Self {
-        let change_ids = plan.changes.iter().map(|change| change.id).collect();
+        let change_ids = plan.changes.ids().collect();
         Self {
             repository_id: plan.repository_id,
             object_format: plan.object_format,
@@ -347,20 +343,52 @@ impl SemanticGitImportPlan {
     ) -> Result<Self> {
         let snapshot = self.raw_snapshot();
         let mut comparison = HeldPlanComparison::new(&self, Enrichment::None, EXACT_UNENRICHED)?;
-        let mut bindings = Vec::with_capacity(self.changes.len());
+        let mut changes = SemanticChangeSpoolWriter::new()?;
+        let mut aliases = Vec::with_capacity(self.aliases.len());
+        let mut old_to_new = BTreeMap::new();
         let derived = derive_semantic_git_history(
             &snapshot,
             blob_store,
             TreeRetention::Frontier,
             &mut |oid, change, alias, tree, facts| {
                 comparison.check_commit(oid, change, alias, facts)?;
-                let held = comparison.held_change(oid)?;
-                bindings.push(enrich(held, tree)?);
+                let mut held = comparison.held_change(oid)?;
+                let binding = enrich(&held, tree)?;
+                if binding.change_id != held.id {
+                    return Err(GitError::InvalidSnapshot(
+                        "historical semantic deltas name a different change".to_string(),
+                    ));
+                }
+                let old_id = held.id;
+                held.parents = held
+                    .parents
+                    .iter()
+                    .map(|parent| {
+                        old_to_new.get(parent).copied().ok_or_else(|| {
+                            GitError::InvalidSnapshot(format!(
+                                "parent {parent} was not reidentified before change {old_id}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                held.entity_deltas = binding.entity_deltas.into_owned();
+                held.relation_deltas = binding.relation_deltas.into_owned();
+                held.id = placeholder_change_id();
+                held.id = compute_semantic_change_id(&held)?;
+                validate_semantic_change_id(&held)?;
+                let alias = ExternalChangeAlias::new(self.repository_id.clone(), oid, held.id);
+                alias.validate_change(&held)?;
+                old_to_new.insert(old_id, held.id);
+                changes.append(held)?;
+                aliases.push(alias);
                 Ok(())
             },
         )?;
         comparison.finish(&derived)?;
-        apply_historical_semantic_deltas_unchecked(self, bindings)
+        let mut plan = self;
+        plan.changes = changes.finish()?;
+        plan.aliases = aliases;
+        Ok(plan)
     }
 
     /// Bind deterministic CAS-native semantic deltas and recompute every
@@ -430,10 +458,10 @@ pub(crate) struct DerivedEnrichedHistory {
 /// one. Only the visitor decides what survives the commit it was handed; this
 /// walk keeps the frontier trees the derivation itself needs, plus one identity
 /// pair per commit, and nothing else.
-pub(crate) fn derive_enriched_semantic_git_history<'held>(
+pub(crate) fn derive_enriched_semantic_git_history(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
-    held_semantics: &dyn Fn(GitObjectId) -> Option<(&'held [EntityDelta], &'held [RelationDelta])>,
+    held_semantics: &dyn Fn(GitObjectId) -> Result<Option<(Vec<EntityDelta>, Vec<RelationDelta>)>>,
     visit: &mut dyn FnMut(
         GitObjectId,
         &[GitObjectId],
@@ -466,14 +494,14 @@ pub(crate) fn derive_enriched_semantic_git_history<'held>(
                 parent_oids.push(parent_oid);
                 parents.push(parent_id);
             }
-            let Some((entity_deltas, relation_deltas)) = held_semantics(oid) else {
+            let Some((entity_deltas, relation_deltas)) = held_semantics(oid)? else {
                 return Err(GitError::InvalidSnapshot(format!(
                     "historical semantic deltas omit Git commit {oid}"
                 )));
             };
             change.parents = parents;
-            change.entity_deltas = entity_deltas.to_vec();
-            change.relation_deltas = relation_deltas.to_vec();
+            change.entity_deltas = entity_deltas;
+            change.relation_deltas = relation_deltas;
             change.id = placeholder_change_id();
             change.id = compute_semantic_change_id(&change)?;
             validate_semantic_change_id(&change)?;
@@ -523,9 +551,10 @@ fn apply_historical_semantic_deltas_unchecked(
     }
 
     let mut old_to_new = BTreeMap::<SemanticChangeId, SemanticChangeId>::new();
-    let mut changes = Vec::with_capacity(plan.changes.len());
+    let mut changes = SemanticChangeSpoolWriter::new()?;
     let mut aliases = Vec::with_capacity(plan.changes.len());
-    for mut change in plan.changes {
+    for change in plan.changes.iter() {
+        let mut change = change?;
         let old_id = change.id;
         let delta = delta_by_change.remove(&old_id).ok_or_else(|| {
             GitError::InvalidSnapshot(format!("historical semantic deltas omit change {old_id}"))
@@ -567,7 +596,7 @@ fn apply_historical_semantic_deltas_unchecked(
         let alias = ExternalChangeAlias::new(plan.repository_id.clone(), oid, change.id);
         alias.validate_change(&change)?;
         old_to_new.insert(old_id, change.id);
-        changes.push(change);
+        changes.append(change)?;
         aliases.push(alias);
     }
     if !delta_by_change.is_empty() {
@@ -575,7 +604,7 @@ fn apply_historical_semantic_deltas_unchecked(
             "historical semantic deltas contain unknown changes".to_string(),
         ));
     }
-    plan.changes = changes;
+    plan.changes = changes.finish()?;
     plan.aliases = aliases;
     Ok(plan)
 }
@@ -641,6 +670,7 @@ impl<'a> HeldPlanComparison<'a> {
     ) -> Result<Self> {
         let mut held_by_oid = BTreeMap::new();
         for (index, change) in plan.changes.iter().enumerate() {
+            let change = change?;
             let ChangeOrigin::GitCommit { oid } = change.origin else {
                 return Err(GitError::InvalidSnapshot(
                     "semantic Git import contains a native-origin change".to_string(),
@@ -667,13 +697,16 @@ impl<'a> HeldPlanComparison<'a> {
     }
 
     /// The held change for one Git commit, wherever it sits in the plan.
-    fn held_change(&self, oid: GitObjectId) -> Result<&'a SemanticChange> {
+    fn held_change(&self, oid: GitObjectId) -> Result<SemanticChange> {
         let index = *self.held_by_oid.get(&oid).ok_or_else(|| {
             GitError::InvalidSnapshot(format!(
                 "semantic Git import is missing enriched commit {oid}"
             ))
         })?;
-        self.plan.changes.get(index).ok_or_else(|| self.refuse())
+        self.plan
+            .changes
+            .read_at(index)?
+            .ok_or_else(|| self.refuse())
     }
 
     fn check_commit(
@@ -693,7 +726,7 @@ impl<'a> HeldPlanComparison<'a> {
             let held = self
                 .plan
                 .changes
-                .get(held_index)
+                .read_at(held_index)?
                 .ok_or_else(|| self.refuse())?;
             let old_id = change.id;
             change.parents = change
@@ -707,8 +740,8 @@ impl<'a> HeldPlanComparison<'a> {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            change.entity_deltas = held.entity_deltas.clone();
-            change.relation_deltas = held.relation_deltas.clone();
+            change.entity_deltas = held.entity_deltas;
+            change.relation_deltas = held.relation_deltas;
             change.id = placeholder_change_id();
             change.id = compute_semantic_change_id(&change)?;
             validate_semantic_change_id(&change)?;
@@ -726,7 +759,7 @@ impl<'a> HeldPlanComparison<'a> {
         // held plan whose tree hash or content summary was altered fails at
         // the commit it was altered for.
         let index = self.checked;
-        if self.plan.changes.get(index) != Some(&change)
+        if self.plan.changes.read_at(index)?.as_ref() != Some(&change)
             || self.plan.aliases.get(index) != Some(&alias)
             || self.plan.commit_tree_hashes.get(&oid) != Some(&facts.tree_hash)
             || self.plan.content.trees.get(&oid) != Some(&facts.content)
@@ -1067,14 +1100,14 @@ fn build_semantic_git_import_plan(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
 ) -> Result<SemanticGitImportPlan> {
-    let mut changes = Vec::new();
+    let mut changes = SemanticChangeSpoolWriter::new()?;
     let mut aliases = Vec::new();
     let derived = derive_semantic_git_history(
         snapshot,
         blob_store,
         TreeRetention::Frontier,
         &mut |_oid, change, alias, _tree, _facts| {
-            changes.push(change);
+            changes.append(change)?;
             aliases.push(alias);
             Ok(())
         },
@@ -1094,7 +1127,7 @@ fn build_semantic_git_import_plan(
         repository_id: snapshot.repository_id.clone(),
         object_format: snapshot.object_format,
         external_objects: snapshot.objects.clone(),
-        changes,
+        changes: changes.finish()?,
         aliases,
         commit_tree_hashes: derived.commit_tree_hashes,
         content: derived.content,
@@ -2147,6 +2180,72 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn spooled_history_preserves_enrichment_and_refuses_missing_or_reordered_records() {
+        let fixture = SemanticFixture::octopus_polyglot();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("spooled-history").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &fixture.blob_store).unwrap();
+        let bindings = plan
+            .changes
+            .ids()
+            .map(|id| HistoricalSemanticBinding::owned(id, Vec::new(), Vec::new()))
+            .collect();
+        let legacy = plan
+            .clone()
+            .with_historical_semantics(&fixture.blob_store, bindings)
+            .unwrap();
+        let streamed = plan
+            .clone()
+            .enrich_with_historical_semantics(&fixture.blob_store, &mut |change, _tree| {
+                Ok(HistoricalSemanticBinding::owned(
+                    change.id,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            })
+            .unwrap();
+        assert_eq!(streamed, legacy);
+        streamed.validate(&fixture.blob_store).unwrap();
+        let admitted = admit_semantic_git_import(&streamed, &fixture.blob_store).unwrap();
+        admitted.validate(&fixture.blob_store).unwrap();
+
+        for remove in [false, true] {
+            let mut malformed = plan.clone();
+            let mut records = malformed
+                .changes
+                .iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            if remove {
+                records.pop();
+            } else {
+                records.swap(0, 1);
+            }
+            malformed.changes = SemanticChangeSpool::from_changes(records).unwrap();
+            assert!(malformed.validate(&fixture.blob_store).is_err());
+
+            let mut malformed = admitted.clone();
+            let mut records = malformed
+                .changes
+                .iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            if remove {
+                records.pop();
+            } else {
+                records.swap(0, 1);
+            }
+            malformed.changes = SemanticChangeSpool::from_changes(records).unwrap();
+            assert!(malformed.validate(&fixture.blob_store).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn plans_exact_polyglot_octopus_history_without_repository_access() {
         let fixture = SemanticFixture::octopus_polyglot();
         let snapshot = capture_lossless_git_repository(
@@ -2183,6 +2282,7 @@ mod tests {
             );
         }
         assert!(second.changes.iter().all(|change| {
+            let change = change.unwrap();
             matches!(change.origin, ChangeOrigin::GitCommit { .. })
                 && change.entity_deltas.is_empty()
                 && change.relation_deltas.is_empty()
@@ -2473,7 +2573,6 @@ mod tests {
         }
         let initial_delta = admitted_change_for_oid(&admitted, fixture.initial)
             .admission_policy_delta
-            .as_ref()
             .unwrap();
         assert_eq!(initial_delta.old, None);
         assert_eq!(initial_delta.new.as_ref(), Some(initial_policy));
@@ -2494,7 +2593,6 @@ mod tests {
         assert_ne!(branch_one_policy.hash, initial_policy.hash);
         let branch_one_delta = admitted_change_for_oid(&admitted, fixture.one)
             .admission_policy_delta
-            .as_ref()
             .unwrap();
         assert_eq!(branch_one_delta.old.as_ref(), Some(initial_policy));
         assert_eq!(branch_one_delta.new.as_ref(), Some(branch_one_policy));
@@ -2519,7 +2617,6 @@ mod tests {
         assert_eq!(merge_policy.generation, 1);
         let merge_delta = admitted_change_for_oid(&admitted, fixture.merge)
             .admission_policy_delta
-            .as_ref()
             .unwrap();
         assert_eq!(merge_delta.old.as_ref(), Some(empty_policy));
         assert_eq!(merge_delta.new.as_ref(), Some(merge_policy));
@@ -2561,7 +2658,10 @@ mod tests {
                 "admit branch-versioned Git history",
             )
             .unwrap();
-        assert_eq!(transaction.changes, admitted.changes);
+        assert_eq!(
+            transaction.changes,
+            admitted.changes.iter().collect::<Result<Vec<_>>>().unwrap()
+        );
         assert_eq!(transaction.aliases, admitted.aliases);
         assert!(transaction.git_authority_delta.is_none());
         assert!(transaction.workspace_mutation.is_none());
@@ -2672,7 +2772,9 @@ mod tests {
         let admitted = admit_semantic_git_import(&plan, &blob_store).unwrap();
 
         let mut mutated = plan.clone();
-        mutated.changes[0].message.push_str("tampered");
+        let mut changes = mutated.changes.iter().collect::<Result<Vec<_>>>().unwrap();
+        changes[0].message.push_str("tampered");
+        mutated.changes = SemanticChangeSpool::from_changes(changes).unwrap();
         assert!(matches!(
             mutated.validate(&blob_store),
             Err(GitError::InvalidSnapshot(_))
@@ -3090,11 +3192,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn change_for_oid(plan: &SemanticGitImportPlan, oid: GitObjectId) -> &SemanticChange {
-        plan.changes
-            .iter()
-            .find(|change| change.origin == ChangeOrigin::GitCommit { oid })
-            .unwrap()
+    fn change_for_oid(plan: &SemanticGitImportPlan, oid: GitObjectId) -> SemanticChange {
+        plan.changes.read_by_oid(&oid).unwrap().unwrap()
     }
 
     #[cfg(unix)]
@@ -3106,11 +3205,8 @@ mod tests {
     fn admitted_change_for_oid(
         plan: &AdmittedSemanticGitImportPlan,
         oid: GitObjectId,
-    ) -> &SemanticChange {
-        plan.changes
-            .iter()
-            .find(|change| change.origin == ChangeOrigin::GitCommit { oid })
-            .unwrap()
+    ) -> SemanticChange {
+        plan.changes.read_by_oid(&oid).unwrap().unwrap()
     }
 
     #[cfg(unix)]

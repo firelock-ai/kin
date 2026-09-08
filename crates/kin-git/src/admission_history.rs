@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use kin_blobs::BlobStore;
 use kin_model::{
     compute_semantic_change_id, validate_semantic_change_id, AdmissionPolicyDelta,
-    AdmissionRuleSource, AdmissionRuleSourceKind, AuthorId, ChangeOrigin, DefaultRefMutation,
+    AdmissionRuleSource, AdmissionRuleSourceKind, AuthorId, DefaultRefMutation,
     ExternalChangeAlias, ExternalObjectRecord, GitObjectId, Hash256, OperationId, RefMutation,
     RepositoryId, RepositoryRefState, RepositoryTransaction, ResolvedTree, RootBundle,
     SemanticChange, SemanticChangeId, SharedAdmissionPolicy, TreeEntry, WorkspaceHead,
@@ -21,6 +21,7 @@ use kin_model::{
 };
 
 use crate::error::{GitError, Result};
+use crate::history_spool::{SemanticChangeSpool, SemanticChangeSpoolWriter};
 use crate::lossless::{GitObjectFormat, LosslessGitRepository};
 use crate::sealed_observation::AdmittedContentSummary;
 use crate::semantic_import::{
@@ -39,7 +40,7 @@ pub struct AdmittedSemanticGitImportPlan {
     pub repository_id: RepositoryId,
     pub object_format: GitObjectFormat,
     pub external_objects: Vec<ExternalObjectRecord>,
-    pub changes: Vec<SemanticChange>,
+    pub changes: SemanticChangeSpool,
     pub aliases: Vec<ExternalChangeAlias>,
     /// The same tree identities the pre-admission plan holds.
     pub commit_tree_hashes: BTreeMap<GitObjectId, Hash256>,
@@ -109,29 +110,11 @@ impl AdmittedSemanticGitImportPlan {
             refs: self.refs.clone(),
             head: self.head.clone(),
         };
-        let mut by_oid = BTreeMap::new();
-        for change in &self.changes {
-            let ChangeOrigin::GitCommit { oid } = change.origin else {
-                return Err(GitError::InvalidSnapshot(
-                    "admitted semantic Git import contains a native-origin change".to_string(),
-                ));
-            };
-            if by_oid.insert(oid, change).is_some() {
-                return Err(GitError::InvalidSnapshot(format!(
-                    "admitted semantic Git import repeats commit {oid}"
-                )));
-            }
-        }
-        // Lent, not copied. These deltas live in `self`, which outlives the
-        // call, and the walk below only reads them on their way into the one
-        // commit it is about to check and drop.
         let held_semantics = |oid: GitObjectId| {
-            by_oid.get(&oid).map(|change| {
-                (
-                    change.entity_deltas.as_slice(),
-                    change.relation_deltas.as_slice(),
-                )
-            })
+            Ok(self
+                .changes
+                .read_by_oid(&oid)?
+                .map(|change| (change.entity_deltas, change.relation_deltas)))
         };
 
         let mut admission = AdmittedCommitDeriver::new(self.repository_id.clone());
@@ -147,7 +130,7 @@ impl AdmittedSemanticGitImportPlan {
                 // flag to the end. A plan that has already failed can go on to
                 // trip a structural error further down the walk, and reporting
                 // that instead would name the wrong thing.
-                if self.changes.get(checked) != Some(&admitted)
+                if self.changes.read_at(checked)?.as_ref() != Some(&admitted)
                     || self.aliases.get(checked) != Some(&alias)
                     || self.commit_tree_hashes.get(&oid) != Some(&facts.tree_hash)
                     || self.content.trees.get(&oid) != Some(&facts.content)
@@ -205,6 +188,30 @@ impl AdmittedSemanticGitImportPlan {
         actor: AuthorId,
         reason: impl Into<String>,
     ) -> Result<RepositoryTransaction> {
+        let (mut transaction, changes) = self
+            .into_generation_zero_repository_transaction_streaming(
+                blob_store,
+                operation_id,
+                expected_roots,
+                actor,
+                reason,
+            )?;
+        transaction.changes = changes.iter().collect::<Result<Vec<_>>>()?;
+        transaction.validate()?;
+        Ok(transaction)
+    }
+
+    /// Return validated admitted history and its transaction metadata.
+    /// The caller must validate the complete transaction through its streaming
+    /// bootstrap boundary before publishing it.
+    pub fn into_generation_zero_repository_transaction_streaming(
+        self,
+        blob_store: &BlobStore,
+        operation_id: OperationId,
+        expected_roots: RootBundle,
+        actor: AuthorId,
+        reason: impl Into<String>,
+    ) -> Result<(RepositoryTransaction, SemanticChangeSpool)> {
         self.validate(blob_store)?;
         if expected_roots.generation != 0 {
             return Err(GitError::InvalidSnapshot(format!(
@@ -222,7 +229,7 @@ impl AdmittedSemanticGitImportPlan {
             reason: reason.into(),
             external_objects: self.external_objects,
             git_authority_delta: None,
-            changes: self.changes,
+            changes: Vec::new(),
             aliases: self.aliases,
             ref_mutations: self.ref_mutations,
             default_ref_mutation: self.default_ref_mutation,
@@ -232,8 +239,7 @@ impl AdmittedSemanticGitImportPlan {
             sealed_observation: None,
             collaboration_delta: None,
         };
-        transaction.validate()?;
-        Ok(transaction)
+        Ok((transaction, self.changes))
     }
 }
 
@@ -382,26 +388,11 @@ fn derive_admitted_semantic_git_history(
         refs: plan.refs.clone(),
         head: plan.head.clone(),
     };
-    let mut by_oid = BTreeMap::new();
-    for change in &plan.changes {
-        let ChangeOrigin::GitCommit { oid } = change.origin else {
-            return Err(GitError::InvalidSnapshot(
-                "semantic Git import contains a native-origin change".to_string(),
-            ));
-        };
-        if by_oid.insert(oid, change).is_some() {
-            return Err(GitError::InvalidSnapshot(format!(
-                "semantic Git import repeats commit {oid}"
-            )));
-        }
-    }
     let held_semantics = |oid: GitObjectId| {
-        by_oid.get(&oid).map(|change| {
-            (
-                change.entity_deltas.as_slice(),
-                change.relation_deltas.as_slice(),
-            )
-        })
+        Ok(plan
+            .changes
+            .read_by_oid(&oid)?
+            .map(|change| (change.entity_deltas, change.relation_deltas)))
     };
 
     let mut deriver = AdmittedCommitDeriver::new(plan.repository_id.clone());
@@ -425,7 +416,7 @@ fn derive_admitted_semantic_git_history(
             // graded where they are produced, by the enrichment fold's own
             // tests and by the change-id equality of an admitted store.
             let index = deriver.derived;
-            if plan.changes.get(index) != Some(&enriched)
+            if plan.changes.read_at(index)?.as_ref() != Some(&enriched)
                 || plan.aliases.get(index) != Some(&enriched_alias)
                 || plan.commit_tree_hashes.get(&oid) != Some(&facts.tree_hash)
                 || plan.content.trees.get(&oid) != Some(&facts.content)
@@ -458,11 +449,11 @@ fn build_admitted_semantic_git_import_plan(
     plan: &SemanticGitImportPlan,
     blob_store: &BlobStore,
 ) -> Result<AdmittedSemanticGitImportPlan> {
-    let mut changes = Vec::with_capacity(plan.changes.len());
+    let mut changes = SemanticChangeSpoolWriter::new()?;
     let mut aliases = Vec::with_capacity(plan.aliases.len());
     let derived =
         derive_admitted_semantic_git_history(plan, blob_store, &mut |_oid, admitted, alias| {
-            changes.push(admitted);
+            changes.append(admitted)?;
             aliases.push(alias);
             Ok(())
         })?;
@@ -476,7 +467,7 @@ fn build_admitted_semantic_git_import_plan(
         repository_id: plan.repository_id.clone(),
         object_format: plan.object_format,
         external_objects: plan.external_objects.clone(),
-        changes,
+        changes: changes.finish()?,
         aliases,
         commit_tree_hashes: plan.commit_tree_hashes.clone(),
         content: plan.content.clone(),

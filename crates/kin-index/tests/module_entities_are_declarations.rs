@@ -347,7 +347,8 @@ fn admit_repository(dir: &Path, repository_id: &str, files: &[(&str, &str)]) -> 
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let bindings = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store)
+    let planned_changes = plan.changes.iter().collect::<Result<Vec<_>, _>>().unwrap();
+    let bindings = derive_historical_semantic_deltas(&planned_changes, &trees, &blob_store)
         .unwrap()
         .into_iter()
         .map(|delta| {
@@ -366,6 +367,11 @@ fn admit_repository(dir: &Path, repository_id: &str, files: &[(&str, &str)]) -> 
     )
     .unwrap();
     admitted.validate(&blob_store).unwrap();
+    let admitted_changes = admitted
+        .changes
+        .iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     // Admission fails closed on a relation naming a destination entity the tree
     // does not define, so this replay is also the assertion that removing the
@@ -373,16 +379,14 @@ fn admit_repository(dir: &Path, repository_id: &str, files: &[(&str, &str)]) -> 
     // placeholder edge makes `derive_historical_semantic_deltas` return an
     // error above rather than reaching here.
     let graph = kin_db::InMemoryGraph::new();
-    for change in &admitted.changes {
+    for change in &admitted_changes {
         graph.create_change(change).unwrap();
     }
-    let head = admitted
-        .changes
+    let head = admitted_changes
         .iter()
         .map(|change| change.id)
         .find(|candidate| {
-            !admitted
-                .changes
+            !admitted_changes
                 .iter()
                 .any(|change| change.parents.contains(candidate))
         })
@@ -391,7 +395,7 @@ fn admit_repository(dir: &Path, repository_id: &str, files: &[(&str, &str)]) -> 
         .resolve_graph_at(&head)
         .expect("admitted history must replay");
 
-    replay_first_parent(&admitted.changes)
+    replay_first_parent(&admitted_changes)
 }
 
 /// Apply every change's deltas in parent-first order, the way durable authority

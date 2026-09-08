@@ -231,16 +231,27 @@ fn replay_first_parent_semantic_ids(
                 "cycle in durable first-parent history at change {change_id}"
             )));
         }
-        let change = changes.get(&change_id).ok_or_else(|| {
-            KinError::Graph(format!(
-                "durable first-parent history is missing change {change_id}"
-            ))
-        })?;
-        current = change.parents.first().copied();
-        reverse_lineage.push(change);
+        let parents = changes
+            .change_parents(&change_id)
+            .map_err(|error| KinError::Graph(error.to_string()))?
+            .ok_or_else(|| {
+                KinError::Graph(format!(
+                    "durable first-parent history is missing change {change_id}"
+                ))
+            })?;
+        current = parents.first().copied();
+        reverse_lineage.push(change_id);
     }
 
-    for change in reverse_lineage.into_iter().rev() {
+    for change_id in reverse_lineage.into_iter().rev() {
+        let change = changes
+            .read_change(&change_id)
+            .map_err(|error| KinError::Graph(error.to_string()))?
+            .ok_or_else(|| {
+                KinError::Graph(format!(
+                    "durable first-parent history is missing change {change_id}"
+                ))
+            })?;
         let context = format!("semantic change {}", change.id);
         apply_entity_deltas(entity_ids, &change.entity_deltas, &context)?;
         apply_relation_deltas(relation_ids, &change.relation_deltas, &context)?;

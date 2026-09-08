@@ -57,7 +57,8 @@ fn a_real_repository_enriches_into_replayable_history() {
         })
         .collect::<BTreeMap<_, _>>();
 
-    let deltas = derive_historical_semantic_deltas(&plan.changes, &trees, &blob_store).unwrap();
+    let planned_changes = plan.changes.iter().collect::<Result<Vec<_>, _>>().unwrap();
+    let deltas = derive_historical_semantic_deltas(&planned_changes, &trees, &blob_store).unwrap();
     let bindings = deltas
         .into_iter()
         .map(|delta| {
@@ -76,20 +77,23 @@ fn a_real_repository_enriches_into_replayable_history() {
     )
     .unwrap();
     admitted.validate(&blob_store).unwrap();
+    let admitted_changes = admitted
+        .changes
+        .iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     // The graph must never publish a change its own replay rejects, so every
     // head is resolved rather than only the tip of the default branch.
     let graph = kin_db::InMemoryGraph::new();
-    for change in &admitted.changes {
+    for change in &admitted_changes {
         graph.create_change(change).unwrap();
     }
-    let heads = admitted
-        .changes
+    let heads = admitted_changes
         .iter()
         .map(|change| change.id)
         .filter(|candidate| {
-            !admitted
-                .changes
+            !admitted_changes
                 .iter()
                 .any(|change| change.parents.contains(candidate))
         })

@@ -498,7 +498,7 @@ fn init_from_git_with_hooks(
     let workspace_base_change_id = admitted.workspace_base_change_id();
 
     progress.begin("build bootstrap transaction");
-    let transaction = {
+    let (transaction, changes) = {
         let _span = info_span!(
             "kin.init.build_bootstrap_transaction",
             observed_trees = sealed_observation.observed_trees,
@@ -514,8 +514,8 @@ fn init_from_git_with_hooks(
         let _beat = progress.heartbeat(format!(
             "{admitted_tracked_artifacts} files, {admitted_changes} changes"
         ));
-        let mut transaction = admitted
-            .into_generation_zero_repository_transaction(
+        let (mut transaction, captured_changes) = admitted
+            .into_generation_zero_repository_transaction_streaming(
                 &capture_store,
                 OperationId::new(),
                 prepared.initial_roots().clone(),
@@ -523,8 +523,17 @@ fn init_from_git_with_hooks(
                 "admit exact Git repository authority",
             )
             .map_err(|error| git_boundary_error("construct Git bootstrap transaction", error))?;
+        let mut changes = kin_db::storage::ChangeMap::new();
+        for change in captured_changes.iter() {
+            changes
+                .append_change(
+                    change.map_err(|error| git_boundary_error("read captured change", error))?,
+                )
+                .map_err(|error| KinError::Graph(error.to_string()))?;
+        }
         bind_workspace_authority(
             &mut transaction,
+            Some(&changes),
             prepared.workspace_id(),
             workspace_seed,
             workspace_policy,
@@ -532,15 +541,13 @@ fn init_from_git_with_hooks(
         )?;
         transaction.git_authority_delta =
             Some(GitExternalAuthorityDelta::initialize(git_authority));
-        transaction
+        (transaction, changes)
     };
 
     progress.begin("validate bootstrap transaction");
     {
         let _span = info_span!("kin.init.validate_bootstrap_transaction").entered();
-        transaction.validate().map_err(|error| {
-            KinError::Other(format!("invalid Git bootstrap transaction: {error}"))
-        })?;
+        crate::init::bootstrap_transaction_hash(&transaction, Some(&changes))?;
     }
 
     progress.begin("commit bootstrap transaction");
@@ -554,10 +561,10 @@ fn init_from_git_with_hooks(
         // that keeps moving is this one.
         let _beat = progress.heartbeat(format!(
             "{admitted_tracked_artifacts} files, {} changes, {} objects",
-            transaction.changes.len(),
+            changes.len(),
             transaction.external_objects.len()
         ));
-        prepared.commit_repository_bootstrap(transaction)?;
+        prepared.commit_git_bootstrap_with_changes(transaction, changes)?;
     }
 
     let mut result = publish_repository_layout_linearized(prepared, |publication| {
@@ -1015,6 +1022,7 @@ fn seal_observed_content(
 
 fn bind_workspace_authority(
     transaction: &mut RepositoryTransaction,
+    changes: Option<&kin_db::storage::ChangeMap>,
     workspace_id: kin_model::WorkspaceId,
     workspace_seed: kin_git::GitWorkspaceSeed,
     workspace_policy: kin_model::SharedAdmissionPolicy,
@@ -1062,7 +1070,7 @@ fn bind_workspace_authority(
         // invisible inside it: the phase read as one opaque number while a
         // whole second history sat underneath.
         let _span = info_span!("kin.init.derive_workspace_semantics").entered();
-        imported_workspace_semantic_delta(transaction, &workspace_seed)?
+        imported_workspace_semantic_delta(transaction, changes, &workspace_seed)?
     };
     transaction.workspace_mutation = Some(WorkspaceMutation {
         workspace_id,
@@ -1155,6 +1163,7 @@ impl ChangeStore for BootstrapHistoryView<'_> {
 
 fn imported_workspace_semantic_delta(
     transaction: &RepositoryTransaction,
+    changes: Option<&kin_db::storage::ChangeMap>,
     workspace_seed: &kin_git::GitWorkspaceSeed,
 ) -> Result<WorkspaceSemanticDelta> {
     let Some(base_target) = &workspace_seed.base_target else {
@@ -1181,15 +1190,28 @@ fn imported_workspace_semantic_delta(
         }
     };
 
-    let history = BootstrapHistoryView::new(&transaction.changes);
-    let target = history.resolve_graph_at(&change_id).map_err(|error| {
-        KinError::Other(format!("resolve imported workspace semantics: {error}"))
-    })?;
+    let (entities, relations) = match changes {
+        Some(changes) => {
+            let target =
+                kin_db::storage::resolve_current_graph(changes, &change_id).map_err(|error| {
+                    KinError::Graph(format!("resolve imported workspace semantics: {error}"))
+                })?;
+            (target.entities, target.relations)
+        }
+        None => {
+            let target = BootstrapHistoryView::new(&transaction.changes)
+                .resolve_graph_at(&change_id)
+                .map_err(|error| {
+                    KinError::Other(format!("resolve imported workspace semantics: {error}"))
+                })?;
+            (target.entities, target.relations)
+        }
+    };
     crate::diff_workspace_semantics(
         &Default::default(),
         &Default::default(),
-        &target.entities,
-        &target.relations,
+        &entities,
+        &relations,
     )
     .map_err(|error| KinError::Other(format!("derive imported workspace semantics: {error}")))
 }
@@ -1260,7 +1282,7 @@ fn bind_historical_semantics(
     plan: kin_git::SemanticGitImportPlan,
     capture_store: &BlobStore,
 ) -> Result<kin_git::SemanticGitImportPlan> {
-    let mut fold = kin_index::HistoricalSemanticFold::new(&plan.changes)
+    let mut fold = kin_index::HistoricalSemanticFold::from_change_stream(plan.changes.iter())
         .map_err(|error| git_boundary_error("derive historical semantics", error))?;
     // Handed over rather than copied. The fold has no further use for what it
     // derived, and the plan is where those deltas are going.
@@ -2788,6 +2810,42 @@ mod tests {
             }
         }
         false
+    }
+
+    #[test]
+    fn enrichment_summary_reads_spooled_history_without_materializing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        for value in [1, 2] {
+            std::fs::write(
+                source.join("lib.rs"),
+                format!("pub fn value() -> u32 {{ {value} }}\n"),
+            )
+            .unwrap();
+            git(&source, ["add", "lib.rs"]);
+            git(&source, ["commit", "-m", "update value"]);
+        }
+        let initialized = init_from_git(&source).unwrap();
+        let binding =
+            crate::LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+        let manager = binding.open_manager().unwrap();
+        let authority = manager.read_authority();
+        assert_eq!(authority.snapshot().changes.len(), 2);
+        assert!(!authority.snapshot().changes.is_decoded());
+        let summary =
+            crate::durable_semantic_enrichment_summary(&authority, &binding.workspace_id())
+                .unwrap();
+        assert!(summary.entity_count > 0);
+        assert_eq!(summary.semantic_change_count, 2);
+        assert!(!authority.snapshot().changes.is_decoded());
+        authority.snapshot().changes.decoded().unwrap();
+        assert_eq!(
+            summary,
+            crate::durable_semantic_enrichment_summary(&authority, &binding.workspace_id())
+                .unwrap()
+        );
     }
 
     fn initialize_git(source: &Path) {
