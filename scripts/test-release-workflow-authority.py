@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import difflib
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -10573,7 +10574,34 @@ def setup_buildx_mirror_input(job_block: str, label: str) -> str:
     return "\n".join(body)
 
 
+def assert_release_probe_fixtures() -> None:
+    spec = importlib.util.spec_from_file_location("release_probes", RELEASE_VERSION_FALSIFIER)
+    assert spec is not None and spec.loader is not None
+    probes = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probes)
+    with tempfile.TemporaryDirectory() as temporary:
+        tree = probes.probe_tree(Path(temporary))
+        result = probes.run_suite(tree, probes.INTENT_SUITE)
+        assert result.returncode == 0, (
+            "release intent probe baseline failed\n" + result.stdout + result.stderr
+        )
+        for name in (
+            "resolve-release-intent.mjs",
+            "resolve-release-intent.test.mjs",
+            "release-intent-attestations.json",
+        ):
+            fixture = tree / "scripts" / name
+            original = fixture.read_bytes()
+            fixture.unlink()
+            try:
+                broken = probes.run_suite(tree, probes.INTENT_SUITE)
+                assert broken.returncode != 0, f"missing {name} did not fail the probe suite"
+            finally:
+                fixture.write_bytes(original)
+
+
 def main() -> None:
+    assert_release_probe_fixtures()
     retired = (
         "auto-tag-release.yml",
         "daemon-image.yml",
