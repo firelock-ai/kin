@@ -4629,6 +4629,7 @@ impl DaemonState {
         )
     }
 
+    #[cfg(feature = "vector")]
     fn rebind_hosted_vector_after_graph_commit(
         &self,
         backend: &dyn StorageBackend,
@@ -4669,8 +4670,7 @@ impl DaemonState {
                 .map_err(|error| error.to_string())?;
             let retrieval_authority_hash =
                 kin_db::storage::compute_retrieval_authority_hash(&query_snapshot);
-            let live_retrieval_authority_hash =
-                kin_db::storage::compute_retrieval_authority_hash(&self.graph.to_snapshot());
+            let live_retrieval_authority_hash = self.graph.retrieval_authority_hash();
             if retrieval_authority_hash != live_retrieval_authority_hash {
                 return Err(format!(
                     "committed retrieval authority {} is not the live served authority {}; vector persistence stays closed until the next coherent graph checkpoint",
@@ -10598,8 +10598,7 @@ impl DaemonState {
                 ),
             )));
         }
-        let live_retrieval_hash =
-            kin_db::storage::compute_retrieval_authority_hash(&self.graph.to_snapshot());
+        let live_retrieval_hash = self.graph.retrieval_authority_hash();
         if live_retrieval_hash != hosted.binding.retrieval_authority_hash {
             let refusal = format!(
                 "refusing durable vector artifact save: live retrieval authority {} does not match retained binding {}",
@@ -11007,6 +11006,7 @@ impl DaemonState {
         // receipt that may arrive while derived-index I/O is finishing.
         if self.storage_backend.is_some() {
             self.snapshot_generation.store(new_gen, Ordering::SeqCst);
+            #[cfg(feature = "vector")]
             if committed && new_gen != expected_gen {
                 if let Some(backend) = self.storage_backend.as_ref() {
                     // Retire the old binding immediately, then establish the
@@ -12826,6 +12826,32 @@ mod tests {
         assert_eq!(backend.vector_save_count(), 0);
     }
 
+    #[test]
+    fn hosted_vector_digest_paths_do_not_export_the_live_graph() {
+        let source = include_str!("state.rs");
+        for name in [
+            "rebind_hosted_vector_after_graph_commit",
+            "persist_hosted_vector_artifact",
+        ] {
+            let signature = format!("    fn {name}(");
+            let body = source
+                .split_once(&signature)
+                .expect("the production digest path must exist")
+                .1
+                .split("\n    fn ")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("self.graph.retrieval_authority_hash()"),
+                "{name} must use the direct served-graph digest"
+            );
+            assert!(
+                !body.contains(".to_snapshot()"),
+                "{name} must not copy unrelated graph stores to compare a vector binding"
+            );
+        }
+    }
+
     /// A vector batch can finish after a refusal is recorded and before the
     /// background worker reaches its next checkpoint. That checkpoint must
     /// release the late batch and park the drain instead of leaving the batch
@@ -14110,6 +14136,12 @@ mod tests {
         )
         .unwrap();
         let served_snapshot = served.to_snapshot();
+        #[cfg(feature = "vector")]
+        assert_eq!(
+            served.retrieval_authority_hash(),
+            query_hash,
+            "the direct digest must retain the materialized binding's adjacency semantics"
+        );
         assert_eq!(
             query_snapshot.outgoing, served_snapshot.outgoing,
             "the query snapshot must carry the exact outgoing adjacency the graph serves"
