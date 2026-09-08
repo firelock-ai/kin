@@ -4119,8 +4119,47 @@ mod tests {
 
     #[cfg(unix)]
     async fn check_reconcile_dirty_work(edit: bool, repair_layout: u8, already_dirty: bool) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Outcomes(Arc<std::sync::atomic::AtomicU64>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Outcomes {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Outcome(bool);
+                impl tracing::field::Visit for Outcome {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "outcome" {
+                            self.0 = format!("{value:?}").contains("FilePathId(\"stable.rs\")");
+                        }
+                    }
+                }
+                let mut outcome = Outcome(false);
+                event.record(&mut outcome);
+                if outcome.0 {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let controlled_outcomes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let _capture = crate::capture_events_on_this_thread(
+            tracing_subscriber::registry().with(Outcomes(Arc::clone(&controlled_outcomes))),
+        );
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
+        let canonical = repo.path().canonicalize().unwrap();
+        eprintln!(
+            "watch fixture root={} canonical={}",
+            repo.path().display(),
+            canonical.display()
+        );
+        admit_and_derive(&state, "watch-ready.rs", "pub fn waiting() {}\n");
         let original = "pub fn stable() -> u32 { 7 }\n";
         admit_and_derive(&state, "stable.rs", original);
         let file_id = FilePathId::new("stable.rs");
@@ -4182,6 +4221,45 @@ mod tests {
             RECON_IDLE,
             "the bounded startup wait must reach idle before the controlled observation"
         );
+        // Construction is not delivery. A separate file must reach graph truth
+        // before resetting the fixture; its events cannot count as stable.rs work.
+        let ready_host = repo.path().join("watch-ready.rs");
+        let ready_id = FilePathId::new("watch-ready.rs");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut acknowledged = false;
+        while Instant::now() < deadline && !runner.is_finished() {
+            std::fs::write(&ready_host, "pub fn watcher_ready() {}\n").unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            acknowledged = state
+                .graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(ready_id.clone()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .iter()
+                .any(|entity| entity.name == "watcher_ready");
+            if acknowledged && state.reconciliation_status.load(Ordering::Relaxed) == RECON_IDLE {
+                break;
+            }
+        }
+        if !acknowledged
+            || runner.is_finished()
+            || state.reconciliation_status.load(Ordering::Relaxed) != RECON_IDLE
+        {
+            cancel_tx.send(true).ok();
+            let terminated = runner.await;
+            panic!(
+                "watch readiness not acknowledged: root={}, status={}, runner={terminated:?}",
+                canonical.display(),
+                state.reconciliation_status.load(Ordering::Relaxed)
+            );
+        }
+        eprintln!(
+            "watch readiness acknowledged: root={}, status={}",
+            canonical.display(),
+            state.reconciliation_status.load(Ordering::Relaxed)
+        );
         // Settle fixture work through the normal persistence boundary before
         // attributing anything to the controlled notification.
         state.save_snapshot().unwrap();
@@ -4209,6 +4287,7 @@ mod tests {
             .registered(crate::background_work::PASS_RECONCILE)
             .unwrap();
         let before = pass.progress();
+        let before_controlled = controlled_outcomes.load(Ordering::Relaxed);
         let content = if edit {
             "pub fn changed() -> u32 { 8 }\n"
         } else {
@@ -4216,14 +4295,24 @@ mod tests {
         };
         std::fs::write(&host, content).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while pass.progress() <= before && Instant::now() < deadline {
+        while (pass.progress() <= before
+            || controlled_outcomes.load(Ordering::Relaxed) <= before_controlled)
+            && Instant::now() < deadline
+            && !runner.is_finished()
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        cancel_tx.send(true).unwrap();
-        runner.await.unwrap().unwrap();
+        let finished_before_cancel = runner.is_finished();
+        cancel_tx.send(true).ok();
+        let terminated = runner.await;
+        eprintln!("watch controlled observation: root={}, progress={before}->{}, outcomes={before_controlled}->{}, status={}, early_exit={finished_before_cancel}, runner={terminated:?}",
+            canonical.display(), pass.progress(), controlled_outcomes.load(Ordering::Relaxed),
+            state.reconciliation_status.load(Ordering::Relaxed));
+        terminated.unwrap().unwrap();
         assert!(
-            pass.progress() > before,
-            "the real watcher must process the controlled write"
+            pass.progress() > before
+                && controlled_outcomes.load(Ordering::Relaxed) > before_controlled,
+            "the real watcher must reconcile stable.rs after the controlled write"
         );
         assert_eq!(state.is_dirty(), edit || repair_layout != 0 || already_dirty,
             "an identical settled notification must not create dirty work; edits, layout repairs and existing dirty work must remain dirty");
