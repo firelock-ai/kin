@@ -89,15 +89,11 @@ impl SemanticChangeSpool {
             return Ok(None);
         };
         let path = self.0.file.path();
-        // Keep pathname disappearance and replacement observable even though
-        // positioned reads use the original held file on Unix.
-        let metadata = std::fs::metadata(path).map_err(|error| GitError::io(path, error))?;
-        if metadata.len() != self.0.bytes {
-            return Err(invalid("history spool length changed"));
-        }
         #[cfg(unix)]
-        let file = {
+        let (file, metadata) = {
             use std::os::unix::fs::MetadataExt;
+            // Authenticate the pathname before reading from the held file.
+            let metadata = std::fs::metadata(path).map_err(|error| GitError::io(path, error))?;
             let held = self
                 .0
                 .file
@@ -107,7 +103,7 @@ impl SemanticChangeSpool {
             if (metadata.dev(), metadata.ino()) != (held.dev(), held.ino()) {
                 return Err(invalid("history spool file replaced"));
             }
-            self.0.file.as_file()
+            (self.0.file.as_file(), metadata)
         };
         #[cfg(windows)]
         let reopened = self
@@ -116,7 +112,15 @@ impl SemanticChangeSpool {
             .reopen()
             .map_err(|error| GitError::io(path, error))?;
         #[cfg(windows)]
-        let file = &reopened;
+        let (file, metadata) = (
+            &reopened,
+            reopened
+                .metadata()
+                .map_err(|error| GitError::io(path, error))?,
+        );
+        if metadata.len() != self.0.bytes {
+            return Err(invalid("history spool length changed"));
+        }
         let len = usize::try_from(record.len)
             .map_err(|_| invalid("record length exceeds address space"))?;
         let mut bytes = vec![0; len];
