@@ -1,6 +1,34 @@
 {
   "allowlist": [
     {
+      "file": "crates/kin-cli/src/commands/recovery_carrier.rs",
+      "reason": "Explicit recovery input/output boundary. These helpers copy and verify a caller-selected frozen repository state into an outside carrier or an absent restore destination. Filesystem hashes establish artifact completeness, never semantic query answers; native authority, roots and referenced content are validated through KinDB before publication. Only the recovery boundary functions are exempt.",
+      "owner": "kin-cli",
+      "expiration": "2027-01-29",
+      "allow_match": [
+        "use std::fs::{self, File, OpenOptions};",
+        "use cap_std::fs::Dir;"
+      ],
+      "allow_fn": [
+        "ensure_directory_identity",
+        "open_directory",
+        "open_sync_directory",
+        "open_regular",
+        "open_regular_at",
+        "digest_open_file",
+        "inventory",
+        "write_new",
+        "sync_directory",
+        "publish_absent",
+        "copy_checked",
+        "publish",
+        "validate",
+        "verify_staged_authority",
+        "refuse_path_bound_recovery",
+        "restore"
+      ]
+    },
+    {
       "file": "crates/kin-cli/src/capability.rs",
       "reason": "Hardware check: reads /proc/meminfo for system stats",
       "owner": "kin-cli",

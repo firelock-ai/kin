@@ -291,29 +291,58 @@ against your checkout.
 
 ### What survives if you have to rebuild the store
 
-An upcoming release changes Kin's on-disk repo format, and a store created
-before it will not open afterward. Your working tree is never touched, so
-nothing you have on disk is at risk.
+Keep `.kin` intact when a binary refuses its format. Open it with the Kin
+version that created it and preserve a complete backup outside `.kin` before
+attempting recovery. Working files alone cannot restore native history.
 
-What a rebuild recovers depends on where the work came from. Kin writes `.kin`
-and reads `.git`, so deleting the store cannot touch Git history: if you
-admitted this repository from Git, the recovery path is `kin init` again, and it
-is tested. Measured on 0.7.3 against a 261-commit repository, deleting `.kin`
-and re-running `kin init` returned all 261 commits, all 61 refs and every tag,
-each pointing at the same object as before. Keep the `Repository:` id that
-`kin init` printed, though. A rebuild mints a new one and every exact-transfer
-surface is bound to it, so a store that has ever pushed to a Kin remote needs
-`kin init --adopt-repository-id <ID>` to push where the old one could.
+Git can reconstruct the history and refs it holds, but a Git-admitted
+repository can also contain work recorded only in Kin. Re-initialization loses
+that native state and mints a new repository and workspace identity. Record
+the `Repository:` id as well: `kin init --adopt-repository-id <ID>` can preserve
+the repository identity when admitting a separate replica. It does not restore
+native changes or the original workspace identity.
 
-Work that only ever lived in Kin is a different question, because Git never had
-it. `kin commit` records in Kin authority and not in Git, and native commits,
-Kin branches, reviews and specs all live in `.kin` and go when it goes. Today
-the only way to carry any of it out is `kin git export --output <dir>`, which
-writes every imported commit, every ref and your native commits into a fresh Git
-repository. It carries no review, no spec and no entity history, and it refuses
-a destination that already exists, so treat it as a way out rather than as a
-backup. The format change will ship together with an upgrade command that
-carries native state forward, or it will not ship.
+Drafts, native commits, Kin branches, reviews and specs live in `.kin`.
+Use a complete recovery carrier to preserve them, including repository and
+workspace identities, native parentage, referenced content and remote configuration:
+
+```bash
+kin backup create --output /existing-safe-directory/recovery-backup
+mkdir /new-working-directory
+kin backup restore --from /existing-safe-directory/recovery-backup --target /new-working-directory/.kin
+```
+
+The backup destination must not exist and must be outside `.kin`. Without
+`--output`, backups go into a repository-specific `.kin-backups-<identity-hash>`
+directory outside the working tree; `kin backup list` lists those carriers and
+marks corrupt entries explicitly. If the original repository is unavailable,
+use `kin backup list --directory <backup-directory>`. Restore requires an existing destination working
+directory at a different path from the original and an absent `.kin`. The
+carrier records the original location to enforce that rule. It validates file checksums, identity, native
+authority, referenced content and roots before publication. It never replaces
+an existing repository. A failed staged restore leaves the backup intact and
+does not publish a partial destination.
+
+For an upgrade, keep the original store and its matching binary. Make a carrier,
+then use the newer binary to restore it into a separate working directory and
+check that copy before switching. Compatible older storage remains readable;
+an unsupported format is refused without deleting or re-initializing the source.
+This is not a conversion through Git. `kin git export` does not carry reviews,
+specs or all native authority and is not a recovery backup.
+
+Native authority and source content cannot be discarded. Search indexes and
+other derived caches can be rebuilt, but a rebuilt index cannot recreate native
+history. Restore omits old daemon endpoint, token and process-lock files so the
+new location does not reuse the original daemon's normal discovery route. An
+explicit `KIN_DAEMON_URL` override remains the operator's responsibility. The carrier retains those
+regular files as evidence. Reconciliation authority keys remain intact. Pending
+path-bound reconciliation transactions or exact-eject journals cause backup and
+restore to refuse; preserve the original and recover it with its matching binary
+first.
+
+The carrier conservatively copies regular state files; empty directories
+and runtime sockets are not native authority. A socket or unsupported special file
+in the input is refused rather than followed or silently omitted.
 
 ### Profiling a slow command
 

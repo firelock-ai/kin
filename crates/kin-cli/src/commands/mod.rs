@@ -68,6 +68,7 @@ pub mod projection;
 pub mod publish;
 pub mod purge_ignored;
 pub mod reconcile;
+mod recovery_carrier;
 pub mod ref_grammar;
 pub mod ref_lookup;
 pub mod refs;
@@ -170,27 +171,24 @@ pub(crate) fn not_a_kin_repository() -> anyhow::Error {
 
 /// The one remedy for a `.kin/` store this build cannot open.
 ///
-/// Two messages have to agree on it. The store wall sends the reader to
-/// `kin init`, and `kin init` refuses over an existing store, so a refusal that
-/// named a different path would send the reader in a circle. The consistency
-/// test in `commands::init` holds both texts against this token.
-pub(crate) const REBUILD_INCOMPATIBLE_STORE: &str = "remove .kin/ and run `kin init`";
+/// Store compatibility and initialization refusals share this preservation
+/// instruction, including repositories that contain both Git and native work.
+pub(crate) const REBUILD_INCOMPATIBLE_STORE: &str =
+    "keep .kin/ intact and open it with the Kin version that wrote it";
 
-/// The wall a store written by an older kin is refused with.
-///
-/// The version gap leads, because it is the whole reason nothing else will
-/// work. There is no in-place upgrade and no migration command, so the remedy
-/// is the rebuild the reader can actually perform, and the case where that
-/// rebuild has no source to draw on is named rather than left to be discovered.
+/// Explain an unsupported store version without suggesting destructive recovery.
 pub(crate) fn incompatible_store_refusal(
     kin_root: &std::path::Path,
     error: &kin_core::KinError,
 ) -> String {
     format!(
-        "{error} ({})\nAn older kin wrote this store and there is no in-place upgrade. Kin \
-         re-derives the store from the repository's Git history, so {REBUILD_INCOMPATIBLE_STORE} \
-         here to rebuild it. If the repository has no Git history to re-admit, keep a copy of \
-         .kin/ and open it with the kin that wrote it.",
+        "{error} ({})\nThis build cannot serve this store. {REBUILD_INCOMPATIBLE_STORE}. \
+         Preserve a complete backup outside .kin/ before attempting recovery. Git history \
+         does not preserve native Kin changes, branches, reviews, specs, audit records, \
+         workspace identity or remote configuration, even in a Git-admitted repository. \
+         Re-initialization cannot recover that state. Save the repository identity too: \
+         `kin init --adopt-repository-id <ID>` can retain that identity for a separately \
+         admitted replica, but does not restore native history.",
         kin_root.display()
     )
 }
@@ -198,6 +196,25 @@ pub(crate) fn incompatible_store_refusal(
 #[cfg(test)]
 mod repository_refusal_tests {
     use super::{require_repository_layout_at, NOT_A_KIN_REPOSITORY};
+
+    #[test]
+    fn incompatible_stores_preserve_native_work_even_with_git_history() {
+        for found in [1, 3] {
+            let message = super::incompatible_store_refusal(
+                std::path::Path::new("/repo/.kin"),
+                &kin_core::KinError::IncompatibleVersion {
+                    found,
+                    supported: 2,
+                },
+            );
+            assert!(message.contains(&format!("found v{found}")));
+            assert!(message.contains("keep .kin/ intact"));
+            assert!(message.contains("even in a Git-admitted repository"));
+            assert!(message.contains("does not restore native history"));
+            assert!(!message.contains("remove .kin"));
+            assert!(!message.contains("An older kin"));
+        }
+    }
 
     #[test]
     fn refusing_outside_a_repository_names_the_command_that_creates_one() {
