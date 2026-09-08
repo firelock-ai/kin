@@ -12773,8 +12773,52 @@ fn open_hosted_repository_mcp_view_blocking(
     unreachable!("bounded hosted authority open either returns or reports its second race")
 }
 
+fn resolve_hosted_repository_hydration_timeout(raw: Option<&str>) -> Duration {
+    let seconds = raw
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(300);
+    Duration::from_secs(seconds)
+}
+
+fn hosted_repository_hydration_timeout() -> Duration {
+    resolve_hosted_repository_hydration_timeout(
+        std::env::var("KIN_DAEMON_HOSTED_HYDRATION_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
 async fn run_hosted_repository_hydration<T: Send + 'static>(
     slots: Arc<tokio::sync::Semaphore>,
+    repo_id: &str,
+    hydrate: impl FnOnce() -> std::result::Result<T, RepoScopedMcpFailure> + Send + 'static,
+) -> std::result::Result<T, RepoScopedMcpFailure> {
+    run_hosted_repository_hydration_within(
+        slots,
+        hosted_repository_hydration_timeout(),
+        repo_id,
+        hydrate,
+    )
+    .await
+}
+
+/// Admit one cold hydration against `slots`, bounded in time as well as in count.
+///
+/// A detached supervisor owns the permit, not the caller and not the blocking
+/// worker. That placement answers both failure directions at once. Cancelling
+/// the request drops only the caller's half, so an aborted HTTP request cannot
+/// hand a still-running worker's slot to a second one. A worker that never
+/// returns cannot strand the slot either: `budget` elapses, the supervisor
+/// releases the permit and answers a typed refusal, and the abandoned thread
+/// finishes on tokio's much larger blocking pool with its result discarded.
+/// Putting the timeout on the caller's await instead would answer the request
+/// and leak the permit, because dropping a `spawn_blocking` join handle detaches
+/// the thread rather than stopping it, and two such hangs would refuse every
+/// later cold request for the life of the process.
+async fn run_hosted_repository_hydration_within<T: Send + 'static>(
+    slots: Arc<tokio::sync::Semaphore>,
+    budget: Duration,
     repo_id: &str,
     hydrate: impl FnOnce() -> std::result::Result<T, RepoScopedMcpFailure> + Send + 'static,
 ) -> std::result::Result<T, RepoScopedMcpFailure> {
@@ -12787,21 +12831,48 @@ async fn run_hosted_repository_hydration<T: Send + 'static>(
         )
     })?;
     let error_repo_id = repo_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        // Cancellation of the request cannot stop a running blocking worker.
-        // Admission belongs to that worker until hydration and retries finish.
-        let _permit = permit;
-        hydrate()
-    })
-    .await
-    .map_err(|error| {
-        RepoScopedMcpFailure::new(
+    let supervisor_repo_id = error_repo_id.clone();
+    let worker = tokio::task::spawn_blocking(hydrate);
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let answer = match tokio::time::timeout(budget, worker).await {
+            Ok(Ok(hydrated)) => hydrated,
+            Ok(Err(error)) => Err(RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_authority_unavailable",
+                format!("repository {supervisor_repo_id} authority worker failed: {error}"),
+                true,
+            )),
+            Err(_) => {
+                warn!(
+                    repo_id = %supervisor_repo_id,
+                    budget_secs = budget.as_secs(),
+                    "hosted repository hydration exceeded its admission budget; releasing the slot and abandoning the worker"
+                );
+                Err(RepoScopedMcpFailure::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repo_hydration_timeout",
+                    format!(
+                        "repository {supervisor_repo_id} hydration exceeded its {}s admission budget; retry later",
+                        budget.as_secs()
+                    ),
+                    true,
+                ))
+            }
+        };
+        // Release admission before answering, so a caller that observes its own
+        // result also observes the slot that result vacated.
+        drop(permit);
+        let _ = answer_tx.send(answer);
+    });
+    answer_rx.await.unwrap_or_else(|_| {
+        Err(RepoScopedMcpFailure::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "repo_authority_unavailable",
-            format!("repository {error_repo_id} authority worker failed: {error}"),
+            format!("repository {error_repo_id} hydration supervisor ended without an answer"),
             true,
-        )
-    })?
+        ))
+    })
 }
 
 async fn load_hosted_repository_mcp_view(
@@ -25758,6 +25829,65 @@ mod tests {
         assert_eq!(slots.available_permits(), 2);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hosted_hydration_overrunning_its_budget_releases_admission() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let budget = Duration::from_millis(150);
+        let worker_starts = Arc::clone(&starts);
+        // The caller's own bound is what turns a stranded permit into a red
+        // assertion instead of a hang: without the admission budget this await
+        // never returns, because a blocking worker cannot be cancelled.
+        let refused = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_hosted_repository_hydration_within(
+                Arc::clone(&slots),
+                budget,
+                "stalled",
+                move || {
+                    worker_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // A hydration that does not return on its own, standing in
+                    // for a backend read that never completes.
+                    let _ = release_rx.blocking_recv();
+                    Ok::<(), RepoScopedMcpFailure>(())
+                },
+            ),
+        )
+        .await
+        .expect("a stalled hydration worker must not hold its caller past the admission budget")
+        .unwrap_err();
+
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.code, "repo_hydration_timeout");
+        assert!(refused.retryable);
+        // The stranded permit is the defect this guards. The worker is still
+        // running; the slot it was holding must already be admitting again.
+        assert_eq!(slots.available_permits(), 2);
+        run_hosted_repository_hydration_within(Arc::clone(&slots), budget, "successor", || Ok(()))
+            .await
+            .expect("a cold request must be admitted once the budget reclaims the slot");
+
+        // Let the abandoned worker finish so the runtime can shut down.
+        let _ = release_tx.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hosted_hydration_within_budget_answers_the_worker_not_the_deadline() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let hydrated = run_hosted_repository_hydration_within(
+            Arc::clone(&slots),
+            Duration::from_secs(20),
+            "prompt",
+            || Ok(7_u32),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hydrated, 7);
+        assert_eq!(slots.available_permits(), 2);
+    }
+
     #[tokio::test]
     async fn hosted_hydration_warm_cache_bypasses_busy_cold_admission() {
         let slots = hosted_repository_hydrations();
@@ -31053,6 +31183,30 @@ mod tests {
         assert_eq!(
             resolve_scope_build_timeout(Some("12")),
             Duration::from_secs(12)
+        );
+    }
+
+    #[test]
+    fn hosted_repository_hydration_timeout_defaults_and_rejects_invalid_values() {
+        assert_eq!(
+            resolve_hosted_repository_hydration_timeout(None),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            resolve_hosted_repository_hydration_timeout(Some("")),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            resolve_hosted_repository_hydration_timeout(Some("0")),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            resolve_hosted_repository_hydration_timeout(Some("nonsense")),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            resolve_hosted_repository_hydration_timeout(Some("45")),
+            Duration::from_secs(45)
         );
     }
 
