@@ -30,6 +30,11 @@
       "sha": "8525c7751716b1c5304cd2d62da1aa8235e2e077",
       "intent": "patch",
       "reason": "FIR-3412: This immutable squash commit explicitly records Kin-Release-Intent: patch before the divider preceding its sign-off. Git parses only Signed-off-by. Attest the recorded patch intent without changing history or accepting malformed evidence implicitly."
+    },
+    {
+      "sha": "48bafa7911ccde08f64c14a002a8a991ffefd7a2",
+      "intent": "patch",
+      "reason": "FIR-3412: The immutable squash commit records an explicit patch intent adjacent to its first sign-off, but a second sign-off follows a blank line. Git parses only that final sign-off. Attest the recorded patch intent without changing history or relaxing footer validation."
     }
   ]
 }
