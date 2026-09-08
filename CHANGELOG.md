@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-09-08
+
+### Changed
+
+- Replace retired canon lines in README with the unified packet's (#1591)
+
+
 ## [0.7.4] - 2026-09-07
 
 **How a repo-format change affects your work.** 0.7.3 does not change Kin's on-disk repo format. An upcoming release will, and a store created before it will not open afterward. Your working tree is never touched.
