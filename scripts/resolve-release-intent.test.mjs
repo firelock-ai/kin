@@ -177,6 +177,8 @@ test('the committed historical attestation binds only the recorded full SHA', ()
     '72414aa80531e7adee1ab360eacb28d56a621c6a',
     '9e45cc6c89b12c72e519c86517ac38a8a79a7cea',
     'c67efaa2c737ab0b7ac15d0057c8a3ec5a8041cc',
+    '1b11fda4c870245f2575363adcf1031699580969',
+    '8525c7751716b1c5304cd2d62da1aa8235e2e077',
   ]) {
     const entry = document.attestations.find(({ sha }) => sha === expected);
     assert.equal(entry?.intent, 'patch', expected);
