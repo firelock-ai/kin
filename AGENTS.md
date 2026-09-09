@@ -83,9 +83,10 @@ fleet's login shell hits a VFS wrapper function that shadows the product binary.
 
 **The release version lives in several files at once,** and `scripts/release-intent.mjs` with
 `scripts/check-release-version.mjs` are what hold them in lockstep; the `Release version gate` job
-runs them on every PR. Its `classifyPath` treats `.github/`, `docs/`, `AGENTS.md`, `CLAUDE.md`, any
-markdown, and anything under a test or fixture directory as non-release, so a docs-only change needs
-no bump.
+runs them on pull requests from `automation/release-next` or labelled `release:automated`, and an
+ordinary pull request is not graded by it. Its `classifyPath` treats `.github/`, `docs/`,
+`AGENTS.md`, `CLAUDE.md`, any markdown, and anything under a test or fixture directory as
+non-release, so a docs-only change needs no bump.
 
 ## Landing
 
