@@ -1713,10 +1713,79 @@ fn shallow_tracked_file(shallow: kin_parser::ShallowFile) -> ShallowTrackedFile 
     }
 }
 
+/// Whether persisting one non-entity enrichment record actually wrote it.
+///
+/// The distinction is not bookkeeping. kin-db's three artifact upserts each end
+/// in `invalidate_artifact_for_embedding`, which REMOVES the artifact's vector
+/// and re-queues it, so a rewrite is destructive rather than idempotent. A
+/// caller handed one of these unchanged records on every tick leaves an artifact
+/// key that embedding coverage counts and that can never keep a vector, while
+/// every counter sits still. That is the cost #1626 introduced and #1630 removed
+/// for a path that is not entity source BY NAME; this is the same cost for a
+/// source-named path whose BYTES are not source, which name classification
+/// cannot see and which therefore still reaches the drain on every tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnrichmentPersistence {
+    /// The record was written, so the artifact's vector was discarded.
+    Written,
+    /// The stored record already described these exact bytes, so nothing was
+    /// written and the artifact kept whatever vector it had.
+    AlreadyCurrent,
+}
+
+/// Whether the stored record already says everything the fresh one would.
+///
+/// Compared field by field rather than on `content_hash` alone, and that is the
+/// point rather than caution. Equal bytes are not by themselves equal records: a
+/// pipeline that changes how a preview or a kind is derived produces a different
+/// record for the same hash, and a skip keyed on the hash would leave that stale
+/// record standing with no later tick able to repair it. Comparing every field
+/// makes the skipped write provably a no-op, because the write it avoids would
+/// have stored exactly what is stored.
+fn shallow_file_is_current(stored: &ShallowTrackedFile, fresh: &ShallowTrackedFile) -> bool {
+    stored.file_id == fresh.file_id
+        && stored.language_hint == fresh.language_hint
+        && stored.declaration_count == fresh.declaration_count
+        && stored.import_count == fresh.import_count
+        && stored.syntax_hash == fresh.syntax_hash
+        && stored.signature_hash == fresh.signature_hash
+        && stored.declaration_names == fresh.declaration_names
+        && stored.import_paths == fresh.import_paths
+}
+
+/// The same whole-record comparison for a structured artifact.
+fn structured_artifact_is_current(
+    stored: &kin_model::StructuredArtifact,
+    fresh: &kin_model::StructuredArtifact,
+) -> bool {
+    stored.file_id == fresh.file_id
+        && stored.kind == fresh.kind
+        && stored.content_hash == fresh.content_hash
+        && stored.text_preview == fresh.text_preview
+}
+
+/// The same whole-record comparison for an opaque artifact.
+fn opaque_artifact_is_current(
+    stored: &kin_model::OpaqueArtifact,
+    fresh: &kin_model::OpaqueArtifact,
+) -> bool {
+    stored.file_id == fresh.file_id
+        && stored.content_hash == fresh.content_hash
+        && stored.mime_type == fresh.mime_type
+        && stored.text_preview == fresh.text_preview
+}
+
+/// Persist one non-entity enrichment record, additively.
+///
+/// Incompatible facets are cleared unconditionally, because an entity layout
+/// left beside a current artifact record is a real repair and skipping it would
+/// trade one defect for another. Only the write is conditional: a record that
+/// already describes these exact bytes is left alone, so the artifact keeps its
+/// vector and the drain stops churning a store that never commits.
 fn persist_non_entity_enrichment(
     state: &DaemonState,
     indexed: IndexedAny,
-) -> Result<(FilePathId, FacetCleanup)> {
+) -> Result<(FilePathId, FacetCleanup, EnrichmentPersistence)> {
     match indexed {
         IndexedAny::EntitySource(_) => Err(DaemonError::Io(std::io::Error::other(
             "entity source reached non-entity enrichment path",
@@ -1725,8 +1794,19 @@ fn persist_non_entity_enrichment(
             let shallow = shallow_tracked_file(shallow);
             let cleanup =
                 clear_incompatible_facets(state, &shallow.file_id, EnrichmentFacet::ShallowSyntax)?;
+            if state
+                .graph
+                .get_shallow_file(&shallow.file_id)?
+                .is_some_and(|stored| shallow_file_is_current(&stored, &shallow))
+            {
+                return Ok((
+                    shallow.file_id,
+                    cleanup,
+                    EnrichmentPersistence::AlreadyCurrent,
+                ));
+            }
             state.graph.upsert_shallow_file(&shallow)?;
-            Ok((shallow.file_id, cleanup))
+            Ok((shallow.file_id, cleanup, EnrichmentPersistence::Written))
         }
         IndexedAny::StructuredArtifact(artifact) => {
             let cleanup = clear_incompatible_facets(
@@ -1734,8 +1814,19 @@ fn persist_non_entity_enrichment(
                 &artifact.file_id,
                 EnrichmentFacet::StructuredArtifact,
             )?;
+            if state
+                .graph
+                .get_structured_artifact(&artifact.file_id)?
+                .is_some_and(|stored| structured_artifact_is_current(&stored, &artifact))
+            {
+                return Ok((
+                    artifact.file_id,
+                    cleanup,
+                    EnrichmentPersistence::AlreadyCurrent,
+                ));
+            }
             state.graph.upsert_structured_artifact(&artifact)?;
-            Ok((artifact.file_id, cleanup))
+            Ok((artifact.file_id, cleanup, EnrichmentPersistence::Written))
         }
         IndexedAny::OpaqueArtifact(artifact) => {
             let cleanup = clear_incompatible_facets(
@@ -1743,8 +1834,19 @@ fn persist_non_entity_enrichment(
                 &artifact.file_id,
                 EnrichmentFacet::OpaqueArtifact,
             )?;
+            if state
+                .graph
+                .get_opaque_artifact(&artifact.file_id)?
+                .is_some_and(|stored| opaque_artifact_is_current(&stored, &artifact))
+            {
+                return Ok((
+                    artifact.file_id,
+                    cleanup,
+                    EnrichmentPersistence::AlreadyCurrent,
+                ));
+            }
             state.graph.upsert_opaque_artifact(&artifact)?;
-            Ok((artifact.file_id, cleanup))
+            Ok((artifact.file_id, cleanup, EnrichmentPersistence::Written))
         }
     }
 }
@@ -1828,7 +1930,11 @@ pub(crate) fn ensure_non_entity_enrichment_coverage(state: &DaemonState) -> Resu
 
         match pipeline.index_any_content(&file_id, &content, hash) {
             Ok(indexed) => match persist_non_entity_enrichment(state, indexed) {
-                Ok(_) => created += 1,
+                // The guard above admits only paths carrying no facet at all,
+                // so this pass always writes. Counting the write rather than
+                // the call keeps `created` honest if that guard ever loosens.
+                Ok((_, _, EnrichmentPersistence::Written)) => created += 1,
+                Ok((_, _, EnrichmentPersistence::AlreadyCurrent)) => {}
                 Err(error) => warn!(
                     file = %file_id,
                     error = %error,
@@ -3568,7 +3674,10 @@ pub async fn run_loop_armed(
                     if classification != FileClassification::EntitySource {
                         match enrichment_pipeline.index_any_content(&file_id, &content, blob_hash) {
                             Ok(indexed) => match persist_non_entity_enrichment(&state, indexed) {
-                                Ok((file_id, cleanup)) => {
+                                // The admission that reached here moved the
+                                // tree, so this arm reports a graph change
+                                // whether or not the facet needed rewriting.
+                                Ok((file_id, cleanup, _)) => {
                                     for id in cleanup.removed_entities {
                                         state.emit_event(DaemonEvent::EntityChanged {
                                             entity_id: id,
@@ -4138,6 +4247,7 @@ mod tests {
     use std::path::PathBuf;
 
     include!("loop_runner/tests/startup_recovery.rs");
+    include!("loop_runner/tests/enrichment_churn.rs");
 
     #[test]
     fn partial_c_disclosure_persists_and_only_clean_outcomes_settle() {
@@ -10068,7 +10178,8 @@ pub(crate) async fn readmit_semantics_for_paths(
         if classification != FileClassification::EntitySource {
             match enrichment_pipeline.index_any_content(&file_id, &content, body_hash) {
                 Ok(indexed) => match persist_non_entity_enrichment(state, indexed) {
-                    Ok((persisted, cleanup)) => {
+                    Ok((persisted, cleanup, persistence)) => {
+                        let cleanup_changed = cleanup.changed;
                         for id in cleanup.removed_entities {
                             state.emit_event(DaemonEvent::EntityChanged {
                                 entity_id: id,
@@ -10078,7 +10189,18 @@ pub(crate) async fn readmit_semantics_for_paths(
                                 session_id: None,
                             });
                         }
-                        graph_changed = true;
+                        // This is the repeating caller. A debt entry is settled
+                        // only by a commit, so on a store that never commits
+                        // every tick hands the same unchanged paths back here.
+                        // Claiming a graph change for a record nothing wrote
+                        // bumps the VFS version, retires every client's cached
+                        // materialization and arms a persistence pass, all for a
+                        // graph that did not move.
+                        graph_changed |=
+                            cleanup_changed || persistence == EnrichmentPersistence::Written;
+                        // Counted as readmitted either way: the caller asked
+                        // whether this path's semantics now describe its bytes,
+                        // and they do. Only `failed` means they do not.
                         outcome.enriched += 1;
                     }
                     Err(error) => {
@@ -10560,7 +10682,9 @@ async fn sync_filesystem_with_graph_publishing_inner(
                 if classification != FileClassification::EntitySource {
                     match enrichment_pipeline.index_any_content(&file_id, &content, blob_hash) {
                         Ok(indexed) => match persist_non_entity_enrichment(state, indexed) {
-                            Ok((file_id, cleanup)) => {
+                            // As above: the tree moved to get here, so the
+                            // change is reported whatever the facet needed.
+                            Ok((file_id, cleanup, _)) => {
                                 for id in cleanup.removed_entities {
                                     state.emit_event(DaemonEvent::EntityChanged {
                                         entity_id: id,
