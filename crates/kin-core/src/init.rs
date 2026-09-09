@@ -818,6 +818,8 @@ pub fn prepare_repository_layout_with_origin(
     crate::init_attempt::report_reclaimed_stages(reclaimed.recovered, reclaimed.retained);
 
     create_private_staging_root(&staging_root)?;
+    #[cfg(all(test, unix))]
+    park_at_stage_creation_barrier(&staging_root);
     let layout = KinLayout::new(staging_root);
     let stage_lease = match create_repository_init_stage_lease(
         layout.root(),
@@ -919,6 +921,22 @@ fn create_private_staging_root(staging_root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn park_at_stage_creation_barrier(stage: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Some(barrier) = std::env::var_os("KIN_INIT_STAGE_CREATION_TEST_BARRIER") else {
+        return;
+    };
+    let barrier = PathBuf::from(barrier);
+    let publishing = barrier.with_extension("publishing");
+    std::fs::write(&publishing, stage.as_os_str().as_bytes()).unwrap();
+    std::fs::rename(&publishing, &barrier).unwrap();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 /// Create and bind the local authority backend for one unpublished repository.

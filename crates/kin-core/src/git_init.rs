@@ -1828,6 +1828,65 @@ mod tests {
         let _ = init_from_git(Path::new(&source));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_init_killed_before_stage_owner_publication_is_reclaimed() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let held = match std::env::var_os("KIN_STAGE_INTERRUPTION_KEEP_ROOT") {
+            Some(parent) => tempfile::tempdir_in(parent).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let root = held.path().canonicalize().unwrap();
+        let _automatic_cleanup = if std::env::var_os("KIN_STAGE_INTERRUPTION_KEEP_ROOT").is_some() {
+            let _ = held.keep();
+            None
+        } else {
+            Some(held)
+        };
+        eprintln!("stage interruption evidence: {}", root.display());
+        let source = root.join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        let original = b"exact source survives interrupted staging\n";
+        std::fs::write(source.join("README.md"), original).unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+
+        let barrier = root.join("stage-created");
+        let mut child = ParkedChild::spawn(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("git_init::tests::interrupted_init_subprocess")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env("KIN_INIT_INTERRUPTED_TEST_SOURCE", &source)
+                .env("KIN_INIT_STAGE_CREATION_TEST_BARRIER", &barrier),
+        );
+        let stage = wait_for_capture_barrier(&barrier, &mut child);
+        let stage_name = stage.file_name().unwrap().to_string_lossy();
+        let owner = stage.with_file_name(format!("{stage_name}.owner"));
+        let before = format!("stage={}\nowner_exists={}\nstage_entries={}\n",
+            stage.display(), owner.exists(), std::fs::read_dir(&stage).unwrap().count());
+        std::fs::write(root.join("before-kill.txt"), &before).unwrap();
+        eprintln!("{before}");
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+        assert_eq!(child.wait().signal(), Some(libc::SIGKILL));
+        assert!(!source.join(".kin").exists());
+        let attempts = crate::init_attempt::abandoned_init_attempts(&root).unwrap();
+        assert_eq!(attempts.len(), 1);
+        let record = attempts[0].record.as_ref().unwrap();
+        assert_eq!(record.phase_index, 8);
+        std::fs::write(root.join("interrupted-record.json"), serde_json::to_vec_pretty(record).unwrap()).unwrap();
+        init_from_git(&source).unwrap();
+        assert_eq!(std::fs::read(source.join("README.md")).unwrap(), original);
+        assert!(source.join(".kin").exists());
+        let after = format!("stage_exists={}\nowner_exists={}\n", stage.exists(), owner.exists());
+        std::fs::write(root.join("after-rerun.txt"), &after).unwrap();
+        eprintln!("{after}");
+        assert!(!stage.exists(), "interrupted pre-owner stage survived: {}", stage.display());
+        assert_no_staging_directories(&root);
+    }
+
     /// An init the kernel could kill leaves a post-mortem the next one reads.
     ///
     /// `SIGKILL` is the case, not `SIGTERM`: a signal Kin can catch already
