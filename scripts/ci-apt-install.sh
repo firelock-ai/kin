@@ -40,6 +40,9 @@ drop_azure_mirror() {
   fi
 }
 
+# The runner image preinstalls a Google Chrome apt source this script never needs; when dl.google.com regenerates its Release file mid-fetch every mirror serves a stale, hash-mismatched Packages.gz, and no attempt or mirror swap below clears it, so the list is dropped once before the first update.
+sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+
 for attempt in 1 2 3; do
   if [ "$attempt" -ge 2 ]; then
     echo "apt attempt $attempt: dropping the azure mirror in favour of archive.ubuntu.com" >&2
