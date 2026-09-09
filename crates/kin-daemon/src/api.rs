@@ -18287,10 +18287,15 @@ fn enrichment_unavailable_reason(
 /// exactly that distinction, which is why it exists.
 async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     use std::sync::atomic::Ordering;
+    let pending = state.lsp_work.pending.load(Ordering::SeqCst);
     let total = state.lsp_sweep_files_total.load(Ordering::SeqCst);
     let done = state.lsp_sweep_files_done.load(Ordering::SeqCst);
     Json(json!({
         "running": state.lsp_sweep_running.load(Ordering::SeqCst),
+        "pending_work": pending,
+        "failed_work": state.lsp_work.failed.load(Ordering::SeqCst),
+        "merge_pending": state.lsp_sweep_pending.load(Ordering::SeqCst),
+        "worker_available": state.lsp_enrichment_tx.as_ref().is_some_and(|tx| !tx.is_closed()),
         "files_done": done,
         "files_total": total,
         // A sweep that enriched nothing and a sweep that had nothing left to

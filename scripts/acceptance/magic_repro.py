@@ -60,6 +60,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
@@ -544,6 +545,42 @@ class Suite(object):
         self._kin_commit(repo, "Add tool module")
 
     # ------------------------------------------------------------ status probes
+
+    def await_enrichment(self, repo, timeout=90):
+        """Passively wait for every admitted job, then require the fixture edge.
+
+        Polling schedules no work. A drained queue alone does not prove that
+        enrichment succeeded, so failures and the named override caller are
+        checked before any histogram is accepted.
+        """
+        with open(os.path.join(repo, ".kin", "daemon.port")) as handle:
+            port = int(handle.read().strip().splitlines()[0])
+        with open(os.path.join(repo, ".kin", "daemon.token")) as handle:
+            token = handle.read().strip()
+        endpoint = "http://127.0.0.1:%d/lsp/sweep/status" % port
+        started = time.monotonic()
+        deadline = started + timeout
+        samples = 0
+        while True:
+            request = urllib.request.Request(endpoint, headers={
+                "Authorization": "Bearer " + token})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                state = json.load(response)
+            samples += 1
+            if enrichment_drained(state):
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("enrichment did not drain in %ss: %s" % (timeout, state))
+            time.sleep(0.05)
+        payload, _ = self.mcp(repo, "find_references", {
+            "query": MIXIN_FOCAL_SEND, "relation_kinds": ["calls"]})
+        rows = reference_rows(payload)
+        expected = rows.get("SessionRedirectMixin.resolve_redirects", {})
+        if not expected.get("via_override_of"):
+            raise EnrichmentEdgeMissing("drained enrichment lacks the expected override caller: %s"
+                               % sorted(rows))
+        return "enrichment drained after %d samples in %.3fs; expected override caller present" % (
+            samples, time.monotonic() - started)
 
     def graph_status(self, repo):
         rc, out, err = self.kin_run(["graph", "status"], repo)
@@ -1924,6 +1961,25 @@ def check_9(suite):
     return res
 
 
+class EnrichmentEdgeMissing(RuntimeError):
+    pass
+
+
+def enrichment_drained(state):
+    required = ("pending_work", "failed_work", "merge_pending", "worker_available",
+                "running", "files_blocked", "languages_skipped")
+    missing = [key for key in required if key not in state]
+    if missing:
+        raise RuntimeError("enrichment status lacks completion fields: %s" % missing)
+    if not state["worker_available"]:
+        raise RuntimeError("enrichment worker is unavailable: %s" % state)
+    if state["pending_work"] or state["running"] or state["merge_pending"]:
+        return False
+    if state["failed_work"] or state["files_blocked"] or state["languages_skipped"]:
+        raise RuntimeError("enrichment drained with incomplete work: %s" % state)
+    return True
+
+
 def check_10(suite):
     """FIR-2598: a comment-only commit must not cost the graph an edge.
 
@@ -1935,6 +1991,11 @@ def check_10(suite):
     """
     res = Result("10", "FIR-2598", "a comment-only commit keeps every relation kind")
     repo = suite.fixture("mixin")
+    try:
+        res.ok(suite.await_enrichment(repo))
+    except (RuntimeError, OSError, ValueError) as exc:
+        res.unknown("enrichment readiness: %s" % exc)
+        return res
     before = suite.graph_status(repo)
     if not before["relation_kinds"]:
         res.unknown("graph status printed no relation-kind histogram to compare against")
@@ -1964,6 +2025,14 @@ def check_10(suite):
         res.unknown("the comment-only commit failed: %s" % exc)
         return res
 
+    try:
+        res.ok(suite.await_enrichment(repo))
+    except EnrichmentEdgeMissing as exc:
+        res.bad("post-commit edge loss: %s" % exc)
+        return res
+    except (RuntimeError, OSError, ValueError) as exc:
+        res.unknown("post-commit enrichment readiness: %s" % exc)
+        return res
     after = suite.graph_status(repo)
     if before["entities"] is not None and after["entities"] is not None \
             and after["entities"] < before["entities"]:
@@ -1999,6 +2068,11 @@ def check_11(suite):
     """
     res = Result("11", "FIR-2598", "the census names a kind that lost ground across a commit")
     repo = suite.fixture("mixin")
+    try:
+        res.ok(suite.await_enrichment(repo))
+    except (RuntimeError, OSError, ValueError) as exc:
+        res.unknown("enrichment readiness: %s" % exc)
+        return res
     record = os.path.join(repo, ".kin", "kindb", "relation-census")
     if not os.path.exists(record):
         res.unknown("no relation census recorded at %s after a commit" % record)
