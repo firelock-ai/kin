@@ -160,6 +160,14 @@ which judges its own output with the mint's gate before anything is published;
 the merge is deterministic because the evidence branch is append-only and a
 re-publish of differing bytes is refused as tampering.
 
+The macOS leg also runs interrupted-startup recovery against the verified
+candidate CLI and daemon from that same archive. Synthetic persisted fixtures
+cover legacy recovery and two separate uncommitted recorded-debt restarts,
+including exact debt, legitimate empty coverage and later file-watch progress.
+Fresh fixture control keys are generated locally by the candidate CLI. A
+readiness refusal or failed assertion prevents the leg record from uploading;
+probe results and daemon logs are retained even when the probe fails.
+
 **The stranger runs on a runner the fleet owns.** It cannot run on a hosted one,
 and the reason is memory rather than wall clock. `bin/kin-stranger` launches one
 background process per arm and waits on them together, and each container is

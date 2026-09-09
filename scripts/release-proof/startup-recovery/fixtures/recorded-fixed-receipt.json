@@ -1,0 +1,46 @@
+{
+  "authority_generation": 3,
+  "durable_entities": 0,
+  "empty_cas_entities": 0,
+  "legacy": false,
+  "live_entities": 0,
+  "orphan_body": "4606c3a9405e3fca4541326a2f337c4a75a1aea108fef45f73935a5a38c43487",
+  "orphan_cas_entities": 2,
+  "semantic_debt": [
+    {
+      "body": "4606c3a9405e3fca4541326a2f337c4a75a1aea108fef45f73935a5a38c43487",
+      "path": "orphan.py"
+    },
+    {
+      "body": "0cbcf8e504eee2fe771a543f161fddd92bc280654a5ce78f46f5fc8828230b42",
+      "path": "empty.pyi"
+    },
+    {
+      "body": "34a1dcc6016547f2e309a65ba900b08d707f9551c2699e187d45dc738d558704",
+      "path": "sentinel.py"
+    }
+  ],
+  "files": {
+    "orphan.py": "4606c3a9405e3fca4541326a2f337c4a75a1aea108fef45f73935a5a38c43487",
+    "sentinel.py": "34a1dcc6016547f2e309a65ba900b08d707f9551c2699e187d45dc738d558704",
+    "empty.pyi": "0cbcf8e504eee2fe771a543f161fddd92bc280654a5ce78f46f5fc8828230b42",
+    ".kin/semantic-debt.json": "387c7ab4d20b98696a6788c74e39af4237a7156332506b4d984c24fa2c261641",
+    ".kin/version": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35",
+    ".kin/manifest.json": "e32dd6b341a934c4f65ef187fe61de6f5271c491efee39a8e21537189e8b86a2",
+    ".kin/config.toml": "12b6b31f14c661fbff177ceba57a49d6b72f6efcf514cce64521f517a7ac434b",
+    ".kin/kindb/graph.kidx": "53371acc6c33e6c2c4a7fcaa4e69dcb8209385585349288aadd4c3f39791970b",
+    ".kin/kindb/last-admission": "645fd8969e4eaeb0b23b08c00fe0faae89a770a43d783e9ae6797a7e73f0e7a0",
+    ".kin/kindb/hydration-semantics": "bf242a34dacbc0944becfbeb44857f0243930742201a3046adca7a21c0ff6739",
+    ".kin/kindb/head-generation": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+    ".kin/kindb/text-index/index.bin.kinseg-manifest": "bf3ea33387ece2506e0c97bf8edf9e4f12b761892ef1d6318bdab11a44a36ec9",
+    ".kin/kindb/24268087-9e18-40f9-8680-33bf6c4efd90/.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    ".kin/kindb/24268087-9e18-40f9-8680-33bf6c4efd90/authority.json": "95b5a4bbcb129270cbfa0395c5a7ada8f8ffc2672573b5c3cb35944ca178f54e",
+    ".kin/kindb/ingest-cas/0c/bcf8e504eee2fe771a543f161fddd92bc280654a5ce78f46f5fc8828230b42": "0cbcf8e504eee2fe771a543f161fddd92bc280654a5ce78f46f5fc8828230b42",
+    ".kin/kindb/ingest-cas/34/a1dcc6016547f2e309a65ba900b08d707f9551c2699e187d45dc738d558704": "34a1dcc6016547f2e309a65ba900b08d707f9551c2699e187d45dc738d558704",
+    ".kin/kindb/ingest-cas/46/06c3a9405e3fca4541326a2f337c4a75a1aea108fef45f73935a5a38c43487": "4606c3a9405e3fca4541326a2f337c4a75a1aea108fef45f73935a5a38c43487",
+    ".kin/kindb/24268087-9e18-40f9-8680-33bf6c4efd90/snapshots/00000000000000000003.kndb": "88a6cfa7cd42b462ae5363029fb1c525a1412f88e8fe63b0caf118a7ed1a1793",
+    ".kin/kindb/24268087-9e18-40f9-8680-33bf6c4efd90/source-blobs/sha256/0c/0cbcf8e504eee2fe771a543f161fddd92bc280654a5ce78f46f5fc8828230b42": "0cbcf8e504eee2fe771a543f161fddd92bc280654a5ce78f46f5fc8828230b42",
+    ".kin/kindb/24268087-9e18-40f9-8680-33bf6c4efd90/source-blobs/sha256/34/34a1dcc6016547f2e309a65ba900b08d707f9551c2699e187d45dc738d558704": "34a1dcc6016547f2e309a65ba900b08d707f9551c2699e187d45dc738d558704",
+    ".kin/kindb/24268087-9e18-40f9-8680-33bf6c4efd90/source-blobs/sha256/46/4606c3a9405e3fca4541326a2f337c4a75a1aea108fef45f73935a5a38c43487": "4606c3a9405e3fca4541326a2f337c4a75a1aea108fef45f73935a5a38c43487"
+  }
+}
