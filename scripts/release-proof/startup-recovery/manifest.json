@@ -1,5 +1,5 @@
 {
-  "README.md": "aeaf7eff2d5dbfc9eedd4d27b746fa23e44de0ef9d873b0acd8aa4317c472215",
+  "README.md": "3bb1870a390a999862a2e77b6e3e79cb08ab5437e5b36fcaeb4fdbc9b2c982aa",
   "fixtures/legacy-fixed/.kin/config.toml": "12b6b31f14c661fbff177ceba57a49d6b72f6efcf514cce64521f517a7ac434b",
   "fixtures/legacy-fixed/.kin/kindb/9435d8b0-e3a4-4e16-b446-49016a6e6734/.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "fixtures/legacy-fixed/.kin/kindb/9435d8b0-e3a4-4e16-b446-49016a6e6734/authority.json": "68a1b54a97f54f77e2f313ec027fb1af48bc466c4473fb403826dd608b3916cb",
@@ -43,6 +43,6 @@
   "fixtures/recorded-fixed/orphan.py": "4606c3a9405e3fca4541326a2f337c4a75a1aea108fef45f73935a5a38c43487",
   "fixtures/recorded-fixed/sentinel.py": "34a1dcc6016547f2e309a65ba900b08d707f9551c2699e187d45dc738d558704",
   "fixtures/recorded-fixed-receipt.json": "d8afdc71ac7018f7e36dd202cfccb622e3c900b0683c6d00fc3784aa868dffc1",
-  "probe_startup_binary.py": "3b6153ac85795f47160ba0173d295a558d9dc1036be76bfa6bed6242e5e4983d",
-  "run.py": "03e86fc16507ee0460a436b67fbf7b032440544c52568de04e94487a71340209"
+  "probe_startup_binary.py": "b014e8231ea34273ab8f6b1ce93b0759010bc3e546560c3e2fafbaef8dd999f9",
+  "run.py": "70ec69cca23bbfb795cbff7ddae3fdfa22267a1d9b5d95f33c728b1e6e12be83"
 }

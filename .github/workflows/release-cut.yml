@@ -439,7 +439,9 @@ jobs:
           kin="$RUNNER_TEMP/startup-archive/kin-macos-aarch64/kin"
           test -x "$daemon"
           test -x "$kin"
-          python3 scripts/release-proof/startup-recovery/run.py \
+          mkdir -p "$RUNNER_TEMP/startup-home"
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/startup-home" TMPDIR="$RUNNER_TEMP/startup-home" \
+            python3 scripts/release-proof/startup-recovery/run.py \
             --kin "$kin" --daemon "$daemon" --output "$RUNNER_TEMP/startup-recovery"
 
       - name: Preserve native startup recovery evidence

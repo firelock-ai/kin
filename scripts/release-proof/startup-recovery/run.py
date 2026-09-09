@@ -68,7 +68,8 @@ def prepare(root, label, output, kin):
     fixture.mkdir()
     home = output / (label + "-init-home")
     home.mkdir()
-    env = {k: v for k, v in os.environ.items() if not k.startswith("KIN_")}
+    env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(home),
+           "TMPDIR": str(home)}
     env.update(KIN_HOME=str(home), KIN_EMBED_BACKEND="cpu", KIN_DAEMON_AUTO_EMBED="false")
     command = [str(kin), "init", str(fixture), "--no-enrich", "--json"]
     result = subprocess.run(command, env=env, capture_output=True, text=True)

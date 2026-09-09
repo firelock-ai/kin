@@ -50,7 +50,8 @@ assert (fixture / '.kin').is_dir() and (fixture / 'orphan.py').is_file()
 assert not (fixture / '.kin/daemon.port').exists(), 'fixture must not have a live endpoint'
 output.mkdir(parents=True, exist_ok=False)
 token = uuid.uuid4().hex
-env = {key: value for key, value in os.environ.items() if not key.startswith('KIN_')}
+env = {'PATH': os.environ.get('PATH', os.defpath),
+       'HOME': str(output / 'isolated-home'), 'TMPDIR': str(output / 'isolated-home')}
 env.update(KIN_EMBED_BACKEND='cpu', KIN_DAEMON_AUTO_EMBED='false',
            KIN_HOME=str(output / 'isolated-home'), KIN_DAEMON_AUTH_TOKEN=token,
            KIN_DAEMON_BIND_HOST='127.0.0.1', KIN_DAEMON_IDLE_TIMEOUT_SECS='0')

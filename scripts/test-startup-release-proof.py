@@ -88,6 +88,24 @@ for label in ('legacy-fixed', 'recorded-fixed'):
             del changed['semantic_debt'][index]
             refuses(lambda: profile(fixture, changed, label), 'receipt profile changed')
 
+# Evaluate the actual candidate environment assignments with credential canaries.
+import os
+for name in ('run.py', 'probe_startup_binary.py'):
+    tree = ast.parse((ROOT / name).read_text())
+    assignment = next(n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == 'env' for t in n.targets))
+    fake_os = types.SimpleNamespace(environ={'PATH': '/usr/bin:/bin',
+        'ACTIONS_RUNTIME_TOKEN': 'credential-canary', 'GITHUB_ENV': 'command-file-canary',
+        'AWS_SECRET_ACCESS_KEY': 'cloud-canary', 'KIN_DAEMON_AUTH_TOKEN': 'old-token'},
+        defpath=os.defpath)
+    env_ns = {'os': fake_os, 'home': Path('/owned/home'), 'output': Path('/owned/output')}
+    exec(compile(ast.Module(body=[assignment], type_ignores=[]), name, 'exec'), env_ns)
+    assert set(env_ns['env']) == {'PATH', 'HOME', 'TMPDIR'}, env_ns['env']
+    assert env_ns['env']['HOME'].startswith('/owned/')
+    assert 'canary' not in json.dumps(env_ns['env'])
+    inherited = dict(fake_os.environ)
+    assert set(inherited) != {'PATH', 'HOME', 'TMPDIR'}, 'credential inheritance mutant survived'
+
 for name in ('run.py', 'probe_startup_binary.py'):
     result = subprocess.run([sys.executable, '-O', str(ROOT / name), '--help'], capture_output=True, text=True)
     assert result.returncode != 0 and 'without optimization' in result.stderr, name

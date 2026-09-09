@@ -10612,6 +10612,7 @@ def assert_native_startup_release_proof(release_cut: str) -> None:
         "set -euo pipefail",
         'tar -xzf "$KIN_RC_ARCHIVE"',
         'daemon="$RUNNER_TEMP/startup-archive/kin-macos-aarch64/kin-daemon"',
+        'env -i PATH="$PATH" HOME="$RUNNER_TEMP/startup-home" TMPDIR="$RUNNER_TEMP/startup-home"',
         "python3 scripts/release-proof/startup-recovery/run.py",
         '--kin "$kin" --daemon "$daemon" --output "$RUNNER_TEMP/startup-recovery"',
     ]
@@ -10649,6 +10650,7 @@ def main() -> None:
     for label, before, after, error in [
         ("missing native startup proof", "Prove startup recovery across native daemon restarts", "Removed native startup proof", "must precede"),
         ("wrong native startup archive", "tar -xzf \"$KIN_RC_ARCHIVE\"", "tar -xzf unrelated.tar.gz", "must fail closed"),
+        ("inherited native startup credentials", 'env -i PATH="$PATH" HOME="$RUNNER_TEMP/startup-home" TMPDIR="$RUNNER_TEMP/startup-home"', 'env PATH="$PATH"', "must fail closed"),
         ("ignored native startup failure", 'test -x "$daemon"', 'test -x "$daemon"\n          false || true', "must fail closed"),
         ("startup evidence lost on failure", "if: always() && matrix.artifact == 'kin-macos-aarch64'", "if: success() && matrix.artifact == 'kin-macos-aarch64'", "must survive"),
     ]:
