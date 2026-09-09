@@ -4,7 +4,9 @@
 //! Private temporary storage for ordered import changes, verified on every read.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
+#[cfg(test)]
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -87,25 +89,42 @@ impl SemanticChangeSpool {
             return Ok(None);
         };
         let path = self.0.file.path();
-        let mut file = self
+        #[cfg(unix)]
+        let (file, metadata) = {
+            use std::os::unix::fs::MetadataExt;
+            // Authenticate the pathname before reading from the held file.
+            let metadata = std::fs::metadata(path).map_err(|error| GitError::io(path, error))?;
+            let held = self
+                .0
+                .file
+                .as_file()
+                .metadata()
+                .map_err(|error| GitError::io(path, error))?;
+            if (metadata.dev(), metadata.ino()) != (held.dev(), held.ino()) {
+                return Err(invalid("history spool file replaced"));
+            }
+            (self.0.file.as_file(), metadata)
+        };
+        #[cfg(windows)]
+        let reopened = self
             .0
             .file
             .reopen()
             .map_err(|error| GitError::io(path, error))?;
-        if file
-            .metadata()
-            .map_err(|error| GitError::io(path, error))?
-            .len()
-            != self.0.bytes
-        {
+        #[cfg(windows)]
+        let (file, metadata) = (
+            &reopened,
+            reopened
+                .metadata()
+                .map_err(|error| GitError::io(path, error))?,
+        );
+        if metadata.len() != self.0.bytes {
             return Err(invalid("history spool length changed"));
         }
-        file.seek(SeekFrom::Start(record.offset))
-            .map_err(|error| GitError::io(path, error))?;
         let len = usize::try_from(record.len)
             .map_err(|_| invalid("record length exceeds address space"))?;
         let mut bytes = vec![0; len];
-        file.read_exact(&mut bytes)
+        read_at_offset(file, &mut bytes, record.offset)
             .map_err(|error| GitError::io(path, error))?;
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         if digest != record.digest {
@@ -133,6 +152,33 @@ impl SemanticChangeSpool {
         }
         writer.finish()
     }
+}
+
+/// Read one record without sharing a seek cursor between concurrent readers.
+#[cfg(unix)]
+fn read_at_offset(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_at_offset(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut filled = 0usize;
+    while filled < buffer.len() {
+        let read = match file.seek_read(&mut buffer[filled..], offset + filled as u64) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "history spool record ended before its recorded length",
+            ));
+        }
+        filled += read;
+    }
+    Ok(())
 }
 
 pub(crate) struct SemanticChangeSpoolWriter(Storage);
@@ -226,8 +272,8 @@ mod tests {
     /// One spool directory for this module's cases, alive for the whole binary.
     ///
     /// A `TempDir` bound to the call would be removed the moment the statement
-    /// ended, and `read_at` reopens the spool by path, so every later read
-    /// would fail on a directory that is no longer there.
+    /// ended, and `read_at` stats the spool by path on every call, so every
+    /// later read would fail on a directory that is no longer there.
     fn spool_dir() -> &'static Path {
         static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         DIR.get_or_init(|| tempfile::tempdir().unwrap()).path()
@@ -311,6 +357,44 @@ mod tests {
         );
         assert_eq!(spool.read_at(2).unwrap(), None);
         assert_eq!(spool.read_by_id(&change(3).id).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spool_refuses_same_length_path_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let spool = SemanticChangeSpool::from_changes(directory.path(), [change(1)]).unwrap();
+        assert_eq!(spool.read_at(0).unwrap(), Some(change(1)));
+        let path = spool.0.file.path();
+        let replacement = directory.path().join("replacement");
+        std::fs::copy(path, &replacement).unwrap();
+        std::fs::rename(replacement, path).unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().len(), spool.0.bytes);
+        assert!(
+            spool.read_at(0).is_err(),
+            "a replacement cannot authenticate the held file"
+        );
+    }
+
+    #[test]
+    fn spool_clones_read_independent_offsets_concurrently() {
+        let records = (1..=16).map(change).collect::<Vec<_>>();
+        let spool = SemanticChangeSpool::from_changes(spool_dir(), records.clone()).unwrap();
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let spool = spool.clone();
+                let records = &records;
+                scope.spawn(move || {
+                    for round in 0..64 {
+                        let index = (round * 7 + worker) % records.len();
+                        assert_eq!(
+                            spool.read_at(index).unwrap().as_ref(),
+                            Some(&records[index])
+                        );
+                    }
+                });
+            }
+        });
     }
 
     #[test]

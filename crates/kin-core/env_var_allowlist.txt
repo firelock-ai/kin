@@ -24,6 +24,9 @@ KIN_AGENT_TEST_KIN_BIN
 # KIN_GCS_ENDPOINT, which is registered.
 KIN_GCS_TEST_BUCKET
 KIN_GIT_TEST_NO_SYMLINK_PRIVILEGE
+# Read only by the ignored history-spool wall-time benchmark. This selects
+# a disposable measurement corpus; no product runtime reads it.
+KIN_SPOOL_BENCH_REPO
 # Read only by the admission memory tests' shared probe, to print a per-phase
 # live-heap line during a passing run. Recording is unconditional; this only
 # controls whether the run also narrates. No runtime behaviour keys on it and
