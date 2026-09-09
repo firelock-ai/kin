@@ -407,6 +407,7 @@ impl DurableVectorTestBackend {
             .expect("test graph snapshot must publish")
     }
 
+    #[cfg(feature = "embeddings")]
     pub(crate) fn publish_snapshot(
         &self,
         repo_id: &str,
@@ -12511,6 +12512,7 @@ mod tests {
     /// adjacency is what `materialize_hosted_repository_snapshot` rebuilds and
     /// what the retrieval authority folds, and a store with no edges has an
     /// empty one either way and can tell the two apart from nothing.
+    #[cfg(feature = "embeddings")]
     fn publish_hosted_repository_v6_store(
         storage: &std::path::Path,
         label: &str,
@@ -13101,6 +13103,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "vector")]
     #[test]
     fn hosted_graph_commit_rebinds_vectors_to_the_exact_successor_snapshot_cursor() {
         let working = tempfile::tempdir().unwrap();
