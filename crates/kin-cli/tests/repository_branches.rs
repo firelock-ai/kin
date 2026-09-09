@@ -111,6 +111,7 @@ fn open_authority(
 /// its base for as long as it takes the loop to drain a tick, and several
 /// repository transitions refuse over exactly that state. Polling authority is
 /// how a test asks "has the loop finished" without asserting on a clock.
+#[cfg(unix)]
 fn wait_for_level_workspace(layout: &kin_core::KinLayout, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
     loop {
