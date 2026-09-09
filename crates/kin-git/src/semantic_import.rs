@@ -26,7 +26,9 @@ use uuid::Uuid;
 
 use crate::error::{GitError, Result};
 use crate::history_spool::{SemanticChangeSpool, SemanticChangeSpoolWriter};
-use crate::lossless::{validate_snapshot, GitObjectFormat, LosslessGitRepository};
+use crate::lossless::{
+    validate_snapshot, GitObjectFormat, LosslessGitRepository, SharedObjectClosure,
+};
 use crate::sealed_observation::{AdmittedContentSummary, SealedTreeObservation};
 
 const GIT_ARTIFACT_NAMESPACE: Uuid = Uuid::from_bytes([
@@ -1153,7 +1155,7 @@ fn build_semantic_git_import_plan(
 
 fn parse_commits(
     snapshot: &LosslessGitRepository,
-    bodies: &BTreeMap<ExternalObjectId, Vec<u8>>,
+    bodies: &SharedObjectClosure,
     hash_kind: gix::hash::Kind,
 ) -> Result<BTreeMap<GitObjectId, ParsedCommit>> {
     let mut commits = BTreeMap::new();
@@ -1162,13 +1164,8 @@ fn parse_commits(
         .iter()
         .filter(|record| record.object.kind == ExternalObjectKind::Commit)
     {
-        let body = bodies
-            .get(&record.object)
-            .ok_or_else(|| GitError::MissingObject {
-                oid: record.object.oid.to_string(),
-                context: "semantic commit decoding".to_string(),
-            })?;
-        let commit = gix::objs::CommitRef::from_bytes(body, hash_kind).map_err(|error| {
+        let body = bodies.body(&record.object)?;
+        let commit = gix::objs::CommitRef::from_bytes(&body, hash_kind).map_err(|error| {
             GitError::InvalidSnapshot(format!("decode commit {}: {error}", record.object.oid))
         })?;
         let parsed = ParsedCommit {
@@ -1264,7 +1261,7 @@ fn topological_commit_order(
 /// what the repository holds.
 struct TreeDecoder<'a> {
     hash_kind: gix::hash::Kind,
-    bodies: &'a BTreeMap<ExternalObjectId, Vec<u8>>,
+    bodies: &'a SharedObjectClosure,
     records: &'a BTreeMap<ExternalObjectId, &'a ExternalObjectRecord>,
 }
 
@@ -1287,7 +1284,7 @@ struct RawPathChange {
 impl<'a> TreeDecoder<'a> {
     fn new(
         hash_kind: gix::hash::Kind,
-        bodies: &'a BTreeMap<ExternalObjectId, Vec<u8>>,
+        bodies: &'a SharedObjectClosure,
         records: &'a BTreeMap<ExternalObjectId, &'a ExternalObjectRecord>,
     ) -> Self {
         Self {
@@ -1300,14 +1297,8 @@ impl<'a> TreeDecoder<'a> {
     /// The direct entries of one tree object, keyed by name.
     fn direct_entries(&self, tree_oid: GitObjectId) -> Result<BTreeMap<Vec<u8>, RawTreeEntry>> {
         let object = ExternalObjectId::new(ExternalObjectKind::Tree, tree_oid);
-        let body = self
-            .bodies
-            .get(&object)
-            .ok_or_else(|| GitError::MissingObject {
-                oid: tree_oid.to_string(),
-                context: "semantic tree decoding".to_string(),
-            })?;
-        let tree = gix::objs::TreeRef::from_bytes(body, self.hash_kind).map_err(|error| {
+        let body = self.bodies.body(&object)?;
+        let tree = gix::objs::TreeRef::from_bytes(&body, self.hash_kind).map_err(|error| {
             GitError::InvalidSnapshot(format!("decode tree {tree_oid}: {error}"))
         })?;
         let mut entries = BTreeMap::new();
@@ -1667,7 +1658,7 @@ fn append_identity_field(target: &mut Vec<u8>, field: &[u8]) {
 /// nothing reads again. Both callers resolve HEAD by this one rule.
 fn resolve_workspace_seed_commit(
     snapshot: &LosslessGitRepository,
-    bodies: &BTreeMap<ExternalObjectId, Vec<u8>>,
+    bodies: &SharedObjectClosure,
     hash_kind: gix::hash::Kind,
 ) -> Result<Option<GitObjectId>> {
     let refs = snapshot
@@ -1701,7 +1692,7 @@ fn resolve_workspace_seed_commit(
 
 fn resolve_workspace_seed(
     snapshot: &LosslessGitRepository,
-    bodies: &BTreeMap<ExternalObjectId, Vec<u8>>,
+    bodies: &SharedObjectClosure,
     hash_kind: gix::hash::Kind,
     commit_trees: &BTreeMap<GitObjectId, ResolvedTree>,
 ) -> Result<GitWorkspaceSeed> {
@@ -1795,7 +1786,7 @@ fn resolve_symbolic_target(
 
 fn peel_to_commit(
     start: ExternalObjectId,
-    bodies: &BTreeMap<ExternalObjectId, Vec<u8>>,
+    bodies: &SharedObjectClosure,
     hash_kind: gix::hash::Kind,
 ) -> Result<GitObjectId> {
     let current = peel_annotated_tags(start, bodies, hash_kind)?;
@@ -1813,7 +1804,7 @@ fn peel_to_commit(
 
 fn material_ref_target(
     target: &RefTarget,
-    bodies: &BTreeMap<ExternalObjectId, Vec<u8>>,
+    bodies: &SharedObjectClosure,
     hash_kind: gix::hash::Kind,
 ) -> Result<RefTarget> {
     let RefTarget::ExternalObject { object } = target else {
@@ -1832,7 +1823,7 @@ fn material_ref_target(
 
 fn peel_annotated_tags(
     start: ExternalObjectId,
-    bodies: &BTreeMap<ExternalObjectId, Vec<u8>>,
+    bodies: &SharedObjectClosure,
     hash_kind: gix::hash::Kind,
 ) -> Result<ExternalObjectId> {
     let mut current = start;
@@ -1849,13 +1840,8 @@ fn peel_annotated_tags(
                 return Ok(current)
             }
             ExternalObjectKind::Tag => {
-                let body = bodies
-                    .get(&current)
-                    .ok_or_else(|| GitError::MissingObject {
-                        oid: current.oid.to_string(),
-                        context: "peeling annotated tag".to_string(),
-                    })?;
-                let tag = gix::objs::TagRef::from_bytes(body, hash_kind).map_err(|error| {
+                let body = bodies.body(&current)?;
+                let tag = gix::objs::TagRef::from_bytes(&body, hash_kind).map_err(|error| {
                     GitError::InvalidSnapshot(format!(
                         "decode annotated tag {}: {error}",
                         current.oid

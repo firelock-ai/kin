@@ -9,6 +9,7 @@
 //! returned. Rehydration performs the inverse operation in a private staging
 //! repository and publishes the destination only after an exact recapture.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(unix)]
 use std::ffi::OsString;
@@ -87,9 +88,42 @@ struct ClosureKey {
     objects: Vec<ExternalObjectRecord>,
 }
 
-type ClosureBodies = BTreeMap<ExternalObjectId, Vec<u8>>;
+/// A validated object closure, holding what is read again and not what is not.
+///
+/// Every object's body is read from the CAS and checked against its descriptor
+/// when this is built. What differs from holding the whole decompression is
+/// what survives that pass. Blob bodies do not, because nothing reads one
+/// again: `TreeDecoder` resolves a blob through its RECORD's `body_hash`,
+/// `enqueue_raw_dependencies` has no dependencies to enqueue from a blob, and
+/// commits and tags are decoded from their own bodies. Blob payload is also
+/// almost the whole of a repository's object bytes, measured at 94.2, 93.0 and
+/// 98.4 percent across hiredis, psf/requests and kin, so dropping it is where
+/// nearly all of the residency goes.
+///
+/// The rest is kept whole rather than cached with a bound. Tree, commit and tag
+/// bodies together are 5.83, 7.03 and 1.63 percent of those same three
+/// repositories, 22.2 MiB on the largest, and the share falls as history grows
+/// because payload outgrows metadata. A bound over 22 MiB would be an eviction
+/// policy, a capacity constant and a hit rate to watch, bought against nothing.
+struct ClosureBodies {
+    /// A read-only handle on the CAS the closure was validated from, for the
+    /// one caller that asks for a blob body afterwards. Reads verify the
+    /// content hash and quarantine a mismatch, so a re-read is checked twice:
+    /// once by the CAS against its address and once by `validate_raw` against
+    /// the descriptor.
+    blob_store: BlobStore,
+    /// Every object's descriptor. This is what the closure was validated
+    /// against, and it is what `len` and the id walk are counted over, so a
+    /// membership question is never answered from whatever happens to be
+    /// resident.
+    records: BTreeMap<ExternalObjectId, ExternalObjectRecord>,
+    /// Tree, commit and tag bodies, validated and kept. Never mutated after
+    /// construction, which is why this needs no interior mutability and has no
+    /// cache state that could go stale.
+    resident: BTreeMap<ExternalObjectId, Vec<u8>>,
+}
 
-/// A decompressed object closure this process built and is still holding.
+/// A validated object closure this process built and is still holding.
 ///
 /// The skip this enables rests on one claim: these bytes were read from the
 /// CAS and checked against their descriptors BY THIS PROCESS, and have been
@@ -120,11 +154,62 @@ impl Clone for SharedObjectClosure {
     }
 }
 
-impl std::ops::Deref for SharedObjectClosure {
-    type Target = ClosureBodies;
+impl SharedObjectClosure {
+    /// One object's validated body.
+    ///
+    /// Borrowed for a tree, commit or tag, which are resident. Re-read and
+    /// re-validated for a blob, which is not.
+    ///
+    /// A request for an object this closure does not describe FAILS. It does
+    /// not answer "not found", because a reader whose miss path returns an
+    /// absence is exactly what would let a conversion admit a shorter history
+    /// and call it complete.
+    pub(crate) fn body(&self, object: &ExternalObjectId) -> Result<Cow<'_, [u8]>> {
+        if let Some(body) = self.0.resident.get(object) {
+            return Ok(Cow::Borrowed(body));
+        }
+        let record = self.0.records.get(object).ok_or_else(|| {
+            GitError::InvalidSnapshot(format!(
+                "object {} is not described by this closure",
+                object.oid
+            ))
+        })?;
+        let body = self.0.blob_store.read(&record.body_hash)?;
+        record.validate_raw(&body).map_err(|error| {
+            GitError::InvalidSnapshot(format!(
+                "object {} descriptor/body mismatch on re-read: {error}",
+                object.oid
+            ))
+        })?;
+        Ok(Cow::Owned(body))
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    /// Whether this closure describes an object, answered from the descriptors
+    /// it was validated against rather than from what is resident.
+    pub(crate) fn contains(&self, object: &ExternalObjectId) -> bool {
+        self.0.records.contains_key(object)
+    }
+
+    /// How many objects this closure describes.
+    pub(crate) fn len(&self) -> usize {
+        self.0.records.len()
+    }
+
+    /// Every object this closure describes, in descriptor order.
+    pub(crate) fn ids(&self) -> impl Iterator<Item = &ExternalObjectId> {
+        self.0.records.keys()
+    }
+
+    /// Bytes held resident, for the memory tests that grade this seam.
+    ///
+    /// `cfg(test)` alone rather than `any(test, feature = "test-support")`,
+    /// because nothing outside this module's own tests reads it and the
+    /// feature-gated form compiles into a lib built with `--all-features` where
+    /// `cfg(test)` is off, leaving a method nothing calls and a denied
+    /// dead-code lint.
+    #[cfg(test)]
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.0.resident.values().map(Vec::len).sum()
     }
 }
 
@@ -853,7 +938,15 @@ fn decompressed_closure(
     // visible.
     CLOSURE_RECONSTRUCTIONS.with(|count| count.set(count.get() + 1));
 
-    let mut bodies = BTreeMap::new();
+    // One pass, reading and checking every body exactly as before. What changed
+    // is what the pass KEEPS: a blob's body is dropped the moment it has
+    // passed, because nothing reads one again, while its descriptor stays in
+    // `records` so every membership and completeness question is still answered
+    // over the whole object set. Both refusals below are proved from the two
+    // identity sets, not from what is resident, so they are unchanged in
+    // strength by the residency change.
+    let mut records = BTreeMap::new();
+    let mut resident = BTreeMap::new();
     let mut object_ids = BTreeSet::new();
     for record in &snapshot.objects {
         if object_format_for_oid(record.object.oid) != snapshot.object_format {
@@ -869,11 +962,16 @@ fn decompressed_closure(
                 record.object.oid
             ))
         })?;
-        if bodies.insert(record.object, body).is_some() {
+        if records.insert(record.object, record.clone()).is_some() {
             return Err(GitError::InvalidSnapshot(format!(
                 "duplicate object {}",
                 record.object.oid
             )));
+        }
+        if record.object.kind == ExternalObjectKind::Blob {
+            drop(body);
+        } else {
+            resident.insert(record.object, body);
         }
         if !object_ids.insert(record.object.oid) {
             return Err(GitError::InvalidSnapshot(format!(
@@ -885,7 +983,18 @@ fn decompressed_closure(
 
     // Published only after every body passed, so a rejected object set leaves
     // nothing behind for the next caller to hit.
-    let shared = SharedObjectClosure(Rc::new(bodies));
+    //
+    // The store is reopened rather than borrowed, because this closure outlives
+    // the call in a `thread_local` and a borrow cannot. Durability governs
+    // writes and this handle never writes, so it opens ephemeral and promises
+    // nothing it does not need; reads verify the content hash either way.
+    let blob_store = BlobStore::new_ephemeral(blob_store.root().to_path_buf())
+        .map_err(|error| GitError::InvalidSnapshot(format!("reopen capture CAS: {error}")))?;
+    let shared = SharedObjectClosure(Rc::new(ClosureBodies {
+        blob_store,
+        records,
+        resident,
+    }));
     CLOSURE_CACHE.with(|cache| {
         *cache.borrow_mut() = Some((key, shared.clone()));
     });
@@ -918,7 +1027,7 @@ fn validate_head_and_default(snapshot: &LosslessGitRepository) -> Result<()> {
 
 fn validate_reachable_closure(
     snapshot: &LosslessGitRepository,
-    bodies: &BTreeMap<ExternalObjectId, Vec<u8>>,
+    bodies: &SharedObjectClosure,
 ) -> Result<()> {
     let mut pending = VecDeque::new();
     for repository_ref in &snapshot.refs.refs {
@@ -934,16 +1043,37 @@ fn validate_reachable_closure(
         if !reached.insert(object) {
             continue;
         }
-        let body = bodies.get(&object).ok_or_else(|| GitError::MissingObject {
-            oid: object.oid.to_string(),
-            context: context.clone(),
-        })?;
-        enqueue_raw_dependencies(snapshot.object_format, object, body, &context, &mut pending)?;
+        // Membership is asked of the descriptors, and it is asked for EVERY
+        // reached object including a blob, which is what this walk proved
+        // before by fetching a body it then handed to a branch that does
+        // nothing with it. A blob's body is not re-read here, because reading
+        // 98 percent of a repository to pass it to `ExternalObjectKind::Blob =>
+        // {}` is the cost this seam exists to remove; what is proved is
+        // unchanged.
+        if !bodies.contains(&object) {
+            return Err(GitError::MissingObject {
+                oid: object.oid.to_string(),
+                context: context.clone(),
+            });
+        }
+        if object.kind != ExternalObjectKind::Blob {
+            let body = bodies.body(&object)?;
+            enqueue_raw_dependencies(
+                snapshot.object_format,
+                object,
+                &body,
+                &context,
+                &mut pending,
+            )?;
+        }
     }
 
+    // Counted over the descriptors, never over what is resident. Answering this
+    // from the resident bodies would make it a tautology the moment a body
+    // stopped being kept.
     if reached.len() != bodies.len() {
         let unreachable = bodies
-            .keys()
+            .ids()
             .find(|object| !reached.contains(object))
             .expect("different set lengths imply one unreachable object");
         return Err(GitError::InvalidSnapshot(format!(
@@ -1735,7 +1865,7 @@ fn sync_publication_directory(path: &Path) -> Result<()> {
 
 fn build_staging_repository(
     snapshot: &LosslessGitRepository,
-    bodies: &BTreeMap<ExternalObjectId, Vec<u8>>,
+    bodies: &SharedObjectClosure,
     blob_store: &BlobStore,
     staging: &Path,
 ) -> Result<()> {
@@ -1743,11 +1873,14 @@ fn build_staging_repository(
         .map_err(|error| GitError::Git(format!("initialize {}: {error}", staging.display())))?;
 
     for record in &snapshot.objects {
-        let body = bodies
-            .get(&record.object)
-            .expect("validated snapshot has every descriptor body");
+        // The one caller that wants a blob body after validation. It gets one
+        // validated read per object rather than a resident copy of the
+        // repository, which is what this path wanted anyway: it runs with
+        // `ClosureSharing::Fresh` precisely because its contract is that the
+        // CAS can supply these bytes NOW.
+        let body = bodies.body(&record.object)?;
         let written = repo
-            .write_buf(gix_kind(record.object.kind), body)
+            .write_buf(gix_kind(record.object.kind), &body)
             .map_err(|error| {
                 GitError::Git(format!("write object {}: {error}", record.object.oid))
             })?;
@@ -2388,9 +2521,18 @@ mod tests {
         );
 
         assert_eq!(
-            *shared, *fresh,
-            "a shared closure must be byte-identical to one rebuilt from the CAS",
+            shared.ids().collect::<Vec<_>>(),
+            fresh.ids().collect::<Vec<_>>(),
+            "a shared closure must describe the same objects as one rebuilt from the CAS",
         );
+        for object in snapshot.objects.iter().map(|record| record.object) {
+            assert_eq!(
+                shared.body(&object).unwrap(),
+                fresh.body(&object).unwrap(),
+                "a shared closure must serve object {} byte-identically to a rebuilt one",
+                object.oid,
+            );
+        }
     }
 
     #[test]
@@ -2415,18 +2557,26 @@ mod tests {
             "a second shared validation of one object set must hit the cache",
         );
 
-        fixture
-            .blob_store
-            .delete(&snapshot.objects[0].body_hash)
-            .unwrap();
+        // Deleted by KIND rather than by position. A blob's body is not resident,
+        // so deleting one would be re-read and would fail on the read instead of
+        // being served stale, and this test would then pass for a reason that has
+        // nothing to do with what it guards. A tree, commit or tag body IS
+        // resident, which is the only case where a warm closure can still serve
+        // bytes the CAS has lost.
+        let resident = snapshot
+            .objects
+            .iter()
+            .find(|record| record.object.kind != ExternalObjectKind::Blob)
+            .expect("a captured repository has at least one commit");
+        fixture.blob_store.delete(&resident.body_hash).unwrap();
 
         // The shared closure is now stale in the only way it can be: the
         // descriptors are untouched, so the key still matches, and it still
         // hands out a body the CAS can no longer supply.
         let served = validate_snapshot(&snapshot, &fixture.blob_store).unwrap();
         assert!(
-            served.contains_key(&snapshot.objects[0].object),
-            "the shared closure must still hold the deleted body for this to prove anything",
+            served.body(&resident.object).is_ok(),
+            "the shared closure must still serve the deleted body for this to prove anything",
         );
 
         // Rehydration reads fresh, so it fails closed on the CAS rather than
@@ -2437,6 +2587,250 @@ mod tests {
             Err(GitError::Blob(kin_blobs::BlobError::NotFound { .. }))
         ));
         assert!(!output.exists());
+    }
+
+    /// The whole of this seam, stated as a number: a validated closure holds
+    /// every tree, commit and tag body and no blob body at all.
+    ///
+    /// Asserted against the descriptors rather than against a remembered
+    /// constant, so it stays true for any fixture and goes red the moment a
+    /// blob body starts being kept again.
+    #[test]
+    fn a_validated_closure_holds_every_non_blob_body_and_no_blob_body() {
+        let fixture = Fixture::simple();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("resident-bytes").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+        let closure = validate_snapshot(&snapshot, &fixture.blob_store).unwrap();
+
+        let non_blob: usize = snapshot
+            .objects
+            .iter()
+            .filter(|record| record.object.kind != ExternalObjectKind::Blob)
+            .map(|record| usize::try_from(record.body_len).unwrap())
+            .sum();
+        let blob: usize = snapshot
+            .objects
+            .iter()
+            .filter(|record| record.object.kind == ExternalObjectKind::Blob)
+            .map(|record| usize::try_from(record.body_len).unwrap())
+            .sum();
+        // A fixture with no blob bytes would let a closure that kept everything
+        // pass this, so the control is asserted rather than assumed.
+        assert!(
+            blob > 0,
+            "this fixture must carry blob payload to prove anything"
+        );
+
+        assert_eq!(
+            closure.resident_bytes(),
+            non_blob,
+            "a closure must hold exactly the non-blob bodies: {} blob bytes must not be resident",
+            blob,
+        );
+        assert_eq!(
+            closure.len(),
+            snapshot.objects.len(),
+            "every object stays DESCRIBED, whatever is resident",
+        );
+    }
+
+    /// A miss must fail loudly. A reader that answers "not found" for an object
+    /// it cannot supply is what would let a conversion admit a shorter history
+    /// and call it complete.
+    #[test]
+    fn a_body_request_for_an_undescribed_object_fails_rather_than_answering_absent() {
+        let fixture = Fixture::simple();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("undescribed").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+        let closure = validate_snapshot(&snapshot, &fixture.blob_store).unwrap();
+
+        let stranger = ExternalObjectId::new(ExternalObjectKind::Blob, GitObjectId::sha1([9; 20]));
+        assert!(
+            !closure.contains(&stranger),
+            "the fixture must not describe the stranger, or this proves nothing",
+        );
+        // The positive control: a described object answers.
+        assert!(closure.body(&snapshot.objects[0].object).is_ok());
+        assert!(
+            closure.body(&stranger).is_err(),
+            "an undescribed object must fail rather than answer absent",
+        );
+    }
+
+    /// A blob body is served by re-reading the CAS and re-checking it, which is
+    /// the other half of not keeping it. Proved by taking the body away from a
+    /// WARM closure: a resident copy would still answer, a re-read cannot.
+    #[test]
+    fn a_blob_body_is_re_read_from_the_cas_and_re_validated() {
+        let fixture = Fixture::simple();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("blob-reread").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+        let closure = validate_snapshot(&snapshot, &fixture.blob_store).unwrap();
+
+        let blob = snapshot
+            .objects
+            .iter()
+            .find(|record| record.object.kind == ExternalObjectKind::Blob)
+            .expect("this fixture carries blobs");
+        assert!(
+            closure.body(&blob.object).is_ok(),
+            "the blob must be servable before its body is taken away",
+        );
+
+        fixture.blob_store.delete(&blob.body_hash).unwrap();
+        assert!(
+            closure.body(&blob.object).is_err(),
+            "a blob body must come from the CAS on every ask, so losing it must fail",
+        );
+    }
+
+    /// Completeness is counted over the descriptors a closure was validated
+    /// from, not over the bodies it happens to keep.
+    ///
+    /// This is the check that stops a closure describing an object nothing
+    /// reaches, and it had no test before this seam made the two sets differ.
+    /// Answering it from residency would pass this the moment blob bodies
+    /// stopped being kept, which is exactly the silent weakening to guard.
+    #[test]
+    fn an_object_no_ref_reaches_is_refused_even_when_no_body_is_resident() {
+        let fixture = Fixture::simple();
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("unreachable-blob").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+        assert!(
+            validate_snapshot(&snapshot, &fixture.blob_store).is_ok(),
+            "the unmodified capture must pass, or the arm below proves nothing",
+        );
+
+        // A second commit gives a real blob, with a real oid and a real CAS
+        // body, that the FIRST snapshot's refs do not reach. Built by capture
+        // rather than by hand, so its descriptor is exactly what the product
+        // would have written.
+        write(
+            &fixture.repo,
+            "later.txt",
+            b"unreachable from the first snapshot\n",
+        );
+        git_ok(&fixture.repo, ["add", "later.txt"]);
+        git_ok(&fixture.repo, ["commit", "-m", "later"]);
+        let later = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("unreachable-blob-later").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+        let stranger = later
+            .objects
+            .iter()
+            .find(|record| {
+                record.object.kind == ExternalObjectKind::Blob
+                    && !snapshot
+                        .objects
+                        .iter()
+                        .any(|held| held.object == record.object)
+            })
+            .expect("the second commit introduced a blob the first snapshot lacks")
+            .clone();
+
+        let mut widened = snapshot.clone();
+        widened.objects.push(stranger.clone());
+        widened.objects.sort_by_key(|record| record.object);
+
+        // Matched rather than `expect_err`, because the Ok side is a closure
+        // that deliberately carries no `Debug`.
+        let Err(error) = validate_snapshot(&widened, &fixture.blob_store) else {
+            panic!("an object no ref reaches must be refused");
+        };
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&stranger.object.oid.to_string())
+                && rendered.contains("not reachable"),
+            "the refusal must name the unreachable object: {rendered}",
+        );
+    }
+
+    /// The descriptor check in the validation pass, isolated from the CAS's own
+    /// verify-on-read.
+    ///
+    /// A tampered CAS BODY is caught one step earlier, by `BlobStore::read`
+    /// comparing content to address, so a test that tampers with bytes proves
+    /// nothing about `validate_raw`. The input only `validate_raw` can catch is
+    /// a descriptor that names one object while addressing another object's
+    /// bytes: the CAS read succeeds, because the address and the content agree,
+    /// and only recomputing the Git object ID over the envelope reveals that
+    /// the record is lying about which object it describes.
+    #[test]
+    fn a_descriptor_naming_one_object_and_addressing_anothers_bytes_is_refused() {
+        let fixture = Fixture::simple();
+        write(
+            &fixture.repo,
+            "second.txt",
+            b"a second blob with its own oid\n",
+        );
+        git_ok(&fixture.repo, ["add", "second.txt"]);
+        git_ok(&fixture.repo, ["commit", "-m", "second"]);
+        let snapshot = capture_lossless_git_repository(
+            &fixture.repo,
+            RepositoryId::new("lying-descriptor").unwrap(),
+            &fixture.blob_store,
+        )
+        .unwrap();
+        assert!(
+            validate_snapshot(&snapshot, &fixture.blob_store).is_ok(),
+            "the unmodified capture must pass, or the arm below proves nothing",
+        );
+
+        let blobs: Vec<_> = snapshot
+            .objects
+            .iter()
+            .filter(|record| record.object.kind == ExternalObjectKind::Blob)
+            .cloned()
+            .collect();
+        assert!(
+            blobs.len() >= 2,
+            "this fixture must carry two distinct blobs to swap between",
+        );
+
+        // Keeps the NAME of the first blob and the ADDRESS of the second. Both
+        // bodies are in the CAS and both hash correctly to their own addresses,
+        // so the read below succeeds and the refusal can only come from
+        // recomputing the Git object ID.
+        let mut lying = snapshot.clone();
+        for record in &mut lying.objects {
+            if record.object == blobs[0].object {
+                record.body_hash = blobs[1].body_hash;
+                record.body_len = blobs[1].body_len;
+            }
+        }
+        assert!(
+            fixture.blob_store.read(&blobs[1].body_hash).is_ok(),
+            "the borrowed address must still be readable, or the CAS refuses first",
+        );
+
+        let Err(error) = validate_snapshot(&lying, &fixture.blob_store) else {
+            panic!("a descriptor addressing another object's bytes must be refused");
+        };
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("descriptor/body mismatch")
+                && rendered.contains(&blobs[0].object.oid.to_string()),
+            "the refusal must name the lying descriptor: {rendered}",
+        );
     }
 
     #[test]
