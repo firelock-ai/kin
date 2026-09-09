@@ -18,7 +18,7 @@ fn resolve_org_id() -> Result<String> {
     std::env::var("KIN_ORG_ID")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("KIN_ORG_ID not set — set it or configure a native remote"))
+        .ok_or_else(|| anyhow::anyhow!("KIN_ORG_ID not set; set it or configure a native remote"))
 }
 
 fn resolve_repo_id() -> Result<String> {
@@ -128,7 +128,7 @@ pub async fn list() -> Result<()> {
         let name = rel.get("name").and_then(|n| n.as_str()).unwrap_or(tag);
         let created = rel.get("createdAt").and_then(|c| c.as_str()).unwrap_or("");
         let id = rel.get("id").and_then(|i| i.as_str()).unwrap_or("");
-        println!("  {} ({}) [{}] — {}", name, tag, id, created);
+        println!("  {} ({}) [{}]: {}", name, tag, id, created);
     }
 
     Ok(())

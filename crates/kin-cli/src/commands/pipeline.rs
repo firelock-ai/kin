@@ -18,7 +18,7 @@ fn resolve_org_id() -> Result<String> {
     std::env::var("KIN_ORG_ID")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("KIN_ORG_ID not set — set it or configure a native remote"))
+        .ok_or_else(|| anyhow::anyhow!("KIN_ORG_ID not set; set it or configure a native remote"))
 }
 
 fn resolve_repo_id() -> Result<String> {

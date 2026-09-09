@@ -1204,7 +1204,7 @@ async fn stop_current_repo(json: bool, quiet: bool, kin_root: Option<&Path>) -> 
     };
     let Some(layout) = layout else {
         bail!(
-            "not inside a Kin repository — run `kin daemon stop` from a repo, or \
+            "not inside a Kin repository; run `kin daemon stop` from a repo, or \
              `kin daemon stop --all` to stop every daemon"
         );
     };

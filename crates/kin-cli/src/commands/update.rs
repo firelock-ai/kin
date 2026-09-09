@@ -10512,7 +10512,7 @@ async fn fetch_archive_checksum(
         .iter()
         .find(|a| a.name == CHECKSUMS_ASSET)
         .with_context(|| {
-            format!("release is missing '{CHECKSUMS_ASSET}' — cannot verify the download")
+            format!("release is missing '{CHECKSUMS_ASSET}'; cannot verify the download")
         })?;
 
     let response = client

@@ -2127,7 +2127,7 @@ async fn reaper_sweep(
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok());
             if should_reexec_self(start, mtime, policy.redeploy_grace_secs, reexeced_for_mtime) {
-                warn!("supervisor binary is stale — re-execing into new build");
+                warn!("supervisor binary is stale; re-execing into new build");
                 let error = reexec_self(mtime);
                 warn!(error = %error, "supervisor self-re-exec failed; continuing on current binary");
             }
@@ -2248,7 +2248,7 @@ async fn reaper_sweep(
                             warn!(
                                 pid = daemon.pid,
                                 repo = %daemon.repo_root,
-                                "two live daemons claim one repo_root; keeping both (split-brain) — not reaping active daemon"
+                                "two live daemons claim one repo_root; keeping both (split-brain): not reaping active daemon"
                             );
                         }
                     }
@@ -2513,7 +2513,7 @@ async fn graceful_terminate(pid: u32, repo_root: &str, action: &str, reason: &st
             pid,
             repo = %repo_root,
             reason,
-            "daemon survived SIGTERM grace — sending SIGKILL"
+            "daemon survived SIGTERM grace; sending SIGKILL"
         );
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
@@ -2587,7 +2587,7 @@ async fn reap_daemon(observation: &DaemonObservation, reason: ReapReason) {
             transaction = %summary,
             reason = ?reason,
             "reaping a daemon that has a write transaction open; its beat went stale, so it is \
-             wedged rather than busy — the caller waiting on this transaction will lose it"
+             wedged rather than busy: the caller waiting on this transaction will lose it"
         );
     }
     graceful_terminate(

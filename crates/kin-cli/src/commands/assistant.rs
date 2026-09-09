@@ -230,7 +230,7 @@ pub async fn sync() -> Result<()> {
         } else {
             "unchanged"
         };
-        println!("  {} — {}", result.path.display(), status);
+        println!("  {}: {}", result.path.display(), status);
     }
 
     let updated_count = results.iter().filter(|r| r.updated || r.created).count();

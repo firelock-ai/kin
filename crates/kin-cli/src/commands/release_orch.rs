@@ -90,7 +90,7 @@ fn workspace_root() -> Result<PathBuf> {
         }
     }
     bail!(
-        "could not locate the umbrella workspace root above {} — run from inside the \
+        "could not locate the umbrella workspace root above {}; run from inside the \
          kin-ecosystem checkout or set KIN_WORKSPACE_ROOT",
         start.display()
     )
@@ -358,9 +358,9 @@ pub async fn plan(offline: bool) -> Result<()> {
     // ── render ────────────────────────────────────────────────────────────────
     println!();
     if offline {
-        println!("Kin release plan — bottom-up  (offline: registry not queried)");
+        println!("Kin release plan: bottom-up  (offline: registry not queried)");
     } else {
-        println!("Kin release plan — bottom-up");
+        println!("Kin release plan: bottom-up");
     }
     println!("{}", "=".repeat(64));
     println!(
@@ -385,7 +385,7 @@ pub async fn plan(offline: bool) -> Result<()> {
                 Published::Error => ("<error>".to_string(), "registry error".to_string()),
                 Published::Unpublished => (
                     "<unpublished>".to_string(),
-                    "UNPUBLISHED — first publish pending".to_string(),
+                    "UNPUBLISHED: first publish pending".to_string(),
                 ),
                 Published::Version(nv) => {
                     let status = match &lv {
@@ -394,7 +394,7 @@ pub async fn plan(offline: bool) -> Result<()> {
                             let l = parse_version(lv);
                             let n = parse_version(nv);
                             if l > n {
-                                format!("NEEDS PUBLISH — local ahead of {nv}")
+                                format!("NEEDS PUBLISH: local ahead of {nv}")
                             } else if l < n {
                                 format!("BEHIND registry {nv} (?)")
                             } else {
@@ -449,7 +449,7 @@ pub async fn plan(offline: bool) -> Result<()> {
     println!("Downstream pin status");
     println!("  {}", "-".repeat(60));
     if offline {
-        println!("  (skipped — registry not queried in offline mode)");
+        println!("  (skipped, registry not queried in offline mode)");
     } else if stale.is_empty() {
         println!("  all registry pins are at the newest published version");
     } else {
@@ -465,7 +465,7 @@ pub async fn plan(offline: bool) -> Result<()> {
     if offline {
         println!("  run without --offline to compare against the registry");
     } else if needs_publish.is_empty() && stale.is_empty() {
-        println!("  nothing pending — every registry crate is published and every pin is current");
+        println!("  nothing pending: every registry crate is published and every pin is current");
     } else {
         let repo_of: BTreeMap<&str, &str> = REGISTRY_CRATES.iter().copied().collect();
         let mut n = 1;
@@ -477,7 +477,7 @@ pub async fn plan(offline: bool) -> Result<()> {
                 .flatten()
                 .unwrap_or_else(|| "?".to_string());
             println!(
-                "  {n}. publish {crate_name} ({lv}) — merge {repo} to main; CI publishes \
+                "  {n}. publish {crate_name} ({lv}): merge {repo} to main; CI publishes \
                  behind the version gate"
             );
             n += 1;
@@ -540,7 +540,7 @@ pub async fn apply(
         eprintln!("kin release apply: no repo pinned {crate_name}; nothing changed.");
     } else {
         println!(
-            "kin release apply: complete — {changed} repo(s) updated. Nothing was \
+            "kin release apply: complete; {changed} repo(s) updated. Nothing was \
              committed or pushed."
         );
         eprintln!(

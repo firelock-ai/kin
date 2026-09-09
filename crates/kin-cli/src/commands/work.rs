@@ -615,7 +615,7 @@ fn render_work_verification(graph: &kin_db::InMemoryGraph, work_id: String) -> R
         writeln!(out, "  Targeted test set: none")?;
         writeln!(
             out,
-            "  Completion: INCOMPLETE — no targeted proof exists for this work item"
+            "  Completion: INCOMPLETE; no targeted proof exists for this work item"
         )?;
         return Ok(out);
     }
@@ -644,12 +644,12 @@ fn render_work_verification(graph: &kin_db::InMemoryGraph, work_id: String) -> R
     {
         writeln!(
             out,
-            "  Completion: VERIFIED — targeted proof set is passing for this work item"
+            "  Completion: VERIFIED; targeted proof set is passing for this work item"
         )?;
     } else {
         writeln!(
             out,
-            "  Completion: PARTIAL — {} targeted test(s) lack a passing run, {} scope(s) still lack proof",
+            "  Completion: PARTIAL; {} targeted test(s) lack a passing run, {} scope(s) still lack proof",
             report.tests_without_passing_run,
             report.missing_scope_proof.len()
         )?;

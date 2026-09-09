@@ -211,7 +211,7 @@ fn build_entity_verify_response(
         } else {
             covered_count += 1;
             lines.push(format!(
-                "  COVERED  {} ({:?}) — {} test(s)",
+                "  COVERED  {} ({:?}): {} test(s)",
                 ent.name,
                 ent.kind,
                 tests.len()
@@ -690,7 +690,7 @@ fn verification_plan_lines(plan: &VerificationPlan) -> Vec<String> {
         lines.push("  Impacted dependents:".to_string());
         for slice in &plan.impacted {
             lines.push(format!(
-                "    - {} ({:?}) — {} test(s), {} work item(s)",
+                "    - {} ({:?}): {} test(s), {} work item(s)",
                 slice.entity.name,
                 slice.entity.kind,
                 slice.tests.len(),
@@ -745,7 +745,7 @@ fn change_verification_plan_lines(plan: &ChangeVerificationPlan) -> Vec<String> 
         lines.push("  Entity plans:".to_string());
         for entity_plan in &plan.entity_plans {
             lines.push(format!(
-                "    - {} ({:?}) — {} selected test(s), {} impacted dependents",
+                "    - {} ({:?}): {} selected test(s), {} impacted dependents",
                 entity_plan.entity.name,
                 entity_plan.entity.kind,
                 entity_plan.tests.len(),

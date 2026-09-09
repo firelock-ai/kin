@@ -1518,7 +1518,7 @@ mod tests {
 
         assert!(
             deltas.entity_deltas.is_empty(),
-            "no entity changes since the commit — deltas must be empty"
+            "no entity changes since the commit; deltas must be empty"
         );
         assert!(deltas.tree_deltas.is_empty());
     }

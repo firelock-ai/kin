@@ -2217,7 +2217,7 @@ fn behavior_env_divergence_message(divergences: &[kin_core::behavior_env::Diverg
         message.push_str(&d.describe());
     }
     message.push_str(
-        "\nremedy: restart the daemon so it re-inherits the current environment — stop it with \
+        "\nremedy: restart the daemon so it re-inherits the current environment: stop it with \
          `kin daemon stop` (or `kill $(cat .kin/daemon.pid)`; it also self-stops after its \
          KIN_DAEMON_IDLE_TIMEOUT_SECS idle window) and the next kin command respawns it. \
          Set KIN_STRICT_BEHAVIOR_ENV=1 to make this a hard error.",
