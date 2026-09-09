@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-09-09
+
+### Changed
+
+- Install language servers before the release-cut preflight judge (#1634)
+- Re-vendor kin-release-preflight with the FLOW_PATH language-server fix (#1636)
+- Move the language-server install before the archive download (#1637)
+- fix(cli): use IEC labels for binary byte counts (#1611)
+- perf(git): use positioned history spool reads (#1612)
+- perf(core): avoid redundant bootstrap hash validation (#1613)
+- Fail loud on watcher event loss until an explicit admission clears it (#1635)
+- Preserve typed missing-entity errors through the daemon (#1615)
+- Bump serde from 1.0.228 to 1.0.229 (#1474)
+- Land the three items held out of the v0.7.6 cut (#1633)
+- Re-vendor kin-evidence-publish, fixing manifest drift from kin-ecosystem#311 (#1638)
+
+
 ## [0.7.6] - 2026-09-08
 
 ### Changed
