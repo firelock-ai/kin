@@ -14,7 +14,10 @@
 #
 # The install is bounded and retried, for the same reason `ci-apt-install.sh`
 # is: a stalled registry that holds a job to the runner's one-hour timeout
-# ejects a merge-group entry without marking the pull request it ejected.
+# ejects a merge-group entry without marking the pull request it ejected. The
+# bound needs GNU timeout, and where a host has none the install runs unbounded
+# and says so, because not installing at all is the worse failure; the block
+# above the retry loop carries what that cost.
 #
 # A failure warns and exits 0 rather than failing the gate. A registry outage is
 # not a defect in the change under review, and blocking the whole fleet on npm's
@@ -40,10 +43,55 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 0
 fi
 
+# The bound above needs GNU timeout, and a macOS runner ships none, so a bare
+# `timeout` there is not an unbounded install: it is no install at all. On
+# release-cut.yml run 34395244305, job "Preflight kin-macos-aarch64", all three
+# attempts died on `line 46: timeout: command not found` between 19:28:56Z and
+# 19:29:26Z, this script warned that "3 bounded attempts" had failed when none
+# of them had started, and the leg then ran its whole acceptance suite with no
+# language server. magic-repro case 16 (FIR-2524) reads that host as one where
+# Kin can never produce a Python cross-file Calls edge, refuses to certify the
+# absence on both surfaces exactly as it should, and the release cut failed on
+# a correct answer three times in a row.
+#
+# So resolve the binary the way scripts/release-proof/bin/kin-release-preflight
+# already does, and check for GNU rather than trusting the name: macOS carries
+# no `timeout` at all today, but a BSD one appearing later would take different
+# arguments and fail just as quietly.
+TIMEOUT_BIN=""
+for candidate in timeout gtimeout; do
+  if command -v "$candidate" >/dev/null 2>&1 \
+    && "$candidate" --version 2>/dev/null | grep -q GNU; then
+    TIMEOUT_BIN="$(command -v "$candidate")"
+    break
+  fi
+done
+
+# With no GNU timeout, install unbounded rather than not at all. That is the
+# same trade `bounded()` in kin-release-preflight already makes, and it is the
+# right one here: an unbounded install risks holding the job, while no install
+# guarantees the enrichment proof does not run. The warning says which happened
+# so a reader never has to infer it, and ATTEMPT_KIND keeps the failure line
+# below from claiming a bound that was never applied.
+ATTEMPT_KIND=bounded
+if [ -z "$TIMEOUT_BIN" ]; then
+  ATTEMPT_KIND=unbounded
+  echo "::warning::no GNU timeout on this runner, so the language-server install runs \
+unbounded; install coreutils before this step to restore the bound" >&2
+fi
+
+bounded_npm() { # <npm args...>: run under GNU timeout when this host has one
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" "$INSTALL_BOUND" npm "$@"
+  else
+    npm "$@"
+  fi
+}
+
 mkdir -p "$PREFIX"
 
 for attempt in 1 2 3; do
-  if timeout "$INSTALL_BOUND" npm install \
+  if bounded_npm install \
     --prefix "$PREFIX" \
     --no-fund --no-audit --no-progress \
     "pyright@${PYRIGHT_VERSION}" \
@@ -76,6 +124,6 @@ for attempt in 1 2 3; do
   sleep $((attempt * 10))
 done
 
-echo "::warning::could not install language servers after 3 bounded attempts; the \
+echo "::warning::could not install language servers after 3 ${ATTEMPT_KIND} attempts; the \
 reference-enrichment proof will skip and say so per test" >&2
 exit 0

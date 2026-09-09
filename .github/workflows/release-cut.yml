@@ -359,6 +359,40 @@ jobs:
       # shape running once an untrusted artifact is already in the workspace
       # (alert firelock-ai/kin#145). This step never reads the archive, so
       # there is no reason for it to run after it lands.
+      # Was inline in "Judge the archive" below, which is one step too late.
+      # The language-server install underneath bounds npm with GNU timeout, a
+      # macOS runner has none, and on run 34395244305 all three of its attempts
+      # died on `timeout: command not found` between 19:28:56Z and 19:29:26Z.
+      # Six seconds after it gave up, the judge step installed coreutils. The
+      # leg then ran its whole acceptance suite with no language server, and
+      # magic-repro case 16 correctly refused to certify a Python absence Kin
+      # could never have linked, which read as a product regression and stopped
+      # three consecutive cuts. Hoisting it costs six measured seconds and the
+      # judge step still re-checks, so a future edit that drops this one
+      # degrades rather than breaks.
+      - name: Give the runner a GNU timeout
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+          if timeout --version >/dev/null 2>&1; then
+            echo "GNU timeout already present: $(command -v timeout)"
+            exit 0
+          fi
+          brew install coreutils
+          # Homebrew installs GNU timeout as `gtimeout` unless gnubin is on
+          # PATH, and the consumers below resolve either name, so prove one of
+          # them answers rather than trusting the install's exit code.
+          for candidate in timeout gtimeout; do
+            if "$candidate" --version 2>/dev/null | grep -q GNU; then
+              echo "GNU timeout available as ${candidate}"
+              exit 0
+            fi
+          done
+          echo "::error::coreutils installed but neither timeout nor gtimeout answers as GNU"
+          exit 1
+
       - name: Install language servers for the enrichment checks
         run: bash scripts/ci-install-language-servers.sh
 
