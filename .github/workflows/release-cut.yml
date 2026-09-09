@@ -348,6 +348,20 @@ jobs:
       - name: Prove the vendored proof tooling is the bytes its manifest names
         run: node --test scripts/release-proof/vendored.test.mjs
 
+      # FIR-2598's magic-repro checks 10 and 11 need enrichment_drained with
+      # worker_available true, which needs a Python language server on PATH
+      # when the daemon starts. Without one here the Linux legs read
+      # UNREADABLE and the cut publishes nothing (run 34323687836); this
+      # mirrors the install acceptance.yml already runs before its own
+      # enrichment checks. Runs before the archive download on purpose: npm
+      # install is package-manager-shaped, and CodeQL's
+      # actions/cache-poisoning/poisonable-step query flags exactly that
+      # shape running once an untrusted artifact is already in the workspace
+      # (alert firelock-ai/kin#145). This step never reads the archive, so
+      # there is no reason for it to run after it lands.
+      - name: Install language servers for the enrichment checks
+        run: bash scripts/ci-install-language-servers.sh
+
       - name: Download the candidate archive
         env:
           GH_TOKEN: ${{ github.token }}
@@ -375,15 +389,6 @@ jobs:
           fi
           echo "KIN_RC_ARCHIVE=$archive" >> "$GITHUB_ENV"
           echo "$ARTIFACT sha256 $have"
-
-      # FIR-2598's magic-repro checks 10 and 11 need enrichment_drained with
-      # worker_available true, which needs a Python language server on PATH
-      # when the daemon starts. Without one here the Linux legs read
-      # UNREADABLE and the cut publishes nothing (run 34323687836); this
-      # mirrors the install acceptance.yml already runs before its own
-      # enrichment checks.
-      - name: Install language servers for the enrichment checks
-        run: bash scripts/ci-install-language-servers.sh
 
       - name: Judge the archive with the release preflight
         env:
