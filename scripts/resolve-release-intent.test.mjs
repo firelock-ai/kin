@@ -129,6 +129,17 @@ test('an explicit full-SHA attestation resolves the divider case and records its
   assert.throws(() => resolveReleaseIntent({ root, baseRef: 'v1.2.3' }), /malformed or non-footer/);
 });
 
+test('a separately appended sign-off makes the earlier intent require attestation', () => {
+  const footer = 'Kin-Release-Intent: patch\nSigned-off-by: Test <test@example.invalid>\n';
+  const readable = repository(['change\n\n' + footer]);
+  assert.equal(resolveReleaseIntent({ root: readable, baseRef: 'v1.2.3' }).evidence[0].intent, 'patch');
+  const root = repository(['change\n\n' + footer + '\nSigned-off-by: Test <test@example.invalid>\n']);
+  assert.throws(() => resolveReleaseIntent({ root, baseRef: 'v1.2.3' }), /malformed or non-footer/);
+  const result = resolveReleaseIntent({ root, baseRef: 'v1.2.3', attestations: attested(root) });
+  assert.equal(result.evidence[0].source, 'attestation');
+  assert.equal(result.intent, 'patch');
+});
+
 test('attestations cannot replace readable, duplicate, invalid or absent intent', () => {
   for (const message of [
     'change\n\nKin-Release-Intent: major\n',
@@ -179,6 +190,7 @@ test('the committed historical attestation binds only the recorded full SHA', ()
     'c67efaa2c737ab0b7ac15d0057c8a3ec5a8041cc',
     '1b11fda4c870245f2575363adcf1031699580969',
     '8525c7751716b1c5304cd2d62da1aa8235e2e077',
+    '48bafa7911ccde08f64c14a002a8a991ffefd7a2',
   ]) {
     const entry = document.attestations.find(({ sha }) => sha === expected);
     assert.equal(entry?.intent, 'patch', expected);
