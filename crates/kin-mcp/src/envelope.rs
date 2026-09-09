@@ -1525,6 +1525,103 @@ fn embedding_class_states(envelope: &Envelope) -> (Map<String, Value>, Vec<Strin
     (classes, vec!["embeddings".to_string()], limits)
 }
 
+/// A watcher-reported loss of events standing against the store that answered.
+///
+/// A positive observation of missing input, which is what makes it a verdict
+/// input rather than a note. The watcher's own backend reported that it dropped
+/// events: notify emits a pathless `EventKind::Other` carrying its `Rescan`
+/// flag, from inotify on kernel queue overflow and from FSEvents on
+/// `MUST_SCAN_SUBDIRS`. No path is named, so nothing derives a per-path
+/// recovery from it and no ambient watch tick can close it. Until a complete
+/// exact-tree admission runs, an unknown set of paths changed without reaching
+/// graph truth, and no absence over this store is trustworthy.
+///
+/// Absent when the daemon reported no reconcile block, and absent when it
+/// reported one carrying no standing loss. The producer omits the field
+/// entirely on a store that owes no recovery, so the field's PRESENCE is the
+/// observation and nothing here has to re-derive it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WatcherLossObservation {
+    /// Every loss signal this store has been told about, durably and across
+    /// daemon lives.
+    #[serde(default)]
+    pub generation: u64,
+    /// The highest generation a completed full admission covered.
+    #[serde(default)]
+    pub recovered_through: u64,
+    /// Wall-clock time of the newest loss, RFC 3339, when the record named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// The daemon's own disclosure, carried verbatim rather than rewritten, so
+    /// the sentence `kin graph status` prints and the one this verdict refuses
+    /// beside cannot drift apart.
+    pub disclosure: String,
+}
+
+impl WatcherLossObservation {
+    /// Read the standing loss out of a daemon `/health` body.
+    ///
+    /// `None` for a body with no reconcile block and for one whose reconcile
+    /// block carries no loss. Neither is evidence of a loss and neither may
+    /// manufacture one.
+    pub fn from_health(health: &Value) -> Option<Self> {
+        let loss = health.get("reconcile")?.get("watcher_loss")?;
+        if loss.is_null() {
+            return None;
+        }
+        let generation = loss
+            .get("generation")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let recovered_through = loss
+            .get("recovered_through")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        // The producer already omits the block on a store that owes no
+        // recovery, so this is not the only gate. It is what makes the two
+        // sides agree by construction rather than by convention: a reader keyed
+        // on the block's mere presence would refuse forever the day any
+        // producer published a settled record, and nothing in this crate would
+        // notice.
+        if generation <= recovered_through {
+            return None;
+        }
+        Some(Self {
+            generation,
+            recovered_through,
+            at: loss.get("at").and_then(Value::as_str).map(str::to_string),
+            // A block that arrived without its own sentence still has to say
+            // something. Falling silent here would turn an unreadable
+            // disclosure into a store with no loss.
+            disclosure: loss
+                .get("disclosure")
+                .and_then(Value::as_str)
+                .unwrap_or("the daemon reported a watcher loss it did not describe")
+                .to_string(),
+        })
+    }
+
+    /// The factor this store carries into the single verdict.
+    ///
+    /// Names the generation, the recovery point and the one command that clears
+    /// it, because a reader told only that an answer is inconclusive has nothing
+    /// to do about it.
+    pub fn limiting_factor(&self) -> String {
+        let at = match self.at.as_deref() {
+            Some(at) => format!(", most recently {at}"),
+            None => String::new(),
+        };
+        format!(
+            "watcher_events_lost: the filesystem watcher reported that it lost events (loss \
+             generation {}, recovered through {}{at}) and no complete admission has covered them, \
+             so an unknown set of paths changed without reaching graph truth and no absence in \
+             this answer is authoritative; run `kin admit` on the repository to admit the complete \
+             exact tree and clear it",
+            self.generation, self.recovered_through
+        )
+    }
+}
+
 /// The graph class state, from the freshness signals the envelope observed.
 ///
 /// Both halves have to be affirmatively true. `initialized` says first
@@ -1962,6 +2059,14 @@ pub struct Envelope {
     /// certifying an all-clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<GraphFreshness>,
+    /// Whether the watcher that fed graph truth admits it lost events, beside
+    /// `freshness` rather than inside it because the two answer different
+    /// questions. `freshness` answers "was the graph ever brought level"; this
+    /// answers "did the mechanism that keeps it level go blind". A store can be
+    /// admitted seconds ago and still be missing whatever changed during a queue
+    /// overflow, and nothing else on this envelope can see that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watcher_loss: Option<WatcherLossObservation>,
     /// Honest graph freshness context; omitted entirely when nothing is known.
     #[serde(default, skip_serializing_if = "GraphState::is_empty")]
     pub graph_state: GraphState,
@@ -2009,6 +2114,7 @@ impl Envelope {
             durability: None,
             behind: None,
             freshness: None,
+            watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 offline_fallback: Some(true),
@@ -2033,6 +2139,7 @@ impl Envelope {
             durability: None,
             behind: None,
             freshness: None,
+            watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded::default(),
             hydration_semantics: None,
@@ -2293,6 +2400,7 @@ impl Envelope {
             durability: None,
             behind: None,
             freshness: None,
+            watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 daemon_unreachable: Some(true),
@@ -2322,6 +2430,7 @@ impl Envelope {
             durability: None,
             behind: None,
             freshness: None,
+            watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 workspace_mismatch: Some(true),
@@ -2394,6 +2503,11 @@ impl Envelope {
         // `behind`: the count gates that object off on a clean working copy, and
         // the clock is a fact about the graph rather than about the disk.
         self.freshness = GraphFreshness::from_health(health);
+        // Read from the same reconcile block, and separately from every reading
+        // above it: a store can be durable, level and holding zero unadmitted
+        // paths while an unknown region of it is missing because the watcher's
+        // backend dropped the events that would have named it.
+        self.watcher_loss = WatcherLossObservation::from_health(health);
         if let Some(behind) = self.behind.as_ref() {
             self.durability = self
                 .durability
@@ -2432,6 +2546,11 @@ impl Envelope {
     pub fn with_working_copy_health(mut self, health: &Value) -> Self {
         self.behind = GraphBehind::from_health(health);
         self.freshness = GraphFreshness::from_health(health);
+        // Read from the same reconcile block, and separately from every reading
+        // above it: a store can be durable, level and holding zero unadmitted
+        // paths while an unknown region of it is missing because the watcher's
+        // backend dropped the events that would have named it.
+        self.watcher_loss = WatcherLossObservation::from_health(health);
         if let Some(behind) = self.behind.as_ref() {
             self.durability = self
                 .durability

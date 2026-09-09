@@ -2830,6 +2830,20 @@ pub async fn run_loop_armed(
     // repository, as this loop last disclosed it. Held so a standing count is
     // reported once per rise rather than once per tick.
     let mut disclosed_events_outside_root = 0_u64;
+    // The same for the watcher's own reports that it LOST events. Held against
+    // the watcher's in-memory count, which restarts with each backend
+    // registration; the generation a store recovers against is durable and is
+    // advanced by the rise this sees rather than assigned from it.
+    let mut disclosed_watcher_loss = 0_u64;
+    // A loss outlives the daemon that observed it, so the durable record is
+    // republished onto this daemon's surfaces before the loop answers anything.
+    // Without this a restart would erase the one state saying an unknown region
+    // of the working copy is described by nothing, and the store would come up
+    // reporting itself well while still blind.
+    state
+        .background_work
+        .reconcile()
+        .record_watcher_loss(crate::watcher_loss::standing(&state.layout, working_dir));
 
     info!(
         poll_ms = config.poll_interval_ms,
@@ -3108,6 +3122,29 @@ pub async fn run_loop_armed(
                 .background_work
                 .reconcile()
                 .record_event_skipped(disclosure, tick_started);
+        }
+        // A backend that lost events names no path, so nothing in the drain
+        // above carries it and nothing below will ever hear about the writes it
+        // stands for. This loop admits what it is told about, so no later tick
+        // closes the gap however long it runs: only a complete exact-tree
+        // admission can, and the founder's contract is that a person or an agent
+        // asks for one rather than the daemon healing quietly.
+        //
+        // Persisted before it is disclosed. The disclosure dies with this
+        // daemon; the loss does not.
+        let lost_events = watcher.lost_events();
+        if lost_events.generation > disclosed_watcher_loss {
+            let signals = lost_events.generation - disclosed_watcher_loss;
+            disclosed_watcher_loss = lost_events.generation;
+            crate::watcher_loss::record_loss(
+                &state.layout,
+                signals,
+                lost_events.last_reason.as_deref(),
+            );
+            state
+                .background_work
+                .reconcile()
+                .record_watcher_loss(crate::watcher_loss::standing(&state.layout, working_dir));
         }
         // A graph-only repository member owns its own host subtree. Admission
         // already refuses to traverse one, so an event beneath it carries no
@@ -5215,6 +5252,74 @@ mod tests {
         assert!(
             reasons.contains("/private/var/repo/main.rs"),
             "the degraded reason names the dropped path: {reasons}"
+        );
+    }
+
+    /// Fail loud, and stay loud until an admission clears it. A store whose
+    /// watcher reported lost events stops every surface reporting a healthy
+    /// loop, names the generation and the time, and says what clears it.
+    ///
+    /// The withdrawal at the end is the half that makes the rest mean something:
+    /// a surface that could never clear would be a permanent alarm, and an
+    /// operator learns to read past those.
+    #[test]
+    fn a_standing_watcher_loss_degrades_the_reconcile_surface_until_an_admission_clears_it() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let working_dir = state.layout.working_dir().to_path_buf();
+        let probes = crate::background_work::ReconcileProbes::default();
+        let now = Instant::now();
+
+        probes.record_watcher_loss(crate::watcher_loss::standing(&state.layout, &working_dir));
+        assert!(
+            !probes.report(now).degraded(),
+            "a loop whose watcher has lost nothing is not degraded"
+        );
+
+        crate::watcher_loss::record_loss(&state.layout, 1, Some("rescan: kernel dropped"));
+        probes.record_watcher_loss(crate::watcher_loss::standing(&state.layout, &working_dir));
+
+        let report = probes.report(now);
+        assert!(
+            report.degraded(),
+            "a watcher that reported lost events is a degraded loop"
+        );
+        let reasons = report.degraded_reasons().join(" ");
+        assert!(
+            reasons.contains("generation 1"),
+            "the degraded reason carries the generation: {reasons}"
+        );
+        assert!(
+            reasons.contains("kin admit"),
+            "the degraded reason names what clears it: {reasons}"
+        );
+        assert!(
+            reasons.contains("rescan: kernel dropped"),
+            "the degraded reason carries the backend's own reason: {reasons}"
+        );
+        assert_eq!(
+            report.watcher_loss.as_ref().map(|loss| loss.generation),
+            Some(1),
+            "the machine-readable field carries it too, not only the prose"
+        );
+        assert!(
+            report
+                .watcher_loss
+                .as_ref()
+                .and_then(|loss| loss.at.as_ref())
+                .is_some(),
+            "the surface names the time of loss"
+        );
+
+        crate::watcher_loss::record_recovery(
+            &state.layout,
+            crate::watcher_loss::RecoveryCapture::Through(1),
+        );
+        probes.record_watcher_loss(crate::watcher_loss::standing(&state.layout, &working_dir));
+
+        assert!(
+            !probes.report(now).degraded(),
+            "the surface clears when a completed full admission clears the record"
         );
     }
 

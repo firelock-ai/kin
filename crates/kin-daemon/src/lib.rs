@@ -159,6 +159,7 @@ pub mod state;
 pub mod storage_delegate;
 pub mod supervisor;
 pub mod traffic_adapter;
+pub mod watcher_loss;
 pub mod write_veto;
 
 pub use daemon::{

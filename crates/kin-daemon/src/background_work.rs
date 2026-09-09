@@ -35,7 +35,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use kin_cli::commands::resources::{BackgroundPassReport, DaemonWorkState, ReconcileHealth};
+use kin_cli::commands::resources::{
+    BackgroundPassReport, DaemonWorkState, ReconcileHealth, WatcherLossState,
+};
 
 /// The background embedding worker.
 pub const PASS_EMBED: &str = "embed";
@@ -811,6 +813,14 @@ struct ReconcileProbesInner {
     /// it is set, every admission failure recorded below is a refusal against
     /// the mismatched tree rather than an independent fault.
     deferred_tree_wedge: Option<RecordedFault>,
+    /// The watcher loss standing against this store, as the durable record last
+    /// read.
+    ///
+    /// Mirrored here rather than owned here. The record is on disk, because a
+    /// loss outlives the daemon that observed it, and these probes deliberately
+    /// know nothing about the store's layout. So the loop and the explicit
+    /// admission path push what they read, and this is what the surfaces see.
+    watcher_loss: Option<WatcherLossState>,
 }
 
 /// Host content one complete walk declined to observe at all.
@@ -872,6 +882,17 @@ impl ReconcileProbes {
         let mut inner = self.lock();
         inner.skipped_events = inner.skipped_events.saturating_add(1);
         inner.last_error = Some(RecordedFault::new(error.to_string(), now));
+    }
+
+    /// Publish, or withdraw, the watcher loss standing against this store.
+    ///
+    /// Pushed rather than read, because the record that decides it lives on disk
+    /// and these probes hold no layout. `None` withdraws it, and the only caller
+    /// that can produce a `None` after a `Some` is a completed complete-exact-tree
+    /// admission: the ambient tick reads the same record and pushes whatever it
+    /// still says.
+    pub fn record_watcher_loss(&self, standing: Option<WatcherLossState>) {
+        self.lock().watcher_loss = standing;
     }
 
     /// A complete exact-tree admission attempt failed. Extends the streak.
@@ -1089,6 +1110,7 @@ impl ReconcileProbes {
                     at: Some(fault.wall_clock.to_rfc3339()),
                 }
             }),
+            watcher_loss: inner.watcher_loss.clone(),
         }
     }
 }

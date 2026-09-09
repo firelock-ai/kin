@@ -83,7 +83,7 @@ pub use repository::{
 };
 pub use resolution::{RelationResolution, RESOLUTION_FIELD, RESOLUTION_TIER_LADDER};
 pub use support::{compute_coverage_report, CoverageReport};
-pub use watcher::{EventsOutsideRoot, FileEvent, FileWatcher};
+pub use watcher::{EventsOutsideRoot, FileEvent, FileWatcher, LostEvents};
 
 use std::path::Path;
 

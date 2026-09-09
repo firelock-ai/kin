@@ -1561,6 +1561,16 @@
           "count": 2
         }
       ]
+    },
+    {
+      "file": "crates/kin-daemon/src/watcher_loss.rs",
+      "reason": "Durable bookkeeping record published beside the last-admission marker, not an answer authority. The excused bodies read and write .kin/kindb/watcher-loss, which records how many times a filesystem watcher backend reported that it LOST events and how much of that a completed exact-tree admission has covered. Both backends report the loss the same way and neither names a path: notify emits a pathless EventKind::Other carrying its Rescan flag, from inotify on kernel queue overflow and from FSEvents on MUST_SCAN_SUBDIRS. The record therefore holds two counters and a timestamp, names no entity, carries no repository content, and is read only by health surfaces and by the explicit admission path. It cannot change what any query returns: a reader that lied in either direction would change whether kin graph status, /health and the _kin verdict report that this store owes a `kin admit`, never a locate, search, context, trace, review, xref or rename answer. It is durable rather than in-daemon memory precisely because the loss outlives the daemon that observed it, and a restart that erased it would turn a recoverable gap into a permanent silent one. Publication is a temp-and-rename with an fsync of the staged file and then of the containing directory, through crate::state::sync_directory_metadata, which is the same shape write_generation_marker in crates/kin-daemon/src/state.rs uses for the authority head marker and the same shape kin_core::last_admission uses for the marker this record sits beside; routing through a shared boundary helper instead was not available, because neither kin-core nor kin-daemon exposes a public atomic-write path and each site open-codes its own. Function-scoped rather than whole-file so the rest of the module stays scanned, including the three-way read classification, the advance-never-assign rule on the generation and the three refusals in record_recovery, and so any newly added filesystem primitive here fails the guard until it is justified.",
+      "owner": "kin-daemon",
+      "expiration": "2027-10-29",
+      "allow_fn": [
+        "read",
+        "write"
+      ]
     }
   ]
 }

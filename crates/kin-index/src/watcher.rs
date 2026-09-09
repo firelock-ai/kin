@@ -32,6 +32,38 @@ pub struct EventsOutsideRoot {
     pub last_path: Option<PathBuf>,
 }
 
+/// A watcher backend's own report that it lost events.
+///
+/// Both backends spell this the same way and neither spelling survives
+/// classification. notify 8.2 emits `EventKind::Other` carrying the `Rescan`
+/// flag and NO paths at all, from `inotify.rs` when the kernel queue overflows
+/// and from `fsevent.rs` on `MUST_SCAN_SUBDIRS`. `classify_event` filters
+/// `event.paths` first and returns on an empty result before it ever matches
+/// `event.kind`, so a loss signal that reaches the filter is already gone, and
+/// `_ => {}` would drop it a second time if it got past. Nothing downstream saw
+/// it, so the loop could not notice its own blindness and every surface asking
+/// the loop how it is doing got a healthy answer.
+///
+/// This is therefore recorded from the callback, before the delivery probe and
+/// before classification. Placing it one line later is the whole defect.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LostEvents {
+    /// How many loss signals this watcher has reported.
+    ///
+    /// Monotonic within one watcher's life and reset with it, because a new
+    /// `FileWatcher` is a new backend registration that has observed nothing.
+    /// The generation a store recovers against is durable and lives in the
+    /// daemon; it advances from rises in this one and never restarts.
+    pub generation: u64,
+    /// The backend's own hint for the most recent loss, when it gave one.
+    ///
+    /// FSEvents distinguishes a user-dropped queue from a kernel-dropped one
+    /// and passes the distinction through `Event::info`; inotify's overflow
+    /// carries nothing. Held rather than derived so a report names the cause
+    /// the backend named instead of guessing at it.
+    pub last_reason: Option<String>,
+}
+
 /// Every form of the repository root a host event may legitimately arrive under.
 ///
 /// The backends do not agree on which form they report, and none of them is
@@ -123,6 +155,36 @@ fn record_outside_root(
     }
 }
 
+/// Record one backend report that events were lost, or decline an event that
+/// reports no loss.
+///
+/// Returns whether this event was a loss signal, so a caller cannot record one
+/// and classify it as an ordinary change too.
+///
+/// Loud every time, unlike [`record_outside_root`] beside it, which warns once
+/// and counts the rest. A foreign path can churn in the thousands, so a warning
+/// per event there would bury the one that explains the daemon. A rescan cannot
+/// churn that way: it is emitted once per queue overflow, and every one of them
+/// means an unknown region of the working copy is no longer described by
+/// anything this watcher will report.
+fn record_lost_events(lost: &Mutex<LostEvents>, event: &Event) -> bool {
+    if !event.need_rescan() {
+        return false;
+    }
+    let reason = event.info().map(str::to_string);
+    let mut recorded = lost.lock().unwrap_or_else(PoisonError::into_inner);
+    recorded.generation = recorded.generation.saturating_add(1);
+    recorded.last_reason.clone_from(&reason);
+    warn!(
+        generation = recorded.generation,
+        reason = reason.as_deref().unwrap_or("the backend named none"),
+        "the filesystem watcher backend reports that it lost events; an unknown set of paths \
+         changed without any notification, so ambient admission cannot recover them and only a \
+         complete exact-tree admission can"
+    );
+    true
+}
+
 /// An excluded control-file event proves delivery through this watcher's callback.
 struct DeliveryProbe {
     relative_path: PathBuf,
@@ -173,6 +235,7 @@ pub struct FileWatcher {
     _watcher: RecommendedWatcher,
     receiver: mpsc::Receiver<FileEvent>,
     outside_root: Arc<Mutex<EventsOutsideRoot>>,
+    lost: Arc<Mutex<LostEvents>>,
 }
 
 impl FileWatcher {
@@ -292,10 +355,25 @@ impl FileWatcher {
         let event_roots = RepositoryRoots::bind(&root);
         let outside_root = Arc::new(Mutex::new(EventsOutsideRoot::default()));
         let event_outside_root = Arc::clone(&outside_root);
+        let lost = Arc::new(Mutex::new(LostEvents::default()));
+        let event_lost = Arc::clone(&lost);
 
         let callback: WatchCallback = Box::new(
             move |res: std::result::Result<Event, notify::Error>| match res {
                 Ok(mut event) => {
+                    // First, before the delivery probe and before any path
+                    // filtering. A backend that lost events reports it with no
+                    // paths at all, so every step below discards it: the probe
+                    // ignores rescans by design, and `classify_event` returns on
+                    // an empty `relevant_paths` before it ever matches
+                    // `event.kind`. Recorded one line later is recorded nowhere.
+                    //
+                    // Classification still runs on the same event rather than
+                    // this returning early. Notify documents that it may set the
+                    // flag on an event of its own making, and a rescan that did
+                    // carry paths would lose them here; the pathless shape both
+                    // backends emit classifies to nothing anyway.
+                    record_lost_events(&event_lost, &event);
                     if let Some(probe) = &delivery_probe {
                         let mut probe = probe.lock().unwrap_or_else(PoisonError::into_inner);
                         probe.observe(&event, &event_roots);
@@ -328,6 +406,7 @@ impl FileWatcher {
             _watcher: watcher,
             receiver: rx,
             outside_root,
+            lost,
         })
     }
 
@@ -335,6 +414,15 @@ impl FileWatcher {
     /// watches, so a caller can disclose its own blind spot.
     pub fn events_outside_root(&self) -> EventsOutsideRoot {
         self.outside_root
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// What this watcher's backend has told it that it lost, so a caller can
+    /// disclose a blind spot no path in any event can name.
+    pub fn lost_events(&self) -> LostEvents {
+        self.lost
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -789,6 +877,130 @@ mod tests {
             watcher.events_outside_root().count,
             0,
             "no event from inside the repository may be dropped as foreign"
+        );
+    }
+
+    /// The exact event both notify backends emit when they lose events.
+    ///
+    /// `EventKind::Other`, the `Rescan` flag, and no paths at all: notify 8.2's
+    /// `inotify.rs` builds it on `Q_OVERFLOW` and its `fsevent.rs` builds it on
+    /// `MUST_SCAN_SUBDIRS`, the latter adding the backend's own hint.
+    fn backend_loss_signal(reason: Option<&str>) -> Event {
+        let event = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        match reason {
+            Some(reason) => event.set_info(reason),
+            None => event,
+        }
+    }
+
+    /// A loss signal advances the generation and an ordinary edit does not.
+    ///
+    /// Both arms on purpose. A recorder that advanced on every event would pass
+    /// the first assertion alone while making the generation meaningless, so the
+    /// ordinary edit beside it is what gives the first arm any content.
+    #[test]
+    fn a_backend_loss_signal_advances_the_generation_and_an_ordinary_edit_does_not() {
+        let lost = Mutex::new(LostEvents::default());
+
+        assert!(
+            !record_lost_events(&lost, &content_change(vec![PathBuf::from("/tmp/main.rs")])),
+            "an ordinary content change is not a loss signal"
+        );
+        assert_eq!(
+            lost.lock().unwrap().generation,
+            0,
+            "an ordinary content change must not advance the loss generation"
+        );
+
+        assert!(
+            record_lost_events(&lost, &backend_loss_signal(Some("rescan: kernel dropped"))),
+            "the shape both backends emit is a loss signal"
+        );
+        assert_eq!(lost.lock().unwrap().generation, 1);
+        assert_eq!(
+            lost.lock().unwrap().last_reason.as_deref(),
+            Some("rescan: kernel dropped"),
+            "the backend's own hint is carried rather than guessed at"
+        );
+
+        assert!(record_lost_events(&lost, &backend_loss_signal(None)));
+        assert_eq!(
+            lost.lock().unwrap().generation,
+            2,
+            "the generation is monotonic across signals"
+        );
+        assert_eq!(
+            lost.lock().unwrap().last_reason,
+            None,
+            "a backend that named no reason must not leave the previous one standing"
+        );
+    }
+
+    /// The seam that matters: the real callback records the loss, and it does so
+    /// before path filtering.
+    ///
+    /// `classify_event` is asserted here to still yield nothing for the same
+    /// event, which is the positive control for the whole class. If
+    /// classification ever did carry it, the record would be redundant; because
+    /// it does not, the record is the only thing between a lost region of the
+    /// working copy and a daemon that reports itself healthy. A recorder moved
+    /// below the path filter fails this test and passes the unit test above.
+    #[test]
+    fn the_watcher_callback_records_a_loss_signal_that_classification_discards() {
+        let repo = tempfile::tempdir().unwrap();
+        let source = repo.path().join("kept.rs");
+        std::fs::write(&source, "pub fn kept() {}\n").unwrap();
+
+        let callback_slot = Arc::new(Mutex::new(None::<WatchCallback>));
+        let captured = Arc::clone(&callback_slot);
+        let watcher =
+            FileWatcher::new_with_delivery_probe_using(repo.path(), None, move |_, callback| {
+                *captured.lock().unwrap() = Some(callback);
+                // Driven by hand below. This unregistered backend owns no host
+                // stream and no filesystem watch.
+                notify::recommended_watcher(|_: std::result::Result<Event, notify::Error>| {})
+                    .map_err(|error| IndexError::Watcher(error.to_string()))
+            })
+            .unwrap();
+        let mut callback = callback_slot.lock().unwrap().take().unwrap();
+
+        // Positive control. The callback under test is the one this watcher
+        // classifies through, so a later empty drain means "discarded" rather
+        // than "never delivered".
+        callback(Ok(content_change(vec![source.clone()])));
+        assert!(
+            watcher
+                .drain()
+                .iter()
+                .any(|event| matches!(event, FileEvent::Changed(path) if path == &source)),
+            "the fixture must drive the callback this watcher classifies through"
+        );
+        assert_eq!(
+            watcher.lost_events().generation,
+            0,
+            "an ordinary edit through the real callback is not a loss"
+        );
+
+        let signal = backend_loss_signal(Some("rescan: user dropped"));
+        assert!(
+            signal.paths.is_empty(),
+            "the fixture must carry the pathless shape the backends emit"
+        );
+        callback(Ok(signal));
+
+        assert!(
+            watcher.drain().is_empty(),
+            "classification still yields nothing for a pathless rescan, which is why the record \
+             is the only thing that can carry it downstream"
+        );
+        assert_eq!(
+            watcher.lost_events().generation,
+            1,
+            "the callback must record the loss before it filters paths"
+        );
+        assert_eq!(
+            watcher.lost_events().last_reason.as_deref(),
+            Some("rescan: user dropped")
         );
     }
 }
