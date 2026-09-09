@@ -803,6 +803,12 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     },
     ".github/workflows/install-proof.yml": {
         "install-proof": "${{ matrix.os }}",
+        # FIR-3442. Proves the real update path moves a real installation from
+        # the previously published release to Latest. It produces no required
+        # check context; it gates the release the way every other leg of this
+        # workflow does, which is the point: a broken updater matters most at
+        # exactly the moment a release is cut.
+        "update-proof": "Update proof (N-1 to Latest)",
     },
     # The dependency receiver validates the exact payload, prepares and compiles
     # candidate registry bytes without a write credential, then admits only the
