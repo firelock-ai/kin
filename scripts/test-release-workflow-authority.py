@@ -10600,6 +10600,35 @@ def assert_release_probe_fixtures() -> None:
                 fixture.write_bytes(original)
 
 
+def assert_native_startup_release_proof(release_cut: str) -> None:
+    block = release_cut.split("  preflight:\n", 1)[1].split("\n  publish:", 1)[0]
+    proof_name = "      - name: Prove startup recovery across native daemon restarts\n"
+    upload_name = "      - name: Upload this leg's record\n"
+    if proof_name not in block or block.index(proof_name) > block.index(upload_name):
+        raise AssertionError("native startup proof must precede the successful leg upload")
+    proof = block.split(proof_name, 1)[1].split("\n      - name:", 1)[0]
+    required = [
+        "if: matrix.artifact == 'kin-macos-aarch64'",
+        "set -euo pipefail",
+        'tar -xzf "$KIN_RC_ARCHIVE"',
+        'daemon="$RUNNER_TEMP/startup-archive/kin-macos-aarch64/kin-daemon"',
+        "python3 scripts/release-proof/startup-recovery/run.py",
+        '--kin "$kin" --daemon "$daemon" --output "$RUNNER_TEMP/startup-recovery"',
+    ]
+    active = {line.strip() for line in proof.splitlines()}
+    if required[0] not in active or any(line not in proof for line in required) or "continue-on-error" in proof or "||" in proof or "set +e" in proof:
+        raise AssertionError("native startup proof must fail closed on the verified macOS archive")
+    evidence = block.split("      - name: Preserve native startup recovery evidence\n", 1)[1].split("\n      - name:", 1)[0]
+    if "if: always() && matrix.artifact == 'kin-macos-aarch64'" not in evidence:
+        raise AssertionError("native startup evidence must survive a failed probe")
+    for suffix in ("/*/probe-result.json", "/*/daemon.log", "/*-init.log"):
+        if "${{ runner.temp }}/startup-recovery" + suffix not in evidence:
+            raise AssertionError("native startup evidence must retain logs without fixture controls")
+    upload = block.split(upload_name, 1)[1]
+    if "if: success()" not in upload:
+        raise AssertionError("native startup failure must prevent the leg upload")
+
+
 def main() -> None:
     assert_release_probe_fixtures()
     retired = (
@@ -10616,6 +10645,16 @@ def main() -> None:
 
     release = RELEASE.read_text(encoding="utf-8")
     release_cut = RELEASE_CUT.read_text(encoding="utf-8")
+    assert_native_startup_release_proof(release_cut)
+    for label, before, after, error in [
+        ("missing native startup proof", "Prove startup recovery across native daemon restarts", "Removed native startup proof", "must precede"),
+        ("wrong native startup archive", "tar -xzf \"$KIN_RC_ARCHIVE\"", "tar -xzf unrelated.tar.gz", "must fail closed"),
+        ("ignored native startup failure", 'test -x "$daemon"', 'test -x "$daemon"\n          false || true', "must fail closed"),
+        ("startup evidence lost on failure", "if: always() && matrix.artifact == 'kin-macos-aarch64'", "if: success() && matrix.artifact == 'kin-macos-aarch64'", "must survive"),
+    ]:
+        expect_assertion(label, error, lambda before=before, after=after: assert_native_startup_release_proof(release_cut.replace(before, after, 1)))
+    subprocess.run([sys.executable, str(ROOT / "scripts/release-proof/startup-recovery/run.py"), "--verify-only"], check=True)
+    subprocess.run([sys.executable, str(ROOT / "scripts/test-startup-release-proof.py")], check=True)
     release_recovery = RELEASE_RECOVERY.read_text(encoding="utf-8")
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
     release_train = RELEASE_TRAIN.read_text(encoding="utf-8")

@@ -429,6 +429,31 @@ jobs:
           mkdir -p "$RUNNER_TEMP/leg"
           cp "$record" "$RUNNER_TEMP/leg/preflight.json"
 
+      - name: Prove startup recovery across native daemon restarts
+        if: matrix.artifact == 'kin-macos-aarch64'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/startup-archive"
+          tar -xzf "$KIN_RC_ARCHIVE" -C "$RUNNER_TEMP/startup-archive"
+          daemon="$RUNNER_TEMP/startup-archive/kin-macos-aarch64/kin-daemon"
+          kin="$RUNNER_TEMP/startup-archive/kin-macos-aarch64/kin"
+          test -x "$daemon"
+          test -x "$kin"
+          python3 scripts/release-proof/startup-recovery/run.py \
+            --kin "$kin" --daemon "$daemon" --output "$RUNNER_TEMP/startup-recovery"
+
+      - name: Preserve native startup recovery evidence
+        if: always() && matrix.artifact == 'kin-macos-aarch64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: kin-startup-recovery-${{ matrix.artifact }}
+          path: |
+            ${{ runner.temp }}/startup-recovery/*/probe-result.json
+            ${{ runner.temp }}/startup-recovery/*/daemon.log
+            ${{ runner.temp }}/startup-recovery/*-init.log
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Upload this leg's record
         if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
