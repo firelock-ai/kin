@@ -1042,6 +1042,15 @@ jobs:
       - name: Test bounded brownfield trace witnesses
         run: python3 scripts/acceptance/test_brownfield_trace_witness.py
 
+      # magic-repro case 16 reads two surfaces and decides whether they agree,
+      # and acceptance.yml never grades that reading on a pull request. kin#1642
+      # added the arm and the daemon route it exercises in one commit, and the
+      # first thing to run it was a release cut, which then failed three times
+      # on a correct answer. The reading is pure and needs no repo or daemon,
+      # so it is graded here, where a pull request can see it.
+      - name: Test magic-repro case 16's surface reading
+        run: python3 scripts/acceptance/test_magic_repro_case16.py
+
       # Here rather than in `check`, for the reason the step above records: a
       # script step in `check` is a gate `bin/kin-precheck` enumerates and must
       # classify by name, and one wired there without the matching umbrella
