@@ -195,15 +195,22 @@ fn the_conversion_phase_leaves_no_daemon_behind_when_it_exits_early() {
     // The daemon record is the evidence. A phase that stopped what it started
     // leaves either no pid file or a pid that is gone; a leaked daemon leaves a
     // live one, which is exactly what blocked the next daemon on the runner.
-    let pid_file = repo.join(".kin").join("daemon.pid");
-    if let Ok(recorded) = fs::read_to_string(&pid_file) {
-        if let Ok(pid) = recorded.trim().parse::<i32>() {
-            let alive = unsafe { libc::kill(pid, 0) } == 0;
-            assert!(
-                !alive,
-                "kin init left daemon pid {pid} running; the conversion phase must stop the \
-                 daemon it started on every exit, including its early ones"
-            );
+    //
+    // Unix only: `libc` is a `cfg(unix)` dependency, so the whole check
+    // compiles out on a target that does not carry the crate rather than fail
+    // to find it.
+    #[cfg(unix)]
+    {
+        let pid_file = repo.join(".kin").join("daemon.pid");
+        if let Ok(recorded) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = recorded.trim().parse::<i32>() {
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                assert!(
+                    !alive,
+                    "kin init left daemon pid {pid} running; the conversion phase must stop the \
+                     daemon it started on every exit, including its early ones"
+                );
+            }
         }
     }
 }

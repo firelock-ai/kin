@@ -1583,14 +1583,21 @@ jobs:
       # musl steps in `check` check for their targets too. Not `--workspace`:
       # `kin-notifier-macos` is a macOS-only member and `tests/integration` is a
       # test crate, and neither is in a shipped Windows binary. `cargo check`
-      # with no target flags takes libs and bins, and both matter here, because
-      # the two call sites kin#1410 exists for are in `kin-cli/src/main.rs` and
+      # with no target flags took libs and bins only, because the two call
+      # sites kin#1410 exists for are in `kin-cli/src/main.rs` and
       # `kin-daemon/src/bin/kin-daemon.rs` while the dead helper was in the
       # `kin-core` lib beneath them.
+      #
+      # `--tests` now compiles the test targets too, closing the gap that let
+      # kin#1626 land a Windows-only `libc` reference with no Windows arm in
+      # `kin-cli/tests/init_non_tty_output.rs`: `Windows authority tests` only
+      # runs on push to main, so no pull request saw that break before kin#1629
+      # fixed it. Measured at 74 seconds against these same two packages,
+      # cheap enough to add to the ten-minute open-to-merge path.
       - name: Check the Windows target compiles
         run: |
           cargo check --locked --target x86_64-pc-windows-gnu \
-            -p kin-cli -p kin-daemon
+            -p kin-cli -p kin-daemon --tests
 
   # The required context, and the only job that publishes it. It always runs, on
   # every event, because a required context that is never reported is a silent

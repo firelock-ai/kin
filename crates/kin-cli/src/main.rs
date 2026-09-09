@@ -665,8 +665,8 @@ enum Command {
         /// keeps instead of proximity deciding it.
         #[arg(long = "target", value_name = "ENTITY")]
         target: Option<String>,
-        /// Return the chain's shape — names, kinds, roles, spans, edges —
-        /// without inlining any source body.
+        /// Return the chain's shape, meaning names, kinds, roles, spans and
+        /// edges, without inlining any source body.
         #[arg(long = "no-bodies", default_value_t = false)]
         no_bodies: bool,
         /// Serialized characters this response may occupy before the tool cuts
@@ -2597,8 +2597,9 @@ enum PipelineAction {
 ///
 /// `plan`/`apply`/`intent` read registry truth + the local sibling manifests and
 /// drive the bottom-up front (primitives -> kin-model -> kin-db -> kin -> bench/
-/// vfs/lsp) deliberately. They never publish — publishing stays in CI behind the
-/// version gate. `snapshot` is the original `kin release <tag>` graph snapshot.
+/// vfs/lsp) deliberately. They never publish, because publishing stays in CI
+/// behind the version gate. `snapshot` is the original `kin release <tag>`
+/// graph snapshot.
 #[derive(Subcommand)]
 enum ReleaseAction {
     /// Read-only bottom-up release plan: which crates need publishing and which

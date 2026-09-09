@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+// This file's one test exercises symlink resolution through
+// `std::os::unix::fs::symlink`, and every helper below exists only to serve
+// it, so the whole binary is scoped to that platform rather than leaving
+// unreachable helpers behind on others.
+#![cfg(unix)]
+
 //! Ambient admission through a repository root reached by a symbolic link.
 //!
 //! A repository is reached through symlinked paths far more often than it looks.
@@ -189,7 +195,6 @@ fn live_entity_count(repo: &Path, home: &Path, port: u16) -> u64 {
 
 /// FIR-2442. A repository reached through a symbolic link admits host writes
 /// ambiently, exactly as the same repository reached directly does.
-#[cfg(unix)]
 #[test]
 fn a_repository_bound_through_a_symlinked_root_admits_a_host_write() {
     let root = tempdir().expect("temp root");
