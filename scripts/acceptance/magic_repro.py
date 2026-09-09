@@ -2858,6 +2858,12 @@ def check_16(suite):
         res.ok("references returned (%d), so the refusing arm is not exercised here"
                % len(payload.get("references") or []))
 
+    res.asserts[-1]["receipt"] = {
+        "query": "parse_note", "mcp_payload": payload,
+        "cli": {"args": ["refs", "parse_note"], "exit_code": rc,
+                "stdout": out, "stderr": err},
+    }
+
     # ARM B, the positive control. An answer holding rows is not an absence, so
     # it carries no qualifier. This is the arm a fix that stamps everything
     # uncertain fails.
@@ -2873,14 +2879,18 @@ def check_16(suite):
     else:
         res.ok("positive control: an answer holding rows stays unqualified")
 
+    res.asserts[-1]["receipt"] = {"cli": {
+        "args": ["refs", "normalize_title"], "exit_code": rc_b,
+        "stdout": out_b, "stderr": err_b}}
+
     # ARM C, the negative control on the ruled exclusion, second row-group
     # command. `dead_code`'s empty result is the INVERSE claim, so kin_mcp gives
     # it no cross-file classes and no language scope; only the SUBSTRATE can put
     # it in doubt. On a sound daemon it certifies, so a clean scan says nothing
     # extra. This arm fails if a future change bolts a coverage refusal onto the
     # inverse claim.
-    dead = suite.dead_code(repo)
-    dead_text = dead.get("raw") or ""
+    rc_c, out_c, err_c = suite.kin_run(["dead-code"], repo)
+    dead_text = out_c + "\n" + err_c
     if not dead_text.strip():
         res.unknown("kin dead-code produced no output, so the negative control cannot "
                     "be evaluated")
@@ -2897,6 +2907,82 @@ def check_16(suite):
                 "is not an absence claim: %s" % dead_text.strip()[:240])
     else:
         res.ok("group=partial-vocabulary dead-code: a populated scan stays unqualified")
+    res.asserts[-1]["receipt"] = {"cli": {
+        "args": ["dead-code"], "exit_code": rc_c,
+        "stdout": out_c, "stderr": err_c}}
+
+    # An isolated unused focal makes the empty arm mandatory, independent of
+    # the shared fixture's incoming references. A raised census is the same
+    # deterministic substrate hold exercised by check 20.
+    isolated = tempfile.mkdtemp(prefix="absence-refusal-", dir=suite.workdir)
+    suite.fixtures["absence-refusal-" + os.path.basename(isolated)] = isolated
+    focal = "unused_absence_probe"
+    suite.git(["init", "-q", "."], isolated)
+    suite._write(isolated, "callee.py", "def called_probe():\n    return 1\n\ndef unused_absence_probe():\n    return 2\n")
+    suite._write(isolated, "caller.py", "from callee import called_probe\n\ndef caller_probe():\n    return called_probe()\n")
+    suite._kin_init(isolated)
+    suite._kin_commit(isolated, "Add absence control fixture")
+    args = ["refs", focal, "--kind", "calls"]
+
+    def paired_probe():
+        answer = suite.references(isolated, focal, relation_kinds=["calls"])
+        code, stdout, stderr = suite.kin_run(args, isolated)
+        return answer, {"query": focal, "mcp_payload": answer,
+                        "cli": {"args": args, "exit_code": code,
+                                "stdout": stdout, "stderr": stderr}}
+
+    before, receipt = paired_probe()
+    if resolution_miss(before, focal) or before.get("references"):
+        res.bad("isolated empty control did not resolve an unreferenced focal")
+    elif ((before.get("negative") or {}).get("safe_to_conclude_absent") is not True
+          or receipt["cli"]["exit_code"] != 0
+          or "No incoming Calls relations." not in receipt["cli"]["stdout"]
+          or CANNOT_RULE_OUT.search(receipt["cli"]["stdout"] + receipt["cli"]["stderr"])):
+        res.bad("healthy isolated empty control did not certify plainly on both surfaces")
+    else:
+        res.ok("healthy isolated empty control certifies plainly on both surfaces")
+    res.asserts[-1]["receipt"] = receipt
+    if res.asserts[-1]["status"] != PASS:
+        return res
+
+    record = os.path.join(isolated, ".kin", "kindb", "relation-census")
+    try:
+        with open(record) as handle:
+            raised = json.load(handle)
+        status = suite.graph_status(isolated)
+        calls = status["relation_kinds"].get("Calls", 0)
+        if not calls or status["entities"] is None:
+            res.unknown("isolated control has no measurable Calls census")
+            return res
+        raised["kinds"] = dict(raised.get("kinds") or {})
+        raised["kinds"]["Calls"] = calls + 1
+        raised["total"] = sum(raised["kinds"].values())
+        raised["entities"] = status["entities"]
+        with open(record, "w") as handle:
+            json.dump(raised, handle)
+        with open(os.path.join(isolated, "caller.py"), "a") as handle:
+            handle.write("\n# Preserve the caller.\n")
+        suite._kin_commit(isolated, "Note the preserved caller")
+    except (ValueError, OSError, RuntimeError) as exc:
+        res.unknown("isolated refusal fixture could not establish its census hold: %s" % exc)
+        return res
+
+    after, receipt = paired_probe()
+    degraded = ((after.get("_kin") or {}).get("degraded") or {})
+    same_focal = ((after.get("focal_entity") or {}).get("id")
+                  == before["focal_entity"]["id"])
+    if not same_focal or after.get("references"):
+        res.bad("isolated refusing arm did not preserve the resolved empty focal")
+    elif not degraded.get("relation_census_loss"):
+        res.bad("isolated refusing arm did not publish the required census hold")
+    elif (after.get("negative") or {}).get("safe_to_conclude_absent") is not False:
+        res.bad("MCP certified the isolated absence despite the census hold")
+    elif (receipt["cli"]["exit_code"] != 0
+          or not CANNOT_RULE_OUT.search(receipt["cli"]["stdout"] + receipt["cli"]["stderr"])):
+        res.bad("CLI did not carry the isolated empty-reference refusal")
+    else:
+        res.ok("isolated empty-reference arm refuses on both surfaces under census hold")
+    res.asserts[-1]["receipt"] = receipt
     return res
 
 

@@ -5458,7 +5458,10 @@ async fn command_refs(
     // impact route builds one (FIR-2524): only the daemon holds it, and a
     // thinner envelope is the shortcut that makes the CLI MORE confident than
     // MCP on exactly the degraded daemon nobody exercises.
-    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
+    let census_hold = kin_core::relation_census::CensusHold::read(state.layout.root());
+    let envelope = kin_mcp::Envelope::daemon()
+        .with_health(&daemon_health_snapshot(&state).await)
+        .with_relation_census_loss(census_hold.as_ref());
     let response = kin_cli::commands::refs::build_refs_response(
         &state.layout,
         graph.as_ref(),
@@ -46164,6 +46167,89 @@ mod tests {
             .unwrap();
         assert_eq!(annotations.len(), 1);
         assert!(state.is_dirty());
+    }
+
+    #[tokio::test]
+    async fn refs_endpoint_tracks_census_hold_without_qualifying_populated_answers() {
+        let state = test_state();
+        seed_cross_file_call_witness(&state);
+        state
+            .graph
+            .upsert_entity(&test_entity("unused_probe", "src/unused.py"))
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(Arc::clone(&state));
+        let hold_path = kin_core::relation_census::census_hold_path(state.layout.root());
+        for (held, query, empty) in [
+            (false, "unused_probe", true),
+            (true, "unused_probe", true),
+            (true, "witness_callee", false),
+            (false, "unused_probe", true),
+        ] {
+            if held {
+                std::fs::write(
+                    &hold_path,
+                    serde_json::to_vec(&json!({
+                        "held_at": "2026-09-08T00:00:00Z",
+                        "held_source": "test census",
+                        "losses": ["Calls decreased from 2 to 1"]
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            } else if hold_path.exists() {
+                std::fs::remove_file(&hold_path).unwrap();
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/commands/refs")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"entity": query, "kind": "all"}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            let result: kin_cli::commands::refs::RefsResponse =
+                serde_json::from_slice(&body).unwrap();
+            let text = result.lines.join("\n");
+            assert_eq!(text.contains("No incoming"), empty, "{text}");
+            assert_eq!(
+                text.contains("Kin cannot rule out"),
+                held && empty,
+                "{text}"
+            );
+            if empty {
+                let negative = result.negative.unwrap();
+                assert_eq!(
+                    negative["safe_to_conclude_absent"],
+                    json!(!held),
+                    "{negative}"
+                );
+                assert_eq!(
+                    negative["degraded_signals"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|v| v == "relation_census_loss"),
+                    held,
+                    "{negative}"
+                );
+            } else {
+                assert!(text.contains("referenced by"), "{text}");
+                assert!(text.contains("witness_caller"), "{text}");
+                assert!(result.negative.is_none());
+            }
+        }
     }
 
     #[tokio::test]
