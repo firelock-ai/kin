@@ -2240,26 +2240,32 @@ async fn park_reconcile_loop(
 /// 4. Projects overlay mutations back to files (overlay -> file)
 ///
 /// The loop runs on a tokio task and shares state through `DaemonState`.
-/// The reconcile loop's one-shot promise that its file watcher exists.
+/// The reconcile loop's one-shot promise of verified watcher callback delivery.
 ///
-/// Fired only after the watcher exists. Dropping it without firing closes the
+/// Fired only after the watcher acknowledges its control probe. Dropping it closes the
 /// channel, which tells endpoint publication that no watch exists rather than
 /// fabricating an `Armed` result. A loop can end before it ever builds a watcher
 /// — filesystem reconcile switched off, a bare checkout, a watcher the host
 /// refused — and a daemon that waited on a channel none of those paths closes
 /// would never publish its endpoint at all.
 #[derive(Debug)]
-pub struct WatchArmed(Option<tokio::sync::oneshot::Sender<()>>);
+pub struct WatchArmed(Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>);
 
 impl WatchArmed {
-    pub fn new(signal: tokio::sync::oneshot::Sender<()>) -> Self {
+    pub fn new(signal: tokio::sync::oneshot::Sender<std::result::Result<(), String>>) -> Self {
         Self(Some(signal))
     }
 
     /// Report the watch, once. Later calls and the drop below do nothing.
     fn arm(&mut self) {
         if let Some(signal) = self.0.take() {
-            let _ = signal.send(());
+            let _ = signal.send(Ok(()));
+        }
+    }
+
+    fn fail(&mut self, error: String) {
+        if let Some(signal) = self.0.take() {
+            let _ = signal.send(Err(error));
         }
     }
 }
@@ -2724,7 +2730,7 @@ pub async fn run_loop(
     run_loop_armed(state, config, cancel, None).await
 }
 
-/// Run the loop and report the moment its file watcher exists.
+/// Run the loop and report when its file watcher has acknowledged callback delivery.
 ///
 /// The daemon publishes `.kin/daemon.port` only after this fires, so a client
 /// that finds the endpoint is finding a daemon that is already observing the
@@ -2770,7 +2776,24 @@ pub async fn run_loop_armed(
         return Ok(());
     }
 
-    let watcher = FileWatcher::new(working_dir).map_err(DaemonError::from)?;
+    let mut startup_cancel = cancel.clone();
+    if *startup_cancel.borrow() {
+        return Ok(());
+    }
+    let watcher = tokio::select! {
+        result = FileWatcher::new_ready(working_dir, Duration::from_secs(10)) => {
+            match result {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    if let Some(armed) = armed.as_mut() {
+                        armed.fail(error.to_string());
+                    }
+                    return Err(DaemonError::from(error));
+                }
+            }
+        }
+        _ = startup_cancel.changed() => return Ok(()),
+    };
     // Read while the watcher is already reporting and before the endpoint can
     // be published, so the catch-up window and the watch meet rather than leave
     // a seam between them. Planning the pass itself is deliberately left to the
@@ -4447,7 +4470,11 @@ mod tests {
         } else {
             original
         };
-        std::fs::write(&host, content).unwrap();
+        // Replacing the inode produces a real host event even when the bytes
+        // are unchanged. The final source remains identical in that arm.
+        let replacement = repo.path().join(".kin/stable-notification");
+        std::fs::write(&replacement, content).unwrap();
+        std::fs::rename(&replacement, &host).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while (pass.progress() <= before
             || controlled_outcomes.load(Ordering::Relaxed) <= before_controlled)
@@ -8872,7 +8899,39 @@ mod tests {
         armed.arm();
         armed.arm();
         drop(armed);
-        assert_eq!(rx.try_recv(), Ok(()), "the arm reaches the daemon");
+        assert_eq!(rx.try_recv(), Ok(Ok(())), "the arm reaches the daemon");
+    }
+
+    #[tokio::test]
+    async fn canceled_startup_does_not_arm_or_create_a_probe() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(true);
+        let (armed_tx, mut armed_rx) = tokio::sync::oneshot::channel();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            run_loop_armed(
+                state,
+                LoopConfig::default(),
+                cancel_rx,
+                Some(WatchArmed::new(armed_tx)),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            armed_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(std::fs::read_dir(repo.path().join(".kin"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("watcher-ready-")));
+        drop(cancel_tx);
     }
 
     /// A graph-only daemon deliberately keeps its reconciliation task alive so

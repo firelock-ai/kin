@@ -1435,10 +1435,10 @@ const WATCH_ARMING_BOUND: Duration = Duration::from_secs(30);
 
 /// How the wait for the reconcile loop's watch ended.
 ///
-/// Three outcomes rather than a bool because they mean different things to an
+/// Distinct outcomes rather than a bool because they mean different things to an
 /// operator reading the log. Only `Armed` promises that a write landing after
 /// the endpoint appears will be observed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WatchArming {
     /// The loop reported its watcher. Publication is safe to proceed.
     Armed,
@@ -1448,27 +1448,43 @@ pub(crate) enum WatchArming {
     LoopGone,
     /// The bound expired with the loop neither arming nor ending.
     TimedOut,
+    /// The host watcher could not establish verified delivery.
+    Failed(String),
+}
+
+impl WatchArming {
+    fn publication_error(&self) -> Option<String> {
+        match self {
+            Self::Failed(error) => Some(error.clone()),
+            Self::TimedOut => Some("watcher readiness deadline expired before verified delivery; endpoint was not published".into()),
+            Self::Armed | Self::LoopGone => None,
+        }
+    }
 }
 
 /// Wait for the reconcile loop to report its file watcher, but never forever.
 ///
-/// Publishing late beats not publishing: an endpoint that never appears is a
-/// daemon no client can reach, so the bound expires into publication with the
-/// reason recorded rather than into a refusal.
+/// A deadline is a refusal to publish, not permission to serve an unverified
+/// filesystem watcher. Deliberately disabled and bare repositories remain valid
+/// graph-only daemons.
 pub(crate) async fn await_watch_armed(
-    armed: tokio::sync::oneshot::Receiver<()>,
+    armed: tokio::sync::oneshot::Receiver<std::result::Result<(), String>>,
     bound: Duration,
 ) -> WatchArming {
     match tokio::time::timeout(bound, armed).await {
-        Ok(Ok(())) => WatchArming::Armed,
+        Ok(Ok(Ok(()))) => WatchArming::Armed,
+        Ok(Ok(Err(error))) => WatchArming::Failed(error),
         Ok(Err(_)) => WatchArming::LoopGone,
         Err(_) => WatchArming::TimedOut,
     }
 }
 
 /// Say what the wait produced, at the level each outcome deserves.
-fn announce_watch_arming(arming: WatchArming, bound: Duration) {
+fn announce_watch_arming(arming: &WatchArming, bound: Duration) {
     match arming {
+        WatchArming::Failed(error) => {
+            error!(%error, "refusing daemon startup because watcher delivery could not be established")
+        }
         WatchArming::Armed => {
             debug!("the reconciliation watch is armed; publishing the daemon endpoint")
         }
@@ -1478,9 +1494,7 @@ fn announce_watch_arming(arming: WatchArming, bound: Duration) {
         ),
         WatchArming::TimedOut => warn!(
             bound_s = bound.as_secs(),
-            "the reconciliation loop did not report a file watcher within its bound; publishing \
-             the endpoint anyway, so a host write landing now may go unobserved until an \
-             explicit admission seam takes it"
+            "the reconciliation loop did not verify watcher delivery within its bound; refusing endpoint publication"
         ),
     }
 }
@@ -1542,8 +1556,8 @@ mod watch_arming_log_tests {
         let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
         {
             let _capture = crate::capture_events_on_this_thread(subscriber);
-            announce_watch_arming(WatchArming::LoopGone, Duration::from_secs(30));
-            announce_watch_arming(WatchArming::Armed, Duration::from_secs(30));
+            announce_watch_arming(&WatchArming::LoopGone, Duration::from_secs(30));
+            announce_watch_arming(&WatchArming::Armed, Duration::from_secs(30));
         }
 
         assert_eq!(
@@ -4408,7 +4422,8 @@ pub async fn run_with_authority_on(
     //
     // The wait is bounded and the signal fires on the loop's drop as well as on
     // arming, so no early return, disabled loop, bare checkout, or refused
-    // watcher can leave this daemon unpublished.
+    // watcher can leave this daemon waiting indefinitely. A refused watcher
+    // reports its error and exits before publication.
     let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
     let loop_state = Arc::clone(&state);
     let loop_config = config.loop_config.clone();
@@ -4423,7 +4438,13 @@ pub async fn run_with_authority_on(
         .await
     });
     let arming = await_watch_armed(armed_rx, WATCH_ARMING_BOUND).await;
-    announce_watch_arming(arming, WATCH_ARMING_BOUND);
+    announce_watch_arming(&arming, WATCH_ARMING_BOUND);
+    if let Some(error) = arming.publication_error() {
+        let _ = cancel_tx.send(true);
+        loop_handle.abort();
+        let _ = loop_handle.await;
+        return Err(DaemonError::Index(kin_index::IndexError::Watcher(error)));
+    }
 
     // Publish PID and the actual bound port as one lifecycle-authorized
     // operation. Endpoint retirement takes the same authority, so no client can
@@ -7105,7 +7126,7 @@ mod tests {
         let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(120)).await;
-            let _ = armed_tx.send(());
+            let _ = armed_tx.send(Ok(()));
         });
 
         assert_eq!(
@@ -7122,7 +7143,8 @@ mod tests {
     /// out would hold the endpoint back for nothing.
     #[tokio::test]
     async fn a_loop_that_ends_without_a_watch_releases_publication_at_once() {
-        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        let (armed_tx, armed_rx) =
+            tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
         drop(armed_tx);
 
         assert_eq!(
@@ -7132,17 +7154,108 @@ mod tests {
     }
 
     /// The bound is a ceiling on a wedged loop, not on a healthy one. An
-    /// endpoint that never appears is a daemon no client can reach, so the wait
-    /// expires into publication with the reason recorded.
+    /// endpoint must remain unpublished when callback delivery is unverified.
     #[tokio::test]
     async fn a_loop_that_never_reports_stops_holding_publication_at_its_bound() {
         // Held rather than dropped: dropping it is the LoopGone arm above, and
         // this arm is the one where nothing happens at all.
-        let (_armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        let (_armed_tx, armed_rx) =
+            tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
 
+        let arming = await_watch_armed(armed_rx, Duration::from_millis(80)).await;
+        assert_eq!(arming, WatchArming::TimedOut);
+        assert!(
+            arming
+                .publication_error()
+                .unwrap()
+                .contains("endpoint was not published"),
+            "a timeout must refuse the same publication boundary as a failed probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_arming_preserves_a_delivery_failure() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Err("probe was never observed".to_string()))
+            .unwrap();
         assert_eq!(
-            await_watch_armed(armed_rx, Duration::from_millis(80)).await,
-            WatchArming::TimedOut
+            await_watch_armed(rx, Duration::from_secs(1)).await,
+            WatchArming::Failed("probe was never observed".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watch_arming_failure_refuses_before_endpoint_publication() {
+        use tracing_subscriber::layer::SubscriberExt;
+        struct Publications(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Publications {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Published(bool);
+                impl tracing::field::Visit for Published {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message"
+                            && format!("{value:?}").contains("published the daemon endpoint")
+                        {
+                            self.0 = true;
+                        }
+                    }
+                }
+                let mut published = Published(false);
+                event.record(&mut published);
+                if published.0 {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let publications = Arc::new(AtomicUsize::new(0));
+        let _capture = crate::capture_events_on_this_thread(
+            tracing_subscriber::registry().with(Publications(Arc::clone(&publications))),
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        state
+            .filesystem_reconcile_disabled
+            .store(false, Ordering::Relaxed);
+        let moved = outside.path().join("control");
+        std::fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &root).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            super::run(
+                state,
+                DaemonConfig {
+                    api_port: 0,
+                    lsp_enabled: false,
+                    ..DaemonConfig::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            publications.load(Ordering::Relaxed),
+            0,
+            "a failed probe must never publish, even if shutdown later removes the endpoint files"
+        );
+        assert!(
+            matches!(result, Err(crate::error::DaemonError::Index(ref error)) if error.to_string().contains("outside the watched root")),
+            "a refused delivery probe must fail startup with its actual cause: {result:?}"
+        );
+        assert!(
+            !root.join("daemon.pid").exists() && !root.join("daemon.port").exists(),
+            "a failed watcher must never publish an endpoint"
         );
     }
 
