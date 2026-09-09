@@ -1143,13 +1143,21 @@ async fn a_standalone_publication_owes_no_parse_for_a_non_source_artifact() {
 
     // What the drain would do if the record named them, so the cost above is
     // demonstrated rather than asserted. Asking for the two artifacts directly
-    // re-persists both facets, which is the upsert that discards their vectors.
+    // re-reads both bodies from CAS and re-indexes them.
+    //
+    // It no longer re-persists their facets. `persist_non_entity_enrichment` is
+    // additive since the follow-up to this change, so a record that already
+    // describes these exact bytes is left alone and keeps its vector. That
+    // removes the sharpest half of the reason a debt entry must never name a
+    // path that is not entity source, and leaves the rest: every tick still
+    // pays a CAS read, a re-classification and a re-index for a path that owes
+    // no parse, and still counts it as enriched.
     let artifacts = BTreeSet::from([test_repo_path(config), test_repo_path(lock)]);
     let readmitted = readmit_semantics_for_paths(&state, &artifacts).await;
     assert_eq!(
         readmitted.enriched, 2,
-        "control: the drain does re-persist a non-source facet when it is asked to, \
-         which is why the debt record must never name one"
+        "control: the drain does take a non-source facet through the whole re-index when it is \
+         asked to, which is why the debt record must never name one"
     );
     assert!(readmitted.failed.is_empty(), "{:?}", readmitted.failed);
 }
