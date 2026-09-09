@@ -1245,11 +1245,11 @@ enum Command {
         runtime_sessions: Vec<String>,
         /// Set how an available update should reach this machine and exit.
         /// `auto` (the default) installs unattended through the gated
-        /// executor: it waits for a moment with no managed Kin process or
-        /// agent session, defers at most a bounded window, and runs the full
-        /// stop-install-acknowledge chain. `prompt` notifies with the remedy
-        /// attached and waits to be told. `manual` never notifies; checks
-        /// still run.
+        /// executor: it waits for a moment with no managed Kin daemon or VFS
+        /// server, defers at most a bounded window, and runs the full
+        /// stop-install-acknowledge chain. An open agent session does not hold
+        /// it back. `prompt` notifies with the remedy attached and waits to be
+        /// told. `manual` never notifies; checks still run.
         #[arg(
             long,
             value_enum,
@@ -1277,11 +1277,14 @@ enum Command {
         dry_run: bool,
         /// Run the unattended executor (what the update watchdog invokes on a
         /// stale install with policy auto): evaluate the machine-activity
-        /// gates, and on proceed stop every managed Kin process cooperatively
-        /// and run the full --apply chain. Blocked runs persist a deferral
-        /// clock instead of installing. The final stdout line is one JSON
-        /// record (also appended to ~/.kin/update-ledger.jsonl) carrying the
-        /// decision, reason, blocked_seconds, and window_seconds.
+        /// gates, and on proceed stop the managed daemon and VFS server
+        /// cooperatively and run the full --apply chain. Agent MCP servers keep
+        /// running; each picks up the new binary when its agent next starts it.
+        /// Blocked runs persist a deferral clock instead of installing. The
+        /// final stdout line is one JSON record (also appended to
+        /// ~/.kin/update-ledger.jsonl) carrying the decision, reason,
+        /// blocked_seconds, window_seconds, and how many releases the deferral
+        /// has blocked across.
         #[arg(long, conflicts_with_all = [
             "skip_verify",
             "channel",
@@ -1298,8 +1301,10 @@ enum Command {
         unattended: bool,
         /// With --unattended: apply despite the activity gates. For the
         /// watchdog once a deferred record shows blocked_seconds >=
-        /// window_seconds (24h). Never overrides a recorded prompt or manual
-        /// policy, only the executor's own activity gates.
+        /// window_seconds, which starts at 24h and shortens as the
+        /// installation falls further behind, to a floor of 6h. Never
+        /// overrides a recorded prompt or manual policy, only the executor's
+        /// own activity gates.
         #[arg(long, requires = "unattended")]
         force_window: bool,
     },
@@ -4996,6 +5001,54 @@ mod tests {
                 assert!(
                     known.iter().any(|name| name == expected),
                     "{expected:?} is not a kin subcommand; known: {known:?}"
+                );
+            }
+        });
+    }
+
+    /// `--force-window` names the window bounds as numbers a user reads, and a
+    /// clap doc comment cannot interpolate a constant without a compile-time
+    /// formatting crate, which is not a dependency worth adding for a help
+    /// string. So the literals are pinned to the constants here instead: move
+    /// either bound and this test names the help text still claiming the old one.
+    ///
+    /// The class is worth stating, because this change was repairing it
+    /// elsewhere. Three sentences in this file described update behaviour that
+    /// had been removed, and nothing compared them against the code, so they
+    /// stayed green through every gate. Help text is written once and re-read by
+    /// users rather than by CI.
+    #[test]
+    fn the_update_help_names_the_real_deferral_bounds() {
+        on_cli_test_stack(|| {
+            let command = Cli::command();
+            let update = command
+                .get_subcommands()
+                .find(|sub| sub.get_name() == "update")
+                .expect("kin update is a subcommand");
+            let arg = update
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == "force_window")
+                .expect("--force-window is an argument of kin update");
+            // Read both halves. clap splits a doc comment into short and long
+            // help at the first blank line, so asserting on one of them would
+            // pass or fail on where the paragraph breaks rather than on what
+            // the text says.
+            let help = format!(
+                "{} {}",
+                arg.get_help()
+                    .map(|help| help.to_string())
+                    .unwrap_or_default(),
+                arg.get_long_help()
+                    .map(|help| help.to_string())
+                    .unwrap_or_default(),
+            );
+            for bound in [
+                commands::update::UNATTENDED_DEFERRAL_WINDOW_HOURS,
+                commands::update::UNATTENDED_DEFERRAL_FLOOR_HOURS,
+            ] {
+                assert!(
+                    help.contains(&format!("{bound}h")),
+                    "--force-window help must name the {bound}h bound, found: {help}"
                 );
             }
         });

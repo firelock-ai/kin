@@ -371,10 +371,15 @@ pub fn decide_auto_update(policy: UpdatePolicy, activity: MachineActivity) -> Au
         UpdatePolicy::Manual => AutoDecision::Silent("update policy is manual"),
         UpdatePolicy::Prompt => AutoDecision::Prompt("update policy is prompt"),
         UpdatePolicy::Auto => {
+            // `external_sessions` is deliberately absent from this chain. An
+            // agent's MCP server holds no store and is no longer stopped by an
+            // update, so its presence is an observation rather than a reason
+            // to wait. Gating on it made the answer a constant on any machine
+            // with an agent open, which is every machine Kin is for, and left
+            // the founder's install stale across release after release
+            // (FIR-3442).
             if !activity.readable {
                 AutoDecision::Prompt("could not read whether this machine was busy")
-            } else if activity.external_sessions {
-                AutoDecision::Prompt("an agent or user session is open")
             } else if activity.managed_runtimes_active {
                 AutoDecision::Prompt("a managed Kin process is still running")
             } else if activity.work_in_flight {
@@ -753,6 +758,53 @@ impl RuntimeKind {
             Self::Daemon => "daemon",
             Self::Mcp => "mcp",
             Self::Vfs => "vfs",
+        }
+    }
+
+    /// Whether a live runtime of this kind must be stopped before managed
+    /// bytes may move.
+    ///
+    /// A daemon and a VFS server hold the store open, so installing under one
+    /// is installing under a live writer. A product MCP stdio server holds
+    /// nothing: `kin mcp start` calls `kin_mcp::run_stdio_daemon`
+    /// (`crates/kin-cli/src/commands/mcp.rs`), which takes no store parameter
+    /// and, in its own words, "never receives a graph store and cannot fall
+    /// through to local graph handlers". It is a transport that delegates
+    /// every question to the daemon. Stopping one protects no store. It only
+    /// severs the agent session holding it.
+    ///
+    /// Kin does not sever a developer's working sessions to install an update
+    /// (founder principle, FIR-3442). Surface, do not sever. An MCP server
+    /// keeps serving from its own inode until its agent next starts it, which
+    /// agents do on demand, and the update says how many it kept rather than
+    /// killing them or pretending they are not there.
+    ///
+    /// This one predicate is read by the activity gate, the stop sweep and the
+    /// install preflight, so they cannot drift apart. That agreement is a
+    /// deliberate invariant: an executor that believed idle a machine the
+    /// preflight would reject would proceed, sever every session, and then
+    /// fail the run having severed them for nothing, which is exactly what
+    /// happened on 2026-09-08 when one of 37 signalled servers survived.
+    fn blocks_managed_byte_movement(self) -> bool {
+        match self {
+            Self::Daemon | Self::Vfs => true,
+            Self::Mcp => false,
+        }
+    }
+
+    /// Raise the signal a live runtime of this kind contributes to a machine
+    /// activity observation.
+    ///
+    /// This is the mapping `probe_machine_activity` applies, extracted so it
+    /// has exactly one definition. `the_gate_and_the_install_preflight_cannot_disagree`
+    /// walks every kind through THIS function rather than a copy of its match,
+    /// because a test carrying its own table stays green while the mapping
+    /// beneath it moves, and the invariant it guards is precisely that the
+    /// gate and the install preflight answer the same way about the same kind.
+    fn raise_activity_signal(self, activity: &mut MachineActivity) {
+        match self {
+            Self::Mcp => activity.external_sessions = true,
+            Self::Daemon | Self::Vfs => activity.managed_runtimes_active = true,
         }
     }
 }
@@ -1384,8 +1436,21 @@ fn registry_authority_preflight() -> Result<()> {
 /// never, and never is what left the incident machine eight releases stale.
 pub const UNATTENDED_DEFERRAL_WINDOW_HOURS: u64 = 24;
 
+/// The shortest window drift may shorten a deferral to.
+///
+/// The bound above is the patience an installation ONE release behind is
+/// entitled to. It was never meant to be the patience an installation many
+/// releases behind gets, and reading it that way is what FIR-3442 cost. The
+/// floor is the other end of the same ruling: however far behind a machine
+/// falls, it still gets a courtesy period after its last convergence, and no
+/// version stream can collapse the window to zero and force an install the
+/// instant a session opens.
+pub const UNATTENDED_DEFERRAL_FLOOR_HOURS: u64 = 6;
+
 const UNATTENDED_SCHEMA: &str = "kin.update-unattended.v1";
-const UNATTENDED_DEFERRAL_SCHEMA_VERSION: u32 = 1;
+/// Schema 2 added `releases_blocked_across`. A schema 1 file still loads, and
+/// must: see the field's own note.
+const UNATTENDED_DEFERRAL_SCHEMA_VERSION: u32 = 2;
 
 fn unattended_deferral_path(kin_home: &Path) -> PathBuf {
     kin_home.join("update-deferral.json")
@@ -1406,7 +1471,47 @@ struct UnattendedDeferral {
     first_blocked_at: String,
     first_blocked_at_unix_seconds: u64,
     reason: String,
+    /// The newest release this deferral has seen, updated in place as Latest
+    /// moves so the counter beside it can count the moves. Before FIR-3442
+    /// this field was written once and never read again.
     latest_version_seen: String,
+    /// How many distinct releases this ONE deferral has been blocking against,
+    /// counting the release it started on.
+    ///
+    /// A state file written before this field existed reads as 1, which is the
+    /// truth for it: it recorded exactly one release. Defaulting rather than
+    /// failing is load-bearing, because an unreadable state file restarts the
+    /// clock, and restarting every existing installation's clock on upgrade is
+    /// the regression this default exists to prevent.
+    #[serde(default = "one_release")]
+    releases_blocked_across: u64,
+}
+
+fn one_release() -> u64 {
+    1
+}
+
+impl UnattendedDeferral {
+    /// How long this deferral may run before its caller is entitled to force
+    /// the window.
+    ///
+    /// An installation one release behind keeps the whole base window: waiting
+    /// a day for a quiet moment is the courtesy the founder ruling is about,
+    /// and one release behind is the case it was written for. Every FURTHER
+    /// release that ships while this same deferral is still blocked is direct
+    /// evidence that this window is not converging this machine, so the window
+    /// divides by the number of distinct releases the deferral has spanned.
+    ///
+    /// Bounding on wall time alone caps a machine at one apply per window
+    /// however far behind it falls, which is not a bound on staleness at all
+    /// once releases ship faster than the window. That is what left the
+    /// founder's installation at v0.7.2 while Latest walked v0.7.3, v0.7.4 and
+    /// v0.7.5, and again at v0.7.5 across v0.7.6 and v0.7.7 (FIR-3442).
+    fn effective_window_seconds(&self) -> u64 {
+        let base = UNATTENDED_DEFERRAL_WINDOW_HOURS * 3600;
+        let floor = UNATTENDED_DEFERRAL_FLOOR_HOURS * 3600;
+        (base / self.releases_blocked_across.max(1)).max(floor)
+    }
 }
 
 /// One line of the update ledger, and byte-for-byte the final stdout line of
@@ -1433,7 +1538,26 @@ struct UnattendedLedgerEntry {
     first_blocked_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     blocked_seconds: Option<u64>,
+    /// How many distinct releases the running deferral has blocked across, so
+    /// a consumer sees non-convergence without doing arithmetic over the
+    /// ledger's history. Absent when no deferral is running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    releases_blocked_across: Option<u64>,
+    /// The window this run's `blocked_seconds` should be compared against.
+    /// Republished per entry because it is no longer a constant: it shortens
+    /// as the installation falls further behind, and the caller must never
+    /// carry its own copy.
     window_seconds: u64,
+    /// Whether an agent's MCP session was open when this run decided.
+    ///
+    /// Observed, never gating, since FIR-3442. It is written down because the
+    /// whole point of the change above is that Kin no longer severs these to
+    /// install, so "an update ran while agent sessions were open" is the fact
+    /// a reader needs to confirm that held. Before this field the executor
+    /// probed the signal and then dropped it, which is how nobody noticed it
+    /// had been deciding everything.
+    #[serde(default)]
+    agent_sessions_open: bool,
     steps: Vec<String>,
     outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1454,7 +1578,11 @@ impl UnattendedLedgerEntry {
             update_available: false,
             first_blocked_at: None,
             blocked_seconds: None,
+            releases_blocked_across: None,
+            // The base window is the truth when no deferral is running. A run
+            // that finds one overwrites this from the deferral's own state.
             window_seconds: UNATTENDED_DEFERRAL_WINDOW_HOURS * 3600,
+            agent_sessions_open: false,
             steps: Vec::new(),
             outcome: String::new(),
             error: None,
@@ -1480,24 +1608,59 @@ fn load_unattended_deferral(kin_home: &Path) -> Option<UnattendedDeferral> {
     }
 }
 
-/// Record the first blocked moment, or return the one already recorded.
+/// Record the first blocked moment, or update the one already recorded.
+///
+/// The first blocked moment and the first reason are facts, and neither ever
+/// moves: a clock that restarts on every watchdog cycle never elapses. What
+/// DOES move is the release this deferral is blocking against. When Latest has
+/// moved since the last run, this machine has failed to converge across one
+/// more release, and that is what shortens the window it is entitled to.
+///
+/// Before FIR-3442 this returned the stored state untouched, so
+/// `latest_version_seen` was written once and never read again. The machine
+/// had the evidence that it was falling behind and discarded it every six
+/// hours.
 fn record_unattended_blocked(
     kin_home: &Path,
     reason: &str,
     latest_version: &str,
 ) -> Result<UnattendedDeferral> {
-    if let Some(existing) = load_unattended_deferral(kin_home) {
-        return Ok(existing);
-    }
-    let now = chrono::Utc::now();
-    let state = UnattendedDeferral {
-        schema_version: UNATTENDED_DEFERRAL_SCHEMA_VERSION,
-        first_blocked_at: now.to_rfc3339(),
-        first_blocked_at_unix_seconds: now.timestamp().max(0) as u64,
-        reason: reason.to_string(),
-        latest_version_seen: latest_version.to_string(),
+    let state = match load_unattended_deferral(kin_home) {
+        // Same release as the last run: nothing changed, so nothing is written.
+        Some(existing) if existing.latest_version_seen == latest_version => return Ok(existing),
+        // A different release while still blocked. Any change counts, in
+        // either direction: a channel switch or a withdrawn release is still a
+        // distinct release this deferral failed to converge on, and counting
+        // it only shortens the window, which is the safe direction and is
+        // floored anyway.
+        Some(existing) => {
+            let blocked_across = existing.releases_blocked_across.saturating_add(1);
+            UnattendedDeferral {
+                latest_version_seen: latest_version.to_string(),
+                releases_blocked_across: blocked_across,
+                ..existing
+            }
+        }
+        None => {
+            let now = chrono::Utc::now();
+            UnattendedDeferral {
+                schema_version: UNATTENDED_DEFERRAL_SCHEMA_VERSION,
+                first_blocked_at: now.to_rfc3339(),
+                first_blocked_at_unix_seconds: now.timestamp().max(0) as u64,
+                reason: reason.to_string(),
+                latest_version_seen: latest_version.to_string(),
+                releases_blocked_across: 1,
+            }
+        }
     };
-    let bytes = serde_json::to_vec_pretty(&state).context("serialize unattended deferral state")?;
+    persist_unattended_deferral(kin_home, &state)?;
+    Ok(state)
+}
+
+/// Write deferral state through a staged file and a rename, so a concurrent
+/// reader never sees a half-written clock.
+fn persist_unattended_deferral(kin_home: &Path, state: &UnattendedDeferral) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(state).context("serialize unattended deferral state")?;
     let path = unattended_deferral_path(kin_home);
     let staged = kin_home.join(format!(".update-deferral.tmp.{}", std::process::id()));
     {
@@ -1515,8 +1678,44 @@ fn record_unattended_blocked(
             .context("write unattended deferral state")?;
     }
     fs::rename(&staged, &path)
-        .with_context(|| format!("persist unattended deferral state at {}", path.display()))?;
-    Ok(state)
+        .with_context(|| format!("persist unattended deferral state at {}", path.display()))
+}
+
+/// Say, on stderr, that this deferral has stopped converging the machine.
+///
+/// A deferral across one release is routine politeness. A deferral across
+/// several is the failure this file exists to prevent, and both times
+/// auto-update died on this fleet the machine had written the truth down and
+/// nobody read it. Detection was never the hard part. Saying so was.
+fn report_deferral_not_converging(state: &UnattendedDeferral, blocked_seconds: u64) {
+    if let Some(warning) = deferral_not_converging_warning(state, blocked_seconds) {
+        eprintln!("{warning}");
+    }
+}
+
+/// The words the function above prints, separated from the printing so they can
+/// be asserted on.
+///
+/// `None` while one deferral has spanned a single release, which is the routine
+/// politeness the window exists to grant. A message once it has spanned more,
+/// which is the state both outages of this capability sat in, correctly
+/// recorded, while nobody read it.
+fn deferral_not_converging_warning(
+    state: &UnattendedDeferral,
+    blocked_seconds: u64,
+) -> Option<String> {
+    if state.releases_blocked_across <= 1 {
+        return None;
+    }
+    Some(format!(
+        "WARNING: unattended updating has now deferred across {} releases (latest v{}), blocked \
+         {}h since {}. The window is shortened to {}h because this machine is not converging.",
+        state.releases_blocked_across,
+        state.latest_version_seen,
+        blocked_seconds / 3600,
+        state.first_blocked_at,
+        state.effective_window_seconds() / 3600,
+    ))
 }
 
 /// Forget the deferral clock. Called when the machine converges (an apply
@@ -1572,9 +1771,13 @@ fn conclude_unattended(kin_home: &Path, entry: &UnattendedLedgerEntry) {
 ///
 /// Gate semantics under policy auto (FIR-2342), stated once here:
 /// - `external_sessions`: a managed MCP serving process is alive, the stdio
-///   transport an agent session holds open. Defers the install; never blocks
-///   it forever, because the caller passes `--force-window` once the bounded
-///   deferral window is spent.
+///   transport an agent session holds open. REPORTED, NOT GATING since
+///   FIR-3442. These hold no store, are no longer stopped by an update, and
+///   are alive on any machine with an agent open, so gating on them made the
+///   gate's answer a constant: across 37 ledger entries the founder's box
+///   never once proceeded, and 37 such servers were alive there holding 0.40
+///   CPU-seconds between them. Kept for the record and the operator, because
+///   how many sessions an update kept running is worth saying.
 /// - `managed_runtimes_active`: a managed daemon or VFS server is alive.
 ///   Same deferral semantics; the orchestrated stop makes the forced path
 ///   safe by stopping them cooperatively before any byte moves.
@@ -1589,23 +1792,27 @@ fn conclude_unattended(kin_home: &Path, entry: &UnattendedLedgerEntry) {
 ///   process-table walk that either returns or the process errors before
 ///   constructing an answer, so a constructed `MachineActivity` is always a
 ///   read one.
+///
+/// Worth stating plainly, because it is why nobody noticed the fourth signal
+/// had gone constant too: `work_in_flight` and `readable` are hardcoded
+/// `false` and `true` below, for the sound reasons above. With
+/// `external_sessions` now reported rather than gating, `managed_runtimes_active`
+/// is the only signal here that both varies and decides. That is the honest
+/// shape, and a reader should not have to derive it from three separate
+/// paragraphs.
 fn probe_machine_activity(kin_home: &Path, spec: &[ComponentSpec]) -> MachineActivity {
     let mut system = System::new_all();
     system.refresh_all();
-    let mut managed_runtimes_active = false;
-    let mut external_sessions = false;
-    for (kind, _, _) in scan_active_managed_runtimes(&system, kin_home, spec) {
-        match kind {
-            RuntimeKind::Mcp => external_sessions = true,
-            RuntimeKind::Daemon | RuntimeKind::Vfs => managed_runtimes_active = true,
-        }
-    }
-    MachineActivity {
-        managed_runtimes_active,
-        external_sessions,
+    let mut activity = MachineActivity {
+        managed_runtimes_active: false,
+        external_sessions: false,
         work_in_flight: false,
         readable: true,
+    };
+    for (kind, _, _) in scan_active_managed_runtimes(&system, kin_home, spec) {
+        kind.raise_activity_signal(&mut activity);
     }
+    activity
 }
 
 /// Stop every managed serving executable so the unattended chain can run,
@@ -1633,6 +1840,26 @@ async fn stop_managed_runtimes_for_update(
     spec: &[ComponentSpec],
 ) -> Result<Vec<String>> {
     let mut actions = Vec::new();
+    // Say what is being kept, before anything is signalled. These hold no
+    // store, so an update cannot harm them and they need not be severed for
+    // it; each picks up the new binary when its agent next starts it. Counted
+    // here rather than inferred later, because "how many sessions did this
+    // update keep alive" is the fact an operator wants and the old behaviour
+    // could only answer with a list of what it killed.
+    {
+        let mut system = System::new_all();
+        system.refresh_all();
+        let kept = scan_active_managed_runtimes(&system, kin_home, spec)
+            .into_iter()
+            .filter(|(kind, _, _)| !kind.blocks_managed_byte_movement())
+            .count();
+        if kept > 0 {
+            actions.push(format!(
+                "kept {kept} agent MCP server{} serving; each picks up the new binary when its agent next starts it",
+                if kept == 1 { "" } else { "s" }
+            ));
+        }
+    }
     match crate::commands::daemon::stop_all_quiet().await {
         Ok(()) => actions.push("stopped managed daemons and supervisor cooperatively".to_string()),
         // The sweep failing (no supervisor to talk to, a worker already gone)
@@ -1645,7 +1872,7 @@ async fn stop_managed_runtimes_for_update(
     loop {
         let mut system = System::new_all();
         system.refresh_all();
-        let residual = scan_active_managed_runtimes(&system, kin_home, spec);
+        let residual = scan_blocking_managed_runtimes(&system, kin_home, spec);
         if residual.is_empty() {
             return Ok(actions);
         }
@@ -1778,6 +2005,7 @@ pub async fn run_unattended(force_window: bool) -> Result<()> {
     }
 
     let activity = probe_machine_activity(&kin_home, spec);
+    entry.agent_sessions_open = activity.external_sessions;
     let decision = decide_auto_update(policy, activity);
     entry.reason = decision.reason().map(str::to_string);
     let proceed = unattended_may_proceed(policy, &decision, force_window);
@@ -1795,8 +2023,15 @@ pub async fn run_unattended(force_window: bool) -> Result<()> {
                 match record_unattended_blocked(&kin_home, reason, &latest) {
                     Ok(state) => {
                         let now = chrono::Utc::now().timestamp().max(0) as u64;
-                        entry.blocked_seconds =
-                            Some(now.saturating_sub(state.first_blocked_at_unix_seconds));
+                        let blocked = now.saturating_sub(state.first_blocked_at_unix_seconds);
+                        // The bound the caller compares against is this
+                        // deferral's own, never the base constant: it shortens
+                        // as the installation falls further behind, and the
+                        // watchdog deliberately re-derives nothing.
+                        entry.blocked_seconds = Some(blocked);
+                        entry.window_seconds = state.effective_window_seconds();
+                        entry.releases_blocked_across = Some(state.releases_blocked_across);
+                        report_deferral_not_converging(&state, blocked);
                         entry.first_blocked_at = Some(state.first_blocked_at);
                     }
                     Err(error) => {
@@ -1819,6 +2054,8 @@ pub async fn run_unattended(force_window: bool) -> Result<()> {
     if let Some(state) = load_unattended_deferral(&kin_home) {
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         entry.blocked_seconds = Some(now.saturating_sub(state.first_blocked_at_unix_seconds));
+        entry.window_seconds = state.effective_window_seconds();
+        entry.releases_blocked_across = Some(state.releases_blocked_across);
         entry.first_blocked_at = Some(state.first_blocked_at);
     }
 
@@ -11332,6 +11569,23 @@ fn collect_active_managed_runtime_pids(
     pids
 }
 
+/// Every managed serving process that must be stopped before managed bytes
+/// may move. The full scan below, filtered by
+/// [`RuntimeKind::blocks_managed_byte_movement`].
+///
+/// The activity gate, the stop sweep and the install preflight all answer from
+/// this one function, which is what keeps them in agreement.
+fn scan_blocking_managed_runtimes(
+    system: &System,
+    kin_home: &Path,
+    spec: &[ComponentSpec],
+) -> Vec<(RuntimeKind, &'static str, u32)> {
+    scan_active_managed_runtimes(system, kin_home, spec)
+        .into_iter()
+        .filter(|(kind, _, _)| kind.blocks_managed_byte_movement())
+        .collect()
+}
+
 /// Every managed serving process on the machine, across all runtime kinds.
 fn scan_active_managed_runtimes(
     system: &System,
@@ -11399,11 +11653,21 @@ fn reject_active_managed_runtime(
     );
 }
 
+/// Refuse to move managed bytes while anything that holds the store is still
+/// serving.
+///
+/// Narrowed by [`RuntimeKind::blocks_managed_byte_movement`], so a running
+/// agent MCP server no longer refuses an install it cannot be harmed by. The
+/// gate reads the same predicate, so this can never reject a machine the gate
+/// called idle.
 fn ensure_no_active_managed_runtimes(kin_home: &Path, spec: &[ComponentSpec]) -> Result<()> {
     for pass in 0..3 {
         let mut system = System::new_all();
         system.refresh_all();
         for kind in [RuntimeKind::Daemon, RuntimeKind::Mcp, RuntimeKind::Vfs] {
+            if !kind.blocks_managed_byte_movement() {
+                continue;
+            }
             for component in spec
                 .iter()
                 .filter(|component| runtime_component_matches(kind, component.name))
@@ -19502,8 +19766,11 @@ cwd = {:?}
 
     #[test]
     fn the_force_window_overrides_activity_gates_and_never_a_recorded_policy() {
+        // A live daemon, which does hold the store open. An open agent MCP
+        // session is no longer a busy machine: see
+        // `an_open_agent_session_no_longer_defers_an_update` below.
         let busy = MachineActivity {
-            external_sessions: true,
+            managed_runtimes_active: true,
             ..idle_machine()
         };
         // The rule the ruling bounds: activity gates defer, and the caller
@@ -19565,6 +19832,10 @@ cwd = {:?}
             second.reason, "an agent or user session is open",
             "the recorded first reason is the fact; later reasons never rewrite it"
         );
+        assert_eq!(
+            second.releases_blocked_across, 2,
+            "a newer release while blocked does not restart the clock, it counts against it"
+        );
 
         clear_unattended_deferral(home);
         assert!(
@@ -19573,6 +19844,272 @@ cwd = {:?}
         );
         // Clearing an already-clear state is a no-op, not an error.
         clear_unattended_deferral(home);
+    }
+
+    /// A deferral state with the fields a test does not care about filled in.
+    fn deferral_behind(releases: u64) -> UnattendedDeferral {
+        UnattendedDeferral {
+            schema_version: UNATTENDED_DEFERRAL_SCHEMA_VERSION,
+            first_blocked_at: "2026-09-09T10:12:56.483775+00:00".to_string(),
+            first_blocked_at_unix_seconds: 1_788_948_776,
+            reason: "an agent or user session is open".to_string(),
+            latest_version_seen: "0.7.7".to_string(),
+            releases_blocked_across: releases,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn the_deferral_window_shortens_as_the_installation_falls_further_behind() {
+        // FIR-3442. The bound used to be flat wall time, so an installation
+        // many releases behind waited exactly as long as one release behind,
+        // and a fleet shipping faster than the window never converged.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let base = UNATTENDED_DEFERRAL_WINDOW_HOURS * 3600;
+
+        // One release behind keeps the whole founder-ruling window.
+        let first = record_unattended_blocked(home, "an agent or user session is open", "0.7.6")
+            .expect("record the first blocked moment");
+        assert_eq!(first.releases_blocked_across, 1);
+        assert_eq!(first.effective_window_seconds(), base);
+
+        // Re-running against the SAME release changes nothing at all.
+        let again = record_unattended_blocked(home, "an agent or user session is open", "0.7.6")
+            .expect("reread");
+        assert_eq!(again.releases_blocked_across, 1);
+        assert_eq!(again.effective_window_seconds(), base);
+
+        // A second release ships while still blocked. This is the exact shape
+        // of the incident: v0.7.6 then v0.7.7, 5h23m apart, against a 24h
+        // window that would not have moved.
+        let second = record_unattended_blocked(home, "an agent or user session is open", "0.7.7")
+            .expect("record the supersession");
+        assert_eq!(
+            second.first_blocked_at, first.first_blocked_at,
+            "a newer release must never restart the clock"
+        );
+        assert_eq!(second.releases_blocked_across, 2);
+        assert!(
+            second.effective_window_seconds() < base,
+            "an installation more than one release behind must not be left waiting a full window"
+        );
+        assert_eq!(second.effective_window_seconds(), base / 2);
+
+        // And it keeps tightening as the machine keeps falling behind.
+        let third = record_unattended_blocked(home, "an agent or user session is open", "0.7.8")
+            .expect("record the second supersession");
+        assert_eq!(third.releases_blocked_across, 3);
+        assert_eq!(third.effective_window_seconds(), base / 3);
+        assert!(third.effective_window_seconds() < second.effective_window_seconds());
+
+        // Floored, so no version stream can force an install the instant a
+        // session opens.
+        assert_eq!(
+            deferral_behind(1_000).effective_window_seconds(),
+            UNATTENDED_DEFERRAL_FLOOR_HOURS * 3600
+        );
+        assert!(deferral_behind(u64::MAX).effective_window_seconds() > 0);
+        assert!(deferral_behind(0).effective_window_seconds() <= base);
+    }
+
+    #[test]
+    fn the_caller_forces_sooner_once_more_than_one_release_behind() {
+        // The caller's rule, mirrored from `executor_should_force` in
+        // kin-ecosystem's kin-update-watchdog: force when a deferred record
+        // shows `blocked_seconds >= window_seconds`. It re-derives no constant,
+        // so shortening the window here is what moves production behaviour.
+        fn caller_would_force(blocked_seconds: u64, window_seconds: u64) -> bool {
+            window_seconds > 0 && blocked_seconds >= window_seconds
+        }
+
+        // Twelve hours into the deferral, which is where FIR-3442 sat.
+        let blocked = 12 * 3600;
+        assert!(
+            !caller_would_force(blocked, deferral_behind(1).effective_window_seconds()),
+            "one release behind still gets its full day of quiet-hours courtesy"
+        );
+        assert!(
+            caller_would_force(blocked, deferral_behind(2).effective_window_seconds()),
+            "two releases behind must be moved at twelve hours, not left for a second day"
+        );
+        assert!(
+            caller_would_force(blocked, deferral_behind(3).effective_window_seconds()),
+            "and sooner still as it falls further behind"
+        );
+    }
+
+    #[test]
+    fn a_deliberately_pinned_installation_holds_however_far_behind_it_falls() {
+        // The negative control. The window shortens with drift, and no window
+        // value may turn a person's recorded choice into an unattended
+        // install: `--force-window` bounds the executor's own caution, never
+        // an explicit answer to "ask me first".
+        for behind in [1_u64, 2, 3, 50, u64::MAX] {
+            let state = deferral_behind(behind);
+            assert!(
+                state.effective_window_seconds() >= UNATTENDED_DEFERRAL_FLOOR_HOURS * 3600,
+                "the floor holds at {behind} releases behind"
+            );
+            let prompt = decide_auto_update(UpdatePolicy::Prompt, idle_machine());
+            assert!(
+                !unattended_may_proceed(UpdatePolicy::Prompt, &prompt, true),
+                "a recorded prompt policy holds {behind} releases behind, forced or not"
+            );
+            let manual = decide_auto_update(UpdatePolicy::Manual, idle_machine());
+            assert!(
+                !unattended_may_proceed(UpdatePolicy::Manual, &manual, true),
+                "a recorded manual policy holds {behind} releases behind, forced or not"
+            );
+            assert_eq!(
+                decide_auto_update(UpdatePolicy::Manual, idle_machine()),
+                AutoDecision::Silent("update policy is manual"),
+                "and manual is still silent about it"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_deferral_written_before_the_count_existed_keeps_its_clock() {
+        // Every installation in the field has a schema 1 file with no count.
+        // An unreadable one restarts the clock, so a missing field must
+        // default rather than fail, or this change would reset the window on
+        // every machine it shipped to.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::write(
+            unattended_deferral_path(home),
+            br#"{
+  "schema_version": 1,
+  "first_blocked_at": "2026-09-09T10:12:56.483775+00:00",
+  "first_blocked_at_unix_seconds": 1788948776,
+  "reason": "an agent or user session is open",
+  "latest_version_seen": "0.7.6"
+}"#,
+        )
+        .unwrap();
+
+        let loaded = load_unattended_deferral(home)
+            .expect("an existing installation's clock must survive the upgrade, not restart");
+        assert_eq!(loaded.first_blocked_at_unix_seconds, 1_788_948_776);
+        assert_eq!(
+            loaded.releases_blocked_across, 1,
+            "a file that recorded one release has blocked across exactly one"
+        );
+        assert_eq!(
+            loaded.effective_window_seconds(),
+            UNATTENDED_DEFERRAL_WINDOW_HOURS * 3600
+        );
+
+        // And the next run against a newer release counts from there.
+        let moved = record_unattended_blocked(home, "unused", "0.7.7").expect("count forward");
+        assert_eq!(moved.releases_blocked_across, 2);
+        assert_eq!(moved.first_blocked_at_unix_seconds, 1_788_948_776);
+    }
+
+    #[test]
+    fn an_open_agent_session_no_longer_defers_an_update() {
+        // FIR-3442's root cause. `external_sessions` is set by the mere
+        // existence of a `kin mcp start` process, which on any machine with an
+        // agent open is always. Measured on the incident machine: 37 such
+        // servers holding 0.40 CPU-seconds between them across ~500
+        // process-hours, and 37 consecutive ledger entries with no proceed.
+        //
+        // They hold no store: `kin mcp start` runs `run_stdio_daemon`, which
+        // takes no store parameter, so an update cannot harm them and no
+        // longer stops them. Presence is an observation, not a reason to wait.
+        assert_eq!(
+            decide_auto_update(
+                UpdatePolicy::Auto,
+                MachineActivity {
+                    external_sessions: true,
+                    ..idle_machine()
+                },
+            ),
+            AutoDecision::Proceed,
+            "an open agent session must not defer an update that cannot disturb it"
+        );
+        // A store-holding runtime still does defer.
+        assert_eq!(
+            decide_auto_update(
+                UpdatePolicy::Auto,
+                MachineActivity {
+                    managed_runtimes_active: true,
+                    external_sessions: true,
+                    ..idle_machine()
+                },
+            ),
+            AutoDecision::Prompt("a managed Kin process is still running"),
+            "a live daemon or VFS server holds the store and still defers"
+        );
+    }
+
+    #[test]
+    fn the_executor_says_out_loud_when_it_has_stopped_converging() {
+        // Founder directive: a third occurrence must not be quiet. Both times
+        // this capability died, the machine had written the truth down
+        // correctly and nobody read it, so the warning IS the deliverable, and
+        // an untested one is not a deliverable at all: invert its condition and
+        // nothing else in this file goes red.
+        assert_eq!(
+            deferral_not_converging_warning(&deferral_behind(1), 12 * 3600),
+            None,
+            "one release behind is the courtesy the window grants, not a problem to shout about"
+        );
+
+        let warning = deferral_not_converging_warning(&deferral_behind(3), 30 * 3600)
+            .expect("three releases behind is exactly the state nobody noticed, twice");
+        assert!(
+            warning.contains("3 releases"),
+            "the warning names how many releases it has failed to converge across: {warning}"
+        );
+        assert!(
+            warning.contains("v0.7.7"),
+            "and the release it is stuck behind: {warning}"
+        );
+        assert!(
+            warning.contains("30h"),
+            "and how long this deferral has been running: {warning}"
+        );
+        assert!(
+            warning.contains(&format!(
+                "{}h because",
+                UNATTENDED_DEFERRAL_WINDOW_HOURS / 3
+            )),
+            "and the shortened window it is now measured against: {warning}"
+        );
+    }
+
+    #[test]
+    fn the_gate_and_the_install_preflight_cannot_disagree() {
+        // Both answer from `RuntimeKind::blocks_managed_byte_movement`. If they
+        // ever split, the executor could call idle a machine the preflight then
+        // rejects: it would proceed, sever every agent session, and fail the
+        // run having severed them for nothing. That is not hypothetical, it is
+        // the 2026-09-08T16:08:23Z ledger entry, where one of 37 signalled
+        // servers survived and the run failed.
+        for kind in [RuntimeKind::Daemon, RuntimeKind::Mcp, RuntimeKind::Vfs] {
+            let blocks = kind.blocks_managed_byte_movement();
+            // Raised through the same function `probe_machine_activity` calls,
+            // never a copy of its match. A test carrying its own kind-to-signal
+            // table stays green while the mapping beneath it moves, which would
+            // leave exactly the disagreement this test exists to forbid.
+            let mut observed = idle_machine();
+            kind.raise_activity_signal(&mut observed);
+            let gate_defers =
+                decide_auto_update(UpdatePolicy::Auto, observed) != AutoDecision::Proceed;
+            assert_eq!(
+                blocks,
+                gate_defers,
+                "{} must either block the install AND defer the gate, or neither",
+                kind.label()
+            );
+        }
+        // And the split is the one the store dictates.
+        assert!(RuntimeKind::Daemon.blocks_managed_byte_movement());
+        assert!(RuntimeKind::Vfs.blocks_managed_byte_movement());
+        assert!(!RuntimeKind::Mcp.blocks_managed_byte_movement());
     }
 
     #[test]
@@ -19631,13 +20168,6 @@ cwd = {:?}
         );
 
         for (activity, expected) in [
-            (
-                MachineActivity {
-                    external_sessions: true,
-                    ..idle_machine()
-                },
-                "an agent or user session is open",
-            ),
             (
                 MachineActivity {
                     managed_runtimes_active: true,
