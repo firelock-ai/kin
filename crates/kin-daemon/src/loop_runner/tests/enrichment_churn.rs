@@ -16,6 +16,12 @@
 /// early on an identical value, so re-persisting an unchanged record does not
 /// merely record nothing: it erases that record's creation from the delta the
 /// daemon may persist (`state.rs` -> `backend.save_delta`).
+///
+/// Gated with the tests that call it, all four of which are `#[cfg(unix)]`
+/// because their fixtures publish through the host filesystem. Without the gate
+/// this helper is dead code on the Windows cross-check, which builds test
+/// targets under `-D warnings`.
+#[cfg(unix)]
 fn pending_artifact_additions(state: &DaemonState) -> (usize, usize, usize) {
     match state.graph.pending_delta_snapshot(0) {
         Some(delta) => (
