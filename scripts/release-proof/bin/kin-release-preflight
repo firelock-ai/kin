@@ -202,6 +202,24 @@ resolve_tomllib_python() {
   return 1
 }
 
+# Print, one per line, the real directory of each enrichment language server
+# found on PATH. FLOW_PATH below is a fixed, hermetic allowlist rather than
+# the ambient PATH, on purpose: only what a hosted runner actually has should
+# reach the daemon this flow starts. acceptance.yml installs pyright and
+# typescript-language-server onto that ambient PATH before its own enrichment
+# checks, which is exactly what this resolves, the same way NODE_DIR and
+# GIT_DIR_ already are. Returns 1 and prints nothing when neither is found,
+# which is how the caller decides whether to warn.
+resolve_language_server_dirs() {
+  local tool bin rc=1
+  for tool in pyright-langserver typescript-language-server; do
+    bin="$(command -v "$tool" 2>/dev/null)" || continue
+    printf '%s\n' "$(cd -P "$(dirname "$bin")" && pwd)"
+    rc=0
+  done
+  return "$rc"
+}
+
 # Sourcing this file with KIN_PREFLIGHT_DEFINITIONS_ONLY=1 stops here, with the
 # helpers defined and nothing run, so the behavioral suite can drive
 # publish_record against a stub publisher. Set KIN_PREFLIGHT_ORIGIN too, or the
@@ -294,6 +312,21 @@ FLOW_PATH="$NODE_DIR:$PY_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
 if [ -n "$TIMEOUT_BIN" ]; then FLOW_PATH="$FLOW_PATH:$(dirname "$TIMEOUT_BIN")"; fi
 GIT_DIR_="$(cd -P "$(dirname "$(command -v git)")" && pwd)"
 case ":$FLOW_PATH:" in *":$GIT_DIR_:"*) ;; *) FLOW_PATH="$FLOW_PATH:$GIT_DIR_" ;; esac
+
+# FIR-2598's magic-repro checks 10 and 11 need a language server on PATH when
+# the daemon starts, or they read UNREADABLE: runs 34323687836 and
+# 34325966701 both did, on kin-linux-x86_64 and kin-linux-aarch64, "enrichment
+# worker is unavailable: ... this daemon found no language server for any
+# language it enriches ... reason: no_language_server", even after the CI
+# install step ran, because that step only extends GITHUB_PATH and this flow
+# does not inherit it here; only FLOW_PATH reaches the daemon.
+if LSP_DIRS="$(resolve_language_server_dirs)"; then
+  while IFS= read -r lsp_dir; do
+    case ":$FLOW_PATH:" in *":$lsp_dir:"*) ;; *) FLOW_PATH="$FLOW_PATH:$lsp_dir" ;; esac
+  done <<<"$LSP_DIRS"
+else
+  warn "no pyright-langserver or typescript-language-server on PATH; the enrichment checks (FIR-2598, magic-repro 10 and 11) will read UNREADABLE on a Python or TypeScript fixture"
+fi
 
 # ---------------------------------------------------------------- run layout
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
