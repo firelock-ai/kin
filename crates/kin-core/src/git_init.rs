@@ -1847,6 +1847,165 @@ mod tests {
         let _ = init_from_git(Path::new(&source));
     }
 
+    /// An init killed with its stage directory on disk and its owner record
+    /// still a reservation is reclaimed by the next one.
+    ///
+    /// The window is the one FIR-3435 names, entered through the product's own
+    /// path rather than fabricated: the child runs a real `init_from_git`,
+    /// parks at a barrier inside `prepare_repository_layout_with_origin` the
+    /// moment `create_private_staging_root` returns, and is killed there.
+    ///
+    /// Before the reorder there was no owner file at that point at all, so the
+    /// stage was not a candidate for any recovery pass and survived every later
+    /// init forever. Revert the reorder and this goes red twice over, first on
+    /// the owner record the barrier no longer finds and then on the stage the
+    /// second init walks past.
+    #[cfg(unix)]
+    #[test]
+    fn an_init_killed_before_stage_owner_publication_is_reclaimed() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let held = tempfile::tempdir().unwrap();
+        let root = held.path().canonicalize().unwrap();
+        let source = root.join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        let original = b"exact source survives interrupted staging\n";
+        std::fs::write(source.join("README.md"), original).unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+
+        let barrier = root.join("stage-created");
+        let mut child = ParkedChild::spawn(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("git_init::tests::interrupted_init_subprocess")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env("KIN_INIT_INTERRUPTED_TEST_SOURCE", &source)
+                .env("KIN_INIT_STAGE_CREATION_TEST_BARRIER", &barrier),
+        );
+        let stage = wait_for_capture_barrier(&barrier, &mut child);
+        let stage_name = stage.file_name().unwrap().to_string_lossy();
+        let owner = stage.with_file_name(format!("{stage_name}.owner"));
+        // Printed rather than asserted on: what the kill leaves behind is the
+        // subject of the assertions below, and this is the line that says which
+        // window the child was actually parked in when it died.
+        eprintln!(
+            "parked at stage={} owner_exists={} stage_entries={}",
+            stage.display(),
+            owner.exists(),
+            std::fs::read_dir(&stage).unwrap().count()
+        );
+        assert!(
+            owner.is_file(),
+            "the owner record must exist before the stage directory it covers: {}",
+            owner.display()
+        );
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+        assert_eq!(child.wait().signal(), Some(libc::SIGKILL));
+        assert!(!source.join(".kin").exists());
+        let attempts = crate::init_attempt::abandoned_init_attempts(&root).unwrap();
+        assert_eq!(attempts.len(), 1);
+        let record = attempts[0].record.as_ref().unwrap();
+        assert_eq!(record.phase_index, 8);
+        init_from_git(&source).unwrap();
+        assert_eq!(std::fs::read(source.join("README.md")).unwrap(), original);
+        assert!(source.join(".kin").exists());
+        eprintln!(
+            "after the next init: stage_exists={} owner_exists={}",
+            stage.exists(),
+            owner.exists()
+        );
+        assert!(
+            !stage.exists(),
+            "interrupted pre-owner stage survived: {}",
+            stage.display()
+        );
+        assert!(
+            !owner.exists(),
+            "and its owner record survived with it: {}",
+            owner.display()
+        );
+        assert_no_staging_directories(&root);
+    }
+
+    /// A live init parked in that same window is neither surveyed nor
+    /// reclaimed, and becomes reclaimable the instant it is killed.
+    ///
+    /// The negative control for the test above, carrying its own positive
+    /// control so a fixture that could never be reclaimed cannot pass it. The
+    /// child holds the exclusive lock on the owner record it reserved before
+    /// its `mkdir`, so both operator surfaces count it live and touch nothing;
+    /// the kill frees that lock and the same reclaim then takes the stage back.
+    ///
+    /// Liveness here is the lock and nothing else, which is what keeps the
+    /// FIR-3435 reorder from buying reclamation with a weaker proof. Delete the
+    /// `RecoveryLock::Contended` arm of `scan_repository_init_stages` and the
+    /// live half goes red: the stage is listed and reaped while the init that
+    /// owns it is still running.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_init_between_its_stage_and_its_owner_record_is_not_reclaimed() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let held = tempfile::tempdir().unwrap();
+        let root = held.path().canonicalize().unwrap();
+        let source = root.join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"a live init holds its lock\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+
+        let barrier = root.join("stage-created");
+        let mut child = ParkedChild::spawn(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("git_init::tests::interrupted_init_subprocess")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env("KIN_INIT_INTERRUPTED_TEST_SOURCE", &source)
+                .env("KIN_INIT_STAGE_CREATION_TEST_BARRIER", &barrier),
+        );
+        let stage = wait_for_capture_barrier(&barrier, &mut child);
+        let staging_parent = stage.parent().unwrap().to_path_buf();
+        let stage_name = stage.file_name().unwrap().to_string_lossy().into_owned();
+        let owner = stage.with_file_name(format!("{stage_name}.owner"));
+        assert!(
+            owner.is_file(),
+            "the parked init reserved its owner before its stage: {}",
+            owner.display()
+        );
+
+        let survey = crate::init::survey_orphaned_repository_stages(&staging_parent).unwrap();
+        assert!(survey.stages.is_empty(), "{survey:?}");
+        assert_eq!(survey.live, 1, "{survey:?}");
+        let held_pass = crate::init::reclaim_orphaned_repository_stages(&staging_parent).unwrap();
+        assert_eq!(held_pass.recovered, 0, "{held_pass:?}");
+        assert_eq!(held_pass.retained, 0, "{held_pass:?}");
+        assert_eq!(held_pass.live, 1, "{held_pass:?}");
+        assert!(stage.is_dir(), "a live stage keeps its directory");
+        assert!(owner.is_file(), "and its reservation");
+
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+        assert_eq!(child.wait().signal(), Some(libc::SIGKILL));
+
+        // Bounded, because the only route through this pass that can fail
+        // intermittently is the owner lock, and a descendant of a sibling test
+        // can still hold an inherited descriptor on it for a window.
+        let mut reclaimed =
+            crate::init::reclaim_orphaned_repository_stages(&staging_parent).unwrap();
+        for _ in 0..40 {
+            if reclaimed.live == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            reclaimed = crate::init::reclaim_orphaned_repository_stages(&staging_parent).unwrap();
+        }
+        assert_eq!(reclaimed.recovered, 1, "{reclaimed:?}");
+        assert!(!stage.exists(), "the killed init's stage is gone");
+        assert!(!owner.exists(), "and its reservation with it");
+    }
+
     /// An init the kernel could kill leaves a post-mortem the next one reads.
     ///
     /// `SIGKILL` is the case, not `SIGTERM`: a signal Kin can catch already

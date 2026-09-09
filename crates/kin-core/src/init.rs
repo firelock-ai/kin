@@ -112,7 +112,23 @@ struct RepositoryInitStageOwner {
     destination_path: ExactPathIdentity,
     repository_id: String,
     workspace_id: String,
-    stage_identity: RecoverableFileIdentity,
+    /// Filesystem identity of the stage directory, once there is one.
+    ///
+    /// `None` is a reservation: this owner was created and locked before the
+    /// stage directory existed, so there was no inode to record yet. An init
+    /// rewrites the same locked descriptor with `Some` as soon as the `mkdir`
+    /// returns, and a record that survives with `None` says the init died in
+    /// that window.
+    ///
+    /// `schema_version` deliberately stays at 1. A build carrying this change
+    /// reads a record an older build wrote as `Some` and behaves exactly as
+    /// before, which is the case that matters, because those are the stages
+    /// already stranded on disk. An older build reading a reservation cannot
+    /// decode `null` into the identity enum, so it declines the candidate and
+    /// retains it, which is the conservative direction. Bumping the version
+    /// would instead make this build decline every stage an older one stranded.
+    #[serde(default)]
+    stage_identity: Option<RecoverableFileIdentity>,
 }
 
 struct RepositoryInitStageLease {
@@ -836,21 +852,29 @@ pub fn prepare_repository_layout_with_origin(
     let reclaimed = recover_orphaned_repository_stages(staging_parent, &final_kin_dir)?;
     crate::init_attempt::report_reclaimed_stages(reclaimed.recovered, reclaimed.retained);
 
-    create_private_staging_root(&staging_root)?;
-    let layout = KinLayout::new(staging_root);
-    let stage_lease = match create_repository_init_stage_lease(
-        layout.root(),
+    // Owner, then directory, then the identity the owner could not know yet.
+    // A stage created before its owner is invisible to every recovery pass
+    // there is, because each one takes its candidates from owner files alone,
+    // so an init killed in that window kept its stage forever. FIR-3435.
+    let mut lease = reserve_repository_init_stage_owner(
+        &staging_root,
         &final_kin_dir,
         &repository_id,
         workspace_id,
-    ) {
-        Ok(lease) => lease,
-        Err(error) => {
-            cleanup_created_staging_root(layout.root());
-            return Err(error);
-        }
-    };
-    let mut stage_lease = Some(stage_lease);
+    )?;
+    if let Err(error) = create_private_staging_root(&staging_root) {
+        let _ = remove_stage_owner(lease);
+        return Err(error);
+    }
+    let layout = KinLayout::new(staging_root);
+    #[cfg(all(test, unix))]
+    park_at_stage_creation_barrier(layout.root());
+    if let Err(error) = publish_repository_init_stage_owner(&mut lease, layout.root()) {
+        cleanup_created_staging_root(layout.root());
+        let _ = remove_stage_owner(lease);
+        return Err(error);
+    }
+    let mut stage_lease = Some(lease);
     let preparation = (|| {
         let authority_root = layout.kindb_dir();
         let backend = create_staged_repository_authority_backend(&authority_root)?;
@@ -938,6 +962,22 @@ fn create_private_staging_root(staging_root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn park_at_stage_creation_barrier(stage: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Some(barrier) = std::env::var_os("KIN_INIT_STAGE_CREATION_TEST_BARRIER") else {
+        return;
+    };
+    let barrier = PathBuf::from(barrier);
+    let publishing = barrier.with_extension("publishing");
+    std::fs::write(&publishing, stage.as_os_str().as_bytes()).unwrap();
+    std::fs::rename(&publishing, &barrier).unwrap();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 /// Create and bind the local authority backend for one unpublished repository.
@@ -1035,7 +1075,22 @@ fn lock_own_stage_owner(owner_file: &File) -> std::io::Result<()> {
     Err(last)
 }
 
-fn create_repository_init_stage_lease(
+/// Create and lock this init's owner record before its stage directory exists.
+///
+/// Owner first, directory second, and the order is the whole point. Every
+/// candidate `scan_repository_init_stages` will ever consider is an owner file,
+/// so a stage created before its owner is a directory no later pass looks at:
+/// not surveyed, not reclaimed, not named to an operator, kept forever. Taking
+/// the lock first puts a proof of liveness in front of the directory rather
+/// than behind it, so a kill anywhere after this call leaves a free lock and a
+/// readable record, and a live init anywhere after it holds the lock and is
+/// skipped. FIR-3435.
+///
+/// The record it writes is a reservation: `stage_identity` is `None`, because
+/// a directory that does not exist has no inode to record.
+/// [`publish_repository_init_stage_owner`] completes it once the `mkdir`
+/// returns.
+fn reserve_repository_init_stage_owner(
     stage_root: &Path,
     final_kin_dir: &Path,
     repository_id: &RepositoryId,
@@ -1058,8 +1113,6 @@ fn create_repository_init_stage_lease(
         ))
     })?;
     let owner_path = parent.join(stage_owner_name(stage_id));
-    let stage_metadata =
-        std::fs::symlink_metadata(stage_root).map_err(|error| KinError::io(stage_root, error))?;
     let record = RepositoryInitStageOwner {
         schema_version: INIT_STAGE_OWNER_SCHEMA_VERSION,
         stage_id: stage_id.to_string(),
@@ -1067,16 +1120,9 @@ fn create_repository_init_stage_lease(
         destination_path: exact_path_identity(final_kin_dir)?,
         repository_id: repository_id.as_str().to_string(),
         workspace_id: workspace_id.to_string(),
-        stage_identity: recoverable_path_identity(stage_root, &stage_metadata),
+        stage_identity: None,
     };
-    let mut bytes = serde_json::to_vec(&record)
-        .map_err(|error| KinError::Other(format!("serialize repository stage owner: {error}")))?;
-    bytes.push(b'\n');
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_INIT_STAGE_OWNER_BYTES {
-        return Err(KinError::Other(
-            "repository stage owner record exceeds its bounded size".to_string(),
-        ));
-    }
+    let bytes = encoded_stage_owner_record(&record)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
     #[cfg(unix)]
@@ -1115,6 +1161,63 @@ fn create_repository_init_stage_lease(
         owner_file,
         record,
     })
+}
+
+/// One owner record as its bounded on-disk bytes.
+fn encoded_stage_owner_record(record: &RepositoryInitStageOwner) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(record)
+        .map_err(|error| KinError::Other(format!("serialize repository stage owner: {error}")))?;
+    bytes.push(b'\n');
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_INIT_STAGE_OWNER_BYTES {
+        return Err(KinError::Other(
+            "repository stage owner record exceeds its bounded size".to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Complete the reservation [`reserve_repository_init_stage_owner`] took, now
+/// that the stage directory exists and has an inode to record.
+///
+/// Written over the reservation on the same descriptor the reservation locked.
+/// Never a temporary file and a rename: a rename swaps the inode out from under
+/// the live init's `flock`, leaving the init holding a lock on an unlinked
+/// inode while the owner path carries a fresh, unlocked one, and the next scan
+/// would read a free lock beside a live stage and reap it. `remove_stage_owner`
+/// already refuses when the owner path stops matching its open descriptor,
+/// which is the same hazard caught one step later; this must not create it.
+///
+/// The write needs no truncation, because a complete record is strictly longer
+/// than the reservation it replaces: the reservation encodes `null` where this
+/// encodes a tagged identity object, whose shortest form on any platform is
+/// `{"platform":"unavailable"}`. So the two states a kill can leave on disk are
+/// the reservation and the complete record, both readable. The relation is
+/// checked rather than assumed, and a build that ever broke it fails here
+/// instead of leaving a trailing fragment behind a valid record.
+fn publish_repository_init_stage_owner(
+    lease: &mut RepositoryInitStageLease,
+    stage_root: &Path,
+) -> Result<()> {
+    let stage_metadata =
+        std::fs::symlink_metadata(stage_root).map_err(|error| KinError::io(stage_root, error))?;
+    let mut record = lease.record.clone();
+    record.stage_identity = Some(recoverable_path_identity(stage_root, &stage_metadata));
+    let bytes = encoded_stage_owner_record(&record)?;
+    let reserved = encoded_stage_owner_record(&lease.record)?;
+    if bytes.len() < reserved.len() {
+        return Err(KinError::Other(format!(
+            "a complete repository stage owner record is shorter than its reservation: {}",
+            lease.owner_path.display()
+        )));
+    }
+    (|| -> std::io::Result<()> {
+        lease.owner_file.seek(SeekFrom::Start(0))?;
+        lease.owner_file.write_all(&bytes)?;
+        lease.owner_file.sync_all()
+    })()
+    .map_err(|error| KinError::io(&lease.owner_path, error))?;
+    lease.record = record;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2337,16 +2440,22 @@ fn remove_stage_owner(lease: RepositoryInitStageLease) -> Result<()> {
     Ok(())
 }
 
+/// Prove a lease this process holds still describes the stage in front of it.
+///
+/// Requires a complete record. A reservation reaches this only if publication
+/// was skipped or failed, which is a stage this process has no proof of, so it
+/// declines rather than cleaning up a directory it cannot bind to its own
+/// record.
 fn validate_live_stage_lease(lease: &RepositoryInitStageLease, stage_root: &Path) -> Result<()> {
     let observed = read_stage_owner_record(&lease.owner_file, &lease.owner_path)?;
     if observed != lease.record
         || observed.stage_path != exact_path_identity(stage_root)?
         || observed.stage_identity
-            != recoverable_path_identity(
+            != Some(recoverable_path_identity(
                 stage_root,
                 &std::fs::symlink_metadata(stage_root)
                     .map_err(|error| KinError::io(stage_root, error))?,
-            )
+            ))
     {
         return Err(KinError::Other(
             "repository stage ownership changed while held".to_string(),
@@ -2612,11 +2721,14 @@ pub struct StrandedRepositoryStage {
     /// neither is on disk this is still the `.kin.init-` path, so an operator
     /// reads the name the leftover owner record belongs to.
     pub stage_path: PathBuf,
-    /// The owner record beside it. Always present, because it is what made this
-    /// a candidate.
+    /// The owner record beside it, which is what made this a candidate, except
+    /// for one class: a `.kin.init-` directory stranded with no owner at all by
+    /// a build that created its stage before its owner. For that class this is
+    /// the path an owner record would occupy and nothing is there. FIR-3435.
     pub owner_path: PathBuf,
     /// The `.kin` the interrupted init was going to publish, as its own record
-    /// names it. `None` for a record this platform cannot decode.
+    /// names it. `None` for a record this platform cannot decode, and for a
+    /// stage stranded with no owner record to read it from.
     pub destination_path: Option<PathBuf>,
     /// Disk the regular files under `stage_path` are holding, counted the way
     /// `du` counts it.
@@ -2637,6 +2749,12 @@ pub enum StrandedStageVerdict {
     /// No live initializer holds the owner lock, every ownership and identity
     /// proof passed, and the `.kin` the record names does not exist.
     /// [`reclaim_orphaned_repository_stages`] takes this one back.
+    ///
+    /// Also the verdict for the one class that has no owner record to lock: an
+    /// empty, private `.kin.init-` directory stranded before its owner existed
+    /// by a build that created the two in the other order. That one is proven
+    /// by its emptiness rather than by a lock, and is taken back with
+    /// `remove_dir`, which cannot remove anything that holds content. FIR-3435.
     Reclaimable,
     /// The owner is gone, but the `.kin` its record names exists now. Something
     /// else owns that destination, so this stage is named and left alone.
@@ -2895,6 +3013,115 @@ fn measure_stage_tree(root: &Path) -> (u64, bool, Option<std::time::SystemTime>)
     (bytes, complete, newest)
 }
 
+/// Judge one `.kin.init-` directory that has no owner record beside it.
+///
+/// A build carrying FIR-3435 cannot create one, because it publishes the owner
+/// before the directory. Every build before it could, and those directories are
+/// on operators' disks now with nothing on the machine that will ever look at
+/// them again, which is the leak FIR-3435 found.
+///
+/// There is no lock to read for one of these, and this module decides liveness
+/// from a free owner lock and never from an age, an mtime or a pid. Two facts
+/// take the place of the lock. An ownerless stage directory is always empty:
+/// nothing is written inside a stage until after its owner lease exists, so the
+/// window that can strand one produces a bare `mkdir` and nothing more. And
+/// `remove_dir` refuses a directory that is not empty, so the syscall itself is
+/// the proof, and a directory holding anything at all cannot be removed by this
+/// route even if something else put content there.
+///
+/// Unbound scans only, which are `kin doctor` and `kin doctor
+/// --reclaim-staging`. The destination-bound reaper inside `kin init` never
+/// considers one, because it runs at a moment when an init is certainly live on
+/// this machine. That is where the residual upgrade race lives: an older binary
+/// sitting between its own `mkdir` and its owner write can lose its empty stage
+/// directory to an operator's reclaim, and it then fails loudly building the
+/// layout underneath a directory that is gone, leaving an owner record with no
+/// directory that the next pass reclaims.
+#[cfg(unix)]
+fn scan_ownerless_stage_directory(
+    staging_parent: &Path,
+    stage_id: uuid::Uuid,
+    scope: StageScanScope<'_>,
+    action: StageScanAction,
+    outcome: &mut StageScanOutcome,
+) -> Result<()> {
+    if matches!(scope, StageScanScope::Destination(_)) {
+        return Ok(());
+    }
+    let stage_root = staging_parent.join(stage_directory_name(stage_id));
+    let reap_root = staging_parent.join(format!(".kin.reap-{stage_id}"));
+    let owner_path = staging_parent.join(stage_owner_name(stage_id));
+    if filesystem_entry_exists(&owner_path)? {
+        return Ok(());
+    }
+    if let Err(error) = validate_private_stage_directory(&stage_root) {
+        debug!(
+            path = %stage_root.display(),
+            %error,
+            "retaining ownerless repository stage that is not a private directory"
+        );
+        decline_stage(
+            outcome,
+            action,
+            &stage_root,
+            &reap_root,
+            &owner_path,
+            None,
+            "it carries no owner record and is not a private directory owned by this user"
+                .to_string(),
+        );
+        return Ok(());
+    }
+    let empty = std::fs::read_dir(&stage_root)
+        .map_err(|error| KinError::io(&stage_root, error))?
+        .next()
+        .is_none();
+    if !empty {
+        debug!(
+            path = %stage_root.display(),
+            "retaining ownerless repository stage that holds content"
+        );
+        decline_stage(
+            outcome,
+            action,
+            &stage_root,
+            &reap_root,
+            &owner_path,
+            None,
+            "it carries no owner record and is not empty, so nothing here proves no init is \
+             still filling it"
+                .to_string(),
+        );
+        return Ok(());
+    }
+    if action == StageScanAction::Report {
+        outcome.stages.push(describe_stage(
+            &stage_root,
+            &reap_root,
+            &owner_path,
+            None,
+            StrandedStageVerdict::Reclaimable,
+        ));
+        return Ok(());
+    }
+    // `remove_dir`, never `remove_dir_all`. The emptiness read above is a
+    // check; this is the proof, and it is the one that runs against the tree as
+    // it is at the instant of the claim.
+    match std::fs::remove_dir(&stage_root) {
+        Ok(()) => outcome.recovered += 1,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            debug!(
+                path = %stage_root.display(),
+                %error,
+                "retaining ownerless repository stage this pass could not remove"
+            );
+            outcome.retained += 1;
+        }
+    }
+    Ok(())
+}
+
 /// The path an owner record's exact destination units name, when this platform
 /// can read them.
 ///
@@ -2926,6 +3153,11 @@ fn path_from_exact_identity(identity: &ExactPathIdentity) -> Option<PathBuf> {
 /// Abandonment is the free owner lock and nothing else. Nothing in here reads a
 /// pid, an age or an mtime to decide whether a stage is alive, and
 /// `orphan_recovery_never_reaps_a_live_stage` holds that true for every caller.
+///
+/// One class has no owner lock to read, because it was stranded before its
+/// owner existed by a build that created the stage directory first. It is
+/// judged by [`scan_ownerless_stage_directory`] on the operator surfaces alone,
+/// by emptiness rather than by elapsed time, and never on the init-time path.
 #[cfg(unix)]
 fn scan_repository_init_stages(
     staging_parent: &Path,
@@ -2947,6 +3179,15 @@ fn scan_repository_init_stages(
             continue;
         };
         let Some(stage_id) = stage_id_from_owner_name(&name) else {
+            if let Some(stage_id) = stage_id_from_directory_name(&name) {
+                scan_ownerless_stage_directory(
+                    staging_parent,
+                    stage_id,
+                    scope,
+                    action,
+                    &mut outcome,
+                )?;
+            }
             continue;
         };
         let owner_path = entry.path();
@@ -3231,13 +3472,31 @@ fn scan_repository_init_stages(
             outcome.recovered += 1;
             continue;
         };
-        if validate_private_stage_directory(&owned_root).is_err()
-            || recoverable_path_identity(
+        // A reservation records no identity, because its owner was published
+        // before the directory existed, so there is nothing to compare against.
+        // What the claim below is bound to instead is the identity read here,
+        // under the lock that already proved the stage abandoned, so the
+        // rename-swap guard after the claim still compares against something
+        // observed before it. Every other proof this route runs is unchanged:
+        // the record names this stage id and this stage path, the destination
+        // matched or is absent, the identities are ones this build writes, and
+        // the directory itself is private and owned by this user. A record that
+        // does carry an identity is judged exactly as before. FIR-3435.
+        let claimed_identity = if validate_private_stage_directory(&owned_root).is_ok() {
+            let observed = recoverable_path_identity(
                 &owned_root,
                 &std::fs::symlink_metadata(&owned_root)
                     .map_err(|error| KinError::io(&owned_root, error))?,
-            ) != record.stage_identity
-        {
+            );
+            record
+                .stage_identity
+                .clone()
+                .filter(|recorded| *recorded == observed)
+                .or_else(|| record.stage_identity.is_none().then_some(observed))
+        } else {
+            None
+        };
+        let Some(claimed_identity) = claimed_identity else {
             debug!(
                 path = %owned_root.display(),
                 "retaining repository stage whose filesystem identity is not provable"
@@ -3252,7 +3511,7 @@ fn scan_repository_init_stages(
                 "its filesystem identity is not provable".to_string(),
             );
             continue;
-        }
+        };
         // Every proof has passed. A reporting pass stops here, one step short
         // of the claim, and says what a reclaiming pass would take back.
         if action == StageScanAction::Report {
@@ -3291,7 +3550,7 @@ fn scan_repository_init_stages(
                 &std::fs::symlink_metadata(&reap_root)
                     .map_err(|error| KinError::io(&reap_root, error))?,
             );
-            if reaped_identity != record.stage_identity {
+            if reaped_identity != claimed_identity {
                 debug!(
                     path = %reap_root.display(),
                     "retaining claimed repository stage after identity changed"
@@ -5054,6 +5313,228 @@ mod tests {
 
         drop(prepared);
         assert!(!stage_root.exists());
+    }
+
+    /// Reserve one owner the way an init does, and hand back the lease that
+    /// holds its lock.
+    ///
+    /// Through the product's own reservation rather than a hand-written record,
+    /// so a test using it is asserting against the bytes `kin init` writes and
+    /// not against its own copy of the format.
+    #[cfg(unix)]
+    fn reserve_one_owner(parent: &Path, destination: &Path) -> RepositoryInitStageLease {
+        let stage_root = parent.join(format!("{INIT_STAGE_PREFIX}{}", uuid::Uuid::new_v4()));
+        reserve_repository_init_stage_owner(
+            &stage_root,
+            destination,
+            &RepositoryId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            WorkspaceId::from_uuid(uuid::Uuid::new_v4()),
+        )
+        .unwrap()
+    }
+
+    /// Release a lease's lock without removing anything, which is what a
+    /// `SIGKILL` does to the init holding it.
+    #[cfg(unix)]
+    fn release_lock_leaving_everything(lease: RepositoryInitStageLease) {
+        let RepositoryInitStageLease { owner_file, .. } = lease;
+        drop(owner_file);
+    }
+
+    /// An owner reserved before its stage directory existed is reclaimed once
+    /// its lock is free, and never before.
+    ///
+    /// The first of the two states the FIR-3435 reorder creates: an init killed
+    /// between publishing its owner and creating its stage. There is no
+    /// directory, so what comes back is one private file, and what matters is
+    /// that a record carrying no stage identity is still a record this pass
+    /// will act on.
+    ///
+    /// Falsified by making `reserve_repository_init_stage_owner` write
+    /// `stage_identity: Some(RecoverableFileIdentity::Unavailable)` instead of
+    /// `None`: the reclaim arm goes red with `recovered: 0`, because a recorded
+    /// identity no directory can match is exactly what this pass declines.
+    #[cfg(unix)]
+    #[test]
+    fn a_reserved_owner_with_no_stage_directory_is_reclaimed_only_once_its_lock_is_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let corpus = parent.join("workspace");
+        std::fs::create_dir(&corpus).unwrap();
+        let lease = reserve_one_owner(&parent, &corpus.join(".kin"));
+        let owner_path = lease.owner_path.clone();
+        assert!(owner_path.is_file(), "the reservation is on disk");
+        assert_eq!(
+            lease.record.stage_identity, None,
+            "a reservation records no identity, because there is no directory yet"
+        );
+
+        let survey = survey_orphaned_repository_stages(&parent).unwrap();
+        assert!(survey.stages.is_empty(), "{survey:?}");
+        assert_eq!(survey.live, 1, "{survey:?}");
+        let held = reclaim_orphaned_repository_stages(&parent).unwrap();
+        assert_eq!(held.recovered, 0, "{held:?}");
+        assert_eq!(held.retained, 0, "{held:?}");
+        assert_eq!(held.live, 1, "{held:?}");
+        assert!(owner_path.is_file(), "a live reservation keeps its record");
+
+        release_lock_leaving_everything(lease);
+        let reclaimed = reclaim_until_no_live(&parent);
+        assert_eq!(reclaimed.recovered, 1, "{reclaimed:?}");
+        assert_eq!(reclaimed.retained, 0, "{reclaimed:?}");
+        assert!(!owner_path.exists(), "and the record with it");
+    }
+
+    /// A stage directory whose owner is still only a reservation is reclaimed
+    /// once its lock is free, and never before.
+    ///
+    /// The second state the reorder creates, and the one the end-to-end
+    /// evidence test in `git_init` produces by killing a real init: the `mkdir`
+    /// returned and the owner record was never completed. Before FIR-3435 this
+    /// state was an ownerless directory no pass would ever look at.
+    ///
+    /// Falsified by reverting the scan to compare the observed identity against
+    /// `record.stage_identity` directly: a reservation carries none, the
+    /// comparison fails, and the reclaim arm goes red with `recovered: 0` and
+    /// `retained: 1`.
+    #[cfg(unix)]
+    #[test]
+    fn a_reserved_stage_directory_is_reclaimed_only_once_its_lock_is_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let corpus = parent.join("workspace");
+        std::fs::create_dir(&corpus).unwrap();
+        let lease = reserve_one_owner(&parent, &corpus.join(".kin"));
+        let owner_path = lease.owner_path.clone();
+        let stage_root =
+            path_from_exact_identity(&lease.record.stage_path).expect("a unix record decodes");
+        create_private_staging_root(&stage_root).unwrap();
+        assert!(
+            stage_root.is_dir(),
+            "the stage exists with no identity recorded"
+        );
+
+        let survey = survey_orphaned_repository_stages(&parent).unwrap();
+        assert!(survey.stages.is_empty(), "{survey:?}");
+        assert_eq!(survey.live, 1, "{survey:?}");
+        let held = reclaim_orphaned_repository_stages(&parent).unwrap();
+        assert_eq!(held.recovered, 0, "{held:?}");
+        assert_eq!(held.retained, 0, "{held:?}");
+        assert_eq!(held.live, 1, "{held:?}");
+        assert!(stage_root.is_dir(), "a live stage keeps its directory");
+        assert!(owner_path.is_file(), "and its reservation");
+
+        release_lock_leaving_everything(lease);
+        let reclaimed = reclaim_until_no_live(&parent);
+        assert_eq!(reclaimed.recovered, 1, "{reclaimed:?}");
+        assert_eq!(reclaimed.retained, 0, "{reclaimed:?}");
+        assert!(!stage_root.exists(), "the stage is gone");
+        assert!(!owner_path.exists(), "and its reservation with it");
+    }
+
+    /// A stage directory left with no owner at all is named and removed by the
+    /// operator surfaces, and never touched by the reaper inside `kin init`.
+    ///
+    /// The class already on disk from builds that created the stage before the
+    /// owner. Fabricated as a bare directory on purpose: no build carrying
+    /// FIR-3435 can produce one, so the state has to be built by hand to be
+    /// tested at all.
+    ///
+    /// The destination-bound arm is the control, and it is the half that keeps
+    /// the upgrade race bounded: an older binary still running its own init is
+    /// exactly the process a `kin init` on this machine could be racing, so the
+    /// init-time reaper must walk past this and only `kin doctor` may act.
+    ///
+    /// Falsified by deleting the `StageScanScope::Destination` early return in
+    /// `scan_ownerless_stage_directory`: the control goes red, because the
+    /// init-time pass removes a directory it must not see.
+    #[cfg(unix)]
+    #[test]
+    fn an_ownerless_stage_directory_is_named_and_removed_by_the_operator_surfaces_alone() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let corpus = parent.join("workspace");
+        std::fs::create_dir(&corpus).unwrap();
+        let stage_root = parent.join(format!("{INIT_STAGE_PREFIX}{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&stage_root)
+            .unwrap();
+
+        let bound = recover_orphaned_repository_stages(&parent, &corpus.join(".kin")).unwrap();
+        assert_eq!(bound.recovered, 0, "{bound:?}");
+        assert_eq!(bound.retained, 0, "{bound:?}");
+        assert!(
+            stage_root.is_dir(),
+            "the reaper inside kin init leaves an ownerless stage alone"
+        );
+
+        let survey = survey_orphaned_repository_stages(&parent).unwrap();
+        let named = survey.reclaimable().collect::<Vec<_>>();
+        assert_eq!(named.len(), 1, "{survey:?}");
+        assert_eq!(named[0].stage_path, stage_root);
+        assert_eq!(
+            named[0].destination_path, None,
+            "there is no record to read one from"
+        );
+        assert_eq!(
+            named[0].bytes, 0,
+            "an ownerless stage is empty by construction"
+        );
+        assert!(stage_root.is_dir(), "surveying removes nothing");
+
+        let reclaimed = reclaim_orphaned_repository_stages(&parent).unwrap();
+        assert_eq!(reclaimed.recovered, 1, "{reclaimed:?}");
+        assert_eq!(reclaimed.retained, 0, "{reclaimed:?}");
+        assert!(!stage_root.exists(), "the empty leftover is gone");
+    }
+
+    /// An ownerless stage directory that holds anything is named and left
+    /// alone.
+    ///
+    /// Emptiness is the whole proof for a stage with no lock to read, so a
+    /// directory holding content has no proof at all and this pass must not
+    /// take it. `remove_dir` is what makes that mechanical rather than a
+    /// promise: it cannot remove a directory with an entry in it.
+    ///
+    /// Falsified by changing `scan_ownerless_stage_directory` to call
+    /// `remove_dir_all`: the retained arm goes red and the body is gone.
+    #[cfg(unix)]
+    #[test]
+    fn an_ownerless_stage_directory_holding_content_is_named_and_left_alone() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let stage_root = parent.join(format!("{INIT_STAGE_PREFIX}{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&stage_root)
+            .unwrap();
+        std::fs::write(stage_root.join("body"), vec![0_u8; 4096]).unwrap();
+
+        let survey = survey_orphaned_repository_stages(&parent).unwrap();
+        assert_eq!(survey.stages.len(), 1, "{survey:?}");
+        assert!(
+            matches!(
+                survey.stages[0].verdict,
+                StrandedStageVerdict::Unprovable(_)
+            ),
+            "{survey:?}"
+        );
+        assert_eq!(survey.reclaimable().count(), 0, "{survey:?}");
+
+        let reclaimed = reclaim_orphaned_repository_stages(&parent).unwrap();
+        assert_eq!(reclaimed.recovered, 0, "{reclaimed:?}");
+        assert_eq!(reclaimed.retained, 1, "{reclaimed:?}");
+        assert!(stage_root.is_dir(), "the directory is still there");
+        assert_eq!(
+            std::fs::read(stage_root.join("body")).unwrap().len(),
+            4096,
+            "and so is everything in it"
+        );
     }
 
     /// The destination-bound reaper inside `kin init` measures nothing.
