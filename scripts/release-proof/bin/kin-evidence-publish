@@ -52,6 +52,13 @@ const DEFAULT_REPO = 'firelock-ai/kin';
 const COMMIT_SHA = /^[0-9a-f]{40}$/;
 const PREFLIGHT_RECORD = 'preflight.json';
 const STRANGER_RECORD = 'stranger.env';
+// The release's own receipt, and the second record that can link a stranger
+// run to a candidate's bytes. kin's release.yml publishes it onto every release
+// and other jobs verify its attestation; nothing in this tool does, so it
+// counts here as a trusted release receipt, a record the release chain wrote,
+// and never as signature-verified proof.
+const PROVENANCE_ASSET = 'release-provenance.json';
+const ARCHIVE_SHA = /^[0-9a-f]{64}$/;
 const RECORDS = new Set([PREFLIGHT_RECORD, STRANGER_RECORD]);
 
 function usage(message) {
@@ -93,9 +100,9 @@ function parseArgs(argv) {
   return args;
 }
 
-async function call(token, method, route, body) {
+async function call(token, method, route, body, accept = 'application/vnd.github+json') {
   const headers = {
-    accept: 'application/vnd.github+json',
+    accept,
     'user-agent': 'kin-evidence-publish',
     'x-github-api-version': '2022-11-28',
   };
@@ -146,12 +153,164 @@ async function createOrphanBranch(token, repo, filePath, content, message) {
   return commit.body.sha;
 }
 
+// One read that fails closed. readExisting turns a 404 into "nothing here
+// yet", which is the right answer for a record that may not have been
+// published; the release surface is not that shape, so an unreadable answer
+// there raises rather than being reported as an empty listing.
+async function readOrThrow(token, repo, route, what, accept) {
+  let response;
+  try {
+    response = await call(token, 'GET', route, undefined, accept);
+  } catch (cause) {
+    // A rejected request is not an HTTP answer, and without this it would
+    // surface as a bare "fetch failed" with nothing naming which read died.
+    throw new Error(
+      `could not reach GitHub to ${what} on ${repo}: ${cause.message}`,
+      { cause },
+    );
+  }
+  if (!response.ok) {
+    throw new Error(
+      `could not ${what} on ${repo}: HTTP ${response.status} ${response.text.slice(0, 200)}`,
+    );
+  }
+  return response;
+}
+
+// Resolve a tag to the commit it names, dereferencing an annotated tag. The
+// same two steps kin's scripts/check-release-proof-artifacts.mjs takes, because
+// the write-time guard here and that read-time judge must agree about which
+// release belongs to a candidate. A ref that resolves to no commit sha answers
+// null: the caller is searching a listing for the ONE tag that names this
+// candidate, and a ref it cannot resolve is not that tag.
+async function resolveReleaseTagCommit(token, repo, tag) {
+  const ref = (await readOrThrow(
+    token,
+    repo,
+    `/repos/${repo}/git/ref/tags/${encodeURIComponent(tag)}`,
+    `resolve the tag ${tag}`,
+  )).body;
+  let sha = ref?.object?.sha;
+  if (ref?.object?.type === 'tag' && COMMIT_SHA.test(sha ?? '')) {
+    sha = (await readOrThrow(
+      token,
+      repo,
+      `/repos/${repo}/git/tags/${sha}`,
+      `dereference the annotated tag ${tag}`,
+    )).body?.object?.sha;
+  }
+  return COMMIT_SHA.test(sha ?? '') ? sha : null;
+}
+
+// The bytes the release of this candidate shipped, and the second thing that
+// can link a stranger run to it.
+//
+// A preflight leg judges an rc-build archive. kin's release.yml rebuilds fresh
+// bytes at the tag, so the archive a developer downloads from a published
+// release is by construction never a preflight leg, and a guard that knows only
+// the preflight cannot file a stranger record measured on released bytes.
+//
+// The read-time judge in kin accepts either receipt, so this one must too, or
+// the two disagree about the same record and the disagreement only surfaces at
+// a release window.
+//
+// Two statements have to agree: the release's TAG must resolve to the
+// candidate, and the record itself must say it is about that commit, at
+// kin.commit and on every artifact. A release whose tag points here while its
+// provenance describes another build is refused rather than passed over,
+// because a receipt that disagrees with the release carrying it is tampering,
+// not absence.
+async function releaseArchives(token, repo, sha) {
+  for (let page = 1; ; page += 1) {
+    const releases = (await readOrThrow(
+      token,
+      repo,
+      `/repos/${repo}/releases?per_page=100&page=${page}`,
+      `list the releases`,
+    )).body;
+    if (!Array.isArray(releases)) {
+      throw new Error(
+        `release listing page ${page} of ${repo} did not come back as an ` +
+        `array, so no release can be resolved to ${sha}`,
+      );
+    }
+    for (const release of releases) {
+      // A draft is not published, so nothing about it is a claim yet, and a
+      // release carrying no receipt cannot be the second link. Both are
+      // skipped BEFORE a tag is resolved, which keeps this search at one extra
+      // request in the ordinary case: the candidate's own release is newest.
+      if (release?.draft === true) continue;
+      const tag = typeof release?.tag_name === 'string' ? release.tag_name : '';
+      if (!tag) continue;
+      const asset = (Array.isArray(release?.assets) ? release.assets : []).find(
+        (entry) => entry?.name === PROVENANCE_ASSET && entry?.id !== undefined,
+      );
+      if (!asset) continue;
+      if ((await resolveReleaseTagCommit(token, repo, tag)) !== sha) continue;
+      const record = (await readOrThrow(
+        token,
+        repo,
+        `/repos/${repo}/releases/assets/${asset.id}`,
+        `read ${PROVENANCE_ASSET} from release ${tag}`,
+        'application/octet-stream',
+      )).body;
+      if (!record || typeof record !== 'object' || Array.isArray(record)) {
+        throw new Error(
+          `${PROVENANCE_ASSET} on release ${tag} did not parse as a release provenance record`,
+        );
+      }
+      if (record?.kin?.commit !== sha) {
+        throw new Error(
+          `${PROVENANCE_ASSET} on release ${tag} records commit ` +
+          `${record?.kin?.commit ?? '<none>'}, not ${sha}; the release exists ` +
+          'but its provenance is about a different build',
+        );
+      }
+      const archives = [];
+      for (const [index, artifact] of (Array.isArray(record.artifacts) ? record.artifacts : []).entries()) {
+        const name = artifact?.artifact ?? artifact?.target ?? `artifact ${index}`;
+        if (artifact?.kin?.commit !== sha) {
+          throw new Error(
+            `${PROVENANCE_ASSET} on release ${tag} artifact "${name}" records ` +
+            `commit ${artifact?.kin?.commit ?? '<none>'}, not ${sha}; the ` +
+            'record exists but that artifact is about a different build',
+          );
+        }
+        const built = artifact?.archive?.sha256;
+        if (typeof built !== 'string' || !ARCHIVE_SHA.test(built)) {
+          throw new Error(
+            `${PROVENANCE_ASSET} on release ${tag} artifact "${name}" records ` +
+            'no archive sha256, so nothing can link a stranger run to the ' +
+            'bytes it shipped',
+          );
+        }
+        archives.push(built);
+      }
+      if (archives.length === 0) {
+        throw new Error(
+          `${PROVENANCE_ASSET} on release ${tag} lists no artifacts, so it ` +
+          'names no released bytes',
+        );
+      }
+      return { tag, archives };
+    }
+    // A full final page is indistinguishable from a truncated listing without
+    // one more request.
+    if (releases.length < 100) return { tag: null, archives: [] };
+  }
+}
+
 // The chain, enforced at write time as well as read time. A stranger record is
 // only meaningful under a candidate whose preflight judged the very archive the
-// stranger ran, so publishing one under any other candidate is refused here
-// rather than discovered by the gate at release time. It also turns an
-// operator's mistyped candidate sha into an immediate, named failure instead of
-// a record that sits unread until a release is held by it.
+// stranger ran, or whose RELEASE shipped it, so publishing one under any other
+// candidate is refused here rather than discovered by the gate at release time.
+// It also turns an operator's mistyped candidate sha into an immediate, named
+// failure instead of a record that sits unread until a release is held by it.
+//
+// Both receipts, in the same order and on the same terms kin's
+// scripts/check-release-proof-artifacts.mjs uses them. The preflight is still
+// required to EXIST: a candidate with no machine proof establishes nothing, and
+// a release alone is not that proof.
 async function assertArchiveJudged(token, repo, sha, archive) {
   const route = `/repos/${repo}/contents/evidence/${sha}/preflight.json?ref=${BRANCH}`;
   const record = await readExisting(token, repo, route);
@@ -171,13 +330,20 @@ async function assertArchiveJudged(token, repo, sha, archive) {
   const judged = (Array.isArray(parsed.legs) ? parsed.legs : [])
     .map((leg) => leg?.result?.archive?.sha256)
     .filter(Boolean);
-  if (!judged.includes(archive)) {
-    throw new Error(
-      `archive ${archive} is not one the published preflight for ${sha} judged ` +
-      `(${judged.join(', ') || 'none'}). Either the candidate sha is wrong or ` +
-      'the stranger ran on a different build; both need a human, not a retry.',
-    );
-  }
+  if (judged.includes(archive)) return;
+  // Only now, and only for this candidate. The preflight legs answer for a
+  // stranger run on the rc-build archive, which is the ordinary case and costs
+  // no extra request.
+  const shipped = await releaseArchives(token, repo, sha);
+  if (shipped.archives.includes(archive)) return;
+  const alsoNot = shipped.tag === null
+    ? `, and no published release of ${sha} carries a ${PROVENANCE_ASSET}`
+    : `, nor one release ${shipped.tag} shipped (${shipped.archives.join(', ')})`;
+  throw new Error(
+    `archive ${archive} is not one the published preflight for ${sha} judged ` +
+    `(${judged.join(', ') || 'none'})${alsoNot}. Either the candidate sha is ` +
+    'wrong or the stranger ran on a different build; both need a human, not a retry.',
+  );
 }
 
 // Name what is being filed, before filing it.
