@@ -820,7 +820,7 @@ fn render_daemon_work_lines(
             .then(|| model_fetch.download_phase())
             .flatten();
         let detail = match (&pass.stopped_reason, downloading, pass.working_seconds) {
-            (Some(reason), _, _) => format!("stopped — {reason}"),
+            (Some(reason), _, _) => format!("stopped: {reason}"),
             (None, Some(phase), Some(working)) => format!("{phase}, working {working}s"),
             (None, Some(phase), None) => phase,
             (None, None, Some(working)) => format!("working {working}s"),

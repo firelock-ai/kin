@@ -94,7 +94,7 @@ pub async fn register(
                     let vendor = c["vendor"].as_str().unwrap_or("unknown");
                     let desc = c["task_description"].as_str().unwrap_or("");
                     let cid = c["intent_id"].as_str().unwrap_or("-");
-                    println!("  [{vendor}] {cid} — {desc}");
+                    println!("  [{vendor}] {cid}: {desc}");
                 }
             }
         }

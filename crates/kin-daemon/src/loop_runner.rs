@@ -3300,7 +3300,7 @@ pub async fn run_loop_armed(
                 warn!(
                     pending = event_count,
                     base_batch = base_batch_size,
-                    "event queue backpressure — retaining bounded batches for fair catch-up"
+                    "event queue backpressure: retaining bounded batches for fair catch-up"
                 );
                 backlog_warning_active = true;
             }

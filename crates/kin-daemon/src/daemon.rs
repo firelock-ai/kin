@@ -797,7 +797,7 @@ pub(crate) async fn run_shutdown_persistence(state: &Arc<DaemonState>) {
                     .persisted_entity_count
                     .load(std::sync::atomic::Ordering::SeqCst),
                 current = state.graph.entity_count(),
-                "skipping final graph flush on shutdown — in-memory entity count collapsed vs on-disk snapshot; preserving the larger snapshot"
+                "skipping final graph flush on shutdown: in-memory entity count collapsed vs on-disk snapshot; preserving the larger snapshot"
             );
         } else {
             info!("final persistence flush on shutdown");
@@ -1732,7 +1732,7 @@ pub fn spawn_shutdown_escalation_watchdog<F>(
             // process down so a stop request always results in actual
             // termination — no zombie, and no unbounded stop.
             eprintln!(
-                "kin-daemon: graceful shutdown exceeded {}s grace — forcing process exit to prevent a CPU zombie",
+                "kin-daemon: graceful shutdown exceeded {}s grace; forcing process exit to prevent a CPU zombie",
                 grace.as_secs()
             );
              std::process::exit(0);
@@ -4571,7 +4571,7 @@ pub async fn run_with_authority_on(
                 }
                 warn!(
                     owner_pid,
-                    "owner process is gone — shutting down orphaned daemon"
+                    "owner process is gone; shutting down orphaned daemon"
                 );
                 // Arm the force-exit backstop here, not via the propagation
                 // task: an orphaned daemon is exactly the case where the async
@@ -4639,7 +4639,7 @@ pub async fn run_with_authority_on(
             if elapsed >= init_timeout {
                 error!(
                     elapsed_s = elapsed.as_secs(),
-                    "daemon initialization timed out — first reconciliation did not complete within 120s; check snapshot or repo state"
+                    "daemon initialization timed out: first reconciliation did not complete within 120s; check snapshot or repo state"
                 );
                 return;
             }
@@ -4847,7 +4847,7 @@ pub async fn run_with_authority_on(
                                 error = %e,
                                 consecutive_failures,
                                 next_retry_s = backoff_secs,
-                                "daemon persistence unhealthy — check disk space and permissions"
+                                "daemon persistence unhealthy: check disk space and permissions"
                             );
                         } else {
                             tracing::warn!(
@@ -5204,7 +5204,7 @@ pub async fn run_with_authority_on(
                                 path = %rel_path,
                                 count = request.changed_entity_ids.len(),
                                 max = MAX_ENTITIES_PER_REQUEST,
-                                "skipping LSP enrichment — too many changed entities (likely full re-parse)"
+                                "skipping LSP enrichment: too many changed entities (likely full re-parse)"
                             );
                             continue;
                         }
@@ -5274,7 +5274,7 @@ pub async fn run_with_authority_on(
                             info!(
                                 path = %rel_path,
                                 entities_queried = file_entities.len(),
-                                "LSP enrichment completed — no new relations found"
+                                "LSP enrichment completed: no new relations found"
                             );
                         }
                         if failed_queries == 0
@@ -6774,13 +6774,13 @@ pub(crate) fn spawn_background_embedding_worker(
                     Ok(BackgroundEmbeddingBatchOutcome::ResetAfterIndexError(e)) => {
                         warn!(
                             error = %e,
-                            "embedding worker hit a vector-index error — reset vector index and re-queued once"
+                            "embedding worker hit a vector-index error; reset vector index and re-queued once"
                         );
                         index_reset_triggered = true;
                         error_backoff = None;
                         error!(
                             error = %e,
-                            "embedding worker error — reset vector index, retrying next interval"
+                            "embedding worker error: reset vector index, retrying next interval"
                         );
                         break;
                     }
@@ -6805,7 +6805,7 @@ pub(crate) fn spawn_background_embedding_worker(
                         error!(
                             error = %e,
                             backoff_s = next.as_secs(),
-                            "embedding worker error — backing off"
+                            "embedding worker error: backing off"
                         );
                         // Backoff bounds how fast this ladder retries and not how
                         // long it retries for, so a failure that never clears
@@ -6820,7 +6820,7 @@ pub(crate) fn spawn_background_embedding_worker(
                         ) {
                             error!(
                                 budget_s = embed_retry_budget.as_secs(),
-                                "embedding worker parked — cumulative retry budget exhausted (see /health background_passes)"
+                                "embedding worker parked: cumulative retry budget exhausted (see /health background_passes)"
                             );
                         }
                         break;
@@ -6847,7 +6847,7 @@ pub(crate) fn spawn_background_embedding_worker(
                             error!(
                                 error = %e,
                                 consecutive_panics,
-                                "embedding worker permanently failed — vector index will not update until daemon restart; daemon continues in embed-degraded mode (see /health embed_worker_failed)"
+                                "embedding worker permanently failed: vector index will not update until daemon restart; daemon continues in embed-degraded mode (see /health embed_worker_failed)"
                             );
                             drain_embed_flush(
                                 &mut pending_flush,
@@ -8349,7 +8349,7 @@ mod tests {
         );
         assert!(
             !is_shutdown.load(Ordering::Relaxed),
-            "is_shutdown was never set — the backstop must not depend on it"
+            "is_shutdown was never set; the backstop must not depend on it"
         );
     }
 

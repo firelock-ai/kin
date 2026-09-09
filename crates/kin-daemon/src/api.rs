@@ -53997,7 +53997,7 @@ mod tests {
             let status = response.status();
             assert!(
                 status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
-                "path {path} returned {status} — public route should not require auth"
+                "path {path} returned {status}; public route should not require auth"
             );
         }
     }
@@ -54071,7 +54071,7 @@ mod tests {
             // 401/403, which would mean daemon_auth wrongly gated the registry.
             assert!(
                 status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
-                "registry path {path} returned {status} — registry must be public"
+                "registry path {path} returned {status}; registry must be public"
             );
         }
 

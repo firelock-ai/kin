@@ -20,7 +20,7 @@ pub async fn run_status() -> Result<()> {
     println!();
 
     if let Some(ref val) = env_val {
-        println!("  KIN_LOCATE_TELEMETRY={val}  (env override — takes precedence)");
+        println!("  KIN_LOCATE_TELEMETRY={val}  (env override, takes precedence)");
     }
 
     if consent_marker {
@@ -89,7 +89,7 @@ pub async fn run_revoke() -> Result<()> {
         })?;
         println!("Telemetry consent revoked. No further queries will be spooled.");
     } else {
-        println!("No consent marker found — telemetry was already off.");
+        println!("No consent marker found; telemetry was already off.");
     }
 
     println!(

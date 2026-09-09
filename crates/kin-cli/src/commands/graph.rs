@@ -1112,11 +1112,11 @@ fn build_graph_status_response_for_store(
         .semantic_relation_count
         .saturating_add(health.cochange_relation_count);
     if entity_count > 0 && all_relation_count == 0 {
-        warnings.push("no relations in graph — cross-file linking may have failed".to_string());
+        warnings.push("no relations in graph; cross-file linking may have failed".to_string());
     }
     if entity_count > 0 && role_counts.len() == 1 && role_counts.contains_key(&EntityRole::Source) {
         warnings
-            .push("all entities are Source — role classification may not be working".to_string());
+            .push("all entities are Source; role classification may not be working".to_string());
     }
     let entity_rels_per_ent = if entity_count == 0 {
         0.0
@@ -1125,7 +1125,7 @@ fn build_graph_status_response_for_store(
     };
     if entity_rels_per_ent < 0.1 && entity_count > 100 {
         warnings.push(format!(
-            "very low entity-to-entity relation density ({:.2} rels/entity) — entity linker may be failing",
+            "very low entity-to-entity relation density ({:.2} rels/entity); entity linker may be failing",
             entity_rels_per_ent
         ));
     }
@@ -1135,7 +1135,7 @@ fn build_graph_status_response_for_store(
     // `kin graph status` nonzero for every caller scripting it. Killing the
     // false all-clear is the requirement; changing an exit code is not.
     for reason in reconcile.degraded_reasons() {
-        warnings.push(format!("reconcile loop degraded — {reason}"));
+        warnings.push(format!("reconcile loop degraded: {reason}"));
     }
     // Warnings rather than criticals, for the reason stated directly above:
     // criticals set the response error and would turn `kin graph status`
@@ -1769,7 +1769,7 @@ fn entity_source_not_found_message(entity_query: &str) -> String {
     let trimmed = entity_query.trim();
     if uuid::Uuid::parse_str(trimmed).is_ok() {
         format!(
-            "no entity exists with ID '{trimmed}'. This entity ID is invalid or stale — it is \
+            "no entity exists with ID '{trimmed}'. This entity ID is invalid or stale: it is \
              not present in the graph, so retrying the same ID will not succeed. Use \
              semantic_locate or semantic_search to obtain a current entity ID."
         )
@@ -1787,7 +1787,7 @@ fn entity_source_not_found_message(entity_query: &str) -> String {
 fn entity_no_source_message(entity: &Entity, reason: &str) -> String {
     format!(
         "entity '{}' ({}) exists in the graph but has no retrievable source: {reason}. The \
-         entity ID is valid — this is not a missing or stale ID — there is simply no source \
+         entity ID is valid (not missing or stale); there is simply no source \
          body attached to return.",
         entity.name, entity.id
     )

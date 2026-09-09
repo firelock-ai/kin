@@ -679,7 +679,7 @@ pub async fn run(
         );
     } else if budget_stopped {
         println!(
-            "Time budget reached after {:.0}s ({pass} pass(es), {:.2} ent/s): {} entities + {} artifacts still pending{}. Progress is persisted — re-run `kin embed` to continue.",
+            "Time budget reached after {:.0}s ({pass} pass(es), {:.2} ent/s): {} entities + {} artifacts still pending{}. Progress is persisted; re-run `kin embed` to continue.",
             elapsed,
             rate,
             final_result.pending_entities,
@@ -688,7 +688,7 @@ pub async fn run(
         );
     } else {
         println!(
-            "Stopped with {} entities + {} artifacts still pending after {pass} pass(es) — the daemon made no progress on the last pass. Re-run `kin embed` or inspect the daemon log.",
+            "Stopped with {} entities + {} artifacts still pending after {pass} pass(es); the daemon made no progress on the last pass. Re-run `kin embed` or inspect the daemon log.",
             final_result.pending_entities, final_result.pending_artifacts
         );
     }

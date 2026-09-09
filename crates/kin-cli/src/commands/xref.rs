@@ -157,7 +157,7 @@ fn spine_xref_lines(
                     lines.push("  No cross-repo references found in the spine.".to_string());
                 } else {
                     lines.push(
-                        "  The spine returned no cross-repo edges, but its authority is incomplete — this is not the same as 'no references found'."
+                        "  The spine returned no cross-repo edges, but its authority is incomplete; this is not the same as 'no references found'."
                             .to_string(),
                     );
                 }
@@ -192,7 +192,7 @@ fn spine_xref_lines(
             lines
         }
         ::kin_spine::SpineQuery::Unavailable(reason) => vec![format!(
-            "  Cross-repo spine unavailable ({reason}) — this is not the same as 'no references found'."
+            "  Cross-repo spine unavailable ({reason}); this is not the same as 'no references found'."
         )],
         ::kin_spine::SpineQuery::NotConfigured => vec![
             "  Cross-repo spine not configured (no daemon endpoint available).".to_string(),
@@ -212,7 +212,7 @@ fn spine_xref_lines(
 fn xref_not_found_guidance(entity: &str) -> Vec<String> {
     vec![
         format!(
-            "Entity '{entity}' not found in this repo's graph — xref has no local anchor for the lookup."
+            "Entity '{entity}' not found in this repo's graph; xref has no local anchor for the lookup."
         ),
         "hint: `kin xref` finds cross-repo references by first resolving the symbol in THIS repo's"
             .to_string(),

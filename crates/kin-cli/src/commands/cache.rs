@@ -413,7 +413,7 @@ fn print_status_body(stats: &CacheStats, budget: Option<u64>, now: SystemTime, b
             let tag = if sv.is_current {
                 "current".to_string()
             } else {
-                "stale — reclaim with: kin cache gc --prune-stale-schema".to_string()
+                "stale; reclaim with: kin cache gc --prune-stale-schema".to_string()
             };
             println!(
                 "    {:<20} {:>10}  {:>12} entries  ({tag})",
@@ -447,7 +447,7 @@ fn print_status_body(stats: &CacheStats, budget: Option<u64>, now: SystemTime, b
             if stats.total_bytes > budget_bytes {
                 let over = stats.total_bytes - budget_bytes;
                 println!(
-                    "  WARNING: cache is OVER BUDGET by {} — run `kin cache gc` to reclaim space",
+                    "  WARNING: cache is OVER BUDGET by {}; run `kin cache gc` to reclaim space",
                     human_bytes(over)
                 );
             } else {
@@ -456,7 +456,7 @@ fn print_status_body(stats: &CacheStats, budget: Option<u64>, now: SystemTime, b
         }
         None => {
             println!(
-                "  budget:   not set — eviction is opt-in (set {} or pass `kin cache gc --budget-gb N`)",
+                "  budget:   not set; eviction is opt-in (set {} or pass `kin cache gc --budget-gb N`)",
                 cache_admin::BUDGET_ENV
             );
         }
@@ -526,7 +526,7 @@ pub async fn gc(dry_run: bool, budget_gb: Option<f64>, prune_stale_schema: bool)
     let budget_bytes = resolve_budget(budget_gb);
 
     if budget_bytes.is_none() && !prune_stale_schema {
-        println!("kin cache gc: nothing to do — non-destructive default.");
+        println!("kin cache gc: nothing to do (non-destructive default).");
         println!(
             "  set a budget (`--budget-gb N` or {}) to evict oldest entries,",
             cache_admin::BUDGET_ENV
@@ -605,7 +605,7 @@ fn print_gc_report(report: &GcReport) {
             );
         } else {
             println!(
-                "  within budget ({}) — no entries evicted",
+                "  within budget ({}); no entries evicted",
                 human_bytes(budget)
             );
         }

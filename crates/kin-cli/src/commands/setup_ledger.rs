@@ -209,7 +209,7 @@ impl SetupLedger {
         };
         let ledger: SetupLedger = serde_json::from_slice(bytes).with_context(|| {
             format!(
-                "install ledger {} is not valid JSON — fix or remove it and re-run `kin setup`",
+                "install ledger {} is not valid JSON; fix or remove it and re-run `kin setup`",
                 path.display()
             )
         })?;
@@ -359,7 +359,7 @@ pub(crate) fn verify_entry_locked(
         Some(_) => (
             EntryState::Modified,
             format!(
-                "{} at {} changed since install — Kin will not touch it",
+                "{} at {} changed since install; Kin will not touch it",
                 entry.kind.label(),
                 entry.path.display()
             ),
@@ -386,7 +386,7 @@ pub fn verify_entry(entry: &LedgerEntry) -> EntryVerification {
             // mistake the object for an absent or verified artifact.
             state: EntryState::Modified,
             detail: format!(
-                "{} at {} could not be safely verified — Kin will not trust or touch it: {error:#}",
+                "{} at {} could not be safely verified; Kin will not trust or touch it: {error:#}",
                 entry.kind.label(),
                 entry.path.display()
             ),
@@ -487,7 +487,7 @@ fn uninstall_entry_with_verification(
             entry: entry.clone(),
             action: RemovalAction::SkippedModified,
             detail: format!(
-                "{} at {} was modified since install — left in place (re-run with --force to remove)",
+                "{} at {} was modified since install; left in place (re-run with --force to remove)",
                 entry.kind.label(),
                 entry.path.display()
             ),

@@ -380,7 +380,7 @@ fn print_human_report(report: &DebugReport) {
                 .rank
                 .map(|r| format!("rank #{}", r))
                 .unwrap_or_else(|| "NOT FOUND".to_string());
-            println!("  {} {} — {}", status_icon, g.path, rank_str);
+            println!("  {} {}: {}", status_icon, g.path, rank_str);
 
             if g.rank.is_some() {
                 println!(

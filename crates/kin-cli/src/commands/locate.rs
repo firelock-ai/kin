@@ -2948,7 +2948,7 @@ fn emit_telemetry_disclosure_once() {
     DISCLOSED.call_once(|| {
         eprintln!(
             "ℹ kin locate telemetry is ON (you opted in). Recording queries + results \
-+ funnel traces to .kin/telemetry/ — local only, never uploaded. Disable: delete \
++ funnel traces to .kin/telemetry/; local only, never uploaded. Disable: delete \
 .kin/telemetry/consent (or KIN_LOCATE_TELEMETRY=0). Purge: delete .kin/telemetry/."
         );
     });
@@ -17788,7 +17788,7 @@ fn bounded_entity_body_with_note(
         if total_lines > shown {
             let remaining = total_lines - shown;
             return Some(format!(
-                "{body}\n… (+{remaining} more line{} — get_entity_source {} for the full body)",
+                "{body}\n… (+{remaining} more line{}: get_entity_source {} for the full body)",
                 if remaining == 1 { "" } else { "s" },
                 entity.id
             ));
@@ -19048,7 +19048,7 @@ fn coverage_banner(coverage: &SemanticCoverage) -> Option<String> {
     Some(coverage.note.clone().unwrap_or_else(|| {
         format!(
             "semantic (embedding) signal incomplete: {}/{} entities indexed, \
-             {} pending — lexical + graph signals still ran",
+             {} pending; lexical + graph signals still ran",
             coverage.indexed, coverage.total, coverage.pending
         )
     }))
@@ -19216,7 +19216,7 @@ fn coverage_notes(result: &LocateResult) -> Vec<CoverageNote> {
             format!("{}: {}", degradation.component, degradation.detail)
         } else {
             format!(
-                "{}: {} — {}",
+                "{}: {}; {}",
                 degradation.component, degradation.detail, degradation.remediation
             )
         };
