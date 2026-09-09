@@ -1722,7 +1722,7 @@ RESCUE_FIXTURE_COMMITS = 240
 # would not exercise what the fix reclaims.
 RESCUE_KILL_AT_PHASE = 8
 
-RESCUE_PHASE_LINE = re.compile(r"\[\s*(\d+)/17\]")
+RESCUE_PHASE_LINE = re.compile(r"\[\s*(\d+)/16\]")
 
 # What init stages beside the repository, and what a clean disk has none of.
 RESCUE_STAGING_PREFIXES = (".kin.init-", ".kin-git-capture-")
@@ -1867,7 +1867,7 @@ def check_9(suite):
         res.unknown("the kill left no staging behind, so there is nothing for "
                     "a post-mortem to be about")
         return res
-    res.note("killed at phase %d of 17, rc %s, %d staging path(s) stranded: %s"
+    res.note("killed at phase %d of 16, rc %s, %d staging path(s) stranded: %s"
              % (reached, rc, len(stranded),
                 ", ".join(os.path.basename(path) for path in stranded)))
 
@@ -1877,7 +1877,7 @@ def check_9(suite):
     doctor_text = doctor_out + doctor_err
     row = [line for line in doctor_text.splitlines()
            if "Interrupted conversion" in line]
-    phase_in_doctor = re.search(r"phase (\d+) of 17", doctor_text)
+    phase_in_doctor = re.search(r"phase (\d+) of 16", doctor_text)
     if not row:
         res.bad("`kin doctor` after the kill carries no interrupted-conversion "
                 "row, so nothing names the %d staging path(s) left behind"
@@ -1890,7 +1890,7 @@ def check_9(suite):
                 "at phase %d" % (phase_in_doctor.group(1),
                                  RESCUE_KILL_AT_PHASE))
     else:
-        res.ok("`kin doctor` names the kill at phase %s of 17: %s"
+        res.ok("`kin doctor` names the kill at phase %s of 16: %s"
                % (phase_in_doctor.group(1), row[0].strip()[:160]))
 
     # A diagnostic that deletes is one an operator learns not to run, so the
@@ -1913,7 +1913,7 @@ def check_9(suite):
     rerun_text = read_text(rerun_log)
     said_unfinished = "did not finish" in rerun_text
     said_disposition = re.search(r"\b(restarts|resumes|resuming)\b", rerun_text)
-    phase_in_rerun = re.search(r"phase (\d+) of 17", rerun_text)
+    phase_in_rerun = re.search(r"phase (\d+) of 16", rerun_text)
     if not said_unfinished:
         res.bad("the re-run says nothing about the conversion that did not "
                 "finish, so an operator repeats eleven minutes with no idea "
@@ -1926,7 +1926,7 @@ def check_9(suite):
                 "it resumes from it or starts over, which is the one thing an "
                 "operator has to know before waiting again")
     else:
-        res.ok("the re-run names phase %s of 17 and says it %s"
+        res.ok("the re-run names phase %s of 16 and says it %s"
                % (phase_in_rerun.group(1), said_disposition.group(1)))
 
     # ARM 3. Nothing is orphaned silently.

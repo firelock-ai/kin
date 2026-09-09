@@ -544,11 +544,8 @@ fn init_from_git_with_hooks(
         (transaction, changes)
     };
 
-    progress.begin("validate bootstrap transaction");
-    {
-        let _span = info_span!("kin.init.validate_bootstrap_transaction").entered();
-        crate::init::bootstrap_transaction_hash(&transaction, Some(&changes))?;
-    }
+    #[cfg(test)]
+    tests::capture_bootstrap_identity(&transaction, &changes, sealed_observation.fingerprint);
 
     progress.begin("commit bootstrap transaction");
     {
@@ -3049,5 +3046,112 @@ mod tests {
                 "{door} left no file at the path the reader looks in"
             );
         }
+    }
+
+    type BootstrapIdentity = (kin_model::Hash256, kin_model::Hash256);
+
+    thread_local! {
+        static BOOTSTRAP_IDENTITY: std::cell::RefCell<Option<Option<BootstrapIdentity>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn capture_bootstrap_identity(
+        transaction: &kin_model::RepositoryTransaction,
+        changes: &kin_db::storage::ChangeMap,
+        seal: kin_model::Hash256,
+    ) {
+        BOOTSTRAP_IDENTITY.with(|slot| {
+            if slot.borrow().is_some() {
+                let hash =
+                    crate::init::bootstrap_transaction_hash(transaction, Some(changes)).unwrap();
+                *slot.borrow_mut() = Some(Some((hash, seal)));
+            }
+        });
+    }
+
+    /// Imported changes and the content seal are stable for a pinned repository
+    /// and Git history. The transaction also binds freshly minted workspace and
+    /// operation identities, so its receipt is compared to the pre-commit input.
+    #[test]
+    fn removing_the_discarded_validation_pass_does_not_move_admitted_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("a.txt"), b"first\n").unwrap();
+        commit_all_at(&source, "first", "2030-01-01T00:00:00 +0000");
+        std::fs::write(source.join("a.txt"), b"second\n").unwrap();
+        commit_all_at(&source, "second", "2030-01-02T00:00:00 +0000");
+        git(&source, ["checkout", "-b", "side", "HEAD~1"]);
+        std::fs::write(source.join("side.bin"), [0, 255, 17]).unwrap();
+        commit_all_at(&source, "side", "2030-01-03T00:00:00 +0000");
+        git(&source, ["checkout", "main"]);
+        let repository = RepositoryId::new("bootstrap-identity-fixture".to_string()).unwrap();
+        BOOTSTRAP_IDENTITY.with(|slot| *slot.borrow_mut() = Some(None));
+        let result = init_from_git_adopting(&source, &repository);
+        let captured = BOOTSTRAP_IDENTITY.with(|slot| slot.borrow_mut().take());
+        let result = result.unwrap();
+        let (transaction_hash, seal) = captured.flatten().expect("pre-commit identity captured");
+        assert_eq!(result.authority.receipt.transaction_hash, transaction_hash);
+        let binding = crate::LocalRepositoryAuthorityBinding::from_layout(&result.layout).unwrap();
+        let manager = binding.open_manager().unwrap();
+        let lease = manager.read_authority();
+        let mut ids = lease
+            .snapshot()
+            .changes
+            .change_ids()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(
+            ids.len(),
+            3,
+            "include history reachable only through the side branch"
+        );
+        println!(
+            "IDENTITY initial {}",
+            result.authority.initial_change_id.unwrap()
+        );
+        println!("IDENTITY seal {seal}");
+        println!("IDENTITY changes {ids:?}");
+        assert_eq!(
+            seal.to_string(),
+            "9a9c56b8193d5bffdd4f5a8488a345b2624feb1c5d9376aab21717134d796ff1"
+        );
+        assert_eq!(
+            result.authority.initial_change_id.unwrap().to_string(),
+            "2f5b60b25a36cba3a9b10022fc006ff01f8481de7b342886a7e23c5e26339b37"
+        );
+        assert_eq!(
+            ids,
+            [
+                "2f5b60b25a36cba3a9b10022fc006ff01f8481de7b342886a7e23c5e26339b37",
+                "7df071acd75aa91c22fcd0517200af76b97e256b31d7e27a12aa6bacece5a7bb",
+                "8b41366e341722bf4257ce4456fc5e38368c24e049625b9a3d99c0766095322a",
+            ]
+        );
+    }
+
+    fn commit_all_at(repository: &Path, message: &str, stamp: &str) {
+        let output = fixture_git(repository)
+            .args(["add", "--all"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git add --all failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = fixture_git(repository)
+            .args(["commit", "-m", message])
+            .author_date(stamp)
+            .committer_date(stamp)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
