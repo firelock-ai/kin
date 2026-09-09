@@ -608,19 +608,22 @@ class Suite(object):
         os.makedirs(os.path.join(repo, "src"))
         os.makedirs(os.path.join(repo, "tests"))
 
+        # Only the depth-eight trace needs long signatures. Optional parameters
+        # make its returned records exceed 12,000 characters without changing calls.
+        trace_params = ", ".join("a%d=0" % index for index in range(100))
         lines = ["def hop_0(value):", '    """The base of the chain."""', "    return value"]
         for index in range(1, 60):
             lines += [
                 "",
                 "",
-                "def hop_%d(value):" % index,
+                "def hop_%d(value%s):" % (index, ", " + trace_params if index >= 52 else ""),
                 '    """A hop carrying enough text to cost the budget real characters."""',
                 "    return hop_%d(value) + %d" % (index - 1, index),
             ]
         lines += [
             "",
             "",
-            "def entry(value):",
+            "def entry(value, %s):" % trace_params,
             '    """The focal the deep walk starts from."""',
             "    return hop_59(value)",
             "",
@@ -1047,6 +1050,25 @@ def check_4(suite):
     return res
 
 
+def response_ceiling_interference(payload, ceiling):
+    """Separate byte-ceiling cuts from the token cuts that also mark a pack bounded."""
+    accounting = ((payload.get("_kin") or {}).get("response")) or {}
+    if accounting.get("max_chars") != ceiling:
+        return ["the response does not confirm the requested %d-character ceiling" % ceiling]
+    problems = []
+    for key, entry in (payload.get("elisions") or {}).items():
+        reason = entry.get("reason") if isinstance(entry, dict) else None
+        reasons = {part.strip() for part in reason.split(",")} if isinstance(reason, str) else set()
+        if "response_budget" in reasons:
+            problems.append("the response ceiling also cut %s" % key)
+    if any(
+        isinstance(entry, dict) and entry.get("reason") == OVER_BUDGET_REASON
+        for entry in payload.get("degradations") or []
+    ):
+        problems.append("the response could not fit its byte ceiling")
+    return problems
+
+
 def check_5(suite):
     res = Result(
         "5",
@@ -1073,12 +1095,11 @@ def check_5(suite):
     # two cutters at once, which is exactly the confusion this check exists to
     # remove. Read off each response's own accounting rather than assumed.
     for label, payload in (("generous", whole), ("tight", cut)):
-        accounting = ((payload.get("_kin") or {}).get("response")) or {}
-        if accounting.get("bounded"):
+        interference = response_ceiling_interference(payload, 60000)
+        if interference:
             res.unknown(
-                "the %s call was also cut by the response budget (%s), so the token "
-                "budget cannot be isolated on this fixture"
-                % (label, json.dumps(accounting, sort_keys=True))
+                "the %s call cannot isolate the token budget: %s"
+                % (label, "; ".join(interference))
             )
             return res
 
@@ -1734,6 +1755,23 @@ def self_test():
     def expect(label, got, want):
         if got != want:
             problems.append("%s: got %r, wanted %r" % (label, got, want))
+
+    token_only = {
+        "_kin": {"response": {"bounded": True, "max_chars": 60000}},
+        "elisions": {"dependencies": {"reason": "token_budget"}},
+        "degradations": [{"component": "response_budget", "reason": "response_bounded"}],
+    }
+    expect("token-only cuts remain isolated", response_ceiling_interference(token_only, 60000), [])
+    mixed = dict(token_only, elisions={"dependencies": {"reason": "token_budget, response_budget"}})
+    expect("mixed cuts cannot isolate tokens", bool(response_ceiling_interference(mixed, 60000)), True)
+    residual = dict(token_only, degradations=[{"reason": OVER_BUDGET_REASON}])
+    expect("residual byte overrun cannot isolate tokens", bool(response_ceiling_interference(residual, 60000)), True)
+    expect("an unconfirmed ceiling is unreadable", bool(response_ceiling_interference({}, 60000)), True)
+    fitting_walk = {"chain": [{"name": "entry"}], "elisions": {"chain": {"kept": 1, "elided": 8}}}
+    expect("a cut walk fitting its ceiling passes", grade_ceiling_walk(fitting_walk, 12000, True)[0], [])
+    expect("an uncut walk proves no ceiling", grade_ceiling_walk({"chain": []}, 12000, True)[0], None)
+    oversized_walk = dict(fitting_walk, detail="x" * 13000)
+    expect("an oversized cut walk fails its advertised ceiling", bool(grade_ceiling_walk(oversized_walk, 12000, True)[0]), True)
 
     # The final-page grader, against one correct page and one break per rule it
     # enforces. A grader that cannot fail is what lets a regression ship green.
