@@ -3241,7 +3241,10 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             .into());
         }
         let transaction_hash = transaction.transaction_hash_with_changes(changes.len(), || {
-            Ok(changes.change_ids().into_iter().map(|id| {
+            let ids = changes
+                .change_ids()
+                .map_err(|error| ModelError::InvalidOperation(error.to_string()))?;
+            Ok(ids.into_iter().map(|id| {
                 let change = changes
                     .read_change(&id)
                     .map_err(|error| ModelError::InvalidOperation(error.to_string()))?
@@ -4133,7 +4136,7 @@ pub(crate) fn derive_change_children(
     changes: &crate::storage::ChangeMap,
 ) -> Result<HashMap<SemanticChangeId, Vec<SemanticChangeId>>, KinDbError> {
     let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
-    for id in changes.change_ids() {
+    for id in changes.change_ids()? {
         for parent in changes
             .change_parents(&id)?
             .ok_or_else(|| ModelError::ChangeNotFound(id.to_string()))?
@@ -4150,7 +4153,7 @@ pub(crate) fn derive_change_children(
 fn validate_unscoped_history_caches(snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
     let mut expected_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>> = HashMap::new();
     let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
-    for id in snapshot.changes.change_ids() {
+    for id in snapshot.changes.change_ids()? {
         for parent in snapshot.changes.change_parents(&id)?.unwrap_or_default() {
             children.entry(parent).or_default().insert(id);
         }
@@ -6321,7 +6324,7 @@ fn validate_history_replay_with<'a>(
     if validation_targets.is_empty() {
         validation_targets = snapshot
             .changes
-            .change_ids()
+            .change_ids()?
             .into_iter()
             .filter(|change_id| {
                 snapshot
@@ -6341,7 +6344,7 @@ fn topological_change_order(
 ) -> Result<Vec<SemanticChangeId>, KinDbError> {
     let mut indegree = BTreeMap::new();
     let mut children: BTreeMap<SemanticChangeId, BTreeSet<SemanticChangeId>> = BTreeMap::new();
-    for id in changes.change_ids() {
+    for id in changes.change_ids()? {
         let unique_parents: BTreeSet<_> = changes
             .change_parents(&id)?
             .unwrap_or_default()
@@ -11167,8 +11170,18 @@ mod tests {
         );
         assert_eq!(actual.generation, 1);
         assert_eq!(
-            streamed.read_authority().snapshot.changes.change_ids(),
-            owned.read_authority().snapshot.changes.change_ids()
+            streamed
+                .read_authority()
+                .snapshot
+                .changes
+                .change_ids()
+                .unwrap(),
+            owned
+                .read_authority()
+                .snapshot
+                .changes
+                .change_ids()
+                .unwrap()
         );
         assert_eq!(
             streamed.read_authority().metadata().ref_state.refs,
@@ -16094,7 +16107,7 @@ mod tests {
         let bytes = std::fs::read(frame_path(&directory, 2)).unwrap();
         let mut frame =
             crate::storage::authority_frame::AuthorityFrame::from_bytes(&bytes).unwrap();
-        let id = base.changes.change_ids()[0];
+        let id = base.changes.change_ids().unwrap()[0];
         let mut valid = base.changes.read_change(&id).unwrap().unwrap();
         valid.message.push_str(" valid appended record");
         valid.id = compute_semantic_change_id(&valid).unwrap();

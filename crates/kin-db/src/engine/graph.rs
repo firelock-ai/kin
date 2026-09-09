@@ -484,7 +484,7 @@ fn derive_entity_revisions_across_history(
 fn derive_indexed_entity_revisions(
     changes: &crate::storage::change_map::ChangeMap,
 ) -> Result<HashMap<EntityId, Vec<EntityRevision>>, KinDbError> {
-    let mut ids = changes.change_ids();
+    let mut ids = changes.change_ids()?;
     ids.sort_by_key(|id| id.to_string());
     let mut visited = HashSet::new();
     let mut ordered = Vec::with_capacity(ids.len());
@@ -2633,7 +2633,7 @@ impl InMemoryGraph {
             // consumed by this proof, so retain one replay state instead.
             crate::storage::history_replay::validate_first_parent_history(
                 &snapshot.changes,
-                &snapshot.changes.change_ids(),
+                &snapshot.changes.change_ids()?,
             )?;
         }
         Ok(())

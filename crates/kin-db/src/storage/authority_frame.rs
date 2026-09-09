@@ -376,7 +376,7 @@ impl AuthorityFrame {
         }
 
         let mut changes = Vec::new();
-        for id in next.changes.change_ids() {
+        for id in next.changes.change_ids()? {
             if !current.changes.contains_change(&id) {
                 changes.push(next.changes.read_change(&id)?.ok_or_else(|| {
                     KinDbError::StorageError(format!("successor change {id} is missing"))
@@ -894,7 +894,7 @@ fn same_changes(left: &super::ChangeMap, right: &super::ChangeMap) -> Result<boo
     if left.len() != right.len() {
         return Ok(false);
     }
-    for id in left.change_ids() {
+    for id in left.change_ids()? {
         let Some(left_change) = left.read_change(&id)? else {
             return Ok(false);
         };

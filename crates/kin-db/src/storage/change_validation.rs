@@ -75,7 +75,7 @@ impl<'a> AdmittedChangeMap<'a> {
         changes: &'a crate::storage::change_map::ChangeMap,
         boundary: &str,
     ) -> Result<Self, KinDbError> {
-        for id in changes.change_ids() {
+        for id in changes.change_ids()? {
             let change = changes.read_change(&id)?.ok_or_else(|| {
                 KinDbError::StorageError(format!("{boundary} missing change {id}"))
             })?;

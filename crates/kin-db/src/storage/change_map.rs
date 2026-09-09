@@ -539,7 +539,12 @@ impl ChangeMap {
     }
 
     /// Copy compact identity metadata, leaving change bodies on disk.
-    pub fn change_ids(&self) -> Vec<SemanticChangeId> {
+    ///
+    /// Unindexed encoded history must be decoded to enumerate its keys; read or
+    /// decode failures are returned without yielding an empty or partial list.
+    /// Decoded and indexed history use verified identity metadata without reading
+    /// the bodies. The result is sorted and contains each identity once.
+    pub fn change_ids(&self) -> Result<Vec<SemanticChangeId>, KinDbError> {
         let mut ids: Vec<_> = if let Some(decoded) = self.body.decoded.get() {
             decoded.keys().copied().collect()
         } else if let Some(index) = self
@@ -555,7 +560,11 @@ impl ChangeMap {
                 .as_ref()
                 .expect("encoded history has a source")
                 .decode()
-                .unwrap_or_else(|error| panic!("{error}"))
+                .map_err(|error| {
+                    KinDbError::StorageError(format!(
+                        "change_ids could not list the change map's records: {error}"
+                    ))
+                })?
                 .keys()
                 .copied()
                 .collect()
@@ -563,7 +572,7 @@ impl ChangeMap {
         ids.extend(self.overlay.keys().copied());
         ids.sort_unstable();
         ids.dedup();
-        ids
+        Ok(ids)
     }
 
     /// Visit complete records with at most one decoded body retained by this
@@ -584,7 +593,7 @@ impl ChangeMap {
                 visit(&change)?;
             }
         } else {
-            for id in self.change_ids() {
+            for id in self.change_ids()? {
                 let change = self.read_change(&id)?.ok_or_else(|| {
                     KinDbError::StorageError(format!("history record {id} missing"))
                 })?;
@@ -756,7 +765,9 @@ impl ChangeMap {
                     digests.extend(index.values().map(|record| record.leaf_digest));
                     digests.extend(self.overlay.values().map(|record| record.leaf_digest));
                 } else {
-                    for id in self.change_ids() {
+                    for id in self.change_ids().expect(
+                        "this arm already holds an index, so change_ids reads it without decoding",
+                    ) {
                         let change = self
                             .read_change(&id)
                             .unwrap_or_else(|error| panic!("{error}"))
@@ -1007,7 +1018,7 @@ impl Serialize for ChangeMap {
             }
         }
         let mut map = serializer.serialize_map(Some(self.len()))?;
-        for id in self.change_ids() {
+        for id in self.change_ids().map_err(serde::ser::Error::custom)? {
             let change = self
                 .read_change(&id)
                 .map_err(serde::ser::Error::custom)?
