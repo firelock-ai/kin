@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-09-09
+
+### Changed
+
+- Remove em dashes from kin-cli and kin-daemon runtime strings (#1643)
+- Propagate change enumeration failures during bootstrap hashing (#1610)
+- Wire relation-census hold into the /commands/refs daemon route (#1642)
+- Stop re-enriching an unchanged non-entity record on every reconcile tick (#1644)
+- perf(git): stop holding blob bodies in the validated object closure (#1645)
+
+
 ## [0.7.7] - 2026-09-09
 
 ### Changed
