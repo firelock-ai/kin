@@ -1039,3 +1039,117 @@ async fn startup_diagnostic_purge_refuses_unrecorded_changed_body() {
     assert_eq!(state.graph.resolved_tree(), previous);
     assert!(marker.is_dir());
 }
+
+/// A standalone publication owes a parse only for the paths that have one.
+///
+/// #1626 began recording semantic debt at `publish_exact_workspace_tree`, the
+/// ambient watcher's own publication seam, for every blob in the exact tree
+/// correction. Nothing but a commit settles a debt entry, so a path recorded
+/// there on a store that never commits is owed on every later reconcile tick,
+/// and every drain hands it to [`readmit_semantics_for_paths`]. For a path that
+/// is not entity source that means re-persisting its artifact facet, and
+/// kin-db's artifact upsert calls `invalidate_artifact_for_embedding`, which
+/// REMOVES the artifact's vector and re-queues it. The store is then left
+/// holding an artifact key that embedding coverage counts and that can never
+/// keep a vector, while every counter sits still.
+///
+/// Measured, not assumed: kin's install proof passed on 18a67fe7 and has failed
+/// on every commit since 4f89f45e, the #1626 squash, freezing at
+/// `indexed 4, pending 2, total 6` across 177 consecutive one-second reads.
+/// `kin setup` leaves exactly two non-source files in the proof's tree,
+/// `.agents/mcp_config.json` and a zero-byte
+/// `.agents/.mcp_config.json.kin-update.lock`, and two is the gap.
+///
+/// The fixture reproduces that pair beside a source file, so the source arm is
+/// the positive control: it must stay owed, because a source file published
+/// without its parse is the whole reason this record exists.
+#[tokio::test]
+#[serial_test::serial(commit_phase_capture)]
+async fn a_standalone_publication_owes_no_parse_for_a_non_source_artifact() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = open_test_state(&repo);
+    std::fs::write(
+        repo.path().join("probe.py"),
+        b"def hello():\n    return 42\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.path().join(".agents")).unwrap();
+    std::fs::write(
+        repo.path().join(".agents/mcp_config.json"),
+        br#"{"mcpServers":{"kin":{"command":"kin","args":["mcp","start"]}}}"#,
+    )
+    .unwrap();
+    // Zero bytes, exactly as `kin setup` leaves its update lock behind.
+    std::fs::write(
+        repo.path().join(".agents/.mcp_config.json.kin-update.lock"),
+        b"",
+    )
+    .unwrap();
+    sync_filesystem_with_graph(&state).await.unwrap();
+
+    let config = ".agents/mcp_config.json";
+    let lock = ".agents/.mcp_config.json.kin-update.lock";
+    let tree_paths: BTreeSet<String> = state
+        .graph
+        .resolved_tree()
+        .artifacts_by_path()
+        .into_iter()
+        .filter_map(|artifact| artifact.path.as_utf8().map(|path| path.to_string()))
+        .collect();
+    assert!(
+        tree_paths.contains("probe.py")
+            && tree_paths.contains(config)
+            && tree_paths.contains(lock),
+        "the fixture must actually reach the tree or every assertion below is vacuous: \
+         {tree_paths:?}"
+    );
+    // Both non-source files carry an enrichment record, which is exactly what
+    // makes them artifact retrieval keys that embedding coverage counts
+    // (kin-db's `collect_artifact_ids` reads those three maps and nothing else).
+    // Asserted through the facet reads rather than through a queue depth,
+    // because the queue is gated on kin-db's `vector` feature and this test has
+    // to mean the same thing in every permutation the feature matrix builds.
+    let enriched = |path: &str| {
+        let file_id = FilePathId::new(path);
+        state.graph.get_shallow_file(&file_id).unwrap().is_some()
+            || state
+                .graph
+                .get_structured_artifact(&file_id)
+                .unwrap()
+                .is_some()
+            || state.graph.get_opaque_artifact(&file_id).unwrap().is_some()
+    };
+    assert!(
+        enriched(config) && enriched(lock),
+        "both non-source files must carry an enrichment record, or they are not artifact \
+         keys and this test asserts nothing"
+    );
+
+    let recorded = crate::semantic_debt::outstanding(&state);
+    let (owed, _spent) = crate::semantic_debt::partition_against_tree(&state, &recorded);
+    let owed_paths: BTreeSet<String> = owed
+        .iter()
+        .filter_map(|path| path.as_utf8().map(|path| path.to_string()))
+        .collect();
+    assert!(
+        owed_paths.contains("probe.py"),
+        "the source file published without its parse must stay owed: {owed_paths:?}"
+    );
+    assert!(
+        !owed_paths.contains(config) && !owed_paths.contains(lock),
+        "a file that is not entity source owes no parse, and an entry a commit never \
+         settles re-enriches it on every tick: {owed_paths:?}"
+    );
+
+    // What the drain would do if the record named them, so the cost above is
+    // demonstrated rather than asserted. Asking for the two artifacts directly
+    // re-persists both facets, which is the upsert that discards their vectors.
+    let artifacts = BTreeSet::from([test_repo_path(config), test_repo_path(lock)]);
+    let readmitted = readmit_semantics_for_paths(&state, &artifacts).await;
+    assert_eq!(
+        readmitted.enriched, 2,
+        "control: the drain does re-persist a non-source facet when it is asked to, \
+         which is why the debt record must never name one"
+    );
+    assert!(readmitted.failed.is_empty(), "{:?}", readmitted.failed);
+}

@@ -53,8 +53,9 @@
 
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use kin_index::{FileClassification, FileClassifier};
 use kin_model::{RepoPath, TreeEntry};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -98,6 +99,30 @@ pub(crate) fn owed_by(deltas: &[kin_model::TreeDelta]) -> Vec<SemanticDebt> {
         let Some(path) = new.path.as_utf8() else {
             continue;
         };
+        // Only a path that owes a PARSE belongs in this record. A file that is
+        // not entity source owes none: its shallow, structured or opaque record
+        // is written by the same admission that publishes its bytes, so there is
+        // no deferred derivation for a later drain to perform.
+        //
+        // Recording one anyway is not merely waste. Nothing but a commit settles
+        // a debt entry, and the install proof never commits, so such an entry is
+        // owed on every later reconcile tick. Each drain hands the path to
+        // `readmit_semantics_for_paths`, whose non-source branch re-persists the
+        // facet, and kin-db's artifact upsert calls `invalidate_artifact_for_embedding`,
+        // which REMOVES the artifact's vector and re-queues it. The store then
+        // holds an artifact key that is counted in embedding coverage and can
+        // never keep a vector, and the counters sit still while it happens.
+        //
+        // Classification is by name here rather than by content, because a tree
+        // delta carries no body. That admits a source-named path whose bytes are
+        // opaque, which the drain then re-enriches; `readmit_semantics_for_paths`
+        // refuses to rewrite an unchanged non-source record for that reason.
+        if !matches!(
+            FileClassifier::classify(Path::new(path)),
+            FileClassification::EntitySource
+        ) {
+            continue;
+        }
         owed.push(SemanticDebt {
             path: path.to_string(),
             body: hash.to_string(),
