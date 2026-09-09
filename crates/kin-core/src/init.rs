@@ -1764,7 +1764,10 @@ pub(crate) fn bootstrap_transaction_hash(
     match changes {
         None => transaction.transaction_hash(),
         Some(changes) => transaction.transaction_hash_with_changes(changes.len(), || {
-            Ok(changes.change_ids().into_iter().map(|id| {
+            let ids = changes
+                .change_ids()
+                .map_err(|error| kin_model::ModelError::InvalidOperation(error.to_string()))?;
+            Ok(ids.into_iter().map(|id| {
                 changes
                     .read_change(&id)
                     .map_err(|error| kin_model::ModelError::InvalidOperation(error.to_string()))?
@@ -5509,6 +5512,58 @@ mod tests {
             progress.detail_updates(),
             4,
             "an exact retry returns the existing bootstrap without reporting new work"
+        );
+    }
+
+    #[test]
+    fn streamed_bootstrap_hash_matches_owned_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_prepared, mut owned) = prepare_unborn(directory.path(), "hash-identity");
+        let mut changes = kin_db::storage::ChangeMap::new();
+        let mut parent = None;
+        for index in 0..3 {
+            let mut change = SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                parents: parent.into_iter().collect(),
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("importer"),
+                message: format!("imported history {index}"),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                tree_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                origin: ChangeOrigin::Native,
+                admission_policy_delta: None,
+                external_reference_deltas: vec![],
+            };
+            change.id = compute_semantic_change_id(&change).unwrap();
+            parent = Some(change.id);
+            changes.append_change(change.clone()).unwrap();
+            owned.changes.push(change);
+        }
+        let expected = owned.transaction_hash().unwrap();
+        assert_eq!(bootstrap_transaction_hash(&owned, None).unwrap(), expected);
+        let mut streamed = owned.clone();
+        streamed.changes.clear();
+        for _ in 0..2 {
+            assert_eq!(
+                bootstrap_transaction_hash(&streamed, Some(&changes)).unwrap(),
+                expected
+            );
+        }
+        for change in &owned.changes {
+            assert_eq!(
+                changes.read_change(&change.id).unwrap().as_ref(),
+                Some(change)
+            );
+            kin_model::validate_semantic_change_id(change).unwrap();
+        }
+        assert_ne!(
+            bootstrap_transaction_hash(&streamed, None).unwrap(),
+            expected
         );
     }
 
