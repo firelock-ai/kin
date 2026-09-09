@@ -1651,7 +1651,17 @@ mod tests {
         );
         let line = retained_parse_line(&init.layout).expect("a recorded path speaks");
         assert!(line.contains("search.py (4 parse errors)"), "{line}");
-        assert!(line.contains("The bytes on disk do not parse"), "{line}");
+        // Both halves of the record's own sentence, because this route renders
+        // it from the same store record `kin status` and `kin commit` render.
+        // A partial admission leaves some declarations current and others on an
+        // earlier parse, so the line has to say both, and asserting only the
+        // lead clause would pass on a line that dropped the coverage half.
+        assert!(line.contains("Did not parse as written"), "{line}");
+        assert!(
+            line.contains("Some entities may be retained")
+                && line.contains("File coverage remains incomplete"),
+            "{line}"
+        );
     }
 
     /// The control for the withheld-count test above. A diff that elides

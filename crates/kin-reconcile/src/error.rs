@@ -35,6 +35,9 @@ pub enum ReconcileError {
         reason: String,
     },
 
+    #[error("Incomplete parse cannot verify deletion of declarations in file {file_id}")]
+    IncompleteParseWouldDelete { file_id: kin_model::FilePathId },
+
     #[error("Broken AST rejected by policy for file {file_id}")]
     BrokenAstRejected {
         file_id: kin_model::FilePathId,

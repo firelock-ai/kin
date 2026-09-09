@@ -8992,8 +8992,14 @@ async fn context(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let result = kin_cli::commands::context::build_context_response(graph.as_ref(), &req)
-        .map_err(internal_error)?;
+    let repository_authority =
+        require_mcp_command_repository_authority(&state).map_err(internal_error)?;
+    let result = kin_cli::commands::context::build_context_response_with_authority(
+        graph.as_ref(),
+        &req,
+        &repository_authority,
+    )
+    .map_err(internal_error)?;
     Ok(Json(result))
 }
 
@@ -14330,7 +14336,7 @@ fn disclose_mcp_local_clamps(
         Some(existing) => existing.extend(entries),
         None => payload["degradations"] = serde_json::Value::Array(entries),
     }
-    match serde_json::to_string_pretty(&payload) {
+    match kin_mcp::budget::render(&payload) {
         Ok(rendered) => kin_mcp::ToolCallResult {
             content: vec![kin_mcp::ContentBlock::Text { text: rendered }],
             is_error: result.is_error,
@@ -14439,11 +14445,10 @@ async fn mcp_tools_call(
         ),
         None => None,
     };
-    Ok(Json(disclose_outside_graph(
-        graph.as_deref(),
-        question.as_deref(),
-        disclosed,
-    )))
+    // Clamp and outside-graph disclosures add bytes after the first fit.
+    // Enforce the ceiling again against the complete emitted payload.
+    let disclosed = disclose_outside_graph(graph.as_deref(), question.as_deref(), disclosed);
+    Ok(Json(bound_mcp_tool_result(disclosed, &tool, &budget)))
 }
 
 /// Disclose an identifier the question named that this graph holds no
@@ -14495,7 +14500,8 @@ fn disclose_outside_graph(
                 kin_mcp::outside_graph::OUTSIDE_GRAPH_KEY.to_string(),
                 block.clone(),
             );
-            match serde_json::to_string_pretty(&payload) {
+            // The caller re-fits after this disclosure adds its bytes.
+            match kin_mcp::budget::render(&payload) {
                 Ok(rendered) => kin_mcp::ContentBlock::Text { text: rendered },
                 Err(_) => kin_mcp::ContentBlock::Text { text },
             }
@@ -14522,6 +14528,7 @@ fn bound_mcp_tool_result(
     if !kin_mcp::budget::is_budgeted(tool) {
         return result;
     }
+    let mut is_error = result.is_error;
     let content = result
         .content
         .into_iter()
@@ -14534,19 +14541,20 @@ fn bound_mcp_tool_result(
                 return kin_mcp::ContentBlock::Text { text };
             }
             kin_mcp::budget::enforce(&mut payload, tool, budget);
+            if !kin_mcp::budget::fit_context_payload(&mut payload, tool, budget) {
+                is_error = Some(true);
+                payload = serde_json::json!({"error": "context metadata cannot fit the effective token and byte limits; request fewer focals or a larger budget"});
+            }
             if tool == "trace_data_flow" {
                 reconcile_trace_body_presence(&mut payload);
             }
-            match serde_json::to_string_pretty(&payload) {
+            match kin_mcp::budget::render(&payload) {
                 Ok(rendered) => kin_mcp::ContentBlock::Text { text: rendered },
                 Err(_) => kin_mcp::ContentBlock::Text { text },
             }
         })
         .collect();
-    kin_mcp::ToolCallResult {
-        content,
-        is_error: result.is_error,
-    }
+    kin_mcp::ToolCallResult { content, is_error }
 }
 
 /// Keep the trace's body-presence claim aligned with what survives the common
@@ -18279,10 +18287,15 @@ fn enrichment_unavailable_reason(
 /// exactly that distinction, which is why it exists.
 async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     use std::sync::atomic::Ordering;
+    let pending = state.lsp_work.pending.load(Ordering::SeqCst);
     let total = state.lsp_sweep_files_total.load(Ordering::SeqCst);
     let done = state.lsp_sweep_files_done.load(Ordering::SeqCst);
     Json(json!({
         "running": state.lsp_sweep_running.load(Ordering::SeqCst),
+        "pending_work": pending,
+        "failed_work": state.lsp_work.failed.load(Ordering::SeqCst),
+        "merge_pending": state.lsp_sweep_pending.load(Ordering::SeqCst),
+        "worker_available": state.lsp_enrichment_tx.as_ref().is_some_and(|tx| !tx.is_closed()),
         "files_done": done,
         "files_total": total,
         // A sweep that enriched nothing and a sweep that had nothing left to
@@ -46128,6 +46141,52 @@ mod tests {
     #[tokio::test]
     async fn context_endpoint_uses_live_graph() {
         let state = test_state();
+        let source = "def handler():\n    return 42";
+        install_repository_file(&state, "src/lib.py", source.as_bytes());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/context")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "handler",
+                            "budget": "8k",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let result: kin_cli::commands::context::ContextResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            result.pack.as_ref().unwrap().focal_entities[0].content,
+            source
+        );
+        assert!(
+            result
+                .lines
+                .iter()
+                .any(|line| line.contains("Context pack for 'handler'")),
+            "context response should identify the daemon graph entity"
+        );
+    }
+
+    /// A missing workspace body preserves the context pack and names the gap.
+    #[tokio::test]
+    async fn context_endpoint_withholds_an_unpublished_source_body_and_answers() {
+        let state = test_state();
         let entity = test_entity("handler", "src/lib.py");
         state.graph.upsert_entity(&entity).unwrap();
         state
@@ -46150,19 +46209,34 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
             .await
             .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         let result: kin_cli::commands::context::ContextResponse =
             serde_json::from_slice(&body).unwrap();
+        let withheld: Vec<&String> = result
+            .lines
+            .iter()
+            .filter(|line| line.contains("Source body withheld"))
+            .collect();
+        assert_eq!(withheld.len(), 1, "{:#?}", result.lines);
+        assert!(
+            withheld[0].contains("is not in workspace"),
+            "the row names the graph gap it hit: {}",
+            withheld[0]
+        );
+        // The rest of the answer survives the missing body.
         assert!(
             result
                 .lines
                 .iter()
                 .any(|line| line.contains("Context pack for 'handler'")),
-            "context response should identify the daemon graph entity"
+            "{:#?}",
+            result.lines
         );
+        assert!(result.pack.is_some());
     }
 
     /// The daemon half of the cancellation chain.
@@ -58291,6 +58365,91 @@ mod tests {
         );
         let payload: serde_json::Value = serde_json::from_str(&bounded).unwrap();
         assert_eq!(payload["total_upstream"], json!(400));
+    }
+
+    #[test]
+    fn the_raw_route_settles_context_tokens_and_refuses_the_metadata_floor() {
+        let budget = kin_mcp::budget::ResponseBudget {
+            max_chars: 60000,
+            ..Default::default()
+        };
+        let payload = serde_json::json!({"token_budget": 8000, "tokens_used": 0, "focal_entity": {"id": "focal", "name": "focal", "body": "execute();\n".repeat(2400), "projection": "FullBody"}});
+        let result = bound_mcp_tool_result(
+            kin_mcp::ToolCallResult::text(payload.to_string()),
+            "get_context_pack",
+            &budget,
+        );
+        assert_ne!(result.is_error, Some(true));
+        let kin_mcp::ContentBlock::Text { text } = &result.content[0];
+        let output: serde_json::Value = serde_json::from_str(text).unwrap();
+        let tokens = output["tokens_used"].as_u64().unwrap();
+        assert!(tokens > 0 && tokens <= 8000);
+        assert!(output["focal_entity"]["body"].is_null());
+        let refusal = bound_mcp_tool_result(kin_mcp::ToolCallResult::text(serde_json::json!({"token_budget": 1, "tokens_used": 0, "focal_entity": {"id": "focal", "name": "focal"}}).to_string()), "get_context_pack", &budget);
+        assert_eq!(refusal.is_error, Some(true));
+    }
+
+    #[test]
+    fn the_raw_route_compacts_whitespace_before_withholding_reference_rows() {
+        let payload = json!({
+            "total_upstream": 11,
+            "references": (0..11).map(|index| json!({
+                "entity_id": format!("reference-{index}"),
+                "name": format!("caller_{index}"),
+                "reference_lines": (0..60).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        });
+        let original = serde_json::to_string_pretty(&payload).unwrap();
+        let budget = kin_mcp::budget::ResponseBudget {
+            max_chars: 4_000,
+            ..kin_mcp::budget::ResponseBudget::default()
+        };
+        assert!(original.len() > budget.max_chars);
+        let response = bound_mcp_tool_result(
+            kin_mcp::ToolCallResult::text(original.clone()),
+            "find_references",
+            &budget,
+        );
+        let text = mcp_result_text(&response);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["references"], payload["references"]);
+        assert!(text.len() <= budget.max_chars);
+        // Compact, and compact ONLY by whitespace: re-serializing the parsed
+        // answer reproduces the shipped bytes exactly, so nothing was dropped
+        // to make it fit.
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), text);
+        assert!(!text.contains('\n'), "the shipped response is compact");
+        // The serialization control field chose that format and did not ship.
+        // Equality with the untouched payload is the assertion: any extra key
+        // at all, this one included, fails it.
+        assert!(parsed.get("_kin_json_format").is_none(), "{parsed}");
+        assert_eq!(parsed, payload);
+
+        let roomy = kin_mcp::budget::ResponseBudget {
+            max_chars: 60_000,
+            ..budget
+        };
+        let fitting = bound_mcp_tool_result(
+            kin_mcp::ToolCallResult::text(original.clone()),
+            "find_references",
+            &roomy,
+        );
+        assert_eq!(mcp_result_text(&fitting), original);
+
+        let annotated = kin_mcp::envelope::finalize_bounded(
+            response,
+            kin_mcp::envelope::Envelope::daemon(),
+            "find_references",
+            &roomy,
+        );
+        let emitted = mcp_result_text(&annotated);
+        let final_payload: serde_json::Value = serde_json::from_str(&emitted).unwrap();
+        assert_eq!(final_payload["references"], payload["references"]);
+        assert_eq!(
+            final_payload["_kin"]["response"]["chars_after_budget"],
+            emitted.len()
+        );
+        assert_eq!(kin_mcp::budget::measure(&final_payload), emitted.len());
     }
 
     /// A tool the budget does not govern is returned exactly as built. A source

@@ -389,11 +389,31 @@ pub fn record_elision_for(
     }
 }
 
-/// Serialized size of a payload, measured the way every emitter on both
-/// surfaces renders it. Measuring a compact form nobody sends would charge the
-/// budget for a payload no caller receives.
+/// Internal format choice retained across budget passes and omitted on emission.
+const JSON_FORMAT_KEY: &str = "_kin_json_format";
+
+/// Serialize in the budget-selected format without emitting its control field.
+pub fn render(value: &Value) -> serde_json::Result<String> {
+    if value.get(JSON_FORMAT_KEY).and_then(Value::as_str) == Some("compact") {
+        let mut emitted = value.clone();
+        if let Some(object) = emitted.as_object_mut() {
+            object.remove(JSON_FORMAT_KEY);
+        }
+        serde_json::to_string(&emitted)
+    } else {
+        serde_json::to_string_pretty(value)
+    }
+}
+
+/// Serialized size of the exact response every emitter sends.
 pub fn measure(value: &Value) -> usize {
-    serde_json::to_string_pretty(value).map_or(usize::MAX, |json| json.len())
+    render(value).map_or(usize::MAX, |json| json.len())
+}
+
+fn compact_json_under_pressure(payload: &mut Value, budget: &ResponseBudget) {
+    if measure(payload) > budget.max_chars && payload.is_object() {
+        payload[JSON_FORMAT_KEY] = json!("compact");
+    }
 }
 
 /// Give up a chain's least load-bearing branches until it fits, and hand back
@@ -809,6 +829,7 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             // split by direction, and a group the budget cannot trim is a group
             // that can push a response past its cap on its own.
             collections: &[
+                "entities",
                 "dependencies",
                 "dependents",
                 "transitive_deps",
@@ -816,7 +837,7 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
                 "contracts",
             ],
             body_keys: &["body"],
-            explain_keys: &["projection"],
+            explain_keys: &[],
             top_explain_keys: &[],
             duplicate_keys: &[],
             bulk_keys: &[],
@@ -1033,6 +1054,145 @@ pub fn is_budgeted(tool: &str) -> bool {
 /// through `get_entity_source`. Only then are hits themselves withheld, from the
 /// tail of the least important array first, which is the only cut that removes
 /// an answer rather than a description of one.
+pub fn fit_context_payload(payload: &mut Value, tool: &str, budget: &ResponseBudget) -> bool {
+    if !matches!(tool, "get_context_pack" | "trace_computation") {
+        return true;
+    }
+    let Some(limit) = payload.get("token_budget").and_then(Value::as_u64) else {
+        return true;
+    };
+    loop {
+        let mut settled = false;
+        for _ in 0..16 {
+            let tokens =
+                kin_context::estimate_tokens(&render(payload).expect("JSON serialization"));
+            if payload.get("tokens_used").and_then(Value::as_u64) == Some(tokens as u64) {
+                settled = true;
+                break;
+            }
+            payload["tokens_used"] = json!(tokens);
+        }
+        if !settled {
+            return false;
+        }
+        let output = render(payload).expect("JSON serialization");
+        if output.len() <= budget.max_chars
+            && kin_context::estimate_tokens(&output) <= limit as usize
+        {
+            return true;
+        }
+        let reason = if output.len() > budget.max_chars {
+            ELISION_REASON_BUDGET
+        } else {
+            ELISION_REASON_TOKEN_BUDGET
+        };
+        if !trim_context_output_once(payload, reason) {
+            return false;
+        }
+    }
+}
+
+pub(crate) fn trim_context_output_once(payload: &mut Value, reason: &str) -> bool {
+    let before = measure(payload);
+    if !trim_context_output_inner(payload, reason) {
+        return false;
+    }
+    mark_context_cut(payload, before);
+    true
+}
+
+pub(crate) fn mark_context_cut(payload: &mut Value, before: usize) {
+    let entry = json!({"component": "response_budget", "reason": BOUNDED_REASON, "chars_before_budget": before, "detail": "complete context output was reduced to fit its effective token or byte limit; elisions identify the withheld projections"});
+    let entries = payload
+        .as_object_mut()
+        .expect("context object")
+        .entry("degradations")
+        .or_insert_with(|| json!([]));
+    if let Some(entries) = entries.as_array_mut() {
+        if !entries
+            .iter()
+            .any(|entry| entry.get("reason").and_then(Value::as_str) == Some(BOUNDED_REASON))
+        {
+            entries.push(entry);
+        }
+    }
+}
+
+fn trim_context_output_inner(payload: &mut Value, reason: &str) -> bool {
+    if payload.get("lines").is_some() {
+        payload
+            .as_object_mut()
+            .expect("context object")
+            .remove("lines");
+        payload["lines_note"] =
+            json!("rendered lines withheld to fit the final response; structured entities remain");
+        record_elision_for(payload, "lines", 0, 1, reason);
+        return true;
+    }
+    let shape = shape_for("get_context_pack").expect("context shape");
+    let carrying = rows_carrying(payload, &shape, shape.body_keys);
+    let stripped = strip_keys_marking(payload, &shape, shape.body_keys, &[], true);
+    if stripped > 0 {
+        record_elision_for(
+            payload,
+            "body",
+            carrying.saturating_sub(stripped),
+            stripped,
+            reason,
+        );
+        payload["projection_measurement_scope"] = json!("focal and neighborhood token contributions were measured before final response projection cuts");
+        return true;
+    }
+    for key in [
+        "annotations",
+        "work_items",
+        "contracts",
+        "tests",
+        "transitive_deps",
+        "dependents",
+        "dependencies",
+        "entities",
+    ] {
+        let Some(rows) = payload.get_mut(key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let index = if key == "entities" {
+            rows.iter().rposition(|row| {
+                !matches!(
+                    row.get("section").and_then(Value::as_str),
+                    Some("focal" | "route")
+                )
+            })
+        } else {
+            rows.len().checked_sub(1)
+        };
+        let Some(index) = index else {
+            continue;
+        };
+        rows.remove(index);
+        let kept = rows.len();
+        record_elision_for(payload, key, kept, 1, reason);
+        let count = payload
+            .get(format!("{key}_withheld"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        payload[format!("{key}_withheld")] = json!(count + 1);
+        if let Some(selection) = payload.get_mut("dependency_selection") {
+            let field = if key == "dependents" {
+                "dependents_returned"
+            } else {
+                "returned"
+            };
+            if matches!(key, "dependencies" | "dependents") {
+                selection[field] = json!(kept);
+            }
+        }
+        payload["projection_measurement_scope"] = json!("focal and neighborhood contributions describe admission before final response cuts; elisions report withheld output rows");
+        return true;
+    }
+    false
+}
+
 pub fn enforce(
     payload: &mut Value,
     tool: &str,
@@ -1068,7 +1228,35 @@ pub fn enforce(
         // Solved after the ladder, which is the only thing that can change it.
         primary_rows: None,
     };
-    run_ladder(payload, tool, &shape, budget, primary, &mut accounting);
+    let original = (chars_before > budget.max_chars).then(|| payload.clone());
+    let initial_accounting = accounting.clone();
+    let mut extra_reserve = 0usize;
+    loop {
+        if extra_reserve > 0 {
+            *payload = original.as_ref().expect("overflow snapshot").clone();
+            accounting = initial_accounting.clone();
+        }
+        run_ladder(
+            payload,
+            tool,
+            &shape,
+            budget,
+            primary,
+            &mut accounting,
+            extra_reserve,
+        );
+        let after = measure(payload);
+        if after <= budget.max_chars || original.is_none() || extra_reserve == budget.max_chars {
+            break;
+        }
+        // Retry from the whole answer when the cut disclosure itself overflowed.
+        // Replaying avoids accumulating disclosures or withholding counts from
+        // unsuccessful attempts. Doubling bounds the number of retries.
+        extra_reserve = extra_reserve
+            .saturating_mul(2)
+            .max(extra_reserve.saturating_add(after - budget.max_chars))
+            .min(budget.max_chars);
+    }
     accounting.chars_after = measure(payload);
 
     // A response the ladder could not bring under its ceiling is the case
@@ -1109,6 +1297,7 @@ fn run_ladder(
     // second derivation is what would let them drift apart.
     primary: Option<&'static str>,
     accounting: &mut BudgetAccounting,
+    extra_reserve: usize,
 ) {
     let started_at = measure(payload);
     let mut cuts: Vec<String> = Vec::new();
@@ -1128,12 +1317,38 @@ fn run_ladder(
         return;
     }
 
+    compact_json_under_pressure(payload, budget);
+    if measure(payload) <= budget.max_chars {
+        return;
+    }
+
+    // Exact qualification pointers preserve the answer. Charge their disclosure
+    // before deciding whether any unique content needs to be withheld.
+    point_restated_limiting_factor(payload, budget);
+    if measure(payload) <= budget.max_chars {
+        return;
+    }
+
+    if matches!(tool, "get_context_pack" | "trace_computation")
+        && payload.get("token_budget").is_some()
+    {
+        while measure(payload) > budget.max_chars
+            && trim_context_output_once(payload, ELISION_REASON_BUDGET)
+        {
+            accounting.bounded = true;
+        }
+        return;
+    }
+
     // The reserve holds room for the disclosure the cut adds, but it can never
     // be a fixed number: at the floor of the clamp a flat 1,500 characters would
     // leave a few hundred for the answer, and the ladder would strip a response
     // down to nothing to make room for the note explaining that it had. It
     // scales with the budget instead.
-    let reserve = RESPONSE_DISCLOSURE_RESERVE_CHARS.min(budget.max_chars / 4);
+    let reserve = RESPONSE_DISCLOSURE_RESERVE_CHARS
+        .min(budget.max_chars / 4)
+        .saturating_add(extra_reserve)
+        .min(budget.max_chars);
     let target = budget.max_chars.saturating_sub(reserve);
 
     // A caller that explicitly turned compaction off still cannot be served a
@@ -1296,28 +1511,6 @@ fn run_ladder(
             break;
         }
     }
-    // Before the floor goes, the cheapest bytes in the response: the verbatim
-    // restatements of one sentence.
-    //
-    // Measured on 2026-09-02 (FIR-3107) on a `trace_data_flow` at depth, at the
-    // agent belt's 12,000-character ceiling. The part of that response the
-    // budget never trims was 9,210 characters, and roughly 7,700 of it was FOUR
-    // copies of one 1,900-character limiting-factor sentence:
-    // `_kin.verdict.limiting_factor`, `_kin.verdict.note`, `negative.advice`
-    // and `negative.trust_reason`. No rung above could reach the ceiling
-    // because the answer rows were not what was over it.
-    //
-    // This drops two of the three restatements and leaves a pointer. It never
-    // touches `limiting_factor`, which is the canonical copy every reader is
-    // sent to first, nor `trust_reason`, which is the sentence `negative`
-    // publishes in its own right. Nothing is lost: the statement survives, and
-    // the two places that repeated it now name where it lives.
-    // Applied here so the floor guard below measures the response after the
-    // pointer rather than before it, and applied AGAIN by the envelope
-    // finalizer once its loop settles, because a pass of that loop can rebuild
-    // the verdict and write the long form back over this.
-    point_restated_limiting_factor(payload, budget);
-
     // The floor of one entry per list is absolute, and a response that cannot
     // reach its ceiling with it says so rather than giving it up.
     //
@@ -1382,8 +1575,8 @@ const LIMITING_FACTOR_JOIN: &str = " Limiting factor: ";
 /// Point the restatements at the canonical sentence and say so, on a response
 /// over its ceiling. Returns how many fields were pointed.
 ///
-/// Called twice on the stdio path: once inside the ladder, so the floor rung
-/// below it measures the smaller response, and once by the envelope finalizer
+/// Called twice on the stdio path: once before the ladder withholds content,
+/// so every rung measures the smaller response, and once by the envelope finalizer
 /// after its loop settles, because that loop rebuilds the verdict and would
 /// otherwise write the long form back over the pointer. Both the rewrite and
 /// its disclosure are idempotent, so the second call is free when the first
@@ -1394,13 +1587,13 @@ pub(crate) fn point_restated_limiting_factor(
 ) -> usize {
     let pointed = shed_restated_limiting_factor(payload, budget);
     if pointed > 0 {
-        disclose_restatements_pointed(payload, pointed);
+        disclose_restatements_pointed(payload);
     }
     pointed
 }
 
 /// Replace a verbatim restatement of the limiting factor with a pointer to it,
-/// in the two fields that carry one, and only on a response over its ceiling.
+/// in the fields that carry one, only on a response over its ceiling.
 ///
 /// Returns how many fields were pointed.
 ///
@@ -1412,40 +1605,35 @@ fn shed_restated_limiting_factor(payload: &mut Value, budget: &ResponseBudget) -
     if measure(payload) <= budget.max_chars {
         return 0;
     }
-    // Each row is one field that ends by restating another, and the field it
-    // restates. `_kin.verdict.limiting_factor` and `negative.trust_reason` are
-    // both left whole: the first is the canonical sentence the server tells
-    // every reader to consult first, the second is what `negative` publishes in
-    // its own right and what the acceptance suite grades.
-    const RESTATEMENTS: [(&str, &str, &str, &str); 2] = [
+    const RESTATEMENTS: [(&str, &str, &str); 3] = [
         (
-            crate::envelope::ENVELOPE_KEY,
-            "verdict",
-            "note",
-            "limiting_factor",
+            "/_kin/verdict/note",
+            "/_kin/verdict/limiting_factor",
+            "_kin.verdict.limiting_factor",
         ),
-        (crate::negative::NEGATIVE_KEY, "", "advice", "trust_reason"),
+        (
+            "/negative/advice",
+            "/negative/trust_reason",
+            "negative.trust_reason",
+        ),
+        (
+            "/_kin/completeness/note",
+            "/_kin/verdict/limiting_factor",
+            "_kin.verdict.limiting_factor",
+        ),
     ];
     let mut pointed = 0usize;
-    for (root, section, field, canonical_field) in RESTATEMENTS {
-        fn block<'a>(value: &'a Value, root: &str, section: &str) -> Option<&'a Value> {
-            let block = value.get(root)?;
-            if section.is_empty() {
-                Some(block)
-            } else {
-                block.get(section)
-            }
-        }
-        let Some(canonical) = block(payload, root, section)
-            .and_then(|block| block.get(canonical_field))
+    for (field, canonical_field, owner) in RESTATEMENTS {
+        let Some(canonical) = payload
+            .pointer(canonical_field)
             .and_then(Value::as_str)
             .map(|text| text.trim_end_matches('.').to_string())
             .filter(|text| !text.is_empty())
         else {
             continue;
         };
-        let Some(text) = block(payload, root, section)
-            .and_then(|block| block.get(field))
+        let Some(text) = payload
+            .pointer(field)
             .and_then(Value::as_str)
             .map(str::to_string)
         else {
@@ -1454,28 +1642,17 @@ fn shed_restated_limiting_factor(payload: &mut Value, budget: &ResponseBudget) -
         let Some(at) = text.rfind(LIMITING_FACTOR_JOIN) else {
             continue;
         };
-        // Word for word, or not at all. A tail that says anything of its own is
-        // left alone, which is what keeps this from turning a field with
-        // something to say into a pointer at something else.
         if text[at + LIMITING_FACTOR_JOIN.len()..].trim_end_matches('.') != canonical {
             continue;
         }
-        let mut shortened = text[..at].to_string();
-        let owner = if section.is_empty() {
-            format!("{root}.{canonical_field}")
-        } else {
-            format!("{root}.{section}.{canonical_field}")
-        };
-        shortened.push_str(&format!("{LIMITING_FACTOR_JOIN}see `{owner}`."));
-        let target = if section.is_empty() {
-            payload.get_mut(root).and_then(|block| block.get_mut(field))
-        } else {
-            payload
-                .get_mut(root)
-                .and_then(|block| block.get_mut(section))
-                .and_then(|block| block.get_mut(field))
-        };
-        if let Some(target) = target {
+        // Preserve the original prefix and punctuation so following the pointer
+        // reconstructs the exact field, including an absent terminal full stop.
+        let punctuation = &text[text.trim_end_matches('.').len()..];
+        let shortened = format!(
+            "{}{LIMITING_FACTOR_JOIN}see `{owner}`{punctuation}",
+            &text[..at]
+        );
+        if let Some(target) = payload.pointer_mut(field) {
             *target = Value::String(shortened);
             pointed += 1;
         }
@@ -1489,16 +1666,28 @@ fn shed_restated_limiting_factor(payload: &mut Value, budget: &ResponseBudget) -
 /// reason code means answer rows were withheld and `prior_bound` reads it on
 /// the second arm to decide whether the response was bounded. Nothing was
 /// withheld here.
-fn disclose_restatements_pointed(payload: &mut Value, pointed: usize) {
+fn disclose_restatements_pointed(payload: &mut Value) {
+    let mut owners = Vec::new();
+    for (pointer, owner) in [
+        ("/_kin/verdict/note", "_kin.verdict.limiting_factor"),
+        ("/negative/advice", "negative.trust_reason"),
+        ("/_kin/completeness/note", "_kin.verdict.limiting_factor"),
+    ] {
+        if payload
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains(&format!("see `{owner}`")))
+        {
+            let owner = format!("`{owner}`");
+            if !owners.contains(&owner) {
+                owners.push(owner);
+            }
+        }
+    }
     let entry = json!({
         "component": "response_budget",
         "reason": RESTATEMENT_POINTED_REASON,
-        "detail": format!(
-            "this response was over its ceiling, so {pointed} field(s) that restated \
-             another field word for word now point at it instead. Nothing was dropped: \
-             `_kin.verdict.limiting_factor` and `negative.trust_reason` carry the statement \
-             in full, and each pointer names the field it points at"
-        ),
+        "detail": format!("Exact restatements point to unchanged {}.", owners.join(", ")),
     });
     match payload
         .get_mut("degradations")
@@ -1523,6 +1712,14 @@ pub const BOUNDED_REASON: &str = "response_bounded";
 
 /// The reason code a response that stayed over its ceiling carries.
 pub const OVER_BUDGET_REASON: &str = "response_over_budget";
+
+/// The reason code an elision carries when a whole graph-owned body was
+/// withheld before it was copied, rather than cut after.
+///
+/// The elision is written by `disclose_projection_bodies`, which derives it from
+/// the rows themselves. Nothing writes a `degradations` entry under this reason,
+/// so `prior_bound` below does not look for one.
+pub const BODY_HYDRATION_REASON: &str = "whole_body_withheld";
 
 /// What an earlier arm recorded cutting this payload from, if one did.
 ///
@@ -1688,6 +1885,11 @@ fn strip_keys_marking(
                 // it empty, and the marker beside it says who emptied it.
                 if *key == "body" {
                     map.insert((*key).to_string(), Value::Null);
+                    if map.get("projection").and_then(Value::as_str) == Some("FullBody") {
+                        map.insert("projection".into(), json!("SignatureOnly"));
+                        map.insert("projection_downgraded_from".into(), json!("FullBody"));
+                        map.insert("body_complete".into(), json!(false));
+                    }
                 }
             }
         }
@@ -1719,6 +1921,15 @@ fn strip_keys_marking(
         if let Some(map) = payload.get_mut(focal).and_then(Value::as_object_mut) {
             if strip_row(map) {
                 stripped += 1;
+            }
+        }
+    }
+    if keys.contains(&"body") && stripped > 0 {
+        if let Some(focals) = payload.get_mut("focals").and_then(Value::as_array_mut) {
+            for focal in focals {
+                if focal.get("projection").and_then(Value::as_str) == Some("full_body") {
+                    focal["projection"] = json!("header_and_signature");
+                }
             }
         }
     }
@@ -3151,6 +3362,8 @@ mod tests {
         };
         let accounting = enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
         let kept = payload["results"].as_array().unwrap().len();
+        assert!(payload["next_cursor"].is_null());
+        assert_eq!(accounting.chars_after, measure(&payload));
         assert!(
             kept < before,
             "a final page over its ceiling must still be cut: kept {kept} of {before}"
@@ -4093,6 +4306,50 @@ mod tests {
             rows.push(focal.clone());
         }
         rows
+    }
+
+    #[test]
+    fn context_body_elisions_downgrade_single_and_multi_focal_claims() {
+        for multi in [false, true] {
+            let row = json!({
+                "id": "focal", "name": "focal", "signature": "fn focal()",
+                "body": "whole body ".repeat(800), "projection": "FullBody",
+                "body_complete": true, "span_coherence": "digest_verified",
+            });
+            let mut payload = if multi {
+                json!({"entities": [row.clone()], "focals": [{"entity_id": "focal", "projection": "full_body"}]})
+            } else {
+                json!({"focal_entity": row.clone(), "dependencies": [row.clone()]})
+            };
+            let budget = ResponseBudget {
+                max_chars: 4000,
+                ..ResponseBudget::default()
+            };
+            let accounting = enforce(&mut payload, "get_context_pack", &budget).unwrap();
+            let rows = if multi {
+                vec![&payload["entities"][0]]
+            } else {
+                vec![&payload["focal_entity"], &payload["dependencies"][0]]
+            };
+            for row in rows {
+                assert!(row["body"].is_null());
+                assert_eq!(row["projection"], "SignatureOnly");
+                assert_eq!(row["projection_downgraded_from"], "FullBody");
+                assert_eq!(row["body_complete"], false);
+                assert_eq!(row["body_elided"], json!(["body"]));
+                assert_eq!(row["span_coherence"], "digest_verified");
+            }
+            if multi {
+                assert_eq!(payload["focals"][0]["projection"], "header_and_signature");
+            }
+            assert!(accounting.bounded);
+            assert_eq!(accounting.chars_after, render(&payload).unwrap().len());
+            assert!(accounting.chars_after <= budget.max_chars);
+            let mut fitting = json!({"entities": [{"body": "whole\r\n", "projection": "FullBody", "body_complete": true}]});
+            let before = fitting.clone();
+            enforce(&mut fitting, "get_context_pack", &budget).unwrap();
+            assert_eq!(fitting, before);
+        }
     }
 
     #[test]

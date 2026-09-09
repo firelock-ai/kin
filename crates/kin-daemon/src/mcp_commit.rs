@@ -3789,6 +3789,119 @@ mod tests {
         );
     }
 
+    #[test]
+    fn incomplete_mcp_replacement_preserves_verified_declarations_and_authority() {
+        let (_dir, state) = test_state();
+        let before = "int value(void) { return 1; }\nint retained(void) { return 9; }\n";
+        let partial = "int value(void) { return 2; }\n/* int retained(void) { return 9; }\n";
+        install_exact_source(&state, "test.c", before.as_bytes(), "value");
+        let base = load_native_commit_base(&state.layout).unwrap();
+        let held = base
+            .graph
+            .query_entities(&EntityFilter {
+                file_path: Some(FilePathId::new("test.c")),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(held.iter().any(|e| e.name == "retained"));
+        let indexed = kin_index::IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("test.c"),
+                partial.as_bytes(),
+                kin_blobs::digest(partial.as_bytes()),
+            )
+            .unwrap()
+            .indexed_file;
+        assert!(matches!(
+            indexed.parse_state,
+            kin_model::ParseState::Incomplete { .. }
+        ));
+        assert!(
+            !indexed.entities.iter().any(|e| e.name == "retained"),
+            "the incomplete parse must hide a declaration whose text remains"
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:test.c")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![replaced_source_file("test.c", partial)],
+            )
+            .unwrap();
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(
+            after.roots,
+            base.roots,
+            "incomplete replacement moved repository authority: {}",
+            result_text(&result)
+        );
+        assert!(semantic_workspace_matches(&after.graph, &base.graph));
+        assert!(semantic_workspace_matches(
+            state.graph.as_ref(),
+            &base.graph
+        ));
+        assert_eq!(
+            std::fs::read_to_string(state.layout.working_dir().join("test.c")).unwrap(),
+            before
+        );
+        assert_eq!(result.is_error, Some(true), "{}", result_text(&result));
+        assert!(
+            result_text(&result).contains("Incomplete parse cannot verify deletion"),
+            "{}",
+            result_text(&result)
+        );
+
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:test.c")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![replaced_source_file(
+                    "test.c",
+                    "int value(void) { return 2; }\n",
+                )],
+            )
+            .unwrap();
+        let valid = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(valid.is_error, Some(true), "{}", result_text(&valid));
+        let valid_base = load_native_commit_base(&state.layout).unwrap();
+        assert!(
+            valid_base
+                .graph
+                .query_entities(&EntityFilter {
+                    name_pattern: Some("retained".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty(),
+            "a complete parse can verify an intentional removal"
+        );
+        assert!(semantic_workspace_matches(
+            state.graph.as_ref(),
+            &valid_base.graph
+        ));
+    }
+
     /// A rewrite of a path repository authority does not track is refused by
     /// name, and told which verb admits one.
     ///
