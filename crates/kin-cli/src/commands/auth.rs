@@ -1040,6 +1040,113 @@ mod tests {
         );
     }
 
+    fn read_logout_request(connection: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {
+        connection.set_nonblocking(false)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        read_logout_headers(|buffer| {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+            connection.set_read_timeout(Some(remaining))?;
+            connection.read(buffer)
+        })
+    }
+
+    fn read_logout_headers(
+        mut read_chunk: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut buffer = [0; 4096];
+        let mut used = 0;
+        loop {
+            if used == buffer.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "logout request headers exceed the fixture limit",
+                ));
+            }
+            let read = match read_chunk(&mut buffer[used..]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if read == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            used += read;
+            if buffer[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                return Ok(buffer[..used].to_vec());
+            }
+        }
+    }
+
+    #[test]
+    fn logout_mock_waits_for_request_on_nonblocking_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut connection, _) = listener.accept().unwrap();
+        connection.set_nonblocking(true).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            request_tx
+                .send(read_logout_request(&mut connection))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            matches!(
+                request_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the reader must wait for bytes on an accepted nonblocking socket"
+        );
+        let expected =
+            b"POST /api/cli/auth/logout HTTP/1.1\r\nAuthorization: Bearer not-a-real-token\r\n\r\n";
+        client.write_all(expected).unwrap();
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(request.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn logout_mock_collects_fragmented_headers() {
+        let fragments: [&[u8]; 2] = [
+            b"POST /api/cli/auth/logout HTTP/1.1\r\nAuthorization: Bearer ",
+            b"not-a-real-token\r\n\r\n",
+        ];
+        let mut chunks = fragments.into_iter();
+        let request = read_logout_headers(|buffer| {
+            let chunk = chunks.next().unwrap_or_default();
+            buffer[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        })
+        .unwrap();
+        assert_eq!(request, fragments.concat());
+    }
+
+    #[test]
+    fn logout_mock_rejects_incomplete_and_oversized_headers() {
+        for (request, expected) in [
+            (
+                b"POST /api/cli/auth/logout HTTP/1.1\r\n".to_vec(),
+                std::io::ErrorKind::UnexpectedEof,
+            ),
+            (vec![b'x'; 4096], std::io::ErrorKind::InvalidData),
+        ] {
+            let mut reader = std::io::Cursor::new(request);
+            assert_eq!(
+                read_logout_headers(|buffer| reader.read(buffer))
+                    .unwrap_err()
+                    .kind(),
+                expected
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn logout_revokes_on_allowed_transport_and_removes_local_credentials() {
@@ -1064,12 +1171,8 @@ mod tests {
                     Err(error) => panic!("expected revocation request: {error}"),
                 }
             };
-            connection
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut buffer = [0; 4096];
-            let n = connection.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
+            let request = read_logout_request(&mut connection).unwrap();
+            let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
             assert!(request.starts_with("post /api/cli/auth/logout "));
             assert!(request.contains("authorization: bearer not-a-real-token"));
             connection
