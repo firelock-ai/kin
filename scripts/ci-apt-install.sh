@@ -40,6 +40,28 @@ drop_azure_mirror() {
   fi
 }
 
+# The runner image preinstalls a Google Chrome apt source this script never needs, and it can
+# ship as either sources.list.d/google-chrome.list (classic one-line form) or
+# google-chrome.sources (DEB822);
+# drop_azure_mirror below already treats both extensions as live on this runner fleet. When
+# dl.google.com regenerates its Release file mid-fetch, every mirror serves a stale,
+# hash-mismatched Packages.gz through whichever form is present, and no attempt or mirror swap
+# below clears it, so match and drop it by content once before the first update. A hardcoded
+# filename here (tried first, and it did not clear a live failure on kin#1651's own run) is a
+# guess about which form the image ships; matching content is not.
+chrome_matches=$(grep -l 'dl\.google\.com' /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true)
+if [ -n "$chrome_matches" ]; then
+  echo "dropping the Chrome apt source(s), matched by content:" >&2
+  printf '%s\n' "$chrome_matches" >&2
+  printf '%s\n' "$chrome_matches" | xargs -r sudo rm -f
+  echo "sources.list.d after removal:" >&2
+  ls -la /etc/apt/sources.list.d/ >&2
+else
+  echo "no sources.list.d/sources.list file matched dl.google.com by content; listing what is there so the next attempt starts from a fact, not a guess:" >&2
+  ls -la /etc/apt/sources.list.d/ >&2
+  grep -r 'dl\.google\.com' /etc/apt >&2 2>/dev/null || echo "grep -r dl.google.com /etc/apt found nothing" >&2
+fi
+
 for attempt in 1 2 3; do
   if [ "$attempt" -ge 2 ]; then
     echo "apt attempt $attempt: dropping the azure mirror in favour of archive.ubuntu.com" >&2
