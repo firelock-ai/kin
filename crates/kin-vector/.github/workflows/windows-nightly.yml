@@ -50,8 +50,8 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
+      - name: Restore cargo registry and build cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -81,3 +81,18 @@ jobs:
       - name: Check the nightly Windows job still runs these steps
         if: runner.os == 'Linux'
         run: ./scripts/check-windows-nightly-parity.sh
+
+      # Actions caches are scoped to the ref that saved them, so only main's
+      # cache is readable from every other ref. Every PR and merge-queue leg
+      # saving into its own private scope is what pushed this repo's cache
+      # past the 10 GB repo-wide cap and evicted main's own cache. Save only
+      # from main; every other ref just restores what main already saved.
+      - name: Save cargo registry and build cache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
