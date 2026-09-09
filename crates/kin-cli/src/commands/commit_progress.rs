@@ -20,6 +20,8 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use super::byte_fmt::human_bytes;
+
 /// One phase line lifted out of the daemon log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhaseLine {
@@ -195,16 +197,6 @@ pub fn daemon_death_explanation(kin_root: &Path) -> Option<String> {
 /// loses a little time, while one that really was killed at 92% and is told
 /// nothing sends its user back to reading a socket error.
 const NEAR_CEILING_FRACTION: f64 = 0.90;
-
-fn human_bytes(bytes: u64) -> String {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const MIB: u64 = 1024 * 1024;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else {
-        format!("{} MiB", bytes / MIB)
-    }
-}
 
 /// What the daemon's own abandoned marker says about how the commit ended.
 ///

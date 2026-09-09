@@ -15,6 +15,7 @@ pub mod bench;
 pub mod bench_meta;
 pub mod blame;
 pub mod branch;
+mod byte_fmt;
 pub mod cache;
 pub mod capabilities;
 pub mod checkout;
