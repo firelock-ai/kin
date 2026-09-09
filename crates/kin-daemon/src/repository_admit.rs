@@ -198,12 +198,41 @@ pub(crate) async fn execute(state: &Arc<DaemonState>) -> Result<AdmitResponse> {
     }
 }
 
+/// The watcher loss this pass is entitled to clear, captured before it runs.
+///
+/// Two rules, and both of them are about a pass clearing a loss it never
+/// covered.
+///
+/// Captured BEFORE the seam, because the pass observes the working copy when it
+/// starts. A loss signal that arrives while it runs stands for writes its tree
+/// observation may never have reached, so reading the record afterwards would
+/// clear a loss nothing recovered.
+///
+/// And nothing at all when the seam will walk nothing.
+/// `sync_filesystem_with_graph` returns `Ok(())` on two conditions without
+/// touching the working copy, filesystem reconcile disabled and a bare Git
+/// repository, so a pass over either reports a clean success having looked at
+/// no file. Both endpoints that reach this module refuse those conditions ahead
+/// of the pass, and that is exactly why this does not depend on them: a
+/// recovery that leaned on a caller's guard would be one refactor away from
+/// healing a blind store. The predicates are the seam's own rather than a copy,
+/// so the two cannot drift apart.
+fn watcher_loss_this_pass_can_cover(state: &DaemonState) -> crate::watcher_loss::RecoveryCapture {
+    if state.filesystem_reconcile_disabled()
+        || crate::loop_runner::is_bare_repository(state.layout.working_dir())
+    {
+        return crate::watcher_loss::RecoveryCapture::Clean;
+    }
+    crate::watcher_loss::capture(&state.layout)
+}
+
 async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
     let repository_id =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?
             .repository_id()
             .clone();
     let before = census(state);
+    let watcher_loss = watcher_loss_this_pass_can_cover(state);
 
     // The same seam `/commands/commit` calls. It takes the coordination gate
     // itself, so this must not already hold it.
@@ -257,7 +286,23 @@ async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
     // freshness this marker exists to prevent, reached by the other door.
     if failure.is_none() {
         crate::background_work::record_durable_admission(&state.layout, after.tracked as u64);
+        // The only path in the product that clears a watcher loss, and
+        // deliberately not the line above it. The ambient watch tick reaches
+        // `record_durable_admission` too, and an ambient tick admits what the
+        // watcher told it about, which for a loss that named no path is nothing
+        // at all. Putting the clear there would let every 100ms tick heal a gap
+        // no tick ever observed. This module is the explicit request, which is
+        // what the contract requires: fail loud, and let a person or an agent
+        // decide to admit.
+        crate::watcher_loss::record_recovery(&state.layout, watcher_loss);
     }
+    // Refreshed whatever the outcome, and before the report below reads the
+    // reconcile surface, so `kin admit` answers with the state its own pass
+    // left rather than the state it found.
+    probes.record_watcher_loss(crate::watcher_loss::standing(
+        &state.layout,
+        state.layout.working_dir(),
+    ));
 
     let embeddings = state.graph.embedding_status();
     let report = AdmitReport {
@@ -306,5 +351,157 @@ fn annotate_admission_failure(cause: String) -> String {
         )
     } else {
         cause
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::watcher_loss::{self, RecoveryCapture};
+
+    fn open_test_state(repo: &tempfile::TempDir) -> Arc<DaemonState> {
+        let init = kin_core::init(repo.path()).unwrap();
+        Arc::new(DaemonState::open(init.layout).unwrap())
+    }
+
+    /// The founder's contract in one test: rescan loss fails loud, and only an
+    /// explicit `kin admit` clears it.
+    ///
+    /// The bounded half is driven through the SAME seam and the SAME success
+    /// bookkeeping the watch loop runs, `sync_filesystem_with_graph` followed by
+    /// `record_admission_success` and `record_durable_admission`, because that
+    /// is where a clearing call would most naturally be put and where it must
+    /// not be. Both paths reach that bookkeeping; only this module is the
+    /// explicit one.
+    #[tokio::test]
+    async fn only_an_explicit_full_admission_clears_a_watcher_loss() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            state.layout.working_dir().join("admitted.rs"),
+            "pub fn admitted() -> u8 {\n    7\n}\n",
+        )
+        .unwrap();
+
+        watcher_loss::record_loss(&state.layout, 1, Some("rescan: kernel dropped"));
+        assert!(
+            watcher_loss::read(&state.layout).recovery_required(),
+            "the fixture must start with a loss standing, or neither half below can fail"
+        );
+
+        // One ambient reconcile round, ending exactly as the loop's own
+        // successful tick ends.
+        crate::loop_runner::sync_filesystem_with_graph(&state)
+            .await
+            .expect("the ambient seam admits the fixture");
+        let now = Instant::now();
+        state
+            .background_work
+            .reconcile()
+            .record_admission_success(now);
+        crate::background_work::record_durable_admission(
+            &state.layout,
+            state.graph.resolved_tree().len() as u64,
+        );
+
+        assert!(
+            watcher_loss::read(&state.layout).recovery_required(),
+            "an ordinary bounded watch tick must not clear a watcher loss"
+        );
+
+        let response = execute(&state).await.expect("the pass reported an outcome");
+        let report = response.report.expect("a reported pass carries its report");
+        assert!(report.admitted, "{:?}", report.failure);
+
+        assert!(
+            !watcher_loss::read(&state.layout).recovery_required(),
+            "a completed explicit admission clears the generation it covered"
+        );
+    }
+
+    /// A pass that FAILED clears nothing. Clearing before the outcome is known
+    /// would report a recovered store on the one path where no recovery
+    /// happened.
+    ///
+    /// The failure is the mass-deletion guard, which refuses a walk that removes
+    /// more than three quarters of a baseline of at least sixteen files. It is
+    /// used here because it fails the seam itself rather than a layer above it,
+    /// which is the shape a real refused recovery has.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_pass_leaves_the_loss_standing() {
+        let repo = tempfile::tempdir().unwrap();
+        for index in 0..20 {
+            std::fs::write(
+                repo.path().join(format!("member{index}.txt")),
+                format!("admitted {index}\n"),
+            )
+            .unwrap();
+        }
+        let state = open_test_state(&repo);
+        crate::loop_runner::sync_filesystem_with_graph(&state)
+            .await
+            .expect("the fixture admits its twenty members");
+
+        for index in 0..20 {
+            std::fs::remove_file(repo.path().join(format!("member{index}.txt"))).unwrap();
+        }
+        watcher_loss::record_loss(&state.layout, 1, None);
+
+        let response = execute(&state).await.expect("the pass reported an outcome");
+        let report = response.report.expect("a reported pass carries its report");
+        assert!(
+            !report.admitted,
+            "the fixture must actually fail the pass, or this asserts nothing"
+        );
+
+        assert!(
+            watcher_loss::read(&state.layout).recovery_required(),
+            "a pass that did not succeed must leave the loss standing"
+        );
+    }
+
+    /// A pass over a store the admission seam will not walk clears nothing.
+    ///
+    /// `sync_filesystem_with_graph` returns `Ok(())` without touching the
+    /// working copy when filesystem reconcile is disabled, so the pass reports a
+    /// clean success having observed no file at all. A recovery keyed only on
+    /// that success would heal a blind store from a pass that never looked.
+    #[tokio::test]
+    async fn a_pass_whose_seam_walks_nothing_clears_nothing() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            state.layout.working_dir().join("unseen.rs"),
+            "pub fn unseen() {}\n",
+        )
+        .unwrap();
+        state
+            .filesystem_reconcile_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        watcher_loss::record_loss(&state.layout, 1, None);
+        assert_eq!(
+            watcher_loss_this_pass_can_cover(&state),
+            RecoveryCapture::Clean,
+            "a seam that will walk nothing covers nothing"
+        );
+
+        let response = execute(&state).await.expect("the pass reported an outcome");
+        let report = response.report.expect("a reported pass carries its report");
+        assert!(
+            report.admitted,
+            "the seam skips silently, so the pass still reports success: {:?}",
+            report.failure
+        );
+        assert_eq!(
+            report.tracked_after, 0,
+            "the fixture must exercise a pass that observed nothing"
+        );
+
+        assert!(
+            watcher_loss::read(&state.layout).recovery_required(),
+            "a pass that observed no file must not clear a watcher loss"
+        );
     }
 }

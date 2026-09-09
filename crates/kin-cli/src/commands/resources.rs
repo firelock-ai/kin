@@ -435,6 +435,10 @@ pub struct ReconcileHealth {
     /// accepted, and only a restart clears it. Absent on every other daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_tree_wedge: Option<DeferredTreeWedge>,
+    /// The filesystem watcher told this daemon it lost events, and no complete
+    /// admission has covered that loss yet. Absent on every other daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watcher_loss: Option<WatcherLossState>,
 }
 
 /// The background-work supervisor's account of a parked reconciliation loop.
@@ -500,6 +504,39 @@ pub struct DeferredTreeWedge {
     pub at: Option<String>,
 }
 
+/// A watcher-reported loss of events that no complete admission has covered.
+///
+/// The backends report lost events without naming a single path: notify emits a
+/// pathless `EventKind::Other` carrying its `Rescan` flag, from inotify on
+/// kernel queue overflow and from FSEvents on `MUST_SCAN_SUBDIRS`. So no
+/// per-path recovery can be derived from it, and no ambient tick can close it:
+/// the loop admits what it was told about, and it was told nothing.
+///
+/// Reported rather than counted for the same reason every other field here is.
+/// A store that lost a subtree kept answering that it had no issues, because the
+/// only surface the signal ever reached was a probe that withheld a readiness
+/// acknowledgment.
+///
+/// Withdrawn only by a completed complete-exact-tree admission that covered the
+/// generation standing when it began. An ordinary watch tick never withdraws it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatcherLossState {
+    /// Every loss signal this store has been told about, durably and across
+    /// daemon lives.
+    #[serde(default)]
+    pub generation: u64,
+    /// The highest generation a completed full admission covered.
+    #[serde(default)]
+    pub recovered_through: u64,
+    /// Wall-clock time of the newest loss, RFC 3339. Absent when the durable
+    /// record could not be read, which is itself a reported state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// The whole disclosure, verbatim, so one producer states this on every
+    /// surface rather than three renderers composing three sentences.
+    pub disclosure: String,
+}
+
 impl ReconcileHealth {
     /// Every reason this reconcile state is degraded, worst first, empty when
     /// it is not.
@@ -543,6 +580,15 @@ impl ReconcileHealth {
                  threshold {}s)",
                 parked.reason, parked.progress, parked.stall_threshold_seconds
             ));
+        }
+        // Above the counters below because it is the only fault here that no
+        // counter can see. Every reading under this one is about work the loop
+        // attempted; this is about work it was never told existed, so a store
+        // carrying it can report a clean streak, an empty backlog and no skipped
+        // events while an unknown region of the working copy is missing from the
+        // graph entirely.
+        if let Some(loss) = &self.watcher_loss {
+            reasons.push(loss.disclosure.clone());
         }
         if self.admission_failure_streak >= ADMISSION_FAILURE_STREAK_ATTENTION {
             let since = match self.last_admission_success_age_seconds {

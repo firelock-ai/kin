@@ -245,6 +245,12 @@ impl Verdict {
             negative.get("interpretation").and_then(Value::as_str) != Some("qualified_answer")
         });
         let readings = [
+            // First, because it is the only input here that says the SUBSTRATE
+            // was fed incompletely. Every other reading below is about what this
+            // answer could see in graph truth; this one says graph truth itself
+            // is missing an unknown set of paths, which is the fact that
+            // qualifies all of them.
+            ("watcher_loss", watcher_loss_reading(envelope)),
             (
                 "absence_gate",
                 absence_gate_reading(tool, payload, negative),
@@ -834,6 +840,35 @@ fn degradations_reading(payload: &Value) -> Reading {
 /// staleness separate and the clock becomes a real input too. Until then,
 /// silence is the only honest reading of it, and a silent input never
 /// contributes agreement, so nothing there can license an answer either.
+/// A watcher-reported loss of events as a verdict input.
+///
+/// The one reading here that rests on a positive observation of missing input
+/// rather than on an inference from an absence, which is why it refuses where
+/// the admission clock beside it stays silent. The watcher's backend said it
+/// dropped events and named no path, so the graph is missing an unknown set of
+/// them and no absence over this store can be authoritative until a complete
+/// exact-tree admission runs.
+///
+/// The consequence is deliberate and worth stating plainly: every answer over
+/// an affected store reads `inconclusive` until someone runs `kin admit`. That
+/// is the founder's contract for this class, fail loud plus an explicit
+/// admission, and the alternative is the silent healthy read this whole module
+/// exists to stop. It is bounded in exactly the way a permanent floor would not
+/// be: the record clears, so the verdict returns.
+///
+/// Silent when nothing stands. The producer omits the block entirely on a store
+/// that owes no recovery, and a silent input never contributes agreement, so
+/// this can never license an answer either.
+fn watcher_loss_reading(envelope: &Envelope) -> Reading {
+    match envelope.watcher_loss.as_ref() {
+        // Taken from the observation rather than written again here, so the
+        // sentence the daemon publishes and the one the verdict refuses with
+        // cannot drift apart.
+        Some(loss) => Reading::Inconclusive(vec![loss.limiting_factor()]),
+        None => Reading::Silent,
+    }
+}
+
 fn graph_freshness_reading(envelope: &Envelope) -> Reading {
     match envelope.freshness.as_ref() {
         // The clause is taken from the type rather than written again here, so
@@ -1162,6 +1197,149 @@ mod tests {
     /// field names, and both are `skip_serializing_if = "Option::is_none"`
     /// there, which is why the no-clock arm omits the key rather than setting it
     /// null.
+    /// Fail loud on the agent-facing surface, and stop being loud once the
+    /// recovery has happened.
+    ///
+    /// Three arms because two of them would prove nothing. `inconclusive` on a
+    /// lossy store means nothing without the healthy control that certifies on
+    /// the same payload, and neither means anything without the settled arm,
+    /// which is what stops this being a permanent floor over every store that
+    /// ever dropped an event.
+    ///
+    /// The fixtures spell the wire shape by hand because this crate does not
+    /// depend on the producer's. The producer is
+    /// `kin_cli::commands::resources::WatcherLossState`, written by the daemon's
+    /// `watcher_loss::standing`, and the daemon-side test that grades the pair
+    /// is `repository_admit::tests::only_an_explicit_full_admission_clears_a_watcher_loss`.
+    mod watcher_loss {
+        use super::*;
+
+        fn envelope_with(watcher_loss: Option<Value>) -> Envelope {
+            let mut reconcile = json!({
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
+                "last_admission_success_at": "2026-09-09T00:00:00Z",
+                "last_admission_success_age_seconds": 12,
+            });
+            if let Some(loss) = watcher_loss {
+                reconcile["watcher_loss"] = loss;
+            }
+            Envelope::daemon().with_health(&json!({
+                "graph_loaded": true,
+                "initialized": true,
+                "reconcile": reconcile,
+            }))
+        }
+
+        fn standing_loss() -> Value {
+            json!({
+                "generation": 2,
+                "recovered_through": 0,
+                "at": "2026-09-09T06:00:00Z",
+                "disclosure": "the filesystem watcher lost events (loss generation 2, recovered \
+                               through 0)",
+            })
+        }
+
+        /// The control. Without it, `inconclusive` below could come from
+        /// anything on this fixture and would say nothing about the loss.
+        #[test]
+        fn a_store_with_no_watcher_loss_certifies_on_the_same_payload() {
+            let envelope = envelope_with(None);
+            assert!(
+                envelope.watcher_loss.is_none(),
+                "the control fixture must carry no loss: {:?}",
+                envelope.watcher_loss
+            );
+            assert!(matches!(watcher_loss_reading(&envelope), Reading::Silent));
+
+            let verdict = Verdict::compute(
+                "find_references",
+                &populated_reference_payload("present"),
+                &envelope,
+                None,
+            )
+            .expect("the readings are not all silent");
+            assert!(
+                verdict.certified,
+                "the control must certify, or the arm below proves nothing: {:?}",
+                verdict.limiting_factor
+            );
+        }
+
+        /// A store whose watcher lost events answers inconclusive, and the
+        /// reader is told the generation and the one command that clears it.
+        #[test]
+        fn a_standing_loss_refuses_the_verdict_and_names_the_recovery() {
+            let envelope = envelope_with(Some(standing_loss()));
+            let observed = envelope
+                .watcher_loss
+                .as_ref()
+                .expect("a standing loss is read off the wire");
+            assert_eq!(observed.generation, 2);
+            assert_eq!(observed.recovered_through, 0);
+
+            let verdict = Verdict::compute(
+                "find_references",
+                &populated_reference_payload("present"),
+                &envelope,
+                None,
+            )
+            .expect("the readings are not all silent")
+            .to_value();
+
+            assert_eq!(verdict["state"], json!(INCONCLUSIVE), "{verdict}");
+            assert_eq!(
+                verdict["inputs"]["watcher_loss"],
+                json!(INCONCLUSIVE),
+                "{verdict}"
+            );
+            let factor = verdict["limiting_factor"]
+                .as_str()
+                .expect("a refusing verdict names its factor");
+            assert!(
+                factor.contains("watcher_events_lost:"),
+                "the clause is labelled so it survives composition: {factor}"
+            );
+            assert!(
+                factor.contains("generation 2"),
+                "the factor carries the generation: {factor}"
+            );
+            assert!(
+                factor.contains("kin admit"),
+                "a reader told only that this is inconclusive has nothing to do: {factor}"
+            );
+        }
+
+        /// The bound on all of it. A record a completed full admission covered
+        /// stops refusing, so this is a state a store leaves rather than a floor
+        /// it lives under.
+        #[test]
+        fn a_record_a_full_admission_covered_stops_refusing() {
+            let mut settled = standing_loss();
+            settled["recovered_through"] = json!(2);
+            let envelope = envelope_with(Some(settled));
+
+            assert!(
+                envelope.watcher_loss.is_none(),
+                "a covered generation is not a standing loss: {:?}",
+                envelope.watcher_loss
+            );
+            let verdict = Verdict::compute(
+                "find_references",
+                &populated_reference_payload("present"),
+                &envelope,
+                None,
+            )
+            .expect("the readings are not all silent");
+            assert!(
+                verdict.certified,
+                "the verdict returns once the recovery has happened: {:?}",
+                verdict.limiting_factor
+            );
+        }
+    }
+
     mod graph_freshness {
         use super::*;
 
