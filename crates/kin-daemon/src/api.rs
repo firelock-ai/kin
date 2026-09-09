@@ -12577,6 +12577,7 @@ where
 }
 
 fn repo_scoped_mcp_error(repo_id: &str, failure: RepoScopedMcpFailure) -> Response {
+    let refusal_code = failure.code;
     let mut response = (
         failure.status,
         Json(RepoScopedMcpErrorResponse {
@@ -12594,6 +12595,10 @@ fn repo_scoped_mcp_error(repo_id: &str, failure: RepoScopedMcpFailure) -> Respon
     response.headers_mut().insert(
         HeaderName::from_static("x-kin-semantic-capability"),
         HeaderValue::from_static(REPO_SCOPED_SEMANTIC_CAPABILITY),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-kin-semantic-refusal"),
+        HeaderValue::from_static(refusal_code),
     );
     response
 }
@@ -13271,6 +13276,7 @@ fn bind_repo_semantic_cursor(
 
 fn repo_scoped_handler_failure(error: kin_mcp::McpError) -> RepoScopedMcpFailure {
     let (status, code, retryable) = match &error {
+        kin_mcp::McpError::EntityNotFound(_) => (StatusCode::NOT_FOUND, "entity_not_found", false),
         kin_mcp::McpError::InvalidParams(_)
         | kin_mcp::McpError::WorkspaceAbsent(_)
         | kin_mcp::McpError::ToolNotFound(_)
@@ -25310,15 +25316,37 @@ mod tests {
         // one of them is the envelope this endpoint publishes, and a caller
         // that has to parse a success to learn it was refused is the shape the
         // typed error schema exists to replace.
+        assert_eq!(status, StatusCode::NOT_FOUND, "{wrong_repository_entity}");
         assert_eq!(
-            status,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "{wrong_repository_entity}"
-        );
-        assert_eq!(
-            wrong_repository_entity["error"]["code"], "invalid_semantic_tool_call",
+            wrong_repository_entity["error"]["code"], "entity_not_found",
             "an entity from repository A must not resolve through repository B: {wrong_repository_entity}"
         );
+        assert_eq!(wrong_repository_entity["error"]["retryable"], false);
+        let missing_id = Uuid::new_v4().to_string();
+        let (status, headers, missing) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_b,
+            "get_context_pack",
+            json!({ "entity_id": missing_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+        assert_eq!(missing["error"]["code"], "entity_not_found");
+        assert_eq!(missing["error"]["retryable"], false);
+        assert_eq!(headers["x-kin-semantic-refusal"], "entity_not_found");
+
+        let (status, _, malformed) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_b,
+            "get_context_pack",
+            json!({ "entity_id": "not-a-uuid" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{malformed}");
+        assert_eq!(malformed["error"]["code"], "invalid_semantic_tool_call");
+
         // The load-bearing half, unchanged: whatever shape the refusal takes,
         // no byte of repository A's source may travel in it.
         assert!(

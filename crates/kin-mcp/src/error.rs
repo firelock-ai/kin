@@ -18,6 +18,9 @@ pub enum McpError {
     #[error("context error: {0}")]
     Context(String),
 
+    #[error("entity not found: {0}")]
+    EntityNotFound(String),
+
     /// An entity's recorded source path does not exist at the workspace's
     /// current generation.
     ///
@@ -96,6 +99,15 @@ impl McpError {
             McpError::Json(_) => -32700,          // Parse error
             McpError::Protocol(_) => -32600,      // Invalid request / transport
             _ => -32603,                          // Internal error
+        }
+    }
+}
+
+impl From<kin_context::ContextError> for McpError {
+    fn from(error: kin_context::ContextError) -> Self {
+        match error {
+            kin_context::ContextError::EntityNotFound(id) => Self::EntityNotFound(id),
+            other => Self::Context(other.to_string()),
         }
     }
 }

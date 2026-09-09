@@ -908,7 +908,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
 
     let (traffic_pack, _) =
         build_context_pack_with_traffic_and_provenance(store, &entity_id, &opts, &nearby_intents)
-            .map_err(|e| McpError::Context(e.to_string()))?;
+            .map_err(McpError::from)?;
     let held = HeldSourceAuthority::new(store, repository_authority);
     let fields = ContextSourceFields::default();
     let mut provider = ContextSourceProvider {
@@ -948,7 +948,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
             Ok(kin_context::estimate_tokens(&json))
         },
     )
-    .map_err(|error| McpError::Context(error.to_string()))?;
+    .map_err(McpError::from)?;
     let mut result = render.render(&pack, &selection, &projections, &fields)?;
     Ok(ToolCallResult::text(serialize_with_measured_tokens(
         &mut result,
@@ -1608,7 +1608,7 @@ fn multi_focal_pack_result<G: GraphStore>(
             Ok(kin_context::estimate_tokens(&json))
         },
     )
-    .map_err(|error| McpError::Context(error.to_string()))?;
+    .map_err(McpError::from)?;
     let mut result =
         render_multi_context(store, &pack, report, &unresolved, &fields, &projections)?;
     Ok(Some(ToolCallResult::text(serialize_with_measured_tokens(
