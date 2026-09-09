@@ -3099,6 +3099,7 @@ mod tests {
             .snapshot()
             .changes
             .change_ids()
+            .unwrap()
             .into_iter()
             .map(|id| id.to_string())
             .collect::<Vec<_>>();
