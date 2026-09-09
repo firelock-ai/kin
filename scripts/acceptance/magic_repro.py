@@ -2793,6 +2793,94 @@ def check_15(suite):
 # that answers an absence question (crates/kin-cli/src/commands/absence_qualifier.rs).
 CANNOT_RULE_OUT = re.compile(r"Kin cannot rule out ", re.I)
 
+# The one enrichment gap that belongs to the HOST rather than to the build.
+# `crates/kin-mcp/src/verdict.rs` publishes this sentence when an adapter IS
+# wired for the language and no server for it is installed here, and the
+# neighbouring `reference_enrichment_unsupported:` when the build wires no
+# adapter at all. Only the first is an environment fact; the second would be a
+# real regression if it appeared for a language Kin ships an adapter for.
+#
+# The `edge_coverage:` label cannot be the key, because
+# `crates/kin-mcp/src/negative.rs` pushes one string,
+# `edge_coverage:reference_enrichment_unsupported`, for BOTH states. That label
+# is all the CLI carries, so the MCP verdict is what tells the two apart and
+# the CLI is only asked to agree that its refusal is the same class.
+NO_LANGUAGE_SERVER = "reference_enrichment_no_language_server"
+ENRICHMENT_CLASS = "reference_enrichment_unsupported"
+
+
+def host_lacks_reference_enrichment(payload, cli_text):
+    """Both surfaces name THIS HOST's missing language server, in agreement.
+
+    Returns the verdict's own sentence, so a caller quotes a reason it read
+    rather than one it composed, or None. Both surfaces are required: half of
+    this is the surface disagreement FIR-2524 exists to catch, and must stay a
+    failure rather than become an excuse.
+    """
+    verdict = (payload.get("_kin") or {}).get("verdict") or {}
+    negative = payload.get("negative") or {}
+    limiting = str(verdict.get("limiting_factor") or "")
+    trust = str(negative.get("trust_reason") or "")
+    if NO_LANGUAGE_SERVER not in limiting and NO_LANGUAGE_SERVER not in trust:
+        return None
+    if not CANNOT_RULE_OUT.search(cli_text) or ENRICHMENT_CLASS not in cli_text:
+        return None
+    return limiting or trust
+
+
+def certification_arm_reading(payload, cli):
+    """Read the healthy empty control's two surfaces: (status, detail).
+
+    Every condition that gated a PASS still gates one, and the conditions are
+    unchanged. What changed is the two ways the arm used to lie about a
+    non-pass, both of which it told on 2026-09-09 while three Release Cut runs
+    failed on a correct answer.
+
+    It reported "did not certify plainly on both surfaces" whichever condition
+    tripped, which reads as a disagreement between the surfaces. There was
+    none: both refused, together, for the same reason. So a failure now names
+    the conditions that actually tripped.
+
+    And it reported FAIL on a host that could never have produced the edge the
+    arm asks about, because no language server for the fixture's language was
+    installed on it. Refusing to certify there is Kin answering correctly. An
+    arm whose own premise the host cannot satisfy was not graded, so it reads
+    UNREADABLE, which still stops a release cut and no longer blames the
+    product for the runner. The gap branch demands that everything else about
+    the answer be right and that BOTH surfaces refuse in agreement, so the only
+    difference between it and a PASS is the shared qualifier.
+    """
+    stdout = cli.get("stdout") or ""
+    text = stdout + (cli.get("stderr") or "")
+    certified = (payload.get("negative") or {}).get("safe_to_conclude_absent")
+    named_absence = "No incoming Calls relations." in stdout
+    qualifier = CANNOT_RULE_OUT.search(text)
+
+    tripped = []
+    if certified is not True:
+        tripped.append("MCP negative.safe_to_conclude_absent is %s, not true"
+                       % json.dumps(certified))
+    if cli.get("exit_code") != 0:
+        tripped.append("the CLI exited %s" % json.dumps(cli.get("exit_code")))
+    if not named_absence:
+        tripped.append('the CLI never printed "No incoming Calls relations."')
+    if qualifier:
+        tripped.append("the CLI qualified the answer: %s"
+                       % text[qualifier.start():qualifier.start() + 160].strip())
+    if not tripped:
+        return PASS, "healthy isolated empty control certifies plainly on both surfaces"
+
+    gap = host_lacks_reference_enrichment(payload, text)
+    if (gap and certified is False and qualifier
+            and cli.get("exit_code") == 0 and named_absence):
+        return UNREADABLE, (
+            "this host cannot satisfy the arm's own premise, so the arm was not graded: both "
+            "surfaces refuse the absence in agreement and the verdict says %s. Install a "
+            "language server for the fixture's language on this runner "
+            "(scripts/ci-install-language-servers.sh) and the arm grades again." % gap)
+    return FAIL, ("healthy isolated empty control did not certify plainly on both surfaces: %s"
+                  % "; ".join(tripped))
+
 
 def check_16(suite):
     """FIR-2524 rung three: the CLI must carry the verdict MCP publishes, on the
@@ -2934,13 +3022,8 @@ def check_16(suite):
     before, receipt = paired_probe()
     if resolution_miss(before, focal) or before.get("references"):
         res.bad("isolated empty control did not resolve an unreferenced focal")
-    elif ((before.get("negative") or {}).get("safe_to_conclude_absent") is not True
-          or receipt["cli"]["exit_code"] != 0
-          or "No incoming Calls relations." not in receipt["cli"]["stdout"]
-          or CANNOT_RULE_OUT.search(receipt["cli"]["stdout"] + receipt["cli"]["stderr"])):
-        res.bad("healthy isolated empty control did not certify plainly on both surfaces")
     else:
-        res.ok("healthy isolated empty control certifies plainly on both surfaces")
+        res.add(*certification_arm_reading(before, receipt["cli"]))
     res.asserts[-1]["receipt"] = receipt
     if res.asserts[-1]["status"] != PASS:
         return res
