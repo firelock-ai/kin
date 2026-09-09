@@ -477,6 +477,60 @@ jobs:
           mkdir -p "$RUNNER_TEMP/leg"
           cp "$record" "$RUNNER_TEMP/leg/preflight.json"
 
+      # The leg's receipts, not just its verdict. A published record
+      # (kin.release-preflight.leg.v1) keeps only {id, ticket, status, detail}
+      # per magic-repro check, and a failing leg publishes no record at all, so
+      # a failing check's own evidence lived on the runner's temp disk and died
+      # with it. On 2026-09-09 three cuts failed naming "16/FIR-2524 FAIL:
+      # healthy isolated empty control did not certify plainly on both
+      # surfaces" and nobody could say which surface disagreed, because the MCP
+      # payload and CLI stdout that check stores in its own receipt were never
+      # uploaded. `repro.json` carries them under results[].asserts[].receipt.
+      # `always()`, because a failing leg is the one whose receipts are wanted.
+      - name: Preserve this leg's preflight receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: kin-preflight-receipts-${{ matrix.artifact }}
+          path: |
+            ${{ runner.temp }}/kpf/preflight.log
+            ${{ runner.temp }}/kpf/preflight.json
+            ${{ runner.temp }}/kpf/legs/*/repro.json
+            ${{ runner.temp }}/kpf/legs/*/repro.log
+            ${{ runner.temp }}/kpf/legs/*/result.json
+            ${{ runner.temp }}/kpf/legs/*/steps.tsv
+            ${{ runner.temp }}/kpf/legs/*/validate.json
+            ${{ runner.temp }}/kpf/legs/*/logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      # `if-no-files-found: warn` above cannot tell a wrong glob from a leg
+      # that never started, and a silent miss costs another cut cycle to
+      # notice. So say plainly what was there to collect, on the same
+      # condition, and treat an empty run root as its own annotation.
+      - name: Say which receipts this leg produced
+        if: always()
+        run: |
+          set -uo pipefail
+          root="$RUNNER_TEMP/kpf"
+          if [ ! -d "$root" ]; then
+            echo "::warning::the preflight created no run root at ${root}, so no receipt was collected"
+            exit 0
+          fi
+          found=0
+          while IFS= read -r file; do
+            found=$((found + 1))
+            echo "receipt: ${file#"$root"/} ($(wc -c < "$file" | tr -d ' ') bytes)"
+          done < <(find "$root" -maxdepth 4 -type f \
+            \( -name 'repro.json' -o -name 'repro.log' -o -name 'result.json' \
+               -o -name 'steps.tsv' -o -name 'validate.json' -o -name 'preflight.*' \
+               -o -path '*/legs/*/logs/*.log' \) | sort)
+          if [ "$found" -eq 0 ]; then
+            echo "::warning::${root} exists but holds none of the receipt files this job uploads"
+          else
+            echo "${found} receipt file(s) under ${root}"
+          fi
+
       - name: Prove startup recovery across native daemon restarts
         if: matrix.artifact == 'kin-macos-aarch64'
         run: |
