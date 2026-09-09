@@ -4552,7 +4552,16 @@ mod tests {
         check_reconcile_dirty_work(true, 0, false).await;
     }
 
-    #[cfg(unix)]
+    // Deliberately not `#[cfg(unix)]`, unlike the watcher helpers around it.
+    // `startup_diagnostic_legitimate_empty_parse_still_certifies_from_cas` is a
+    // plain `#[test]` that calls this, so gating the helper leaves that caller
+    // with no callee on Windows and the whole `kin-daemon` lib test target fails
+    // to compile there. Nothing inside it is platform specific: it reads the
+    // graph through the same MCP handler the product answers with. A pull
+    // request cannot see that break, because `Windows authority tests` carries
+    // `if: github.event_name != 'pull_request'` and the `Windows cross-check`
+    // that does run on one checks libs and bins only, so no `#[cfg(test)]` code
+    // is compiled for Windows before a merge.
     fn file_coverage(state: &Arc<DaemonState>, rel_path: &str) -> serde_json::Value {
         let args = HashMap::from([("path".to_string(), serde_json::json!(rel_path))]);
         // No working-copy probe: these arms grade what the LAYOUT and the
