@@ -153,6 +153,13 @@ pub(crate) struct AdmittedWorkspaceTree {
 }
 
 impl AdmittedWorkspaceTree {
+    pub(crate) fn exact_deltas(&self) -> Result<Vec<kin_model::TreeDelta>> {
+        Ok(kin_core::exact_tree_correction(
+            &self.previous_tree,
+            &self.desired_tree,
+        )?)
+    }
+
     pub(crate) fn from_complete_observation(
         completion: kin_index::CompleteScanToken,
         expected_roots: RootBundle,

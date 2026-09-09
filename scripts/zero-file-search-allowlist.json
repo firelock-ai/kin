@@ -628,12 +628,13 @@
     },
     {
       "file": "crates/kin-daemon/src/semantic_debt.rs",
-      "reason": "Semantic-debt record boundary. Three primitives on one bookkeeping file at <kin_root>/semantic-debt.json: one read of what is owed, one rewrite when an entry is recorded or settled, and one removal when a commit settles the whole record. It names repository paths whose exact bytes reached authority without a parse, and nothing else. No repository content is read here and no query answer derives from it: what the record names is decided against graph truth by partition_against_tree before anything acts on it, and the parse it triggers reads the body the exact tree names from graph-owned CAS rather than from the filesystem. An absent or unparseable record degrades to the behaviour that existed before it, a path answering at the positions its previous parse recorded, rather than to a wrong answer this daemon believes. It is a file rather than in-memory state for the same reason the unpublished-enrichment marker beside it is: the fact it carries is only ever read by a LATER process. A session reconcile publishes the workspace tree with no history and no ref move, entities reach durable authority only inside a semantic change, so the re-derivation it triggers has nothing to ride and dies with the daemon that performed it. Measured, not assumed: a daemon reopened between a session's edit and its commit read the pre-edit span back, and a synchronous snapshot immediately after the re-derivation did not change that. Function-scoped so the rest of the module stays scanned, and the module holds no other filesystem call.",
+      "reason": "Semantic-debt bookkeeping boundary on <kin_root>/semantic-debt.json. Reads load owed exact-body identities; checked writes atomically replace that marker through a unique sibling temporary file and sync its directory; settlement removes the marker. Standalone publication refuses corrupt or unwritable debt records before advancing authority. No repository content is read here and no query answer derives from this file. partition_against_tree validates identities against graph truth, and re-admission reads exact bodies from graph-owned CAS. Function-scoped so all other module functions remain scanned.",
       "owner": "kin-daemon",
       "expiration": "2027-09-24",
       "allow_fn": [
         "outstanding",
-        "write",
+        "record_before_standalone_publication",
+        "write_checked",
         "settle_all"
       ]
     },

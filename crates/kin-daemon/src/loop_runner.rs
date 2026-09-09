@@ -507,6 +507,10 @@ pub(crate) fn publish_exact_workspace_tree(
     state: &DaemonState,
     admitted: &crate::repository_commit::AdmittedWorkspaceTree,
 ) -> Result<Option<u64>> {
+    crate::semantic_debt::record_before_standalone_publication(
+        state,
+        &crate::semantic_debt::owed_by(&admitted.exact_deltas()?),
+    )?;
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
     let started = Instant::now();
@@ -2700,7 +2704,8 @@ pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<Layou
         // ordinary host event so the reconciler re-derives it through the same
         // bounded admission an edit takes.
         let stale = spans_a_fresh_parse_does_not_reproduce(&entities, &indexed.entities);
-        if stale > 0 {
+        let missing = spans_a_fresh_parse_does_not_reproduce(&indexed.entities, &entities);
+        if stale > 0 || missing > 0 {
             if let Ok(host_path) =
                 kin_index::host_path_from_repo_path(state.layout.working_dir(), &artifact.path)
             {
@@ -2709,7 +2714,8 @@ pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<Layou
             report.stale += 1;
             completeness = ParseCompleteness::Partial(format!(
                 "{stale} of {} entity span(s) the graph holds for this file were not derived from \
-                 the bytes the repository tree holds at this path; they are being re-derived",
+                 the bytes the repository tree holds at this path; {missing} parsed entity \
+                 span(s) are missing from the graph; they are being re-derived",
                 entities.len()
             ));
         }
@@ -3048,8 +3054,8 @@ pub async fn run_loop_armed(
                     if !report.rederive.is_empty() {
                         warn!(
                             count = report.rederive.len(),
-                            "these paths hold entities a fresh parse of the tree's bytes does not \
-                             reproduce, so their spans describe an earlier state of the file; \
+                            "these paths hold entity spans that disagree with a fresh parse of \
+                             the tree's bytes; \
                              their parse observation was published as partial and they are being \
                              re-derived"
                         );
@@ -4093,6 +4099,8 @@ fn take_file_event_batch(pending: &mut VecDeque<FileEvent>, batch_size: usize) -
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    include!("loop_runner/tests/startup_recovery.rs");
 
     #[test]
     fn partial_c_disclosure_persists_and_only_clean_outcomes_settle() {
@@ -9744,19 +9752,27 @@ pub(crate) async fn sync_filesystem_with_graph_deferring_tree_publication(
 /// Re-derive the semantics every recorded debt still owes, and refuse in words
 /// if any of them cannot be.
 ///
-/// Entries a later transition overtook are settled here rather than re-parsed:
-/// the tree no longer names the body they were recorded for, so the admission
-/// that moved it enriched the path already. What survives that filter is settled
+/// Entries for an overtaken body or an unpublished proposal are settled here
+/// rather than re-parsed: the current tree does not owe that exact body. A
+/// different owed body at the same path remains recorded. Surviving debt is settled
 /// only by the commit that publishes it, because a commit is the transaction
 /// that makes a parse durable and a crash before one would otherwise clear the
 /// record for work nothing carried.
 pub(crate) async fn drain_semantic_debt(state: &DaemonState) -> Result<()> {
+    drain_semantic_debt_inner(state, false).await
+}
+
+async fn drain_semantic_debt_inner(state: &DaemonState, retain_spent: bool) -> Result<()> {
     let recorded = crate::semantic_debt::outstanding(state);
     if recorded.is_empty() {
         return Ok(());
     }
     let (owed, spent) = crate::semantic_debt::partition_against_tree(state, &recorded);
-    crate::semantic_debt::settle(state, &spent);
+    // A deferred tree has not displaced authority yet. Its older body may
+    // still be owed after publication refuses and the derived tree resets.
+    if !retain_spent {
+        crate::semantic_debt::settle(state, &spent);
+    }
     if owed.is_empty() {
         return Ok(());
     }
@@ -10338,7 +10354,7 @@ async fn sync_filesystem_with_graph_publishing_inner(
     // settles the whole record once its transaction reaches authority. Draining
     // only on the empty path would let one unrelated edit clear a debt nothing
     // had paid.
-    if let Err(error) = drain_semantic_debt(state).await {
+    if let Err(error) = drain_semantic_debt_inner(state, deferred_out.is_some()).await {
         drop(graph_mutation);
         return Err(error);
     }
