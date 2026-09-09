@@ -4084,6 +4084,92 @@ mod tests {
         assert!(names.contains("restart_third"));
     }
 
+    /// A record written twice with the same value inside ONE pending delta must
+    /// still be in that delta when the journal is replayed.
+    ///
+    /// `delta_vec_upsert_by_key` clears the key out of `delta.added` before it
+    /// decides whether the value changed, so an identical second upsert used to
+    /// take the entry out and then return without putting it back. Two shapes
+    /// come out of that and both are here: a record created in the delta lost
+    /// its creation, and a record modified in the delta kept only its
+    /// `removed` half, which replays as a deletion of a record that exists.
+    ///
+    /// End to end on purpose. The loss is invisible in the live graph, which
+    /// holds the record either way; it only shows up once the delta is the
+    /// durable authority and the store is reopened from it.
+    #[test]
+    fn identical_reupsert_in_one_delta_survives_the_journal_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let created = ShallowTrackedFile {
+            file_id: FilePathId::new("src/created.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 2,
+            import_count: 1,
+            syntax_hash: Hash256::from_bytes([0x21; 32]),
+            signature_hash: None,
+            declaration_names: vec!["created".into()],
+            import_paths: vec!["std::fmt".into()],
+        };
+        let base = ShallowTrackedFile {
+            file_id: FilePathId::new("src/modified.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 3,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x22; 32]),
+            signature_hash: None,
+            declaration_names: vec!["before".into()],
+            import_paths: Vec::new(),
+        };
+        let modified = ShallowTrackedFile {
+            declaration_count: 9,
+            declaration_names: vec!["after".into()],
+            ..base.clone()
+        };
+
+        // Base authority: both artifacts admitted, one shallow file already
+        // tracked, written as a full snapshot so the delta below starts empty.
+        let manager = SnapshotManager::new(&path);
+        let graph = manager.graph();
+        graph.admit_artifact_for_test(&created.file_id.0, regular_tree_entry(0x21));
+        graph.admit_artifact_for_test(&base.file_id.0, regular_tree_entry(0x22));
+        graph.upsert_shallow_file(&base).unwrap();
+        manager.save().unwrap();
+        drop(manager);
+
+        // One pending delta: create one record, modify another, and write each
+        // a second time with the value the same delta just wrote.
+        let manager = SnapshotManager::open_without_text_index(&path).unwrap();
+        let graph = manager.graph();
+        graph.upsert_shallow_file(&created).unwrap();
+        graph.upsert_shallow_file(&created).unwrap();
+        graph.upsert_shallow_file(&modified).unwrap();
+        graph.upsert_shallow_file(&modified).unwrap();
+        manager
+            .save_delta()
+            .unwrap()
+            .expect("the identical re-upserts must still leave a delta to journal");
+        drop(manager);
+
+        let reopened = SnapshotManager::open_without_text_index(&path).unwrap();
+        let reopened_created = reopened
+            .graph()
+            .get_shallow_file(&created.file_id)
+            .unwrap()
+            .expect("a record created and identically re-upserted in one delta must survive");
+        assert_eq!(reopened_created.declaration_count, 2);
+        let reopened_modified = reopened
+            .graph()
+            .get_shallow_file(&base.file_id)
+            .unwrap()
+            .expect("a record modified and identically re-upserted in one delta must survive");
+        assert_eq!(
+            reopened_modified.declaration_count, 9,
+            "the reopened value must be the modification, not the base"
+        );
+    }
+
     #[test]
     fn local_authority_write_propagates_post_rename_parent_sync_failure() {
         let dir = TempDir::new().unwrap();

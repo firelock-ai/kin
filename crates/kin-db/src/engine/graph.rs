@@ -1576,6 +1576,18 @@ where
     V: Clone + serde::Serialize,
     F: Fn(&V) -> K,
 {
+    // An unchanged value leaves the delta exactly as it already stands, and
+    // that has to be settled before the key is cleared out of `added` below.
+    // Clearing first and returning here afterwards left the key with no entry
+    // at all: it dropped a creation this delta had made, and it reduced a
+    // modification this delta had made to the bare removal of the base value,
+    // which replays as a deletion of a record that exists.
+    if let Some(ref old) = old {
+        if delta_values_equal(old, &new) {
+            return;
+        }
+    }
+
     let new_key = key_of(&new);
     delta.added.retain(|existing| key_of(existing) != new_key);
 
@@ -1596,9 +1608,6 @@ where
     }
 
     if let Some(old) = old {
-        if delta_values_equal(&old, &new) {
-            return;
-        }
         if !delta
             .removed
             .iter()
@@ -17121,6 +17130,144 @@ mod tests {
         let fetched = graph.get_shallow_file(&sf2.file_id).unwrap().unwrap();
         assert_eq!(fetched.file_id, sf2.file_id);
         assert_eq!(fetched.declaration_count, sf2.declaration_count);
+    }
+
+    /// Writing the same value twice inside one pending delta must leave the
+    /// delta's own record of the creation in place.
+    ///
+    /// The function used to clear the key out of `added` before it checked
+    /// whether the value had changed, so the identical second write took the
+    /// entry out and the equality early return left it out.
+    #[test]
+    fn identical_reupsert_keeps_the_pending_creation() {
+        let graph = InMemoryGraph::new();
+        let shallow = ShallowTrackedFile {
+            file_id: FilePathId::new("src/created.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 2,
+            import_count: 1,
+            syntax_hash: Hash256::from_bytes([0x41; 32]),
+            signature_hash: None,
+            declaration_names: vec!["created".into()],
+            import_paths: vec!["std::fmt".into()],
+        };
+        admit_enrichment(&graph, &shallow.file_id, shallow.syntax_hash);
+        graph.clear_pending_delta();
+
+        graph.upsert_shallow_file(&shallow).unwrap();
+        graph.upsert_shallow_file(&shallow).unwrap();
+
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("the creation must still be pending after an identical re-upsert");
+        assert_eq!(
+            pending.shallow_files.added.len(),
+            1,
+            "an identical re-upsert must not drop the creation this delta made"
+        );
+        assert_eq!(pending.shallow_files.added[0].file_id, shallow.file_id);
+        assert_eq!(pending.shallow_files.added[0].declaration_count, 2);
+        assert!(pending.shallow_files.removed.is_empty());
+    }
+
+    /// The same reordering, on the shape that loses more: a record the delta
+    /// modifies keeps both halves, so replay writes the new value instead of
+    /// deleting the base one.
+    #[test]
+    fn identical_reupsert_keeps_the_pending_modification() {
+        let graph = InMemoryGraph::new();
+        let base = ShallowTrackedFile {
+            file_id: FilePathId::new("src/modified.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 3,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x42; 32]),
+            signature_hash: None,
+            declaration_names: vec!["before".into()],
+            import_paths: Vec::new(),
+        };
+        let modified = ShallowTrackedFile {
+            declaration_count: 9,
+            declaration_names: vec!["after".into()],
+            ..base.clone()
+        };
+        admit_enrichment(&graph, &base.file_id, base.syntax_hash);
+        graph.upsert_shallow_file(&base).unwrap();
+        // Everything above is the persistence base this delta is measured from.
+        graph.clear_pending_delta();
+
+        graph.upsert_shallow_file(&modified).unwrap();
+        graph.upsert_shallow_file(&modified).unwrap();
+
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("the modification must still be pending after an identical re-upsert");
+        assert_eq!(
+            pending.shallow_files.added.len(),
+            1,
+            "an identical re-upsert must not reduce a modification to a bare removal"
+        );
+        assert_eq!(pending.shallow_files.added[0].declaration_count, 9);
+        assert_eq!(pending.shallow_files.removed.len(), 1);
+        assert_eq!(pending.shallow_files.removed[0].declaration_count, 3);
+    }
+
+    /// The mirror on the removed set: after an identical re-upsert, removing
+    /// the record still records the removal of the value the base holds, and
+    /// removing a record this delta created still nets out to nothing.
+    #[test]
+    fn removal_after_an_identical_reupsert_records_the_base_removal() {
+        let graph = InMemoryGraph::new();
+        let base = ShallowTrackedFile {
+            file_id: FilePathId::new("src/removed.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 4,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x43; 32]),
+            signature_hash: None,
+            declaration_names: vec!["before".into()],
+            import_paths: Vec::new(),
+        };
+        let modified = ShallowTrackedFile {
+            declaration_count: 11,
+            ..base.clone()
+        };
+        let created = ShallowTrackedFile {
+            file_id: FilePathId::new("src/created-then-removed.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 1,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x44; 32]),
+            signature_hash: None,
+            declaration_names: vec!["transient".into()],
+            import_paths: Vec::new(),
+        };
+        admit_enrichment(&graph, &base.file_id, base.syntax_hash);
+        admit_enrichment(&graph, &created.file_id, created.syntax_hash);
+        graph.upsert_shallow_file(&base).unwrap();
+        graph.clear_pending_delta();
+
+        graph.upsert_shallow_file(&modified).unwrap();
+        graph.upsert_shallow_file(&modified).unwrap();
+        graph.delete_shallow_file(&base.file_id).unwrap();
+        graph.upsert_shallow_file(&created).unwrap();
+        graph.upsert_shallow_file(&created).unwrap();
+        graph.delete_shallow_file(&created.file_id).unwrap();
+
+        let pending = graph
+            .pending_delta_snapshot(0)
+            .expect("removing the base value is itself a pending change");
+        assert!(
+            pending.shallow_files.added.is_empty(),
+            "neither removal may leave a pending add behind"
+        );
+        assert_eq!(
+            pending.shallow_files.removed.len(),
+            1,
+            "only the record the base holds is removed on replay"
+        );
+        assert_eq!(pending.shallow_files.removed[0].file_id, base.file_id);
+        assert_eq!(pending.shallow_files.removed[0].declaration_count, 4);
     }
 
     #[test]
