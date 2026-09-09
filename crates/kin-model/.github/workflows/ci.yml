@@ -52,8 +52,13 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
+      # Restore only. This workflow never runs on push to main (see the on:
+      # comment above), so an unconditional save here would write into every
+      # pull-request and merge-queue ref's own private scope and never into
+      # the one scope everybody can read. cache-seed.yml saves this exact key
+      # from main instead; it already restores and re-saves it on every push.
+      - name: Restore cargo registry and build cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry

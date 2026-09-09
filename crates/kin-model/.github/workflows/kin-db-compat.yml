@@ -119,8 +119,8 @@ jobs:
       - name: Install Rust toolchain
         uses: ./kin-model/.github/actions/rust-toolchain
 
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
+      - name: Restore cargo registry and build cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -231,3 +231,22 @@ jobs:
           --skip default_dimensions_match_default_model
           --skip test_vector_index_dimension_mismatch_auto_recovery
           --skip many_vectors_search_quality
+
+      # Actions caches are scoped to the ref that saved them, so only main's
+      # cache is readable from every other ref. This workflow has no
+      # merge_group trigger and never runs on push, so every save used to
+      # write into a pull-request ref's own private scope. Save only from
+      # main; nothing currently seeds that scope (this workflow never runs
+      # there either, since it triggers on pull_request only), so this key
+      # goes cold rather than polluting the cache budget. This check is not a
+      # required context on kin-model, so that is a slower non-gating job,
+      # not a landing risk.
+      - name: Save cargo registry and build cache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kin-db/target
+          key: ${{ runner.os }}-kindbcompat-${{ hashFiles('kin-db/Cargo.lock') }}
