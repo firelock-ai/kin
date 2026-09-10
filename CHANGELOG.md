@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.10] - 2026-09-10
+
+### Changed
+
+- Restamp the ported preflight pin and grade its drift on the pull request (#1662)
+
+
 ## [0.7.9] - 2026-09-10
 
 ### Changed
