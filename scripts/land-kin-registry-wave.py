@@ -150,6 +150,11 @@ class Verdict:
     # a judge given a wait budget re-reads until it does. A hold or an empty
     # branch is not transient, and returns at once.
     transient: bool = False
+    # A wait that needs a person, raised as a warning annotation rather than
+    # the quiet notice an ordinary wait prints. It is still a wait, so this
+    # workflow stays green: see the failed-checks branch of `judge` for why a
+    # red pull request is not a red main.
+    alarm: bool = False
 
     def document(self) -> dict[str, Any]:
         return {
@@ -159,6 +164,7 @@ class Verdict:
             "head": self.head,
             "details": self.details,
             "transient": self.transient,
+            "alarm": self.alarm,
         }
 
 
@@ -589,12 +595,38 @@ def judge(snapshot: dict[str, Any]) -> Verdict:
     except LandingError as exc:
         return Verdict(REFUSE, f"check-runs unreadable: {exc}", number, head)
     if checks["failed"]:
+        # A WAIT, not a REFUSE, and this is the whole point of the distinction.
+        #
+        # A failed check on the wave head is a property of that pull request,
+        # never of main. This workflow is triggered by a four-times-an-hour cron
+        # and by every CI completion on the wave branch, so a REFUSE here
+        # repainted main red on every pass for as long as the head stayed red:
+        # the head at 2026-09-05T12:14:53Z failed one test shard and produced
+        # about twenty failed runs of this workflow on main over the three days
+        # before anyone touched it. Sixty-two of the seventy failures in the
+        # hundred runs to 2026-09-10 were that shape.
+        #
+        # A permanently red job stops being read, and the reader who does open
+        # it finds a run about an automation branch and closes the tab, which is
+        # how this became a chronic red nobody owned. The red belongs on the
+        # pull request, where it already is and where it can be fixed. So this
+        # run stays green and raises a warning naming the pull and the contexts.
+        #
+        # Not transient: a concluded failure does not resolve by itself, and
+        # spinning the wait budget on it would burn the runner for nothing.
+        #
+        # Every other refusal below and above stays a refusal. Those are
+        # properties of the machinery (a pull the release App did not open, a
+        # write outside the receiver's set, a commit identity that does not
+        # match, an attestation that does not verify), and a red main is the
+        # right report for each of them.
         return Verdict(
-            REFUSE,
+            WAIT,
             "checks failed: " + ", ".join(checks["failed"]),
             number,
             head,
             checks,
+            alarm=True,
         )
     if checks["pending"]:
         return Verdict(
@@ -865,6 +897,10 @@ def judge_with_wait(
                 verdict.head,
                 {**verdict.details, "passes": passes},
                 verdict.transient,
+                # Rebuilt positionally, so every field has to be named here or
+                # it is silently dropped on the one path a judgment with a wait
+                # budget always takes, which is every real run.
+                verdict.alarm,
             ), snapshot
         print(f"::notice::wave landing waits ({int(remaining)}s left): {verdict.reason}", file=sys.stderr)
         sleep(min(WAIT_POLL_SECONDS, remaining))
@@ -971,7 +1007,17 @@ def _emit(verdict: Verdict) -> int:
         print(f"::error title=Kin registry wave refused::{verdict.reason}", file=sys.stderr)
         return 1
     if verdict.decision == WAIT:
-        print(f"::notice::wave landing waits: {verdict.reason}", file=sys.stderr)
+        if verdict.alarm:
+            # Louder than a notice and quieter than a failed run, which is
+            # exactly the shape this condition has: somebody has to act, and
+            # the thing to act on is the pull request, not main.
+            print(
+                f"::warning title=Kin registry wave is not landable::"
+                f"pull {verdict.pull}: {verdict.reason}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"::notice::wave landing waits: {verdict.reason}", file=sys.stderr)
     return 0
 
 

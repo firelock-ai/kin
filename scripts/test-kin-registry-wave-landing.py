@@ -510,22 +510,76 @@ class WaveJudgeTests(unittest.TestCase):
         self.assertEqual(verdict.details["failed"], [])
         self.assertEqual(verdict.details["base"], BASE)
 
-    def test_one_failure_refuses(self) -> None:
+    def test_one_failure_waits_loudly_and_leaves_main_green(self) -> None:
+        """A red wave head is not a red main.
+
+        This workflow is triggered four times an hour by cron and by every CI
+        completion on the wave branch, so refusing a failed check repainted main
+        red on every pass for as long as the head stayed red: the head at
+        2026-09-05T12:14:53Z failed one test shard and produced about twenty
+        failed runs on main over three days. Sixty-two of the seventy failures
+        in the hundred runs to 2026-09-10 were that shape, and a permanently red
+        job stops being read. The wave still does not land; the red stays on the
+        pull request, where it can be fixed.
+
+        Reverting this branch to REFUSE takes the decision assertion red, and
+        dropping `alarm=True` takes the annotation assertion red.
+        """
+
         runs = green_runs() + [check_run("cargo-fuzz (parse_adapter)", "failure")]
         verdict = self.assertVerdict(
             green_snapshot(check_run_pages=pages(runs)),
-            landing.REFUSE,
+            landing.WAIT,
             r"checks failed: cargo-fuzz \(parse_adapter\)=failure",
         )
         self.assertEqual(verdict.pull, 1360)
+        self.assertTrue(verdict.alarm, "a failed check has to be raised, not merely noted")
+        # Not transient. A concluded failure does not resolve by itself, and a
+        # transient wait would spin the whole 1500-second budget on it.
+        self.assertFalse(verdict.transient)
+        self.assertEqual(verdict.details["failed"], ["cargo-fuzz (parse_adapter)=failure"])
         for conclusion in ("timed_out", "action_required", "stale", "startup_failure"):
             with self.subTest(conclusion=conclusion):
                 runs = green_runs() + [check_run("Linux Daemon Smoke", conclusion)]
-                self.assertVerdict(
+                held = self.assertVerdict(
                     green_snapshot(check_run_pages=pages(runs)),
-                    landing.REFUSE,
+                    landing.WAIT,
                     f"checks failed: Linux Daemon Smoke={conclusion}",
                 )
+                self.assertTrue(held.alarm)
+
+    def test_a_failed_check_never_lands_the_wave(self) -> None:
+        """The wave still does not land. Only the colour of the run changed.
+
+        `land-wave` runs on `decision == 'land'`, so a wait is as unlandable as
+        a refusal. A mutation that turned the failed-checks branch into LAND to
+        make the run green would take this red.
+        """
+
+        runs = green_runs() + [check_run("cargo-deny", "failure")]
+        verdict = landing.judge(green_snapshot(check_run_pages=pages(runs)))
+        self.assertNotEqual(verdict.decision, landing.LAND)
+
+    def test_machinery_refusals_stay_red_on_main(self) -> None:
+        """Only the checks-failed branch moved.
+
+        A pull the release App did not open, a write outside the receiver's set,
+        a commit identity that does not match, an attestation that does not
+        verify: each says something is wrong with the automation itself, and a
+        red main is the right report. Widening the wait to those would make this
+        workflow incapable of reporting anything.
+        """
+
+        off_scope = [wave_file("Cargo.toml"), wave_file("Cargo.lock"), wave_file("README.md")]
+        for name, snapshot in (
+            ("off-scope write", green_snapshot(files=off_scope, pull=wave_pull(changed_files=3))),
+            ("two commits", green_snapshot(commits=[bot_commit(), bot_commit()])),
+            ("unverified attestation", green_snapshot(attestation="attestation missing")),
+        ):
+            with self.subTest(refusal=name):
+                verdict = landing.judge(snapshot)
+                self.assertEqual(verdict.decision, landing.REFUSE, verdict.reason)
+                self.assertFalse(verdict.alarm)
 
     def test_cancelled_by_a_repush_waits_instead_of_failing(self) -> None:
         # The receiver's re-push cancels the superseded suite and the attester's
@@ -672,14 +726,15 @@ class WaveJudgeTests(unittest.TestCase):
             green_snapshot(check_run_pages=pages(runs)), landing.LAND, "concluded green"
         )
 
-    def test_newer_failure_after_an_older_success_refuses(self) -> None:
+    def test_newer_failure_after_an_older_success_holds(self) -> None:
         runs = green_runs()
         runs.append(check_run("cargo-deny", "failure", started="2026-09-02T09:40:00Z"))
-        self.assertVerdict(
+        verdict = self.assertVerdict(
             green_snapshot(check_run_pages=pages(runs)),
-            landing.REFUSE,
+            landing.WAIT,
             "checks failed: cargo-deny=failure",
         )
+        self.assertTrue(verdict.alarm)
 
     def test_missing_required_context_waits(self) -> None:
         runs = [run for run in green_runs() if run["name"] != "cargo-deny"]
@@ -855,6 +910,35 @@ class WaveJudgeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["decision"], landing.LAND)
 
+            # A machinery refusal still exits 1 and still paints main red.
+            refused = Path(directory) / "refused.json"
+            refused.write_text(
+                json.dumps(
+                    green_snapshot(
+                        files=[
+                            wave_file("Cargo.toml"),
+                            wave_file("Cargo.lock"),
+                            wave_file("README.md"),
+                        ],
+                        pull=wave_pull(changed_files=3),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, str(LANDING_PATH), "judge-fixture", "--fixture", str(refused)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(json.loads(result.stdout)["decision"], landing.REFUSE)
+            self.assertIn("::error title=Kin registry wave refused::", result.stderr)
+
+            # A failed check on the wave head exits 0, so this workflow's run on
+            # main is green, and raises a warning naming the pull. The exit code
+            # is the assertion that matters: it is what GitHub reads as the run
+            # conclusion, and it is what made this a chronic red on main.
             red = Path(directory) / "red.json"
             runs = green_runs() + [check_run("cargo-deny", "failure")]
             red.write_text(
@@ -866,9 +950,15 @@ class WaveJudgeTests(unittest.TestCase):
                 capture_output=True,
                 check=False,
             )
-            self.assertEqual(result.returncode, 1)
-            self.assertEqual(json.loads(result.stdout)["decision"], landing.REFUSE)
-            self.assertIn("::error title=Kin registry wave refused::", result.stderr)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            document = json.loads(result.stdout)
+            self.assertEqual(document["decision"], landing.WAIT)
+            self.assertTrue(document["alarm"])
+            self.assertIn(
+                "::warning title=Kin registry wave is not landable::pull 1360:",
+                result.stderr,
+            )
+            self.assertNotIn("::error", result.stderr)
 
             waiting = Path(directory) / "wait.json"
             waiting.write_text(json.dumps(green_snapshot(open_pulls=[])), encoding="utf-8")
@@ -1032,9 +1122,29 @@ class WaitLoopTests(unittest.TestCase):
     def test_a_hold_and_a_refusal_return_at_once(self) -> None:
         verdict, slept, gathers = self._loop([green_snapshot(freeze="hold")], 600)
         self.assertEqual((verdict.decision, slept, gathers), (landing.WAIT, [], 1))
-        red = green_snapshot(check_run_pages=pages(green_runs() + [check_run("cargo-deny", "failure")]))
-        verdict, slept, gathers = self._loop([red], 600)
+        off_scope = green_snapshot(
+            files=[wave_file("Cargo.toml"), wave_file("Cargo.lock"), wave_file("README.md")],
+            pull=wave_pull(changed_files=3),
+        )
+        verdict, slept, gathers = self._loop([off_scope], 600)
         self.assertEqual((verdict.decision, slept, gathers), (landing.REFUSE, [], 1))
+
+    def test_a_failed_check_returns_at_once_and_keeps_its_alarm(self) -> None:
+        """Two properties on one path, both of which a rebuild can silently lose.
+
+        The wait loop rebuilds the verdict positionally, so a field added to
+        Verdict and not named there is dropped on the one path every real run
+        takes. And a failed check is a final wait, so it must not burn the
+        wait budget: `slept == []` is that assertion.
+        """
+
+        red = green_snapshot(
+            check_run_pages=pages(green_runs() + [check_run("cargo-deny", "failure")])
+        )
+        verdict, slept, gathers = self._loop([red], 600)
+        self.assertEqual((verdict.decision, slept, gathers), (landing.WAIT, [], 1))
+        self.assertTrue(verdict.alarm, "the alarm was dropped by the wait loop's rebuild")
+        self.assertFalse(verdict.transient)
 
     def test_a_repush_during_the_wait_is_judged_on_the_new_head(self) -> None:
         moved = green_snapshot(branch_tip=OTHER)

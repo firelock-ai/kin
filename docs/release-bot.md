@@ -592,8 +592,19 @@ suite awaiting its rerun, an attestation on its way, GitHub still computing
 mergeability, a re-pushed head), so one trigger outlasts the checks it waits
 on. Only then does the land job mint the App token, squash-merge with the pull
 title and body and never the marker line, and prove the squash is on `main`.
-A failed check, a foreign commit, an off-scope file or an unreadable listing
-refuses loudly; everything transient and an open hold wait quietly. A wave
+A foreign commit, an off-scope file, an unreadable listing or an attestation
+that does not verify refuses loudly, because each says something is wrong with
+the automation itself and a red run on main is the right report for it.
+
+A failed check on the wave head does not. It is a property of that pull
+request, never of main, and refusing it repainted main red on every pass of a
+cron that fires four times an hour: one head that failed a test shard on
+2026-09-05 produced about twenty failed runs over three days, and sixty-two of
+the seventy failures in the hundred runs to 2026-09-10 were that shape. A
+permanently red job stops being read. So it is a wait that raises a warning
+naming the pull and the failed contexts, the run stays green, the wave still
+does not land, and the red stays on the pull request where it can be fixed.
+Everything transient and an open hold wait quietly. A wave
 whose pins a lane already carried onto main has nothing to merge and is left
 for the receiver's next refresh, never squashed as an empty diff. GitHub's
 own auto-merge is not the mechanism, because it merges on the six ruleset
