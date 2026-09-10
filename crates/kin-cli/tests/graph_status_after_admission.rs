@@ -869,9 +869,15 @@ fn init_status_and_graph_status_use_their_real_durable_and_live_routes() {
         .current_dir(&repo)
         .output()
         .expect("run production kin status route");
+    // No daemon holds this store yet, so nothing admits the working copy and
+    // status answers 9 beside a report that is complete and true about durable
+    // authority. This case is about the enrichment view that report carries, so
+    // it takes the report and ignores that code; any other non-zero is still a
+    // failure.
     assert!(
-        status.status.success(),
-        "status stdout={} stderr={}",
+        matches!(status.status.code(), Some(0) | Some(9)),
+        "status answered {:?}: stdout={} stderr={}",
+        status.status.code(),
         String::from_utf8_lossy(&status.stdout),
         String::from_utf8_lossy(&status.stderr)
     );

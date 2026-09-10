@@ -108,10 +108,40 @@ fn assert_clean_exit(args: &[&str], status: ExitStatus, stderr: &str) {
     );
 }
 
+/// The pipe arm held to the code the FILE arm produced, rather than to a
+/// constant.
+///
+/// This file is about one property: a reader going away must not change the
+/// answer. A constant 0 expressed that as long as every command in the fixture
+/// answered 0, and two of them stopped: `kin status` and `kin diff HEAD
+/// WORKSPACE` answer 9 here, because no daemon holds this store and nothing
+/// admitted the working copy. That is the command's verdict about the working
+/// copy and not a failure of the pipe, so the file arm sets the expectation and
+/// the pipe arm has to match it. Reading the code off the control is also the
+/// stronger test: it would catch a pipe arm that answered 0 where the command
+/// itself answers 9, which the constant could not.
+fn assert_pipe_matches_the_file_arm(
+    args: &[&str],
+    status: ExitStatus,
+    stderr: &str,
+    file: &Output,
+) {
+    assert_eq!(
+        status.code(),
+        file.status.code(),
+        "kin {args:?} answered differently with its reader gone than with it present: \
+         stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "kin {args:?} into a closed pipe must not panic: stderr={stderr}"
+    );
+}
+
 fn assert_full_output(args: &[&str], output: &Output) {
     assert!(
-        output.status.success(),
-        "kin {args:?} into a file must still succeed: stdout={} stderr={}",
+        matches!(output.status.code(), Some(0) | Some(9)),
+        "kin {args:?} into a file must still answer: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -255,8 +285,11 @@ fn every_repository_command_survives_a_reader_that_is_gone() {
     ];
     for (index, args) in commands.iter().enumerate() {
         let stderr_path = root.path().join(format!("pipe-{index}.stderr"));
+        // The control runs FIRST here, because it is what says which code this
+        // command answers in this fixture. Two of the six answer 9.
+        let file = run_into_files(&runtime, &repo, args);
+        assert_full_output(args, &file);
         let (status, stderr) = run_with_reader_gone(&runtime, &repo, args, &stderr_path);
-        assert_clean_exit(args, status, &stderr);
-        assert_full_output(args, &run_into_files(&runtime, &repo, args));
+        assert_pipe_matches_the_file_arm(args, status, &stderr, &file);
     }
 }

@@ -898,10 +898,28 @@ jobs:
           # Do not pipe this command through tee. On Windows, the daemon child
           # inherits the pipe and keeps it open until idle shutdown, which makes
           # the shell wait for the daemon and then tests a process that just exited.
+          #
+          # `kin status` exits 9 when nothing admitted the working copy, and it
+          # never starts a daemon to change that, so a first-run capture reaches
+          # this line with no daemon and gets 9. These captures want the
+          # durable-authority report, not an answer about uncommitted work, so
+          # they accept that one code and no other. `set +e` around the pair
+          # rather than `|| true` on each: the redirect stays byte-identical, and
+          # every other non-zero is still checked below instead of swallowed.
+          set +e
           kin status > "$captures/kin-status.txt" 2>&1
-          cat "$captures/kin-status.txt"
+          status_rc=$?
           kin status --json > "$captures/kin-status.json" 2>&1
+          status_json_rc=$?
+          set -e
+          cat "$captures/kin-status.txt"
           cat "$captures/kin-status.json"
+          printf 'kin status rc=%s / kin status --json rc=%s (9 = working copy unmeasured)\n' \
+            "$status_rc" "$status_json_rc" > "$captures/kin-status-exit.txt"
+          cat "$captures/kin-status-exit.txt"
+          for rc in "$status_rc" "$status_json_rc"; do
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 9 ]; then exit "$rc"; fi
+          done
           kin bench-meta --json > "$captures/kin-build-meta.json"
           cat "$captures/kin-build-meta.json"
           # Prove every supported agent-client config writer without requiring
@@ -1635,14 +1653,26 @@ jobs:
             *--wait-quiesce*)
               printf 'bounded settle (kin status --wait-quiesce 60)\n' \
                 | tee "$captures/kin-status-settle-mode.txt"
+              set +e
               kin status --json --wait-quiesce 60 | tee "$captures/kin-embedded-status.json"
+              settle_rc=$?
+              set -e
               ;;
             *)
               printf 'single sample (installed kin has no --wait-quiesce)\n' \
                 | tee "$captures/kin-status-settle-mode.txt" >&2
+              set +e
               kin status --json | tee "$captures/kin-embedded-status.json"
+              settle_rc=$?
+              set -e
               ;;
           esac
+          # Same acceptance as the first-run capture above, and here `pipefail`
+          # is the reason it has to be explicit: it promotes `kin status`'s exit
+          # 9 to the pipeline's status, so an unguarded `| tee` would fail this
+          # leg over a working copy nothing admitted. 9 is accepted; anything
+          # else is a real failure and still stops the leg.
+          if [ "$settle_rc" -ne 0 ] && [ "$settle_rc" -ne 9 ]; then exit "$settle_rc"; fi
           kin setup status --json | tee "$captures/kin-embedded-health.json"
           kin doctor --json | tee "$captures/kin-embedded-doctor.json"
           kin search hello --semantic --json | tee "$captures/kin-semantic-search.json"

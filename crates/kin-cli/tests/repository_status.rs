@@ -80,9 +80,16 @@ fn status_is_one_exact_authority_lease_and_ignores_checkout_and_git_drift() {
     );
 
     let before = run_kin(&repo, &home, &["status", "--json"]);
+    // No daemon holds this repository, which is the state this case is about
+    // and which the coverage assertions below name outright, so status answers
+    // 9: the report is complete and true about durable authority and the code
+    // says none of it describes the files on disk. This case compares two such
+    // reports for equality across checkout and Git drift, which that code does
+    // not touch. Any other non-zero is still a failure.
     assert!(
-        before.status.success(),
-        "stdout={} stderr={}",
+        matches!(before.status.code(), Some(0) | Some(9)),
+        "status answered {:?}: stdout={} stderr={}",
+        before.status.code(),
         String::from_utf8_lossy(&before.stdout),
         String::from_utf8_lossy(&before.stderr)
     );
@@ -158,9 +165,16 @@ fn status_is_one_exact_authority_lease_and_ignores_checkout_and_git_drift() {
     .expect("add unrelated file");
 
     let after = run_kin(&repo, &home, &["status", "--json"]);
+    // No daemon holds this repository, which is the state this case is about
+    // and which the coverage assertions below name outright, so status answers
+    // 9: the report is complete and true about durable authority and the code
+    // says none of it describes the files on disk. This case compares two such
+    // reports for equality across checkout and Git drift, which that code does
+    // not touch. Any other non-zero is still a failure.
     assert!(
-        after.status.success(),
-        "stdout={} stderr={}",
+        matches!(after.status.code(), Some(0) | Some(9)),
+        "status answered {:?}: stdout={} stderr={}",
+        after.status.code(),
         String::from_utf8_lossy(&after.stdout),
         String::from_utf8_lossy(&after.stderr)
     );

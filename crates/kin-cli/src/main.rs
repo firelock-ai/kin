@@ -3011,7 +3011,18 @@ fn run() -> Result<()> {
                     Ok(())
                 }
                 Command::Status { json, wait_quiesce } => {
-                    commands::status::run(json, std::time::Duration::from_secs(wait_quiesce)).await
+                    // A working copy nothing admitted is an answer, not an
+                    // error, and it travels in the exit code the way a parked
+                    // merge and an unrouted `kin path` already do. The report is
+                    // printed either way; the code says whether any of it
+                    // describes the files on disk.
+                    let code =
+                        commands::status::run(json, std::time::Duration::from_secs(wait_quiesce))
+                            .await?;
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
                 }
                 Command::Resources { action } => match action {
                     ResourcesAction::Set {
@@ -3061,7 +3072,15 @@ fn run() -> Result<()> {
                     head,
                     json,
                     full_bodies,
-                } => commands::diff::run(base, head, json, full_bodies).await,
+                } => {
+                    // Same code and the same reason as `kin status` above, and
+                    // only a workspace endpoint can produce it.
+                    let code = commands::diff::run(base, head, json, full_bodies).await?;
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
+                }
                 Command::Eject { yes } => commands::eject::run(yes).await,
                 Command::Impact {
                     entity,

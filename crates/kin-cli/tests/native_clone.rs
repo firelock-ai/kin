@@ -124,8 +124,21 @@ fn run(runtime: &common::IsolatedDaemonRuntime, repo: &Path, args: &[&str]) -> O
 }
 
 fn status(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> Value {
-    serde_json::from_slice(&require_success(run(runtime, repo, &["status", "--json"])).stdout)
-        .expect("status JSON")
+    // Not `require_success`. Every case here reads status with no daemon
+    // holding the store, so nothing admits the working copy and status answers
+    // 9: the report is complete and true about durable authority, and the code
+    // says none of it describes the files on disk. What this file asserts about
+    // a clone is the report's contents, which that code does not touch. Any
+    // other non-zero is still a failure.
+    let output = run(runtime, repo, &["status", "--json"]);
+    assert!(
+        matches!(output.status.code(), Some(0) | Some(9)),
+        "kin status --json answered {:?}: stdout={} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("status JSON")
 }
 
 fn history(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> Value {

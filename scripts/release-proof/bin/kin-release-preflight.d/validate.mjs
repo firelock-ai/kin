@@ -91,13 +91,17 @@ import path from "node:path";
 //
 // The drift above was found by the driver refusing a cut, hours after kin#1652
 // landed, which is the fourth time this pin has gone stale outside the
-// mirrored step. `assert_ported_validator_pin_tracks_install_proof` in
+// mirrored step. The fifth was the working-copy exit-code change, which edited
+// the first-run and settle captures and left the "Validate installed capability
+// proof" step untouched: 411 lines, sha256
+// f2b88473c0ce233badb97decebbf21b05c84cb798d5de11710119e309258d5e9, identical at
+// both whole-file shas. Nothing was ported that time; only the pin moved. `assert_ported_validator_pin_tracks_install_proof` in
 // scripts/test-release-workflow-authority.py now fails the pull request that
 // moves install-proof.yml without moving this pin, so the next drift is caught
 // by that pull request rather than by a release.
 export const PORTED_FROM = {
   file: ".github/workflows/install-proof.yml",
-  sha256: "c4b55da81b9d74d955b7e9165b162c67e355246640398b6f7468e5a7c11d67aa",
+  sha256: "a92d64226a0ed4e99b8078cb3469a1b4027503eb0cc9e013b79d4477e8de6f26",
 };
 
 class Unreadable extends Error {}

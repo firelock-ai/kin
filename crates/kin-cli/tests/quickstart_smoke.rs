@@ -117,15 +117,23 @@ fn public_quickstart_reads_one_fixture_from_graph_authority() {
     );
     require_success(init, "kin init");
 
-    let status = require_success(
-        run(
-            kin_command(&runtime, &daemon_bin)
-                .args(["status", "--json"])
-                .current_dir(repo.path()),
-            deadline,
-            "kin status --json",
-        ),
+    // Not `require_success`. No daemon holds this store, so nothing admits the
+    // working copy and status answers 9 beside a report that is complete and
+    // true about durable authority. This smoke reads that report; any other
+    // non-zero is still a failure.
+    let status = run(
+        kin_command(&runtime, &daemon_bin)
+            .args(["status", "--json"])
+            .current_dir(repo.path()),
+        deadline,
         "kin status --json",
+    );
+    assert!(
+        matches!(status.status.code(), Some(0) | Some(9)),
+        "kin status --json answered {:?}: stdout={} stderr={}",
+        status.status.code(),
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
     );
     let status: serde_json::Value =
         serde_json::from_slice(&status.stdout).expect("status is one JSON document");

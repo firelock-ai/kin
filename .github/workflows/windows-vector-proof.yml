@@ -203,7 +203,19 @@ jobs:
           # not read the placement as buying coverage under either answer.
           # Nothing here depends on it: the read is captured as a diagnostic and
           # every assertion below runs off `kin embed`'s own report instead.
+          #
+          # `kin status` also exits 9 when nothing admitted the working copy,
+          # which is the same absent daemon seen from the other side, and under
+          # `pipefail` that would fail this leg over a diagnostic it does not
+          # gate on. Accept 9 by number and nothing else, and record which code
+          # this run got, so the reading above stops being an assumption.
+          set +e
           kin.exe status --json | tee "$RUNNER_TEMP/kin-status.json"
+          status_rc=$?
+          set -e
+          printf 'kin status rc=%s (9 = working copy unmeasured)\n' "$status_rc" \
+            | tee "$RUNNER_TEMP/kin-status-exit.txt"
+          if [ "$status_rc" -ne 0 ] && [ "$status_rc" -ne 9 ]; then exit "$status_rc"; fi
 
       - name: Assert the runtime proved semantic search
         shell: bash

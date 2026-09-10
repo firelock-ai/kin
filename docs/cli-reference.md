@@ -111,6 +111,8 @@ kin status [options]
 | `--json` |  | Output machine-readable JSON for editor integrations |
 | `--wait-quiesce <seconds>` | `0` | Seconds to keep re-reading while embedding coverage is only momentarily unobservable, such as an embedding pass or a graph mutation batch spanning the sample. Never waits on a coverage that was observed, nor on an absence a re-read cannot clear. 0 reads once |
 
+Exit 9 means nothing admitted the working copy, so no count in the report describes the files on disk. It is not a failure: every line is still true about durable authority, and the reading is printed either way. It happens when no daemon is holding the repository, because neither command starts one, and `kin admit` is what takes the working copy. The banner at the top of the output says the same thing, and the exit code is the only place the `--json` form can carry it.
+
 ### `kin commit`
 
 Create an exact semantic and artifact commit
@@ -160,6 +162,8 @@ kin diff [base] [head] [options]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--json` |  | Output the exact authority-backed report as JSON |
+
+Exit 9 means the same thing here as it does for `kin status`, and only a workspace endpoint can produce it. A diff between two changes reads durable authority on both sides, needs no admission, and exits 0 with or without a daemon.
 
 ## Ask the graph
 
