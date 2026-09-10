@@ -87,6 +87,7 @@ WINDOWS_INIT_CONTRACT = ROOT / "scripts" / "assert-windows-init-contract.sh"
 WINDOWS_INIT_CONTRACT_POLICY = "scripts/assert-windows-init-contract.sh"
 WINDOWS_WSL2_DOC = ROOT / "docs" / "windows-wsl2.md"
 QUICKSTART_DOC = ROOT / "docs" / "quickstart.md"
+README_REFERENCE_DOC = ROOT / "docs" / "readme-reference.md"
 MCP_TOOLS_DOC = ROOT / "docs" / "mcp-tools.md"
 LLMS_DOC = ROOT / "llms.txt"
 NPM_CANONICAL_README = ROOT / "packages" / "kin" / "README.md"
@@ -10853,6 +10854,56 @@ def assert_native_startup_release_proof(release_cut: str) -> None:
         raise AssertionError("native startup failure must prevent the leg upload")
 
 
+def assert_readme_latest_release_policy(readme: str, readme_reference: str) -> None:
+    """The README must follow the moving latest release, never a pinned tag.
+
+    The badge may be written as Markdown or as the centered HTML header the
+    README also uses; either way it must be the static release-latest-6E56CF
+    image linking to /releases/latest, never a dynamic shields.io badge that
+    tracks whatever tag GitHub currently calls latest. The rewrite moved the
+    npm line and the download-prefix mention out of the README itself and
+    onto the linked reference page, so those two may live on either page;
+    the badge and the pinned-version refusal stay README-only, since that is
+    the page whose visible surface they protect.
+    """
+
+    # A dotted quad is not a version. `\b\d+\.\d+\.\d+\b` matches "127.0.0" inside
+    # "127.0.0.1", so documenting a loopback endpoint tripped this guard with a message
+    # about pinning a release. Refuse a match that has a digit or dot on either side.
+    pinned_readme_version = re.search(r"(?<![\d.])v?\d+\.\d+\.\d+(?![\d.])", readme)
+    if pinned_readme_version:
+        raise AssertionError(
+            "README must follow the proven latest release instead of pinning "
+            f"{pinned_readme_version.group(0)}"
+        )
+    markdown_badge = "[![Latest release](https://img.shields.io/badge/release-latest-6E56CF.svg)]"
+    html_badge = (
+        '<a href="https://github.com/firelock-ai/kin/releases/latest">'
+        '<img src="https://img.shields.io/badge/release-latest-6E56CF.svg" '
+        'alt="Latest release" /></a>'
+    )
+    if markdown_badge not in readme and html_badge not in readme:
+        raise AssertionError(
+            "moving latest-release README reference is missing required policy: "
+            "a release-latest-6E56CF.svg badge linking to /releases/latest, "
+            "as Markdown or as the HTML <a><img> form"
+        )
+    require(readme, "https://github.com/firelock-ai/kin/releases/latest", "moving latest-release README reference")
+    for policy in (
+        "https://github.com/firelock-ai/kin/releases/latest/download/",
+        "npm install -g @kinlab/kin@latest",
+    ):
+        if policy not in readme and policy not in readme_reference:
+            raise AssertionError(
+                "moving latest-release README reference is missing required "
+                f"policy: {policy}"
+            )
+    if "img.shields.io/github/v/release" in readme:
+        raise AssertionError(
+            "README release badge must follow /releases/latest, not an unpromoted GitHub tag"
+        )
+
+
 def main() -> None:
     assert_release_probe_fixtures()
     retired = (
@@ -10904,6 +10955,7 @@ def main() -> None:
     health = HEALTH.read_text(encoding="utf-8")
     setup = SETUP.read_text(encoding="utf-8")
     quickstart = QUICKSTART_DOC.read_text(encoding="utf-8")
+    readme_reference = README_REFERENCE_DOC.read_text(encoding="utf-8")
     mcp_tools = MCP_TOOLS_DOC.read_text(encoding="utf-8")
     npm_canonical_readme = NPM_CANONICAL_README.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
@@ -12350,26 +12402,49 @@ def main() -> None:
                 f"release recovery contains forbidden authority or retry state: {forbidden}"
             )
 
-    # A dotted quad is not a version. `\b\d+\.\d+\.\d+\b` matches "127.0.0" inside
-    # "127.0.0.1", so documenting a loopback endpoint tripped this guard with a message
-    # about pinning a release. Refuse a match that has a digit or dot on either side.
-    pinned_readme_version = re.search(r"(?<![\d.])v?\d+\.\d+\.\d+(?![\d.])", readme)
-    if pinned_readme_version:
-        raise AssertionError(
-            "README must follow the proven latest release instead of pinning "
-            f"{pinned_readme_version.group(0)}"
-        )
-    for policy in (
-        "[![Latest release](https://img.shields.io/badge/release-latest-6E56CF.svg)]",
-        "https://github.com/firelock-ai/kin/releases/latest",
-        "https://github.com/firelock-ai/kin/releases/latest/download/",
-        "npm install -g @kinlab/kin@latest",
-    ):
-        require(readme, policy, "moving latest-release README reference")
-    if "img.shields.io/github/v/release" in readme:
-        raise AssertionError(
-            "README release badge must follow /releases/latest, not an unpromoted GitHub tag"
-        )
+    assert_readme_latest_release_policy(readme, readme_reference)
+    # The guard above has never been seen to fail. Falsify the four ways a
+    # README could still slip a pinned release past it: the good badge simply
+    # missing (proves the Markdown-or-HTML check itself can fail), the image
+    # swapped for a tag-tracking shields.io badge, a pinned x.y.z string added
+    # anywhere in the file, and the npm/download policy absent from both the
+    # README and the reference page it may now live on instead.
+    expect_assertion(
+        "the README carries neither the Markdown nor the HTML latest-release badge",
+        "is missing required policy",
+        lambda: assert_readme_latest_release_policy(
+            readme.replace(
+                "https://img.shields.io/badge/release-latest-6E56CF.svg",
+                "https://example.invalid/no-badge-here",
+                1,
+            ),
+            readme_reference,
+        ),
+    )
+    expect_assertion(
+        "the README badge tracks a GitHub tag instead of the moving latest release",
+        "must follow /releases/latest, not an unpromoted GitHub tag",
+        lambda: assert_readme_latest_release_policy(
+            readme + '\n<img src="https://img.shields.io/github/v/release/firelock-ai/kin.svg" />\n',
+            readme_reference,
+        ),
+    )
+    expect_assertion(
+        "neither the README nor the reference page mentions the npm install line",
+        "is missing required policy: npm install -g @kinlab/kin@latest",
+        lambda: assert_readme_latest_release_policy(
+            readme,
+            readme_reference.replace("npm install -g @kinlab/kin@latest", "", 1),
+        ),
+    )
+    expect_assertion(
+        "the README pins a release version instead of following latest",
+        "must follow the proven latest release instead of pinning",
+        lambda: assert_readme_latest_release_policy(
+            readme + "\n\nSee kin v0.7.10 for details.\n",
+            readme_reference,
+        ),
+    )
 
     first_run_start = install_proof.index(
         "      - name: First-run repository, daemon, and setup proof"
