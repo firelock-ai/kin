@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.12] - 2026-09-10
+
+### Changed
+
+- Stop reporting a red wave pull request as a failure of main (#1670)
+- Report an unadmitted working copy in the headline and the exit code (#1671)
+- Rewrite the README and move the detail to a reference page (#1663)
+- Move the immutable kin-vfs release checkout to the tree that builds 0.4.25 (#1672)
+- Measure the working copy before grading a status read (#1675)
+- Alarm the release sentinel instead of skipping it (#1673)
+- Dispatch RC Build on the App token when granted, and nudge release-tag directly (#1676)
+- Replace the superseded category line on every surface kin ships (#1678)
+- Read the language table from the README's reference page in CI (#1680)
+
+
 ## [0.7.11] - 2026-09-10
 
 ### Changed
