@@ -16789,7 +16789,64 @@ async fn repo_files(
     Ok(Json(RepoFilesResponse { repo_id, files }))
 }
 
+/// Refuse a ref listing that cannot name one identity for one of its refs.
+///
+/// The message names the ref. `repo_history` does not need to, because it
+/// resolves exactly one ref and its caller already knows which; a listing over
+/// forty refs that says only that it could not be produced is an operator dead
+/// end.
+///
+/// It separates the two cases because they mean different things. A default
+/// ref that will not resolve means this repository is already unreadable
+/// through `/history`, `/files` and graph materialization, so this refusal is
+/// one more symptom of a state the operator can already see elsewhere. Any
+/// other ref that will not resolve surfaces here first and nowhere else, so
+/// the message says that is what happened rather than implying the whole
+/// repository is dark.
+fn unresolvable_ref_error(
+    name: &kin_model::RefName,
+    is_default: bool,
+    error: impl std::fmt::Display,
+) -> (StatusCode, String) {
+    let scope = if is_default {
+        format!(
+            "default ref {name} does not resolve to a semantic change, so this repository is \
+             already unreadable through /history and /files"
+        )
+    } else {
+        format!(
+            "ref {name} does not resolve to a semantic change, so this listing cannot name one \
+             identity for it"
+        )
+    };
+    (StatusCode::FAILED_DEPENDENCY, format!("{scope}: {error}"))
+}
+
 /// GET /repos/{repo_id}/refs — list repository-v6 refs.
+///
+/// Every `commit_id` here is a semantic change id, resolved through the same
+/// persisted authority `/repos/{repo_id}/history` resolves through, so the two
+/// routes cannot name one ref differently.
+///
+/// Rendering the stored target instead is what made them disagree (FIR-3488).
+/// A `RefTarget::Change` came out as a semantic change id, a
+/// `RefTarget::ExternalObject` as a raw Git object id and a
+/// `RefTarget::Symbolic` as a ref name, all under one field called
+/// `commit_id`, and a consumer could not tell which it had received.
+/// Measuring the hex width does not separate them either, because
+/// [`kin_model::GitObjectId`] has a `Sha256` variant whose `Display` is plain
+/// hex, so a Git object id is forty OR sixty-four lowercase hex characters.
+/// Reading a Git object id off this route and handing it to any
+/// change-keyed route is how hosted `git clone` broke under FIR-3444.
+///
+/// [`kin_remote::repository_transfer::repository_ref_advertisement`] already
+/// answers this same question on this same authority: it resolves every ref,
+/// carries the raw [`kin_model::RefTarget`] in a separate typed field rather
+/// than merged into that string, and refuses the whole advertisement when one
+/// ref will not resolve. This route follows it. A ref that does not resolve
+/// refuses here for the reason `repo_history` and `repo_files` already refuse:
+/// a graph gap is reported rather than filled with a value shaped like an
+/// answer.
 async fn repo_refs(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
@@ -16803,24 +16860,33 @@ async fn repo_refs(
             None
         }
     });
+    // The envelope this route already holds is the resolver's whole input, so
+    // resolving costs no second authority open and keeps the generation-bound
+    // metadata read this route exists to preserve.
+    let resolved_change_id = |repository_ref: &kin_model::RepositoryRef| {
+        crate::state::resolve_repository_target(&metadata, &repository_ref.target)
+            .map(|change_id| change_id.to_string())
+            .map_err(|error| {
+                unresolvable_ref_error(
+                    &repository_ref.name,
+                    default_name.as_ref() == Some(&repository_ref.name),
+                    error,
+                )
+            })
+    };
     let selected = default_repository_ref(&metadata)?;
-    let selected_head = selected.map(|repository_ref| match &repository_ref.target {
-        kin_model::RefTarget::Change { change_id } => change_id.to_string(),
-        kin_model::RefTarget::ExternalObject { object } => object.oid.to_string(),
-        kin_model::RefTarget::Symbolic { target } => target.to_string(),
-    });
+    let selected_head = match selected {
+        Some(repository_ref) => Some(resolved_change_id(repository_ref)?),
+        None => None,
+    };
     let refs = metadata
         .ref_state
         .refs
         .iter()
         .map(|repository_ref| {
             let name = repository_ref.name.to_string();
-            let commit_id = match &repository_ref.target {
-                kin_model::RefTarget::Change { change_id } => change_id.to_string(),
-                kin_model::RefTarget::ExternalObject { object } => object.oid.to_string(),
-                kin_model::RefTarget::Symbolic { target } => target.to_string(),
-            };
-            RepoRefEntry {
+            let commit_id = resolved_change_id(repository_ref)?;
+            Ok(RepoRefEntry {
                 short_name: short_ref_name(&repository_ref.name),
                 name,
                 kind: if repository_ref.name.is_branch() {
@@ -16839,9 +16905,9 @@ async fn repo_refs(
                 is_default_branch: default_name
                     .as_ref()
                     .is_some_and(|default| default == &repository_ref.name),
-            }
+            })
         })
-        .collect();
+        .collect::<std::result::Result<Vec<_>, (StatusCode, String)>>()?;
     let default_branch = default_name.as_ref().map(short_ref_name);
     Ok(Json(RepoRefsResponse {
         repo_id,
@@ -35152,6 +35218,183 @@ mod tests {
             listed.repos.contains(&repo_id),
             "the advertised id must appear in the repo listing: {:?}",
             listed.repos
+        );
+    }
+
+    /// FIR-3488. One ref, one identity, on both routes that publish it.
+    ///
+    /// The ref under test has to be a `RefTarget::ExternalObject`, which is
+    /// what a Git import leaves on `refs/heads/main`. A `RefTarget::Change`
+    /// resolves to itself, so its stored form and its resolved form are the
+    /// same sixty-four characters and no assertion here could tell the two
+    /// routes apart: a test built on one would pass forever while proving
+    /// nothing. The two preconditions below pin that the fixture really does
+    /// make the candidates disagree.
+    ///
+    /// The assertion that fails when `repo_refs` goes back to rendering the
+    /// stored target is the `refs.head_ref == history.head_ref` equality, and
+    /// the one below it names the reason: a raw Git object id is forty OR
+    /// sixty-four lowercase hex characters, so a consumer cannot recover the
+    /// identity from the string it received.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refs_and_history_name_one_git_imported_ref_with_one_identity() {
+        install_test_registry_override();
+        let repository =
+            std::env::temp_dir().join(format!("kin-daemon-refs-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&repository).unwrap();
+        run_test_git(&repository, ["init", "--initial-branch=main"]);
+        run_test_git(&repository, ["config", "user.email", "kin@example.invalid"]);
+        run_test_git(
+            &repository,
+            ["config", "user.name", "Kin Ref Identity Test"],
+        );
+        std::fs::write(repository.join("README.md"), b"ref identity fixture\n").unwrap();
+        run_test_git(&repository, ["add", "--all"]);
+        run_test_git(&repository, ["commit", "-s", "-m", "ref identity fixture"]);
+
+        let layout = kin_core::init_from_git(&repository).unwrap().layout;
+
+        let (git_object_id, resolved_head) = {
+            let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+            let lease = authority.manager.read_authority();
+            let main = kin_model::RefName::branch(b"main").unwrap();
+            let target = lease.resolve_ref_target(&main).unwrap().unwrap();
+            let kin_model::RefTarget::ExternalObject { object } = &target else {
+                panic!(
+                    "a Git import must leave refs/heads/main on an external object, \
+                     and this fixture cannot exercise FIR-3488 without one: {target:?}"
+                );
+            };
+            assert_eq!(
+                object.kind,
+                kin_model::ExternalObjectKind::Commit,
+                "the imported branch must point at a commit object"
+            );
+            let oid = object.oid.to_string();
+            let resolved = lease.resolve_target_change_id(&target).unwrap().to_string();
+            (oid, resolved)
+        };
+        assert_ne!(
+            git_object_id, resolved_head,
+            "nothing here can distinguish the two routes unless the stored Git object id and \
+             the semantic change id it aliases to are different strings"
+        );
+
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        let repo_id = advertised_repo_id(Arc::clone(&state)).await;
+
+        let (refs_status, refs_body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/refs")).await;
+        assert_eq!(
+            refs_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&refs_body)
+        );
+        let refs: RepoRefsResponse = serde_json::from_slice(&refs_body).unwrap();
+
+        let (history_status, history_body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/history")).await;
+        assert_eq!(
+            history_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&history_body)
+        );
+        let history: RepoHistoryResponse = serde_json::from_slice(&history_body).unwrap();
+
+        assert_eq!(
+            refs.head_ref, history.head_ref,
+            "one ref read at one moment must carry one identity on both routes"
+        );
+        assert_eq!(
+            refs.head_ref.as_deref(),
+            Some(resolved_head.as_str()),
+            "the published identity must be the semantic change id the authority resolves"
+        );
+        assert_ne!(
+            refs.head_ref.as_deref(),
+            Some(git_object_id.as_str()),
+            "publishing the stored Git object id is the defect, and a consumer cannot detect it \
+             by width: kin_model::GitObjectId carries a Sha256 variant, so a Git object id is \
+             forty OR sixty-four lowercase hex characters"
+        );
+
+        let main_entry = refs
+            .refs
+            .iter()
+            .find(|entry| entry.name == "refs/heads/main")
+            .expect("the imported branch must appear in the ref listing");
+        assert_eq!(
+            Some(main_entry.commit_id.as_str()),
+            history.head_ref.as_deref(),
+            "the per-ref commit_id must be the identity /history publishes for the same ref"
+        );
+        assert!(
+            main_entry
+                .commit_id
+                .starts_with(&main_entry.short_commit_id),
+            "the short form must abbreviate the identity actually published: {} against {}",
+            main_entry.short_commit_id,
+            main_entry.commit_id
+        );
+        assert_eq!(
+            history
+                .commits
+                .first()
+                .map(|commit| commit.commit_id.as_str()),
+            Some(main_entry.commit_id.as_str()),
+            "the head of history and the ref that names it must be one change"
+        );
+    }
+
+    /// The refusal an operator reads when one ref will not resolve.
+    ///
+    /// Covered here rather than through the route, because admission refuses
+    /// to persist a ref whose target has no semantic change behind it
+    /// (`validate_target_exists` needs the external object present, alias
+    /// admission needs a commit projection), so a route test would have to
+    /// manufacture an authority the product cannot produce. What that leaves
+    /// untested is the wiring from the resolver's error to this function; what
+    /// it does test is the half an operator actually reads.
+    #[test]
+    fn an_unresolvable_ref_refusal_names_the_ref_and_says_which_case_it_is() {
+        let main = kin_model::RefName::branch(b"main").unwrap();
+        let stale = kin_model::RefName::tag(b"v0.1.0").unwrap();
+
+        let (default_status, default_message) =
+            unresolvable_ref_error(&main, true, "no semantic change alias");
+        assert_eq!(default_status, StatusCode::FAILED_DEPENDENCY);
+        assert!(
+            default_message.contains("refs/heads/main"),
+            "the refusal must name the ref it could not resolve: {default_message}"
+        );
+        assert!(
+            default_message.contains("/history"),
+            "a default ref that will not resolve is already visible on the other read routes, \
+             and the message must send the operator there: {default_message}"
+        );
+        assert!(
+            default_message.contains("no semantic change alias"),
+            "the resolver's own reason must survive into the refusal: {default_message}"
+        );
+
+        let (other_status, other_message) =
+            unresolvable_ref_error(&stale, false, "does not peel to a commit");
+        assert_eq!(other_status, StatusCode::FAILED_DEPENDENCY);
+        assert!(
+            other_message.contains("refs/tags/v0.1.0"),
+            "the refusal must name the ref it could not resolve: {other_message}"
+        );
+        assert!(
+            !other_message.contains("/history"),
+            "a non-default ref failing surfaces on this route alone and must not be reported as \
+             a repository that is already dark: {other_message}"
+        );
+        assert!(
+            other_message.contains("does not peel to a commit"),
+            "the resolver's own reason must survive into the refusal: {other_message}"
         );
     }
 
