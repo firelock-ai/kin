@@ -34,14 +34,31 @@ fault above lived in the seam between those pieces, and each piece was fine.
 What it grades
 
     CHECK 1 FIR-3498 PASS|FAIL|UNREADABLE the page's payload carries nodes
-    CHECK 2 FIR-3498 PASS|FAIL|UNREADABLE the payload reports the population it sampled
+    CHECK 2 FIR-3498 PASS|FAIL|UNREADABLE the payload carries a coherent population field
     CHECK 3 FIR-3498 PASS|FAIL|UNREADABLE a resolvable-nothing store refuses, non-zero
     CHECK 4 FIR-3498 PASS|FAIL|UNREADABLE that refusal names the directory it read
+    CHECK 5 FIR-3498 PASS|FAIL|UNREADABLE the offline admin read draws a populated store
+    CHECK 6 FIR-3498 PASS|FAIL|UNREADABLE that draw came from the local arm, not a daemon
 
 Checks 3 and 4 are separate because they fail differently. A build that refused
 without naming the path reds 4 alone, and that is the failure that matters most:
 a refusal nobody can act on sends the reader back to guessing, which is where
 this whole class started.
+
+Checks 5 and 6 are the reported symptom itself, and they are the reason this
+suite is not only Arm A. Arm A exercises the daemon export and Arm B a refusal,
+so the one path that actually served the founder an empty canvas, a populated
+store with no daemon reachable and the admin escape hatch set, would otherwise
+be graded here by nothing. Check 6 is check 5's identity control: a daemon that
+came up anyway would satisfy the node count while proving nothing, so check 5
+reports UNREADABLE rather than PASS unless the run announced the fallback.
+
+What check 2 can and cannot prove. On a fixture this size the export never
+crosses its 1,400-node cap, so `sampled` is always false and the grader reduces
+to "the field is present and is at least the drawn count". That is exactly the
+pre-fix shape it exists to catch, a payload with no population at all, and it is
+not a test of the sampling arithmetic, which the `graph_export` unit tests own.
+The title says field rather than sample for that reason.
 """
 
 import argparse
@@ -161,10 +178,23 @@ def refusal_is_nonzero(rc):
     return isinstance(rc, int) and rc != 0
 
 
+def drew_from_the_local_arm(text):
+    """The run took the offline/admin local read, not the daemon.
+
+    Arm C's whole subject is the local arm, so it has to prove which path drew
+    the page. Without this, a daemon that came up anyway would satisfy the
+    non-empty check and the arm would report a local read it never performed.
+    The sentence is the one `graph_viz.rs` logs before it falls back, and the
+    arm sets `RUST_LOG` so it reaches stderr.
+    """
+    return "drawing from the local store directly" in (text or "")
+
+
 GRADERS = {
     "payload_has_nodes": payload_has_nodes,
     "payload_reports_population": payload_reports_population,
     "refusal_is_nonzero": refusal_is_nonzero,
+    "drew_from_the_local_arm": drew_from_the_local_arm,
 }
 
 
@@ -192,6 +222,18 @@ GOOD_PAYLOAD = {
 # A sample larger than the population it claims to come from is not a smaller
 # graph, it is an incoherent one, and it must not read as a healthy payload.
 INCOHERENT_PAYLOAD = dict(GOOD_PAYLOAD, entity_count=0)
+
+# What the CLI logs on each arm, as `graph_viz.rs` writes it.
+LOCAL_ARM_LOG = (
+    "Serving kin graph at http://127.0.0.1:4220/\n"
+    "WARN kin_cli::commands::graph_viz: daemon unavailable; drawing from the "
+    "local store directly (KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN) "
+    "command=\"kin graph viz\"\n"
+)
+DAEMON_ARM_LOG = (
+    "1,400 of 20,298 entities and 3,102 of 86,814 relations (sampled) at root abc seq 12\n"
+    "Serving kin graph at http://127.0.0.1:4220/\n"
+)
 
 NAMESPACE = "/tmp/store/.kin/kindb/c2fd2519-1d5a-4292-8511-7e9196accade"
 REFUSAL_WITH_PATH = (
@@ -230,6 +272,12 @@ def self_test():
         # server still listening over a namespace that is not there is the
         # regression, not evidence against it.
         ("refusal_is_nonzero", False, None),
+        ("drew_from_the_local_arm", True, LOCAL_ARM_LOG),
+        # A daemon that came up anyway. The page would still be non-empty, so
+        # without this row Arm C would report a local read it never took.
+        ("drew_from_the_local_arm", False, DAEMON_ARM_LOG),
+        ("drew_from_the_local_arm", False, ""),
+        ("drew_from_the_local_arm", False, None),
     ]
     failures = []
     for name, want, value in cases:
@@ -386,6 +434,12 @@ def namespace_of(work):
 def fetch_payload(kin, env, work, port, timeout=180):
     """Start `kin graph viz`, read `/api/graph.json`, stop it.
 
+    Returns `(payload, text, rc)`. `text` is everything the server printed, and
+    it is collected on every path rather than only on an early exit, because an
+    arm has to be able to prove WHICH path drew the page. A run that only
+    checked the payload could not tell a local admin draw from a daemon one, and
+    an arm whose identity rests on silence is not an arm.
+
     The process is killed in a `finally`: a server left listening would hold the
     port and make the next arm's failure look like a bind error.
     """
@@ -397,23 +451,34 @@ def fetch_payload(kin, env, work, port, timeout=180):
         stderr=subprocess.STDOUT,
         text=True,
     )
+    payload = None
+    rc = None
     deadline = time.time() + timeout
     try:
         while time.time() < deadline:
             if process.poll() is not None:
-                return None, process.communicate()[0], process.returncode
+                rc = process.returncode
+                break
             try:
                 with urllib.request.urlopen(
                     "http://127.0.0.1:%d/api/graph.json" % port, timeout=5
                 ) as response:
-                    return json.loads(response.read().decode("utf-8")), "", 0
+                    payload = json.loads(response.read().decode("utf-8"))
+                    rc = 0
+                    break
             except (urllib.error.URLError, OSError, ValueError):
                 time.sleep(0.25)
-        return None, "the page never answered within %ds" % timeout, None
     finally:
         if process.poll() is None:
             process.kill()
             process.wait(timeout=30)
+        try:
+            text = process.communicate(timeout=30)[0] or ""
+        except subprocess.TimeoutExpired:
+            text = ""
+    if payload is None and rc is None:
+        text = "the page never answered within %ds. %s" % (timeout, text)
+    return payload, text, rc
 
 
 def run_refusal(kin, env, work, port, timeout=180):
@@ -467,10 +532,12 @@ def main():
     daemon = Path(args.daemon).resolve() if args.daemon else None
 
     drawn = Result(1, "the page's payload carries nodes")
-    population = Result(2, "the payload reports the population it sampled")
+    population = Result(2, "the payload carries a coherent population field")
     refuses = Result(3, "an unresolvable store refuses, non-zero")
     names_path = Result(4, "that refusal names the directory it read")
-    results = [drawn, population, refuses, names_path]
+    local_draw = Result(5, "the offline admin read draws a populated store")
+    local_arm = Result(6, "that draw came from the local arm, not a daemon")
+    results = [drawn, population, refuses, names_path, local_draw, local_arm]
 
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
@@ -564,6 +631,76 @@ def main():
                     names_path.bad(
                         "the refusal does not name %s, so a reader cannot act on "
                         "it: %s" % (namespace, text[-400:])
+                    )
+
+        # Arm C: the exact shape the founder hit. A populated store, no daemon
+        # to answer, the admin escape hatch set, and the page must still draw.
+        #
+        # Arm A grades the daemon export and Arm B grades a refusal, so without
+        # this the one path that actually served the empty canvas is graded by
+        # nothing here. The daemon is made unreachable by pointing
+        # `KIN_DAEMON_URL` at a port nothing listens on rather than by killing a
+        # process: `connect_for_command` honours that variable first and would
+        # otherwise auto-start a daemon and quietly turn this back into Arm A.
+        home_c = tmp / "home-c"
+        home_c.mkdir()
+        work_c = tmp / "work-c"
+        env_c = suite_env(home_c, daemon)
+        init_c = build_store(kin, env_c, work_c)
+        if init_c.returncode != 0:
+            note = "kin init failed on the local-draw fixture: %s" % (
+                (init_c.stdout + init_c.stderr)[-400:]
+            )
+            local_draw.unknown(note)
+            local_arm.unknown(note)
+        else:
+            subprocess.run(
+                [str(kin), "daemon", "stop"],
+                cwd=str(work_c),
+                env=env_c,
+                capture_output=True,
+                text=True,
+            )
+            offline_env = dict(
+                env_c,
+                KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN="1",
+                KIN_DAEMON_URL="http://127.0.0.1:%d" % free_port(),
+                # The fallback is announced at warn level and the arm's identity
+                # rests on reading it, so ask for it explicitly rather than
+                # hoping the default filter carries it.
+                RUST_LOG="kin_cli=warn",
+            )
+            payload, text, rc = fetch_payload(kin, offline_env, work_c, free_port())
+            if payload is None:
+                note = "no payload from the offline admin draw (exit %r): %s" % (
+                    rc,
+                    (text or "")[-400:],
+                )
+                local_draw.unknown(note)
+                local_arm.unknown(note)
+            elif not drew_from_the_local_arm(text):
+                # Identity first. A page drawn by a daemon that came up anyway
+                # would satisfy the node count while proving nothing about the
+                # path under test, so that reads UNREADABLE rather than PASS.
+                note = (
+                    "this run never reported the local fallback, so it is not the "
+                    "local arm and its node count says nothing about it: %s"
+                    % (text or "")[-400:]
+                )
+                local_draw.unknown(note)
+                local_arm.unknown(note)
+            else:
+                local_arm.ok("the run reported the offline admin fallback")
+                node_count = len(payload.get("nodes") or [])
+                if payload_has_nodes(payload):
+                    local_draw.ok(
+                        "the offline admin read drew %d node(s)" % node_count
+                    )
+                else:
+                    local_draw.bad(
+                        "the offline admin read drew %d nodes over a store kin "
+                        "init just admitted; this is the reported defect exactly"
+                        % node_count
                     )
 
     for result in results:

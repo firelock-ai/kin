@@ -41,12 +41,6 @@ pub fn open_kindb_snapshot(
     open_kindb_snapshot_with_mode(layout, false)
 }
 
-pub fn open_kindb_snapshot_read_only(
-    layout: &kin_core::KinLayout,
-) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
-    open_kindb_snapshot_with_mode(layout, true)
-}
-
 fn open_kindb_snapshot_with_mode(
     layout: &kin_core::KinLayout,
     read_only: bool,
@@ -125,25 +119,19 @@ pub fn open_snapshot_local(
         ))
     };
 
-    // The same bounded retry the flat open carried. A CLI reader racing a
-    // maintenance process for the namespace's recovery lock is a transient
-    // condition, and reporting it as a broken store would be a false diagnosis.
-    let mut attempts = 0usize;
-    let mut delay = Duration::from_millis(SNAPSHOT_OPEN_INITIAL_DELAY_MS);
-    let manager = loop {
-        match binding.open_manager() {
-            Ok(manager) => break manager,
-            Err(kin_db::KinDbError::LockError(message))
-                if attempts + 1 < SNAPSHOT_OPEN_MAX_ATTEMPTS
-                    && is_transient_lock_error(&message) =>
-            {
-                attempts += 1;
-                thread::sleep(delay);
-                delay = std::cmp::min(delay.saturating_mul(2), Duration::from_millis(100));
-            }
-            Err(error) => return Err(describe("cannot open repository authority", &error)),
-        }
-    };
+    // No retry loop here, deliberately, and this is the reason rather than an
+    // omission. The flat open above retries `KinDbError::LockError` because
+    // `SnapshotManager` reports contention that way. The repository-authority
+    // path does not: kin-db takes the namespace lock with a BLOCKING
+    // `lock_exclusive()`, so a reader racing another process waits rather than
+    // erroring, and the one failure that call can return arrives as a
+    // `StorageError` (kin-db 0.7.110 `storage/backend.rs:6038-6043`), which
+    // `is_transient_lock_error` never matches because it only ever sees
+    // `LockError`. A retry carried over here would be a loop that cannot fire,
+    // reading as protection while providing none.
+    let manager = binding
+        .open_manager()
+        .map_err(|error| describe("cannot open repository authority", &error))?;
 
     let lease = manager.read_authority();
     let snapshot = lease

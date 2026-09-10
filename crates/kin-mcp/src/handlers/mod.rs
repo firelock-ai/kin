@@ -498,9 +498,7 @@ mod tests {
         let manifest =
             kin_core::KinManifest::load(&root.join(".kin").join("manifest.json")).unwrap();
         let digest = hash.to_string();
-        root.join(".kin")
-            .join("kindb")
-            .join(manifest.repo_id)
+        kin_core::kindb_namespace_in(&root.join(".kin").join("kindb"), &manifest.repo_id)
             .join("source-blobs")
             .join("sha256")
             .join(&digest[..2])

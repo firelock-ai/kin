@@ -2406,7 +2406,7 @@ kin graph export [options]
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--limit <n>` | `1400` | Cap the exported node count, sampled by degree with per-module quotas. `0` exports every entity |
+| `--limit <N>` | `1400` | Cap the exported node count, sampled by degree with per-module quotas. `0` exports every entity |
 | `--kinds <kinds>` |  | Keep only these entity kinds, comma-separated (`function,class`). Any spelling of a kind name matches |
 | `--path <prefix>` |  | Keep only entities whose file starts with this repository path prefix |
 | `--include <fields>` |  | Attach optional node fields, comma-separated (`signature,line`) |

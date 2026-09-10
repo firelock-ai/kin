@@ -288,6 +288,38 @@ if ((${#unexpected_cli_admin_bootstrap_reads[@]} > 0)); then
   exit 1
 fi
 
+# Direct local storage reads from a command module.
+#
+# The scan above governs `open_snapshot_explicit_admin_read_only`, which carries
+# its own daemon-first authority order and env gate. `open_snapshot_local` is the
+# raw local open underneath it, and a command calling it directly gets neither
+# unless it arranges them itself. `graph_viz.rs` does arrange them, at
+# `resolve_payload`: daemon first, then `daemon_bootstrap_admin_allowed()`, then a
+# refusal. It is the one command allowed to, and it is named here so the next one
+# has to be a decision rather than an omission.
+#
+# This scan exists because the allowlist above lost its `graph_viz.rs` entry when
+# that file stopped calling the wrapper, which left its new direct call ungoverned
+# by anything in this script.
+unexpected_cli_direct_local_opens=()
+while IFS=: read -r file line _; do
+  [[ -z "$file" ]] && continue
+  file="${file#"$repo_root/"}"
+  case "$file" in
+    crates/kin-cli/src/commands/graph_viz.rs)
+      ;;
+    *)
+      unexpected_cli_direct_local_opens+=("$file:$line")
+      ;;
+  esac
+done < <(rg -n 'open_snapshot_local\(' "$repo_root/crates/kin-cli/src/commands" -g '*.rs')
+
+if ((${#unexpected_cli_direct_local_opens[@]} > 0)); then
+  echo "Unexpected direct local graph open in a CLI command; route it through the daemon, or add the file here with the authority order it implements:" >&2
+  printf '  %s\n' "${unexpected_cli_direct_local_opens[@]}" >&2
+  exit 1
+fi
+
 unexpected_session_registry_hits=()
 while IFS=: read -r file line _; do
   [[ -z "$file" ]] && continue

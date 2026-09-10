@@ -225,25 +225,40 @@ fn a_namespace_without_its_authority_record_fails_loud_and_names_the_path() {
     );
 }
 
-/// The resolver and the backend spell the namespace the same way.
+/// The resolver names the directory the import actually wrote, found without
+/// asking the resolver.
 ///
-/// Both halves of the original defect were path rules that disagreed while each
-/// looked reasonable on its own, so this asserts the agreement directly against
-/// a directory the import actually created.
+/// Both halves of the original defect were path rules that each looked
+/// reasonable alone and disagreed with the product, so the expectation here is
+/// discovered from the store rather than restated: scan `.kin/kindb/` for the
+/// one directory carrying an `authority.json` and require the resolver to name
+/// exactly it. Comparing `kindb_namespace_path(id)` against
+/// `kindb_dir().join(id)` would only restate that function's own body and could
+/// not fail; the exact-path spelling is pinned by the unit test in
+/// `kin_core::layout` instead. This case exists to catch the resolver drifting
+/// away from the product, which is the failure that actually happened.
 #[test]
 fn the_layout_resolver_names_the_directory_the_import_created() {
     let fixture = admitted_store();
 
+    let kindb = fixture.layout.kindb_dir();
+    let mut written: Vec<std::path::PathBuf> = std::fs::read_dir(&kindb)
+        .expect("read the kindb directory")
+        .map(|entry| entry.expect("read a kindb entry").path())
+        .filter(|path| path.join("authority.json").is_file())
+        .collect();
+    written.sort();
+
+    assert_eq!(
+        written.len(),
+        1,
+        "a single-repository store must hold exactly one authority namespace \
+         under {}, found {written:?}",
+        kindb.display()
+    );
     assert_eq!(
         fixture.namespace(),
-        fixture
-            .layout
-            .kindb_dir()
-            .join(fixture.repository_id.as_str())
-    );
-    assert!(
-        fixture.namespace().is_dir(),
-        "the resolver must name a directory that exists after a real import: {}",
-        fixture.namespace().display()
+        written[0],
+        "the resolver must name the namespace the import wrote"
     );
 }
