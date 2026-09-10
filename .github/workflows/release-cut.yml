@@ -784,7 +784,16 @@ jobs:
       # refuses either), so this sends nothing for it to misread as break
       # glass; `reason` is unread by that workflow and exists only for a
       # person scanning the Actions log.
+      # Best-effort, on purpose. This nudge already has two fallbacks that
+      # need no code here to work: release-tag.yml's own 15-minute schedule,
+      # and CI's workflow_run trigger on the next ordinary push to main. A
+      # transient API failure on this call must not redden the publish job
+      # of a cut that already durably wrote the record this step only
+      # announces; continue-on-error plus the warning below make that true
+      # the same way the dispatch-token mint in the arm job does.
       - name: Nudge release-tag to evaluate now
+        id: nudge-release-tag
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           CANDIDATE: ${{ needs.select.outputs.candidate }}
@@ -793,6 +802,11 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/dispatches" \
             -f event_type=release_tag_evaluate \
             -f "client_payload[reason]=release-cut run ${GITHUB_RUN_ID} published preflight.json for ${CANDIDATE}"
+
+      - name: Warn when the release-tag nudge did not go out
+        if: steps.nudge-release-tag.outcome != 'success'
+        run: |
+          echo "::warning::the direct nudge to release-tag.yml did not go out for this candidate; release-tag.yml still reaches it through its own 15-minute schedule and through CI's workflow_run trigger, so the mint is not blocked, only slower"
 
       - name: Say what the stranger will run next
         env:

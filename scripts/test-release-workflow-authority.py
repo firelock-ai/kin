@@ -10980,6 +10980,12 @@ def assert_release_tag_nudge_uses_app_identity(release_cut: str) -> None:
     kin-release-bot token scoped to contents:write for kin-evidence-publish;
     this reuses that exact token rather than minting a second one or reaching
     for github.token.
+
+    The nudge must also be best-effort. It has two fallbacks that need no
+    code here to work at all, release-tag.yml's own 15-minute schedule and
+    CI's workflow_run trigger, so a transient API failure on this one call
+    must not redden the publish job of a cut that already durably wrote the
+    record this step only announces.
     """
 
     step = workflow_step_source(
@@ -10987,6 +10993,7 @@ def assert_release_tag_nudge_uses_app_identity(release_cut: str) -> None:
     )
     require(step, "release_tag_evaluate", "release-tag nudge")
     require(step, "repos/${GITHUB_REPOSITORY}/dispatches", "release-tag nudge")
+    require(step, "continue-on-error: true", "release-tag nudge")
     bindings = [
         match.group("token") for match in STEP_ENV_TOKEN_BINDING.finditer(step)
     ]
@@ -11097,6 +11104,19 @@ def main() -> None:
                     lambda _: f"          GH_TOKEN: {DEFAULT_WORKFLOW_TOKEN}",
                     release_tag_nudge,
                     count=1,
+                ),
+                1,
+            )
+        ),
+    )
+    expect_assertion(
+        "release-tag nudge loses its continue-on-error",
+        "is missing required policy: continue-on-error: true",
+        lambda: assert_release_tag_nudge_uses_app_identity(
+            release_cut.replace(
+                release_tag_nudge,
+                release_tag_nudge.replace(
+                    "        continue-on-error: true\n", "", 1
                 ),
                 1,
             )
