@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.9] - 2026-09-10
+
+### Changed
+
+- fix(update): converge auto-update instead of deferring forever (#1650)
+- Drop the stale Google Chrome apt list in ci-apt-install.sh (#1651)
+- Publish a repository stage's owner record before its stage directory (#1647)
+- Install the macOS preflight leg's language servers and keep its receipts (#1655)
+- ci(install-proof): prove the real update path moves a real installation (#1652)
+- Adopt kin-db 0.7.110 and audit the StorageBackend surface with it (#1657)
+- Replace the retired category line in the architecture overview (#1656)
+- Record v0.7.8 as an abandoned release tag (#1659)
+
+
 ## [0.7.8] - 2026-09-09
 
 ### Changed
