@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.11] - 2026-09-10
+
+### Changed
+
+- Resolve every ref identity on the daemon's refs route (#1666)
+- Re-vendor the preflight proof flow with its unmeasured-exit tolerance (#1667)
+- Hold the coupled kin-vfs-core pin until the release input backs it (#1668)
+
+
 ## [0.7.10] - 2026-09-10
 
 ### Changed
