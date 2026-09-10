@@ -119,6 +119,12 @@ def run(cmd, cwd=None, env=None, timeout=900):
 # Pure functions, so --self-test can drive every one against the input that must
 # produce the opposite verdict.
 
+# The line `kin status` leads with when nothing admitted the working copy
+# (FIR-3420). Named once so the measured-read control below cannot drift from
+# the product's own wording without this file noticing.
+UNMEASURED_BANNER = "Working copy: NOT MEASURED"
+
+
 def head_line(text):
     """The `Head:` line `kin status` printed, or None when it printed none.
 
@@ -297,6 +303,47 @@ class Suite(object):
             print("  $ kin %s -> rc=%s" % (" ".join(args), rc))
         return rc, out, err
 
+    def measured_status(self, repo):
+        """`kin status` over a working copy something actually admitted.
+
+        A bare `kin status` never starts a daemon, so with none serving it
+        reports durable authority alone and exits
+        `EXIT_WORKING_COPY_UNMEASURED`. That is the product being honest and it
+        is not what this suite grades: every check here is about the HEAD an
+        authority read reports, and a read that measured nothing is the wrong
+        instrument for that question rather than a defect in it.
+
+        So the read is made measured instead of tolerated. `kin admit` starts
+        the daemon and takes the working copy, exactly as
+        `vcs_read_surfaces_repro.py` does, and the status after it answers about
+        a working copy the graph has actually seen. The admission is a no-op on
+        an unmodified fixture and never moves HEAD, which is the only thing the
+        graders below read.
+
+        Returns `(rc, text, gap)`. `gap` is the reason the read is not measured,
+        or None when it is, so a caller reports a fixture that could not reach
+        this state as UNREADABLE rather than grading it.
+        """
+        arc, aout, aerr = self.kin_run(repo, ["admit"])
+        if arc != 0:
+            return (arc, (aout or "") + (aerr or ""),
+                    "kin admit exited %s, so nothing admitted the working copy: %s"
+                    % (arc, ((aerr or aout) or "")[-200:]))
+        rc, out, err = self.kin_run(repo, ["status"])
+        text = out or ""
+        if rc != 0:
+            return (rc, text + (err or ""),
+                    "kin status exited %s after an admission that succeeded: %s"
+                    % (rc, ((err or out) or "")[-200:]))
+        # The positive control on the state, not on the answer. If this read
+        # were still unmeasured the banner would say so, and every grader below
+        # would be reading durable authority alone while believing otherwise.
+        if UNMEASURED_BANNER in text:
+            return (rc, text,
+                    "the status after the admission still reports the working copy as "
+                    "unmeasured, so the pass did not take")
+        return (rc, text, None)
+
     def git(self, repo, args, timeout=300):
         rc, out, err = run(["git"] + args, cwd=repo, env=self.env, timeout=timeout)
         if rc != 0:
@@ -375,10 +422,9 @@ def check_branch_control(suite):
 
 def check_head_visible(suite):
     repo = suite.repo("detached", detach=True)
-    rc, out, err = suite.kin_run(repo, ["status"])
-    if rc != 0:
-        return Result("head_visible", UNREADABLE,
-                      "kin status exited %s: %s" % (rc, (err or out)[-200:]))
+    rc, out, gap = suite.measured_status(repo)
+    if gap is not None:
+        return Result("head_visible", UNREADABLE, gap)
     OBSERVED["head_before"] = head_line(out)
     status, detail = grade_head_is_visible(out)
     return Result("head_visible", status, detail)
@@ -404,10 +450,9 @@ def check_head_advanced(suite):
         return Result("head_advanced", UNREADABLE,
                       "the commit did not land, so no head could have moved")
     repo = suite.repo("detached", detach=True)
-    rc, out, err = suite.kin_run(repo, ["status"])
-    if rc != 0:
-        return Result("head_advanced", UNREADABLE,
-                      "kin status exited %s: %s" % (rc, (err or out)[-200:]))
+    rc, out, gap = suite.measured_status(repo)
+    if gap is not None:
+        return Result("head_advanced", UNREADABLE, gap)
     OBSERVED["head_after"] = head_line(out)
     status, detail = grade_head_advanced(OBSERVED.get("head_before"),
                                          OBSERVED.get("head_after"))
