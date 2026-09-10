@@ -2140,10 +2140,27 @@ jobs:
   # filesystem and a real installed binary.
   update-proof:
     name: Update proof (N-1 to Latest)
-    # A pull request has no published release to update FROM, so this is for the
-    # release, schedule and dispatch paths. Guarding on the input rather than the
-    # event name matches the matrix above, which uses the same signal.
-    if: ${{ !inputs.local_artifact }}
+    # The weekly schedule and a manual dispatch are this job's witnesses, and
+    # the release path is excluded on purpose.
+    #
+    # release.yml creates every tag `prerelease: true, make_latest: false` and
+    # promotes it to Latest only after this workflow succeeds, then calls this
+    # workflow with `release_tag: ${{ github.ref_name }}`. So at the moment the
+    # job would run, the tag under test is not Latest yet, while `kin update`
+    # on the default stable channel resolves `/releases/latest`, which never
+    # returns a pre-release (crates/kin-cli/src/commands/update.rs,
+    # `resolve_release`). The updater would report "Already up to date" at N-1,
+    # correctly, the final assertion below would exit 1, and every job that
+    # needs `install_proof` to succeed would skip with it: npm publish, the
+    # boundary contracts, the version-tag image, and the promotion that makes
+    # the tag Latest in the first place. The job would fail every stable cut
+    # while proving nothing about the updater.
+    #
+    # A called workflow reads the CALLING run's `github` context, so this
+    # filter also excludes ci.yml's pull-request call, which arrives as `push`
+    # or `merge_group`, and the `release: published` trigger, which arrives as
+    # `release`.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2158,9 +2175,25 @@ jobs:
           # Ordered by publication date, which is what "the release before it"
           # has to mean here: an installation falls behind in publication order,
           # not in semver order.
-          mapfile -t tags < <(gh release list --repo "$GITHUB_REPOSITORY" \
+          #
+          # gh's exit code is captured on its own line, before the guard below
+          # can read it. `mapfile -t tags < <(gh ...)` runs gh in a subshell
+          # whose status neither `set -e` nor `pipefail` observes, so a 403 or a
+          # network flake yields an empty array that is indistinguishable from a
+          # repository with one published release, and the guard would then name
+          # the wrong cause.
+          rc=0
+          listing="$(gh release list --repo "$GITHUB_REPOSITORY" \
             --exclude-drafts --exclude-pre-releases --limit 5 \
-            --json tagName --jq '.[].tagName')
+            --json tagName --jq '.[].tagName')" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=release listing failed::gh release list exited $rc"
+            echo "The GitHub release listing failed. That is an API failure, not" >&2
+            echo "an absent previous release, and reporting it as the latter would" >&2
+            echo "send a reader looking for a release that is published." >&2
+            exit 1
+          fi
+          mapfile -t tags < <(printf '%s' "$listing")
           latest="${RELEASE_EVENT_TAG:-${tags[0]:-}}"
           previous=""
           for t in "${tags[@]}"; do
@@ -2182,9 +2215,13 @@ jobs:
         env:
           PREVIOUS: ${{ steps.tags.outputs.previous }}
         run: |
-          set -eu
+          set -euo pipefail
           # Same installer and the same env contract as the proof above.
-          # KIN_NO_SETUP binds to `sh`, not to `curl`.
+          # KIN_NO_SETUP binds to `sh`, not to `curl`. pipefail is what makes a
+          # failed `curl` fail this step: `sh` reading an empty or truncated
+          # script exits 0, so without it the break surfaces a step later as a
+          # missing `kin` and reads as a broken binary rather than a dead
+          # endpoint.
           curl -fsSL https://get.kinlab.dev/install | \
             KIN_NO_SETUP=1 KIN_VERSION="${PREVIOUS#v}" sh
           echo "$HOME/.kin/bin" >> "$GITHUB_PATH"
