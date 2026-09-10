@@ -111,9 +111,11 @@ Kin has its own commits, branches, merges, diffs, and history, including in repo
 
 **Coverage is incomplete.** Supported languages are parsed into entities and relationships; other files remain available as content and history. An empty result does not prove there are no callers or dependencies. Keep using your compiler, tests, and review. See [language support](docs/language-support.md).
 
-**Compatibility varies.** Native Windows support is early; WSL2 is recommended for the full workflow. Filesystem projection has separate platform and tool restrictions. Check [platform notes](docs/readme-reference.md#platform-and-maturity) before relying on it.
+**Compatibility varies.** Filesystem projection has separate platform and tool restrictions. Check [platform notes](docs/readme-reference.md#platform-and-maturity) before relying on it.
 
 **Preserve Kin-only state.** Deleting `.kin` and re-importing from Git does not recover commits, reviews, or other state that existed only in Kin. Read the [import, recovery, and upgrade notes](docs/readme-reference.md#what-is-real-today-and-what-is-alpha).
+
+**Windows.** Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
 
 ## Why I built Kin
 
