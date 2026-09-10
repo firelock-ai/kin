@@ -17894,7 +17894,7 @@ jobs:
         "always()",
         "needs.publish.result == 'success'",
         "uses: ./.github/workflows/install-proof.yml",
-        "expected_vfs_commit: 4ff5262bb345d2d08846b0e8e09abc9fad639aed",
+        "expected_vfs_commit: 199818f0d1d9ff934de76b73b353183352db08b3",
     ):
         require(install_proof_job, policy, "mandatory public install proof")
 

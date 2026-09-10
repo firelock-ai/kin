@@ -3797,9 +3797,9 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-core"
-version = "0.4.24"
+version = "0.4.25"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "6c1247c07fd55f47e11390c74df6f5cb643f2a4e789cbf60cde58fb0bdf98e7d"
+checksum = "b0c08d92d479665b8a4c0df4ed78ea081aab2c189e8a4a93c040d41d083efd0c"
 dependencies = [
  "lru",
  "parking_lot",
@@ -6684,7 +6684,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

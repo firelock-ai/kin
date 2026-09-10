@@ -164,7 +164,7 @@ kin-db = { version = "=0.7.110", registry = "kin", default-features = false }
 # tokenizer, so a version skew here would be a silent recall loss rather than a
 # build failure.
 kin-search = { version = "=0.1.9", registry = "kin" }
-kin-vfs-core = { version = "=0.4.24", registry = "kin" }
+kin-vfs-core = { version = "=0.4.25", registry = "kin" }
 
 [profile.release]
 opt-level = 3
