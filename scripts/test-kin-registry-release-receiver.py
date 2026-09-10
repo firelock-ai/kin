@@ -2387,6 +2387,78 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('--version "$EVENT_VERSION"', update)
         self.assertNotIn('--crate "$EVENT_CRATE"', update)
 
+    def test_kin_vfs_core_rolls_only_behind_the_pin_decision(self) -> None:
+        """The coupled crate is gated, and the gate runs before the update.
+
+        kin-vfs-core has two authorities that a required context makes agree:
+        the registry requirement this wave writes, and the immutable kin-vfs
+        checkout commit it cannot write. Rolling it unconditionally moved one of
+        the two on every publish and produced a wave head that could not pass
+        its own gate. The gate below holds it unless the decision step says the
+        registry and the pin already agree, and an unconditional
+        `--crate kin-vfs-core` beside the other five takes this red.
+        """
+
+        decision = step_block(
+            self.workflow, "Decide whether the coupled kin-vfs-core pin may roll"
+        )
+        self.assertIn("node scripts/wave-kin-vfs-core-hold.mjs", decision)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", decision)
+        self.assertIn("id: vfs", decision)
+
+        # Ordered: the decision has to be an earlier step than the update, or
+        # the update reads an output that does not exist yet and every value is
+        # the empty string, which reads as a hold forever with nothing said.
+        self.assertLess(
+            self.prepare_job.index(
+                "- name: Decide whether the coupled kin-vfs-core pin may roll"
+            ),
+            self.prepare_job.index("- name: Update the allowed root-manifest pins"),
+        )
+
+        update = step_block(self.workflow, "Update the allowed root-manifest pins")
+        self.assertIn(
+            "VFS_CORE_ROLL: ${{ steps.vfs.outputs.kin_vfs_core_roll }}", update
+        )
+        self.assertIn(
+            "VFS_CORE_REASON: ${{ steps.vfs.outputs.kin_vfs_core_reason }}", update
+        )
+        self.assertIn('if [ "$VFS_CORE_ROLL" = "true" ]; then', update)
+        self.assertIn("crate_args+=( --crate kin-vfs-core )", update)
+
+        # The five uncoupled crates are in the unconditional array; the coupled
+        # one is not. Reading the array literal rather than the whole step is
+        # what makes an unconditional kin-vfs-core visible here.
+        array = update.split("crate_args=(", 1)[1].split(")", 1)[0]
+        for crate in validator.ALLOWED_SOURCES:
+            if crate == "kin-vfs-core":
+                self.assertNotIn(crate, array)
+            else:
+                self.assertIn(f"--crate {crate}", array)
+
+        # A dispatch naming the held crate drops its event arguments, because
+        # the updater rejects an event crate outside the requested set.
+        self.assertIn('if [ "$EVENT_CRATE" = "kin-vfs-core" ]', update)
+
+    def test_kin_vfs_core_hold_gate_runs_on_every_pull_request(self) -> None:
+        """The hold decision's own tests grade the pull request, not just main.
+
+        `Product Acceptance` carries `github.event_name != 'pull_request'`, so a
+        rule added there does not run on the pull request that breaks it. The
+        fast gate does, and `release-policy-gate.sh` hard-fails any change under
+        `.github/` or `scripts/`, which is every change that could break this.
+        """
+
+        self.assertIn("scripts/wave-kin-vfs-core-hold.test.mjs", self.fast_gate)
+        self.assertTrue(
+            (ROOT / "scripts" / "wave-kin-vfs-core-hold.mjs").is_file(),
+            "the decision script the receiver runs is missing",
+        )
+        self.assertTrue(
+            (ROOT / "scripts" / "wave-kin-vfs-core-hold.test.mjs").is_file(),
+            "the decision script has no tests",
+        )
+
     def test_generated_smoke_and_admission_order_is_exact(self) -> None:
         snapshot = step_block(
             self.workflow, "Snapshot the exact generated dependency delta"

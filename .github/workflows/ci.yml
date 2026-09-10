@@ -1329,6 +1329,7 @@ jobs:
             scripts/release-proof/vendored.test.mjs \
             scripts/check-glibc-floor.test.mjs \
             scripts/check-kin-vfs-compat.test.mjs \
+            scripts/wave-kin-vfs-core-hold.test.mjs \
             scripts/check-rc-build-drift.test.mjs \
             scripts/check-release-proof-artifacts.test.mjs \
             scripts/release-promotion-plan.test.mjs \
@@ -2026,6 +2027,7 @@ jobs:
             scripts/release-proof/vendored.test.mjs \
             scripts/check-glibc-floor.test.mjs \
             scripts/check-kin-vfs-compat.test.mjs \
+            scripts/wave-kin-vfs-core-hold.test.mjs \
             scripts/check-rc-build-drift.test.mjs \
             scripts/check-release-proof-artifacts.test.mjs \
             scripts/release-promotion-plan.test.mjs \

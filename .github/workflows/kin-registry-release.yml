@@ -195,11 +195,41 @@ jobs:
             'index = "sparse+https://kinlab.ai/registry/cargo/"' \
             > "$cargo_home/config.toml"
 
+      # kin-vfs-core is the one crate in the roll below with two authorities
+      # that have to agree. Its registry requirement is what the Kin binary
+      # links against; the immutable kin-vfs checkout commit, a literal in
+      # release.yml and rc-build.yml, is the tree the release builds the kin-vfs
+      # binary from. check-kin-vfs-compat.mjs refuses when they disagree and it
+      # carries the required `Fast gate lint and policy` context.
+      #
+      # This wave can write Cargo.toml, Cargo.lock and fuzz/Cargo.lock and
+      # nothing else, and its App token has no `workflows` scope, so it can move
+      # the requirement and can never move the pin. Rolling on every publish
+      # moved one of the two and produced a pull request that could not pass its
+      # own required gate: eight wave heads across four version steps between
+      # 2026-08-31 and 2026-09-10, each cleared by a hand-written pull request
+      # (kin#1223, kin#1344, kin#1431) that moved both together. Widening the
+      # write set is the wrong repair. The pin is a reviewed release input, and a
+      # bot that advanced it would ship a kin-vfs tree nobody read.
+      #
+      # So the coupled crate holds instead, and every other crate rolls as
+      # before, which keeps the wave landing. The reviewed pull request that
+      # advances the pin is what releases the next kin-vfs-core roll.
+      - name: Decide whether the coupled kin-vfs-core pin may roll
+        id: vfs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node scripts/wave-kin-vfs-core-hold.mjs
+
       - name: Update the allowed root-manifest pins
         id: update
         env:
           EVENT_CRATE: ${{ github.event.client_payload.crate_name }}
           EVENT_VERSION: ${{ github.event.client_payload.crate_version }}
+          VFS_CORE_ROLL: ${{ steps.vfs.outputs.kin_vfs_core_roll }}
+          VFS_CORE_REASON: ${{ steps.vfs.outputs.kin_vfs_core_reason }}
         run: |
           set -uo pipefail
           crate_args=(
@@ -208,8 +238,14 @@ jobs:
             --crate kin-db
             --crate kin-lsp
             --crate kin-search
-            --crate kin-vfs-core
           )
+          # Anything but the exact string "true" holds, so a step that failed to
+          # emit its decision holds rather than rolling on an empty value.
+          if [ "$VFS_CORE_ROLL" = "true" ]; then
+            crate_args+=( --crate kin-vfs-core )
+          else
+            echo "::notice title=Kin dependency wave holds kin-vfs-core::$VFS_CORE_REASON"
+          fi
           title="refresh Kin registry dependency pins"
           case "$GITHUB_EVENT_NAME" in
             repository_dispatch)
@@ -217,11 +253,20 @@ jobs:
                 echo "::error::validated dispatch lost its crate or version"
                 exit 1
               fi
-              crate_args+=(
-                --event-crate "$EVENT_CRATE"
-                --version "$EVENT_VERSION"
-              )
-              title="refresh Kin registry pins after ${EVENT_CRATE}@${EVENT_VERSION}"
+              # The updater rejects an event crate outside the requested set, so
+              # a dispatch naming the held crate drops its event arguments and
+              # refreshes the rest. That is the whole dispatch when kin-vfs-core
+              # is the only crate with something new: the updater then reports
+              # nothing changed and no pull request is written.
+              if [ "$EVENT_CRATE" = "kin-vfs-core" ] && [ "$VFS_CORE_ROLL" != "true" ]; then
+                echo "::notice title=Kin dependency wave holds the dispatched crate::${EVENT_CRATE}@${EVENT_VERSION} is held; refreshing the rest of the set"
+              else
+                crate_args+=(
+                  --event-crate "$EVENT_CRATE"
+                  --version "$EVENT_VERSION"
+                )
+                title="refresh Kin registry pins after ${EVENT_CRATE}@${EVENT_VERSION}"
+              fi
               ;;
             schedule) ;;
             *)
