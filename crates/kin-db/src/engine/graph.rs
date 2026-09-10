@@ -4143,6 +4143,47 @@ impl InMemoryGraph {
         edges
     }
 
+    /// Visit every entity under one read lock, borrowing rather than cloning.
+    ///
+    /// [`EntityStore::list_all_entities`] answers the same question by cloning
+    /// the whole map into a `Vec<Entity>`. That vector is a second copy of the
+    /// graph, and it is owed only to a caller that sorts, keeps, moves or
+    /// mutates the entities. A caller that only reads each one should take this
+    /// instead.
+    ///
+    /// The read lock is held for the whole walk, so `visit` must not call back
+    /// into any path that writes the entity domain; that would deadlock.
+    pub fn for_each_entity<F>(&self, mut visit: F)
+    where
+        F: FnMut(&Entity),
+    {
+        let ent = self.entities.read();
+        for entity in ent.entities.values() {
+            visit(entity);
+        }
+    }
+
+    /// Visit every relation under one read lock, borrowing rather than cloning.
+    ///
+    /// Every relation, not only the entity-to-entity ones.
+    /// [`InMemoryGraph::list_all_entity_edges`] drops a relation whose source or
+    /// destination is an artifact, test, contract, work item or external
+    /// reference, because its caller builds an entity-indexed adjacency list.
+    /// This visitor is the whole relation domain, and a reader that wants the
+    /// entity-only view should filter on `as_entity` itself.
+    ///
+    /// The read lock is held for the whole walk, with the same rule about
+    /// writing from inside `visit`.
+    pub fn for_each_relation<F>(&self, mut visit: F)
+    where
+        F: FnMut(&Relation),
+    {
+        let ent = self.entities.read();
+        for relation in ent.relations.values() {
+            visit(relation);
+        }
+    }
+
     /// Resolve one persisted external symbol coordinate by its stable ID.
     pub fn get_external_reference(&self, id: &ExternalReferenceId) -> Option<ExternalReference> {
         self.entities.read().external_references.get(id).cloned()
@@ -16836,6 +16877,142 @@ mod tests {
 
         let all = graph.list_all_entities().unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    /// The entity visitor sees every entity, once each, and the same content
+    /// the clone returns.
+    ///
+    /// Length is asserted before content on purpose: a skipped entity and a
+    /// twice-visited one both show up in the count, and a comparison of sorted
+    /// sets alone would let a duplicate through.
+    #[test]
+    fn for_each_entity_visits_every_entity_exactly_once() {
+        let graph = InMemoryGraph::new();
+        let mut expected: Vec<(EntityId, String)> = Vec::new();
+        for index in 0..64 {
+            let entity = test_entity(&format!("entity_{index}"), &format!("src/f{index}.rs"));
+            expected.push((entity.id, entity.name.clone()));
+            graph.upsert_entity(&entity).unwrap();
+        }
+        expected.sort();
+
+        let mut visited: Vec<(EntityId, String)> = Vec::new();
+        graph.for_each_entity(|entity| visited.push((entity.id, entity.name.clone())));
+        visited.sort();
+
+        assert_eq!(
+            visited.len(),
+            64,
+            "visitor must see each entity exactly once"
+        );
+        assert_eq!(visited, expected);
+
+        // The visitor and the clone must not drift apart.
+        let mut cloned: Vec<(EntityId, String)> = graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .map(|entity| (entity.id, entity.name))
+            .collect();
+        cloned.sort();
+        assert_eq!(visited, cloned);
+    }
+
+    /// The relation visitor sees every relation, once each.
+    #[test]
+    fn for_each_relation_visits_every_relation_exactly_once() {
+        let graph = InMemoryGraph::new();
+        let mut ids = Vec::new();
+        for index in 0..16 {
+            let entity = test_entity(&format!("entity_{index}"), &format!("src/f{index}.rs"));
+            ids.push(entity.id);
+            graph.upsert_entity(&entity).unwrap();
+        }
+
+        let mut expected = Vec::new();
+        for pair in ids.windows(2) {
+            let relation = test_relation(pair[0], pair[1], RelationKind::Calls);
+            expected.push(relation.id);
+            graph.upsert_relation(&relation).unwrap();
+        }
+        expected.sort();
+
+        let mut visited = Vec::new();
+        graph.for_each_relation(|relation| visited.push(relation.id));
+        visited.sort();
+
+        assert_eq!(
+            visited.len(),
+            15,
+            "visitor must see each relation exactly once"
+        );
+        assert_eq!(visited, expected);
+        assert_eq!(visited.len(), graph.relation_count());
+    }
+
+    /// The relation visitor is the whole relation domain, not the entity-to-
+    /// entity view.
+    ///
+    /// `list_all_entity_edges` drops a relation whose source or destination is
+    /// an artifact, test, contract, work item or external reference, because its
+    /// caller builds an entity-indexed adjacency list. A visitor written by
+    /// copying that loop would inherit the filter and silently hide kin's
+    /// external-import edges, which is exactly the shape the linker mints.
+    #[test]
+    fn for_each_relation_visits_relations_entity_edges_drops() {
+        let graph = InMemoryGraph::new();
+        let source = test_entity("caller", "src/client.py");
+        let target = test_entity("callee", "src/client.py");
+        graph.upsert_entity(&source).unwrap();
+        graph.upsert_entity(&target).unwrap();
+        let entity_edge = test_relation(source.id, target.id, RelationKind::Calls);
+        graph.upsert_relation(&entity_edge).unwrap();
+
+        let artifact_id = ArtifactId::new();
+        let reference =
+            ExternalReference::new_resolved("python-module-v1", "requests", "get").unwrap();
+        let external_edge = Relation {
+            id: RelationId::new(),
+            src: GraphNodeId::Artifact(artifact_id),
+            dst: GraphNodeId::ExternalReference(reference.id),
+            kind: RelationKind::Imports,
+            confidence: 1.0,
+            origin: RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: vec![RelationDelta::Added {
+                    new: external_edge.clone(),
+                }],
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: test_located(
+                        "src/client.py",
+                        TreeEntry::blob(Hash256::from_bytes([0x31; 32]), false),
+                    ),
+                }],
+                admission_policy_delta: None,
+                external_reference_deltas: vec![ExternalReferenceDelta::Added { new: reference }],
+            })
+            .unwrap();
+
+        let entity_edges = graph.list_all_entity_edges();
+        assert_eq!(
+            entity_edges.len(),
+            1,
+            "the entity-edge view drops the external-import edge, which is what makes this test mean something"
+        );
+
+        let mut visited = Vec::new();
+        graph.for_each_relation(|relation| visited.push(relation.id));
+        visited.sort();
+        let mut expected = vec![entity_edge.id, external_edge.id];
+        expected.sort();
+        assert_eq!(visited, expected);
     }
 
     #[test]

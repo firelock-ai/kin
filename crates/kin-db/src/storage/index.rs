@@ -73,19 +73,21 @@ impl ReadIndex {
             relations = graph.relation_count()
         )
         .entered();
-        use kin_model::EntityStore;
+        // A visitor, not `list_all_entities`. This loop reads each entity once
+        // and keeps only what it copies into `IndexEntity`, so the clone of the
+        // whole entity map that `list_all_entities` returns was a second copy of
+        // the graph held for the length of the build. Measured on a 36,593-entity
+        // store it was 114 MiB, a quarter of that graph's heap, per call.
+        let expected = graph.entity_count();
 
-        let all_entities = graph.list_all_entities()?;
-        let entity_count = all_entities.len() as u32;
-
-        let mut entities = Vec::with_capacity(all_entities.len());
-        let mut id_to_idx = HashMap::with_capacity(all_entities.len());
+        let mut entities = Vec::with_capacity(expected);
+        let mut id_to_idx = HashMap::with_capacity(expected);
         let mut name_index: HashMap<String, Vec<u32>> = HashMap::new();
         let mut kind_counts: HashMap<u8, u32> = HashMap::new();
         let mut language_counts: HashMap<u8, u32> = HashMap::new();
 
-        for (idx, entity) in all_entities.iter().enumerate() {
-            let idx = idx as u32;
+        graph.for_each_entity(|entity| {
+            let idx = entities.len() as u32;
             let kind = entity.kind as u8;
             let lang = entity.language as u8;
             let file_path = entity
@@ -110,12 +112,15 @@ impl ReadIndex {
                 .push(idx);
             *kind_counts.entry(kind).or_insert(0) += 1;
             *language_counts.entry(lang).or_insert(0) += 1;
-        }
+        });
+        // Counted from what was pushed rather than from `entity_count()` again,
+        // so the header can never disagree with the array beneath it.
+        let entity_count = entities.len() as u32;
 
         // Build outgoing and incoming edge lists from a single batch read
         // (avoids 20K+ per-entity lock acquisitions).
-        let mut outgoing = vec![Vec::new(); all_entities.len()];
-        let mut incoming = vec![Vec::new(); all_entities.len()];
+        let mut outgoing = vec![Vec::new(); entities.len()];
+        let mut incoming = vec![Vec::new(); entities.len()];
         let mut relation_count = 0u32;
 
         let all_edges = graph.list_all_entity_edges();
