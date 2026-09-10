@@ -1,0 +1,722 @@
+# Kin: setup, architecture, and alpha details
+
+Start with the [README](../README.md) for an introduction and the short setup path.
+This page holds the longer installation notes, architecture, recorded walkthroughs,
+and compatibility boundaries.
+
+> **Snapshot: September 10, 2026.** These details were carried over from the README
+> supplied for this revision. Measurements, release references, and command output
+> below describe that source and the runs it names, not a fresh verification of the
+> latest release. The platform summary and projection-mode discussion should be
+> checked against [projection documentation](projection.md): the source marks native
+> Windows projection as not shipped while also describing ProjFS selection.
+
+## Detailed setup
+
+### 1. Install Kin
+
+On macOS or Linux, run the installer on its own and finish any setup prompts:
+
+```sh
+curl -fsSL https://get.kinlab.dev/install | sh
+```
+
+Once it finishes, reload your shell with this separate command:
+
+```sh
+exec "$SHELL" -l
+```
+
+The installer resolves the [latest stable release](https://github.com/firelock-ai/kin/releases/latest),
+verifies its published SHA-256 checksum, installs the managed binaries under
+`~/.kin`, and launches setup. Running the explicit `agent` intent, which
+[step 5](#5-wire-your-agent) does once the graph exists, configures the built-in
+MCP server for detected supported clients. Use `--intent local` for CLI and
+filesystem use without MCP configuration, or `--intent editor` for the VS Code
+path.
+
+npm, Homebrew, and a manual archive resolve that same public release channel:
+
+```sh
+npm install -g @kinlab/kin@latest
+brew install firelock-ai/kin/kin
+```
+
+Each archive and its `.sha256` file is published under
+`https://github.com/firelock-ai/kin/releases/latest/download/`, and the release
+page lists the asset names.
+
+Confirm what you installed with `kin --version`, whichever path you took.
+[The quickstart doc](quickstart.md#1-install) carries the operator detail:
+the asset matrix, what to do when a global npm install hits `EACCES`, how the
+Homebrew formula is regenerated from each release rather than hand-maintained,
+and `kin setup uninstall` when you want the integrations gone.
+
+On Windows, run `irm https://get.kinlab.dev/install.ps1 | iex` in PowerShell.
+Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
+Read [Platform and maturity](#platform-and-maturity) below before choosing a
+Windows install path.
+
+### 2. Admit your repository as graph truth
+
+Replace the path below with your repository's location:
+
+```sh
+cd /path/to/your/repository && kin init .
+```
+
+In a detected Git repository, `kin init` atomically admits complete reachable
+history, refs, raw objects, the exact workspace tree, and admission policy into
+repository-v6 graph authority. A worktree with uncommitted edits, staged
+changes, or untracked files still admits: `kin init` admits the committed state
+and discloses what it did not admit. It never substitutes an exact-HEAD snapshot or
+raw-filesystem semantic rebuild. Supported repository-local remote URLs,
+refspecs, branch tracking, and push defaults are sealed into Kin's Git
+coexistence configuration; unsafe, ambiguous, or unsupported transfer settings
+fail closed before publication.
+
+Admission also derives the semantic entity and relation layer for every
+supported entity-source file in that history, and `kin init` reports the durable,
+generation-bound counts it committed. `kin status` reports that repository
+authority view; `kin graph status` separately reports the daemon's mutable live
+query graph, which may include later derived enrichment.
+Query surfaces consume graph-owned enrichment when it exists and report its
+absence instead of hiding the gap behind raw file search.
+
+`kin init` is the slow step and the one that earns the rest. It admits your Git
+history into the graph, and every answer after it comes from that graph rather
+than from re-reading the tree. Measured on a fresh Debian 12 container with 4
+CPUs and 8 GiB against the release npm serves today, the installer took 4
+seconds, `kin init` took 139 seconds on a 503-file repository with 1,983
+commits, and the first `kin locate` answered in 6.7 seconds while the daemon
+cold-started, then in 71 milliseconds warm. Those are separately measured legs
+of one sitting, not one timed run, and a repository with deeper history takes
+longer.
+
+#### Which files become entities
+
+"Supported entity-source file" means a file one of Kin's language adapters
+claims. The adapter registry is the whole set, and every file in a repository
+resolves through it:
+
+| Language | Extensions |
+| --- | --- |
+| TypeScript | `.ts`, `.tsx` |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| Python | `.py`, `.pyi` |
+| Go | `.go` |
+| Java | `.java` |
+| Rust | `.rs` |
+| C | `.c`, `.h` |
+| C++ | `.cpp`, `.hpp`, `.cc`, `.cxx` |
+| C# | `.cs` |
+| Ruby | `.rb` |
+| PHP | `.php` |
+| Swift | `.swift` |
+| Kotlin | `.kt`, `.kts` |
+| HCL / Terraform | `.tf`, `.tfvars` |
+
+A `.h` header is read as C++ when its contents say so, so a C++ project does not
+lose namespaces and templates to the C grammar.
+
+Everything else is admitted as content and stays queryable as history and text,
+but is not parsed into entities and relations. That includes Markdown, HTML and
+CSS, SQL, YAML, JSON and TOML, shell scripts, Objective-C, Scala, Elixir, Dart,
+Lua, R, Zig, Haskell, and Nix. If your language is on that list, `locate` and
+`refs` will not find symbols in it.
+
+### 3. Check the graph is ready
+
+```sh
+kin graph status
+kin embed
+```
+
+`kin graph status` reports the daemon's live query graph and its coverage.
+Admission derives the semantic entities, not their vectors, so run `kin embed`
+to add local vector similarity over them and confirm coverage with
+`kin graph status` again.
+
+One thing to expect on a small repository: `kin init` starts a background
+download of the roughly 523 MB embedding model, and a conversion that finishes
+in seconds can beat it. When that happens the first `kin locate` ranks on
+lexical and graph signals alone and says why on the line beneath its rows. If
+that line reports the model still downloading, run the query again once it
+lands. If it reports that none of it arrived, do not wait on it: `kin embed`
+fetches the rest.
+
+### 4. Ask it something you already know the answer to
+
+This is the honest way to judge it. Pick a helper you know the callers of, or a
+subsystem you could describe from memory, and see whether Kin agrees with you.
+A question about code you've never read tells you nothing about whether the
+answer is right.
+
+```sh
+kin locate "<something you already know is in this repository>"
+kin refs ExactEntityName
+kin trace ExactEntityName
+kin impact ExactEntityName
+```
+
+Replace `ExactEntityName` with a symbol returned by `locate`. `locate` finds the
+entities relevant to an intent, `refs` shows graph-owned callers/importers and
+references, and `trace` returns the focal entity plus nearby semantic context.
+Once embeddings are complete, your configured AI agent can use the vector-backed
+`semantic_locate` tool; `get_context_pack`, `find_references`, and
+`trace_data_flow` expose the graph neighborhood directly.
+
+`impact` walks the other way from `refs` and shows what sits downstream of the
+entity you are about to change. Replace the `locate` string with a behavior you
+could already point to in the source.
+
+### 5. Wire your agent
+
+Now that the graph exists, point your agent at it:
+
+```sh
+kin setup --intent agent
+```
+
+Use `kin setup --intent editor` for the VS Code path, or `--intent local` for
+CLI and filesystem use with no MCP configuration. Confirm the resulting
+machine-readable health checklist with `kin setup status --json`.
+[Works with your agent](#works-with-your-agent) has the per-client one-liners
+and the standard MCP entry.
+
+## What is real today, and what is alpha
+
+Real today. The graph is the repository. Kin has its own commits, branches, and
+merges, with Git import and export beside them. The exact source is preserved
+byte for byte. The CLI, the bundled MCP server, and the VS Code extension all
+answer from that same graph. Local repository work runs on your machine.
+
+These are the limits worth knowing before you start.
+
+**Admission holds the frontier of history, not every commit's tree.** `kin init`
+walks a repository's commits oldest first and resolves each commit's tree from
+its first parent's and the paths that differ, keeps a hash and a content
+observation in the tree's place, and drops the tree once nothing later resolves
+against it, so what a conversion needs follows the commits and the width of the
+tree it admits rather than the two multiplied together. Every commit still lands
+in one graph, each building on the last. On a history too long for the machine,
+Kin still refuses in words with a memory forecast, before it captures anything,
+rather than dying partway. A forecast above what the machine has is refused and
+one in the last third below it is warned about; the forecast counts commits,
+tracked files and the bytes of history reachable from HEAD, names which of the
+three decided it, and its coefficients are floors read off measured conversions,
+a floor and not a predictor: across the repositories measured a conversion held
+between one and three times its floor. Measured on the bytes this release ships,
+without enrichment, with commits counted from HEAD: `redis/hiredis`, 1,141
+commits over 79 files, admits in 74 seconds at a 1.4 GB peak and leaves a 256 MB
+store; `psf/requests`, 6,493 commits over 130 files, admits in about ten minutes
+at a 5.2 GB peak; kin's own repository, 2,924 commits over 1,033 files, admits
+in 35 minutes at a 25.5 GB peak, reached when the finished store is opened for
+its final proof, so it admits on 32 GB and is refused on 8 and 16 GB with its
+1.3 GB of history named as the reason, because its commits carry far more entity
+change each than requests' and that change, held across the conversion and then
+loaded from the store, is what sets the peak; a normal clone of
+`facebook/react`, 21,679 commits over 7,213 files, is forecast at 36.7 GB from
+its 2.0 GB of history and admits in 1 hour 47 minutes at a 36.9 GB peak, so it
+is refused on 16 and 32 GB and admitted where the machine has room, in place of
+a 582.5 GB refusal everywhere. A shallow clone is not the way around a refusal:
+`git clone --depth` leaves a boundary Kin refuses, because a history whose
+oldest commits have absent parents cannot be captured losslessly. There is no
+partial-history mode.
+
+**Some repositories refuse to import at all.** Repositories carrying submodules
+or Git LFS are refused before admission. Kin does not model submodules yet, so
+refusing is the correct answer rather than a silent partial import.
+
+**Git export names Kin as the author's mailbox.** `kin git export` writes native
+Kin commits with the author's name and `kin@localhost` as the email, and no
+sign-off trailer. Commits that came in from Git are reused as their original
+objects, so their identity is untouched.
+
+**`kin init` adds exactly one ignore rule.** It writes `/.kin/` into
+`.git/info/exclude`, which is local to your checkout, and leaves your tracked
+`.gitignore` alone. Whether a teammate's checkout carries a Kin store is their
+business, not a tracked file's.
+
+**Not every language becomes entities.** The adapter table in
+[step 2](#which-files-become-entities) is the whole set. Everything else is
+admitted as content and stays queryable as history and text, but `locate` and
+`refs` will not find symbols in it.
+
+**The graph can still miss relationships.** Coverage is real and it is not
+complete, so treat an empty answer as a question rather than as a proof. You
+still need your compiler, your tests, and your own judgment.
+
+**No format change ships without a migration path.** No release will drop an
+existing store without a tested migration path. A repository admitted from Git
+can always be re-admitted from Git. State that exists only in Kin will be
+carried forward by an upgrade command shipped with any format change, or the
+format change does not ship. A format change never rewrites your working tree.
+
+What that recovery looks like, measured on a 261-commit repository: delete
+`.kin`, run `kin init` again, and everything Git holds comes back, all 61 refs
+byte-identical. Nothing native comes back. A commit, a branch, a review, and a
+spec that existed only in Kin were gone, while the edited file survived as an
+uncommitted working-tree change. Re-admission also mints a new repository id
+unless you pass `--adopt-repository-id`. That is the gap the upgrade command
+above exists to close.
+
+[Platform and maturity](#platform-and-maturity) below has the per-platform
+boundaries, the memory floors, and what a green release does and does not
+establish.
+
+## The stack
+
+Kin is one system with a few clear public surfaces:
+
+| Surface | What it does |
+| --- | --- |
+| **[kin](https://github.com/firelock-ai/kin)** | Semantic system of record: CLI, daemon, graph lifecycle, MCP, review, provenance, and Git coexistence. |
+| **[kin-vfs](https://github.com/firelock-ai/kin-vfs)** | Projects graph-owned files through normal filesystem calls so existing tools can keep using files. |
+| **[kin-editor](https://github.com/firelock-ai/kin-editor)** | VS Code access to the entity explorer, semantic search, trace, review, and rename surfaces. |
+| **[Kin MCP](mcp-tools.md)** | Typed graph tools for AI agents, bundled into `kin` and launched with `kin mcp start`. |
+| **[KinLab](https://kinlab.ai)** | Hosted collaboration and control plane. Public repository connection is not a first-run flow yet. |
+
+## How the pieces fit
+
+The graph is the repository, and everything in the map below either reaches
+that authority or supports it. Humans and AI agents come in
+through the CLI, the bundled MCP server, or the VS Code extension. All
+three ask the same daemon, and the daemon answers from graph authority rather
+than by re-reading the tree. `kin-vfs` projects that same graph back through
+ordinary filesystem calls, so editors, compilers, and build systems keep seeing
+files. Git sits beside the graph as an import and export boundary rather than as
+an answer path, and KinLab is the hosted layer over the same authority.
+
+```mermaid
+flowchart TD
+    people["Humans and AI agents"]
+
+    subgraph surfaces["Access surfaces"]
+        cli["kin CLI"]
+        mcp["Kin MCP server"]
+        editor["kin-editor for VS Code"]
+    end
+
+    daemon["kin daemon"]
+    authority["Graph authority<br/>entities, relations, changes, provenance"]
+    db["kin-db<br/>graph storage, snapshots,<br/>index, text and vector search"]
+    prims["kin-model, kin-blobs, kin-search,<br/>kin-vector, kin-infer, kin-lsp"]
+    vfs["kin-vfs<br/>transparent file projection"]
+    tools["Editors, compilers, build systems"]
+    git["Git<br/>import and export boundary"]
+    kinlab["KinLab<br/>hosted collaboration and control plane"]
+
+    people --> cli
+    people --> mcp
+    people --> editor
+    cli --> daemon
+    mcp --> daemon
+    editor --> daemon
+    daemon --> authority
+    authority --> db
+    db --> prims
+    authority <-->|"kin init imports, kin git export"| git
+    authority -->|"publish and sync"| kinlab
+    authority --> vfs
+    vfs --> tools
+```
+
+Underneath those surfaces are the layers the system is built from:
+
+| Layer | Role |
+| --- | --- |
+| **[kin-db](https://github.com/firelock-ai/kin-db)** | Graph storage, snapshots, indexing, text search, and vector search. |
+| **[kin-model](https://github.com/firelock-ai/kin-model)** | Canonical types and domain models shared across the stack. |
+| **[kin-blobs](https://github.com/firelock-ai/kin-blobs)** | Content-addressable blob storage. |
+| **[kin-search](https://github.com/firelock-ai/kin-search)** | Lexical search primitives and staged retrieval. |
+| **[kin-vector](https://github.com/firelock-ai/kin-vector)** | Vector and nearest-neighbor substrate. |
+| **[kin-infer](https://github.com/firelock-ai/kin-infer)** | Inference and embedding substrate. |
+| **[kin-lsp](https://github.com/firelock-ai/kin-lsp)** | Language-server enrichment feeding the semantic layer. |
+
+These are implementation layers of one system, not separate products a new user
+needs to assemble. None of them is installed separately.
+
+## Open source and the Kin ecosystem
+
+The core of Kin is open source under Apache-2.0: [kin](https://github.com/firelock-ai/kin),
+[kin-db](https://github.com/firelock-ai/kin-db), [kin-vfs](https://github.com/firelock-ai/kin-vfs),
+and [kin-editor](https://github.com/firelock-ai/kin-editor), plus the supporting
+libraries kin-model, kin-blobs, kin-search, kin-vector, kin-infer, kin-lsp, and
+kin-actions.
+
+[KinLab](https://kinlab.ai) is a proprietary product built on this open core: the
+hosted collaboration and control-plane layer described above.
+
+The same boundary applies to how benchmark work is shared. The [benchmark
+specification and a standalone, dependency-free bundle verifier](https://github.com/firelock-ai/kin-bench-spec)
+are public, so a merge-trust benchmark claim can be checked without access to the
+runner that produced it. The runner and proof infrastructure that produce sealed evidence bundles (the
+orchestration, the pinned-release proof gate, and the hosted measurement
+environment) remain private for now. The spec and verifier open first; the runner
+can open later.
+
+## Version control without Git
+
+Kin keeps a full change history with no Git underneath it. In an empty
+directory with no `.git`, the same binary records changes, branches, merges,
+and history, and Git never runs. This is that loop, with the output it printed
+on one real run of a build of `main`. `kin init`, `kin status`, and `kin diff`
+say more than is shown here; the lines below are theirs, unedited, with the
+rest trimmed.
+
+Start an empty repository and record a first change:
+
+```sh
+mkdir kin-demo && cd kin-demo
+kin init
+```
+
+```
+  Authority: repository-v6 (graph-owned)
+  Default ref: refs/heads/main
+  History: unborn (no synthetic commit)
+  Workspace: empty exact tree
+  Store size: 17.4 KiB under .kin/ (no Git object store here to compare against)
+```
+
+```sh
+cat > retry.py <<'PY'
+def backoff(attempt):
+    return min(2 ** attempt, 30)
+PY
+kin commit -m "Add the retry backoff"
+```
+
+```
+  starting the kin daemon for this repository; the first query after a start waits for it to load the graph
+  kin daemon ready in 1.8s
+Created semantic change f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f on branch 'refs/heads/main' (2 entities, 0 relations, 1 artifacts)
+Recorded in Kin authority, not in git. `git status` stays dirty until you run `kin eject` or push this branch to a Kin remote.
+```
+
+The first commit starts the repository's daemon. Before that, right after
+`kin init`, `kin status` reports durable authority alone and says so on its
+`Tree:` line; once the daemon is up, every `kin status` measures the working
+copy. Who made the change comes from your Git identity when you have one, and
+otherwise from `default_author` in `.kin/config.toml`. Kin refuses to record a
+change attributed to nobody.
+
+Branch, change the function on the branch, and commit there:
+
+```sh
+kin branch create cap-backoff
+kin branch switch cap-backoff
+```
+
+```
+Created refs/heads/cap-backoff at change f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f (authority generation 3)
+Switched to refs/heads/cap-backoff at change f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f (1 projected entries, authority generation 4)
+```
+
+```sh
+cat > retry.py <<'PY'
+def backoff(attempt):
+    """Exponential backoff, capped at a minute."""
+    return min(2 ** attempt, 60)
+PY
+kin status
+```
+
+```
+Kin repository-v6 status
+Head: symbolic refs/heads/cap-backoff
+Tree: 198609d9406becdd1fb97f1f3d16d8d869dc382c38823f2b88aa75f72d927029 (1 artifacts, ahead of its base change as admitted 0s ago)
+Refs: 2, default refs/heads/main
+Durable semantic enrichment: present (2 entities, 0 relations, 1 changes at authority generation 5, workspace generation 3; completion not attested)
+Untracked host content: none, measured 0s ago
+```
+
+```sh
+kin commit -m "Raise the backoff cap to a minute"
+```
+
+```
+Created semantic change 64cce9085641a7eee86bd2b870567ac524835e2e80488f7e5444f7cf9b42c065 on branch 'refs/heads/cap-backoff' (2 entities, 0 relations, 1 artifacts)
+```
+
+Back on `main`, record a second change so the merge has two real parents, then
+merge the branch:
+
+```sh
+kin branch switch main
+cat > retry_test.py <<'PY'
+from retry import backoff
+
+def test_first_attempt_waits_one_second():
+    assert backoff(0) == 1
+PY
+kin commit -m "Add a first backoff test"
+kin merge cap-backoff
+```
+
+```
+Switched to refs/heads/main at change f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f (1 projected entries, authority generation 7)
+Created semantic change 18abd82f3a295696fa4938fc078613c0abe4a3214dd6ec0eb81f8a7c1f747105 on branch 'refs/heads/main' (2 entities, 3 relations, 1 artifacts)
+Merged refs/heads/cap-backoff into refs/heads/main as change 4137af4647e6b838771d5e4ce98d8a604304b9d0a66fdb4e0931e828d6b75c9c (2 projected entries, authority generation 9)
+```
+
+The merge composed both sides by entity identity against their common base,
+with no line-level text merge, and published one change carrying both parents.
+`kin log` walks that history and `kin diff` shows what the merge brought in,
+as artifacts, as entities, and as lines:
+
+```sh
+kin log
+```
+
+```
+change 4137af4647e6b838771d5e4ce98d8a604304b9d0a66fdb4e0931e828d6b75c9c
+Author: Kin Demo <demo@example.com>
+Date:   2026-09-05T01:15:32.635348+00:00
+Origin: native
+Parents: 18abd82f3a295696fa4938fc078613c0abe4a3214dd6ec0eb81f8a7c1f747105 64cce9085641a7eee86bd2b870567ac524835e2e80488f7e5444f7cf9b42c065
+Deltas: entities=2 relations=0 tree=1 policy=false
+    Merge refs/heads/cap-backoff into refs/heads/main
+
+change 18abd82f3a295696fa4938fc078613c0abe4a3214dd6ec0eb81f8a7c1f747105
+Author: Kin Demo <demo@example.com>
+Date:   2026-09-05T01:15:32.339226+00:00
+Origin: native
+Parents: f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f
+Deltas: entities=2 relations=3 tree=1 policy=false
+    Add a first backoff test
+
+change 64cce9085641a7eee86bd2b870567ac524835e2e80488f7e5444f7cf9b42c065
+Author: Kin Demo <demo@example.com>
+Date:   2026-09-05T01:15:31.791709+00:00
+Origin: native
+Parents: f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f
+Deltas: entities=2 relations=0 tree=1 policy=false
+    Raise the backoff cap to a minute
+
+change f635b52070f2944aa1c8651fec50cfa62e1cc21c00760137f62f971a7c27642f
+Author: Kin Demo <demo@example.com>
+Date:   2026-09-05T01:15:30.609174+00:00
+Origin: native
+Deltas: entities=2 relations=0 tree=1 policy=true
+    Add the retry backoff
+```
+
+```sh
+kin diff HEAD~1 HEAD
+```
+
+```
+Kin repository-v6 diff
+Base: HEAD~1 (e5aa80af2498ad1d8f8c5a756f24467773a7f12c46039395deb691a0e09ff0bc)
+Head: HEAD 4137af4647e6b838771d5e4ce98d8a604304b9d0a66fdb4e0931e828d6b75c9c (f86d6f68558a54372da1c08cedd8549dd98733110e3f2db6193dc8314ba10c11)
+Artifacts: +0 ~1 -0
+Entities: +0 ~2 -0
+Relations: +0 ~0 -0
+M  retry.py -> retry.py [aab37f62-f986-4543-8187-4af2b8984e0a] blob 0ceda974a82e648bf6e6d40efccc9489eb4b73fa5ab3f0c5cfd35df4911cd524 mode=100644 -> blob c0b44cec88f49e73cc31f7f439ec1b10d9d73cfe1c414dc539106886d4747cce mode=100644
+E~ 0a69467a-63d6-5c34-ac35-632cefde30b7 retry -> retry
+E~ 6cd876cf-cc8a-50bd-94be-e0a2fde3208d backoff -> backoff
+   @@ -1,2 +1,3 @@
+    def backoff(attempt):
+   -    return min(2 ** attempt, 30)
+   +    """Exponential backoff, capped at a minute."""
+   +    return min(2 ** attempt, 60)
+```
+
+`HEAD~1` is the merge's first parent, the test commit, so the diff is exactly
+what `cap-backoff` contributed: one artifact, the two entities in it (the
+module and the function), and the lines. `kin checkout`, `kin stash`,
+`kin rollback`, `kin blame`, and `kin conflicts` with `kin resolve` round out
+the set, and `kin capabilities` prints where each one stands.
+[The CLI reference](cli-reference.md#branches-merges-and-exact-trees) has
+every flag.
+
+Sharing a native repository between machines is still in progress, and public
+repository connection through KinLab is not a first-run flow yet. What the
+transfer commands do today: `kin clone` takes a KinLab locator or the HTTP
+endpoint of another machine's running Kin daemon, adopts that repository's
+identity into a fresh local workspace, and remembers the origin it came from.
+`kin push` sends your new changes to that saved origin one verified pack at a
+time, and refuses rather than forces when the remote has moved past you.
+`kin pull` admits what the origin has that you do not and moves your working
+tree onto it, and when uncommitted work stops the tree from following, it says
+so and keeps the history it received. Each of the three is exercised between two
+Kin daemons over HTTP by the test suite.
+
+## Works with your agent
+
+Kin ships its own agent, and it's the path I recommend for agent work. `kin
+agent run` drives any OpenAI-compatible endpoint, so a local model in LM Studio,
+Ollama, llama.cpp or vLLM works from the same flags as a hosted one, and it
+reaches the graph over the same MCP server every other client uses.
+
+```sh
+kin agent run --task "Find where the retry backoff is computed and document it" \
+  --model qwen/qwen3.6-35b-a3b --base-url http://localhost:1234/v1
+```
+
+What makes it different from pointing another agent at the MCP server is that the
+rule is enforced inside the agent rather than borrowed from a vendor's permission
+layer. It has Kin's tools plus exactly two local ones, `edit_file` and
+`write_file`. There is no shell, no grep and no file-reading tool, so it cannot
+answer a repository question from raw file search, and a tool it invents is
+refused by name. When Kin reports that an empty result cannot be trusted, the
+agent is told the answer is unknown and given the named gap instead of concluding
+the thing does not exist. Every edit runs inside a Kin transaction under a Kin
+session, so the change carries provenance naming the agent. Run `kin agent doctor
+--base-url <url>` first to check both halves answer. See
+[the CLI reference](cli-reference.md#kin-agent) for the full surface.
+
+Working with Claude Code, Codex, Cursor, Gemini and anything else that speaks MCP
+stays first class. `kin setup --intent agent` configures every client it detects
+in one pass. These are the per-client one-liners when you would rather install Kin
+directly.
+
+Run `kin init .` in the repository before you wire a client, not after. These
+tools answer from the graph, so a client pointed at a directory with no graph
+gets a tool surface with nothing behind it. `kin setup` says so itself: its
+round-trip check reports "no initialized Kin repository at or above" the
+directory it ran in, and tells you to run `kin init` there and re-run setup.
+
+Claude Code, from inside a session:
+
+```
+/plugin marketplace add firelock-ai/kin
+/plugin install kin@kin
+```
+
+Codex:
+
+```sh
+codex plugin marketplace add firelock-ai/kin
+codex plugin add kin@kin
+```
+
+Gemini CLI:
+
+```sh
+gemini extensions install https://github.com/firelock-ai/kin
+```
+
+Cursor takes a one-click install link. Paste this into Cursor or into your
+browser's address bar:
+
+```
+cursor://anysphere.cursor-deeplink/mcp/install?name=kin&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBraW5sYWIva2luIiwibWNwIiwic3RhcnQiXX0=
+```
+
+Kiro takes the same thing as a web link:
+[Add Kin to Kiro](https://kiro.dev/launch/mcp/add?name=kin&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40kinlab%2Fkin%22%2C%22mcp%22%2C%22start%22%5D%7D).
+
+Cline takes the standard entry below rather than a one-liner. Its CLI reads
+`~/.cline/mcp.json`. In the VS Code extension, open the MCP Servers panel, then
+the Configure tab, then Configure MCP Servers, and add the entry there.
+
+Every other client that reads a standard MCP config takes this entry:
+
+```json
+{
+  "mcpServers": {
+    "kin": { "command": "npx", "args": ["-y", "@kinlab/kin", "mcp", "start"] }
+  }
+}
+```
+
+`kin setup status` and `kin doctor` recognize this exact shape, alongside the
+absolute-path form `kin setup` writes, and grade anything else MISCONFIGURED. Do
+not shorten `command` to a bare `kin`, because agent clients do not reliably
+inherit your shell `PATH`. `@kinlab/kin-mcp` is the older launcher and keeps
+working for configurations that already name it; new ones should point at
+`@kinlab/kin`, which ships the same MCP server as one mode of the full CLI.
+
+The wrapper needs Node 20 or newer, and on its first run it downloads the
+matching Kin release, verifies its published SHA-256, and caches the binaries per
+user. Codex CLI wants the same thing as TOML under `[mcp_servers.kin]`.
+
+One caveat worth repeating: these tools answer from the graph, so the repository
+has to be admitted with `kin init .` and embedded with `kin embed` before
+`semantic_locate` can rank anything. [llms-install.md](../llms-install.md) is that
+whole path written so an agent can follow it unattended, from a bare machine to a
+first verified tool call.
+
+## How Kin relates to Git
+
+Beside Git today. Repository authority over time. During brownfield adoption,
+Git remains an explicit import/export interoperability boundary; it never
+answers Kin runtime queries or repairs missing graph truth.
+
+- `kin init` imports complete reachable Git history and exact parent edges.
+  Kin deliberately has no partial-history or snapshot-only initialization mode.
+- After import, Kin's graph owns repository identity, tree state, history, refs,
+  and semantic relations. Filesystem and Git views are projections.
+- `kin git export --output ../repo.git` writes a new bare Git projection from
+  one graph-owned authority generation. It does not consult working files or an
+  ambient `.git/` object store, and it refuses an existing or in-repository
+  destination. Objects, refs, and directories are flushed before the
+  no-replace destination publication is acknowledged. Capability-anchored
+  publication is currently available on Unix hosts; other hosts refuse before
+  creating the export.
+
+This lets a team migrate an existing repository without giving up its editor,
+compiler, build system, or Git interoperability while Kin becomes authoritative.
+
+## Platform and maturity
+
+The core runtime and the filesystem projection have different support
+boundaries:
+
+| Platform | Core Kin runtime | `kin-vfs` projection |
+| --- | --- | --- |
+| macOS, Apple Silicon and Intel | Native graph, vector, daemon, setup, MCP, and review surfaces ship in the release archive. | Shipped and exercised on both architectures. It uses `DYLD_INSERT_LIBRARIES`; SIP-protected or hardened programs may reject injection. |
+| Linux x86_64 and arm64 | `kin` and `kin-daemon` are static musl builds intended to run on glibc and musl distributions. | The public VFS executable and shim are GNU/glibc builds, not musl builds. They are built against a pinned glibc floor of 2.31 and link OpenSSL 3, so a projection host needs both; Debian 12 loads them, and Alpine and other musl distributions are not supported projection hosts. The release refuses to publish a Linux archive whose binaries ask for more glibc than that floor. The arm64 release proof runs on Ubuntu 24.04. |
+| Native Windows x86_64 | Early support: repositories admit and graph and lexical queries answer natively, but MCP and review workflows are not yet covered end to end by the install proof. WSL2 remains the recommended path for full Kin. | Not shipped. Use WSL2 with a Linux distribution that meets the glibc boundary for projection. |
+
+The graph is the authority in every case above. The shim, an NFS mount, a FUSE
+mount, and Windows ProjFS are four ways to see that truth as files, and Kin
+picks between them by probing what this host can run: a mount where one is
+available, because the kernel serves it and no process can have it stripped,
+with the injected shim as the compatibility fallback on macOS and Linux and
+ProjFS leading on Windows, where no shim exists. `kin vfs on` engages the chosen
+one, `kin vfs off` disengages it, and `kin doctor` carries a row saying which is
+in force and whether it is working. Where a mode is missing, Kin prints the
+exact line that installs or enables it for your platform.
+[docs/projection.md](projection.md) has the full per-platform table.
+
+First indexing reads the entire reachable Git history, so `kin init` on a
+large or long-lived repository takes minutes, not seconds, before embedding
+begins. After `init` returns, the daemon continues preparing in the
+background, and the first agent calls on a large repository can take
+noticeably longer to answer.
+
+Bounded arm64 testing found the core graph and lexical path usable at 512 MB,
+but full embedding downloads a roughly 522 MB model and currently needs 2 GB as
+the safe operating floor; 1 GB is an unsafe edge and 512 MB can terminate during
+embedding. These are observed alpha constraints, not universal sizing promises.
+
+A successful `kin --version` establishes only that the core binary runs. It
+does not establish VFS compatibility or a live graph-backed projection. On a
+supported Unix host, use `kin vfs status`, which probes each projection mode and
+prints what is actually in force, then `kin setup status` and a real
+`kin-vfs exec --workspace . -- <command>` launch. The VFS launcher includes an
+interposition canary and reports when the operating system strips the shim.
+The [kin-vfs README](https://github.com/firelock-ai/kin-vfs#current-platform-and-package-boundaries)
+contains the full boundary.
+
+Release assets are checksum-published and the release workflow runs anonymous
+installation, daemon/MCP, embedding, and real graph-backed VFS projection checks
+across its supported runner matrix. The workflow itself is public:
+[Install Proof](https://github.com/firelock-ai/kin/actions/workflows/install-proof.yml).
+A green release establishes those exact artifacts and environments; it is not a
+claim that every distribution, tool, or repository shape is already covered.
+
+## Proof posture
+
+The published preregistered Multi-SWE-Bench Go proof package is pinned to an
+older build, not the moving latest release, and does not establish a broad
+speed, token-savings, or category-win claim. Comparative results are withheld
+here pending independent verification.
+
+Read the methodology, task set, build identity, and artifacts in the
+[public proof package](https://firelock.ai/labs/kin-proof). Treat claims outside
+that measured scope as hypotheses until they have their own reproducible proof.
