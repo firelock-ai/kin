@@ -5,7 +5,7 @@
     "url": "https://kinlab.ai"
   },
   "metadata": {
-    "description": "Firelock's marketplace for Kin, the system of record for AI-written software.",
+    "description": "Firelock's marketplace for Kin, a graph-native code repository for people and AI agents.",
     "version": "0.1.0"
   },
   "plugins": [

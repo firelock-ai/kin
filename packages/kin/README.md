@@ -1,7 +1,7 @@
 # @kinlab/kin
 
-The canonical npm install surface for [Kin](https://github.com/firelock-ai/kin), the
-system of record for AI-written software.
+The canonical npm install surface for [Kin](https://github.com/firelock-ai/kin), a
+graph-native code repository for people and AI agents.
 
 Install it without root, without `sudo`, and without a writable global npm prefix. This
 is the default path because it is the one that works everywhere, including the container

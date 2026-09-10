@@ -135,7 +135,7 @@ for the full Kin experience, including projection.`;
 
 const readme = `# Kin ${version} (${target})
 
-Kin is the semantic system of record for software work. It answers questions
+Kin is a graph-native code repository for people and AI agents. It answers questions
 about a repository from a graph rather than from raw file search.
 
 This archive carries these runtime files:
