@@ -270,6 +270,9 @@ class Suite(object):
         if daemon:
             self.env["KIN_DAEMON_BIN"] = daemon
         self._repo = None
+        # The transition is destructive and every check asks for it; see
+        # `transition` below.
+        self._transition = None
 
     def kin_run(self, repo, args, timeout=900):
         rc, out, err = run([self.kin] + args, cwd=repo, env=self.env, timeout=timeout)
@@ -308,6 +311,17 @@ class Suite(object):
             raise RuntimeError("kin init failed: %s" % ((err or out)[-400:]))
         # Fixture assertion. If the scratch file was never tracked, deleting it
         # produces no unmatched removal and every arm below passes vacuously.
+        #
+        # `kin admit` first, so the read is measured. A bare `kin status` never
+        # starts a daemon, and `kin init`'s own daemon can be gone by the time
+        # the next process starts, at which point status reports durable
+        # authority alone and exits `EXIT_WORKING_COPY_UNMEASURED` (FIR-3420).
+        # This read would then have raised on a correct answer, and before that
+        # code existed it passed only when a daemon happened to still be alive.
+        arc, aout, aerr = self.kin_run(path, ["admit"])
+        if arc != 0:
+            raise RuntimeError("kin admit failed after init, so the fixture read below "
+                               "could not be measured: %s" % ((aerr or aout)[-400:]))
         rc, out, err = self.kin_run(path, ["status"])
         if rc != 0:
             raise RuntimeError("kin status failed after init: %s" % ((err or out)[-400:]))
@@ -315,12 +329,23 @@ class Suite(object):
         return path
 
     def transition(self):
-        """Delete the scratch file, write the new ones, and commit."""
+        """Delete the scratch file, write the new ones, and commit.
+
+        Memoised, like `repo()` above and for the same reason: this is
+        destructive and all three checks ask for it. Run twice it raises on the
+        scratch file it already deleted, so the second and third checks read
+        UNREADABLE over a fixture that reached the state they wanted. Every
+        caller grades one transition, which is the experiment the suite is
+        about.
+        """
+        if self._transition is not None:
+            return self._transition
         path = self.repo()
         os.remove(os.path.join(path, SCRATCH))
         for relative in ADDITIONS:
             self._write(path, relative, ADDITION_BODIES[relative])
-        return self.kin_run(path, ["commit", "-m", "Add markdown note parser"])
+        self._transition = self.kin_run(path, ["commit", "-m", "Add markdown note parser"])
+        return self._transition
 
     @staticmethod
     def _write(root, relative, body):
