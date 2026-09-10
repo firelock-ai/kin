@@ -33,6 +33,12 @@ name: Kin Registry Wave Landing
 # admission chain refuses any server-owned landing state on the wave. There
 # is no manual dispatch arm, because this workflow reaches a release-capable
 # secret; the kick is a repository_dispatch, which cannot select a branch.
+#
+# A failed check on the wave head is a wait, not a refusal, so this workflow's
+# run on main stays green while the red stays on the pull request. The colour
+# is the only thing that changed: land-wave still runs on decision == 'land'.
+# See the failed-checks branch of judge() in scripts/land-kin-registry-wave.py
+# for the twenty red runs from one head that bought the distinction.
 on:
   workflow_run:
     workflows: [CI]
