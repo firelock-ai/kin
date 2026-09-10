@@ -250,12 +250,56 @@ jobs:
           fi
           echo "${BRANCH} -> ${CANDIDATE} (${MOVE})"
 
-      # The dispatch goes out on the workflow token, not the App's. rc-build.yml
-      # holds no credential by design and needs none to start, and keeping the
-      # App token off this call keeps its blast radius to the branch write above.
+      # A second, narrower mint: actions:write only, nothing else, so this
+      # token can dispatch rc-build.yml and can do nothing the branch-move
+      # token above already couldn't. kin-release-bot's installation does not
+      # carry the Actions permission today (installation 148381548:
+      # administration:read, contents:write, issues:write, metadata:read,
+      # pull_requests:write; verified live via
+      # `gh api orgs/firelock-ai/installations`), so this mint fails until a
+      # person grants it at
+      # https://github.com/organizations/firelock-ai/settings/installations/148381548.
+      # continue-on-error keeps that failure from reddening this job: the
+      # dispatch step below falls back to today's github.token whenever this
+      # mint did not succeed, so landing this before the grant changes nothing
+      # observable, and the cascade turns on the day the grant lands with no
+      # further edit here.
+      #
+      # rc-build.yml itself gets none of this. It holds no credential by
+      # design, and its workflow_dispatch trigger admits any ref with no actor
+      # gate, so granting it any write permission would hand that same power
+      # to whoever dispatches it on their own branch: workflow_dispatch
+      # resolves both the code that runs and the permissions it runs with from
+      # the dispatched ref, which is exactly why release-cut.yml's own trigger
+      # above avoids workflow_dispatch in the first place. The credential
+      # stays here, on the sender, which is already gated by this job's own
+      # `if:` and the App's repository scope.
+      - name: Mint repository-scoped dispatch token
+        id: dispatch-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: firelock-ai
+          repositories: kin
+          permission-actions: write
+
+      - name: Warn when the dispatch cannot yet use the App identity
+        if: steps.dispatch-token.outcome != 'success'
+        run: |
+          echo "::warning::kin-release-bot (installation 148381548) does not yet carry the Actions permission, so RC Build's completion will not cascade into this workflow's own workflow_run trigger; dispatching rc-build.yml on github.token instead, exactly as before this change. Grant kin-release-bot Actions: write at https://github.com/organizations/firelock-ai/settings/installations/148381548 to turn the cascade on with no further change here."
+
+      # The dispatch goes out on the App identity minted just above whenever
+      # that mint succeeded, and on the workflow token exactly as before
+      # otherwise. `steps.dispatch-token.outcome`, never `.conclusion`: the
+      # mint's continue-on-error masks `.conclusion` to success even when it
+      # failed, which is what lets this job stay green either way, but reading
+      # that masked value here would make the dispatch trust a token that was
+      # never actually issued.
       - name: Dispatch the candidate archive build
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.dispatch-token.outcome == 'success' && steps.dispatch-token.outputs.token || github.token }}
           BRANCH: ${{ needs.select.outputs.branch }}
           CANDIDATE: ${{ needs.select.outputs.candidate }}
         run: |
@@ -722,6 +766,47 @@ jobs:
             --name preflight.json \
             --file "$RUNNER_TEMP/preflight.json" \
             --repo "$GITHUB_REPOSITORY"
+
+      # ADDITIVE: release-tag.yml already reaches this candidate through CI's
+      # workflow_run and a 15-minute schedule, both indirect occasions that
+      # wait on an unrelated event. This is the direct nudge, the moment the
+      # record above is durably published: evaluate now instead of waiting on
+      # either fallback. It reuses the App token minted for kin-evidence-publish
+      # rather than github.token, on purpose. Sending a repository_dispatch
+      # needs contents:write, which this job's default token does not carry
+      # (permissions: contents: read at the top of this file); the minted
+      # token already does, scoped to this repository. Its actor also matters:
+      # release-tag.yml's own trigger guard allowlists troyjr4103 and
+      # kin-release-bot[bot] and refuses everything else, including the
+      # github-actions[bot] actor an automated github.token dispatch would
+      # carry, so that dispatch would start a run and then immediately refuse
+      # itself. release_tag_evaluate takes no tag or sha (release-tag.yml
+      # refuses either), so this sends nothing for it to misread as break
+      # glass; `reason` is unread by that workflow and exists only for a
+      # person scanning the Actions log.
+      # Best-effort, on purpose. This nudge already has two fallbacks that
+      # need no code here to work: release-tag.yml's own 15-minute schedule,
+      # and CI's workflow_run trigger on the next ordinary push to main. A
+      # transient API failure on this call must not redden the publish job
+      # of a cut that already durably wrote the record this step only
+      # announces; continue-on-error plus the warning below make that true
+      # the same way the dispatch-token mint in the arm job does.
+      - name: Nudge release-tag to evaluate now
+        id: nudge-release-tag
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/dispatches" \
+            -f event_type=release_tag_evaluate \
+            -f "client_payload[reason]=release-cut run ${GITHUB_RUN_ID} published preflight.json for ${CANDIDATE}"
+
+      - name: Warn when the release-tag nudge did not go out
+        if: steps.nudge-release-tag.outcome != 'success'
+        run: |
+          echo "::warning::the direct nudge to release-tag.yml did not go out for this candidate; release-tag.yml still reaches it through its own 15-minute schedule and through CI's workflow_run trigger, so the mint is not blocked, only slower"
 
       - name: Say what the stranger will run next
         env:

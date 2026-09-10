@@ -156,6 +156,21 @@ RELEASE_PR_STEP_ANCHOR = "      - name: Open the protected release PR"
 RELEASE_APP_TOKEN = "${{ steps.app-token.outputs.token }}"
 DEFAULT_WORKFLOW_TOKEN = "${{ github.token }}"
 STEP_ENV_TOKEN_BINDING = re.compile(r"(?m)^\s+GH_TOKEN:\s*(?P<token>\S.*?)\s*$")
+PERMISSION_SCOPE_LINE = re.compile(r"(?m)^\s+(permission-[a-z-]+):")
+# FIR-3503. kin-release-bot's installation does not carry Actions today
+# (verified live via `gh api orgs/firelock-ai/installations`: administration:
+# read, contents:write, issues:write, metadata:read, pull_requests:write, no
+# actions key), so the dispatch token below must degrade to the workflow
+# token whenever the narrower mint failed, never dispatch unconditionally.
+RC_BUILD_DISPATCH_TOKEN_STEP_ANCHOR = (
+    "      - name: Mint repository-scoped dispatch token"
+)
+RC_BUILD_DISPATCH_STEP_ANCHOR = "      - name: Dispatch the candidate archive build"
+RC_BUILD_DISPATCH_TOKEN_EXPR = (
+    "${{ steps.dispatch-token.outcome == 'success' && "
+    "steps.dispatch-token.outputs.token || github.token }}"
+)
+RELEASE_TAG_NUDGE_STEP_ANCHOR = "      - name: Nudge release-tag to evaluate now"
 # Which tag each workflow declares it is about to create. Only the mint creates
 # one, so only the mint names it. The train resolves drift from a base tag it
 # never mints, and handing that base over as mint intent refuses exactly when a
@@ -10906,6 +10921,94 @@ def assert_readme_latest_release_policy(readme: str, readme_reference: str) -> N
         )
 
 
+def assert_rc_build_dispatch_degrades_to_todays_token(release_cut: str) -> None:
+    """RC Build's dispatch may use the App only when the App can actually send it.
+
+    kin-release-bot's installation does not carry the Actions permission today
+    (installation 148381548: administration:read, contents:write,
+    issues:write, metadata:read, pull_requests:write; verified live via
+    `gh api orgs/firelock-ai/installations`), so a token minted against it
+    with permission-actions: write fails until a person grants that
+    permission. The mint step must tolerate that failure without reddening
+    the job, and the dispatch step must fall back to github.token, exactly
+    what ran before this change, whenever the mint did not succeed: landing
+    this ahead of the grant must change nothing observable, and the cascade
+    turns on the moment the grant lands with no further edit here. The mint
+    must also ask for nothing beyond actions: a second permission on this
+    token duplicates scope the contents:write token beside it (for the branch
+    move) already carries, on a token the dispatch never needs to use it
+    through.
+    """
+
+    mint_step = workflow_step_source(
+        "release cut", release_cut, RC_BUILD_DISPATCH_TOKEN_STEP_ANCHOR
+    )
+    require(mint_step, "continue-on-error: true", "RC Build dispatch token mint")
+    require(mint_step, "permission-actions: write", "RC Build dispatch token mint")
+    scopes = {match.group(1) for match in PERMISSION_SCOPE_LINE.finditer(mint_step)}
+    if scopes != {"permission-actions"}:
+        raise AssertionError(
+            "the RC Build dispatch token must be scoped to actions only, and "
+            f"is scoped to {sorted(scopes) or '<nothing>'}; a second "
+            "permission on this token over-grants a credential the dispatch "
+            "never needs"
+        )
+    dispatch_step = workflow_step_source(
+        "release cut", release_cut, RC_BUILD_DISPATCH_STEP_ANCHOR
+    )
+    require(dispatch_step, "gh workflow run rc-build.yml", "RC Build dispatch")
+    bindings = [
+        match.group("token")
+        for match in STEP_ENV_TOKEN_BINDING.finditer(dispatch_step)
+    ]
+    if bindings != [RC_BUILD_DISPATCH_TOKEN_EXPR]:
+        raise AssertionError(
+            "the RC Build dispatch step must bind GH_TOKEN to "
+            f"{RC_BUILD_DISPATCH_TOKEN_EXPR} exactly once, falling back to "
+            f"{DEFAULT_WORKFLOW_TOKEN} whenever the App mint above did not "
+            f"succeed, and binds {bindings or '<nothing>'}"
+        )
+
+
+def assert_release_tag_nudge_uses_app_identity(release_cut: str) -> None:
+    """The nudge to release-tag.yml must carry an actor that workflow accepts.
+
+    release-tag.yml's own trigger guard allowlists troyjr4103 and
+    kin-release-bot[bot] and refuses every other actor, including
+    github-actions[bot], the identity a github.token-authenticated dispatch
+    would carry. Sending a repository_dispatch also needs contents:write,
+    which this job's own default token does not hold (permissions:
+    contents: read at the top of this file). The publish job already mints a
+    kin-release-bot token scoped to contents:write for kin-evidence-publish;
+    this reuses that exact token rather than minting a second one or reaching
+    for github.token.
+
+    The nudge must also be best-effort. It has two fallbacks that need no
+    code here to work at all, release-tag.yml's own 15-minute schedule and
+    CI's workflow_run trigger, so a transient API failure on this one call
+    must not redden the publish job of a cut that already durably wrote the
+    record this step only announces.
+    """
+
+    step = workflow_step_source(
+        "release cut", release_cut, RELEASE_TAG_NUDGE_STEP_ANCHOR
+    )
+    require(step, "release_tag_evaluate", "release-tag nudge")
+    require(step, "repos/${GITHUB_REPOSITORY}/dispatches", "release-tag nudge")
+    require(step, "continue-on-error: true", "release-tag nudge")
+    bindings = [
+        match.group("token") for match in STEP_ENV_TOKEN_BINDING.finditer(step)
+    ]
+    if bindings != [RELEASE_APP_TOKEN]:
+        raise AssertionError(
+            "the release-tag nudge must bind GH_TOKEN to the minted App "
+            f"installation token {RELEASE_APP_TOKEN} exactly once, because "
+            "release-tag.yml's own actor allowlist refuses the identity a "
+            f"{DEFAULT_WORKFLOW_TOKEN} dispatch would carry, and binds "
+            f"{bindings or '<nothing>'}"
+        )
+
+
 def main() -> None:
     assert_release_probe_fixtures()
     retired = (
@@ -10931,6 +11034,97 @@ def main() -> None:
         ("startup evidence lost on failure", "if: always() && matrix.artifact == 'kin-macos-aarch64'", "if: success() && matrix.artifact == 'kin-macos-aarch64'", "must survive"),
     ]:
         expect_assertion(label, error, lambda before=before, after=after: assert_native_startup_release_proof(release_cut.replace(before, after, 1)))
+
+    # FIR-3503. RC Build completing does not cascade into this workflow's own
+    # workflow_run trigger when RC Build was dispatched on github.token, which
+    # it always is: a run started that way completes without producing the
+    # occasion anything is listening for. Both new hops below replace which
+    # credential performs a dispatch, never what a dispatch is allowed to do.
+    assert_rc_build_dispatch_degrades_to_todays_token(release_cut)
+    dispatch_token_mint = workflow_step_source(
+        "release cut", release_cut, RC_BUILD_DISPATCH_TOKEN_STEP_ANCHOR
+    )
+    expect_assertion(
+        "dispatch token mint loses its continue-on-error",
+        "is missing required policy: continue-on-error: true",
+        lambda: assert_rc_build_dispatch_degrades_to_todays_token(
+            release_cut.replace(
+                dispatch_token_mint,
+                dispatch_token_mint.replace(
+                    "        continue-on-error: true\n", "", 1
+                ),
+                1,
+            )
+        ),
+    )
+    expect_assertion(
+        "dispatch token mint gains a contents scope too",
+        "must be scoped to actions only",
+        lambda: assert_rc_build_dispatch_degrades_to_todays_token(
+            release_cut.replace(
+                dispatch_token_mint,
+                dispatch_token_mint.replace(
+                    "          permission-actions: write\n",
+                    "          permission-actions: write\n          permission-contents: write\n",
+                    1,
+                ),
+                1,
+            )
+        ),
+    )
+    rc_build_dispatch = workflow_step_source(
+        "release cut", release_cut, RC_BUILD_DISPATCH_STEP_ANCHOR
+    )
+    expect_assertion(
+        "dispatch step drops its fallback to the workflow token",
+        "must bind GH_TOKEN to",
+        lambda: assert_rc_build_dispatch_degrades_to_todays_token(
+            release_cut.replace(
+                rc_build_dispatch,
+                STEP_ENV_TOKEN_BINDING.sub(
+                    lambda _: "          GH_TOKEN: "
+                    + RELEASE_APP_TOKEN.replace("app-token", "dispatch-token"),
+                    rc_build_dispatch,
+                    count=1,
+                ),
+                1,
+            )
+        ),
+    )
+
+    assert_release_tag_nudge_uses_app_identity(release_cut)
+    release_tag_nudge = workflow_step_source(
+        "release cut", release_cut, RELEASE_TAG_NUDGE_STEP_ANCHOR
+    )
+    expect_assertion(
+        "release-tag nudge reverts to the workflow token",
+        "must bind GH_TOKEN to",
+        lambda: assert_release_tag_nudge_uses_app_identity(
+            release_cut.replace(
+                release_tag_nudge,
+                STEP_ENV_TOKEN_BINDING.sub(
+                    lambda _: f"          GH_TOKEN: {DEFAULT_WORKFLOW_TOKEN}",
+                    release_tag_nudge,
+                    count=1,
+                ),
+                1,
+            )
+        ),
+    )
+    expect_assertion(
+        "release-tag nudge loses its continue-on-error",
+        "is missing required policy: continue-on-error: true",
+        lambda: assert_release_tag_nudge_uses_app_identity(
+            release_cut.replace(
+                release_tag_nudge,
+                release_tag_nudge.replace(
+                    "        continue-on-error: true\n", "", 1
+                ),
+                1,
+            )
+        ),
+    )
+
     subprocess.run([sys.executable, str(ROOT / "scripts/release-proof/startup-recovery/run.py"), "--verify-only"], check=True)
     subprocess.run([sys.executable, str(ROOT / "scripts/test-startup-release-proof.py")], check=True)
     release_recovery = RELEASE_RECOVERY.read_text(encoding="utf-8")
@@ -17527,12 +17721,21 @@ def main() -> None:
         ): assert_the_mint_records_the_state_it_tagged_on(mutant),
     )
     assert_the_hosted_stranger_never_reddens_the_rail(release_cut)
+    # Scoped to the stranger job's own block, not a whole-file replace: FIR-3503
+    # gave the arm job a second, step-level `continue-on-error: true` (for the
+    # dispatch-token mint), which sorts earlier in the file and contains this
+    # exact 4-space-indented needle as a substring of its own 8-space line, so
+    # an unanchored `release_cut.replace(..., 1)` strips the wrong one and this
+    # falsification stops failing for the right reason.
+    stranger_block = workflow_job_blocks(release_cut)["stranger"]
     expect_assertion(
         "the hosted stranger can fail a cut run again",
         "must carry continue-on-error: true",
-        lambda mutant=release_cut.replace("    continue-on-error: true\n", "", 1): (
-            assert_the_hosted_stranger_never_reddens_the_rail(mutant)
-        ),
+        lambda mutant=release_cut.replace(
+            stranger_block,
+            stranger_block.replace("    continue-on-error: true\n", "", 1),
+            1,
+        ): assert_the_hosted_stranger_never_reddens_the_rail(mutant),
     )
     expect_assertion(
         "the record publisher trusts a result continue-on-error has masked",
