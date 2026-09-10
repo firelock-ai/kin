@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (528 total, 357 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (530 total, 357 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -119,6 +119,8 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE` | bool | false | correctness | disable daemon filesystem watching and reconcile/sync ingestion so remote graph authority cannot be overwritten by a checkout |
 | `KIN_DAEMON_DISABLE_LSP` | bool | false | correctness | disable LSP enrichment in the daemon, reducing relation coverage |
 | `KIN_DAEMON_EMBED_BATCH_SIZE` | usize | *(unset)* | operational | embedding batch size for daemon-side embed passes |
+| `KIN_DAEMON_EXACT_SOURCE_EXPORT_QUEUE_DEPTH` | usize | 8 | operational | how many exact-source archive exports may wait for the single export slot at once; a request arriving on a full queue is refused at once with a Retry-After rather than holding a connection for the whole wait budget to be told the same thing later. Zero or unparseable keeps one, because a queue that admits nobody is the refusal this replaced |
+| `KIN_DAEMON_EXACT_SOURCE_EXPORT_WAIT_MS` | usize | 3000 | operational | how long one exact-source archive export waits in milliseconds for the daemon's single in-memory export slot before it is refused with a Retry-After. The wait is spent inside the caller's own read bound, so raising it past what one export costs turns a queued clone into a caller timeout instead of an answer. Zero means do not wait, which restores the outright refusal this queue replaced; it is a real value here rather than the unbounded-means-zero convention the millisecond bound knobs use |
 | `KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS` | seconds>=0 | 3 | operational | readiness wait for an already-running daemon |
 | `KIN_DAEMON_HOSTED_HYDRATION_TIMEOUT_SECS` | seconds>=0 | 300 | operational | budget for one cold hosted-repository hydration before its admission slot is reclaimed |
 | `KIN_DAEMON_HTTP_TIMEOUT_SECS` | seconds>=0 | 300 | operational | per-request HTTP timeout for the CLI's daemon client; 0 or invalid falls back to 300, and long-running requests (large-repo review) need a higher value |

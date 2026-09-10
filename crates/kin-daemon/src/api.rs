@@ -39,7 +39,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
-static EXACT_SOURCE_ARCHIVE_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static EXACT_SOURCE_ARCHIVE_EXPORTS: OnceLock<Arc<ExactSourceArchiveExportQueue>> = OnceLock::new();
 static HOSTED_REPOSITORY_HYDRATIONS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 fn hosted_repository_hydrations() -> Arc<tokio::sync::Semaphore> {
@@ -48,9 +48,10 @@ fn hosted_repository_hydrations() -> Arc<tokio::sync::Semaphore> {
     )
 }
 
-fn exact_source_archive_exports() -> Arc<tokio::sync::Semaphore> {
+fn exact_source_archive_exports() -> Arc<ExactSourceArchiveExportQueue> {
     Arc::clone(
-        EXACT_SOURCE_ARCHIVE_EXPORTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1))),
+        EXACT_SOURCE_ARCHIVE_EXPORTS
+            .get_or_init(|| Arc::new(ExactSourceArchiveExportQueue::from_env())),
     )
 }
 
@@ -18586,16 +18587,252 @@ const EXACT_SOURCE_MAX_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
 const EXACT_SOURCE_MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
 const EXACT_SOURCE_ROOT: &str = "kin-source";
 
-fn try_acquire_exact_source_archive_slot(
-    semaphore: Arc<tokio::sync::Semaphore>,
-) -> Result<tokio::sync::OwnedSemaphorePermit, (StatusCode, String)> {
-    semaphore.try_acquire_owned().map_err(|_| {
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            "an exact source archive or release-evidence job is already running; retry after it completes"
-                .to_string(),
+/// How long one exact-source export may wait for the single memory slot.
+///
+/// The number comes from the caller's bound rather than from taste. kinlab's
+/// control plane reads this route with a 12 000 ms budget
+/// (`DEFAULT_DAEMON_REQUEST_TIMEOUT_MS`, `services/control-plane/src/daemon-http.ts`),
+/// and that budget is time-to-FIRST-BYTE: it clears its own timer in the
+/// `finally` that follows the fetch, which is when response headers arrive.
+/// This route cannot flush headers before the archive exists, because
+/// `x-kin-source-manifest-sha256` is derived from the built archive and the
+/// control plane refuses a response missing it, so the queue wait and the
+/// build spend one shared budget.
+///
+/// So the arithmetic picks the number. A waiter arriving `a` into a running
+/// export of length `T` waits `T - a` and then pays `T` itself, putting its
+/// first byte at `2T - a`. Measured on the largest store to hand, the kin
+/// checkout at 1061 files and 42 MiB of source, `T` is 5.8 s median and 6.2 s
+/// at its slowest. Targeting four fifths of the caller's bound, so a loaded
+/// host does not turn a queued clone into a caller timeout, leaves a servable
+/// waiter at `T - a <= 3400` ms. This is that cut rounded down. A waiter that
+/// would need longer is told to retry rather than held until the caller gives
+/// up. Raise it only together with a fresh measurement of the export itself;
+/// `the_export_wait_budget_leaves_the_control_plane_room_to_receive_the_answer`
+/// is the guard on that.
+const EXACT_SOURCE_EXPORT_WAIT_BUDGET: Duration = Duration::from_millis(3_000);
+
+/// Operators override the wait budget with this, in milliseconds. Zero is
+/// meaningful and kept: it means do not wait, which is the behaviour this
+/// queue replaced.
+const EXACT_SOURCE_EXPORT_WAIT_ENV: &str = "KIN_DAEMON_EXACT_SOURCE_EXPORT_WAIT_MS";
+
+/// How many exports may be waiting for the slot at once.
+///
+/// A waiter costs a queued task and a held connection, and past some depth the
+/// wait budget cannot be met anyway, so an immediate `Retry-After` is a more
+/// useful answer than a connection held for the whole budget and then refused.
+const EXACT_SOURCE_EXPORT_QUEUE_DEPTH: usize = 8;
+
+/// Operators override the queue depth with this. Zero is clamped to one,
+/// because a queue that admits nobody is the refusal this replaced.
+const EXACT_SOURCE_EXPORT_QUEUE_DEPTH_ENV: &str = "KIN_DAEMON_EXACT_SOURCE_EXPORT_QUEUE_DEPTH";
+
+/// A malformed or absent override leaves the compiled default rather than
+/// becoming a bound nobody typed.
+fn resolve_exact_source_export_wait_budget(raw: Option<&str>) -> Duration {
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(EXACT_SOURCE_EXPORT_WAIT_BUDGET)
+}
+
+fn resolve_exact_source_export_queue_depth(raw: Option<&str>) -> usize {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(EXACT_SOURCE_EXPORT_QUEUE_DEPTH)
+        .max(1)
+}
+
+/// Admission to the one in-memory exact-source export slot.
+///
+/// The permit count stays at one. The archive is built whole in memory before
+/// any of it is written, so two at once multiply peak RSS against the daemon
+/// memory ceiling, and moving that count is a measurement's decision rather
+/// than this one's.
+///
+/// What changed is what the SECOND concurrent request gets. `try_acquire_owned`
+/// refused it with a 429, and kinlab's control plane throws on any non-2xx
+/// from this route (`getRepoSourceArchive`,
+/// `services/control-plane/src/local-kin-gateway.ts`), which its Git handler
+/// turns into a 500 on `info/refs`
+/// (`services/control-plane/src/git-protocol.ts`). So the second of two
+/// concurrent hosted clones failed outright while the first was still
+/// building, on a door that is every repository page's primary affordance. A
+/// bounded wait answers that: a request that can be served inside the budget
+/// waits and completes, and one that cannot is told when to come back.
+struct ExactSourceArchiveExportQueue {
+    slots: Arc<tokio::sync::Semaphore>,
+    /// Requests inside [`Self::admit`], counted by hand because
+    /// `tokio::sync::Semaphore` does not expose its queue length.
+    waiting: std::sync::atomic::AtomicUsize,
+    queue_depth: usize,
+    wait_budget: Duration,
+}
+
+/// A place in the export wait queue, released on every exit path including a
+/// dropped request future.
+struct ExactSourceExportQueueSeat<'queue> {
+    waiting: &'queue std::sync::atomic::AtomicUsize,
+}
+
+impl Drop for ExactSourceExportQueueSeat<'_> {
+    fn drop(&mut self) {
+        self.waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl ExactSourceArchiveExportQueue {
+    fn new(queue_depth: usize, wait_budget: Duration) -> Self {
+        Self {
+            // One permit, deliberately. See the type comment.
+            slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            queue_depth: queue_depth.max(1),
+            wait_budget,
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::new(
+            resolve_exact_source_export_queue_depth(
+                std::env::var(EXACT_SOURCE_EXPORT_QUEUE_DEPTH_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+            resolve_exact_source_export_wait_budget(
+                std::env::var(EXACT_SOURCE_EXPORT_WAIT_ENV).ok().as_deref(),
+            ),
         )
-    })
+    }
+
+    /// Claim a place in the queue, or `None` when it is already at depth.
+    ///
+    /// A compare-exchange rather than `fetch_add` with a rollback: an add that
+    /// overshoots is visible to a concurrent caller, which would then refuse
+    /// against a depth the queue is not actually holding.
+    fn take_seat(&self) -> Option<ExactSourceExportQueueSeat<'_>> {
+        let mut observed = self.waiting.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if observed >= self.queue_depth {
+                return None;
+            }
+            match self.waiting.compare_exchange_weak(
+                observed,
+                observed + 1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ExactSourceExportQueueSeat {
+                        waiting: &self.waiting,
+                    })
+                }
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    /// Wait for the export slot, bounded in queue depth and in time.
+    ///
+    /// Every admission goes through the semaphore's own FIFO queue, including
+    /// one that would find a permit free. `Semaphore::try_acquire` does not
+    /// consult that queue, so a `try_acquire` fast path would let a fresh
+    /// request barge past one already waiting and, under sustained clone
+    /// traffic, spend that waiter's whole budget before refusing it.
+    async fn admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, ExactSourceExportRefusal> {
+        let Some(_seat) = self.take_seat() else {
+            return Err(ExactSourceExportRefusal::queue_full(
+                self.queue_depth,
+                self.wait_budget,
+            ));
+        };
+        let acquire = Arc::clone(&self.slots).acquire_owned();
+        match tokio::time::timeout(self.wait_budget, acquire).await {
+            Ok(Ok(permit)) => Ok(permit),
+            // The semaphore is a process-lifetime static that nothing closes,
+            // so this is a service condition rather than a caller error.
+            Ok(Err(_closed)) => Err(ExactSourceExportRefusal::slot_closed(self.wait_budget)),
+            Err(_elapsed) => Err(ExactSourceExportRefusal::wait_expired(self.wait_budget)),
+        }
+    }
+
+    #[cfg(test)]
+    fn waiting(&self) -> usize {
+        self.waiting.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// A refusal a caller can act on.
+///
+/// The old answer was a bare 429 carrying a sentence. Two things were missing:
+/// a status the layer in front can tell apart from a broken request, and a
+/// `Retry-After` a client can obey. Capacity that frees on its own is a 503,
+/// which is what the daemon's other admission gate already answers for the
+/// same condition (see `run_hosted_repository_hydration_within`).
+#[derive(Debug)]
+struct ExactSourceExportRefusal {
+    retry_after: Duration,
+    message: String,
+}
+
+impl ExactSourceExportRefusal {
+    fn queue_full(queue_depth: usize, retry_after: Duration) -> Self {
+        Self {
+            retry_after,
+            message: format!(
+                "exact source archive export queue is full at {queue_depth} waiting {}; \
+                 this is capacity, not a bad request, and it frees on its own",
+                if queue_depth == 1 {
+                    "request"
+                } else {
+                    "requests"
+                }
+            ),
+        }
+    }
+
+    fn wait_expired(waited: Duration) -> Self {
+        Self {
+            retry_after: waited,
+            message: format!(
+                "exact source archive export waited {} ms for the single memory slot without \
+                 reaching it; this is capacity, not a bad request, and it frees on its own",
+                waited.as_millis()
+            ),
+        }
+    }
+
+    fn slot_closed(retry_after: Duration) -> Self {
+        Self {
+            retry_after,
+            message: "exact source archive export admission is closed on this daemon; \
+                      this is capacity, not a bad request"
+                .to_string(),
+        }
+    }
+
+    /// Delay-seconds per RFC 9110, and never zero: a client told to retry
+    /// after zero seconds retries straight back into the same saturated queue.
+    fn retry_after_seconds(&self) -> u64 {
+        u64::try_from(self.retry_after.as_millis().div_ceil(1_000))
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+}
+
+impl IntoResponse for ExactSourceExportRefusal {
+    fn into_response(self) -> Response {
+        let retry_after = self.retry_after_seconds();
+        let mut response = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{}; retry after {retry_after}s", self.message),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
+        response
+    }
 }
 
 #[derive(Debug)]
@@ -19163,13 +19400,33 @@ fn load_exact_source_entries_with(
 /// GET /repos/{repo_id}/archive/tar/{source_change_id} — export one exact
 /// semantic change from graph-owned history and immutable backend source bytes.
 async fn repo_exact_source_tar_gz(
-    Path((repo_id, source_change_id)): Path<(String, String)>,
-    State(state): State<Arc<DaemonState>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+    path: Path<(String, String)>,
+    state: State<Arc<DaemonState>>,
+) -> Response {
     // The current backend API returns whole blobs and the HTTP response is a
     // complete in-memory archive. Serialize this bounded path until backend
-    // streaming lands so concurrent requests cannot multiply peak RSS.
-    let archive_permit = try_acquire_exact_source_archive_slot(exact_source_archive_exports())?;
+    // streaming lands so concurrent requests cannot multiply peak RSS. A
+    // second concurrent request WAITS for the slot rather than being refused;
+    // `ExactSourceArchiveExportQueue` carries why that refusal was a
+    // public-facing defect.
+    let archive_permit = match exact_source_archive_exports().admit().await {
+        Ok(permit) => permit,
+        Err(refusal) => return refusal.into_response(),
+    };
+    match repo_exact_source_tar_gz_admitted(path, state, archive_permit).await {
+        Ok(response) => response.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// The export itself, once this request owns the one memory slot. The permit
+/// arrives as a parameter so admission is decided in exactly one place and the
+/// export's own error paths cannot answer for it.
+async fn repo_exact_source_tar_gz_admitted(
+    Path((repo_id, source_change_id)): Path<(String, String)>,
+    State(state): State<Arc<DaemonState>>,
+    archive_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     let requested_change = parse_semantic_change_id("source_change_id", &source_change_id)?;
     let view = repository_read_view(&state, &repo_id).await?;
     if view.change(&requested_change)?.is_none() {
@@ -20074,11 +20331,16 @@ mod tests {
 
     #[tokio::test]
     async fn exact_source_archive_generation_is_single_flight_for_response_lifetime() {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = try_acquire_exact_source_archive_slot(Arc::clone(&semaphore)).unwrap();
+        // A zero wait budget on purpose: this test is about how LONG one
+        // permit is held, so it must not also spend time waiting for one.
+        let queue = ExactSourceArchiveExportQueue::new(4, Duration::ZERO);
+        let permit = queue.admit().await.unwrap();
         let mut body = exact_source_archive_body(vec![0_u8; 16], permit);
-        let error = try_acquire_exact_source_archive_slot(Arc::clone(&semaphore)).unwrap_err();
-        assert_eq!(error.0, StatusCode::TOO_MANY_REQUESTS);
+        let refusal = queue.admit().await.unwrap_err();
+        assert_eq!(
+            refusal.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
 
         // Hyper can drop an exhausted Body as soon as it has polled the data
         // frame, while retaining the Bytes in its socket/write buffer. The
@@ -20091,16 +20353,17 @@ mod tests {
         .unwrap();
         let data = frame.into_data().unwrap();
         drop(body);
-        let error = try_acquire_exact_source_archive_slot(Arc::clone(&semaphore)).unwrap_err();
-        assert_eq!(error.0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(queue.admit().await.is_err());
         drop(data);
-        assert!(try_acquire_exact_source_archive_slot(semaphore).is_ok());
+        assert!(queue.admit().await.is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_archive_request_cannot_release_a_running_worker_permit() {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = try_acquire_exact_source_archive_slot(Arc::clone(&semaphore)).unwrap();
+        // Zero budget again: the property is who OWNS the permit while a
+        // worker runs, and a waiting arm would only obscure it.
+        let queue = ExactSourceArchiveExportQueue::new(4, Duration::ZERO);
+        let permit = queue.admit().await.unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -20118,12 +20381,233 @@ mod tests {
         // Dropping a request's JoinHandle does not abort spawn_blocking. The
         // worker, not the request future, must therefore retain admission.
         drop(worker);
-        let error = try_acquire_exact_source_archive_slot(Arc::clone(&semaphore)).unwrap_err();
-        assert_eq!(error.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            queue.admit().await.unwrap_err().into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
 
         resume_tx.send(()).unwrap();
         done_rx.await.unwrap();
-        assert!(try_acquire_exact_source_archive_slot(semaphore).is_ok());
+        assert!(queue.admit().await.is_ok());
+    }
+
+    /// Poll the export queue's seat count to a state, bounded in time, so a
+    /// regression that stops the queue from ever filling FAILS with a message
+    /// instead of hanging the suite. A bare spin loop here would be a check
+    /// that cannot go red: restore `try_acquire` and nothing ever waits, so
+    /// `while waiting() == 0` would spin for the life of the run.
+    async fn await_queue_state(
+        queue: &ExactSourceArchiveExportQueue,
+        what: &str,
+        mut settled: impl FnMut(usize) -> bool,
+    ) {
+        let reached = tokio::time::timeout(Duration::from_secs(10), async {
+            while !settled(queue.waiting()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            reached.is_ok(),
+            "the export queue never reached {what}; waiting = {}",
+            queue.waiting()
+        );
+    }
+
+    /// The defect FIR-3491 names. With `try_acquire_owned`, the second of two
+    /// concurrent exports was refused outright while the first was still
+    /// building, and the control plane in front of this route turns any
+    /// non-2xx into a 500 on git's `info/refs`. It must WAIT and be admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_concurrent_export_waits_for_the_slot_and_is_admitted() {
+        let queue = Arc::new(ExactSourceArchiveExportQueue::new(
+            4,
+            Duration::from_secs(30),
+        ));
+        let first = queue.admit().await.unwrap();
+
+        let waiter_queue = Arc::clone(&queue);
+        let waiter = tokio::spawn(async move { waiter_queue.admit().await });
+        // A state, not a sleep: the seat count is only non-zero once the
+        // second admission is inside `admit`, and it cannot leave while
+        // `first` is held.
+        await_queue_state(&queue, "one waiting export", |waiting| waiting >= 1).await;
+        assert_eq!(
+            queue.slots.available_permits(),
+            0,
+            "the first export must still hold the only permit"
+        );
+        assert!(
+            !waiter.is_finished(),
+            "the second concurrent export must be waiting, not refused"
+        );
+
+        drop(first);
+        let admitted = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("a queued export must be admitted once the slot frees")
+            .expect("the waiting task must not panic");
+        assert!(
+            admitted.is_ok(),
+            "the second concurrent export must get the slot rather than a refusal"
+        );
+    }
+
+    /// A request that cannot reach the slot inside the budget is told when to
+    /// come back, in a status the layer in front can tell apart from a broken
+    /// request and with a `Retry-After` a client can obey.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_export_that_misses_the_budget_is_refused_with_a_retry_after() {
+        let queue = ExactSourceArchiveExportQueue::new(4, Duration::from_millis(50));
+        let _held = queue.admit().await.unwrap();
+
+        let response = queue.admit().await.unwrap_err().into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // 50 ms of budget still names a whole second: `Retry-After` has no
+        // sub-second form, and zero would send the client straight back into
+        // the same saturated queue.
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("waited 50 ms"),
+            "the refusal must name the budget it spent: {body}"
+        );
+        assert!(
+            body.contains("capacity, not a bad request"),
+            "the refusal must not read as a caller error: {body}"
+        );
+        assert!(
+            body.contains("retry after 1s"),
+            "the refusal must name the retry delay in the body too: {body}"
+        );
+    }
+
+    /// A third request arriving on a queue already at depth is answered at
+    /// once. Holding it for the whole budget and then refusing spends the
+    /// caller's own bound to deliver the same news later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_saturated_queue_refuses_at_once_rather_than_spending_the_budget() {
+        // Depth one: one waiter fits, the next does not.
+        let queue = Arc::new(ExactSourceArchiveExportQueue::new(
+            1,
+            Duration::from_secs(30),
+        ));
+        let held = queue.admit().await.unwrap();
+
+        let waiter_queue = Arc::clone(&queue);
+        let waiter = tokio::spawn(async move { waiter_queue.admit().await });
+        await_queue_state(&queue, "its one queue seat taken", |waiting| waiting >= 1).await;
+
+        let started = Instant::now();
+        let refusal = queue.admit().await.unwrap_err();
+        let waited = started.elapsed();
+        // Six times clear of the 30 s budget. The claim is that the budget was
+        // not spent, and a tighter bound would only add a scheduler-noise
+        // flake to a test whose separation is already unambiguous.
+        assert!(
+            waited < Duration::from_secs(5),
+            "a full queue must answer at once rather than spending its 30 s budget: {waited:?}"
+        );
+        let response = refusal.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "30");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("queue is full at 1 waiting request"),
+            "the refusal must name the depth it is holding: {body}"
+        );
+
+        drop(held);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), waiter)
+                .await
+                .expect("the queued export must still be admitted")
+                .expect("the waiting task must not panic")
+                .is_ok(),
+            "saturation must not cost the request that was already waiting its slot"
+        );
+    }
+
+    /// A queue seat is released on every exit path, including a request future
+    /// dropped mid-wait. Without that, a cancelled clone would consume a seat
+    /// for the life of the process and the depth bound would ratchet closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_waiting_export_gives_its_queue_seat_back() {
+        let queue = Arc::new(ExactSourceArchiveExportQueue::new(
+            1,
+            Duration::from_secs(30),
+        ));
+        let held = queue.admit().await.unwrap();
+
+        let waiter_queue = Arc::clone(&queue);
+        let waiter = tokio::spawn(async move { waiter_queue.admit().await });
+        await_queue_state(&queue, "one waiting export", |waiting| waiting >= 1).await;
+
+        waiter.abort();
+        await_queue_state(&queue, "an empty wait queue", |waiting| waiting == 0).await;
+        drop(held);
+        assert!(
+            queue.admit().await.is_ok(),
+            "the seat and the permit must both be free after a cancelled wait"
+        );
+    }
+
+    /// The compiled budget is only safe next to the caller's own bound, and
+    /// the queue wait is spent inside it. Raising this without re-measuring
+    /// the export is the mistake this asserts against.
+    #[test]
+    fn the_export_wait_budget_leaves_the_control_plane_room_to_receive_the_answer() {
+        // kinlab reads this route with a 12 000 ms time-to-first-byte bound
+        // (`DEFAULT_DAEMON_REQUEST_TIMEOUT_MS`, `daemon-http.ts`).
+        const CONTROL_PLANE_READ_BOUND: Duration = Duration::from_millis(12_000);
+        // The slowest of five samples against the largest store to hand, the
+        // kin checkout at 1061 files and 42 MiB of source: 6 200 ms to first
+        // byte. A waiter admitted at the very end of the budget still pays
+        // that before the caller's bound fires.
+        const MEASURED_SLOWEST_EXPORT: Duration = Duration::from_millis(6_200);
+        assert!(
+            EXACT_SOURCE_EXPORT_WAIT_BUDGET + MEASURED_SLOWEST_EXPORT
+                <= CONTROL_PLANE_READ_BOUND * 4 / 5,
+            "the budget plus one measured export must fit the caller's bound with a fifth spare"
+        );
+    }
+
+    #[test]
+    fn export_queue_overrides_fall_back_to_the_compiled_defaults() {
+        assert_eq!(
+            resolve_exact_source_export_wait_budget(None),
+            EXACT_SOURCE_EXPORT_WAIT_BUDGET
+        );
+        assert_eq!(
+            resolve_exact_source_export_wait_budget(Some("not-a-number")),
+            EXACT_SOURCE_EXPORT_WAIT_BUDGET
+        );
+        assert_eq!(
+            resolve_exact_source_export_wait_budget(Some(" 250 ")),
+            Duration::from_millis(250)
+        );
+        // Zero is a real choice rather than a typo: it restores the refusal
+        // this queue replaced, for a deployment that wants it back.
+        assert_eq!(
+            resolve_exact_source_export_wait_budget(Some("0")),
+            Duration::ZERO
+        );
+        assert_eq!(
+            resolve_exact_source_export_queue_depth(None),
+            EXACT_SOURCE_EXPORT_QUEUE_DEPTH
+        );
+        assert_eq!(resolve_exact_source_export_queue_depth(Some("0")), 1);
+        assert_eq!(resolve_exact_source_export_queue_depth(Some("3")), 3);
+        assert_eq!(
+            resolve_exact_source_export_queue_depth(Some("nonsense")),
+            EXACT_SOURCE_EXPORT_QUEUE_DEPTH
+        );
     }
 
     #[test]
@@ -34261,6 +34745,89 @@ mod tests {
                 .snapshot_generation
                 .load(std::sync::atomic::Ordering::SeqCst),
             generation_before
+        );
+    }
+
+    /// Two concurrent exports of the SAME change over the real router both
+    /// answer 200 with identical bytes, and the second is observed WAITING
+    /// rather than refused. This is the shape the hosted clone door takes, and
+    /// with `try_acquire_owned` the second answered 429 to whichever of the
+    /// two lost the race.
+    ///
+    /// The first response is deliberately left undrained while the second is
+    /// admitted, because that is what holds the permit: it lives in the
+    /// response body's `Bytes` owner until the bytes are flushed, so the
+    /// second export's wait covers the FIRST client's download and not merely
+    /// its build. A slow reader is therefore part of the next clone's wait,
+    /// which is one more reason the answer to a kin-sized repository is a
+    /// cached archive rather than a longer budget.
+    ///
+    /// The window in which this test holds the process-wide permit is the
+    /// microseconds between the first response arriving and its body being
+    /// read. Another route test landing inside it waits that long and is then
+    /// served, which is exactly the behaviour under test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_exact_source_exports_of_one_change_both_complete() {
+        let state = test_state();
+        let repo_id = state.cached_repo_id.clone();
+        let change_id = install_repository_file(&state, "README.md", b"graph-owned source\n");
+        let app = router(Arc::clone(&state));
+        let path = format!("/repos/{repo_id}/archive/tar/{change_id}");
+        let request = || Request::get(&path).body(Body::empty()).unwrap();
+
+        let first = app
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("the router must answer the first export");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let queue = exact_source_archive_exports();
+        let waiting_before = queue.waiting();
+        let second = tokio::spawn(app.clone().oneshot(request()));
+        await_queue_state(
+            &queue,
+            "one more waiting export than it started with",
+            |waiting| waiting > waiting_before,
+        )
+        .await;
+        assert!(
+            !second.is_finished(),
+            "the second concurrent export must be waiting on the slot, not refused"
+        );
+
+        // `to_bytes` hands back the same `Bytes`, and the permit lives in its
+        // owner, so the digest has to be taken and the bytes DROPPED before
+        // the queued export can be admitted. Holding them across the await
+        // below is a self-deadlock that ends at the wait budget, which is how
+        // this test found the retention in the first place.
+        let first_bytes = axum::body::to_bytes(first.into_body(), 8 * 1024 * 1024)
+            .await
+            .expect("the first archive body must read");
+        let first = Sha256::digest(&first_bytes);
+        // Explicitly, not by shadowing: shadowing a binding does not drop the
+        // value it shadowed, so `first_bytes` would keep the permit to the end
+        // of this scope and the export below would never be admitted.
+        drop(first_bytes);
+
+        let second = second
+            .await
+            .expect("the second export task must not panic")
+            .expect("the router must answer the second export");
+        let status = second.status();
+        let second = axum::body::to_bytes(second.into_body(), 8 * 1024 * 1024)
+            .await
+            .expect("the second archive body must read");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the second concurrent export must complete once the slot frees, not be refused: {}",
+            String::from_utf8_lossy(&second)
+        );
+        assert_eq!(
+            first,
+            Sha256::digest(&second),
+            "two exports of one immutable change must produce identical bytes"
         );
     }
 
