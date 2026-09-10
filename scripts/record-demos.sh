@@ -294,7 +294,7 @@ record_full() {
     set -e
     KIN=\"$KIN\"
 
-    echo \"# Kin: semantic system of record for software\"
+    echo \"# Kin: a graph-native code repository for people and AI agents\"
     sleep 2
 
     echo \"\$ kin init .\"

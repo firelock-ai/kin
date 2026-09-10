@@ -433,7 +433,7 @@ mod tests {
         let text = [
             "",
             "kin 0.7.2",
-            "The system of record for AI-written software.",
+            "A graph-native code repository for people and AI agents.",
             "",
         ];
         for style in [

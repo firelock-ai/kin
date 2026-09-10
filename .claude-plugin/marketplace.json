@@ -1,6 +1,6 @@
 {
   "name": "kin",
-  "description": "Firelock's marketplace for Kin, the system of record for AI-written software. Ships the Kin plugin: the bundled MCP server plus skills for graph-backed retrieval and blast-radius review.",
+  "description": "Firelock's marketplace for Kin, a graph-native code repository for people and AI agents. Ships the Kin plugin: the bundled MCP server plus skills for graph-backed retrieval and blast-radius review.",
   "owner": {
     "name": "Firelock",
     "url": "https://kinlab.ai"

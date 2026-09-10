@@ -1,40 +1,40 @@
 # Kin
 
-> Kin is the system of record for AI-written software — a graph-native repository and collaboration substrate that replaces the file-first, diff-first model. Code becomes a graph of entities, relations, and intents that AI agents and humans navigate semantically.
+> Kin is a graph-native code repository for people and AI agents. It replaces the file-first, diff-first model with a repository and collaboration substrate built on a graph: code becomes entities, relations and intents that AI agents and humans navigate semantically.
 
 Kin coexists with Git and projects graph-owned truth back to a normal filesystem through a transparent VFS, so any tool or agent works unchanged. The fastest way for an agent to use Kin is the MCP server, which exposes semantic tools (locate, context, trace) backed by the graph rather than filesystem heuristics.
 
 ## Install
 
-- [Install script — macOS/Linux](https://get.kinlab.dev/install): `curl -fsSL https://get.kinlab.dev/install | sh`
-- [Install script — Windows](https://get.kinlab.dev/install.ps1): `irm https://get.kinlab.dev/install.ps1 | iex`
+- [Install script for macOS and Linux](https://get.kinlab.dev/install): `curl -fsSL https://get.kinlab.dev/install | sh`
+- [Install script for Windows](https://get.kinlab.dev/install.ps1): `irm https://get.kinlab.dev/install.ps1 | iex`
 - [Homebrew](https://github.com/firelock-ai/homebrew-kin): `brew install firelock-ai/kin/kin`
-- [npm — MCP wrapper](https://www.npmjs.com/package/@kinlab/kin-mcp): `npx @kinlab/kin-mcp`
+- [npm MCP wrapper](https://www.npmjs.com/package/@kinlab/kin-mcp): `npx @kinlab/kin-mcp`
 - [GitHub Releases](https://github.com/firelock-ai/kin/releases): prebuilt binaries + checksums for macOS, Linux, and Windows
 
 Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
 
 ## First run (macOS, Linux, or WSL2)
 
-- `kin setup` — configure your shell and connect agents (Claude, Cursor, Codex, Gemini) to the MCP server.
-- `kin doctor` — verify the install and daemon health.
+- `kin setup`: configure your shell and connect agents (Claude, Cursor, Codex, Gemini) to the MCP server.
+- `kin doctor`: verify the install and daemon health.
 - `kin init` turns a Git repo into a Kin workspace. `kin status` and `kin search` require the bundled `kin-daemon` runtime (installed by every channel above).
 - `kin exec -- <cmd>` runs ordinary project tools (npm, make, docker) through a graph-backed session workspace; `kin shell` opens an interactive one; `kin with <assistant>` launches an agent inside one.
 
 ## For AI agents (MCP)
 
-Kin ships an MCP server exposing semantic tools that answer from graph-owned truth, not raw file search — prefer them:
+Kin ships an MCP server exposing semantic tools that answer from graph-owned truth, not raw file search. Prefer them:
 
-- `semantic_locate` — find symbols, functions, and types by meaning.
+- `semantic_locate`: find symbols, functions, and types by meaning.
 - `list_file_entities` lists every entity in one file, with a completeness flag saying whether the list is whole.
-- `get_context_pack` — a structured context bundle around one entity, by id.
-- `trace_data_flow` — cross-file data lineage and dependencies.
+- `get_context_pack`: a structured context bundle around one entity, by id.
+- `trace_data_flow`: cross-file data lineage and dependencies.
 
 `kin setup` auto-configures the MCP server for supported agents.
 
 ## Source and docs
 
-- [kin — CLI, daemon, MCP](https://github.com/firelock-ai/kin)
-- [kin-vfs — transparent filesystem projection](https://github.com/firelock-ai/kin-vfs)
-- [kin-editor — VS Code extension](https://github.com/firelock-ai/kin-editor)
+- [kin: CLI, daemon, MCP](https://github.com/firelock-ai/kin)
+- [kin-vfs: transparent filesystem projection](https://github.com/firelock-ai/kin-vfs)
+- [kin-editor: VS Code extension](https://github.com/firelock-ai/kin-editor)
 - [Quickstart](https://github.com/firelock-ai/kin/blob/main/docs/quickstart.md)

@@ -44,7 +44,7 @@ kin_buildinfo::embed_update_build_identity!(
 /// locked line rather than getting a new one, so this is that line and not a
 /// rewrite of it.
 const ORIENTATION: &str = "\
-The system of record for AI-written software.
+A graph-native code repository for people and AI agents.
 
 Start here:
   kin init            admit an existing or new repository
@@ -2817,7 +2817,7 @@ fn version_lines(version: &str) -> Vec<String> {
 }
 
 /// The canon Category line, shared by `--help` and `--version`.
-const CATEGORY_LINE: &str = "The system of record for AI-written software.";
+const CATEGORY_LINE: &str = "A graph-native code repository for people and AI agents.";
 
 /// What `kin --version` prints.
 ///
@@ -5501,7 +5501,10 @@ mod tests {
         // The literal, not the constant. Comparing the constant against itself
         // is an assertion that cannot fail, and it would sit here looking like
         // one that could.
-        assert_eq!(lines[2], "The system of record for AI-written software.");
+        assert_eq!(
+            lines[2],
+            "A graph-native code repository for people and AI agents."
+        );
         assert_eq!(lines[3], "dca8e950e99f6a1cb9afe4359611e2da288004f2");
         assert_eq!(lines[4], "detached 2026-09-06T08:24:29Z");
 
@@ -6244,7 +6247,7 @@ mod tests {
             let mut command = Cli::command();
             let help = command.render_long_help().to_string();
             assert!(
-                help.starts_with("The system of record for AI-written software."),
+                help.starts_with("A graph-native code repository for people and AI agents."),
                 "help opens with {:?}",
                 help.lines().next().unwrap_or_default()
             );
