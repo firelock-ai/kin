@@ -504,10 +504,20 @@ step_first_run() {
   kin init > "$captures/kin-init.txt" 2>&1 || init_status=$?
   cat "$captures/kin-init.txt"
   if [ "$init_status" -ne 0 ]; then exit "$init_status"; fi
-  kin status > "$captures/kin-status.txt" 2>&1
+  # Both of these are captures, and a capture accepts exit 9. That code is
+  # `kin status` reporting that nothing admitted the working copy, so the gap
+  # is the very thing these files exist to record; abandoning the leg would
+  # throw away the evidence instead of keeping it. This is not a blanket
+  # suppression: every other non-zero still ends the step, and the code is
+  # carried into the exit so a reader sees which one it was.
+  status_txt_rc=0
+  kin status > "$captures/kin-status.txt" 2>&1 || status_txt_rc=$?
   cat "$captures/kin-status.txt"
-  kin status --json > "$captures/kin-status.json" 2>&1
+  if [ "$status_txt_rc" -ne 0 ] && [ "$status_txt_rc" -ne 9 ]; then exit "$status_txt_rc"; fi
+  status_json_rc=0
+  kin status --json > "$captures/kin-status.json" 2>&1 || status_json_rc=$?
   cat "$captures/kin-status.json"
+  if [ "$status_json_rc" -ne 0 ] && [ "$status_json_rc" -ne 9 ]; then exit "$status_json_rc"; fi
   kin bench-meta --json > "$captures/kin-build-meta.json"
   cat "$captures/kin-build-meta.json"
   proof_base_path="$PATH"
@@ -1087,7 +1097,18 @@ step_embedding_retrieval() {
         execFileSync("kin", ["status", "--json"], { encoding: "utf8", timeout: 120_000 }),
       );
     } catch (error) {
-      last = `kin status --json failed: ${error.message}`;
+      // Exit 9 is `kin status` reporting that nothing admitted the working
+      // copy. This loop is the one caller that must NOT accept it as a read:
+      // the fingerprint above includes the workspace generation, so an
+      // unmeasured working copy could hold that field still and let two
+      // consecutive reads agree for a reason nobody measured. So 9 keeps
+      // costing a read, exactly as any other failure does. What changes is
+      // the wording, because a leg that stalls on 9 has an unmeasured working
+      // copy and not a store that never drained, and the recorded line is
+      // where a reader goes looking for which one it was.
+      last = error.status === 9
+        ? "kin status --json exited 9: nothing admitted the working copy"
+        : `kin status --json failed: ${error.message}`;
       previous = null;
       execFileSync("sleep", [String(pollSeconds)]);
       continue;
@@ -1122,18 +1143,29 @@ step_embedding_retrieval() {
 NODE
 
   settle_probe="$(kin status --help 2>&1 || true)"
+  # Both arms sample the store the settle loop just watched drain, and the
+  # thing they are sampling is embedding coverage. Exit 9 is `kin status`
+  # reporting that nothing admitted the working copy, which is a statement
+  # about uncommitted work and says nothing about the coverage this sample
+  # reads, so the sample keeps it rather than failing the step over it. Every
+  # other non-zero still ends the step. pipefail is what puts kin's own code
+  # in embedded_rc; tee is left in place because the sample is meant to reach
+  # the log as it arrives.
+  embedded_rc=0
   case "$settle_probe" in
     *--wait-quiesce*)
       printf 'bounded settle (kin status --wait-quiesce %s)\n' "$PF_QUIESCE_SECONDS" \
         | tee "$captures/kin-status-settle-mode.txt"
-      kin status --json --wait-quiesce "$PF_QUIESCE_SECONDS" | tee "$captures/kin-embedded-status.json"
+      kin status --json --wait-quiesce "$PF_QUIESCE_SECONDS" \
+        | tee "$captures/kin-embedded-status.json" || embedded_rc=$?
       ;;
     *)
       printf 'single sample (installed kin has no --wait-quiesce)\n' \
         | tee "$captures/kin-status-settle-mode.txt" >&2
-      kin status --json | tee "$captures/kin-embedded-status.json"
+      kin status --json | tee "$captures/kin-embedded-status.json" || embedded_rc=$?
       ;;
   esac
+  if [ "$embedded_rc" -ne 0 ] && [ "$embedded_rc" -ne 9 ]; then exit "$embedded_rc"; fi
   kin setup status --json | tee "$captures/kin-embedded-health.json"
   kin doctor --json | tee "$captures/kin-embedded-doctor.json"
   kin search hello --semantic --json | tee "$captures/kin-semantic-search.json"
