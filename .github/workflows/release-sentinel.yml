@@ -17,16 +17,38 @@ name: Release Sentinel
 # that only works once a human wires a secret is a reporting path that was still
 # silent the day it was needed.
 #
-# ACTIVATION IS ONE FOUNDER STEP. This workflow reads
+# A fourth failure, a parked RC-Build-to-Release-Cut handoff, is patrolled by
+# `mechanical-patrol` below rather than by the agent duties above, for exactly
+# that same reason. Measured live on this repository: RC Build run 34485474934
+# concluded success for the v0.7.10 candidate on `release/v0.7.10-candidate` at
+# 2026-09-10T14:43:07Z, and the first Release Cut run of any kind was not
+# created until 2026-09-10T16:35:09Z, 112 minutes later; v0.7.9 sat parked the
+# same way earlier the same day. `mechanical-patrol` reads no secret and needs
+# no output from `preflight`, so it cannot go dark for the reason the agent
+# duties can.
+#
+# A fifth failure was this file itself. `preflight` printed a `::notice::` and
+# exited 0 on an absent secret, `patrol` below simply skipped, and the run's own
+# conclusion read `success`. Run 34506462232 at 2026-09-10T17:09:20Z is exactly
+# that shape: a green run that patrolled nothing. A skipped step reads as green
+# to anyone scanning the workflow list, the same failure this whole file exists
+# to catch elsewhere in the rail, aimed at itself. `credential-alarm` below is
+# the fix: it runs on every tick regardless of `preflight`'s output and fails
+# the run loud, with a tracking issue, exactly when the agent duties have
+# nothing to authenticate with.
+#
+# ACTIVATION IS ONE FOUNDER STEP, for the agent duties only. This workflow reads
 # `secrets.CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI`, which only the founder can mint because
 # `claude setup-token` is interactive:
 #
 #   claude setup-token
 #   gh secret set CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI --org firelock-ai --visibility all
 #
-# Until that secret exists the preflight job below reports it and the patrol is
-# skipped, so this file is inert rather than red. Nothing else about the rail
-# changes while it is unwired.
+# Until that secret exists, `credential-alarm` fails this run and opens a
+# tracking issue saying so, and `patrol`'s three agent duties stay skipped
+# because there is nothing for them to authenticate with. The run itself now
+# reads red rather than quietly green, and `mechanical-patrol` keeps watching
+# the handoff above regardless of whether the founder has minted anything.
 #
 # The guardrails that matter are structural, not promises made in the prompt.
 # The allowlist can express `gh pr create --draft` and `gh pr merge --auto
@@ -44,8 +66,11 @@ on:
     - cron: "11,41 * * * *"
   workflow_dispatch:
 
-# Read-only by default, so a job that says nothing can do nothing. The patrol
-# escalates on its own job below and the credential check never does.
+# Read-only by default, so a job that says nothing can do nothing. `patrol`
+# escalates on its own job below and the credential check never does;
+# `credential-alarm` and `mechanical-patrol` each escalate only to what their
+# own alarm needs (issues: write, plus actions: read for the mechanical
+# patrol's run lookups).
 permissions:
   contents: read
 
@@ -81,7 +106,41 @@ jobs:
             exit 0
           fi
           echo "enabled=false" >> "$GITHUB_OUTPUT"
-          echo "::notice::CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI is not set, so the release sentinel is skipped. Mint it with 'claude setup-token' and store it with 'gh secret set CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI --org firelock-ai --visibility all' to activate the patrol. This run is a success on purpose: an unwired sentinel must not read as a broken rail."
+          echo "::notice::CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI is not set, so the agent patrol below is skipped. Mint it with 'claude setup-token' and store it with 'gh secret set CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI --org firelock-ai --visibility all' to activate it. This step still succeeds on purpose: it only tests the secret's presence, and credential-alarm below is what turns an absent secret into a failed run rather than a quiet one."
+
+  # A missing credential must alarm, never quietly succeed; see "A fifth failure"
+  # above. This job's only job is to say so: it changes nothing about what
+  # `preflight` reports or what gates `patrol`.
+  credential-alarm:
+    name: Alarm when the sentinel has no credential to patrol with
+    needs: preflight
+    # always(), never the default success()-only gate: this job exists to report
+    # on preflight's output regardless of preflight's own conclusion (which is
+    # always success; only the meaning of a 'false' output changes here, from
+    # quiet to loud).
+    if: always()
+    permissions:
+      contents: read
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout the alarm script
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: scripts
+
+      - name: Prove the judge still grades its own fixtures
+        run: python3 scripts/release-sentinel-credential-alarm.py --self-test
+
+      - name: Alarm or clear, based on whether the patrol has a credential
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/release-sentinel-credential-alarm.py \
+            --repo "${{ github.repository }}" \
+            --enabled "${{ needs.preflight.outputs.enabled }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
   patrol:
     name: Patrol the release rail
@@ -289,3 +348,30 @@ jobs:
             --max-turns 60
             --allowedTools "Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr checks:*),Bash(gh pr merge --auto --squash:*),Bash(gh pr create --draft:*),Bash(gh run list:*),Bash(gh run view:*),Bash(gh run download:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh issue create:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh issue close:*),Bash(git ls-remote:*),Bash(git checkout:*),Bash(git switch:*),Bash(git add:*),Bash(git commit:*),Bash(git push --set-upstream origin automation/abandon-:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*),Bash(python3 scripts/select-admissible-release-tag.py:*),Bash(jq:*),Read,Edit,Write"
             --disallowedTools "WebFetch,WebSearch"
+
+  # The mechanical layer, independent of everything above. See "A fourth
+  # failure" in the header: nothing that depends on a Claude credential can be
+  # the only thing watching for a parked rail, because the credential itself
+  # can be the reason nothing is watching. This job reads no secret, sets no
+  # `needs:` on `preflight`, and never gates on its output.
+  mechanical-patrol:
+    name: Patrol the RC-Build-to-Release-Cut handoff mechanically
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout the patrol script
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: scripts
+
+      - name: Prove the judge still grades its own fixtures
+        run: python3 scripts/release-rail-parked-alarm.py --self-test
+
+      - name: Patrol RC Build for a parked rail
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release-rail-parked-alarm.py --repo "${{ github.repository }}"

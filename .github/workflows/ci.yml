@@ -1168,6 +1168,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/check-required-contexts.py
 
+      # Grades release-sentinel.yml's own shape and the two scripts it calls, so a
+      # future edit that reintroduces a quietly-skipped patrol (or re-couples the
+      # mechanical patrol to the Claude credential) is caught on the pull request
+      # that does it rather than discovered a release later. ADDED here as well as
+      # in the `check` job below, for the reason the comment beside
+      # check-required-contexts.py's own self-test gives: `bin/kin-precheck`
+      # enumerates guard scripts out of `check` by name, and only this job runs on
+      # a pull request.
+      - name: Falsify release-sentinel credential alarm
+        run: python3 scripts/release-sentinel-credential-alarm.py --self-test
+
+      - name: Falsify release-sentinel parked-rail patrol
+        run: python3 scripts/release-rail-parked-alarm.py --self-test
+
+      - name: Check release-sentinel.yml's own shape
+        run: python3 scripts/check-release-sentinel-shape.py --self-test
+
       # Byte-identical to the `check` job's clippy step, deliberately. The two
       # run on different events now and there is no event on which neither runs,
       # so the workspace is linted exactly once per event rather than twice.
@@ -2085,6 +2102,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/check-required-contexts.py
+
+      # Duplicated from `fast-gate-lint`, same reason as the required-contexts
+      # self-test above: this job carries `github.event_name != 'pull_request'`, so
+      # this copy buys every lane's local `bin/kin-precheck kin` and a second look
+      # on push to main, while the `fast-gate-lint` copy is what actually grades a
+      # pull request.
+      - name: Falsify release-sentinel credential alarm
+        if: runner.os == 'Linux' && matrix.shard == 1
+        run: python3 scripts/release-sentinel-credential-alarm.py --self-test
+
+      - name: Falsify release-sentinel parked-rail patrol
+        if: runner.os == 'Linux' && matrix.shard == 1
+        run: python3 scripts/release-rail-parked-alarm.py --self-test
+
+      - name: Check release-sentinel.yml's own shape
+        if: runner.os == 'Linux' && matrix.shard == 1
+        run: python3 scripts/check-release-sentinel-shape.py --self-test
 
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
