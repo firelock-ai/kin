@@ -803,6 +803,15 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     },
     ".github/workflows/install-proof.yml": {
         "install-proof": "${{ matrix.os }}",
+        # FIR-3442. Proves the real update path moves a real installation from
+        # the previously published release to Latest. It produces no required
+        # check context, and unlike every other leg of this workflow it does
+        # not gate a release: its witnesses are the weekly schedule and a
+        # manual dispatch. A release tag is still a pre-release while this
+        # workflow runs, so the stable channel would correctly refuse to move
+        # and the job would fail every cut.
+        # `assert_update_proof_stays_off_the_release_path` holds that scoping.
+        "update-proof": "Update proof (N-1 to Latest)",
     },
     # The dependency receiver validates the exact payload, prepares and compiles
     # candidate registry bytes without a write credential, then admits only the
@@ -4017,6 +4026,126 @@ def assert_install_proof_every_leg_gates_the_release(install_proof: str) -> None
         raise AssertionError(
             "install-proof release matrix must gate exactly "
             f"{expected_platforms}; found {release_platforms}"
+        )
+
+
+# The one admitted scoping for the N-1 update proof, spelled exactly so a
+# condition written any other way fails rather than passing as "some filter".
+UPDATE_PROOF_ADMITTED_EVENT_FILTER = (
+    "${{ github.event_name == 'schedule' "
+    "|| github.event_name == 'workflow_dispatch' }}"
+)
+
+
+def assert_update_proof_stays_off_the_release_path(install_proof: str) -> None:
+    """Keep the N-1 update proof on schedule and dispatch, never on a release.
+
+    The job installs the previously published release and requires the real
+    updater to move it to Latest. On the release path that assertion cannot
+    hold, and is not supposed to. release.yml creates every tag
+    ``prerelease: true, make_latest: false`` and promotes it to Latest only
+    after this workflow succeeds, while ``kin update`` on the default stable
+    channel resolves ``/releases/latest``, which never returns a pre-release.
+    The tag under test is therefore not Latest while the job runs, the updater
+    correctly reports the installation already current at N-1, the final
+    assertion exits 1, and every job needing ``install_proof`` to succeed skips
+    with it: npm publish, the boundary contracts, the version-tag image, and
+    the promotion that would have made the tag Latest. The job would fail every
+    stable cut while proving nothing about the updater.
+
+    So the scoping is the property, pinned as the exact expression. A filter
+    written any other way, including one that also admitted ``push``, returns
+    the job to the release path, and a called workflow reads the CALLING run's
+    ``github`` context, so ``push`` is exactly what the release arrives as.
+
+    Two smaller properties of the same job ride here, because each is the
+    difference between a true report and a plausible one. The release listing
+    captures gh's exit code on its own line: ``mapfile -t tags < <(gh ...)``
+    runs gh in a subshell whose status neither ``set -e`` nor ``pipefail``
+    observes, so a 403 would produce an empty array and report an absent
+    previous release for what is really an API failure. And the installer step
+    runs under ``pipefail``, because ``sh`` reading a truncated download exits
+    0 and a dead endpoint would surface a step later as a missing binary.
+    """
+
+    jobs = workflow_job_blocks(install_proof)
+    update_proof = jobs.get("update-proof")
+    if update_proof is None:
+        raise AssertionError(
+            "install-proof must keep the update-proof job; it is the only "
+            "witness that the real updater moves a real installation"
+        )
+    conditions = [
+        value.strip()
+        for key, value in job_top_level_mapping_fields(update_proof)
+        if key == "if"
+    ]
+    if conditions != [UPDATE_PROOF_ADMITTED_EVENT_FILTER]:
+        raise AssertionError(
+            "the update proof runs on the weekly schedule and on a manual "
+            "dispatch and on nothing else. On the release path the tag under "
+            "test is still a pre-release, so the updater refuses to move and "
+            "the job fails every cut; admitted "
+            f"{[UPDATE_PROOF_ADMITTED_EVENT_FILTER]}, found {conditions}"
+        )
+
+    resolve = install_proof_step(
+        install_proof, "Resolve Latest and the release published before it"
+    )
+    resolve_lines = active_lines(resolve)
+    hidden_listing = [
+        line for line in resolve_lines if "mapfile" in line and "gh release list" in line
+    ]
+    if hidden_listing:
+        raise AssertionError(
+            "the release listing must not run gh inside a process "
+            "substitution: neither `set -e` nor `pipefail` sees its status, so "
+            "an API failure becomes an empty array and reads as an absent "
+            f"previous release; found {hidden_listing}"
+        )
+    rc_capture = "--json tagName --jq '.[].tagName')\" || rc=$?"
+    rc_guard = 'if [ "$rc" -ne 0 ]; then'
+    for policy in (rc_capture, rc_guard):
+        if policy not in resolve_lines:
+            raise AssertionError(
+                "the release listing must capture gh's exit code on its own "
+                f"line and refuse on it; missing `{policy}`"
+            )
+    gap_guard = [line for line in resolve_lines if "no N-1 to prove against" in line]
+    if not gap_guard:
+        raise AssertionError(
+            "the release listing must still report an absent previous release; "
+            "an API guard that swallowed that case would trade one wrong cause "
+            "for another"
+        )
+    if resolve_lines.index(rc_guard) > resolve_lines.index(gap_guard[0]):
+        raise AssertionError(
+            "the API-failure refusal must come before the absent-release "
+            "refusal, or a failed listing still reports the wrong cause"
+        )
+
+    install = install_proof_step(
+        install_proof,
+        "Install the PREVIOUS release through the real public installer",
+    )
+    install_lines = active_lines(install)
+    piped_install = [
+        line
+        for line in install_lines
+        if line.startswith("curl ") and line.endswith("| \\")
+    ]
+    if not piped_install:
+        raise AssertionError(
+            "the update proof must install through the real public installer "
+            "piped into `sh`; without that pipe the pipefail requirement below "
+            "guards nothing"
+        )
+    if "set -euo pipefail" not in install_lines:
+        raise AssertionError(
+            "the update proof's installer step runs under pipefail: `sh` "
+            "reading a truncated download exits 0, so a dead endpoint would "
+            "surface a step later as a missing `kin` and read as a broken "
+            f"binary; found {[line for line in install_lines if line.startswith('set ')]}"
         )
 
 
@@ -12822,6 +12951,91 @@ def main() -> None:
             expected,
             lambda mutated=install_proof.replace(original, mutation, 1): (
                 assert_install_proof_every_leg_gates_the_release(mutated)
+            ),
+        )
+
+    assert_update_proof_stays_off_the_release_path(install_proof)
+    update_proof_job = workflow_job_blocks(install_proof)["update-proof"]
+    for label, original, mutation, expected in (
+        (
+            "the update proof loses its scoping and returns to every cut",
+            "    if: ${{ github.event_name == 'schedule' "
+            "|| github.event_name == 'workflow_dispatch' }}\n",
+            "",
+            "and on nothing else",
+        ),
+        (
+            "the release path is admitted beside the two witnesses",
+            "|| github.event_name == 'workflow_dispatch' }}\n",
+            "|| github.event_name == 'workflow_dispatch' "
+            "|| github.event_name == 'push' }}\n",
+            "and on nothing else",
+        ),
+        (
+            "the scoping is spelled as an exclusion instead",
+            "    if: ${{ github.event_name == 'schedule' "
+            "|| github.event_name == 'workflow_dispatch' }}\n",
+            "    if: ${{ github.event_name != 'pull_request' }}\n",
+            "and on nothing else",
+        ),
+        (
+            "the whole update proof is dropped rather than scoped",
+            update_proof_job,
+            "",
+            "must keep the update-proof job",
+        ),
+        (
+            "the release listing goes back inside a process substitution",
+            '          rc=0\n          listing="$(gh release list',
+            "          mapfile -t tags < <(gh release list",
+            "must not run gh inside a process",
+        ),
+        (
+            "the API-failure refusal stops refusing",
+            '          if [ "$rc" -ne 0 ]; then\n',
+            "          if false; then\n",
+            "capture gh's exit code on its own line",
+        ),
+        (
+            "the API guard swallows the absent-release report",
+            '            echo "::error title=no N-1 to prove against::'
+            "latest='$latest' previous='$previous'\"\n",
+            "",
+            "must still report an absent previous release",
+        ),
+        (
+            "the API refusal is moved below the absent-release refusal",
+            "          rc=0\n",
+            '          echo "::error title=no N-1 to prove against::moved"\n'
+            "          rc=0\n",
+            "must come before the absent-release refusal",
+        ),
+        (
+            "the installer step loses pipefail and swallows a dead endpoint",
+            "          set -euo pipefail\n"
+            "          # Same installer and the same env contract as the proof above.\n",
+            "          set -eu\n"
+            "          # Same installer and the same env contract as the proof above.\n",
+            "runs under pipefail",
+        ),
+        (
+            "the installer stops piping the real download into sh",
+            "          curl -fsSL https://get.kinlab.dev/install | \\\n"
+            '            KIN_NO_SETUP=1 KIN_VERSION="${PREVIOUS#v}" sh\n',
+            '          KIN_NO_SETUP=1 KIN_VERSION="${PREVIOUS#v}" sh ./install.sh\n',
+            "piped into `sh`",
+        ),
+    ):
+        if original not in install_proof:
+            raise AssertionError(
+                "update-proof scoping falsification lost fixture for "
+                f"{label}: {original!r}"
+            )
+        expect_assertion(
+            label,
+            expected,
+            lambda mutated=install_proof.replace(original, mutation, 1): (
+                assert_update_proof_stays_off_the_release_path(mutated)
             ),
         )
 

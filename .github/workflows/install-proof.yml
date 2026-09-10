@@ -2124,3 +2124,162 @@ jobs:
             kin-install-proof/.agents/mcp_config.json
             kin-install-proof/*.json
             kin-install-proof/*.log
+
+  # The founder's third directive for FIR-3442: prove the REAL update path moves
+  # a real installation, not just that its logic is right.
+  #
+  # Deliberately a separate job rather than a step in the one above. That job
+  # runs fifteen proof steps written against the release it installed, so
+  # installing N-1 at its top would falsify every one of them.
+  #
+  # What this proves that no crate test can: that real published bytes of the
+  # PREVIOUS release, installed by the real public installer, are moved to
+  # Latest by the real updater. The window arithmetic, the drift counting and
+  # the activity gate underneath are covered by crate tests on every pull
+  # request; this covers only the part that needs real archives, a real
+  # filesystem and a real installed binary.
+  update-proof:
+    name: Update proof (N-1 to Latest)
+    # The weekly schedule and a manual dispatch are this job's witnesses, and
+    # the release path is excluded on purpose.
+    #
+    # release.yml creates every tag `prerelease: true, make_latest: false` and
+    # promotes it to Latest only after this workflow succeeds, then calls this
+    # workflow with `release_tag: ${{ github.ref_name }}`. So at the moment the
+    # job would run, the tag under test is not Latest yet, while `kin update`
+    # on the default stable channel resolves `/releases/latest`, which never
+    # returns a pre-release (crates/kin-cli/src/commands/update.rs,
+    # `resolve_release`). The updater would report "Already up to date" at N-1,
+    # correctly, the final assertion below would exit 1, and every job that
+    # needs `install_proof` to succeed would skip with it: npm publish, the
+    # boundary contracts, the version-tag image, and the promotion that makes
+    # the tag Latest in the first place. The job would fail every stable cut
+    # while proving nothing about the updater.
+    #
+    # A called workflow reads the CALLING run's `github` context, so this
+    # filter also excludes ci.yml's pull-request call, which arrives as `push`
+    # or `merge_group`, and the `release: published` trigger, which arrives as
+    # `release`.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Resolve Latest and the release published before it
+        id: tags
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_EVENT_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
+        run: |
+          set -euo pipefail
+          # Ordered by publication date, which is what "the release before it"
+          # has to mean here: an installation falls behind in publication order,
+          # not in semver order.
+          #
+          # gh's exit code is captured on its own line, before the guard below
+          # can read it. `mapfile -t tags < <(gh ...)` runs gh in a subshell
+          # whose status neither `set -e` nor `pipefail` observes, so a 403 or a
+          # network flake yields an empty array that is indistinguishable from a
+          # repository with one published release, and the guard would then name
+          # the wrong cause.
+          rc=0
+          listing="$(gh release list --repo "$GITHUB_REPOSITORY" \
+            --exclude-drafts --exclude-pre-releases --limit 5 \
+            --json tagName --jq '.[].tagName')" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=release listing failed::gh release list exited $rc"
+            echo "The GitHub release listing failed. That is an API failure, not" >&2
+            echo "an absent previous release, and reporting it as the latter would" >&2
+            echo "send a reader looking for a release that is published." >&2
+            exit 1
+          fi
+          mapfile -t tags < <(printf '%s' "$listing")
+          latest="${RELEASE_EVENT_TAG:-${tags[0]:-}}"
+          previous=""
+          for t in "${tags[@]}"; do
+            if [ "$t" != "$latest" ]; then previous="$t"; break; fi
+          done
+          if [ -z "$latest" ] || [ -z "$previous" ]; then
+            echo "::error title=no N-1 to prove against::latest='$latest' previous='$previous'"
+            echo "This job needs two published releases. Reporting the gap rather" >&2
+            echo "than passing quietly, because a silent skip here is how an" >&2
+            echo "updater regression reaches users." >&2
+            exit 1
+          fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "proving $previous -> $latest"
+
+      - name: Install the PREVIOUS release through the real public installer
+        shell: bash
+        env:
+          PREVIOUS: ${{ steps.tags.outputs.previous }}
+        run: |
+          set -euo pipefail
+          # Same installer and the same env contract as the proof above.
+          # KIN_NO_SETUP binds to `sh`, not to `curl`. pipefail is what makes a
+          # failed `curl` fail this step: `sh` reading an empty or truncated
+          # script exits 0, so without it the break surfaces a step later as a
+          # missing `kin` and reads as a broken binary rather than a dead
+          # endpoint.
+          curl -fsSL https://get.kinlab.dev/install | \
+            KIN_NO_SETUP=1 KIN_VERSION="${PREVIOUS#v}" sh
+          echo "$HOME/.kin/bin" >> "$GITHUB_PATH"
+
+      - name: Assert the installation really starts behind
+        shell: bash
+        env:
+          PREVIOUS: ${{ steps.tags.outputs.previous }}
+        run: |
+          set -euo pipefail
+          got="$(kin --version)"
+          echo "installed: $got"
+          # Without this assertion a no-op passes. If the installer quietly
+          # served Latest, the update below would "succeed" having moved
+          # nothing, and this job would report a working updater forever.
+          case "$got" in
+            *"${PREVIOUS#v}"*) echo "starts at ${PREVIOUS}, as required" ;;
+            *) echo "::error title=did not start from N-1::wanted ${PREVIOUS#v}, got '$got'"
+               exit 1 ;;
+          esac
+
+      - name: Run the real update path
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The product command the update watchdog invokes. No --force-window:
+          # a runner holds no managed daemon or VFS server, so the activity gate
+          # says proceed and this exercises the NATURAL path. A forced arm is
+          # worth adding beside it later; it is a different code path.
+          kin update --unattended | tee update-record.json
+          echo "--- ledger ---"
+          cat "$HOME/.kin/update-ledger.jsonl" || true
+
+      - name: Assert the installation actually moved to Latest
+        shell: bash
+        env:
+          LATEST: ${{ steps.tags.outputs.latest }}
+          PREVIOUS: ${{ steps.tags.outputs.previous }}
+        run: |
+          set -euo pipefail
+          got="$(kin --version)"
+          echo "after update: $got"
+          case "$got" in
+            *"${LATEST#v}"*)
+              echo "the real update path moved ${PREVIOUS} to ${LATEST}" ;;
+            *)
+              echo "::error title=update did not converge::still '$got', wanted ${LATEST#v}"
+              echo "The updater ran and the installed binary did not move. That is" >&2
+              echo "the FIR-3442 failure, and catching it here is why this job" >&2
+              echo "exists." >&2
+              exit 1 ;;
+          esac
+
+      - name: Preserve the update record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kin-update-proof
+          path: |
+            update-record.json
+          if-no-files-found: warn
