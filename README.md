@@ -52,10 +52,11 @@ At the new prompt, replace the path below:
 ```sh
 cd /path/to/your/repository &&
 kin init . &&
-kin overview
+kin overview &&
+kin status
 ```
 
-`kin overview` shows the entities Kin imported. `kin graph status` reports the daemon's live query graph and coverage. Uncommitted and untracked changes are not part of the imported Git history; `kin init` reports what it left out.
+`kin overview` shows the entities Kin imported. `kin status` shows what was admitted and the working tree's state against it. `kin graph status` reports the daemon's live query graph and coverage. Uncommitted and untracked changes are not part of the imported Git history; `kin init` reports what it left out.
 
 ### 3. Ask a question you can check
 
