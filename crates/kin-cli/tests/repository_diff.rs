@@ -80,6 +80,24 @@ fn require_kin_json(repo: &Path, home: &Path, args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("Kin stdout should be JSON")
 }
 
+/// A WORKSPACE-endpoint diff, which answers 9 with no daemon holding the store.
+///
+/// Separate from [`require_kin_json`] on purpose rather than by loosening it.
+/// Only a workspace endpoint can be unmeasured; a diff between two changes reads
+/// durable authority on both sides and must still exit 0, so relaxing the strict
+/// helper would stop those cases noticing if they ever started answering 9.
+fn require_workspace_diff_json(repo: &Path, home: &Path, args: &[&str]) -> Value {
+    let output = run_kin(repo, home, args);
+    assert!(
+        matches!(output.status.code(), Some(0) | Some(9)),
+        "kin {args:?} answered {:?}: stdout={} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("Kin stdout should be JSON")
+}
+
 fn path_hex(path: &[u8]) -> String {
     path.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -365,7 +383,8 @@ fn diff_is_exact_for_polyglot_non_code_binary_modes_symlinks_gitlinks_and_raw_pa
 
     // A single endpoint compares that immutable authority target to the exact
     // graph-owned workspace, not to checkout files.
-    let workspace_report = require_kin_json(&repo, &home, &["diff", &base_oid, "--json"]);
+    let workspace_report =
+        require_workspace_diff_json(&repo, &home, &["diff", &base_oid, "--json"]);
     assert_eq!(workspace_report["head"]["source"], "workspace");
     assert_eq!(
         workspace_report["artifact_deltas"],
@@ -382,7 +401,7 @@ fn diff_is_exact_for_polyglot_non_code_binary_modes_symlinks_gitlinks_and_raw_pa
     assert_eq!(ref_report["head"]["source"], "ref");
     assert_eq!(ref_report["artifact_deltas"], report["artifact_deltas"]);
 
-    let clean = require_kin_json(&repo, &home, &["diff", "--json"]);
+    let clean = require_workspace_diff_json(&repo, &home, &["diff", "--json"]);
     assert_eq!(clean["base"]["source"], "head");
     assert_eq!(clean["head"]["source"], "workspace");
     assert!(clean["artifact_deltas"].as_array().unwrap().is_empty());

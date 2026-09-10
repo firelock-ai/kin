@@ -2562,6 +2562,11 @@ mod tests {
         // The control, and it is the half that matters: no merge, no banner, and
         // the line under the heading is the one that was always there. A fix that
         // printed the banner unconditionally would pass the assertion above.
+        //
+        // Takes an admitted pass, because a skipped one now legitimately puts
+        // the unmeasured-working-copy banner in this position and the control
+        // would then be grading that instead of the merge banner. The skipped
+        // arm has its own assertion below rather than being lost.
         let quiet = render_text(
             &report,
             None,
@@ -2569,7 +2574,7 @@ mod tests {
             None,
             &LastAdmissionRead::Absent,
             &kin_core::retained_parse::RetainedParseRead::Absent,
-            &skipped_pass(),
+            &took_pass(),
             None,
         );
         assert!(
@@ -2581,6 +2586,33 @@ mod tests {
             quiet_lines[1].starts_with("Repository: "),
             "{}",
             quiet_lines[1]
+        );
+
+        // The two banners share one position and this is the order they take.
+        // With no merge and no admission, the working-copy gap is the line under
+        // the heading; with both, the merge leads and the gap follows it. Stated
+        // here because two `insert` calls into one vector is exactly the kind of
+        // ordering that drifts silently.
+        let unmeasured = render_text(
+            &report,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &kin_core::retained_parse::RetainedParseRead::Absent,
+            &skipped_pass(),
+            None,
+        );
+        let unmeasured_lines: Vec<&str> = unmeasured.lines().collect();
+        assert!(
+            unmeasured_lines[1].starts_with("Working copy: NOT MEASURED"),
+            "an unmeasured read must lead with its gap: {}",
+            unmeasured_lines[1]
+        );
+        assert!(
+            lines[2].starts_with("Working copy: NOT MEASURED"),
+            "with a merge open the gap follows the merge banner: {}",
+            lines[2]
         );
     }
 

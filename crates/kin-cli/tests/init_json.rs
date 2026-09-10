@@ -452,9 +452,14 @@ fn init_and_status_report_the_same_admission_enrichment() {
         .current_dir(&repo)
         .output()
         .expect("run kin status");
+    // No daemon holds this store, so nothing admits the working copy and status
+    // answers 9 beside a report that is complete and true about durable
+    // authority. This case compares that report against `kin init`'s, which the
+    // code does not touch; any other non-zero is still a failure.
     assert!(
-        status.status.success(),
-        "stdout={} stderr={}",
+        matches!(status.status.code(), Some(0) | Some(9)),
+        "status answered {:?}: stdout={} stderr={}",
+        status.status.code(),
         String::from_utf8_lossy(&status.stdout),
         String::from_utf8_lossy(&status.stderr)
     );
