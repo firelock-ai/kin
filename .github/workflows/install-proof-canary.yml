@@ -152,7 +152,18 @@ jobs:
 
           # First capture: the store as a new user finds it, before any embedding
           # pass has been asked for.
+          # `kin status` exits 9 when nothing admitted the working copy, and it
+          # starts no daemon to change that, so a first capture reaches this
+          # line with none. These captures want the durable-authority report,
+          # not an answer about uncommitted work, so they accept that one code
+          # and no other.
+          set +e
           kin status --json > "$captures/first-status.json"
+          first_status_rc=$?
+          set -e
+          if [ "$first_status_rc" -ne 0 ] && [ "$first_status_rc" -ne 9 ]; then
+            exit "$first_status_rc"
+          fi
           kin setup status --json > "$captures/first-health.json"
           kin doctor --json > "$captures/first-doctor.json"
 
@@ -163,7 +174,15 @@ jobs:
           # and the contract says so either way.
           kin embed --max-seconds 240 --json > "$captures/kin-embed.json" 2>&1 || \
             echo "::notice::the bounded embedding pass did not complete; the contract judges whatever state the store reached."
+          set +e
           kin status --json > "$captures/settled-status.json"
+          settled_status_rc=$?
+          set -e
+          printf 'first rc=%s / settled rc=%s (9 = working copy unmeasured)\n' \
+            "$first_status_rc" "$settled_status_rc" > "$captures/kin-status-exit.txt"
+          if [ "$settled_status_rc" -ne 0 ] && [ "$settled_status_rc" -ne 9 ]; then
+            exit "$settled_status_rc"
+          fi
           kin setup status --json > "$captures/settled-health.json"
           kin doctor --json > "$captures/settled-doctor.json"
           echo "KIN_CANARY_CAPTURES=$captures" >> "$GITHUB_ENV"
