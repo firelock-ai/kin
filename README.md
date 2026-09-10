@@ -391,8 +391,8 @@ Kin is one system with a few clear public surfaces:
 
 ## How the pieces fit
 
-Kin is the system of record for AI-written software, and everything in the map
-below either reaches that authority or supports it. Humans and AI agents come in
+The graph is the repository, and everything in the map below either reaches
+that authority or supports it. Humans and AI agents come in
 through the CLI, the bundled MCP server, or the VS Code extension. All
 three ask the same daemon, and the daemon answers from graph authority rather
 than by re-reading the tree. `kin-vfs` projects that same graph back through
