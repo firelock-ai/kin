@@ -177,6 +177,11 @@ EXPECTED_SUITES = (
         "detached_head",
         "acceptance/detached_head.json",
     ),
+    ExpectedSuite(
+        "scripts/acceptance/graph_viz_local_render.py",
+        "graph_viz_render",
+        "acceptance/graph_viz_render.json",
+    ),
 )
 
 

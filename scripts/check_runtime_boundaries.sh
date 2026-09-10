@@ -274,7 +274,6 @@ while IFS=: read -r file line _; do
     crates/kin-cli/src/commands/release.rs|\
     crates/kin-cli/src/commands/merge.rs|\
     crates/kin-cli/src/commands/resolve.rs|\
-    crates/kin-cli/src/commands/graph_viz.rs|\
     crates/kin-cli/src/commands/locate_debug.rs)
       ;;
     *)

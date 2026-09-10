@@ -6,7 +6,9 @@
 //! The primary entry point is [`open_snapshot_daemon_first`] which auto-starts
 //! the daemon if needed, then fetches the warm graph from the daemon's
 //! `/graph/bootstrap` endpoint. Direct local snapshot reads are only for
-//! daemon internals and lower-level storage tests.
+//! daemon internals and lower-level storage tests, and they resolve the
+//! repository's storage namespace through the same binding the daemon uses
+//! rather than addressing a fixed file name.
 //!
 //! The synchronous [`open_kindb_snapshot`] is kept for daemon internals
 //! and tests that cannot use the async runtime.
@@ -85,24 +87,86 @@ pub fn vector_index_path(layout: &kin_core::KinLayout) -> PathBuf {
     layout.kindb_vector_index_path()
 }
 
-/// Open snapshot directly from disk without involving the daemon.
-/// Keep this out of product command paths; it exists for daemon bootstrap,
-/// maintenance internals, and lower-level storage tests.
+/// Open this repository's graph directly from disk, without a daemon.
+///
+/// Resolves the namespace exactly the way the daemon resolves it, through the
+/// one binding both use: the repository id out of `.kin/manifest.json`, then
+/// `.kin/kindb/<repository-id>/`, then that namespace's persisted authority and
+/// the workspace graph it names. No second path is tried and no empty graph is
+/// invented. A namespace carrying no authority record is an error naming the
+/// directory that was read and the identity that named it.
+///
+/// This used to open the fixed `.kin/kindb/graph.kndb` instead. Nothing has
+/// written that file since repository-v6, and KinDB answers a path with no
+/// artifacts under it with a valid EMPTY graph rather than an error, because for
+/// an uninitialized namespace that is the right answer. So `kin graph viz` drew
+/// a blank canvas against a 20,298-entity store, at exit 0, with no message.
+/// See `kin_core::KinLayout::kindb_namespace_path`.
+///
+/// Keep this out of product command paths; it exists for the explicit
+/// offline/admin escape hatch, maintenance internals, and storage tests.
 pub fn open_snapshot_local(
     layout: &kin_core::KinLayout,
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
-    let snap = open_kindb_snapshot_with_mode(layout, true)?;
-    load_vector_index_if_exists(&snap, layout);
-    Ok(snap)
-}
+    let binding =
+        kin_core::LocalRepositoryAuthorityBinding::from_layout(layout).map_err(|error| {
+            kin_db::KinDbError::StorageError(format!(
+                "cannot bind the local repository under {}: {error}",
+                layout.kindb_dir().display()
+            ))
+        })?;
+    let namespace = binding.namespace_path();
+    let repository_id = binding.repository_id().clone();
+    let workspace_id = binding.workspace_id();
+    let describe = |what: &str, error: &dyn std::fmt::Display| {
+        kin_db::KinDbError::StorageError(format!(
+            "{what} for repository {repository_id} at {}: {error}",
+            namespace.display()
+        ))
+    };
 
-/// Open snapshot directly from disk using the lightweight locate-only
-/// read path. Keep this out of product command paths; `kin locate` itself
-/// runs through the daemon.
-pub fn open_snapshot_local_for_locate(
-    layout: &kin_core::KinLayout,
-) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
-    let snap = kin_db::SnapshotManager::open_read_only_for_locate(kindb_snapshot_path(layout))?;
+    // The same bounded retry the flat open carried. A CLI reader racing a
+    // maintenance process for the namespace's recovery lock is a transient
+    // condition, and reporting it as a broken store would be a false diagnosis.
+    let mut attempts = 0usize;
+    let mut delay = Duration::from_millis(SNAPSHOT_OPEN_INITIAL_DELAY_MS);
+    let manager = loop {
+        match binding.open_manager() {
+            Ok(manager) => break manager,
+            Err(kin_db::KinDbError::LockError(message))
+                if attempts + 1 < SNAPSHOT_OPEN_MAX_ATTEMPTS
+                    && is_transient_lock_error(&message) =>
+            {
+                attempts += 1;
+                thread::sleep(delay);
+                delay = std::cmp::min(delay.saturating_mul(2), Duration::from_millis(100));
+            }
+            Err(error) => return Err(describe("cannot open repository authority", &error)),
+        }
+    };
+
+    let lease = manager.read_authority();
+    let snapshot = lease
+        .workspace_graph_snapshot(&workspace_id)
+        .map_err(|error| describe("cannot read the workspace graph", &error))?
+        .ok_or_else(|| {
+            describe(
+                "the repository authority holds no such workspace",
+                &workspace_id,
+            )
+        })?;
+    drop(lease);
+    drop(manager);
+
+    let graph = kin_db::InMemoryGraph::from_snapshot_with_text_index_read_only(
+        snapshot,
+        layout.text_index_dir(),
+    )
+    .map_err(|error| describe("cannot materialize the workspace graph", &error))?;
+    // The sidecar anchor, not the graph: `graph.kvec` and `graph.kidx` are named
+    // by suffixing this path, and the loader below reads them from it.
+    let snap =
+        kin_db::SnapshotManager::from_bootstrap_graph_read_only(kindb_snapshot_path(layout), graph);
     load_vector_index_if_exists(&snap, layout);
     Ok(snap)
 }
@@ -110,8 +174,8 @@ pub fn open_snapshot_local_for_locate(
 /// Daemon-required graph open for legacy read-only callers.
 ///
 /// This fetches an in-memory bootstrap snapshot from the repo daemon and never
-/// opens `.kin/kindb/graph.kndb` in the CLI process. Writable product paths must
-/// use daemon endpoints instead of asking the CLI for a local `SnapshotManager`.
+/// opens local storage in the CLI process. Writable product paths must use
+/// daemon endpoints instead of asking the CLI for a local `SnapshotManager`.
 pub async fn open_snapshot_daemon_first(
     layout: &kin_core::KinLayout,
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
@@ -185,7 +249,11 @@ fn daemon_resolution_storage_error(error: anyhow::Error) -> kin_db::KinDbError {
 }
 
 /// Whether the offline/admin local-snapshot escape hatch is enabled.
-fn daemon_bootstrap_admin_allowed() -> bool {
+///
+/// Crate-visible so a command reading the graph through a route other than the
+/// bootstrap open still asks the same question in the same words. A second
+/// reading of this variable is a second policy.
+pub(crate) fn daemon_bootstrap_admin_allowed() -> bool {
     std::env::var("KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN")
         .ok()
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))

@@ -1,7 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+//! `kin graph viz` — serve the live graph as an interactive page.
+//!
+//! The page draws the payload `GET /graph/export` serves, which is the same
+//! projection and the same sample every other drawing consumer gets. It used to
+//! ask `/graph/bootstrap` instead and shape a payload of its own, and both
+//! halves of that were wrong at repository scale.
+//!
+//! `/graph/bootstrap` exports the whole binary snapshot with no cap. This
+//! repository's own measurement of the two routes, recorded beside the export
+//! handler, is 119.6 MiB against 1.0 MiB on a 23,098-entity repository, and the
+//! CLI gave that transfer a 30-second budget. On the 20,298-entity store this
+//! was reported against, the request failed before a pixel was drawn. Nothing
+//! about a bigger timeout or a streaming body makes moving 119.6 MiB to draw
+//! 1,400 nodes the right shape, so it asks for the drawable projection: capped and
+//! sampled server side, off the request thread, and outside the one-at-a-time
+//! whole-snapshot semaphore `/graph/bootstrap` holds.
+//!
+//! The cap is why the page says what it is showing. A sampled export that
+//! reported only its own size would read as the whole graph, so the payload
+//! carries the population it was drawn from and the page renders that line.
+//! `--limit 0` asks for every entity, for a caller willing to wait.
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -11,144 +32,13 @@ use axum::http::{header, HeaderValue};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
-use kin_model::{EntityStore, GraphNodeId};
-use serde::Serialize;
 use tokio::net::TcpListener;
+
+use crate::commands::graph_export::{self, GraphExportPayload};
 
 const INDEX_HTML: &str = include_str!("../../assets/graph_viz/index.html");
 const APP_JS: &str = include_str!("../../assets/graph_viz/app.js");
 const STYLE_CSS: &str = include_str!("../../assets/graph_viz/style.css");
-
-#[derive(Debug, Serialize)]
-struct GraphNode {
-    id: String,
-    name: String,
-    kind: String,
-    file: Option<String>,
-    degree: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct GraphLink {
-    source: String,
-    target: String,
-    kind: String,
-}
-
-#[derive(Debug, Serialize)]
-struct GraphPayload {
-    nodes: Vec<GraphNode>,
-    links: Vec<GraphLink>,
-    /// Relations whose other endpoint is not itself an entity in this graph,
-    /// counted rather than emitted. A link naming an absent node is not a
-    /// drawable edge, and emitting one made the whole render die.
-    unresolved_links: usize,
-}
-
-/// One node's graph-owned identity, split out from the store so payload
-/// assembly is a pure function over what the graph reported.
-struct NodeMeta {
-    id: String,
-    name: String,
-    kind: String,
-    file: Option<String>,
-}
-
-/// Assemble the render payload, dropping every edge whose endpoints are not
-/// both present in the node set.
-///
-/// Relations legitimately point outside the entity set — an import of an
-/// external crate resolves to a placeholder destination that is no entity in
-/// this graph. The renderer joins edges to nodes by id and throws on the first
-/// unmatched one, so a single such relation used to abort the whole layout and
-/// leave a blank canvas. Withheld edges are counted and reported instead of
-/// dropped silently, so the page can say the graph is partial rather than
-/// implying every relation is drawn.
-fn assemble_payload(
-    node_meta: Vec<NodeMeta>,
-    edges: impl IntoIterator<Item = (String, String, String)>,
-) -> GraphPayload {
-    let node_ids: HashSet<&str> = node_meta.iter().map(|meta| meta.id.as_str()).collect();
-
-    let mut link_keys: BTreeSet<(String, String, String)> = BTreeSet::new();
-    let mut unresolved_links = 0usize;
-    for (a, b, kind) in edges {
-        if !node_ids.contains(a.as_str()) || !node_ids.contains(b.as_str()) {
-            unresolved_links += 1;
-            continue;
-        }
-        let (a, b) = if a <= b { (a, b) } else { (b, a) };
-        link_keys.insert((a, b, kind));
-    }
-
-    let mut degrees: HashMap<&str, usize> = HashMap::with_capacity(node_meta.len());
-    for (a, b, _kind) in &link_keys {
-        *degrees.entry(a.as_str()).or_insert(0) += 1;
-        *degrees.entry(b.as_str()).or_insert(0) += 1;
-    }
-
-    let nodes: Vec<GraphNode> = node_meta
-        .iter()
-        .map(|meta| GraphNode {
-            id: meta.id.clone(),
-            name: meta.name.clone(),
-            kind: meta.kind.clone(),
-            file: meta.file.clone(),
-            degree: degrees.get(meta.id.as_str()).copied().unwrap_or(0),
-        })
-        .collect();
-
-    let links: Vec<GraphLink> = link_keys
-        .into_iter()
-        .map(|(source, target, kind)| GraphLink {
-            source,
-            target,
-            kind,
-        })
-        .collect();
-
-    GraphPayload {
-        nodes,
-        links,
-        unresolved_links,
-    }
-}
-
-fn build_payload_from_snapshot(snap: &kin_db::SnapshotManager) -> Result<GraphPayload> {
-    let graph = snap.graph();
-    let entities = graph.list_all_entities()?;
-
-    let mut edges: Vec<(String, String, String)> = Vec::new();
-    for e in &entities {
-        let src_id = e.id.to_string();
-        let rels = graph.get_all_relations_for_entity(&e.id)?;
-        for rel in rels {
-            let other_id = match (&rel.src, &rel.dst) {
-                (GraphNodeId::Entity(s), GraphNodeId::Entity(d)) => {
-                    if *s == e.id {
-                        d.to_string()
-                    } else {
-                        s.to_string()
-                    }
-                }
-                _ => continue,
-            };
-            edges.push((src_id.clone(), other_id, format!("{:?}", rel.kind)));
-        }
-    }
-
-    let node_meta = entities
-        .iter()
-        .map(|e| NodeMeta {
-            id: e.id.to_string(),
-            name: e.name.clone(),
-            kind: format!("{:?}", e.kind),
-            file: e.file_origin.as_ref().map(|f| f.0.clone()),
-        })
-        .collect();
-
-    Ok(assemble_payload(node_meta, edges))
-}
 
 async fn serve_index() -> Response {
     static_response(INDEX_HTML.as_bytes().to_vec(), "text/html; charset=utf-8")
@@ -181,12 +71,101 @@ async fn serve_graph_json(State(json): State<Arc<String>>) -> Response {
     resp
 }
 
+/// Build the export payload from local storage, for the offline/admin arm.
+///
+/// The same projection and the same sampling rule the daemon applies, run in
+/// this process against the store's own graph, so the page cannot draw one
+/// picture through the daemon and a different one beside it.
+fn payload_from_local_store(
+    layout: &kin_core::KinLayout,
+    options: &graph_export::ExportOptions,
+) -> Result<GraphExportPayload> {
+    let snap = crate::backend::open_snapshot_local(layout)?;
+    let graph = snap.graph();
+    let root_hash = hex::encode(graph.compute_root_hash());
+    let (node_meta, all_entity_ids, edges) = graph_export::read_graph(graph.as_ref())?;
+    // Sequence zero rather than a borrowed cursor. An offline read holds no
+    // position in the daemon's event stream, and a client discards every event
+    // at or below this number; zero discards none, so a page that later
+    // subscribes re-applies what it already has instead of skipping what it
+    // does not. An invented cursor would silently lose the difference.
+    Ok(graph_export::assemble_payload(
+        root_hash,
+        0,
+        node_meta,
+        &all_entity_ids,
+        edges,
+        options,
+    ))
+}
+
+/// Resolve the payload the page will draw.
+///
+/// The authority order every read-only graph command follows: the daemon first,
+/// then an explicit offline/admin local read behind
+/// `KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN`, then an actionable refusal. Neither arm
+/// may answer with an empty graph it did not actually read. That is what the old
+/// local arm did, opening a retired file name, finding nothing, and serving a
+/// blank canvas at exit 0 against a store holding 20,298 entities.
+async fn resolve_payload(
+    layout: &kin_core::KinLayout,
+    options: &graph_export::ExportOptions,
+    query: &str,
+) -> Result<GraphExportPayload> {
+    let daemon_error =
+        match crate::daemon_client::DaemonClient::connect_for_command("graph viz", layout).await {
+            Ok(client) => match client.graph_export(query).await {
+                Ok(payload) => return Ok(payload),
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+
+    if crate::backend::daemon_bootstrap_admin_allowed() {
+        tracing::warn!(
+            command = "kin graph viz",
+            error = %daemon_error,
+            "daemon unavailable; drawing from the local store directly (KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN)"
+        );
+        return payload_from_local_store(layout, options);
+    }
+
+    Err(daemon_error.context(
+        "kin graph viz needs the Kin daemon, which could not be reached.\n\
+         Start it with `kin status` (it auto-starts the daemon), then retry.\n\
+         For offline/admin use only, set KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN=1 to read the local store directly.",
+    ))
+}
+
 /// `kin graph viz` — serve an interactive force-directed graph over HTTP.
-pub async fn run(port: u16, open_browser: bool) -> Result<()> {
+///
+/// `limit` caps the drawn node count: `None` uses the export's default cap and
+/// `Some(0)` asks for every entity. The server binds only after a payload has
+/// actually been resolved, so a failure to read the graph refuses the command
+/// rather than serving a page with nothing on it.
+pub async fn run(port: u16, open_browser: bool, limit: Option<usize>) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
-    let snap =
-        crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin graph viz").await?;
-    let payload = build_payload_from_snapshot(&snap)?;
+    let args = graph_export::ExportArgs {
+        limit,
+        ..Default::default()
+    };
+    let options = graph_export::ExportOptions {
+        limit: graph_export::resolve_limit(limit),
+        ..Default::default()
+    };
+    let payload =
+        resolve_payload(&layout, &options, &graph_export::export_query_string(&args)).await?;
+
+    // The same line `kin graph export` prints, on the terminal that started the
+    // server, so what the page claims and what the command reported are one
+    // sentence rather than two that can drift.
+    println!("{}", graph_export::export_summary_line(&payload, None));
+    if payload.nodes.is_empty() {
+        println!(
+            "This repository's graph holds no entities matching the request, so the page will be blank."
+        );
+    }
+
     let json_body = serde_json::to_string(&payload).context("failed to serialize graph JSON")?;
     let shared: Arc<String> = Arc::new(json_body);
 
@@ -218,120 +197,4 @@ pub async fn run(port: u16, open_browser: bool) -> Result<()> {
         .await
         .context("kin graph viz server error")?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{assemble_payload, NodeMeta};
-
-    fn node(id: &str) -> NodeMeta {
-        NodeMeta {
-            id: id.to_string(),
-            name: format!("entity_{id}"),
-            kind: "Function".to_string(),
-            file: Some("src/lib.rs".to_string()),
-        }
-    }
-
-    fn edge(a: &str, b: &str, kind: &str) -> (String, String, String) {
-        (a.to_string(), b.to_string(), kind.to_string())
-    }
-
-    /// The empty-canvas defect in miniature. A relation pointing at an id that
-    /// is no entity in this graph must never reach the payload: the renderer
-    /// joins links to nodes by id and aborts the whole layout on the first
-    /// unmatched one.
-    #[test]
-    fn links_naming_an_absent_node_are_withheld_and_counted() {
-        let payload = assemble_payload(
-            vec![node("a"), node("b")],
-            vec![
-                edge("a", "b", "Calls"),
-                edge("a", "external-placeholder", "Imports"),
-                edge("missing", "b", "Calls"),
-            ],
-        );
-
-        assert_eq!(payload.links.len(), 1);
-        assert_eq!(payload.links[0].source, "a");
-        assert_eq!(payload.links[0].target, "b");
-        assert_eq!(payload.unresolved_links, 2);
-
-        let ids: Vec<&str> = payload.nodes.iter().map(|n| n.id.as_str()).collect();
-        for link in &payload.links {
-            assert!(
-                ids.contains(&link.source.as_str()),
-                "{link:?} source absent"
-            );
-            assert!(
-                ids.contains(&link.target.as_str()),
-                "{link:?} target absent"
-            );
-        }
-    }
-
-    /// Falsification: a graph whose relations all resolve must withhold
-    /// nothing, so a passing test above cannot be explained by the filter
-    /// simply dropping everything.
-    #[test]
-    fn a_fully_resolvable_graph_withholds_no_links() {
-        let payload = assemble_payload(
-            vec![node("a"), node("b"), node("c")],
-            vec![edge("a", "b", "Calls"), edge("b", "c", "Contains")],
-        );
-
-        assert_eq!(payload.unresolved_links, 0);
-        assert_eq!(payload.links.len(), 2);
-    }
-
-    /// Degree drives node radius, so it must count the edges actually drawn.
-    /// Counting withheld relations would inflate a node the layout never
-    /// connects to anything.
-    #[test]
-    fn degree_counts_only_drawn_edges() {
-        let payload = assemble_payload(
-            vec![node("a"), node("b")],
-            vec![
-                edge("a", "b", "Calls"),
-                edge("a", "gone", "Imports"),
-                edge("a", "also-gone", "Imports"),
-            ],
-        );
-
-        let degree_of = |id: &str| {
-            payload
-                .nodes
-                .iter()
-                .find(|n| n.id == id)
-                .map(|n| n.degree)
-                .expect("node present")
-        };
-        assert_eq!(degree_of("a"), 1);
-        assert_eq!(degree_of("b"), 1);
-    }
-
-    /// The same relation observed from both endpoints is one edge, and an
-    /// undirected key must not depend on which endpoint reported it.
-    #[test]
-    fn reciprocal_observations_collapse_to_one_link() {
-        let payload = assemble_payload(
-            vec![node("a"), node("b")],
-            vec![edge("a", "b", "Calls"), edge("b", "a", "Calls")],
-        );
-
-        assert_eq!(payload.links.len(), 1);
-        assert_eq!(payload.unresolved_links, 0);
-    }
-
-    /// The page reports the withheld count, so it must survive serialization
-    /// under the name the page reads.
-    #[test]
-    fn payload_serializes_the_withheld_count_for_the_page() {
-        let payload = assemble_payload(vec![node("a")], vec![edge("a", "gone", "Imports")]);
-        let json = serde_json::to_value(&payload).unwrap();
-
-        assert_eq!(json["unresolved_links"], 1);
-        assert_eq!(json["links"].as_array().unwrap().len(), 0);
-        assert_eq!(json["nodes"].as_array().unwrap().len(), 1);
-    }
 }

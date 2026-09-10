@@ -403,6 +403,16 @@ jobs:
       - name: Falsify the detached-head commit graders
         run: python3 scripts/acceptance/detached_head_commit_repro.py --self-test
 
+      # `kin graph viz` served an empty payload at exit 0 over a 20,298-entity
+      # store, and an empty answer nobody is told about is the one shape that
+      # never gets investigated. Each grader is driven against the exact payload
+      # that shipped, against the pre-fix payload shape that draws without
+      # saying how much it drew, and against a refusal that names the repository
+      # id and not the directory. Each mutation must red exactly one grader, or
+      # a defect is being caught by the wrong assertion.
+      - name: Falsify the graph-viz render graders
+        run: python3 scripts/acceptance/graph_viz_local_render.py --self-test
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
@@ -1273,6 +1283,31 @@ jobs:
             echo "::warning title=Detached-head commit acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: Graph viz local render acceptance suite (verdict comes from the gate step)
+        id: graphvizrender
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/graph_viz_local_render.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/graph_viz_render.json \
+            --verbose >acceptance/graph_viz_render.log 2>&1 || rc=$?
+          cat acceptance/graph_viz_render.log
+          {
+            echo "### Graph viz local render acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/graph_viz_render.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Graph viz local render acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       # Always, including on a cancelled or timed-out run: the reports are how a
       # failure is diagnosed without re-running the job.
       - name: Upload the acceptance reports
@@ -1335,5 +1370,6 @@ jobs:
             --report prose_parity=acceptance/prose_parity.json \
             --report merge_precedence=acceptance/merge_precedence.json \
             --report detached_head=acceptance/detached_head.json \
+            --report graph_viz_render=acceptance/graph_viz_render.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk comes back truncated, and a clip nothing can witness leaves the check unable to tell an absent required edge from a dropped one. A clip whose complete neighborhood witness re-supplies the dropped rows is readable and is graded on its merits, so this line now covers only the unwitnessable case and the FAIL allowance beside it covers the graded one. Any other UNREADABLE still fails the gate, and the moment this check passes both allowances announce themselves stale and can go.' \
             --allow-fail 'brownfield:4=FIR-2464|the hand-off this.router.handle at lib/application.js:177|Measured on the red main run 34225725954 and reproduced locally on 2026-09-08. The absence is real and no truncation causes it: app.handle offers eight callees against a per-step cap of 25 and was never clipped, and the one clip in the walk is on application, whose complete witness carries 45 relations and no matching name either. express is pinned at 5.2.1, where the router is a dependency rather than lib/router/index.js, so this hand-off targets Router.prototype.handle in node_modules/router/index.js while the fixture admits the repository only, 140 of 140 files. The graph has an entity for Router and none for its handle member. Surfacing that hand-off is FIR-2464 itself and is unfixed, and bin/kin-parity has tolerated this same FAIL under this same ticket since it was written, so this line stops the two graders of one report disagreeing.'

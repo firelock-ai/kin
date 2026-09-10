@@ -63,6 +63,14 @@
   // the resting page still says the drawing is partial rather than implying
   // every relation is on screen.
   let withheldRelations = 0;
+  // What the payload said about the population it was drawn from. The export is
+  // capped and sampled server side, so a page that showed only its own counts
+  // would read as the whole graph. These keep the resting line honest.
+  let scope = {
+    entityCount: 0,
+    relationCount: 0,
+    sampled: false,
+  };
   let neighbors = new Map();
   let quadtree = null;
 
@@ -327,6 +335,39 @@
     );
   }
 
+  // What this canvas is, in one sentence, always shown.
+  //
+  // The server caps and samples the export, so the drawn counts alone would
+  // read as the whole repository. Saying "1,400 of 20,298" is the difference
+  // between a picture and a picture that lies about itself. When nothing was
+  // capped it says so instead of going quiet, because a silent page and a
+  // complete one must not look the same.
+  function scopeNote() {
+    const n = (value) => (value || 0).toLocaleString();
+    let line;
+    if (scope.sampled) {
+      line =
+        "showing " +
+        n(nodes.length) +
+        " of " +
+        n(scope.entityCount) +
+        " entities and " +
+        n(links.length) +
+        " of " +
+        n(scope.relationCount) +
+        " relations (sampled; run with --limit 0 to draw them all)";
+    } else {
+      line =
+        "showing all " +
+        n(nodes.length) +
+        " entities and " +
+        n(links.length) +
+        " relations";
+    }
+    const withheld = partialNote().trim();
+    return withheld ? line + "; " + withheld : line;
+  }
+
   async function load() {
     setStatus("loading graph...");
     let data;
@@ -352,9 +393,25 @@
       .map((l) => Object.assign({}, l));
     const droppedHere = raw.length - links.length;
     withheldRelations = (data.unresolved_links || 0) + droppedHere;
+    scope = {
+      entityCount: data.entity_count || 0,
+      relationCount: data.relation_count || 0,
+      sampled: !!data.sampled,
+    };
 
-    nodeCountEl.textContent = nodes.length.toLocaleString();
-    edgeCountEl.textContent = links.length.toLocaleString();
+    // The population, not the sample, beside each count. A panel reading
+    // "nodes 1,400" on a 20,298-entity repository is the same lie the sampled
+    // status line exists to prevent.
+    nodeCountEl.textContent = scope.sampled
+      ? nodes.length.toLocaleString() +
+        " of " +
+        scope.entityCount.toLocaleString()
+      : nodes.length.toLocaleString();
+    edgeCountEl.textContent = scope.sampled
+      ? links.length.toLocaleString() +
+        " of " +
+        scope.relationCount.toLocaleString()
+      : links.length.toLocaleString();
 
     if (nodes.length === 0) {
       setStatus("graph is empty", false);
@@ -419,7 +476,7 @@
     simulation.on("end", () => {
       rebuildQuadtree();
       draw();
-      setStatus(partialNote().trim());
+      setStatus(scopeNote());
     });
 
     setTimeout(() => {
@@ -427,7 +484,7 @@
         simulation.alpha(0).stop();
         rebuildQuadtree();
         draw();
-        setStatus(partialNote().trim());
+        setStatus(scopeNote());
       }
     }, 20000);
   }

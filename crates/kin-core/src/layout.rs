@@ -117,7 +117,38 @@ impl KinLayout {
         self.kindb_dir().join("ingest-cas")
     }
 
-    /// `.kin/kindb/graph.kndb` — KinDB snapshot file.
+    /// `.kin/kindb/<repository-id>/` — the storage namespace holding one
+    /// repository's authority record, deltas, snapshots and source blobs.
+    ///
+    /// This is where graph truth actually lives, and it is the only rule for
+    /// finding it. KinDB's `LocalFileBackend` joins the same component onto its
+    /// base path for every artifact it addresses, so a caller that resolves a
+    /// namespace by hand and a caller that hands the backend a repository id
+    /// must agree by construction rather than by two copies of one convention.
+    ///
+    /// The repository id comes from `.kin/manifest.json`; see
+    /// [`crate::manifest::resolve_repo_id`]. A caller that already holds a
+    /// bound repository asks its binding for
+    /// [`crate::LocalRepositoryAuthorityBinding::namespace_path`] instead of
+    /// re-deriving the id.
+    pub fn kindb_namespace_path(&self, repo_id: &str) -> PathBuf {
+        kindb_namespace_in(&self.kindb_dir(), repo_id)
+    }
+
+    /// `.kin/kindb/graph.kndb` — the anchor the derived sidecars are named
+    /// from, and NOT the graph.
+    ///
+    /// The single-file snapshot this path once addressed is retired: nothing
+    /// writes it, and repository-v6 keeps graph truth under
+    /// [`Self::kindb_namespace_path`] instead. What still lives at this name is
+    /// the derived vector and text sidecar set (`graph.kvec`, `graph.kidx`),
+    /// which kin-db addresses by suffixing this path.
+    ///
+    /// Opening a graph here answers with a valid EMPTY graph rather than an
+    /// error, because an absent namespace is legitimately how an uninitialized
+    /// one looks from this path's point of view. `kin graph viz` did exactly
+    /// that on a 20,298-entity store and drew a blank canvas at exit 0. Resolve
+    /// the namespace, not this file, for anything that is an answer.
     pub fn kindb_snapshot_path(&self) -> PathBuf {
         self.kindb_dir().join("graph.kndb")
     }
@@ -433,6 +464,19 @@ impl KinLayout {
     }
 }
 
+/// Join a repository id onto a KinDB base directory to name that repository's
+/// storage namespace.
+///
+/// The one place the `<base>/<repository-id>` rule is written down. A caller
+/// holding a [`KinLayout`] goes through [`KinLayout::kindb_namespace_path`];
+/// this exists for the callers that hold a backend's base path instead of a
+/// layout, so that both spell the namespace the same way and a change to the
+/// rule reaches both. Two independent copies of it are what let the CLI look
+/// for graph truth at a path the daemon never writes.
+pub fn kindb_namespace_in(kindb_dir: &Path, repo_id: &str) -> PathBuf {
+    kindb_dir.join(repo_id)
+}
+
 /// The real home's `.kin`, which is an install-root identity rather than a
 /// servable repo. Returns `None` when no home directory is resolvable.
 ///
@@ -654,6 +698,30 @@ mod tests {
             PathBuf::from("/repo/.kin/kindb/head-generation")
         );
         assert_eq!(layout.working_dir(), Path::new("/repo"));
+    }
+
+    /// The namespace resolver names the repository-id directory, and it agrees
+    /// with the free function the backend-holding callers use.
+    ///
+    /// Pinned as an exact path rather than as "somewhere under kindb" because
+    /// the defect this replaced was a second, plausible-looking path under the
+    /// same directory that nothing writes.
+    #[test]
+    fn kindb_namespace_is_the_repository_id_directory() {
+        let layout = KinLayout::new(PathBuf::from("/repo/.kin"));
+        let repo_id = "c2fd2519-1d5a-4292-8511-7e9196accade";
+        assert_eq!(
+            layout.kindb_namespace_path(repo_id),
+            PathBuf::from("/repo/.kin/kindb/c2fd2519-1d5a-4292-8511-7e9196accade")
+        );
+        assert_eq!(
+            layout.kindb_namespace_path(repo_id),
+            kindb_namespace_in(&layout.kindb_dir(), repo_id)
+        );
+        assert_ne!(
+            layout.kindb_namespace_path(repo_id),
+            layout.kindb_snapshot_path()
+        );
     }
 
     #[test]

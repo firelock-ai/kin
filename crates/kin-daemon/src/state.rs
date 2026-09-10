@@ -17455,7 +17455,7 @@ mod tests {
         let init = kin_core::init(repo_dir.path()).unwrap();
         let layout = init.layout;
         let manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path()).unwrap();
-        let repository_dir = layout.kindb_dir().join(&manifest.repo_id);
+        let repository_dir = layout.kindb_namespace_path(&manifest.repo_id);
         let authority: serde_json::Value =
             serde_json::from_slice(&std::fs::read(repository_dir.join("authority.json")).unwrap())
                 .unwrap();
@@ -17484,7 +17484,7 @@ mod tests {
         let init = kin_core::init(repo_dir.path()).unwrap();
         let layout = init.layout;
         let manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path()).unwrap();
-        let repository_dir = layout.kindb_dir().join(&manifest.repo_id);
+        let repository_dir = layout.kindb_namespace_path(&manifest.repo_id);
         assert!(
             std::fs::read_dir(repository_dir.join("snapshots"))
                 .unwrap()
