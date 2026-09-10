@@ -75,9 +75,29 @@ import path from "node:path";
 // proof" step is byte for byte identical between the two pins, so this resync
 // moves the pin with no assertion delta, as the kin#1069 (job timeout) and
 // kin#1060 (Windows repo-free provenance step) resyncs before it did.
+//
+// Resynced 2026-09-10 against install-proof.yml carrying kin#1652, which adds
+// the `update-proof` job that installs the previously published release and
+// requires the real updater to move it to Latest. That job is appended whole
+// after the last line of the pin it replaces: that pin's file is a byte-exact
+// prefix of this one, 2126 lines of 2285, so the mirrored "Validate installed
+// capability proof" step at line 1684 did not move a byte. The job is scoped
+// to `github.event_name == 'schedule' || github.event_name ==
+// 'workflow_dispatch'`, so it never runs on the release path this validator
+// mirrors and adds no assertion the release gate runs. This resync moves the
+// pin with no assertion delta, as the kin#1069 and kin#1060 resyncs did. The
+// kin#1238 resync that set the pin being replaced was the other kind, and its
+// relation-census tolerance is ported below.
+//
+// The drift above was found by the driver refusing a cut, hours after kin#1652
+// landed, which is the fourth time this pin has gone stale outside the
+// mirrored step. `assert_ported_validator_pin_tracks_install_proof` in
+// scripts/test-release-workflow-authority.py now fails the pull request that
+// moves install-proof.yml without moving this pin, so the next drift is caught
+// by that pull request rather than by a release.
 export const PORTED_FROM = {
   file: ".github/workflows/install-proof.yml",
-  sha256: "0c469d2871a1a6b02944a2ddc5f12482a1556af4179f8f66bbfa018443ee2878",
+  sha256: "c4b55da81b9d74d955b7e9165b162c67e355246640398b6f7468e5a7c11d67aa",
 };
 
 class Unreadable extends Error {}

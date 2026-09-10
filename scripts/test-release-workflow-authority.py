@@ -47,6 +47,15 @@ CAPABILITY_CONTRACT = ROOT / "scripts" / "verify-capability-proof.mjs"
 CAPABILITY_CONTRACT_POLICY = "scripts/verify-capability-proof.mjs"
 RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
+PORTED_VALIDATOR = (
+    ROOT
+    / "scripts"
+    / "release-proof"
+    / "bin"
+    / "kin-release-preflight.d"
+    / "validate.mjs"
+)
+PREFLIGHT_DRIVER = ROOT / "scripts" / "release-proof" / "bin" / "kin-release-preflight"
 
 # A release tag freezes the workflow that its run will execute. Keep every
 # runner selected by the pretag build, tag mint, tagged release, recovery and
@@ -4147,6 +4156,91 @@ def assert_update_proof_stays_off_the_release_path(install_proof: str) -> None:
             "surface a step later as a missing `kin` and read as a broken "
             f"binary; found {[line for line in install_lines if line.startswith('set ')]}"
         )
+
+
+# The preflight driver refuses to grade a candidate whose install-proof.yml is
+# not the one its ported validator was written against, and it builds that
+# comparison out of these two lines. They are pinned so this test reads the
+# same number the driver reads. A test that recomputed the pin its own way
+# could agree with itself while the driver went on refusing.
+PORTED_PIN_EXTRACTOR = (
+    r"""PORTED_SHA="$(sed -n 's/^  sha256: "\([0-9a-f]\{64\}\)",$/\1/p' """
+    r'''"$HELPERS/validate.mjs" | head -1)"'''
+)
+PORTED_PIN_COMPARISON = 'if [ "$WORKFLOW_SHA" != "$PORTED_SHA" ]; then'
+# That extractor as a Python pattern: any line of validate.mjs, not only the
+# one inside PORTED_FROM, and `head -1` keeps whichever comes first.
+PORTED_PIN_LINE = re.compile(r'(?m)^  sha256: "([0-9a-f]{64})",$')
+PORTED_FROM_BLOCK = re.compile(r"(?ms)^export const PORTED_FROM = \{.*?^\};$")
+
+
+def assert_ported_validator_pin_tracks_install_proof(
+    install_proof: bytes, validator: str, preflight: str
+) -> None:
+    """Fail the pull request that moves install-proof.yml and not the ported pin.
+
+    ``scripts/release-proof/bin/kin-release-preflight.d/validate.mjs`` is a hand
+    port of install-proof.yml's "Validate installed capability proof" step, and
+    it records the sha256 of the workflow it was ported from. The preflight
+    driver compares that pin against the workflow at the ref under test and
+    exits 65, REFUSED, when the two differ, because a PASS from a stale port is
+    a PASS against assertions the release gate no longer runs.
+
+    That refusal is correct and it arrives far too late. It arrives inside
+    Release Cut, on every leg at once, against a candidate already selected,
+    hours after the pull request that moved the workflow merged green. kin#1652
+    appended the update-proof job on 2026-09-09 and all three legs of the
+    v0.7.9 cut refused the next morning, holding a release. It was the fourth
+    drift of this pin, and none of the four was visible to the pull request
+    that caused it. So the driver's own comparison runs here too, where ci.yml
+    runs this file on every pull request, and the author who moves either file
+    restamps the pin in the change that needs it.
+
+    Nothing here judges whether the port is still CORRECT, only whether it
+    still claims to mirror the workflow in this tree. A resync is still a human
+    reading the workflow step assertion by assertion.
+    """
+
+    block = PORTED_FROM_BLOCK.search(validator)
+    if block is None:
+        raise AssertionError(
+            "validate.mjs must export a PORTED_FROM block naming the "
+            "install-proof.yml it was ported from; with no pin the preflight "
+            "has nothing to compare and refuses every leg of the cut"
+        )
+    pins = list(PORTED_PIN_LINE.finditer(validator))
+    inside = [
+        pin for pin in pins if block.start() <= pin.start() and pin.end() <= block.end()
+    ]
+    if len(pins) != 1 or len(inside) != 1:
+        raise AssertionError(
+            "the driver keeps the FIRST line of validate.mjs its sed "
+            "expression matches, so exactly one line may match and it must be "
+            "the one inside PORTED_FROM; a second one earlier in the file "
+            "would be read in its place and this test would still agree with "
+            f"the pin nobody uses. Found {len(pins)} matching, {len(inside)} "
+            "of them in the block"
+        )
+    recorded = inside[0].group(1)
+    actual = hashlib.sha256(install_proof).hexdigest()
+    if recorded != actual:
+        raise AssertionError(
+            "the ported capability validator records install-proof.yml at "
+            f"{recorded}, but the workflow in this tree is {actual}. Read the "
+            '"Validate installed capability proof" step at both shas, port '
+            "every changed assertion into validate.mjs, and move "
+            "PORTED_FROM.sha256 to the new sha. When nothing the validator "
+            "asserts moved, say which hunks you compared and move the pin "
+            "anyway: leaving it behind refuses the next release cut rather "
+            "than this pull request"
+        )
+    for policy in (PORTED_PIN_EXTRACTOR, PORTED_PIN_COMPARISON):
+        if policy not in preflight:
+            raise AssertionError(
+                "the preflight driver must still read the pin and compare it "
+                "to the workflow the way this test mirrors, or the two agree "
+                f"only by luck; missing `{policy}`"
+            )
 
 
 def assert_install_proof_first_run_never_pipes_the_daemon_spawner(
@@ -10796,6 +10890,9 @@ def main() -> None:
     proof_gate = PROOF_GATE.read_text(encoding="utf-8")
     release_bot_doc = RELEASE_BOT_DOC.read_text(encoding="utf-8")
     install_proof = INSTALL_PROOF.read_text(encoding="utf-8")
+    install_proof_bytes = INSTALL_PROOF.read_bytes()
+    ported_validator = PORTED_VALIDATOR.read_text(encoding="utf-8")
+    preflight_driver = PREFLIGHT_DRIVER.read_text(encoding="utf-8")
     install_proof_canary = INSTALL_PROOF_CANARY.read_text(encoding="utf-8")
     capability_contract = CAPABILITY_CONTRACT.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
@@ -13036,6 +13133,77 @@ def main() -> None:
             expected,
             lambda mutated=install_proof.replace(original, mutation, 1): (
                 assert_update_proof_stays_off_the_release_path(mutated)
+            ),
+        )
+
+    assert_ported_validator_pin_tracks_install_proof(
+        install_proof_bytes, ported_validator, preflight_driver
+    )
+    ported_pin = PORTED_PIN_LINE.search(ported_validator).group(1)
+    ported_block = PORTED_FROM_BLOCK.search(ported_validator).group(0)
+    decoy_pin = "0" * 64
+    for fixture, source, name in (
+        (ported_pin, ported_validator, "the PORTED_FROM pin"),
+        (ported_block, ported_validator, "the PORTED_FROM block"),
+        (PORTED_PIN_EXTRACTOR, preflight_driver, "the driver's pin extractor"),
+        (PORTED_PIN_COMPARISON, preflight_driver, "the driver's pin comparison"),
+    ):
+        if fixture not in source:
+            raise AssertionError(
+                f"ported-pin falsification lost fixture for {name}: {fixture!r}"
+            )
+    for label, install_bytes, validator_text, preflight_text, expected in (
+        (
+            "install-proof.yml moves and the ported pin stays behind",
+            install_proof_bytes + b"\n# a step the ported validator never saw\n",
+            ported_validator,
+            preflight_driver,
+            "but the workflow in this tree is",
+        ),
+        (
+            "the pin is restamped to a sha that is not the workflow's",
+            install_proof_bytes,
+            ported_validator.replace(ported_pin, "a" * 64, 1),
+            preflight_driver,
+            "but the workflow in this tree is",
+        ),
+        (
+            "the PORTED_FROM export is dropped and nothing is pinned at all",
+            install_proof_bytes,
+            ported_validator.replace(ported_block, "", 1),
+            preflight_driver,
+            "must export a PORTED_FROM block",
+        ),
+        (
+            "a second pin line appears above the block, where the driver's "
+            "first-match extractor reads it instead",
+            install_proof_bytes,
+            ported_validator.replace(
+                ported_block, f'  sha256: "{decoy_pin}",\n{ported_block}', 1
+            ),
+            preflight_driver,
+            "exactly one line may match",
+        ),
+        (
+            "the driver stops extracting the pin the way this test mirrors",
+            install_proof_bytes,
+            ported_validator,
+            preflight_driver.replace(PORTED_PIN_EXTRACTOR, 'PORTED_SHA=""', 1),
+            "must still read the pin",
+        ),
+        (
+            "the driver stops comparing the pin against the workflow",
+            install_proof_bytes,
+            ported_validator,
+            preflight_driver.replace(PORTED_PIN_COMPARISON, "if false; then", 1),
+            "must still read the pin",
+        ),
+    ):
+        expect_assertion(
+            label,
+            expected,
+            lambda i=install_bytes, v=validator_text, p=preflight_text: (
+                assert_ported_validator_pin_tracks_install_proof(i, v, p)
             ),
         )
 
