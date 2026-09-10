@@ -918,7 +918,9 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     },
     ".github/workflows/release-sentinel.yml": {
         "preflight": "Resolve sentinel credential",
+        "credential-alarm": "Alarm when the sentinel has no credential to patrol with",
         "patrol": "Patrol the release rail",
+        "mechanical-patrol": "Patrol the RC-Build-to-Release-Cut handoff mechanically",
     },
     ".github/workflows/install-proof-canary.yml": {
         "capability-canary": "Capability Contract Canary",
