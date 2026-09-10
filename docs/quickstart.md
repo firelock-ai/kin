@@ -450,7 +450,7 @@ kin merge cap-backoff           # one merge change carrying both parents
 
 A merge that does not compose is parked as a durable conflict record rather
 than refused: `kin conflicts` shows it and `kin resolve` settles it. The
-[README runs this loop end to end](../README.md#version-control-without-git)
+[architecture reference runs this loop end to end](readme-reference.md#version-control-without-git)
 in an empty directory, with the output of a real run.
 
 ### View history
