@@ -765,12 +765,26 @@ fn summarize(
     summary
 }
 
+/// `kin diff`, and the exit code it owes a caller.
+///
+/// Non-zero is [`crate::commands::status::EXIT_WORKING_COPY_UNMEASURED`] and
+/// nothing else, and only a workspace endpoint can produce it: a diff between
+/// two changes is history on both sides and needs no admission to be about the
+/// thing it says it is about.
+///
+/// The counts are still printed and are still true about durable authority. What
+/// the code says is that the workspace side of the comparison is whatever the
+/// last admission left, so `Artifacts: +0 ~0 -0` is a gap rather than an answer.
+/// A stranger read exactly that over a file it had edited a moment earlier, at
+/// exit 0, and called it the most serious defect it met. The `--json` arm
+/// returns the same code, and there it is the only signal at all: the scope
+/// lines below are rendered on the text path alone.
 pub async fn run(
     base: Option<String>,
     head: Option<String>,
     json: bool,
     full_bodies: bool,
-) -> Result<()> {
+) -> Result<i32> {
     let layout = crate::commands::require_repository_layout()?;
     let workspace_endpoint =
         endpoint_is_workspace(base.as_deref()) || endpoint_is_workspace(head.as_deref());
@@ -805,7 +819,22 @@ pub async fn run(
     if !json && workspace_endpoint {
         if let Some(response) = daemon_diff(&layout, &base, &head, full_bodies).await {
             let content_rendered = response.artifact_content_rendered;
-            for line in response.lines {
+            // Under the heading and above every count, on this route too. A
+            // daemon answering does not mean an admission ran: it can refuse the
+            // pass, fail it, answer it with no report, or find no author to name,
+            // and each of those leaves the workspace side as stale as an absent
+            // daemon does. Spliced after the responder's first line rather than
+            // printed before it, so the banner sits where the local route puts
+            // it and the daemon's own rendering is otherwise untouched.
+            let mut lines = response.lines;
+            if let Some(crate::commands::status::StatusAdmission::Skipped(why)) = pass.as_ref() {
+                let under_heading = lines.len().min(1);
+                lines.insert(
+                    under_heading,
+                    crate::commands::status::unmeasured_working_copy_banner(why),
+                );
+            }
+            for line in lines {
                 println!("{line}");
             }
             if let Some(report) = response.report.as_ref() {
@@ -854,7 +883,7 @@ pub async fn run(
                     crate::commands::repository_authority::AuthoritySource::RunningDaemonAndOwnOpen
                 })
             );
-            return Ok(());
+            return Ok(exit_code_for(pass.as_ref()));
         }
     }
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
@@ -876,7 +905,19 @@ pub async fn run(
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        for line in render_lines(&report) {
+        let mut lines = render_lines(&report);
+        // Under the heading and above every count, for the reason
+        // `unmeasured_working_copy_banner` states: the `Semantic scope:` and
+        // `Admission scope:` lines below say the same thing correctly, four and
+        // five lines beneath the number a reader has already believed.
+        if let Some(crate::commands::status::StatusAdmission::Skipped(why)) = pass.as_ref() {
+            let under_heading = lines.len().min(1);
+            lines.insert(
+                under_heading,
+                crate::commands::status::unmeasured_working_copy_banner(why),
+            );
+        }
+        for line in lines {
             println!("{line}");
         }
         for row in &report.artifact_content {
@@ -901,7 +942,17 @@ pub async fn run(
             )
         );
     }
-    Ok(())
+    Ok(exit_code_for(pass.as_ref()))
+}
+
+/// The exit code a diff owes its caller for the admission it got.
+///
+/// `None` is a diff between two changes, which took no admission because it
+/// needed none: both endpoints are durable authority and the answer is about
+/// exactly what it claims to be about. Only a workspace endpoint can be
+/// unmeasured, and only that case is non-zero.
+fn exit_code_for(pass: Option<&crate::commands::status::StatusAdmission>) -> i32 {
+    pass.map_or(0, crate::commands::status::exit_code_for_admission)
 }
 
 /// The paths this diff's entity counts were derived from an earlier parse for.

@@ -1067,7 +1067,15 @@ where
     }
 }
 
-pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
+/// `kin status`, and the exit code it owes a caller.
+///
+/// Non-zero is [`EXIT_WORKING_COPY_UNMEASURED`] and nothing else. The report is
+/// still printed and every line in it is still true; what the code says is that
+/// no pass took the working copy, so none of it describes the files on disk.
+/// The `--json` arm returns the same code, and there it is the ONLY signal: the
+/// payload cannot carry the gap, because `StatusReportWire` denies unknown
+/// fields and a new key there makes an older CLI reject a newer daemon's report.
+pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<i32> {
     let layout = crate::commands::require_repository_layout()?;
     // Admit, THEN read. The order is the whole point: a report read before the
     // admission describes the graph as it was, which is exactly the answer
@@ -1149,7 +1157,7 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
         // "there are none".
         println!("{}", untracked_host_content_line(&pass));
     }
-    Ok(())
+    Ok(exit_code_for_admission(&pass))
 }
 
 /// The `kin status` reading of host content graph truth does not carry.
@@ -1415,6 +1423,61 @@ pub enum StatusAdmission {
     Skipped(String),
 }
 
+/// Nothing measured the working copy, so no number below describes it.
+///
+/// Kept apart from 1, which is an error, for the reason `kin path` keeps
+/// [`crate::commands::path::NO_ROUTE_EXIT_CODE`] apart from 1: a caller has to
+/// be able to tell "the question was not answered" from "the command failed".
+/// This one says the first, and the report it rides on is still true about
+/// durable authority.
+///
+/// It is the only signal a machine consumer can get. Both commands that use it
+/// print their qualifications on the text path alone, and the JSON payload
+/// cannot carry the gap: `StatusReportWire` denies unknown fields, so a new key
+/// there makes an older CLI reject a newer daemon's report outright, which the
+/// status module already records as a deliberate wire decision rather than a
+/// field to slip in.
+pub const EXIT_WORKING_COPY_UNMEASURED: i32 = 9;
+
+/// The line a surface prints ABOVE its numbers when no admission took the
+/// working copy.
+///
+/// Its position is the whole point and is the lesson of the two tickets under
+/// this one. FIR-2961 put the basis beside the verdict and FIR-2820 added the
+/// untracked line, and both are correct sentences that a reader meets after the
+/// number they qualify. A stranger running the everyday loop with no daemon read
+/// `Artifacts: +0 ~0 -0` over a tree it had just edited, called it the most
+/// serious defect it met, and said so about output that already carried three
+/// accurate footers. `merge_line` sits directly under the heading for the same
+/// reason, in its own words: a reader who does not already suspect the state
+/// will not scroll for it.
+///
+/// So this goes under the heading and above every count, it says what the
+/// numbers are NOT about before they are read, and it names the exit code the
+/// way `kin merge` names its own, so a reader who sees a non-zero status has the
+/// sentence that explains it in the same output.
+pub fn unmeasured_working_copy_banner(why: &str) -> String {
+    format!(
+        "Working copy: NOT MEASURED, so no count below describes the files on disk: {why}. Exit          {EXIT_WORKING_COPY_UNMEASURED}: the numbers below are durable authority truth and are          not an answer about uncommitted work."
+    )
+}
+
+/// The exit code a surface owes its caller for the admission it got.
+///
+/// One predicate for both commands and all eight [`StatusAdmission::Skipped`]
+/// arms, because every one of them means the same thing: no pass took the
+/// working copy, so the workspace side of every comparison below is whatever
+/// the last admission left. A daemon that is absent, one still opening
+/// authority, one that refused, an author this store cannot name, and an
+/// admission that failed or answered with no report are different news for a
+/// reader and the same news for a script.
+pub fn exit_code_for_admission(pass: &StatusAdmission) -> i32 {
+    match pass {
+        StatusAdmission::Took(_) => 0,
+        StatusAdmission::Skipped(_) => EXIT_WORKING_COPY_UNMEASURED,
+    }
+}
+
 impl StatusAdmission {
     /// The reconcile probes the pass reported, when one ran.
     pub fn reconcile(&self) -> Option<&crate::commands::resources::ReconcileHealth> {
@@ -1665,8 +1728,17 @@ fn render_text_with_tip(
         SemanticEnrichmentPresence::Absent => "absent",
         SemanticEnrichmentPresence::Present => "present",
     };
-    let mut lines = vec![
-        "Kin repository-v6 status".to_string(),
+    let mut lines = vec!["Kin repository-v6 status".to_string()];
+    // Directly under the heading and above every number, for the reason
+    // [`unmeasured_working_copy_banner`] states: the two footers this repository
+    // already prints about an unadmitted working copy are both correct and both
+    // arrive after the count they qualify, and a stranger read `0 artifacts` as
+    // "nothing to commit" over three untracked files anyway. `merge_line` below
+    // is placed here on the same argument.
+    if let StatusAdmission::Skipped(why) = pass {
+        lines.push(unmeasured_working_copy_banner(why));
+    }
+    lines.extend([
         format!("Repository: {}", report.repository.repository_id),
         format!("Authority generation: {}", report.repository.generation),
         format!("Workspace: {}", report.workspace.workspace_id),
@@ -1724,7 +1796,7 @@ fn render_text_with_tip(
             ),
             None => "Authority payload read: none (generation zero built in memory)".to_string(),
         },
-    ];
+    ]);
     // Beside the head it qualifies, not appended at the end. A workspace whose
     // branch has moved past it reads as a clean tree in every line below, and a
     // reader who does not already suspect the gap will not scroll for the one
