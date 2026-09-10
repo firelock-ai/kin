@@ -37,6 +37,15 @@ import {
 } from '../packages/kin-mcp/src/index.js';
 import { emptyGlobalGitConfig } from '../packages/kin-mcp/test/smoke-first-run.mjs';
 
+// `kin status` exits this when nothing admitted the working copy. It is an
+// answer about the report rather than a failure to produce one, and it is the
+// only signal the `--json` arm can carry, because that arm renders none of the
+// text below. Named here so this proof cannot drift from the CLI's own value
+// silently.
+const EXIT_WORKING_COPY_UNMEASURED = 9;
+// The line that read leads with, so a 9 can be shown to be THAT 9.
+const UNMEASURED_BANNER = 'Working copy: NOT MEASURED';
+
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = path.dirname(path.dirname(scriptPath));
 const canonicalKinLauncher = path.join(repoRoot, 'packages', 'kin', 'bin', 'kin.mjs');
@@ -213,6 +222,33 @@ function runChecked(executable, args, { cwd, env, label, timeout = commandTimeou
   if (result.error || result.status !== 0) {
     throw new Error(
       `${label} failed (status=${result.status}, signal=${result.signal}): ` +
+        `${result.error?.message || ''}\nstdout:\n${result.stdout || ''}\nstderr:\n${result.stderr || ''}`,
+    );
+  }
+  return result;
+}
+
+/// Run a command that has more than one correct exit code, and refuse every
+/// other one.
+///
+/// `allowed` is a list, never a "non-zero is fine" switch. A proof that stopped
+/// checking the code would stop noticing a real failure, and the point here is
+/// the opposite: `kin status` answers 0 when something admitted the working
+/// copy and EXIT_WORKING_COPY_UNMEASURED when nothing did, both are correct
+/// answers about the report it prints, and anything else is still a failure.
+function runAllowing(allowed, executable, args, { cwd, env, label, timeout = commandTimeoutMs }) {
+  const result = cp.spawnSync(executable, args, {
+    cwd,
+    env,
+    encoding: 'utf8',
+    timeout,
+    windowsHide: true,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (result.error || !allowed.includes(result.status)) {
+    throw new Error(
+      `${label} failed (status=${result.status}, signal=${result.signal}, ` +
+        `allowed=${allowed.join(',')}): ` +
         `${result.error?.message || ''}\nstdout:\n${result.stdout || ''}\nstderr:\n${result.stderr || ''}`,
     );
   }
@@ -458,15 +494,56 @@ async function proveCanonical({ workRoot, builtKin, builtDaemon, gitBinary }) {
       env,
       label: '@kinlab/kin init',
     });
-    const status = runChecked(process.execPath, [canonicalKinLauncher, 'status', '--json'], {
-      cwd: repoDir,
-      env,
-      label: '@kinlab/kin repository status',
-    });
+    // Two correct exit codes, and this read accepts exactly those two.
+    //
+    // `kin status` never starts a daemon, and the one `kin init` brings up can
+    // be gone before the next process starts, at which point the read reports
+    // durable authority alone and exits EXIT_WORKING_COPY_UNMEASURED (9). What
+    // this leg asks of the read is that the npm launcher drives the real binary
+    // and gets a well-formed report back, and every assertion below is a
+    // durable-authority fact that the code does not touch. The daemon-backed
+    // half of this flow is proven by the graph search immediately after, which
+    // genuinely cannot answer without one.
+    //
+    // Named codes rather than a blanket non-zero: a proof that stopped reading
+    // the code would stop noticing a real failure.
+    const status = runAllowing(
+      [0, EXIT_WORKING_COPY_UNMEASURED],
+      process.execPath,
+      [canonicalKinLauncher, 'status', '--json'],
+      { cwd: repoDir, env, label: '@kinlab/kin repository status' },
+    );
     const statusJson = JSON.parse(status.stdout);
     assert.equal(statusJson.schema, 'kin.status.v3');
     assert.equal(statusJson.authority, 'repository-v6');
     assert.equal(statusJson.repository?.source_cas_verified, true);
+
+    // When the code is 9, prove it is THAT 9. The `--json` arm renders no
+    // banner, so the claim the code makes is unverifiable from the payload
+    // alone, and a 9 that meant something else entirely would read identically
+    // here. The text arm carries the sentence, and it has to be the line the
+    // reader meets first.
+    if (status.status === EXIT_WORKING_COPY_UNMEASURED) {
+      const text = runAllowing(
+        [EXIT_WORKING_COPY_UNMEASURED],
+        process.execPath,
+        [canonicalKinLauncher, 'status'],
+        { cwd: repoDir, env, label: '@kinlab/kin repository status (text arm)' },
+      );
+      const lines = text.stdout.split(/\r?\n/);
+      const banner = lines.findIndex((line) => line.startsWith(UNMEASURED_BANNER));
+      const tree = lines.findIndex((line) => line.startsWith('Tree:'));
+      assert.ok(
+        banner >= 0,
+        `@kinlab/kin status exited ${EXIT_WORKING_COPY_UNMEASURED} without saying the working ` +
+          `copy was unmeasured:\n${text.stdout}`,
+      );
+      assert.ok(
+        tree >= 0 && banner < tree,
+        `@kinlab/kin status put the unmeasured gap below the Tree line it qualifies:\n${text.stdout}`,
+      );
+      log('@kinlab/kin: status reported the working copy unmeasured, with the gap leading the page');
+    }
 
     const search = runChecked(
       process.execPath,
