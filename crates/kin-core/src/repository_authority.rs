@@ -10,6 +10,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use kin_db::{
@@ -384,8 +385,14 @@ impl LocalRepositoryAuthorityBinding {
             Arc::new(LocalFileBackend::new(layout.kindb_dir())),
         );
         binding.revalidate_pinned_namespace().map_err(|error| {
+            // Name the directory and the identity that produced it. A refusal
+            // that carried neither was indistinguishable from a store that is
+            // simply empty, and the caller could not tell whether it had
+            // resolved the wrong namespace or found the right one bare.
             KinError::Other(format!(
-                "cannot pin repository authority namespace at startup: {error}"
+                "cannot pin repository authority namespace {} for repository {} at startup: {error}",
+                binding.namespace_path().display(),
+                binding.repository_id(),
             ))
         })?;
         Ok(binding)
@@ -393,6 +400,17 @@ impl LocalRepositoryAuthorityBinding {
 
     pub fn repository_id(&self) -> &RepositoryId {
         &self.repository_id
+    }
+
+    /// The directory this binding's graph truth lives in.
+    ///
+    /// Resolved through [`crate::kindb_namespace_in`], the same rule KinDB's
+    /// backend applies to every artifact it addresses, so this is the path that
+    /// was actually consulted rather than a second guess at it. Callers report
+    /// it when an open finds nothing: an operator needs the directory that was
+    /// looked at, not only the id that named it.
+    pub fn namespace_path(&self) -> PathBuf {
+        crate::kindb_namespace_in(self.backend.base_path(), self.repository_id.as_str())
     }
 
     pub fn workspace_id(&self) -> WorkspaceId {
@@ -739,7 +757,9 @@ mod payload_receipt_tests {
                 .repo_id,
         )
         .unwrap();
-        let namespace = initialized.layout.kindb_dir().join(repository_id.as_str());
+        let namespace = initialized
+            .layout
+            .kindb_namespace_path(repository_id.as_str());
         let snapshots = namespace.join("snapshots");
         assert!(
             std::fs::read_dir(&snapshots).unwrap().any(|entry| entry
@@ -852,8 +872,7 @@ mod tests {
 
         let namespace = initialized
             .layout
-            .kindb_dir()
-            .join(binding.repository_id().as_str());
+            .kindb_namespace_path(binding.repository_id().as_str());
         let replacement = initialized.layout.root().join("namespace-replacement");
         let original = initialized.layout.root().join("namespace-original");
         copy_directory(&namespace, &replacement);
@@ -887,8 +906,7 @@ mod tests {
 
         let namespace = initialized
             .layout
-            .kindb_dir()
-            .join(binding.repository_id().as_str());
+            .kindb_namespace_path(binding.repository_id().as_str());
         std::fs::rename(
             &namespace,
             initialized.layout.root().join("namespace-detached"),
@@ -959,8 +977,7 @@ mod tests {
 
         let namespace = initialized
             .layout
-            .kindb_dir()
-            .join(binding.repository_id().as_str());
+            .kindb_namespace_path(binding.repository_id().as_str());
         std::fs::write(namespace.join("authority.json"), b"{ truncated").unwrap();
         for entry in std::fs::read_dir(namespace.join("snapshots")).unwrap() {
             let entry = entry.unwrap();
@@ -988,8 +1005,7 @@ mod tests {
 
         let namespace = initialized
             .layout
-            .kindb_dir()
-            .join(binding.repository_id().as_str());
+            .kindb_namespace_path(binding.repository_id().as_str());
         let replacement = initialized.layout.root().join("namespace-replacement");
         copy_directory(&namespace, &replacement);
         std::fs::rename(
@@ -1024,8 +1040,7 @@ mod tests {
 
         let namespace = initialized
             .layout
-            .kindb_dir()
-            .join(binding.repository_id().as_str());
+            .kindb_namespace_path(binding.repository_id().as_str());
         std::fs::rename(
             &namespace,
             initialized.layout.root().join("namespace-detached"),

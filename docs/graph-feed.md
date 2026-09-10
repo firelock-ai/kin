@@ -12,6 +12,11 @@ reuse. The other option was `GET /graph/bootstrap`, which is the whole binary
 snapshot: on a 23,098-entity repository that is 119.6 MiB, against the 1.0 MiB a
 renderer actually draws.
 
+`kin graph viz` now draws this export itself rather than shaping a payload of its
+own, so its page and any other consumer see the same graph and the same sample.
+It asked `/graph/bootstrap` until FIR-3498, and on a 20,298-entity store that
+request did not finish inside the 30-second budget the CLI gave it.
+
 ## The export
 
 `GET /graph/export` on the daemon, or `kin graph export --json`.

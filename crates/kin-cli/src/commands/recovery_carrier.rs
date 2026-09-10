@@ -877,9 +877,7 @@ mod tests {
         let scratch = scratch();
         let (source, manifest) = fixture(scratch.path());
         fs::write(
-            source
-                .join("kindb")
-                .join(&manifest.repository_id)
+            kin_core::kindb_namespace_in(&source.join("kindb"), &manifest.repository_id)
                 .join("authority.json"),
             b"truncated",
         )

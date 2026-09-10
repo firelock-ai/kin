@@ -2406,7 +2406,7 @@ kin graph export [options]
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--limit <n>` | `1400` | Cap the exported node count, sampled by degree with per-module quotas. `0` exports every entity |
+| `--limit <N>` | `1400` | Cap the exported node count, sampled by degree with per-module quotas. `0` exports every entity |
 | `--kinds <kinds>` |  | Keep only these entity kinds, comma-separated (`function,class`). Any spelling of a kind name matches |
 | `--path <prefix>` |  | Keep only entities whose file starts with this repository path prefix |
 | `--include <fields>` |  | Attach optional node fields, comma-separated (`signature,line`) |
@@ -2438,6 +2438,13 @@ kin graph viz [options]
 | --- | --- | --- |
 | `--port <port>` | `4220` | Port to bind the local HTTP server to |
 | `--open` |  | Open the visualization in the system default browser |
+| `--limit <N>` | `1400` | Cap the drawn node count, sampled by degree with per-module quotas. `0` draws every entity |
+
+The page draws the same payload `kin graph export` prints, so it is capped and
+sampled the same way, and it says which it is: a sampled canvas reads "showing
+1,400 of 20,298 entities", and a complete one says so instead of going quiet.
+The command refuses rather than serving a blank page when it cannot read the
+graph, and the refusal names the storage namespace it looked at.
 
 ### `kin embed`
 

@@ -6430,7 +6430,7 @@ mod tests {
             .to_string()
             .contains("changed since this backend opened"));
         assert!(
-            !kindb.join(repository_id.as_str()).exists(),
+            !crate::kindb_namespace_in(&kindb, repository_id.as_str()).exists(),
             "replacement root must remain untouched"
         );
         assert!(

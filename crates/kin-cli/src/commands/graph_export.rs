@@ -122,6 +122,25 @@ impl IncludeFields {
     }
 }
 
+/// Turn a caller's `limit` argument into the cap the export applies.
+///
+/// Three requests, not two: an explicit `0` asks for every entity, an explicit
+/// `n` asks for that cap, and an absent value asks for a drawable default.
+/// Collapsing the first two loses the whole-graph request, and collapsing the
+/// last two makes an uncapped export the default for a renderer.
+///
+/// One function rather than one `match` per entry point. The daemon's export
+/// route and the CLI commands that build an [`ExportOptions`] of their own both
+/// resolve it here, so a page and the route it asks cannot disagree about what
+/// `--limit 0` means.
+pub fn resolve_limit(limit: Option<usize>) -> Option<usize> {
+    match limit {
+        Some(0) => None,
+        Some(limit) => Some(limit),
+        None => Some(DEFAULT_NODE_LIMIT),
+    }
+}
+
 /// A resolved export request.
 #[derive(Debug, Clone, Default)]
 pub struct ExportOptions {
@@ -915,6 +934,104 @@ mod tests {
             "the a->b edge lost its target to the kind filter, a property of this request"
         );
         assert!(payload.links.is_empty());
+    }
+
+    /// Degree drives node radius on the page, so it counts the edges actually
+    /// drawn and not the relations the graph reported.
+    ///
+    /// Counting withheld relations would inflate a node the layout never
+    /// connects to anything, which reads to a viewer as a hub.
+    #[test]
+    fn degree_counts_only_the_edges_that_survive_to_the_payload() {
+        let metas = vec![
+            meta("a", "alpha", "Function", Some("src/a.rs")),
+            meta("b", "beta", "Function", Some("src/b.rs")),
+        ];
+        let known = all_ids(&metas);
+        let edges = vec![
+            ("a".to_string(), "b".to_string(), "Calls".to_string()),
+            ("a".to_string(), "gone".to_string(), "Imports".to_string()),
+            (
+                "a".to_string(),
+                "also-gone".to_string(),
+                "Imports".to_string(),
+            ),
+        ];
+
+        let payload = assemble_payload(
+            "root".to_string(),
+            0,
+            metas,
+            &known,
+            edges,
+            &ExportOptions::default(),
+        );
+
+        let degree_of = |id: &str| {
+            payload
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .map(|node| node.degree)
+                .expect("node present")
+        };
+        assert_eq!(degree_of("a"), 1, "two of a's three relations are withheld");
+        assert_eq!(degree_of("b"), 1);
+        assert_eq!(payload.unresolved_links, 2);
+    }
+
+    /// The page reads this payload by field name, so the names it reads must
+    /// survive serialization.
+    ///
+    /// `kin graph viz` serves this exact object at `/api/graph.json` and its
+    /// script reads `nodes`, `links`, `unresolved_links`, `entity_count`,
+    /// `relation_count` and `sampled`. A renamed field would not fail a Rust
+    /// test that only inspects the struct: the page would silently draw a
+    /// complete-looking canvas with `undefined` counts behind it.
+    #[test]
+    fn the_payload_serializes_every_field_the_page_reads() {
+        let metas = vec![
+            meta("a", "alpha", "Function", Some("src/a.rs")),
+            meta("b", "beta", "Function", Some("src/b.rs")),
+        ];
+        let known = all_ids(&metas);
+        let edges = vec![
+            ("a".to_string(), "b".to_string(), "Calls".to_string()),
+            (
+                "a".to_string(),
+                "outside".to_string(),
+                "Imports".to_string(),
+            ),
+        ];
+
+        let payload = assemble_payload(
+            "root".to_string(),
+            0,
+            metas,
+            &known,
+            edges,
+            &ExportOptions::default(),
+        );
+        let json = serde_json::to_value(&payload).unwrap();
+
+        assert_eq!(json["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(json["links"].as_array().unwrap().len(), 1);
+        assert_eq!(json["unresolved_links"], 1);
+        assert_eq!(json["entity_count"], 2);
+        assert_eq!(json["relation_count"], 1);
+        assert_eq!(json["sampled"], false);
+    }
+
+    /// The three limit requests stay three.
+    ///
+    /// An explicit zero and an absent value are opposite asks, and collapsing
+    /// either into the other is how a renderer ends up pulling a whole
+    /// repository or a caller asking for one gets 1,400 nodes instead.
+    #[test]
+    fn a_limit_of_zero_is_the_whole_graph_and_an_absent_one_is_the_default() {
+        assert_eq!(resolve_limit(Some(0)), None);
+        assert_eq!(resolve_limit(Some(25)), Some(25));
+        assert_eq!(resolve_limit(None), Some(DEFAULT_NODE_LIMIT));
     }
 
     /// One graph edge is one edge, however many times the store reported it.

@@ -1736,6 +1736,10 @@ enum GraphAction {
         /// Open the visualization in the system default browser
         #[arg(long, default_value_t = false)]
         open: bool,
+        /// Cap the drawn node count, sampled by degree with per-module quotas.
+        /// 0 draws every entity; omitted uses the default cap
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
     },
 }
 
@@ -4071,7 +4075,9 @@ fn run() -> Result<()> {
                         })
                         .await
                     }
-                    GraphAction::Viz { port, open } => commands::graph_viz::run(port, open).await,
+                    GraphAction::Viz { port, open, limit } => {
+                        commands::graph_viz::run(port, open, limit).await
+                    }
                 },
                 Command::Git { action } => match action {
                     GitAction::Export { output } => commands::git::export(output),

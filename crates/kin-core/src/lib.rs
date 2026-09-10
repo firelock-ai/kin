@@ -94,7 +94,7 @@ pub use init::{
     RepositoryIdentityOrigin, RepositoryPublication, StrandedRepositoryStage, StrandedStageSurvey,
     StrandedStageVerdict,
 };
-pub use layout::KinLayout;
+pub use layout::{kindb_namespace_in, KinLayout};
 pub use manifest::KinManifest;
 pub use paging::LocateCursor;
 pub use resolver::{ImportResolver, PythonResolver, SymbolTable, TypeScriptResolver};

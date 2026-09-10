@@ -572,6 +572,24 @@ reading `tree=0` must fail, a one-parent change must read UNREADABLE rather than
 graded, and a refusal that names the file but neither entity, or both entities
 but only one side, must each fail on their own assertion.
 
+`graph_viz_local_render.py` grades whether `kin graph viz` draws the store it was
+pointed at. It served `{"nodes": [], "links": [], "unresolved_links": 0}` on a
+20,298-entity repository at exit 0 and said nothing, which is the one shape
+nobody investigates, because it is what a genuinely fresh repository looks like.
+Check 1 asks the page's own `/api/graph.json` for nodes over a store `kin init`
+just admitted; check 2 asks whether the payload says what population it sampled,
+because the export is capped and a payload carrying only its own counts lets the
+page imply it drew everything. Checks 3 and 4 take the resolved namespace away
+and require a non-zero exit and a refusal that names the directory it read, kept
+apart because a build that refuses without naming the path reds only the second
+and is the harder failure to act on.
+
+The self-test drives each grader against the payload that shipped, the pre-fix
+payload shape that draws without saying how much it drew, and a refusal naming
+the repository id but not the directory. The crate test beside it,
+`crates/kin-cli/tests/local_graph_namespace_resolution.rs`, is what grades the
+pull request, since nothing here runs on one.
+
 `mcp_surface_contract.py` is the one suite here that runs per pull request, and
 it exists because the other suites do not. Five assertions in this repository
 read the served `agent-default` MCP surface and all five are graded only on

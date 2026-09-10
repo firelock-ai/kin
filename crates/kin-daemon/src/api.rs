@@ -164,9 +164,7 @@ fn read_local_publication_identity(
 ) -> Result<LocalPublicationIdentity, (StatusCode, String)> {
     use std::io::Read as _;
 
-    let record = backend
-        .base_path()
-        .join(repository_id.as_str())
+    let record = kin_core::kindb_namespace_in(backend.base_path(), repository_id.as_str())
         .join(AUTHORITY_PUBLICATION_RECORD);
     let record_error = |error: std::io::Error| {
         repository_authority_error(format!(
@@ -7784,13 +7782,11 @@ async fn export_graph_projection(
     use kin_cli::commands::graph_export as export;
 
     let options = export::ExportOptions {
-        limit: match params.limit {
-            // An explicit 0 is the request for every entity. Absent is a
-            // request for a drawable default, which is a different question.
-            Some(0) => None,
-            Some(limit) => Some(limit),
-            None => Some(export::DEFAULT_NODE_LIMIT),
-        },
+        // An explicit 0 is the request for every entity. Absent is a request for
+        // a drawable default, which is a different question. The rule lives in
+        // `export::resolve_limit` so every caller that builds these options
+        // reads it the same way.
+        limit: export::resolve_limit(params.limit),
         kinds: params
             .kinds
             .as_deref()
@@ -23229,8 +23225,7 @@ mod tests {
     ) -> PathBuf {
         let digest = digest.to_string();
         layout
-            .kindb_dir()
-            .join(repository_id)
+            .kindb_namespace_path(repository_id)
             .join("source-blobs")
             .join("sha256")
             .join(&digest[..2])
@@ -23352,7 +23347,7 @@ mod tests {
     }
 
     fn remove_local_authority_after_startup(state: &DaemonState) -> PathBuf {
-        let namespace = state.layout.kindb_dir().join(&state.cached_repo_id);
+        let namespace = state.layout.kindb_namespace_path(&state.cached_repo_id);
         assert!(
             std::fs::read_dir(namespace.join("snapshots"))
                 .unwrap()
@@ -34618,7 +34613,7 @@ mod tests {
     fn pinned_repository_namespace(state: &DaemonState) -> PathBuf {
         let manifest =
             kin_core::manifest::KinManifest::load(&state.layout.manifest_path()).unwrap();
-        state.layout.kindb_dir().join(manifest.repo_id)
+        state.layout.kindb_namespace_path(&manifest.repo_id)
     }
 
     /// Prove the retained per-repository capability, not only the storage root,
