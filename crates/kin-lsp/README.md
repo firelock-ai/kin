@@ -15,7 +15,7 @@ from a tree-sitter or linker edge once `kin` commits it to the graph through `ki
 
 ## What is Kin?
 
-Kin is the system of record for AI-written software: your code as a graph of
+Kin is a graph-native code repository for people and AI agents: your code as a graph of
 entities, relations, and intents, not a pile of files and diffs. AI agents and humans
 navigate it semantically, with provenance, review, and governance built in. It coexists
 with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
