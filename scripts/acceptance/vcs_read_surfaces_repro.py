@@ -29,8 +29,19 @@ here, and it grades both directions: a surface that qualifies every answer it
 gives is as useless as one that qualifies none, so the all-clear has its own
 check and must still arrive.
 
-Seven checks, one seeded repository, run in order because the experiment is
-destructive: each one sets up the next, and the last stops the daemon.
+FIR-3420 is the next chapter of the same story and the last three checks are
+its. The stranger that read those qualifications read past them: with no daemon,
+`kin diff HEAD WORKSPACE` printed `Artifacts: +0 ~0 -0` over a tree it had just
+edited and `kin status` over three untracked files printed output byte-identical
+to the empty repository, both at exit 0. Prose below a number is not where a
+reader meets it, and an exit code is the only thing a script reads at all. So
+the gap now leads the page and travels in the exit code, and these checks grade
+the position and the code rather than the wording, because the wording was
+already right.
+
+Nine checks, one seeded repository, run in order because the experiment is
+destructive: each one sets up the next, and the last three run after the daemon
+has stopped.
 
   basis        the `Tree:` line names when graph truth last caught up, rather
                than rendering a bare verdict a reader takes for a statement
@@ -63,6 +74,15 @@ destructive: each one sets up the next, and the last stops the daemon.
                marker beside no admission at all is the most convincing form of
                the defect, and its self-test row is the literal line the earlier
                fix would have printed
+  status_loud  the same reading graded as a caller meets it: the gap is ABOVE
+               the `Tree:` verdict a reader takes for the answer, and the exit
+               code is non-zero so a script has a signal at all. Runs after
+               `unadmitted`, which created the state and needs the daemon gone
+  diff_loud    the same two properties on the workspace diff, where the count a
+               reader stops at is `Artifacts:`. This is the exact reading the
+               stranger called the most serious defect it met, and it is the
+               only one of the nine that grades an exit code on a command that
+               printed a correct-looking answer
 
 Exit status is 0 when every check passed, 1 when one failed, 2 when none failed
 but one could not be read, and 3 when the run could not be set up. `--self-test`
@@ -320,6 +340,68 @@ def grade_diff_discloses_its_semantic_scope(text):
     return PASS, "the workspace diff names what its semantic counts cannot show"
 
 
+UNMEASURED_BANNER = "Working copy: NOT MEASURED"
+
+
+def grade_unmeasured_read_leads_with_its_gap(rc, text, count_prefix):
+    """The gap above the count, and a non-zero exit beside it.
+
+    Both halves are the finding and neither is sufficient. FIR-2961 and FIR-2820
+    already put accurate sentences into this output and a stranger read past
+    them, because they arrive after the number: `Artifacts: +0 ~0 -0` and
+    `0 artifacts` are where a reader stops. So position is graded, not presence.
+
+    And the exit code, because prose fixes nothing for a script. `--json` renders
+    none of these lines, and the status wire schema denies unknown fields, so for
+    a machine consumer the code is the only channel there is.
+
+    `count_prefix` is the line a reader takes for the answer on this surface:
+    `Tree:` in status, `Artifacts:` in a workspace diff. UNREADABLE when it is
+    absent, because a page without it is a fixture failure rather than a product
+    defect.
+    """
+    body = text or ""
+    lines = body.splitlines()
+    count_at = next(
+        (i for i, line in enumerate(lines) if line.startswith(count_prefix)), None
+    )
+    if count_at is None:
+        return UNREADABLE, (
+            "this reading carries no %r line, so the fixture never reached the state "
+            "this check is about" % count_prefix
+        )
+    banner_at = next(
+        (i for i, line in enumerate(lines) if line.startswith(UNMEASURED_BANNER)), None
+    )
+    if banner_at is None:
+        return FAIL, (
+            "an unmeasured reading printed %s with nothing above it saying the working copy "
+            "was never read: %s" % (count_prefix, lines[count_at].strip()[:160])
+        )
+    if banner_at > count_at:
+        return FAIL, (
+            "the gap is printed BELOW the count it qualifies (banner on line %d, %s on line "
+            "%d), which is the defect rather than the fix" % (banner_at, count_prefix, count_at)
+        )
+    if rc == 0:
+        return FAIL, (
+            "an unmeasured reading exited 0, so a script cannot tell it from a measured one, "
+            "however well the page reads"
+        )
+    return PASS, (
+        "the gap leads the page (line %d, above %s on line %d) and the exit code is %s"
+        % (banner_at, count_prefix, count_at, rc)
+    )
+
+
+def grade_unmeasured_status_leads_with_its_gap(rc, text):
+    return grade_unmeasured_read_leads_with_its_gap(rc, text, "Tree:")
+
+
+def grade_unmeasured_diff_leads_with_its_gap(rc, text):
+    return grade_unmeasured_read_leads_with_its_gap(rc, text, "Artifacts:")
+
+
 def grade_admit_left_the_graph_holding_the_edit(before_text, after_text):
     """Whether the graph holds the edit once the pass is done, read as two hashes.
 
@@ -532,6 +614,30 @@ def check_unadmitted(suite):
     return Result("unadmitted", status, "%s %s" % (TICKET, detail))
 
 
+def check_status_loud(suite):
+    """The unadmitted status graded as a caller meets it, page and exit code.
+
+    Runs after `unadmitted`, which stopped the daemon, and takes its own reading
+    rather than reusing that one, because `suite.status_text` hides the exit code
+    this check is half about.
+    """
+    rc, out, err = suite.kin_run(["status"])
+    status, detail = grade_unmeasured_status_leads_with_its_gap(rc, out or err)
+    return Result("status_loud", status, "FIR-3420 %s" % detail)
+
+
+def check_diff_loud(suite):
+    """The reading the stranger called the most serious defect it met.
+
+    `Artifacts: +0 ~0 -0` over a dirty tree at exit 0. The zero is correct about
+    the graph and wrong as an answer, so this grades where the gap sits and what
+    the exit code says, never the counts.
+    """
+    rc, out, err = suite.kin_run(["diff", "HEAD", "WORKSPACE"])
+    status, detail = grade_unmeasured_diff_leads_with_its_gap(rc, out or err)
+    return Result("diff_loud", status, "FIR-3420 %s" % detail)
+
+
 def check_diff_scope(suite):
     rc, out, err = suite.kin_run(["diff", "HEAD", "WORKSPACE"])
     if rc != 0:
@@ -591,6 +697,12 @@ CHECKS = (
     ("diff_scope", check_diff_scope),
     ("held_merge", check_held_merge),
     ("unadmitted", check_unadmitted),
+    # FIR-3420's two, and they run last for the same reason `unadmitted` does:
+    # they are about the daemon-absent shape, and `unadmitted` is what creates
+    # it. Neither restarts a daemon, because neither `kin status` nor `kin diff`
+    # ever starts one.
+    ("status_loud", check_status_loud),
+    ("diff_loud", check_diff_loud),
 )
 
 
@@ -723,6 +835,45 @@ ADMIT_UNMEASURED = (
 )
 ADMIT_REFUSED = "Complete exact-tree admission failed: host entry changed\n"
 
+# The literal shapes FIR-3420 is about, quoted from a run of the built binary
+# rather than invented, and the fixed shapes beside them.
+UNMEASURED_BANNER_LINE = (
+    "Working copy: NOT MEASURED, so no count below describes the files on disk: no daemon is running for this repository, so nothing admitted the working copy and this reports durable authority alone; `kin admit` takes what the working copy holds. Exit 9: the numbers below are durable authority truth and are not an answer about uncommitted work."
+)
+DIFF_ZERO_WITH_FOOTER_ONLY = (
+    "Kin repository-v6 diff\n"
+    "Authority generation: 2\n"
+    "Artifacts: +0 ~0 -0\n"
+    "Entities: +0 ~0 -0\n"
+    "Relations: +0 ~0 -0\n"
+    "Semantic scope: no live graph was reachable, so the entity and relation counts above are "
+    "the admitted overlay's and cannot move for work in the working copy.\n"
+    "Admission scope: this diff was not measured against the working copy: no daemon is running "
+    "for this repository, so nothing admitted the working copy\n"
+)
+DIFF_LED_BY_THE_GAP = (
+    "Kin repository-v6 diff\n"
+    + UNMEASURED_BANNER_LINE + "\n"
+    "Authority generation: 2\n"
+    "Artifacts: +0 ~0 -0\n"
+    "Entities: +0 ~0 -0\n"
+    "Relations: +0 ~0 -0\n"
+)
+# The banner present but under the count, which is the shape this check exists
+# to reject: every word of it is true and a reader still meets the zero first.
+DIFF_GAP_BELOW_THE_COUNT = (
+    "Kin repository-v6 diff\n"
+    "Artifacts: +0 ~0 -0\n"
+    + UNMEASURED_BANNER_LINE + "\n"
+)
+DIFF_NO_ARTIFACTS_LINE = "Kin repository-v6 diff\nEntities: +0 ~0 -0\n"
+STATUS_LED_BY_THE_GAP = (
+    "Kin repository-v6 status\n"
+    + UNMEASURED_BANNER_LINE + "\n"
+    "Tree: 6e22e604 (0 artifacts, matching its base change as last admitted, not measured "
+    "against the working copy: no daemon is running for this repository)\n"
+)
+
 
 def check_the_gate_reads_this_suites_report():
     """Hand this suite's own report to `gate.py`'s loader and require it back.
@@ -848,6 +999,32 @@ def self_test():
         ("settled/moved", grade_admit_still_reports_a_true_no_op, ADMIT_CONTENT_MOVED, FAIL),
         ("settled/unmeasured", grade_admit_still_reports_a_true_no_op, ADMIT_UNMEASURED, FAIL),
         ("settled/refused", grade_admit_still_reports_a_true_no_op, ADMIT_REFUSED, UNREADABLE),
+        # FIR-3420. The pre-fix payload is the literal shape the stranger read,
+        # footers and all, and it must FAIL: every sentence in it is true and the
+        # reader still meets the zero first at exit 0.
+        ("diffloud/footer-only", grade_unmeasured_diff_leads_with_its_gap,
+         (0, DIFF_ZERO_WITH_FOOTER_ONLY), FAIL),
+        ("diffloud/led-and-nonzero", grade_unmeasured_diff_leads_with_its_gap,
+         (9, DIFF_LED_BY_THE_GAP), PASS),
+        # Half a fix each, and both must fail. A banner under the count is the
+        # defect with better wording, and a banner above it at exit 0 leaves
+        # every script exactly where it was.
+        ("diffloud/banner-below-the-count", grade_unmeasured_diff_leads_with_its_gap,
+         (9, DIFF_GAP_BELOW_THE_COUNT), FAIL),
+        ("diffloud/led-but-exit-zero", grade_unmeasured_diff_leads_with_its_gap,
+         (0, DIFF_LED_BY_THE_GAP), FAIL),
+        ("diffloud/no-artifacts-line", grade_unmeasured_diff_leads_with_its_gap,
+         (0, DIFF_NO_ARTIFACTS_LINE), UNREADABLE),
+        ("statusloud/led-and-nonzero", grade_unmeasured_status_leads_with_its_gap,
+         (9, STATUS_LED_BY_THE_GAP), PASS),
+        # The literal pre-fix reading: byte-identical to the empty repository,
+        # correctly qualified in its own footer, exit 0.
+        ("statusloud/unmeasured-verdict-only", grade_unmeasured_status_leads_with_its_gap,
+         (0, STATUS_UNMEASURED_VERDICT), FAIL),
+        ("statusloud/led-but-exit-zero", grade_unmeasured_status_leads_with_its_gap,
+         (0, STATUS_LED_BY_THE_GAP), FAIL),
+        ("statusloud/no-tree-line", grade_unmeasured_status_leads_with_its_gap,
+         (0, STATUS_NO_TREE), UNREADABLE),
     ]
     # The two-hash grader takes a pair, so its rows carry a tuple and are unpacked
     # here. A grader that ignored one side would pass its own table, which is why
