@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-lsp"
+version = "0.7.19"
+edition = "2021"
+license = "Apache-2.0"
+description = "LSP client for graph enrichment: type-resolved relations via language servers"
+repository = "https://github.com/firelock-ai/kin-lsp"
+authors = ["Troy Fortin <troy@firelock.ai>"]
+
+[dependencies]
+kin-model = { version = "0.7.28", registry = "kin" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt"] }
+tracing = "0.1"
+thiserror = "2"
+which = "7"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+# Not a real dependency of this crate. tinyvec 1.13.0, published 2026-09-03, does
+# not compile: src/tinyvec.rs:3 does `use alloc::vec::{self, Vec}`, which binds
+# `vec` to the module and shadows the `vec!` macro that line 710 then calls.
+# This repo gitignores Cargo.lock, so CI resolves fresh on every run and takes the
+# broken release, while a developer's older local lock still pins a good one. Same
+# tree, different resolution. tinyvec is reachable only transitively, through
+# kin-model -> gix-object -> gix-utils -> unicode-normalization,
+# so a direct requirement here is the only in-tree lever.
+# A bare "<1.13" does NOT work: it admits the 0.x line, so cargo takes tinyvec
+# 0.4.1 for this entry and leaves 1.13.0 in the graph for the transitive users.
+# Remove this entry once 1.13.0 is yanked or a fixed tinyvec is published.
+tinyvec = ">=1.6, <1.13"
