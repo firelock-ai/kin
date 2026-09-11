@@ -387,6 +387,12 @@ pub struct Degraded {
     /// so it clears itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enrichment_shortfall: Option<bool>,
+    /// Nothing at or above this server's working directory is a Kin repository,
+    /// so there is no graph to answer from at all. Named apart from
+    /// `daemon_unreachable`: there is no daemon to reach, and the remedy is
+    /// `kin init` or pointing the server at a repository, not starting a daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_repository: Option<bool>,
 }
 
 impl Degraded {
@@ -405,6 +411,7 @@ impl Degraded {
             self.relation_census_loss,
             self.hydration_semantics_stale,
             self.enrichment_shortfall,
+            self.no_repository,
         ]
         .into_iter()
         .any(|flag| flag == Some(true))
@@ -500,6 +507,40 @@ impl GraphState {
             && self.entity_count_scope.is_none()
             && self.loaded.is_none()
             && self.initialized.is_none()
+    }
+}
+
+/// The daemon that answered, as its own `/health` names it: the pid, root and
+/// route `kin daemon status` prints for the same daemon, and how long it had
+/// been serving.
+///
+/// A graph read from a daemon one second old and one read from a daemon a day
+/// old report the same fields, and nothing else in the envelope told them apart.
+/// With this a reader can match the answer to a `kin daemon status` row, and see
+/// that a zero came from a daemon that had only just started.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AnsweringDaemon {
+    pub pid: u32,
+    pub repo_root: String,
+    pub repo_id: String,
+    pub uptime_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+impl AnsweringDaemon {
+    /// Read off a `/health` body, or `None` when it does not name its daemon.
+    pub fn from_health(health: &Value) -> Option<Self> {
+        Some(Self {
+            pid: u32::try_from(health.get("pid")?.as_u64()?).ok()?,
+            repo_root: health.get("repo_root")?.as_str()?.to_string(),
+            repo_id: health.get("repo_id")?.as_str()?.to_string(),
+            uptime_seconds: health.get("uptime_seconds")?.as_u64()?,
+            version: health
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
     }
 }
 
@@ -2100,6 +2141,11 @@ pub struct Envelope {
     /// envelope itself rides in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<crate::budget::BudgetAccounting>,
+    /// Which daemon answered, as its own `/health` names it. Stamped on the
+    /// status answer, and absent wherever it was not read. See
+    /// [`AnsweringDaemon`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<AnsweringDaemon>,
 }
 
 impl Envelope {
@@ -2124,6 +2170,7 @@ impl Envelope {
             completeness: None,
             verdict: None,
             response: None,
+            answered_by: None,
         }
     }
 
@@ -2146,6 +2193,7 @@ impl Envelope {
             completeness: None,
             verdict: None,
             response: None,
+            answered_by: None,
         }
     }
 
@@ -2410,6 +2458,36 @@ impl Envelope {
             completeness: None,
             verdict: None,
             response: None,
+            answered_by: None,
+        }
+    }
+
+    /// Envelope for a call made where nothing at or above the working directory
+    /// is a Kin repository.
+    ///
+    /// Deliberately not [`Envelope::daemon_unreachable`]: there is no daemon to
+    /// be unreachable, and an agent told the transport failed will wait for a
+    /// daemon that nothing is going to start.
+    pub fn no_repository() -> Self {
+        Self {
+            envelope_version: ENVELOPE_VERSION,
+            runtime: Runtime::RepoDaemon,
+            semantic_coverage: None,
+            graph_as_of: None,
+            durability: None,
+            behind: None,
+            freshness: None,
+            watcher_loss: None,
+            graph_state: GraphState::default(),
+            degraded: Degraded {
+                no_repository: Some(true),
+                ..Degraded::default()
+            },
+            hydration_semantics: None,
+            completeness: None,
+            verdict: None,
+            response: None,
+            answered_by: None,
         }
     }
 
@@ -2440,6 +2518,7 @@ impl Envelope {
             completeness: None,
             verdict: None,
             response: None,
+            answered_by: None,
         }
     }
 
@@ -2557,6 +2636,13 @@ impl Envelope {
                 .take()
                 .map(|durability| durability.qualified_by(behind));
         }
+        self
+    }
+
+    /// Name the daemon that answered, from its own `/health`. Left absent when
+    /// the body does not name it, never guessed.
+    pub fn with_answering_daemon(mut self, health: &Value) -> Self {
+        self.answered_by = AnsweringDaemon::from_health(health);
         self
     }
 

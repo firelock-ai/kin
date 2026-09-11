@@ -262,6 +262,11 @@ impl Verdict {
             ("outside_graph", outside_graph_reading(payload)),
             ("completeness", completeness_reading(envelope)),
             ("graph_freshness", graph_freshness_reading(envelope)),
+            // Last, so where the absence gate already named an empty graph its clause
+            // leads and this one is folded into it by label. It is the only input
+            // that speaks on an answer with no absence gate at all, which is the
+            // status answer, where a zero otherwise went out with no verdict.
+            ("graph_empty", graph_empty_reading(envelope)),
         ];
 
         if readings
@@ -884,6 +889,28 @@ fn graph_freshness_reading(envelope: &Envelope) -> Reading {
     }
 }
 
+/// A graph that holds no entities is a graph gap, never a zero.
+///
+/// Keyed on the entity count and nothing else. A daemon that began serving a
+/// moment ago, a repository no admission has reached, and a store that holds
+/// nothing all read this way, and in none of them can the graph speak for the
+/// repository. It deliberately does not consult the admission clock, whose
+/// absence is the ordinary state of a healthy fresh store and must never refuse
+/// on its own. The clause carries the label the absence gate uses for the same
+/// fact, so the two never disagree about an empty graph.
+fn graph_empty_reading(envelope: &Envelope) -> Reading {
+    match envelope.graph_state.entity_count {
+        Some(0) => Reading::Inconclusive(vec![
+            "graph_empty: the graph that answered holds no entities at all, so it cannot speak \
+             for this repository; a daemon that has just begun serving, or a repository no \
+             admission has reached yet, reads this way until its graph is loaded, so ask again \
+             rather than act on it"
+                .to_string(),
+        ]),
+        _ => Reading::Silent,
+    }
+}
+
 fn completeness_reading(envelope: &Envelope) -> Reading {
     let Some(completeness) = &envelope.completeness else {
         return Reading::Silent;
@@ -1211,6 +1238,78 @@ mod tests {
     /// `kin_cli::commands::resources::WatcherLossState`, written by the daemon's
     /// `watcher_loss::standing`, and the daemon-side test that grades the pair
     /// is `repository_admit::tests::only_an_explicit_full_admission_clears_a_watcher_loss`.
+    /// An empty graph is a gap on every answer, and above all on the status answer,
+    /// which has no absence gate of its own to say so.
+    mod graph_empty {
+        use super::*;
+
+        fn status_envelope(entity_count: u64) -> Envelope {
+            Envelope::daemon().with_selected_graph_observation(
+                crate::envelope::DurabilityCounts {
+                    live_entities: entity_count,
+                    durable_entities: None,
+                    live_relations: Some(0),
+                    durable_relations: None,
+                },
+                0,
+                0,
+                0,
+            )
+        }
+
+        #[test]
+        fn an_empty_graph_makes_the_status_answer_inconclusive_and_names_the_gap() {
+            let verdict = Verdict::compute(
+                "kin_graph_status",
+                &json!({ "entity_count": 0 }),
+                &status_envelope(0),
+                None,
+            )
+            .expect("an empty graph must put a verdict on the status answer");
+            assert!(!verdict.certified, "a zero is not a certified answer");
+            assert_eq!(
+                verdict.inputs.get("graph_empty").and_then(Value::as_str),
+                Some(INCONCLUSIVE)
+            );
+            let factor = verdict.limiting_factor.as_deref().unwrap_or_default();
+            assert!(
+                factor.starts_with("graph_empty:") && factor.contains("ask again"),
+                "the factor must name the gap and what to do about it: {factor}"
+            );
+            assert!(
+                !factor.contains("graph_admission"),
+                "the admission clock must not be what refuses: {factor}"
+            );
+        }
+
+        /// The control: a populated graph gives this input nothing to say, so the
+        /// status answer stays exactly as it was.
+        #[test]
+        fn a_populated_graph_gives_the_input_nothing_to_say() {
+            let verdict = Verdict::compute(
+                "kin_graph_status",
+                &json!({ "entity_count": 152 }),
+                &status_envelope(152),
+                None,
+            );
+            assert!(
+                verdict.is_none(),
+                "no input spoke, so no verdict: {:?}",
+                verdict.map(|verdict| verdict.limiting_factor)
+            );
+        }
+
+        /// The absence gate names an empty graph with the same label, so an empty
+        /// retrieval answer carries the clause once, not twice.
+        #[test]
+        fn the_clause_shares_the_absence_gate_s_label() {
+            let Reading::Inconclusive(clauses) = graph_empty_reading(&status_envelope(0)) else {
+                panic!("an empty graph must refuse");
+            };
+            assert_eq!(clause_label(&clauses[0]), "graph_empty");
+        }
+    }
+
     mod watcher_loss {
         use super::*;
 

@@ -965,23 +965,25 @@ fn resolve_daemon_auth_token(env_token: Option<String>, kin_dir: Option<&Path>) 
     (!token.is_empty()).then_some(token)
 }
 
-/// Walk up from the working directory to the repo's `.kin` directory.
+/// This server's repository `.kin` directory, found by the rule every other Kin
+/// surface uses.
 ///
-/// This intentionally does not use `KinLayout::discover`, whose `KIN_DAEMON_URL`
-/// short-circuit assumes the cwd is the repo root; the token file lives in the
-/// repo `.kin` even when an agent runs from a subdirectory, so we walk up to
-/// find it.
+/// `KinLayout::discover` walks up from the working directory like the CLI does,
+/// so a store-scoped read here (the auth token, a kill record, the hydration
+/// standing, revival) resolves the store that `kin status`, `kin daemon status`
+/// and this server's own delegate probe resolve. It skips the managed install
+/// home and refuses a parent store across a nested repository that has none of
+/// its own. A bare upward walk answered these reads from the parent's store
+/// while the delegate probe said no repository was here, so one response
+/// described two repositories.
 fn discover_kin_dir() -> Option<std::path::PathBuf> {
-    let mut current = std::env::current_dir().ok()?;
-    loop {
-        let candidate = current.join(".kin");
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
+    discover_kin_dir_from(&std::env::current_dir().ok()?)
+}
+
+/// [`discover_kin_dir`] from an explicit start, so the rule is testable without
+/// moving the process's working directory.
+fn discover_kin_dir_from(start: &Path) -> Option<std::path::PathBuf> {
+    kin_core::KinLayout::discover(start).map(|layout| layout.root().to_path_buf())
 }
 
 /// Attach the daemon bearer token to a request when auth is configured.
@@ -2428,26 +2430,47 @@ pub(crate) fn parse_graph_status_report(
         .map_err(|error| format!("daemon kin_graph_status contract validation failed: {error}"))
 }
 
-/// The answer a `tools/call` gets when this process has no daemon delegate.
+/// The answer a `tools/call` gets when this process has no daemon delegate, and
+/// the envelope it goes out under.
 ///
 /// Asks the resolver rather than inspecting the filesystem itself, so the
 /// message describes the state the forwarding attempt actually found, and
 /// names which of the three gaps it is. Within one tool call this costs no
 /// second probe: the forwarding attempt already ran one, and the resolver's
 /// cooldown replays that verdict.
-pub async fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
+pub async fn daemon_unavailable_tool_result(
+    name: &str,
+) -> (ToolCallResult, crate::envelope::Envelope) {
     match resolve_delegate().await {
-        DelegateResolution::Gap(gap) => ToolCallResult::error(gap.message(name)),
+        DelegateResolution::Gap(gap) => (
+            ToolCallResult::error(gap.message(name)),
+            envelope_for_gap(&gap),
+        ),
         // A delegate resolved between the forwarding attempt and this message,
         // or the attempt failed for a reason that is not endpoint resolution
         // (no HTTP client could be built at all). Neither is something the
         // caller can act on, and neither is any of the three gaps, so it is
         // reported as itself rather than dressed as one of them.
-        DelegateResolution::Resolved(url) => ToolCallResult::error(format!(
-            "kin-mcp could not issue '{name}' to the repo daemon at {url}, though the delegate \
-             resolves there now. Retry the call; if it keeps failing, capture `kin doctor` output, \
-             which probes that same endpoint."
-        )),
+        DelegateResolution::Resolved(url) => (
+            ToolCallResult::error(format!(
+                "kin-mcp could not issue '{name}' to the repo daemon at {url}, though the \
+                 delegate resolves there now. Retry the call; if it keeps failing, capture `kin \
+                 doctor` output, which probes that same endpoint."
+            )),
+            crate::envelope::Envelope::daemon_unreachable(),
+        ),
+    }
+}
+
+/// The envelope a gap goes out under. A working directory that is no repository
+/// has no daemon to be unreachable, so it carries its own flag; the two gaps with
+/// a repository and no daemon keep `daemon_unreachable`.
+fn envelope_for_gap(gap: &DelegateGap) -> crate::envelope::Envelope {
+    match gap {
+        DelegateGap::NoRepository { .. } => crate::envelope::Envelope::no_repository(),
+        DelegateGap::DaemonNotRunning { .. } | DelegateGap::StartupPredatesRepository { .. } => {
+            crate::envelope::Envelope::daemon_unreachable()
+        }
     }
 }
 
@@ -4928,6 +4951,63 @@ mod tests {
             text.contains("do not need to restart"),
             "an agent cannot restart its own MCP server, so the message must not ask it to: {text}"
         );
+    }
+
+    /// A working directory that is no repository goes out as that, not as a
+    /// daemon the agent should wait for.
+    #[test]
+    fn a_working_directory_that_is_no_repository_is_not_an_unreachable_daemon() {
+        let none = envelope_for_gap(&DelegateGap::NoRepository {
+            working_dir: std::path::PathBuf::from("/work/umbrella"),
+        });
+        assert_eq!(none.degraded.no_repository, Some(true));
+        assert_eq!(
+            none.degraded.daemon_unreachable, None,
+            "there is no daemon to be unreachable"
+        );
+        // The control: a repository with nothing serving it is still an
+        // unreachable daemon, and is not called a missing repository.
+        for gap in [
+            DelegateGap::DaemonNotRunning {
+                repo: std::path::PathBuf::from("/work/express"),
+                retry_in: Duration::from_secs(1),
+            },
+            DelegateGap::StartupPredatesRepository {
+                repo: std::path::PathBuf::from("/work/express"),
+                retry_in: Duration::from_secs(1),
+            },
+        ] {
+            let envelope = envelope_for_gap(&gap);
+            assert_eq!(envelope.degraded.daemon_unreachable, Some(true));
+            assert_eq!(envelope.degraded.no_repository, None);
+        }
+    }
+
+    /// Store-scoped reads resolve the store the delegate probe resolves: a nested
+    /// repository with no store of its own does not borrow its parent's.
+    #[test]
+    fn store_reads_resolve_the_store_the_delegate_probe_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(parent.join(".kin")).unwrap();
+        let nested_src = parent.join("nested").join("src");
+        std::fs::create_dir_all(parent.join("nested").join(".git")).unwrap();
+        std::fs::create_dir_all(&nested_src).unwrap();
+        assert_eq!(
+            discover_kin_dir_from(&nested_src),
+            None,
+            "the parent's store belongs to another repository"
+        );
+        assert_eq!(
+            discover_kin_dir_from(&nested_src),
+            kin_core::KinLayout::discover(&nested_src).map(|layout| layout.root().to_path_buf()),
+            "one rule for the store and for the delegate"
+        );
+        // The control: from a subdirectory of the repository that owns the store,
+        // the store is found.
+        let docs = parent.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        assert_eq!(discover_kin_dir_from(&docs), Some(parent.join(".kin")));
     }
 
     #[test]

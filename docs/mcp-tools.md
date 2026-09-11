@@ -28,10 +28,12 @@ The envelope's fields:
   reconciliation status, entity count, and loaded/initialized flags when known.
 - `semantic_coverage`: `indexed`, `total`, `pending`, and `complete` for the embedding
   signal, carried only when the daemon computed it and never fabricated here.
-- `degraded`: honest flags (`daemon_unreachable`, `embed_worker_failed`,
+- `degraded`: honest flags (`daemon_unreachable`, `no_repository`, `embed_worker_failed`,
   `mass_deletion_blocked`, `offline_fallback`, `workspace_mismatch`,
   `daemon_killed_by_memory`, `sweep_suspended`, `memory_pressure`), each present only
-  when observed. `workspace_mismatch` is a refusal about which repository an answer would
+  when observed. `no_repository` means nothing at or above the server's working directory
+  is a Kin repository, so there is no daemon to reach and the remedy is `kin init` or
+  `--repo`, not waiting. `workspace_mismatch` is a refusal about which repository an answer would
   be about, not a transport failure: the daemon is reachable and the server declined to
   answer from a repository the client is not looking at. The last three are standing
   facts about the store rather than about the call: a daemon this store has lost to the
@@ -64,6 +66,13 @@ composition, then the coverage observation, withheld rows, the run's own
 degradations and the completeness signal), each label once. The first clause is
 what decided the state and the rest are the other things wrong with the same
 answer, so a class gap never hides a dead embedding worker.
+
+An empty graph is a gap, not a zero. When the graph that answered holds no entities,
+`_kin.verdict` is `inconclusive` with a `graph_empty` clause, on `kin_graph_status` as on
+every retrieval tool, because a daemon that has just begun serving and a repository no
+admission has reached both read that way until their graph is loaded. The status answer
+also names the daemon that gave it under `_kin.answered_by`: its pid, repository
+root, route and uptime, the same fields `kin daemon status` prints for it.
 
 ---
 

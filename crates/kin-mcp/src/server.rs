@@ -1424,10 +1424,9 @@ async fn handle_tools_call_daemon(
     let (result, mut base_env) =
         match daemon_delegate::forward_tool_call(&call_params.name, &call_params.arguments).await {
             Ok(Some(result)) => (result, Envelope::daemon()),
-            Ok(None) => (
-                daemon_delegate::daemon_unavailable_tool_result(&call_params.name).await,
-                Envelope::daemon_unreachable(),
-            ),
+            // Which gap it was decides the envelope: a working directory that is no
+            // repository has no daemon to be unreachable.
+            Ok(None) => daemon_delegate::daemon_unavailable_tool_result(&call_params.name).await,
             Err(error) => {
                 let base = envelope_for_delegate_error(
                     &error,
@@ -1489,7 +1488,9 @@ async fn handle_tools_call_daemon(
     // the working-copy reading away from it along with the counts it is right to
     // refuse, and left it publishing "0 uncommitted" over a repository holding a
     // module the graph had never met (FIR-2820).
-    let health = if base_env.degraded.daemon_unreachable == Some(true) {
+    let health = if base_env.degraded.daemon_unreachable == Some(true)
+        || base_env.degraded.no_repository == Some(true)
+    {
         None
     } else {
         daemon_delegate::fetch_health_snapshot().await
@@ -1504,6 +1505,10 @@ async fn handle_tools_call_daemon(
         // field from the report itself.
         if let Some(health) = health.as_ref() {
             base_env = base_env.with_working_copy_health(health);
+            // The third lift: which daemon answered, and how long it had been up.
+            // A status read from a daemon that began serving a moment ago is the
+            // answer most in need of saying so.
+            base_env = base_env.with_answering_daemon(health);
             if let Some(unavailable) = health
                 .get("embed_persistence_unavailable")
                 .and_then(serde_json::Value::as_bool)
@@ -1796,6 +1801,82 @@ mod tests {
 
     fn direct_graph_status_result() -> ToolCallResult {
         direct_graph_status_result_with_coverage(1, 1, 2)
+    }
+
+    /// The same report with its graph emptied, the shape a daemon answers with in
+    /// the moment after it begins serving and before its graph is loaded.
+    fn direct_graph_status_result_with_entities(entity_count: u64) -> ToolCallResult {
+        let result = direct_graph_status_result();
+        let ContentBlock::Text { text } = result.content.first().expect("one content block");
+        let mut report: serde_json::Value = serde_json::from_str(text).expect("report json");
+        report["entity_count"] = serde_json::json!(entity_count);
+        report["relation_count"] = serde_json::json!(0);
+        ToolCallResult::text(report.to_string())
+    }
+
+    /// A status answer from a daemon whose graph holds nothing goes out as a
+    /// graph gap with a verdict, and names the daemon that gave it, never as a
+    /// bare zero.
+    #[test]
+    fn an_empty_selected_graph_goes_out_as_a_graph_gap_naming_its_daemon() {
+        let health = serde_json::json!({
+            "pid": 98031,
+            "repo_root": "/work/umbrella",
+            "repo_id": "local-4705badf13d922e2",
+            "uptime_seconds": 1,
+            "version": "0.7.9",
+        });
+        let base = Envelope::daemon()
+            .with_working_copy_health(&health)
+            .with_answering_daemon(&health);
+        let enveloped =
+            finalize_daemon_graph_status(direct_graph_status_result_with_entities(0), base, &[], 2);
+        let report = daemon_delegate::parse_graph_status_report(&enveloped)
+            .unwrap()
+            .expect("successful stdio status report");
+        let envelope = report
+            .response_envelope
+            .expect("stdio status carries the standard envelope");
+        assert_eq!(envelope.graph_state.entity_count, Some(0));
+        let verdict = envelope
+            .verdict
+            .expect("an empty graph must carry a verdict, never a bare zero");
+        assert_eq!(
+            verdict["inputs"]["graph_empty"], "inconclusive",
+            "{verdict}"
+        );
+        assert!(
+            verdict
+                .to_string()
+                .contains("graph_empty: the graph that answered holds no entities"),
+            "the verdict must name the gap: {verdict}"
+        );
+        let daemon = envelope
+            .answered_by
+            .expect("the status answer names the daemon that gave it");
+        assert_eq!(daemon.pid, 98031);
+        assert_eq!(daemon.repo_id, "local-4705badf13d922e2");
+        assert_eq!(daemon.repo_root, "/work/umbrella");
+        assert_eq!(daemon.uptime_seconds, 1);
+
+        // The control: a populated graph carries no graph gap.
+        let populated = finalize_daemon_graph_status(
+            direct_graph_status_result(),
+            Envelope::daemon().with_answering_daemon(&health),
+            &[],
+            2,
+        );
+        let populated = daemon_delegate::parse_graph_status_report(&populated)
+            .unwrap()
+            .expect("successful stdio status report")
+            .response_envelope
+            .expect("stdio status carries the standard envelope");
+        assert!(
+            !serde_json::to_string(&populated)
+                .unwrap()
+                .contains("graph_empty"),
+            "a populated graph is not a gap: {populated:?}"
+        );
     }
 
     #[test]
