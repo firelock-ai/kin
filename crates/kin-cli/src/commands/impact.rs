@@ -2453,13 +2453,21 @@ mod tests {
             healthy.lines
         );
 
-        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
-            "initialized": true,
-            "graph_loaded": true,
-            "graph_entity_count": 3,
-            "graph_generation": 1,
-            "embed_worker_failed": true,
-        }));
+        // A held language-server sweep: a flag that describes the relations
+        // impact reads, so it still refuses.
+        let degraded = kin_mcp::Envelope::daemon()
+            .with_health(&serde_json::json!({
+                "initialized": true,
+                "graph_loaded": true,
+                "graph_entity_count": 3,
+                "graph_generation": 1,
+            }))
+            .with_memory_pressure(Some(&kin_core::memory_pressure::PressureRefusal {
+                work: "lsp-sweep".to_string(),
+                level: "critical".to_string(),
+                reason: "host memory pressure is critical".to_string(),
+                at_unix: 0,
+            }));
         let refused = build_impact_response(&layout, &graph, &request, &degraded)
             .await
             .unwrap();
@@ -2492,6 +2500,41 @@ mod tests {
             refused.negative,
             kin_mcp::negative::negative_for("impact_analysis", &payload, &degraded, &[]),
             "the field is the verdict `impact_analysis` publishes, byte for byte"
+        );
+
+        // A stopped embedding worker describes vectors, which impact never
+        // reads, so the same empty answer certifies in prose and payload alike
+        // while the flag stays disclosed.
+        let vectors_only = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+        let certified = build_impact_response(&layout, &graph, &request, &vectors_only)
+            .await
+            .unwrap();
+        let certified_verdict = certified
+            .negative
+            .as_ref()
+            .expect("an empty impact answer publishes its verdict");
+        assert_eq!(
+            certified_verdict["safe_to_conclude_absent"],
+            serde_json::json!(true),
+            "a flag that describes vectors must not bound an answer read off relations: \
+             {certified_verdict}"
+        );
+        assert!(
+            certified_verdict["degraded_signals"]
+                .as_array()
+                .is_some_and(|signals| signals.contains(&serde_json::json!("embed_worker_failed"))),
+            "the flag stays disclosed: {certified_verdict}"
+        );
+        assert!(
+            !certified.lines.join("\n").contains("cannot rule out"),
+            "a certified absence prints no refusal: {:?}",
+            certified.lines
         );
     }
 
