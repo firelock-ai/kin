@@ -12137,16 +12137,43 @@ fn projection_control_names_match(left: &std::ffi::OsStr, right: &std::ffi::OsSt
     }
 }
 
-fn is_reserved_source_component(component: &str) -> bool {
+/// A component whose materialization would write into repository control.
+///
+/// Position decides for a control DIRECTORY and does not for a run marker,
+/// which is the split kin-db's admission authority makes in
+/// `intrinsic_repository_control`. `.git` and `.kin` at `index == 0` are this
+/// repository's own, so projecting into one would write over the store that
+/// owns the projection. Deeper, the same name is a directory somebody
+/// committed on purpose, and materializing it is the entire point of a
+/// startup-recovery or migration fixture. `.kin-session` is transient run state
+/// wherever it sits, so it stays reserved at every depth.
+///
+/// Authority is what keeps the deeper case honest rather than trusting the
+/// path: kin-db admits a nested control directory only where the tree tracks
+/// it, so one that reaches here below the root was admitted deliberately. Until
+/// that kin-db lands, no such path can be in a graph this reads, and this is
+/// inert.
+fn is_control_plane_component(component: &str) -> bool {
     if component.eq_ignore_ascii_case(".git")
         || component.eq_ignore_ascii_case(".kin")
         || component.eq_ignore_ascii_case(".kin-session")
     {
         return true;
     }
-
     let key = projection_component_comparison_key(component);
     matches!(key.as_str(), ".git" | ".kin" | ".kin-session")
+}
+
+fn is_run_marker_component(component: &str) -> bool {
+    component.eq_ignore_ascii_case(".kin-session")
+        || projection_component_comparison_key(component) == ".kin-session"
+}
+
+fn is_reserved_source_component(index: usize, component: &str) -> bool {
+    if !is_control_plane_component(component) {
+        return false;
+    }
+    is_run_marker_component(component) || index == 0
 }
 
 fn validate_portable_source_path(path: &str) -> Result<Vec<&str>> {
@@ -12161,11 +12188,11 @@ fn validate_portable_source_path(path: &str) -> Result<Vec<&str>> {
         )));
     }
     let components: Vec<_> = path.split('/').collect();
-    if components.iter().any(|component| {
+    if components.iter().enumerate().any(|(index, component)| {
         component.is_empty()
             || component.len() > 255
             || matches!(*component, "." | "..")
-            || is_reserved_source_component(component)
+            || is_reserved_source_component(index, component)
             || !is_safe_windows_source_component(component)
     }) {
         return Err(KinError::Other(format!(
@@ -12187,11 +12214,11 @@ fn validate_source_path(path: &str) -> Result<Vec<&str>> {
         )));
     }
     let components: Vec<_> = path.split('/').collect();
-    if components.iter().any(|component| {
+    if components.iter().enumerate().any(|(index, component)| {
         component.is_empty()
             || component.len() > 255
             || matches!(*component, "." | "..")
-            || is_reserved_source_component(component)
+            || is_reserved_source_component(index, component)
             || cfg!(windows) && !is_safe_windows_source_component(component)
     }) {
         return Err(KinError::Other(format!(
@@ -12295,7 +12322,7 @@ fn validate_source_symlink_target_with_windows_rules(
                     )));
                 }
             }
-            component if is_reserved_source_component(component) => {
+            component if is_control_plane_component(component) => {
                 return Err(KinError::Other(format!(
                     "source symlink targets reserved control-plane path {target:?}"
                 )))
@@ -12314,7 +12341,7 @@ fn validate_source_symlink_target_with_windows_rules(
     }
     if resolved
         .iter()
-        .any(|component| is_reserved_source_component(component))
+        .any(|component| is_control_plane_component(component))
     {
         return Err(KinError::Other(format!(
             "source symlink targets reserved control-plane path {target:?}"
@@ -13349,12 +13376,33 @@ mod tests {
         );
     }
 
+    /// A Unicode case alias cannot reach a reserved name, and position decides
+    /// which names are reserved where.
+    ///
+    /// The alias half is the original guard: `.g\u{131}t` is a dotless i and
+    /// `.\u{212a}in` a Kelvin sign, and both fold onto a reserved name through
+    /// `projection_component_comparison_key`. The position half is FIR-3527: a
+    /// control directory is the repository's own only at component zero, a run
+    /// marker is reserved wherever it sits, and both must stay true of the
+    /// aliases too or the alias path becomes the way around the new boundary.
     #[test]
     fn unicode_case_aliases_cannot_target_reserved_control_plane_paths() {
-        for component in [".g\u{131}t", ".\u{212a}in", ".\u{212a}in-session"] {
+        for component in [".g\u{131}t", ".\u{212a}in"] {
             assert!(
-                is_reserved_source_component(component),
-                "Unicode alias of a reserved component was accepted: {component:?}"
+                is_reserved_source_component(0, component),
+                "Unicode alias of the repository's own control directory was accepted: \
+                 {component:?}"
+            );
+            assert!(
+                !is_reserved_source_component(1, component),
+                "a control directory below the repository root is content, alias or not: \
+                 {component:?}"
+            );
+        }
+        for index in [0, 1, 7] {
+            assert!(
+                is_reserved_source_component(index, ".\u{212a}in-session"),
+                "Unicode alias of a run marker was accepted at index {index}"
             );
         }
     }
@@ -17039,5 +17087,160 @@ mod tests {
             std::fs::read(outside.join("delete.txt")).unwrap(),
             b"outside sentinel"
         );
+    }
+
+    /// FIR-3527. A control directory a tree TRACKS is content, so projection
+    /// must be able to materialize it, and the repository's own must stay
+    /// unwritable.
+    ///
+    /// kin's own repository tracks two of these as startup-recovery fixtures,
+    /// and a fixture whose whole purpose is to be opened as a store is useless
+    /// if `kin checkout` cannot write it. The reason this is safe to relax is
+    /// upstream and not here: kin-db admits a nested control directory only
+    /// where the tree tracks it, so a graph path reaching this validator below
+    /// the root was admitted deliberately.
+    ///
+    /// Both halves matter. Without the refusing arm this reads as "stop
+    /// reserving `.kin`", which would let a projection write over the store
+    /// that owns it.
+    #[test]
+    fn projection_materializes_a_nested_control_directory_and_never_the_repositorys_own() {
+        for path in [
+            "scripts/release-proof/startup-recovery/fixtures/legacy-fixed/.kin/config.toml",
+            "scripts/release-proof/startup-recovery/fixtures/recorded-fixed/.kin/manifest.json",
+            "fixtures/nested/.KIN/config.toml",
+            "fixtures/nested/.git/config",
+        ] {
+            validate_source_paths([&repo_path(path)])
+                .unwrap_or_else(|error| panic!("{path} must be projectable: {error}"));
+        }
+
+        for path in [
+            ".kin/config.toml",
+            ".KIN/config.toml",
+            ".git/config",
+            ".kin-session/state.json",
+            "nested/.kin-session/state.json",
+        ] {
+            let error = validate_source_paths([&repo_path(path)])
+                .expect_err(&format!("{path} must stay unprojectable"));
+            assert!(
+                error.to_string().contains("unsafe graph-owned source path"),
+                "{path} must be refused as an unsafe source path, got: {error}"
+            );
+        }
+    }
+
+    /// The same boundary on the portable validator, which grades an archive
+    /// that will be extracted on a host this one is not.
+    #[test]
+    fn the_portable_validator_draws_the_same_line() {
+        validate_portable_source_paths(["fixtures/legacy-fixed/.kin/config.toml"])
+            .expect("a nested control directory must survive a portable archive");
+        for path in [
+            ".kin/config.toml",
+            ".git/config",
+            "nested/.kin-session/state.json",
+        ] {
+            assert!(
+                validate_portable_source_paths([path]).is_err(),
+                "{path} must stay out of a portable archive"
+            );
+        }
+    }
+
+    /// A SYMLINK TARGET STAYS OUT OF EVERY CONTROL DIRECTORY, including one a
+    /// file path may now be materialized into. The asymmetry is deliberate.
+    ///
+    /// A file path is bounded by the tree: it is in the graph because authority
+    /// admitted it, and authority admits a nested control directory only where
+    /// the tree TRACKS it, so materializing one writes bytes the repository
+    /// owns. A symlink target is bounded by nothing. It is validated for shape
+    /// and never against the tree, so a tracked link may name any path at all,
+    /// including one inside a live nested store that nothing tracks. Following
+    /// it on the host then reaches that store's internals.
+    ///
+    /// So the file rule moved and the link rule did not. The first pair below
+    /// is the whole point: the same path, admitted as a file and refused as a
+    /// link target.
+    ///
+    /// This was found by running the full kin-core suite rather than the six
+    /// tests this change added. A position-aware link rule passed all six and
+    /// failed `materialization_rejects_escaping_or_reserved_symlink_targets`,
+    /// which has guarded `dir/link -> .kin/config` since before this change.
+    #[test]
+    fn a_symlink_target_stays_out_of_every_control_directory_a_file_may_reach() {
+        let fixture = "fixtures/legacy-fixed/.kin/config.toml";
+        validate_source_paths([&repo_path(fixture)])
+            .expect("as a file path, a tracked nested control directory is content");
+        let error = validate_source_entry(
+            &repo_path("fixtures/link"),
+            symlink(),
+            b"legacy-fixed/.kin/config.toml",
+        )
+        .expect_err("as a link target, the same path is still refused");
+        assert!(
+            error.to_string().contains("reserved control-plane path"),
+            "the refusal must name the control plane: {error}"
+        );
+
+        for (path, target) in [
+            // The repository's own, directly and by walking back with `..`.
+            ("link", ".kin/config.toml".as_bytes()),
+            ("fixtures/nested/link", "../../.kin/config.toml".as_bytes()),
+            (
+                "fixtures/nested/deeper/link",
+                "../../../.git/config".as_bytes(),
+            ),
+            // Entering the repository's own control directory and leaving
+            // again, which resolves to something innocent.
+            ("link", ".kin/../compose.yaml".as_bytes()),
+            // A run marker, wherever it sits.
+            ("fixtures/link", "nested/.kin-session/state.json".as_bytes()),
+            // Entering a NESTED control directory and leaving again. Only the
+            // per-component check in the loop can see this one: the resolved
+            // target is `fixtures/compose.yaml`, which is innocent, so the
+            // check on the fully resolved path finds nothing. It is refused
+            // because a symlink traversing a control directory follows it on
+            // the host, whatever the tree thinks of the directory.
+            (
+                "fixtures/link",
+                "legacy-fixed/.kin/../compose.yaml".as_bytes(),
+            ),
+        ] {
+            assert!(
+                validate_source_entry(&repo_path(path), symlink(), target).is_err(),
+                "link {path} -> {} must be refused",
+                String::from_utf8_lossy(target)
+            );
+        }
+
+        // A link that LIVES inside a nested control directory, with a target
+        // that is innocent on its own. The loop never sees those components,
+        // because they are inherited from the link's own path rather than
+        // pushed by the target, and that path now validates as a file path. So
+        // only the check on the fully resolved target catches this one, which
+        // is why that check is still here.
+        assert!(
+            validate_source_entry(
+                &repo_path("fixtures/legacy-fixed/.kin/link"),
+                symlink(),
+                b"config.toml"
+            )
+            .is_err(),
+            "a symlink inside a nested control directory must be refused"
+        );
+        validate_source_paths([&repo_path("fixtures/legacy-fixed/.kin/link")])
+            .expect("and the same path as a file is content, which is what makes it reachable");
+
+        // The control for all of it: an ordinary relative target still works,
+        // so this is a rule about control paths and not a validator that
+        // refuses every symlink.
+        validate_source_entry(
+            &repo_path("fixtures/link"),
+            symlink(),
+            b"legacy-fixed/sentinel.py",
+        )
+        .expect("an ordinary relative target must stay valid");
     }
 }
