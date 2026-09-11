@@ -1,0 +1,5 @@
+# Pinned so local toolchains match CI exactly. Bump DELIBERATELY together with
+# the CI clippy gate (see .github/workflows/ci.yml) — never by @stable drift.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

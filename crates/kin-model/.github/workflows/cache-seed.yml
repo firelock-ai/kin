@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Cache Seed
+
+# An Actions cache entry is readable from the ref that wrote it and from the
+# default branch, and from nowhere else. A pull request run and a merge-queue
+# run cannot see each other's entries, so `refs/heads/main` is the only scope
+# every build can restore from. CI used to write that scope as a side effect of
+# running on push to main. That run was removed as a duplicate test pass, which
+# left nothing writing it, and once the last main entry ages out at seven days
+# every pull request and every queue build compiles the dependency graph cold.
+#
+# This workflow exists only to keep that scope alive. It is not a gate: it
+# restores and re-saves the key `ci.yml` restores, warms it with a dependency
+# build, and does nothing else. No formatting, no lint, no tests. A failure here
+# means a slower build rather than a bad commit, which is why the warm step
+# cannot fail the job.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One seed per commit is pointless when several land together, and the newest
+# tree is the one worth caching, so a newer push supersedes an older seed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  seed:
+    name: Seed the default-branch cargo cache
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # Both platforms `ci.yml` gates on. Each writes its own `runner.os` key,
+      # so seeding one would leave the other cold.
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      # Paths, key and restore-keys are copied verbatim from the `Check & Test`
+      # job in `ci.yml` and have to stay identical to it. A seed written under
+      # any other key produces an entry nothing restores, and the only symptom
+      # is a cold build, so nothing reports it. Restoring also refreshes the
+      # entry, which is what resets the seven-day eviction clock in the common
+      # case where the lockfile has not moved.
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Dependencies and workspace libraries only. `--all-targets` is left off
+      # on purpose, so test and bench targets are not compiled and nothing is
+      # run. RUSTFLAGS above matches `ci.yml` because cargo fingerprints every
+      # unit on it, and a seed built under different flags fills the cache with
+      # artifacts CI would rebuild anyway.
+      - name: Warm the dependency build
+        continue-on-error: true
+        run: |
+          cargo fetch
+          cargo build
