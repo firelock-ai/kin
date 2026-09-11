@@ -12649,7 +12649,7 @@ mod tests {
         assert!(
             reported
                 .detail
-                .contains("killed by the memory limit 4 time(s) since 01:12Z"),
+                .contains("killed by the memory limit 4 time(s) since 1970-01-01 01:12Z"),
             "{}",
             reported.detail
         );

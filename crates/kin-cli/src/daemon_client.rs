@@ -13191,9 +13191,11 @@ mod tests {
             "lsp sweep status",
             Some(dir.path()),
         );
+        // The record proves the daemon ended without retiring; with no signal
+        // observed it does not prove a kill, so that is the word it may not use.
         assert!(
-            killed.contains("killed"),
-            "the daemon died and the message has to say so: {killed}"
+            killed.contains("without retiring its serving record"),
+            "the daemon ended and the message has to say so: {killed}"
         );
         assert!(
             !killed.contains("idle window, so re-run"),

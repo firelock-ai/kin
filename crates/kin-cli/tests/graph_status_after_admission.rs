@@ -266,7 +266,7 @@ fn graph_status_reports_a_daemon_this_store_lost_to_the_memory_limit() {
     let after = graph_status_at(&admitted.binding, &graph, Some(admitted.layout.root()));
     let rendered = after.lines.join("\n");
     assert!(
-        rendered.contains("killed by the memory limit 4 time(s) since 01:12Z"),
+        rendered.contains("killed by the memory limit 4 time(s) since 1970-01-01 01:12Z"),
         "the store's own record belongs on the page a reader is already on: {rendered}"
     );
     assert!(
