@@ -27,10 +27,12 @@ use kin_db::{RepositoryAuthorityManager, StorageBackend};
 use kin_model::{AuthorId, RefName, RepositoryId, RootBundle, SemanticChange, SemanticChangeId};
 use serde::{Deserialize, Serialize};
 
+use crate::collaboration_transfer::{CollaborationTransfer, ReviewDomain};
 use crate::repository_transfer::{
-    apply_repository_transfer_pack_with_pre_commit, build_repository_transfer_segment,
-    count_repository_transfer_packs, model, repository_transfer_status,
-    require_negotiated_features, validate_limits, verify_transfer_source_readiness,
+    apply_repository_transfer_pack_with_pre_commit, build_collaboration_transfer_pack,
+    build_repository_transfer_segment, count_repository_transfer_packs, model, pack_moves_history,
+    peer_exchanges_collaboration, repository_transfer_status, require_negotiated_features,
+    validate_limits, validate_pack, verify_transfer_source_readiness, with_collaboration,
     RepositoryAuthorityMetadata, RepositoryRefAdvertisement, RepositoryTransferError,
     RepositoryTransferExpectation, RepositoryTransferLimits, RepositoryTransferPack,
     RepositoryTransferReceipt, RepositoryTransferStatus, Result, REPOSITORY_TRANSFER_PROTOCOL,
@@ -113,13 +115,32 @@ pub struct RepositoryTransferOutcome {
     /// One receipt per published pack, in publication order. Empty exactly
     /// when the plan was [`RepositoryTransferPlan::UpToDate`].
     pub receipts: Vec<RepositoryTransferReceipt>,
+    /// What the review phase did once the ref phase above was done. Its
+    /// receipt, when it published one, is here rather than in `receipts`,
+    /// because it moved no history.
+    ///
+    /// Absent in an outcome from a daemon that predates the review phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration: Option<CollaborationTransfer>,
 }
 
 impl RepositoryTransferOutcome {
     /// True when this negotiation published at least one repository
-    /// transaction.
+    /// transaction that moved history.
     pub fn moved_history(&self) -> bool {
         !self.receipts.is_empty()
+    }
+
+    /// True when the review phase published review records on the receiving
+    /// replica.
+    pub fn carried_review_records(&self) -> bool {
+        matches!(
+            self.collaboration,
+            Some(CollaborationTransfer::Exchanged {
+                receipt: Some(_),
+                ..
+            })
+        )
     }
 
     /// The receipt for the pack that landed the transfer's final head.
@@ -709,6 +730,15 @@ where
             &expectation,
             source_hydration_semantics,
         )?;
+        // A segment with no changes is the answer to a review export, which the
+        // ref phase never asks for: this replica's ref moved back under the
+        // negotiation until it no longer leads the remote's.
+        if segment.pack.changes.is_empty() {
+            return Err(conflict(format!(
+                "local authority moved during negotiation: {source_ref} no longer leads the \
+                 remote's {destination_ref}"
+            )));
+        }
         if segment.pack.transfer_target_head != source_head {
             return Err(conflict(format!(
                 "local authority moved during negotiation: planned head {source_head}, packed transfer toward {}",
@@ -743,6 +773,14 @@ where
         },
         (_, plan) => plan,
     };
+    let collaboration = push_review_records(
+        local,
+        transport,
+        repository_id,
+        source_ref,
+        destination_ref,
+        source_hydration_semantics,
+    );
     Ok(RepositoryTransferOutcome {
         direction: RepositoryTransferDirection::Push,
         repository_id: repository_id.clone(),
@@ -750,7 +788,262 @@ where
         destination_ref: destination_ref.clone(),
         plan,
         receipts,
+        collaboration: Some(collaboration),
     })
+}
+
+/// Carry this replica's review records to the remote once the ref phase has
+/// brought both replicas to one head.
+///
+/// The remote's records are read first and merged against this replica's, so
+/// the pack carries only what the remote lacks and never a record that would
+/// replace one the remote decided; the remote's admission enforces the same
+/// rule against its own lease. A lease that moves between the export and the
+/// publication is retried once, from a fresh export. The ref phase has already
+/// published by now, so a review phase that cannot complete is reported in the
+/// outcome rather than raised.
+fn push_review_records<B, T>(
+    local: &RepositoryAuthorityManager<B>,
+    transport: &T,
+    repository_id: &RepositoryId,
+    source_ref: &RefName,
+    destination_ref: &RefName,
+    source_hydration_semantics: Option<u32>,
+) -> CollaborationTransfer
+where
+    B: StorageBackend + ?Sized + 'static,
+    T: RepositoryTransferTransport + ?Sized,
+{
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match try_push_review_records(
+            local,
+            transport,
+            repository_id,
+            source_ref,
+            destination_ref,
+            source_hydration_semantics,
+        ) {
+            Ok(transfer) => return transfer,
+            Err(RepositoryTransferError::Conflict(_)) if attempts == 1 => {}
+            Err(error) => {
+                return CollaborationTransfer::Refused {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+}
+
+fn try_push_review_records<B, T>(
+    local: &RepositoryAuthorityManager<B>,
+    transport: &T,
+    repository_id: &RepositoryId,
+    source_ref: &RefName,
+    destination_ref: &RefName,
+    source_hydration_semantics: Option<u32>,
+) -> Result<CollaborationTransfer>
+where
+    B: StorageBackend + ?Sized + 'static,
+    T: RepositoryTransferTransport + ?Sized,
+{
+    // The remote's lease comes first, so a record it admits after this read
+    // moves the roots the publication below is checked against.
+    let remote = negotiated_destination_lease(transport, repository_id, destination_ref)?;
+    if !peer_exchanges_collaboration(&remote.supported_features) {
+        let held = ReviewDomain::from_snapshot(local.read_authority().snapshot());
+        return Ok(CollaborationTransfer::PeerUnsupported {
+            local_records: Some(held.record_count()),
+        });
+    }
+    let own = RepositoryTransferExpectation::try_from(repository_transfer_status(
+        local,
+        repository_id,
+        source_ref,
+    )?)?;
+    if own.roots.collaboration == remote.roots.collaboration {
+        return Ok(CollaborationTransfer::InSync);
+    }
+    let exported = transport.export_pack(repository_id, destination_ref, &own)?;
+    let theirs = exported_review_domain(&exported, &own)?;
+    let merge = ReviewDomain::from_snapshot(local.read_authority().snapshot())
+        .merge_into(&theirs, RepositoryTransferDirection::Push);
+    let Some(records) = merge.delta else {
+        return Ok(CollaborationTransfer::Exchanged {
+            carried: 0,
+            gaps: merge.gaps,
+            receipt: None,
+        });
+    };
+    let carried = records.record_count();
+    let pack = build_collaboration_transfer_pack(
+        local,
+        source_ref,
+        &remote,
+        source_hydration_semantics,
+        records,
+    )?;
+    let receipt = transport.receive_pack(repository_id, destination_ref, &pack)?;
+    verify_receipt_binds_pack(&pack, &receipt).map_err(|error| {
+        invalid(format!(
+            "the remote answered its review records with a receipt that does not bind them: {error}"
+        ))
+    })?;
+    Ok(CollaborationTransfer::Exchanged {
+        carried,
+        gaps: merge.gaps,
+        receipt: Some(receipt),
+    })
+}
+
+/// Pull the remote's review records into this replica once the ref phase has
+/// brought both replicas to one head.
+///
+/// This replica is the holder here, so the remote's export is merged against
+/// this replica's own records and only the merge is admitted, through the
+/// caller's `admit` like every other pack of the pull. Admission checks it
+/// against this replica's lease, which is read before the merge, and a lease
+/// that moves in between is retried once from a fresh export.
+fn pull_review_records<B, T, A>(
+    local: &RepositoryAuthorityManager<B>,
+    transport: &T,
+    repository_id: &RepositoryId,
+    source_ref: &RefName,
+    destination_ref: &RefName,
+    admit: &mut A,
+) -> CollaborationTransfer
+where
+    B: StorageBackend + ?Sized + 'static,
+    T: RepositoryTransferTransport + ?Sized,
+    A: FnMut(&RepositoryTransferPack) -> Result<RepositoryTransferReceipt>,
+{
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match try_pull_review_records(
+            local,
+            transport,
+            repository_id,
+            source_ref,
+            destination_ref,
+            admit,
+        ) {
+            Ok(transfer) => return transfer,
+            Err(RepositoryTransferError::Conflict(_)) if attempts == 1 => {}
+            Err(error) => {
+                return CollaborationTransfer::Refused {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+}
+
+fn try_pull_review_records<B, T, A>(
+    local: &RepositoryAuthorityManager<B>,
+    transport: &T,
+    repository_id: &RepositoryId,
+    source_ref: &RefName,
+    destination_ref: &RefName,
+    admit: &mut A,
+) -> Result<CollaborationTransfer>
+where
+    B: StorageBackend + ?Sized + 'static,
+    T: RepositoryTransferTransport + ?Sized,
+    A: FnMut(&RepositoryTransferPack) -> Result<RepositoryTransferReceipt>,
+{
+    let advertisement = read_ref_advertisement(transport, repository_id)?;
+    if !peer_exchanges_collaboration(&advertisement.supported_features) {
+        return Ok(CollaborationTransfer::PeerUnsupported {
+            local_records: None,
+        });
+    }
+    // This replica's lease comes first, so a record admitted here after this
+    // read moves the roots the admission below is checked against, rather than
+    // being overwritten by a merge that never saw it.
+    let status = repository_transfer_status(local, repository_id, destination_ref)?;
+    if status.destination_head.is_none() {
+        return Ok(CollaborationTransfer::Skipped {
+            reason: format!(
+                "this replica publishes no {destination_ref} yet, and review records travel only \
+                 between replicas at one published head"
+            ),
+        });
+    }
+    if status.roots.collaboration == advertisement.roots.collaboration {
+        return Ok(CollaborationTransfer::InSync);
+    }
+    let lease = RepositoryTransferExpectation::try_from(status)?;
+    let exported = transport.export_pack(repository_id, source_ref, &lease)?;
+    let theirs = exported_review_domain(&exported, &lease)?;
+    let merge = theirs.merge_into(
+        &ReviewDomain::from_snapshot(local.read_authority().snapshot()),
+        RepositoryTransferDirection::Pull,
+    );
+    let Some(records) = merge.delta else {
+        return Ok(CollaborationTransfer::Exchanged {
+            carried: 0,
+            gaps: merge.gaps,
+            receipt: None,
+        });
+    };
+    let carried = records.record_count();
+    let pack = with_collaboration(exported, records, &lease.limits)?;
+    let receipt = admit(&pack)?;
+    verify_receipt_binds_pack(&pack, &receipt).map_err(|error| {
+        invalid(format!(
+            "admitting the remote's review records returned a receipt that does not bind them: \
+             {error}"
+        ))
+    })?;
+    Ok(CollaborationTransfer::Exchanged {
+        carried,
+        gaps: merge.gaps,
+        receipt: Some(receipt),
+    })
+}
+
+/// The peer's review domain, from the pack its export answered a review request
+/// with.
+///
+/// The answer has to move no history. An export that found history to send
+/// means the peer's ref moved after the ref phase, and review records travel
+/// only between replicas at one head.
+fn exported_review_domain(
+    pack: &RepositoryTransferPack,
+    requested: &RepositoryTransferExpectation,
+) -> Result<ReviewDomain> {
+    require_protocol(pack.schema_version, &pack.protocol, "review export")?;
+    require_same_repository(
+        &requested.repository_id,
+        &pack.repository_id,
+        "review export",
+    )?;
+    if pack.destination_ref != requested.destination_ref {
+        return Err(invalid(format!(
+            "remote answered a review export for ref {} but this replica asked about {}",
+            pack.destination_ref, requested.destination_ref
+        )));
+    }
+    if pack_moves_history(pack) {
+        return Err(conflict(format!(
+            "the remote's {} moved after the ref phase, so its review export carries history \
+             instead of review records",
+            pack.source_ref
+        )));
+    }
+    if pack.expected_destination_roots != requested.roots {
+        return Err(conflict(
+            "the remote answered a review export against a lease this replica did not send",
+        ));
+    }
+    validate_pack(pack, &requested.limits)?;
+    Ok(pack
+        .collaboration
+        .as_ref()
+        .map(ReviewDomain::from_delta)
+        .unwrap_or_default())
 }
 
 /// What a pull negotiation produced, before anything is admitted locally.
@@ -914,7 +1207,9 @@ where
 /// packs itself, so that publication and the refresh of everything derived from
 /// it stay on one path. `admit` is that step. It is called once per pack, in
 /// order, and this function verifies each returned receipt binds the pack it
-/// was given before asking for the next one.
+/// was given before asking for the next one. After the ref phase it is called
+/// once more when the remote holds review records this replica lacks, with a
+/// pack that carries them and moves no history.
 ///
 /// A remote gap larger than one negotiated envelope arrives as several packs.
 /// Each is admitted and receipted on its own; see [`RepositoryTransferOutcome`]
@@ -935,6 +1230,7 @@ where
     let mut receipts = Vec::new();
     let mut originally_at = None;
     let mut admitted_changes = 0usize;
+    let mut up_to_date = None;
 
     loop {
         let negotiation =
@@ -942,14 +1238,7 @@ where
         let pack = match negotiation {
             PullNegotiation::UpToDate { head: current } => {
                 if receipts.is_empty() {
-                    return Ok(RepositoryTransferOutcome {
-                        direction: RepositoryTransferDirection::Pull,
-                        repository_id: repository_id.clone(),
-                        source_ref: source_ref.clone(),
-                        destination_ref: destination_ref.clone(),
-                        plan: RepositoryTransferPlan::UpToDate { head: current },
-                        receipts,
-                    });
+                    up_to_date = Some(current);
                 }
                 break;
             }
@@ -971,23 +1260,40 @@ where
         }
     }
 
-    // The head this pull admitted is the one the last receipt was verified to
-    // bind, not a head tracked alongside it.
-    let source_head = receipts
-        .last()
-        .map(|receipt| receipt.destination_head)
-        .ok_or_else(|| invalid("a pull that moved history produces at least one receipt"))?;
+    let plan = match up_to_date {
+        Some(head) => RepositoryTransferPlan::UpToDate { head },
+        None => {
+            // The head this pull admitted is the one the last receipt was
+            // verified to bind, not a head tracked alongside it.
+            let source_head = receipts
+                .last()
+                .map(|receipt| receipt.destination_head)
+                .ok_or_else(|| {
+                    invalid("a pull that moved history produces at least one receipt")
+                })?;
+            RepositoryTransferPlan::FastForward {
+                source_head,
+                destination_head: originally_at,
+                change_count: Some(admitted_changes),
+            }
+        }
+    };
+    let collaboration = pull_review_records(
+        local,
+        transport,
+        repository_id,
+        source_ref,
+        destination_ref,
+        &mut admit,
+    );
     Ok(RepositoryTransferOutcome {
         direction: RepositoryTransferDirection::Pull,
         repository_id: repository_id.clone(),
         source_ref: source_ref.clone(),
         destination_ref: destination_ref.clone(),
-        plan: RepositoryTransferPlan::FastForward {
-            source_head,
-            destination_head: originally_at,
-            change_count: Some(admitted_changes),
-        },
+        plan,
         receipts,
+        collaboration: Some(collaboration),
     })
 }
 
@@ -1008,8 +1314,12 @@ mod tests {
     use uuid::Uuid;
 
     use crate::repository_transfer::{
-        repository_ref_advertisement, RepositoryTransferApplyOutcome,
+        repository_ref_advertisement, RepositoryTransferApplyOutcome, FEATURE_COLLABORATION,
     };
+    use kin_model::review::{
+        Review, ReviewCompletionState, ReviewDecision, ReviewDecisionState, ReviewId,
+    };
+    use kin_model::{CollaborationDelta, IdentityRef, Keyed};
 
     use super::*;
 
@@ -1168,8 +1478,13 @@ mod tests {
         /// Publish no default ref, to prove a clone refuses rather than
         /// synthesizing a ref the remote does not publish.
         strip_default_ref: bool,
+        /// Advertise no `collaboration-v1`, as every peer that predates the
+        /// review phase does.
+        strip_collaboration: bool,
         exported: RefCell<usize>,
         received: RefCell<usize>,
+        /// Every pack this peer was asked to publish, in order.
+        received_packs: RefCell<Vec<RepositoryTransferPack>>,
     }
 
     impl<'a> LocalPeer<'a> {
@@ -1183,8 +1498,10 @@ mod tests {
                 advertised_max_changes: None,
                 advertised_max_trees: None,
                 strip_default_ref: false,
+                strip_collaboration: false,
                 exported: RefCell::new(0),
                 received: RefCell::new(0),
+                received_packs: RefCell::new(Vec::new()),
             }
         }
 
@@ -1229,6 +1546,13 @@ mod tests {
                 ..Self::new(authority)
             }
         }
+
+        fn without_collaboration(authority: &'a TestManager) -> Self {
+            Self {
+                strip_collaboration: true,
+                ..Self::new(authority)
+            }
+        }
     }
 
     impl RepositoryTransferTransport for LocalPeer<'_> {
@@ -1242,6 +1566,11 @@ mod tests {
             }
             if self.strip_default_ref {
                 advertisement.default_ref = None;
+            }
+            if self.strip_collaboration {
+                advertisement
+                    .supported_features
+                    .retain(|feature| feature != FEATURE_COLLABORATION);
             }
             Ok(advertisement)
         }
@@ -1264,6 +1593,11 @@ mod tests {
             }
             if let Some(max_trees) = self.advertised_max_trees {
                 status.limits.max_trees = max_trees;
+            }
+            if self.strip_collaboration {
+                status
+                    .supported_features
+                    .retain(|feature| feature != FEATURE_COLLABORATION);
             }
             Ok(status)
         }
@@ -1295,6 +1629,7 @@ mod tests {
             pack: &RepositoryTransferPack,
         ) -> Result<RepositoryTransferReceipt> {
             *self.received.borrow_mut() += 1;
+            self.received_packs.borrow_mut().push(pack.clone());
             let mut receipt = apply_repository_transfer_pack(
                 self.authority,
                 repository_id,
@@ -1361,6 +1696,381 @@ mod tests {
         let lease = manager.read_authority();
         let target = lease.resolve_ref_target(ref_name).unwrap()?;
         Some(lease.resolve_target_change_id(&target).unwrap())
+    }
+
+    fn review_record(title: &str) -> Review {
+        Review {
+            review_id: ReviewId::new(),
+            title: title.to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "feature/reviews".to_string(),
+            state: ReviewDecisionState::Pending,
+            completion: ReviewCompletionState::InReview,
+            created_by: IdentityRef::human("troy"),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            scopes: vec![],
+        }
+    }
+
+    fn decision(reviewer: &str, state: ReviewDecisionState) -> ReviewDecision {
+        ReviewDecision {
+            reviewer: IdentityRef::human(reviewer),
+            state,
+            comment: None,
+            decided_at: Timestamp::now(),
+        }
+    }
+
+    /// Commit review records into `manager` the way the daemon's review writer
+    /// does: one transaction whose only mutation they are.
+    fn record_reviews(
+        manager: &TestManager,
+        repository_id: &RepositoryId,
+        operation: u128,
+        reviews: Vec<(Review, Vec<ReviewDecision>)>,
+    ) {
+        let records = CollaborationDelta {
+            review_decisions: reviews
+                .iter()
+                .filter(|(_, decisions)| !decisions.is_empty())
+                .map(|(review, decisions)| Keyed::new(review.review_id, decisions.clone()))
+                .collect(),
+            reviews: reviews
+                .into_iter()
+                .map(|(review, _)| Keyed::new(review.review_id, review))
+                .collect(),
+            ..CollaborationDelta::default()
+        };
+        // The one canonical order kin-model admits, as an export produces it.
+        let records = ReviewDomain::from_delta(&records).to_delta().unwrap();
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::from_u128(operation)),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("negotiation-fixture"),
+            reason: "record review state".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: Some(records),
+        };
+        drop(lease);
+        manager.commit_repository_transaction(transaction).unwrap();
+    }
+
+    fn reviews_of(manager: &TestManager) -> HashMap<ReviewId, Review> {
+        manager.read_authority().snapshot().reviews.clone()
+    }
+
+    fn push(fixture: &Fixture, peer: &LocalPeer<'_>) -> RepositoryTransferOutcome {
+        push_to_remote(
+            &fixture.source,
+            peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Review records follow the history a push publishes, and a second push
+    /// finds the two replicas' collaboration roots equal and sends nothing.
+    ///
+    /// Falsify by dropping the roots comparison from the push's review phase:
+    /// the second push then exports and merges, and the `InSync` assertion
+    /// goes red.
+    #[test]
+    fn a_push_carries_review_records_and_a_repush_carries_nothing() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.destination);
+        record_reviews(
+            &fixture.source,
+            &fixture.repository_id,
+            100,
+            vec![
+                (review_record("carry me"), vec![]),
+                (
+                    review_record("and my decision"),
+                    vec![decision("alice", ReviewDecisionState::Approved)],
+                ),
+            ],
+        );
+
+        let outcome = push(&fixture, &peer);
+        assert!(outcome.moved_history(), "the history moves first");
+        match &outcome.collaboration {
+            Some(CollaborationTransfer::Exchanged {
+                carried,
+                gaps,
+                receipt: Some(_),
+            }) => {
+                assert_eq!(*carried, 3, "two reviews and one decision history");
+                assert!(gaps.is_empty(), "{gaps:?}");
+            }
+            other => panic!("review records must travel with the push: {other:?}"),
+        }
+        assert_eq!(
+            reviews_of(&fixture.destination),
+            reviews_of(&fixture.source)
+        );
+
+        let sent = peer.received_packs.borrow().len();
+        let again = push(&fixture, &peer);
+        assert_eq!(again.collaboration, Some(CollaborationTransfer::InSync));
+        assert_eq!(
+            peer.received_packs.borrow().len(),
+            sent,
+            "a re-push whose collaboration roots agree sends no pack"
+        );
+    }
+
+    /// A receiver that holds every review record but one is sent exactly that
+    /// record, in a pack that moves no history.
+    ///
+    /// Falsify by sending the whole domain instead of the merge: the pack then
+    /// carries both reviews and the count assertion goes red.
+    #[test]
+    fn a_receiver_missing_one_record_is_sent_exactly_that_record() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.destination);
+        record_reviews(
+            &fixture.source,
+            &fixture.repository_id,
+            100,
+            vec![(review_record("both replicas hold me"), vec![])],
+        );
+        push(&fixture, &peer);
+
+        let missing = review_record("only the source holds me");
+        record_reviews(
+            &fixture.source,
+            &fixture.repository_id,
+            101,
+            vec![(missing.clone(), vec![])],
+        );
+        let outcome = push(&fixture, &peer);
+        assert!(!outcome.moved_history());
+        assert!(
+            matches!(
+                outcome.collaboration,
+                Some(CollaborationTransfer::Exchanged {
+                    carried: 1,
+                    receipt: Some(_),
+                    ..
+                })
+            ),
+            "{:?}",
+            outcome.collaboration
+        );
+        let packs = peer.received_packs.borrow();
+        let last = packs.last().expect("the review phase sent a pack");
+        assert!(last.changes.is_empty(), "a records pack moves no history");
+        let carried = last
+            .collaboration
+            .as_ref()
+            .expect("the last pack carries review records");
+        assert_eq!(carried.record_count(), 1, "{carried:?}");
+        assert_eq!(carried.reviews[0].key, missing.review_id);
+        assert_eq!(reviews_of(&fixture.destination).len(), 2);
+    }
+
+    /// A peer that does not advertise collaboration-v1 gets exactly the
+    /// transfer it always got, and the sender says how many records stayed.
+    ///
+    /// Falsify by skipping the feature check in the push's review phase: it
+    /// then asks the peer for a review export and publishes records to it, and
+    /// the assertions on both go red.
+    #[test]
+    fn a_peer_without_collaboration_gets_a_plain_transfer_and_is_told_what_stayed() {
+        let fixture = fixture();
+        let peer = LocalPeer::without_collaboration(&fixture.destination);
+        record_reviews(
+            &fixture.source,
+            &fixture.repository_id,
+            100,
+            vec![(review_record("stays here"), vec![])],
+        );
+
+        let outcome = push(&fixture, &peer);
+        assert!(outcome.moved_history(), "the history still moves");
+        assert_eq!(
+            outcome.collaboration,
+            Some(CollaborationTransfer::PeerUnsupported {
+                local_records: Some(1)
+            })
+        );
+        assert_eq!(*peer.exported.borrow(), 0, "no review export was asked for");
+        assert!(peer
+            .received_packs
+            .borrow()
+            .iter()
+            .all(|pack| pack.collaboration.is_none()));
+        assert!(reviews_of(&fixture.destination).is_empty());
+    }
+
+    /// A pull brings the remote's review records in after its history, and a
+    /// second pull finds nothing to carry.
+    ///
+    /// Falsify by dropping the review phase from the pull: the first
+    /// collaboration assertion goes red.
+    #[test]
+    fn a_pull_brings_review_records_in_and_a_repull_carries_nothing() {
+        let fixture = fixture();
+        let remote = LocalPeer::new(&fixture.source);
+        let decided = review_record("decided on the remote");
+        record_reviews(
+            &fixture.source,
+            &fixture.repository_id,
+            100,
+            vec![(
+                decided.clone(),
+                vec![decision("bob", ReviewDecisionState::NeedsWork)],
+            )],
+        );
+        let pull = || {
+            pull_from_remote(
+                &fixture.destination,
+                &remote,
+                &fixture.repository_id,
+                &fixture.main,
+                &fixture.main,
+                AuthorId::new("review-puller"),
+            )
+            .unwrap()
+        };
+
+        let outcome = pull();
+        assert!(outcome.moved_history());
+        assert!(
+            matches!(
+                outcome.collaboration,
+                Some(CollaborationTransfer::Exchanged {
+                    carried: 2,
+                    receipt: Some(_),
+                    ..
+                })
+            ),
+            "{:?}",
+            outcome.collaboration
+        );
+        assert_eq!(
+            reviews_of(&fixture.destination),
+            reviews_of(&fixture.source)
+        );
+        assert_eq!(
+            fixture
+                .destination
+                .read_authority()
+                .snapshot()
+                .review_decisions
+                .get(&decided.review_id)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let again = pull();
+        assert_eq!(again.collaboration, Some(CollaborationTransfer::InSync));
+    }
+
+    /// The merge never builds a pack that overwrites a review the receiver
+    /// decided further, and a pack built without the merge is refused where it
+    /// lands, naming the record.
+    ///
+    /// Falsify by removing `admission_refusals` from the receive path: the
+    /// stale review is admitted over the newer one and the refusal assertion
+    /// goes red.
+    #[test]
+    fn a_receiver_refuses_review_records_that_would_overwrite_a_newer_decision() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.destination);
+        let first = decision("alice", ReviewDecisionState::NeedsWork);
+        let mut review = review_record("decided twice on the remote");
+        review.state = ReviewDecisionState::NeedsWork;
+        record_reviews(
+            &fixture.source,
+            &fixture.repository_id,
+            100,
+            vec![(review.clone(), vec![first.clone()])],
+        );
+        push(&fixture, &peer);
+
+        // The remote decides again, and this replica never hears of it.
+        let mut newer = review.clone();
+        newer.state = ReviewDecisionState::Approved;
+        record_reviews(
+            &fixture.destination,
+            &fixture.repository_id,
+            200,
+            vec![(
+                newer,
+                vec![first, decision("bob", ReviewDecisionState::Approved)],
+            )],
+        );
+
+        let outcome = push(&fixture, &peer);
+        assert!(
+            matches!(
+                outcome.collaboration,
+                Some(CollaborationTransfer::Exchanged {
+                    carried: 0,
+                    receipt: None,
+                    ..
+                })
+            ),
+            "the remote's history contains this replica's, so nothing travels: {:?}",
+            outcome.collaboration
+        );
+
+        let lease = RepositoryTransferExpectation::try_from(
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap(),
+        )
+        .unwrap();
+        let unmerged = ReviewDomain::from_snapshot(fixture.source.read_authority().snapshot())
+            .to_delta()
+            .unwrap();
+        let pack = build_collaboration_transfer_pack(
+            &fixture.source,
+            &fixture.main,
+            &lease,
+            None,
+            unmerged,
+        )
+        .unwrap();
+        let message = apply_repository_transfer_pack(
+            &fixture.destination,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("stale-sender"),
+            &pack,
+            &RepositoryTransferLimits::default(),
+        )
+        .expect_err("a pack that would overwrite a newer decision must be refused")
+        .to_string();
+        assert!(
+            message.contains("would overwrite review records"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&review.review_id.to_string()),
+            "the refusal names the record: {message}"
+        );
+        assert_eq!(
+            reviews_of(&fixture.destination)[&review.review_id].state,
+            ReviewDecisionState::Approved
+        );
     }
 
     #[test]
@@ -2851,6 +3561,7 @@ mod tests {
             destination_ref: ref_name.clone(),
             plan: RepositoryTransferPlan::UpToDate { head },
             receipts: Vec::new(),
+            collaboration: None,
         }
     }
 }

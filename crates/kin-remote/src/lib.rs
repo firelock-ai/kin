@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+pub mod collaboration_transfer;
 pub mod connection;
 pub mod delta_bridge;
 pub mod delta_pull;

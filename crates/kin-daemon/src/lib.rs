@@ -153,6 +153,7 @@ mod repository_rename;
 mod repository_rollback;
 mod repository_stash;
 mod repository_tag;
+mod review_transfer;
 mod review_write;
 mod semantic_debt;
 pub mod session_registry;

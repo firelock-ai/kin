@@ -729,6 +729,13 @@ export interface RepositoryTransferPack {
    * record and sends `null`.
    */
   source_hydration_semantics: number | null;
+  /**
+   * Review records this pack carries. Present only on a pack that moves no
+   * history, sent after the ref phase to a peer that advertises the
+   * `collaboration-v1` feature; absent from every other pack, so a pack that
+   * carries none serializes exactly as it did before.
+   */
+  collaboration?: Record<string, unknown>;
 }
 
 export interface RepositoryTransferReceipt {
