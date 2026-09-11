@@ -958,6 +958,27 @@ pub(crate) fn commit_session_workspace_admission(
     })
 }
 
+/// The clause both stale-plan refusals in [`publish_workspace_tree`] end on.
+///
+/// One constant for the refusal and for [`is_stale_plan_refusal`], because the
+/// reconcile loop answers this refusal differently from every other one. It does
+/// not describe the transition; it says the tree the plan was taken from is not
+/// the tree authority holds, so the answer is to bring the graph level with
+/// authority and plan again, never to retry the same plan. A classifier holding
+/// its own copy of this text would stop matching the first time the wording
+/// moved; one reading the constant the refusal is built from cannot.
+pub(crate) const STALE_PLAN_REFUSAL: &str =
+    "exact admission does not replan a stale desired tree against newer authority";
+
+/// Whether `error` is one of [`publish_workspace_tree`]'s stale-plan refusals.
+pub(crate) fn is_stale_plan_refusal(error: &DaemonError) -> bool {
+    matches!(
+        error,
+        DaemonError::Core(kin_core::KinError::Model(ModelError::InvalidOperation(message)))
+            if message.contains(STALE_PLAN_REFUSAL)
+    )
+}
+
 /// Atomically publish one exact graph-owned workspace tree.
 ///
 /// The caller has already performed the explicit filesystem-ingestion scan and
@@ -990,10 +1011,10 @@ pub(crate) fn publish_workspace_tree(
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let lease = authority.read_authority();
     if lease.roots() != &admitted.expected_roots {
-        return Err(invalid(
+        return Err(invalid(format!(
             "repository authority moved after the complete workspace observation was planned; \
-             exact admission does not replan a stale desired tree against newer authority",
-        ));
+             {STALE_PLAN_REFUSAL}"
+        )));
     }
     let workspace = lease
         .metadata()
@@ -1013,11 +1034,10 @@ pub(crate) fn publish_workspace_tree(
         )));
     }
     if workspace.tree != admitted.previous_tree {
-        return Err(invalid(
+        return Err(invalid(format!(
             "the complete workspace observation was planned against a tree that is not this \
-             workspace's authority tree; exact admission does not replan a stale desired tree \
-             against newer authority",
-        ));
+             workspace's authority tree; {STALE_PLAN_REFUSAL}"
+        )));
     }
     if workspace.tree == *desired_tree {
         return Ok(None);
@@ -2997,6 +3017,15 @@ mod tests {
                 .contains("does not replan a stale desired tree against newer authority"),
             "{error}"
         );
+        assert!(
+            super::is_stale_plan_refusal(&error),
+            "the reconcile loop levels the graph on exactly this refusal, so it has to recognize \
+             it: {error}"
+        );
+        assert!(
+            !super::is_stale_plan_refusal(&super::invalid("an unrelated refusal")),
+            "and only it"
+        );
 
         let lease = context.open().unwrap().read_authority();
         let workspace = lease
@@ -3060,6 +3089,7 @@ mod tests {
                 .contains("does not replan a stale desired tree against newer authority"),
             "{error}"
         );
+        assert!(super::is_stale_plan_refusal(&error), "{error}");
     }
 
     #[test]

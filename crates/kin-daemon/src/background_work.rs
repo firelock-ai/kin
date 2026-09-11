@@ -650,6 +650,19 @@ impl RecordedFault {
     }
 }
 
+/// How many dropped relation ids a levelling record names outright.
+const LEVELLED_DROPPED_SAMPLE_LIMIT: usize = 5;
+
+/// A levelling of the live graph with repository authority that landed.
+#[derive(Debug)]
+struct LevelledRecord {
+    generation: u64,
+    paths: u64,
+    dropped_relations: u64,
+    dropped_relations_sample: Vec<String>,
+    at: RecordedFault,
+}
+
 /// Persist the durable last-admission marker after a complete pass succeeded.
 ///
 /// Called beside [`ReconcileProbes::record_admission_success`] rather than from
@@ -829,6 +842,11 @@ struct ReconcileProbesInner {
     /// know nothing about the store's layout. So the loop and the explicit
     /// admission path push what they read, and this is what the surfaces see.
     watcher_loss: Option<WatcherLossState>,
+    /// The last failed attempt to level the live graph with repository
+    /// authority, and how many have failed in a row.
+    authority_split: Option<(RecordedFault, u64)>,
+    /// The most recent levelling that landed.
+    authority_levelled: Option<LevelledRecord>,
 }
 
 /// Host content one complete walk declined to observe at all.
@@ -951,6 +969,9 @@ impl ReconcileProbes {
         // Clearing it here rather than on a timer means the state can only leave
         // the surfaces by being resolved.
         inner.deferred_tree_wedge = None;
+        // The same proof ends a split: an admission that landed was planned
+        // from a tree repository authority accepted.
+        inner.authority_split = None;
     }
 
     /// A commit's deferred tree was left unpublished because the publication
@@ -974,6 +995,50 @@ impl ReconcileProbes {
     /// own transaction carries the tree across.
     pub fn clear_deferred_tree_wedge(&self) {
         self.lock().deferred_tree_wedge = None;
+    }
+
+    /// One attempt to level the live graph with repository authority failed.
+    ///
+    /// Returns the consecutive count including this one, which the surfaces
+    /// compare with `AUTHORITY_SPLIT_WEDGE_ATTEMPTS` to decide whether a
+    /// restart is what clears it.
+    pub fn record_authority_split(&self, error: impl std::fmt::Display, now: Instant) -> u64 {
+        let mut inner = self.lock();
+        let attempts = inner
+            .authority_split
+            .as_ref()
+            .map_or(0, |(_, attempts)| *attempts)
+            .saturating_add(1);
+        inner.authority_split = Some((RecordedFault::new(error.to_string(), now), attempts));
+        attempts
+    }
+
+    /// A levelling landed: the live graph's tree is repository authority's
+    /// again.
+    ///
+    /// Ends the split and records what the levelling did, every dropped
+    /// relation included, because a reader who finds an edge missing needs to
+    /// know it was dropped rather than never written.
+    pub fn record_authority_levelled(
+        &self,
+        generation: u64,
+        paths: u64,
+        dropped_relations: &[String],
+        now: Instant,
+    ) {
+        let mut inner = self.lock();
+        inner.authority_split = None;
+        inner.authority_levelled = Some(LevelledRecord {
+            generation,
+            paths,
+            dropped_relations: dropped_relations.len() as u64,
+            dropped_relations_sample: dropped_relations
+                .iter()
+                .take(LEVELLED_DROPPED_SAMPLE_LIMIT)
+                .cloned()
+                .collect(),
+            at: RecordedFault::new(String::new(), now),
+        });
     }
 
     /// Whether the loop finished a tick still holding work.
@@ -1155,6 +1220,24 @@ impl ReconcileProbes {
                 }
             }),
             watcher_loss: inner.watcher_loss.clone(),
+            authority_split: inner.authority_split.as_ref().map(|(fault, attempts)| {
+                kin_cli::commands::resources::AuthoritySplit {
+                    error: fault.message.clone(),
+                    attempts: *attempts,
+                    age_seconds: age(fault),
+                    at: Some(fault.wall_clock.to_rfc3339()),
+                }
+            }),
+            authority_levelled: inner.authority_levelled.as_ref().map(|record| {
+                kin_cli::commands::resources::AuthorityLevelled {
+                    generation: record.generation,
+                    paths: record.paths,
+                    dropped_relations: record.dropped_relations,
+                    dropped_relations_sample: record.dropped_relations_sample.clone(),
+                    age_seconds: age(&record.at),
+                    at: Some(record.at.wall_clock.to_rfc3339()),
+                }
+            }),
         }
     }
 }
