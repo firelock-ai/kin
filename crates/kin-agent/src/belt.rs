@@ -632,6 +632,19 @@ pub fn unpublished_create(arguments: &Value, reason: &str) -> LocalOutcome {
     ))
 }
 
+/// The outcome of an `edit_file` or `write_file` for which Kin could not open a transaction.
+///
+/// Kin is attached, so the change belongs in the graph, and without a transaction it cannot
+/// get there. Nothing is written: a local write here would be a change on disk the graph
+/// never hears about. The model is told why, in the server's words.
+pub fn unbracketed_refusal(arguments: &Value, reason: &str) -> LocalOutcome {
+    let raw_path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
+    LocalOutcome::error(format!(
+        "`{raw_path}` was not changed: Kin could not open a transaction for this change: \
+         {reason}. Nothing was written, so `{raw_path}` is unchanged on disk and in the graph."
+    ))
+}
+
 impl LocalOutcome {
     /// A refusal the model is handed instead of a run, in the shape a run would have
     /// produced, so a routing failure reads to the caller exactly like a tool failure.
