@@ -1736,7 +1736,32 @@ pub fn handle_trace_path<G: GraphStore>(
     let request = request_from_args(args)?;
     match build_path_response(store, &request) {
         Ok(response) => {
-            let json = serde_json::to_string_pretty(&response).map_err(McpError::Json)?;
+            let mut value = serde_json::to_value(&response).map_err(McpError::Json)?;
+            // A pin named by file keeps working for one more release and says
+            // so. The entity id in `from` or `to` is the spelling that stays.
+            for (parameter, used, replacement) in [
+                (
+                    "from_file",
+                    request.from_file.is_some(),
+                    "the entity id in `from`",
+                ),
+                (
+                    "to_file",
+                    request.to_file.is_some(),
+                    "the entity id in `to`",
+                ),
+            ] {
+                if used {
+                    crate::budget::record_deprecation(
+                        &mut value,
+                        TOOL_NAME,
+                        parameter,
+                        replacement,
+                        crate::budget::DEPRECATION_REMOVED_AFTER,
+                    );
+                }
+            }
+            let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
         Err(PathError::InvalidRequest(message)) => Err(McpError::InvalidParams(message)),
@@ -1849,6 +1874,44 @@ mod tests {
 
     fn names(route: &PathRoute) -> Vec<&str> {
         route.steps.iter().map(|step| step.name.as_str()).collect()
+    }
+
+    /// A pin named by file answers with its deprecation beside the route; the
+    /// same call without the pin carries none.
+    #[test]
+    fn a_file_pin_answers_with_its_deprecation_beside_the_route() {
+        let store = InMemoryGraph::new();
+        let a = function("edit", "src/editor.ts");
+        let b = function("apply", "src/view.ts");
+        seed(&store, &[&a, &b], &[call_at(&a, &b, 2)]);
+        let answer = |args: &HashMap<String, serde_json::Value>| -> serde_json::Value {
+            let result = handle_trace_path(args, &store).expect("the route resolves");
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            serde_json::from_str(text).expect("trace_path answers in JSON")
+        };
+        let mut args = HashMap::from([
+            ("from".to_string(), serde_json::json!("edit")),
+            ("to".to_string(), serde_json::json!("apply")),
+        ]);
+
+        let plain = answer(&args);
+        assert!(
+            plain["routes"]
+                .as_array()
+                .is_some_and(|routes| !routes.is_empty()),
+            "positive control: the route itself answered: {plain}"
+        );
+        assert!(plain.get("deprecations").is_none(), "{plain}");
+
+        args.insert("from_file".to_string(), serde_json::json!("src/editor.ts"));
+        let pinned = answer(&args);
+        assert_eq!(pinned["deprecations"][0]["tool"], TOOL_NAME);
+        assert_eq!(pinned["deprecations"][0]["parameter"], "from_file");
+        assert_eq!(
+            pinned["deprecations"].as_array().map(Vec::len),
+            Some(1),
+            "only the pin that was passed: {pinned}"
+        );
     }
 
     /// A three-link chain answers with the chain, in order, with every hop
