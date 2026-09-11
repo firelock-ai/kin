@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{anyhow, bail, Result};
-use kin_model::{Entity, EntityFilter, EntityId, EntityRevision, GraphStore, SemanticChangeId};
+use std::collections::HashSet;
+
+use anyhow::{anyhow, Result};
+use kin_model::{Entity, EntityId, EntityRevision, GraphStore, SemanticChangeId};
+
+use super::ref_grammar::AuthorityOpen;
+use super::repository_authority::RequestRepositoryAuthority;
+use crate::entity_identity::{EntityPointer, EntityResolution, IdentityQualifiers, PinSpelling};
 
 /// A reference did not resolve through repository-v6 authority.
 #[derive(Debug)]
@@ -83,6 +89,35 @@ fn projection_error(
         resolved: resolved.to_string(),
         reason: reason.to_string(),
     })
+}
+
+/// A query that named no one entity, and the answer that says why.
+///
+/// Typed so the daemon answers it as the caller's news rather than as an
+/// internal fault: the graph is sound, and the question needs a name the graph
+/// holds or a pin that picks one entity out of several.
+#[derive(Debug)]
+pub struct EntityQueryRefusal {
+    /// What the query reached and how to name one entity, ready to print.
+    pub lines: Vec<String>,
+    /// Whether the name reached nothing at all, rather than several entities or
+    /// entities every pin excluded.
+    pub absent: bool,
+}
+
+impl std::fmt::Display for EntityQueryRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.lines.join("\n"))
+    }
+}
+
+impl std::error::Error for EntityQueryRefusal {}
+
+/// The refusal inside an error, for a handler classifying it.
+pub fn entity_query_refusal(error: &anyhow::Error) -> Option<&EntityQueryRefusal> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<EntityQueryRefusal>())
 }
 
 /// Split revisions into those that changed THIS entity and those that did not.
@@ -168,6 +203,14 @@ pub fn is_ref_resolution_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<RefResolutionError>().is_some())
 }
 
+/// A ref resolved for blame or history, and what reaching authority cost.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResolvedHead {
+    pub(crate) change_id: SemanticChangeId,
+    /// Set when an arm of the grammar had to reach repository authority.
+    pub(crate) authority_open: Option<AuthorityOpen>,
+}
+
 /// Resolve a ref for `kin blame --ref` and `kin history --ref`.
 ///
 /// The grammar itself lives in [`super::ref_grammar`], which `kin diff` calls
@@ -187,14 +230,34 @@ where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    let authority = RequestRepositoryAuthority::pinned(binding.clone());
+    resolve_ref_through(graph, &authority, reference).map(|head| head.change_id)
+}
+
+/// [`resolve_ref`] through whatever authority the caller has.
+///
+/// The daemon's blame and history routes pass the authority it keeps for the
+/// current publication, so resolving `HEAD` costs a request nothing that grows
+/// with the store. Each request used to open the whole repository authority
+/// from disk for itself, decoding and re-verifying every persisted body to read
+/// one workspace pointer.
+pub(crate) fn resolve_ref_through<G>(
+    graph: &G,
+    authority: &RequestRepositoryAuthority,
+    reference: Option<&str>,
+) -> Result<ResolvedHead>
+where
+    G: GraphStore,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
+{
     let reference = reference.unwrap_or("HEAD");
     // Deferred rather than opened here. An explicit `kin:<id>` or `change:<id>`
     // is graph-owned truth and resolves without repository authority at all;
     // opening it eagerly turned that into a hard requirement and broke
     // `explicit_semantic_change_and_parent_hops_need_no_file_or_git_fallback`,
     // which is pinning exactly the right thing.
-    let authority = super::ref_grammar::Authority::deferred(binding);
-    let resolved = super::ref_grammar::resolve(&authority, graph, reference)
+    let deferred = super::ref_grammar::Authority::deferred(authority);
+    let resolved = super::ref_grammar::resolve(&deferred, graph, reference)
         .map_err(|error| ref_error(reference, format!("{error:#}")))?;
 
     if graph
@@ -211,88 +274,204 @@ where
             ),
         ));
     }
-    Ok(resolved.change_id)
-}
-
-pub(crate) fn resolve_entity_query<G>(graph: &G, entity_query: &str) -> Result<Entity>
-where
-    G: GraphStore,
-    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    let filter = EntityFilter {
-        name_pattern: Some(entity_query.to_string()),
-        ..Default::default()
-    };
-    let entities = graph
-        .query_entities(&filter)
-        .map_err(|error| anyhow!(error.to_string()))?;
-    choose_entity_match(entities, entity_query).or_else(|primary| {
-        // The store-side name_pattern filter and the local matcher do not agree
-        // on every query shape, so a whole-graph sweep is the backstop. It must
-        // still be narrowed to the query: handing choose_entity_match an
-        // unfiltered graph makes it report the first five entities
-        // alphabetically as "matches", which is how `kin history alwaysTrue`
-        // came back with "Multiple entities match 'alwaysTrue': AND_THEN,
-        // AND_WHEN, ANON_TEST_CASE, Approx". None of those contain the query.
-        let narrowed = graph
-            .list_all_entities()
-            .map_err(|error| anyhow!(error.to_string()))?
-            .into_iter()
-            .filter(|entity| entity_matches_query(entity, entity_query))
-            .collect::<Vec<_>>();
-        if narrowed.is_empty() {
-            // Nothing in the graph matches, so the first attempt's message is
-            // the accurate one. Surfacing a second, wider failure here would
-            // bury it.
-            return Err(primary);
-        }
-        choose_entity_match(narrowed, entity_query)
+    Ok(ResolvedHead {
+        change_id: resolved.change_id,
+        authority_open: deferred.open_cost(),
     })
 }
 
-/// The entity a query names at `head`, together with its revision timeline.
+/// The line an answer ends with when resolving its ref opened the whole store
+/// on the thread that built it, which is the one step whose cost follows the
+/// size of the store rather than the question.
 ///
-/// Both come out of one replay of committed state, which is also why the two
-/// are resolved together: the entity lookup already needs the state at `head`,
-/// and resolving revisions separately would replay the same history twice.
-pub(crate) fn resolve_entity_with_revisions_at<G>(
+/// Silent otherwise. A daemon handing over the authority it already holds for
+/// the current publication cost the answer nothing worth naming, and neither did
+/// a selector the graph answered alone.
+pub(crate) fn authority_open_line(open: Option<AuthorityOpen>) -> Option<String> {
+    let open = open.filter(|open| open.opened_here)?;
+    let seconds = open.waited.as_secs_f64();
+    Some(if open.shared {
+        format!(
+            "Answered by: this repository's daemon, which opened repository authority for its \
+             current publication to answer this ({seconds:.1} s, re-verifying every persisted \
+             body); later reads at this publication reuse that open."
+        )
+    } else {
+        format!(
+            "Answered by: a repository-authority open made for this answer alone ({seconds:.1} \
+             s, re-verifying every persisted body); the daemon serving this repository answers \
+             from one open per publication instead."
+        )
+    })
+}
+
+/// The notes a blame or history answer ends with: the stale-span note when a
+/// location it printed is marked, then the open line when resolving its ref
+/// opened the store on this thread.
+pub(crate) fn closing_notes(lines: &[String], open: Option<AuthorityOpen>) -> Vec<String> {
+    crate::entity_identity::stale_span_note(lines)
+        .into_iter()
+        .chain(authority_open_line(open))
+        .collect()
+}
+
+/// The first non-empty line of a commit message. Git calls this the subject and
+/// renders exactly this in `--oneline`; the body belongs in a detail view, not
+/// in a one-row-per-revision list. Blame and history both print it, from here,
+/// so the two cannot disagree about what a change is called.
+pub(crate) fn subject_line(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("(no message)")
+        .to_string()
+}
+
+/// ` @ path:line` for an answer's header, or nothing for an entity with no file.
+pub(crate) fn pointer_suffix(pointer: &EntityPointer) -> String {
+    if pointer.path.is_some() {
+        format!(" @ {}", pointer.render())
+    } else {
+        String::new()
+    }
+}
+
+/// The entity a blame or history answer is about, with what the answer prints
+/// before its rows.
+pub(crate) struct EntityTimeline {
+    pub(crate) target: Entity,
+    /// Every revision of `target` on the lineage reaching the head, oldest first.
+    pub(crate) revisions: Vec<EntityRevision>,
+    /// Where the entity starts, checked against the tree it was read from.
+    pub(crate) pointer: EntityPointer,
+    /// Every candidate and how to pin another, when the query reached several.
+    pub(crate) choice: Vec<String>,
+}
+
+/// Resolve `entity_query` at `head` and read its revisions there.
+///
+/// Without `--ref` the entity comes from the live graph, through the resolver
+/// every read command shares, so `kin blame` and `kin history` answer about the
+/// entity `kin refs` and `kin impact` answer about for the same name and pins.
+/// With `--ref` it comes from the state replayed at that ref, because a name can
+/// have meant a different entity then, or one since removed. The same pins,
+/// narrowing and ranking apply there, with dependents read from the replayed
+/// relations and locations checked against the replayed tree.
+pub(crate) fn resolve_entity_timeline<G>(
     graph: &G,
     entity_query: &str,
     head: &SemanticChangeId,
     reference: Option<&str>,
-) -> Result<(Entity, Vec<EntityRevision>)>
+) -> Result<EntityTimeline>
 where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    if reference.is_none() {
+        let resolution = crate::entity_identity::resolve_entity(
+            graph,
+            entity_query,
+            &IdentityQualifiers::default(),
+        )?;
+        let locate = |entity: &Entity| crate::entity_identity::entity_location(graph, entity);
+        let target = chosen_or_refused(&resolution, locate)?;
+        let revisions = resolve_entity_revisions_at(graph, &target.id, head, None)?;
+        return Ok(EntityTimeline {
+            pointer: crate::entity_identity::entity_pointer(graph, &target),
+            choice: crate::entity_identity::choice_note_by(
+                &resolution,
+                PinSpelling::FileKind,
+                locate,
+            ),
+            target,
+            revisions,
+        });
+    }
+
     let mut state = graph
         .resolve_graph_at(head)
         .map_err(|error| projection_error(reference, head, error))?;
-    let entities = state
-        .entities
+    let depended_on: HashSet<EntityId> = state
+        .relations
         .values()
-        .filter(|entity| entity_matches_query(entity, entity_query))
-        .cloned()
+        .filter_map(crate::entity_identity::depended_on_by)
         .collect();
-    let target = choose_entity_match(entities, entity_query)?;
+    let resolution = crate::entity_identity::resolve_entity_among(
+        state.entities.values(),
+        entity_query,
+        &IdentityQualifiers::default(),
+        |entity| Ok(depended_on.contains(&entity.id)),
+    )?;
+    let tree = &state.tree;
+    let locate =
+        |entity: &Entity| crate::entity_identity::entity_pointer_in_tree(tree, entity).render();
+    let target = chosen_or_refused(&resolution, locate)?;
+    let pointer = crate::entity_identity::entity_pointer_in_tree(tree, &target);
+    let choice = crate::entity_identity::choice_note_by(&resolution, PinSpelling::FileKind, locate);
     let revisions = state
         .entity_revisions
         .remove(&target.id)
         .unwrap_or_default();
-    Ok((target, revisions))
+    Ok(EntityTimeline {
+        target,
+        revisions,
+        pointer,
+        choice,
+    })
 }
 
-/// Every revision of `entity_id` visible at `head`, oldest first.
+/// The entity a resolution chose, or the refusal that says why it chose none.
 ///
-/// `ChangeStore::get_entity_revisions_at` is not usable here. It replays only
-/// the changes that mention this entity, yet validates every delta those
-/// changes carry. A change that touches this entity while also modifying or
-/// removing a second one is then checked against a state the second entity's
-/// own history was filtered out of, so a sound repository answers with a
-/// "stale old payload" conflict for an entity nobody asked about, and the
-/// command fails before printing a single revision. Replaying the complete
-/// first-parent state keeps every delta's precondition checkable, which is the
-/// same reason the MCP entity handlers resolve through `resolve_graph_at`.
+/// A partial name reaching several entities and a pin excluding every entity a
+/// name reaches are answered with the same lines `kin refs` and `kin impact`
+/// print, so an answer never guesses and never calls an entity absent that the
+/// graph holds.
+fn chosen_or_refused(
+    resolution: &EntityResolution,
+    locate: impl Fn(&Entity) -> String + Copy,
+) -> Result<Entity> {
+    let refusal = if resolution.name_matches.is_empty() {
+        EntityQueryRefusal {
+            lines: vec![format!(
+                "No entity matching '{}' found.",
+                resolution.reference.name
+            )],
+            absent: true,
+        }
+    } else if resolution.pin_excluded_all() {
+        EntityQueryRefusal {
+            lines: crate::entity_identity::pin_miss_lines_by(resolution, locate),
+            absent: false,
+        }
+    } else if resolution.needs_a_pin() {
+        EntityQueryRefusal {
+            lines: crate::entity_identity::pin_request_lines_by(resolution, locate),
+            absent: false,
+        }
+    } else {
+        return resolution.chosen().cloned().ok_or_else(|| {
+            anyhow!(
+                "resolving '{}' produced no candidate",
+                resolution.reference.name
+            )
+        });
+    };
+    Err(anyhow::Error::new(refusal))
+}
+
+/// Every revision of `entity_id` on the lineage reaching `head`, oldest first.
+///
+/// kin-model's `ChangeStore::get_entity_revisions_at` reads the complete
+/// first-parent history and applies only this entity's deltas, so every change
+/// is read against the state its parent published, and a change that also
+/// modifies or removes another entity is skipped for that entity rather than
+/// checked against a state its history was filtered out of. The whole-graph
+/// replay this used to run derived every entity and relation in the repository,
+/// swept every live relation after every change and replayed the tree, to keep
+/// one entity's list. The rows are the same, because a revision id is minted
+/// from the entity id and the change that introduced it; the replay's cost grew
+/// with the whole repository's history on every call.
 pub(crate) fn resolve_entity_revisions_at<G>(
     graph: &G,
     entity_id: &EntityId,
@@ -303,62 +482,9 @@ where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    let mut state = graph
-        .resolve_graph_at(head)
-        .map_err(|error| projection_error(reference, head, error))?;
-    Ok(state.entity_revisions.remove(entity_id).unwrap_or_default())
-}
-
-fn choose_entity_match(mut entities: Vec<Entity>, entity_query: &str) -> Result<Entity> {
-    if entities.is_empty() {
-        bail!("No entity matching '{entity_query}' found.");
-    }
-
-    entities.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
-    });
-    if let Some(exact) = entities
-        .iter()
-        .find(|entity| entity.id.to_string() == entity_query || entity.name == entity_query)
-    {
-        return Ok(exact.clone());
-    }
-    if let Some(case_insensitive) = entities
-        .iter()
-        .find(|entity| entity.name.eq_ignore_ascii_case(entity_query))
-    {
-        return Ok(case_insensitive.clone());
-    }
-    match entities.as_slice() {
-        [entity] => Ok(entity.clone()),
-        many => {
-            let preview = many
-                .iter()
-                .take(5)
-                .map(|entity| entity.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!("Multiple entities match '{entity_query}': {preview}. Use a more exact name.")
-        }
-    }
-}
-
-fn entity_matches_query(entity: &Entity, entity_query: &str) -> bool {
-    entity.id.to_string() == entity_query || name_matches_pattern(&entity.name, entity_query)
-}
-
-fn name_matches_pattern(name: &str, pattern: &str) -> bool {
-    let name = name.to_lowercase();
-    let pattern = pattern.to_lowercase();
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        name.ends_with(suffix)
-    } else if let Some(prefix) = pattern.strip_suffix('*') {
-        name.starts_with(prefix)
-    } else {
-        name.contains(&pattern)
-    }
+    graph
+        .get_entity_revisions_at(entity_id, head)
+        .map_err(|error| projection_error(reference, head, error))
 }
 
 #[cfg(test)]
@@ -410,15 +536,13 @@ mod tests {
         }
     }
 
-    /// `resolve_entity_query` sweeps the whole graph when the store-side name
-    /// filter comes back unusable. That sweep must still be narrowed to the
-    /// query. It previously was not, so `choose_entity_match` received every
-    /// entity in the repo and reported the first five alphabetically as
-    /// "matches" — `kin history alwaysTrue` answered "Multiple entities match
-    /// 'alwaysTrue': AND_THEN, AND_WHEN, ANON_TEST_CASE, Approx", none of which
-    /// contain the query.
+    /// A name that reaches nothing is refused with its own name, never with a
+    /// list of unrelated entities. The whole-graph sweep this module used to run
+    /// handed its matcher an unfiltered graph, so `kin history alwaysTrue` once
+    /// answered "Multiple entities match 'alwaysTrue': AND_THEN, AND_WHEN,
+    /// ANON_TEST_CASE, Approx", none of which contain the query.
     #[test]
-    fn whole_graph_fallback_stays_narrowed_to_the_query() {
+    fn a_query_that_reaches_nothing_is_refused_with_its_own_name() {
         use kin_model::EntityStore;
         let graph = kin_db::InMemoryGraph::new();
         for name in [
@@ -431,17 +555,26 @@ mod tests {
         ] {
             graph.upsert_entity(&named_entity(name)).unwrap();
         }
+        let locate = |entity: &Entity| crate::entity_identity::entity_location(&graph, entity);
+        let resolve = |query: &str| {
+            crate::entity_identity::resolve_entity(&graph, query, &IdentityQualifiers::default())
+                .unwrap()
+        };
 
-        let resolved = resolve_entity_query(&graph, "alwaysTrue")
+        let chosen = chosen_or_refused(&resolve("alwaysTrue"), locate)
             .expect("an exact name present in the graph must resolve");
-        assert_eq!(resolved.name, "alwaysTrue");
+        assert_eq!(chosen.name, "alwaysTrue");
 
-        let err = resolve_entity_query(&graph, "definitely_not_here")
-            .expect_err("a query matching nothing must fail");
-        let message = err.to_string();
+        let error = chosen_or_refused(&resolve("definitely_not_here"), locate)
+            .expect_err("a query matching nothing must be refused");
+        let refusal =
+            entity_query_refusal(&error).expect("the refusal must be typed for the daemon");
+        assert!(refusal.absent, "nothing matched, so the entity is absent");
+        let message = error.to_string();
+        assert!(message.contains("definitely_not_here"), "{message}");
         assert!(
             !message.contains("AND_THEN") && !message.contains("Approx"),
-            "an unmatched query must not list unrelated entities as matches, got: {message}"
+            "an unmatched query must not list unrelated entities, got: {message}"
         );
     }
 
@@ -616,6 +749,107 @@ mod tests {
                 .to_string()
                 .contains("was never imported into this repository"),
             "{error:#}"
+        );
+    }
+
+    /// The shared arm is handed the authority its server already holds and
+    /// never opens the store on the resolving thread, the pinned arm opens for
+    /// itself, and a graph-only selector reaches for neither.
+    ///
+    /// The per-thread open counter is the bound, because an open's cost is a
+    /// property of the store rather than of the request: a timing assertion on
+    /// a fixture this small would pass with every request reopening.
+    #[test]
+    fn a_shared_authority_is_handed_over_rather_than_reopened() {
+        use crate::commands::repository_authority::{
+            repository_authority_opens_on_this_thread, ActiveRepositoryAuthority,
+            RequestRepositoryAuthority,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(directory.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&initialized.layout)
+            .expect("fixture must carry persisted empty repository authority");
+        let held = Arc::new(ActiveRepositoryAuthority::open(&binding).unwrap());
+        let handed_over = Arc::new(AtomicUsize::new(0));
+        let shared = RequestRepositoryAuthority::shared(binding.clone(), {
+            let held = Arc::clone(&held);
+            let handed_over = Arc::clone(&handed_over);
+            Arc::new(move || {
+                handed_over.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::clone(&held))
+            })
+        });
+        let graph = kin_db::InMemoryGraph::new();
+
+        // HEAD reads authority. This store has no commit, so HEAD names nothing
+        // and the answer is a refusal; what reaching authority cost is the
+        // property under test.
+        let opens = repository_authority_opens_on_this_thread();
+        let error = resolve_ref_through(&graph, &shared, None)
+            .expect_err("an unborn workspace has no HEAD");
+        assert!(is_ref_resolution_error(&error), "{error:#}");
+        assert_eq!(
+            handed_over.load(Ordering::SeqCst),
+            1,
+            "HEAD must ask the server for the authority it holds"
+        );
+        assert_eq!(
+            repository_authority_opens_on_this_thread(),
+            opens,
+            "the shared arm must not open the store on this thread"
+        );
+
+        // An explicit change is graph-owned truth and reaches for nothing.
+        let explicit = change(Vec::new());
+        graph.create_change(&explicit).unwrap();
+        let head = resolve_ref_through(&graph, &shared, Some(&format!("kin:{}", explicit.id)))
+            .expect("an explicit change the graph holds resolves");
+        assert_eq!(head.change_id, explicit.id);
+        assert_eq!(head.authority_open, None);
+        assert_eq!(
+            handed_over.load(Ordering::SeqCst),
+            1,
+            "a graph-only selector must not ask for authority"
+        );
+
+        // The control: the pinned arm opens for itself, so the bound above is
+        // one that could have moved.
+        let _ = resolve_ref_through(&graph, &RequestRepositoryAuthority::pinned(binding), None);
+        assert_eq!(
+            repository_authority_opens_on_this_thread(),
+            opens + 1,
+            "the pinned arm opens the store once"
+        );
+    }
+
+    /// An answer names an open only when its own thread paid for one, and says
+    /// whether a daemon now holds it for the next read.
+    #[test]
+    fn an_answer_names_an_open_only_when_its_thread_paid_for_one() {
+        let open = |opened_here, shared| {
+            Some(AuthorityOpen {
+                waited: std::time::Duration::from_millis(58_200),
+                opened_here,
+                shared,
+            })
+        };
+        assert_eq!(authority_open_line(None), None);
+        assert_eq!(
+            authority_open_line(open(false, true)),
+            None,
+            "an authority handed over costs the answer nothing worth naming"
+        );
+        let daemon = authority_open_line(open(true, true)).unwrap();
+        assert!(
+            daemon.contains("58.2 s") && daemon.contains("later reads at this publication reuse"),
+            "{daemon}"
+        );
+        let alone = authority_open_line(open(true, false)).unwrap();
+        assert!(
+            alone.contains("58.2 s") && alone.contains("for this answer alone"),
+            "{alone}"
         );
     }
 }

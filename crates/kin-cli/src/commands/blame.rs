@@ -5,6 +5,9 @@ use anyhow::{Context, Result};
 use kin_model::ChangeStore;
 use serde::{Deserialize, Serialize};
 
+use super::ref_lookup;
+use super::repository_authority::RequestRepositoryAuthority;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlameRequest {
     pub entity: String,
@@ -55,31 +58,43 @@ async fn run_daemon_blame(
     client.blame(request).await.context("daemon blame failed")
 }
 
+/// Blame with a binding this call opens for itself when its ref needs
+/// repository authority. A caller that already holds an authority, as the
+/// daemon does, uses [`execute_blame_request_with`].
 pub fn execute_blame_request(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     request: &BlameRequest,
 ) -> Result<BlameResponse> {
-    let head =
-        crate::commands::ref_lookup::resolve_ref(graph, binding, request.reference.as_deref())?;
-    let (target, revisions) = match request.reference.as_deref() {
-        Some(_) => crate::commands::ref_lookup::resolve_entity_with_revisions_at(
-            graph,
-            &request.entity,
-            &head,
-            request.reference.as_deref(),
-        )?,
-        None => {
-            let target = crate::commands::ref_lookup::resolve_entity_query(graph, &request.entity)?;
-            let revisions = crate::commands::ref_lookup::resolve_entity_revisions_at(
-                graph,
-                &target.id,
-                &head,
-                request.reference.as_deref(),
-            )?;
-            (target, revisions)
-        }
-    };
+    execute_blame_request_with(
+        &RequestRepositoryAuthority::pinned(binding.clone()),
+        graph,
+        request,
+    )
+}
+
+/// Blame an entity, resolving its ref through `authority`.
+///
+/// The daemon passes the authority it keeps for the current publication, so
+/// `HEAD` costs this answer nothing that grows with the store, and the answer
+/// names an open only when one happened on the thread that built it.
+pub fn execute_blame_request_with(
+    authority: &RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    request: &BlameRequest,
+) -> Result<BlameResponse> {
+    let head = ref_lookup::resolve_ref_through(graph, authority, request.reference.as_deref())?;
+    let ref_lookup::EntityTimeline {
+        target,
+        revisions,
+        pointer,
+        choice,
+    } = ref_lookup::resolve_entity_timeline(
+        graph,
+        &request.entity,
+        &head.change_id,
+        request.reference.as_deref(),
+    )?;
     // Trimmed by default: the revisions where THIS entity's own text moved.
     //
     // Blame's job is attribution, and the untrimmed list answers a different
@@ -93,17 +108,24 @@ pub fn execute_blame_request(
     let (revisions, withheld) = if request.all_revisions {
         (revisions, Vec::new())
     } else {
-        crate::commands::ref_lookup::split_own_revisions(&revisions)
+        ref_lookup::split_own_revisions(&revisions)
     };
     let mut lines = Vec::new();
     lines.push(format!(
-        "Blame for '{}' ({:?}, {}) at {}:",
-        target.name, target.kind, target.language, head
+        "Blame for '{}' ({:?}, {}){} at {}:",
+        target.name,
+        target.kind,
+        target.language,
+        ref_lookup::pointer_suffix(&pointer),
+        head.change_id
     ));
+    lines.extend(choice);
     lines.push(String::new());
 
     if revisions.is_empty() {
         lines.push("  No history recorded for this entity.".to_string());
+        let closing = ref_lookup::closing_notes(&lines, head.authority_open);
+        lines.extend(closing);
         return Ok(BlameResponse { lines });
     }
 
@@ -131,14 +153,21 @@ pub fn execute_blame_request(
             ));
             continue;
         };
+        // The subject line, the way `kin history` and `git log --oneline` print
+        // a change. The whole message put a pull request's entire body under one
+        // row and pushed every later revision off the screen.
         lines.push(format!(
             "{:<36}  {:<36}  {:<20}  {:<15}  {}",
-            revision.revision_id, change.id, change.timestamp, change.author, change.message,
+            revision.revision_id,
+            change.id,
+            change.timestamp,
+            change.author,
+            ref_lookup::subject_line(&change.message),
         ));
     }
 
     lines.push(format!("\n{} version(s) found.", revisions.len()));
-    if let Some(line) = crate::commands::ref_lookup::withheld_line(withheld.len()) {
+    if let Some(line) = ref_lookup::withheld_line(withheld.len()) {
         lines.push(line);
     }
     if unreadable > 0 {
@@ -148,7 +177,7 @@ pub fn execute_blame_request(
         ));
     }
 
-    lines.push(format!("\nState at {}:", head));
+    lines.push(format!("\nState at {}:", head.change_id));
     lines.push(format!("  Signature: {}", target.signature));
     lines.push(format!("  Visibility: {:?}", target.visibility));
     if let Some(ref file) = target.file_origin {
@@ -157,6 +186,8 @@ pub fn execute_blame_request(
     if let Some(ref doc) = target.doc_summary {
         lines.push(format!("  Doc: {}", doc));
     }
+    let closing = ref_lookup::closing_notes(&lines, head.authority_open);
+    lines.extend(closing);
 
     Ok(BlameResponse { lines })
 }

@@ -9708,6 +9708,65 @@ fn persist_foreground_embed_batch(state: &DaemonState) -> Result<(), kin_db::Kin
     })
 }
 
+/// The authority `/blame` and `/history` resolve a ref through: this daemon's
+/// command slot, reached only when an arm of the ref grammar needs it.
+///
+/// These routes used to hand the ref grammar the bare binding, which opened the
+/// whole repository authority from disk to resolve `HEAD` on every request. On
+/// a full-history store of this repository that was about a minute per call,
+/// nearly all of it decoding and re-verifying the persisted snapshot, and each
+/// call held its own decoded copy while it ran. The slot is keyed on the durable
+/// publication read before the load it labels, so one open serves every read at
+/// that publication, as it already does for `/commands/log` and `/commands/diff`.
+///
+/// Lazy for the reason `/commands/graph` is lazy: an explicit `kin:<id>` or
+/// `change:<id>` is graph-owned truth, reads no authority, and must not start
+/// depending on a storage capability it never needed.
+fn entity_history_authority(
+    state: &Arc<DaemonState>,
+) -> Result<kin_cli::commands::repository_authority::RequestRepositoryAuthority, (StatusCode, String)>
+{
+    let binding = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let resolver_state = Arc::clone(state);
+    Ok(
+        kin_cli::commands::repository_authority::RequestRepositoryAuthority::shared(
+            binding,
+            Arc::new(move || {
+                command_repository_authority(&resolver_state)
+                    .map_err(|(_, message)| anyhow::anyhow!(message))
+            }),
+        ),
+    )
+}
+
+/// How a blame or history failure reaches the caller.
+///
+/// A live-graph replay miss is the CALLER'S news, not an internal fault. The ref
+/// was fine and the change is durable; this daemon's projection cannot replay to
+/// it. It reached `internal_error`, so the user got a 500 carrying the RESOLVED
+/// change id rather than the ref they typed, which is an internal invariant
+/// leaking. rc062j saw exactly that after a merge, on every ref form, always
+/// naming the same id. A query that named no one entity is the caller's news as
+/// well, and its body is the answer listing what the name reached.
+fn entity_history_error(error: anyhow::Error) -> (StatusCode, String) {
+    if kin_cli::commands::ref_lookup::is_graph_projection_error(&error) {
+        (StatusCode::CONFLICT, crate::error::cause_first(&error))
+    } else if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+        (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
+    } else if let Some(refusal) = kin_cli::commands::ref_lookup::entity_query_refusal(&error) {
+        let status = if refusal.absent {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        (status, refusal.to_string())
+    } else {
+        internal_error(error)
+    }
+}
+
 /// POST /blame — render entity blame from daemon-owned graph state.
 async fn blame(
     headers: axum::http::HeaderMap,
@@ -9726,29 +9785,13 @@ async fn blame(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let repository_authority = state
-        .local_repository_authority_binding()
-        .map_err(repository_authority_error)?;
-    let response = kin_cli::commands::blame::execute_blame_request(
+    let repository_authority = entity_history_authority(&state)?;
+    let response = kin_cli::commands::blame::execute_blame_request_with(
         &repository_authority,
         graph.as_ref(),
         &req,
     )
-    .map_err(|error| {
-        // A live-graph replay miss is the CALLER'S news, not an internal fault.
-        // The ref was fine and the change is durable; this daemon's projection
-        // cannot replay to it. It reached `internal_error` below, so the user
-        // got a 500 carrying the RESOLVED change id rather than the ref they
-        // typed, which is an internal invariant leaking. rc062j saw exactly
-        // that after a merge, on every ref form, always naming the same id.
-        if kin_cli::commands::ref_lookup::is_graph_projection_error(&error) {
-            (StatusCode::CONFLICT, crate::error::cause_first(&error))
-        } else if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-            (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
-        } else {
-            internal_error(error)
-        }
-    })?;
+    .map_err(entity_history_error)?;
     Ok(Json(response))
 }
 
@@ -9770,29 +9813,13 @@ async fn history(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let repository_authority = state
-        .local_repository_authority_binding()
-        .map_err(repository_authority_error)?;
-    let response = kin_cli::commands::history::execute_history_request(
+    let repository_authority = entity_history_authority(&state)?;
+    let response = kin_cli::commands::history::execute_history_request_with(
         &repository_authority,
         graph.as_ref(),
         &req,
     )
-    .map_err(|error| {
-        // A live-graph replay miss is the CALLER'S news, not an internal fault.
-        // The ref was fine and the change is durable; this daemon's projection
-        // cannot replay to it. It reached `internal_error` below, so the user
-        // got a 500 carrying the RESOLVED change id rather than the ref they
-        // typed, which is an internal invariant leaking. rc062j saw exactly
-        // that after a merge, on every ref form, always naming the same id.
-        if kin_cli::commands::ref_lookup::is_graph_projection_error(&error) {
-            (StatusCode::CONFLICT, crate::error::cause_first(&error))
-        } else if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-            (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
-        } else {
-            internal_error(error)
-        }
-    })?;
+    .map_err(entity_history_error)?;
     Ok(Json(response))
 }
 /// state whose generation has not yet been persisted.
@@ -49068,6 +49095,201 @@ mod tests {
                 Err(_) => break,
             }
         }
+    }
+
+    /// A store whose repository authority holds one commit of `files`, so
+    /// `HEAD` names a change and blame and history resolve it through the
+    /// authority rather than through an explicit change id.
+    fn test_state_with_committed_sources(files: &[(&str, &str)]) -> Arc<DaemonState> {
+        install_test_registry_override();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-history-state-{}", Uuid::new_v4()));
+        for (path, body) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().expect("a fixture file has a parent")).unwrap();
+            std::fs::write(&path, body).unwrap();
+        }
+        let steps: [&[&str]; 5] = [
+            &["init", "--initial-branch=main"],
+            &["config", "user.email", "kin@example.invalid"],
+            &["config", "user.name", "Kin Test"],
+            &["add", "--all"],
+            &["commit", "-s", "-m", "Seed the history fixture"],
+        ];
+        for args in steps {
+            let output = kin_git::test_support::fixture_git_in(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let layout = kin_core::init_from_git(&dir).unwrap().layout;
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+    }
+
+    /// One `/blame` or `/history` request naming `entity`, with no ref: the
+    /// status and the body, which carries the rendered lines on success and the
+    /// refusal otherwise.
+    async fn entity_read(app: &axum::Router, endpoint: &str, entity: &str) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(endpoint)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "entity": entity }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn answer_lines(body: &str) -> Vec<String> {
+        let answer: serde_json::Value =
+            serde_json::from_str(body).unwrap_or_else(|error| panic!("{error}: {body}"));
+        answer["lines"]
+            .as_array()
+            .expect("a blame or history answer carries its lines")
+            .iter()
+            .map(|line| line.as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// `/blame` and `/history` resolve `HEAD` from the authority this daemon
+    /// keeps for the current publication instead of opening the store per
+    /// request.
+    ///
+    /// Asserted on the answer, which names an open whenever one happened on the
+    /// thread that built it, and on the daemon's load counter. The counter alone
+    /// could not fail: a route handed the bare binding opens the store through
+    /// the ref grammar and never touches this daemon's cache, so the counter
+    /// stays flat while every request pays for a whole-store open.
+    #[tokio::test]
+    async fn blame_and_history_answer_head_from_the_authority_the_daemon_holds() {
+        let state =
+            test_state_with_committed_sources(&[("src/lib.py", "def retained():\n    return 1\n")]);
+        let loads_before = state.projection_authority.loads();
+        let app = router(Arc::clone(&state));
+
+        let (status, body) = entity_read(&app, "/blame", "retained").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let cold = answer_lines(&body);
+        assert!(
+            cold.iter()
+                .any(|line| line.starts_with("Blame for 'retained'")),
+            "{cold:#?}"
+        );
+        assert!(
+            cold.iter().any(|line| line.contains("1 version(s) found.")),
+            "HEAD must reach the committed revision: {cold:#?}"
+        );
+        assert!(
+            cold.iter().any(
+                |line| line.contains("opened repository authority for its current publication")
+            ),
+            "the first read at a publication pays for the open and says so: {cold:#?}"
+        );
+
+        for endpoint in ["/blame", "/history", "/history"] {
+            let (status, body) = entity_read(&app, endpoint, "retained").await;
+            assert_eq!(status, StatusCode::OK, "{endpoint}: {body}");
+            let lines = answer_lines(&body);
+            assert!(
+                !lines.iter().any(|line| line.starts_with("Answered by:")),
+                "{endpoint} at a publication this daemon already holds must not open the store: \
+                 {lines:#?}"
+            );
+        }
+        assert_eq!(
+            state.projection_authority.loads(),
+            loads_before + 1,
+            "one authority load serves every read at one publication"
+        );
+    }
+
+    /// Blame and history resolve a name through the resolver `kin refs` and
+    /// `kin impact` share: twins answer about the first by the one ranking rule,
+    /// say a choice was made and list every candidate by id, a pin reaches the
+    /// twin it names, and a pin that excludes both is refused naming both.
+    #[tokio::test]
+    async fn blame_and_history_pin_one_twin_and_list_the_others() {
+        let state = test_state_with_committed_sources(&[
+            ("src/a.py", "def helper():\n    return 1\n"),
+            ("src/b.py", "def helper():\n    return 2\n"),
+        ]);
+        let twins: Vec<Entity> = state
+            .graph
+            .query_entities(&kin_model::EntityFilter {
+                name_pattern: Some("helper".to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .filter(|entity| entity.name == "helper")
+            .collect();
+        assert_eq!(
+            twins.len(),
+            2,
+            "the fixture must hold two functions named helper: {twins:#?}"
+        );
+        let app = router(Arc::clone(&state));
+
+        let (status, body) = entity_read(&app, "/blame", "helper").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let unpinned = answer_lines(&body);
+        assert!(
+            unpinned[0].contains("@ src/a.py:1"),
+            "an unpinned name answers about the first twin by the ranking rule: {unpinned:#?}"
+        );
+        assert!(
+            unpinned
+                .iter()
+                .any(|line| line.contains("'helper' names 2 entities")),
+            "the answer must say it chose: {unpinned:#?}"
+        );
+        for twin in &twins {
+            assert!(
+                unpinned
+                    .iter()
+                    .any(|line| line.contains(&twin.id.to_string())),
+                "every candidate is listed by id: {unpinned:#?}"
+            );
+        }
+
+        for (endpoint, entity) in [
+            ("/history", "helper#function@src/b.py"),
+            ("/blame", "helper@src/b.py"),
+        ] {
+            let (status, body) = entity_read(&app, endpoint, entity).await;
+            assert_eq!(status, StatusCode::OK, "{endpoint} {entity}: {body}");
+            let pinned = answer_lines(&body);
+            assert!(
+                pinned[0].contains("@ src/b.py:1"),
+                "the pin reaches src/b.py's twin: {pinned:#?}"
+            );
+            assert!(
+                !pinned.iter().any(|line| line.contains("names 2 entities")),
+                "a pinned answer made no choice: {pinned:#?}"
+            );
+        }
+
+        let (status, body) = entity_read(&app, "/blame", "helper@src/nowhere.py").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("src/a.py") && body.contains("src/b.py"),
+            "a pin that excludes both twins names both: {body}"
+        );
     }
 
     #[tokio::test]

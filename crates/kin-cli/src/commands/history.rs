@@ -5,6 +5,9 @@ use anyhow::{Context, Result};
 use kin_model::ChangeStore;
 use serde::{Deserialize, Serialize};
 
+use super::ref_lookup;
+use super::repository_authority::RequestRepositoryAuthority;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryRequest {
     pub entity: String,
@@ -26,18 +29,6 @@ pub struct HistoryResponse {
 /// change range back to the operator.
 fn abbreviate_id(id: &str) -> String {
     id.chars().take(12).collect()
-}
-
-/// The first non-empty line of a commit message. Git calls this the subject and
-/// renders exactly this in `--oneline`; the body belongs in a detail view, not
-/// in a one-row-per-revision list.
-fn subject_line(message: &str) -> String {
-    message
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("(no message)")
-        .to_string()
 }
 
 /// `YYYY-MM-DD` from an ISO-8601 timestamp. The clock time costs eleven columns
@@ -134,42 +125,56 @@ async fn run_daemon_history(
         .context("daemon history failed")
 }
 
+/// History with a binding this call opens for itself when its ref needs
+/// repository authority. A caller that already holds an authority, as the
+/// daemon does, uses [`execute_history_request_with`].
 pub fn execute_history_request(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     request: &HistoryRequest,
 ) -> Result<HistoryResponse> {
-    let head =
-        crate::commands::ref_lookup::resolve_ref(graph, binding, request.reference.as_deref())?;
-    let (target, revisions) = match request.reference.as_deref() {
-        Some(_) => crate::commands::ref_lookup::resolve_entity_with_revisions_at(
-            graph,
-            &request.entity,
-            &head,
-            request.reference.as_deref(),
-        )?,
-        None => {
-            let target = crate::commands::ref_lookup::resolve_entity_query(graph, &request.entity)?;
-            let revisions = crate::commands::ref_lookup::resolve_entity_revisions_at(
-                graph,
-                &target.id,
-                &head,
-                request.reference.as_deref(),
-            )?;
-            (target, revisions)
-        }
-    };
+    execute_history_request_with(
+        &RequestRepositoryAuthority::pinned(binding.clone()),
+        graph,
+        request,
+    )
+}
+
+/// An entity's history, resolving its ref through `authority`.
+///
+/// The same resolution and the same revisions blame reads, from the same
+/// functions, so the two surfaces cannot disagree about which entity a name
+/// means or which revisions are its own.
+pub fn execute_history_request_with(
+    authority: &RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    request: &HistoryRequest,
+) -> Result<HistoryResponse> {
+    let head = ref_lookup::resolve_ref_through(graph, authority, request.reference.as_deref())?;
+    let ref_lookup::EntityTimeline {
+        target,
+        revisions,
+        pointer,
+        choice,
+    } = ref_lookup::resolve_entity_timeline(
+        graph,
+        &request.entity,
+        &head.change_id,
+        request.reference.as_deref(),
+    )?;
     // Identifiers are abbreviated and messages are reduced to their subject
     // line, the way `git log --oneline` does. Printing two full 64-character
     // hashes per row plus a whole commit body pushed every readable field off
     // the right edge and turned a three-entry history into a wall of hex.
     let mut lines = vec![format!(
-        "History for '{}' ({:?}, {}) at {}:",
+        "History for '{}' ({:?}, {}){} at {}:",
         target.name,
         target.kind,
         target.language,
-        abbreviate_id(&head.to_string())
+        ref_lookup::pointer_suffix(&pointer),
+        abbreviate_id(&head.change_id.to_string())
     )];
+    lines.extend(choice);
 
     if revisions.is_empty() {
         lines.push("  No history recorded".to_string());
@@ -179,7 +184,7 @@ pub fn execute_history_request(
         let (revisions, withheld) = if request.all_revisions {
             (revisions, Vec::new())
         } else {
-            crate::commands::ref_lookup::split_own_revisions(&revisions)
+            ref_lookup::split_own_revisions(&revisions)
         };
         let mut rows = Vec::with_capacity(revisions.len());
         for revision in &revisions {
@@ -188,7 +193,7 @@ pub fn execute_history_request(
                 Some(entry) => (
                     calendar_date(&entry.timestamp.to_string()),
                     author_name(&entry.author.to_string()),
-                    subject_line(&entry.message),
+                    ref_lookup::subject_line(&entry.message),
                 ),
                 None => ("?".to_string(), "?".to_string(), "unknown".to_string()),
             };
@@ -200,10 +205,12 @@ pub fn execute_history_request(
             });
         }
         lines.extend(render_revision_rows(&rows));
-        if let Some(line) = crate::commands::ref_lookup::withheld_line(withheld.len()) {
+        if let Some(line) = ref_lookup::withheld_line(withheld.len()) {
             lines.push(line);
         }
     }
+    let closing = ref_lookup::closing_notes(&lines, head.authority_open);
+    lines.extend(closing);
 
     Ok(HistoryResponse { lines })
 }
