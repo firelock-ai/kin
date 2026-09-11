@@ -103,6 +103,26 @@ pub fn parse_entity_ref(token: &str) -> EntityRef {
     }
 }
 
+/// Spell a name and its pins as the one token every command's resolver reads.
+///
+/// The flags a command takes (`--file`, `--kind`) and the suffix a caller can
+/// type (`Name#kind@path`) are the same pin, so a command turns its flags into
+/// the suffix and the daemon reads one spelling. A pin already in the name and
+/// the same pin as a flag with a different value is refused by the resolver,
+/// not silently overridden here.
+pub fn compose_entity_ref(name: &str, file: Option<&str>, kind: Option<&str>) -> String {
+    let mut token = name.trim().to_string();
+    if let Some(kind) = kind.map(str::trim).filter(|kind| !kind.is_empty()) {
+        token.push('#');
+        token.push_str(kind);
+    }
+    if let Some(file) = file.map(str::trim).filter(|file| !file.is_empty()) {
+        token.push('@');
+        token.push_str(file);
+    }
+    token
+}
+
 /// Narrow `matches` to the entity whose span contains `line`.
 ///
 /// A no-op when nothing contains it. A line is a convenience for pointing at a

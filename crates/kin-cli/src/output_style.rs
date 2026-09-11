@@ -114,10 +114,17 @@ fn paint_refs(line: &str) -> String {
     // resolution marker trails the relation bracket, and the reference sites
     // trail that. Anchoring on any one shape loses the color silently, because
     // an unmatched line prints as plain text.
+    // A location the graph cannot vouch for carries `(span stale)` after the
+    // path, and stays part of the painted location.
     let entry = compiled(
         &ENTRY,
-        r"^  (.+) @ (\S+) \[([^\]]*)\](?: \(([^)]*)\))?(?: (sites .*))?$",
+        r"^  (.+) @ (\S+(?: \(span stale\))?) \[([^\]]*)\](?: \(([^)]*)\))?(?: (sites .*))?$",
     );
+    // The candidate note every resolving command shares (FIR-3505).
+    if let Some(rest) = line.strip_prefix("note: ") {
+        return format!("{DIM}note:{RESET} {rest}");
+    }
+
     if let Some(caps) = entry.captures(line) {
         let resolution = caps
             .get(4)
@@ -143,9 +150,11 @@ fn paint_impact(line: &str) -> String {
     static ENTITY: OnceLock<Regex> = OnceLock::new();
     static NOTE: OnceLock<Regex> = OnceLock::new();
 
+    // `(span stale)` after the path is part of the location when the graph
+    // cannot vouch for the line, so it stays inside the painted span.
     let header = compiled(
         &HEADER,
-        r"^Impact analysis for '(.*)' \(([^)]+)\)(?: @ (\S+))?:$",
+        r"^Impact analysis for '(.*)' \(([^)]+)\)(?: @ (\S+(?: \(span stale\))?))?:$",
     );
     if let Some(caps) = header.captures(line) {
         let at = caps
@@ -178,7 +187,10 @@ fn paint_impact(line: &str) -> String {
         return format!("{BOLD_WHITE}{line}{RESET}");
     }
 
-    let entity = compiled(&ENTITY, r"^    - (.+) \(([^)]+)\)(?: @ (\S+))?$");
+    let entity = compiled(
+        &ENTITY,
+        r"^    - (.+) \(([^)]+)\)(?: @ (\S+(?: \(span stale\))?))?$",
+    );
     if let Some(caps) = entity.captures(line) {
         let at = caps
             .get(3)
@@ -193,6 +205,10 @@ fn paint_impact(line: &str) -> String {
     let note = compiled(&NOTE, r"^  Note: (.*)$");
     if let Some(caps) = note.captures(line) {
         return format!("  {DIM}Note:{RESET} {}", &caps[1]);
+    }
+    // The candidate note every resolving command shares (FIR-3505).
+    if let Some(rest) = line.strip_prefix("note: ") {
+        return format!("{DIM}note:{RESET} {rest}");
     }
 
     line.to_string()
@@ -411,8 +427,10 @@ mod tests {
         let header = lines.first().expect("a response opens with its header");
         let painted = paint_refs(header);
         assert_painted(&painted, header, &format!("{BOLD_WHITE}probe_symbol"));
+        // The header points at the definition's own line (FIR-3548), and the
+        // line stays inside the painted location.
         assert!(
-            painted.contains(&format!("{ACCENT}target_mod.rs{RESET}")),
+            painted.contains(&format!("{ACCENT}target_mod.rs:1{RESET}")),
             "target location must be painted whole: {painted:?}"
         );
         assert!(painted.contains(&format!("{DIM}(Function)")));

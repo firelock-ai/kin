@@ -792,7 +792,7 @@ fn resolve_context_target(
         crate::entity_identity::resolve_identity(graph, &reference.name, &reference.qualifiers)?;
     let mut matches = resolved.matches;
     crate::entity_ref::apply_line(&mut matches, reference.line);
-    Ok(crate::entity_identity::choose_definition(&matches).cloned())
+    crate::entity_identity::choose_definition(graph, &matches)
 }
 
 fn parse_budget(s: &str) -> Result<TokenBudget> {
@@ -957,7 +957,7 @@ fn resolve_focal(
 
     let mut matches = resolved.matches.clone();
     crate::entity_ref::apply_line(&mut matches, reference.line);
-    let Some(chosen) = crate::entity_identity::choose_definition(&matches) else {
+    let Some(chosen) = crate::entity_identity::choose_definition(graph, &matches)? else {
         // The name is in the graph and the pin excluded every entity carrying
         // it. Naming the twins that do exist is what turns this from a dead end
         // into a correctable one.
@@ -969,7 +969,7 @@ fn resolve_focal(
         for candidate in resolved.name_matches.iter().take(8) {
             lines.push(format!(
                 "  {} ({})",
-                crate::entity_identity::entity_location(candidate),
+                crate::entity_identity::entity_location(graph, candidate),
                 kin_review::StableEntityIdentity::from_entity(candidate).kind
             ));
         }
@@ -984,7 +984,7 @@ fn resolve_focal(
             .with_twins(twins, reference.pin_note())
     };
     Ok(Ok(ResolvedFocal {
-        entity: chosen.clone(),
+        entity: chosen,
         resolution,
     }))
 }

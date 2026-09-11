@@ -80,7 +80,9 @@ impl DeclarationNeighbors {
     }
 }
 
-/// `path:line` for an entity, or just the path when the graph carries no span.
+/// `path:line` for an entity, just the path when the graph carries no span, or
+/// `path (span stale)` when the span describes an older version of the file
+/// than the graph holds; `None` when the entity has no file at all.
 ///
 /// Location is projection metadata for the human reading the listing; the
 /// analysis itself is keyed on graph identity, never on paths.
@@ -88,14 +90,11 @@ impl DeclarationNeighbors {
 /// The line is 1-based, through the same seam every other presentation surface
 /// converts at. A `path:line` string is read straight into an editor, so the
 /// raw graph row this used to emit put the reader one line above the entity.
-pub fn entity_location(entity: &Entity) -> Option<String> {
-    let path = entity.file_origin.as_ref().map(|f| f.0.clone())?;
-    Some(
-        match kin_mcp::handlers::common::entity_presentation_start_line(entity) {
-            Some(line) => format!("{path}:{line}"),
-            None => path,
-        },
-    )
+/// One implementation, [`crate::entity_identity::entity_pointer`], so no two
+/// listings can disagree about where an entity is.
+pub fn entity_location(graph: &impl GraphStore, entity: &Entity) -> Option<String> {
+    entity.file_origin.as_ref()?;
+    Some(crate::entity_identity::entity_pointer(graph, entity).render())
 }
 
 fn entity_kind_label(entity: &Entity) -> String {
@@ -148,7 +147,7 @@ fn collect_members(
                 relation_kinds,
             )?,
             kind: entity_kind_label(&entity),
-            location: entity_location(&entity).unwrap_or_else(|| "unknown".to_string()),
+            location: entity_location(graph, &entity).unwrap_or_else(|| "unknown".to_string()),
             name: entity.name,
         });
     }
@@ -177,7 +176,7 @@ fn collect_siblings(graph: &impl GraphStore, target: &Entity) -> Result<Vec<Sibl
         })
         .map(|entity| SiblingSummary {
             kind: entity_kind_label(&entity),
-            location: entity_location(&entity).unwrap_or_else(|| "unknown".to_string()),
+            location: entity_location(graph, &entity).unwrap_or_else(|| "unknown".to_string()),
             name: entity.name,
         })
         .collect();
