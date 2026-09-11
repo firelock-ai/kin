@@ -734,7 +734,7 @@ fn plan_review_note_add<G: GraphStore>(
 
     let review_id = parse_review_id(args, "review_id")?;
     let body = get_string_param(args, "body")?;
-    let scope = parse_optional_scope_arg(args)?;
+    let scope = parse_optional_scope_arg(args, store)?;
     let author = parse_identity_arg(args, "author", "author_kind", "mcp-client");
     existing_review(store, &review_id)?;
 
@@ -747,12 +747,13 @@ fn plan_review_note_add<G: GraphStore>(
         created_at: Timestamp::now(),
     };
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "note_id": note.note_id.to_string(),
         "review_id": review_id.to_string(),
         "scope": scope.map(|s| s.to_string()),
         "author": author.name,
     });
+    record_path_anchor_deprecations(&mut result, args, "kin_review_note_add");
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(PlannedReviewEvent {
         action: "review.note",
@@ -794,7 +795,7 @@ fn plan_review_discuss<G: GraphStore>(
 
     let review_id = parse_review_id(args, "review_id")?;
     let body = get_string_param(args, "body")?;
-    let scope = parse_optional_scope_arg(args)?;
+    let scope = parse_optional_scope_arg(args, store)?;
     let author = parse_identity_arg(args, "author", "author_kind", "mcp-client");
     existing_review(store, &review_id)?;
 
@@ -813,13 +814,14 @@ fn plan_review_discuss<G: GraphStore>(
         created_at: now,
     };
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "discussion_id": discussion_id.to_string(),
         "review_id": review_id.to_string(),
         "scope": scope.map(|s| s.to_string()),
         "state": "open",
         "author": author.name,
     });
+    record_path_anchor_deprecations(&mut result, args, "kin_review_discuss");
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(PlannedReviewEvent {
         action: "review.discuss",
@@ -1306,20 +1308,84 @@ fn parse_optional_work_scope(
         .transpose()
 }
 
-fn parse_optional_scope_arg(
+fn parse_optional_scope_arg<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
+    store: &G,
 ) -> Result<Option<kin_model::WorkScope>> {
     if let Some(scope) = parse_optional_work_scope(args.get("scope"))? {
         return Ok(Some(scope));
     }
 
     if let Some(file_path) = get_optional_string_param(args, "file_path") {
+        // A path and a line resolve to the entity that holds them, so the note
+        // anchors on the declaration a reader is pointing at rather than on the
+        // file it sits in. The anchor then survives the entity moving, which a
+        // path and a line do not.
+        let line = args
+            .get("line")
+            .and_then(serde_json::Value::as_u64)
+            .map(|line| line as u32);
+        if let Some(entity) = innermost_entity_at(store, &file_path, line)? {
+            return Ok(Some(kin_model::WorkScope::Entity(entity)));
+        }
         return Ok(Some(kin_model::WorkScope::Artifact(
             kin_model::FilePathId::new(file_path),
         )));
     }
 
     Ok(None)
+}
+
+/// The smallest entity in `file_path` whose span holds `line`, or `None` when no
+/// line was given and when none holds it.
+///
+/// Smallest wins because spans nest: the class containing a method contains the
+/// method's lines too, and a reader pointing at one of them means the method.
+/// The comparison runs on the presentation lines every other surface reports, so
+/// a caller's line means here what it means in the answers it read.
+fn innermost_entity_at<G: GraphStore>(
+    store: &G,
+    file_path: &str,
+    line: Option<u32>,
+) -> Result<Option<kin_model::EntityId>> {
+    let Some(line) = line else {
+        return Ok(None);
+    };
+    let filter = kin_model::graph::EntityFilter {
+        file_path: Some(kin_model::FilePathId::new(file_path)),
+        ..Default::default()
+    };
+    let entities = store.query_entities(&filter).map_err(McpError::graph)?;
+    Ok(entities
+        .into_iter()
+        .filter_map(|entity| {
+            let start = entity_presentation_start_line(&entity)?;
+            let end = entity_presentation_end_line(&entity)?;
+            (start <= line && line <= end).then_some((end.saturating_sub(start), entity.id))
+        })
+        .min_by_key(|(height, _)| *height)
+        .map(|(_, id)| id))
+}
+
+/// Note on the answer that the call anchored by path, once per parameter it
+/// passed. The `scope` the answer already carries says what it resolved to, an
+/// entity or the artifact, so a caller can see which happened.
+fn record_path_anchor_deprecations(
+    payload: &mut serde_json::Value,
+    args: &HashMap<String, serde_json::Value>,
+    tool: &str,
+) {
+    for parameter in ["file_path", "line"] {
+        if args.contains_key(parameter) {
+            crate::budget::record_deprecation(
+                payload,
+                tool,
+                parameter,
+                "scope: entity:<uuid>",
+                crate::budget::DEPRECATION_REMOVED_AFTER,
+            );
+        }
+    }
 }
 
 fn parse_review_create_scopes(
@@ -1547,7 +1613,7 @@ mod tests {
             let args: HashMap<String, serde_json::Value> =
                 serde_json::from_value(args).expect("an argument object");
             assert!(
-                parse_optional_scope_arg(&args).is_err(),
+                parse_optional_scope_arg(&args, &kin_db::InMemoryGraph::new()).is_err(),
                 "a misspelled scope must refuse: {args:?}"
             );
         }
@@ -1587,6 +1653,97 @@ mod tests {
         assert_eq!(value["deprecations"][0]["replacement"], "entity_ids");
     }
 
+    /// One entity per span, built here rather than borrowed, so the nesting this
+    /// test is about is explicit.
+    fn entity_spanning(
+        name: &str,
+        file: &str,
+        start_line: u32,
+        end_line: u32,
+    ) -> kin_model::Entity {
+        kin_model::Entity {
+            id: kin_model::EntityId::new(),
+            kind: kin_model::EntityKind::Function,
+            name: name.to_string(),
+            language: kin_model::LanguageId::Rust,
+            fingerprint: kin_model::entity::SemanticFingerprint {
+                algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: kin_model::Hash256::from_bytes([0; 32]),
+                signature_hash: kin_model::Hash256::from_bytes([0; 32]),
+                behavior_hash: kin_model::Hash256::from_bytes([0; 32]),
+                equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(kin_model::FilePathId::new(file)),
+            span: Some(kin_model::entity::SourceSpan {
+                file: kin_model::FilePathId::new(file),
+                start_byte: 0,
+                end_byte: 1,
+                start_line,
+                start_col: 0,
+                end_line,
+                end_col: 1,
+            }),
+            signature: format!("fn {name}()"),
+            visibility: kin_model::Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    /// A note anchored by file and line lands on the entity that holds the line,
+    /// and on the innermost one when spans nest. A line no entity holds, and a
+    /// path with no line at all, fall back to the artifact rather than guessing.
+    #[test]
+    fn a_path_anchor_resolves_to_the_entity_that_holds_the_line() {
+        use kin_model::graph::EntityStore;
+
+        let file = "src/editor.rs";
+        let store = kin_db::InMemoryGraph::new();
+        let outer = entity_spanning("outer", file, 0, 40);
+        let inner = entity_spanning("inner", file, 9, 12);
+        store.upsert_entity(&outer).unwrap();
+        store.upsert_entity(&inner).unwrap();
+
+        // Read the line to ask for off the same presentation helpers the answer
+        // reports, so this tests the rule and not a line-numbering convention.
+        let inside_inner = entity_presentation_start_line(&inner).expect("inner is placed");
+        let outside_every_span =
+            entity_presentation_end_line(&outer).expect("outer is placed") + 100;
+
+        let anchored = |line: Option<u32>| {
+            let mut args = HashMap::new();
+            args.insert("file_path".to_string(), serde_json::json!(file));
+            if let Some(line) = line {
+                args.insert("line".to_string(), serde_json::json!(line));
+            }
+            parse_optional_scope_arg(&args, &store)
+                .expect("an anchor resolves")
+                .expect("a file_path always anchors on something")
+                .to_string()
+        };
+
+        assert_eq!(
+            anchored(Some(inside_inner)),
+            format!("entity:{}", inner.id),
+            "the innermost span that holds the line wins"
+        );
+        assert_eq!(
+            anchored(Some(outside_every_span)),
+            format!("artifact:{file}"),
+            "a line no entity holds falls back to the artifact"
+        );
+        assert_eq!(
+            anchored(None),
+            format!("artifact:{file}"),
+            "a path with no line cannot name an entity"
+        );
+    }
+
     #[test]
     fn parse_review_create_scopes_accepts_uuid_and_paths() {
         let entity_id = uuid::Uuid::new_v4().to_string();
@@ -1608,7 +1765,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("file_path".into(), serde_json::json!("src/main.ts"));
 
-        let scope = parse_optional_scope_arg(&args).unwrap();
+        let scope = parse_optional_scope_arg(&args, &kin_db::InMemoryGraph::new()).unwrap();
         assert_eq!(scope.unwrap().to_string(), "artifact:src/main.ts");
     }
 
