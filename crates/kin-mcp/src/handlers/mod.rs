@@ -6498,11 +6498,25 @@ mod tests {
         let listed_artifacts = listed["artifacts"].as_array().unwrap();
         assert_eq!(listed_artifacts.len(), 7);
 
+        // A row names its path once: by `path_label` when the bytes are UTF-8, and
+        // by the byte-exact `path` only when the label cannot spell them.
+        for row in listed_artifacts {
+            let lossy = row["path_label_lossy"].as_bool().unwrap();
+            assert_eq!(
+                row.get("path").is_some(),
+                lossy,
+                "a row carries the byte-exact path exactly when its label is lossy: {row}"
+            );
+        }
         let find_path = |path: &kin_model::RepoPath| {
-            let wire = serde_json::to_value(path).unwrap();
             listed_artifacts
                 .iter()
-                .find(|artifact| artifact["path"] == wire)
+                .find(|artifact| match path.as_utf8() {
+                    Some(label) => {
+                        artifact["path_label"] == label && artifact["path_label_lossy"] == false
+                    }
+                    None => artifact["path"] == serde_json::to_value(path).unwrap(),
+                })
                 .unwrap()
         };
         assert_eq!(find_path(&compose_path)["entry"]["type"], "blob");

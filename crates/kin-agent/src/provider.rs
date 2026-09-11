@@ -69,7 +69,18 @@ impl ProviderConfig {
     pub fn models_url(&self) -> String {
         format!("{}/models", self.base_url)
     }
+
+    /// The server root the OpenAI-compatible base hangs off, where a server keeps its own
+    /// API beside the compatible one.
+    pub fn origin(&self) -> &str {
+        self.base_url
+            .strip_suffix("/v1")
+            .unwrap_or(self.base_url.as_str())
+    }
 }
+
+/// How long one context-window probe may take before the run starts without its answer.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What one completion cost, when the endpoint said.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -162,12 +173,25 @@ impl Provider {
             .unwrap_or_default())
     }
 
-    /// One turn. `tools` empty means a tool-free turn, which is how the forced final
-    /// answer is asked for: the model is given nothing to call.
+    /// One turn, waiting as long as the configured request timeout allows.
     pub fn complete(
         &self,
         messages: &[Value],
         tools: &[Value],
+    ) -> Result<Completion, ProviderError> {
+        self.complete_within(messages, tools, self.config.request_timeout)
+    }
+
+    /// One turn that waits at most `limit` for the whole answer, from connecting to the last
+    /// byte of the body. The loop passes what is left of the run's deadline, so a slow
+    /// endpoint ends the wait rather than stretching the run. `tools` empty means a
+    /// tool-free turn, which is how the forced final answer is asked for: the model is
+    /// given nothing to call.
+    pub fn complete_within(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        limit: Duration,
     ) -> Result<Completion, ProviderError> {
         let url = self.config.chat_url();
         let mut body = json!({
@@ -186,6 +210,7 @@ impl Provider {
         let started = std::time::Instant::now();
         let response = self
             .request(self.client.post(&url))
+            .timeout(limit)
             .json(&body)
             .send()
             .map_err(|source| ProviderError::Transport {
@@ -225,6 +250,48 @@ impl Provider {
         })
     }
 
+    /// The context window the endpoint reports for this model, in tokens, when it reports one.
+    ///
+    /// Read first off the OpenAI-compatible model list, where vLLM names `max_model_len` and
+    /// OpenRouter names `context_length`, then off LM Studio's own API, which is the one of
+    /// these that knows the context a model was LOADED with. A model's maximum is never taken
+    /// as its window: a model loaded below its maximum overflows at the loaded size, and a
+    /// budget built on the maximum would let the endpoint cut the conversation silently.
+    pub fn discover_context_window(&self) -> Option<u64> {
+        let model = self.config.model.as_str();
+        if model.is_empty() {
+            return None;
+        }
+        if let Some(tokens) = self
+            .get_json(&self.config.models_url())
+            .and_then(|payload| context_from_model_list(&payload, model))
+        {
+            return Some(tokens);
+        }
+        let origin = self.config.origin();
+        if let Some(tokens) = self
+            .get_json(&format!("{origin}/api/v1/models"))
+            .and_then(|payload| context_from_lmstudio_models(&payload, model))
+        {
+            return Some(tokens);
+        }
+        self.get_json(&format!("{origin}/api/v0/models/{model}"))
+            .and_then(|payload| context_from_lmstudio_model(&payload))
+    }
+
+    /// A short GET whose failure is an absent answer rather than an error, for probes.
+    fn get_json(&self, url: &str) -> Option<Value> {
+        let response = self
+            .request(self.client.get(url))
+            .timeout(DISCOVERY_TIMEOUT)
+            .send()
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json().ok()
+    }
+
     fn request(
         &self,
         builder: reqwest::blocking::RequestBuilder,
@@ -234,6 +301,65 @@ impl Provider {
             None => builder,
         }
     }
+}
+
+/// The window an OpenAI-compatible `/models` entry names for `model`, when it names one.
+pub(crate) fn context_from_model_list(payload: &Value, model: &str) -> Option<u64> {
+    let entry = payload
+        .get("data")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(model))?;
+    [
+        "loaded_context_length",
+        "max_model_len",
+        "context_length",
+        "context_window",
+    ]
+    .into_iter()
+    .find_map(|key| positive_tokens(entry.get(key)))
+}
+
+/// The smallest context any loaded LM Studio instance of `model` carries, from
+/// `/api/v1/models`. An instance is the model's when the model's key is the id asked for, or
+/// when the instance's own id is, which is how a second loaded copy is addressed.
+pub(crate) fn context_from_lmstudio_models(payload: &Value, model: &str) -> Option<u64> {
+    payload
+        .get("models")?
+        .as_array()?
+        .iter()
+        .flat_map(|entry| {
+            let keyed = entry.get("key").and_then(Value::as_str) == Some(model);
+            entry
+                .get("loaded_instances")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(move |instance| {
+                    keyed || instance.get("id").and_then(Value::as_str) == Some(model)
+                })
+        })
+        .filter_map(|instance| positive_tokens(instance.pointer("/config/context_length")))
+        .min()
+}
+
+/// The loaded context an LM Studio `/api/v0/models/<id>` answer carries. Its
+/// `max_context_length` is the model's maximum, not the loaded size, and is never read.
+pub(crate) fn context_from_lmstudio_model(payload: &Value) -> Option<u64> {
+    positive_tokens(payload.get("loaded_context_length"))
+}
+
+fn positive_tokens(value: Option<&Value>) -> Option<u64> {
+    let value = value?;
+    value
+        .as_u64()
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|tokens| tokens.is_finite() && *tokens >= 1.0)
+                .map(|tokens| tokens as u64)
+        })
+        .filter(|tokens| *tokens > 0)
 }
 
 fn truncate(text: &str, limit: usize) -> String {

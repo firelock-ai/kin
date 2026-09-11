@@ -5,11 +5,18 @@
 
 use anyhow::{Context, Result};
 use kin_agent::{
-    AgentConfig, ExitStatus, ProviderConfig, ServerSpec, DEFAULT_DEADLINE_S,
-    DEFAULT_MAX_TOOL_CALLS, DEFAULT_MCP_TIMEOUT_S, DEFAULT_REQUEST_TIMEOUT_S,
+    AgentConfig, ContextSource, ContextWindow, ExitStatus, ProviderConfig, ServerSpec,
+    DEFAULT_CONTEXT_TOKENS, DEFAULT_DEADLINE_S, DEFAULT_MAX_TOOL_CALLS, DEFAULT_MCP_TIMEOUT_S,
+    DEFAULT_REQUEST_TIMEOUT_S,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// The smallest context window a run accepts. Below it the system prompt and the tool specs
+/// alone leave no room for a conversation.
+const MIN_CONTEXT_TOKENS: u64 = 2_048;
+/// The smallest per-result ceiling a run accepts, so a cut result still says something.
+const MIN_RESULT_BYTES: usize = 1_024;
 
 /// Everything the `run` subcommand accepts.
 #[allow(clippy::too_many_arguments)]
@@ -23,6 +30,8 @@ pub struct RunArgs {
     pub out: Option<PathBuf>,
     pub max_tool_calls: Option<u32>,
     pub deadline: Option<u64>,
+    pub context_tokens: Option<u64>,
+    pub max_result_bytes: Option<usize>,
     pub system: Option<PathBuf>,
     pub temperature: Option<f32>,
     pub tool_profile: Option<String>,
@@ -30,6 +39,21 @@ pub struct RunArgs {
 
 /// Run one task. Returns the process exit code; the caller exits with it.
 pub fn run(args: RunArgs) -> Result<i32> {
+    if let Some(tokens) = args.context_tokens {
+        if tokens < MIN_CONTEXT_TOKENS {
+            anyhow::bail!(
+                "--context-tokens {tokens} is below the {MIN_CONTEXT_TOKENS} a run needs for its \
+                 system prompt, its tool specs and a conversation"
+            );
+        }
+    }
+    if let Some(bytes) = args.max_result_bytes {
+        if bytes < MIN_RESULT_BYTES {
+            anyhow::bail!(
+                "--max-result-bytes {bytes} is below the smallest ceiling, {MIN_RESULT_BYTES}"
+            );
+        }
+    }
     let servers = resolve_servers(&args.repo, &args.mcp_command, args.tool_profile.as_deref())?;
     // The first repository is the primary: the process working directory, the default for
     // a relative path, and the tree the transcript names.
@@ -60,6 +84,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
         temperature: args.temperature,
         request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_S),
     };
+    let context = resolve_context_window(args.context_tokens, &provider)?;
 
     let mut servers = servers;
     let primary = servers.remove(0);
@@ -75,6 +100,8 @@ pub fn run(args: RunArgs) -> Result<i32> {
         mcp_timeout: Duration::from_secs(DEFAULT_MCP_TIMEOUT_S),
         max_tool_calls: args.max_tool_calls.unwrap_or(DEFAULT_MAX_TOOL_CALLS),
         deadline: Duration::from_secs(args.deadline.unwrap_or(DEFAULT_DEADLINE_S)),
+        context,
+        max_result_bytes: args.max_result_bytes,
         tool_profile: args.tool_profile,
     };
 
@@ -91,6 +118,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
         attached,
         out.display()
     );
+    eprintln!("kin agent: {}", describe_budget(&config));
 
     let outcome = kin_agent::run(config)?;
     println!("{}", outcome.final_text);
@@ -109,7 +137,61 @@ pub fn run(args: RunArgs) -> Result<i32> {
             .unwrap_or(0),
         outcome.transcript_path.display()
     );
+    if let Some(detail) = outcome
+        .result
+        .pointer("/kin_agent/stop_detail")
+        .and_then(|value| value.as_str())
+    {
+        eprintln!("kin agent: stopped because {detail}");
+    }
     Ok(outcome.status.code())
+}
+
+/// The model's context window: the flag, else what the endpoint reports for the loaded
+/// model, else the default, with the source kept so the run can say which it used.
+fn resolve_context_window(flag: Option<u64>, provider: &ProviderConfig) -> Result<ContextWindow> {
+    if let Some(tokens) = flag {
+        return Ok(ContextWindow {
+            tokens,
+            source: ContextSource::Flag,
+        });
+    }
+    let reported = kin_agent::Provider::new(provider.clone())?.discover_context_window();
+    Ok(match reported {
+        Some(tokens) => ContextWindow {
+            tokens,
+            source: ContextSource::Endpoint,
+        },
+        None => ContextWindow {
+            tokens: DEFAULT_CONTEXT_TOKENS,
+            source: ContextSource::Default,
+        },
+    })
+}
+
+/// One line naming the run's budgets and where the window came from, printed before the
+/// run starts so a budget stop is never a surprise.
+fn describe_budget(config: &AgentConfig) -> String {
+    let window = match config.context.source {
+        ContextSource::Flag => format!(
+            "context window {} tokens (from --context-tokens)",
+            config.context.tokens
+        ),
+        ContextSource::Endpoint => format!(
+            "context window {} tokens (reported by the endpoint for the loaded model)",
+            config.context.tokens
+        ),
+        ContextSource::Default => format!(
+            "context window {} tokens (the endpoint reported none, so this is the default; pass \
+             --context-tokens to budget for the model's real window)",
+            config.context.tokens
+        ),
+    };
+    format!(
+        "{window}; one tool result is sent up to {} bytes; deadline {} s",
+        config.result_ceiling(),
+        config.deadline.as_secs()
+    )
 }
 
 /// Check both halves of the run are reachable before anyone spends a GPU on a task.
@@ -153,6 +235,21 @@ pub fn doctor(
                 false
             }
         };
+    // The window a run would budget for, so a context stop can be predicted before a run.
+    if provider_ok && model.is_some() {
+        let reported = kin_agent::Provider::new(provider.clone())
+            .ok()
+            .and_then(|client| client.discover_context_window());
+        match reported {
+            Some(tokens) => println!(
+                "  context window: {tokens} tokens, as the endpoint reports the loaded model"
+            ),
+            None => println!(
+                "  context window: not reported; a run budgets for {DEFAULT_CONTEXT_TOKENS} \
+                 tokens unless --context-tokens names the model's real window"
+            ),
+        }
+    }
 
     // Every attached repository is probed, because a run that cannot reach the second
     // server fails just as completely as one that cannot reach the first.

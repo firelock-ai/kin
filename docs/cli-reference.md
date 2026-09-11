@@ -1339,6 +1339,8 @@ kin agent run --task <FILE|TEXT> --model <ID> --base-url <URL> [options]
 | `--out <dir>` | `.kin/agent/<timestamp>` | Directory for the transcript, the Kin trace and the result record |
 | `--max-tool-calls <n>` | `40` | Tool-call budget before the agent is asked for a final answer |
 | `--deadline <s>` | `900` | Wall-clock deadline in seconds |
+| `--context-tokens <n>` | what the endpoint reports, else `32768` | The model's context window in tokens |
+| `--max-result-bytes <n>` | an eighth of the window, at most `32768` | Most bytes of one tool result sent to the model |
 | `--system <file>` |  | File holding a system prompt that replaces the built-in one |
 | `--temperature <f>` |  | Sampling temperature passed through to the endpoint |
 | `--tool-profile <profile>` |  | Tool surface the MCP server should serve |
@@ -1349,10 +1351,24 @@ unchanged. `kin-trace.jsonl` is one row per tool call carrying the `_kin` envelo
 `negative` verdict and the policy decision, joinable to the transcript on `tool_use_id`.
 `result.json` is the terminal record on its own.
 
+Three bounds hold on every run. The deadline covers every wait, the endpoint's included: a
+request still unanswered when it passes is abandoned and the run stops with `deadline` as
+its reason. One tool result is sent to the model up to `--max-result-bytes`, and a longer
+one is cut with a note naming its size, the ceiling and how to page. The conversation is
+kept inside the model's context window: the window comes from `--context-tokens`, else from
+what the endpoint reports for the loaded model (LM Studio's own API, vLLM's
+`max_model_len`, OpenRouter's `context_length`), else `32768`, and the first line on
+stderr says which. The estimate starts from the endpoint's own prompt count each turn, a
+result the conversation cannot hold is withheld with a note, and the agent is asked for its
+final answer before the next request would overflow. The result record carries the reason
+in `stop_reason` and `stop_detail`, and the budget under `context`.
+
 The exit code is the run's outcome: `0` a final answer, `1` a harness error, `2` the
 tool-call budget was spent, `3` the deadline expired, `4` the endpoint was unreachable or
-answered with nothing usable, `5` the MCP server failed. A transcript is written and
-closed on every one of them, so a failed run is still measurable.
+answered with nothing usable, `5` the MCP server failed, `6` the run changed files that
+repository authority never published, `7` the conversation reached the model's context
+window. A transcript is written and closed on every one of them, so a failed run is still
+measurable.
 
 #### `kin agent doctor`
 
@@ -1371,7 +1387,9 @@ kin agent doctor --base-url <URL> [options]
 | `--api-key-env <name>` |  | Name of an environment variable holding the API key |
 | `--tool-profile <profile>` |  | Tool surface the MCP server should serve |
 
-Exit `0` when both answer, `4` when the endpoint does not, `5` when the MCP server does not.
+Given `--model`, it also prints the context window the endpoint reports for that model,
+which is the window a run budgets for. Exit `0` when both answer, `4` when the endpoint
+does not, `5` when the MCP server does not.
 
 ### `kin exec`
 

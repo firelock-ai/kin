@@ -2117,6 +2117,12 @@ enum AgentAction {
         /// Wall-clock deadline in seconds
         #[arg(long, value_name = "S")]
         deadline: Option<u64>,
+        /// The model's context window in tokens (default: what the endpoint reports, else 32768)
+        #[arg(long = "context-tokens", value_name = "N")]
+        context_tokens: Option<u64>,
+        /// Most bytes of one tool result sent to the model (default: an eighth of the window, at most 32768)
+        #[arg(long = "max-result-bytes", value_name = "N")]
+        max_result_bytes: Option<usize>,
         /// File holding a system prompt that replaces the built-in one
         #[arg(long, value_name = "FILE")]
         system: Option<PathBuf>,
@@ -3754,6 +3760,8 @@ fn run() -> Result<()> {
                             out,
                             max_tool_calls,
                             deadline,
+                            context_tokens,
+                            max_result_bytes,
                             system,
                             temperature,
                             tool_profile,
@@ -3767,6 +3775,8 @@ fn run() -> Result<()> {
                             out,
                             max_tool_calls,
                             deadline,
+                            context_tokens,
+                            max_result_bytes,
                             system,
                             temperature,
                             tool_profile,
@@ -3789,9 +3799,10 @@ fn run() -> Result<()> {
                     })
                     .join()
                     .map_err(|_| anyhow::anyhow!("the agent thread panicked"))??;
-                    // The run's own taxonomy is reported through the exit code: 2 budget,
-                    // 3 deadline, 4 endpoint, 5 MCP. A caller must be able to tell a task
-                    // the agent could not do from an endpoint that was never there.
+                    // The run's own taxonomy is reported through the exit code: 2 tool-call
+                    // budget, 3 deadline, 4 endpoint, 5 MCP, 6 changes unpublished, 7 context
+                    // window. A caller must be able to tell a task the agent could not do
+                    // from an endpoint that was never there.
                     if code != 0 {
                         std::process::exit(code);
                     }
