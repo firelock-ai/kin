@@ -798,6 +798,29 @@ pub(crate) fn cached_authority_admission(
     Ok((admission.roots, admission.policy))
 }
 
+/// The admission pair for the current publication when it is already held, and
+/// `None` when holding it would take a load.
+///
+/// For a caller that must answer now. A load is a whole-store open, and behind
+/// the load gate it also waits out any other caller's open: `/health` took
+/// 11,332.9 ms and 10,134.4 ms on a 3.5 GiB scratch store doing exactly that,
+/// past every client's health budget. The publication record it reads is one
+/// small file, so this costs what a cache hit costs.
+pub(crate) fn held_authority_admission(
+    state: &DaemonState,
+) -> Option<(
+    kin_model::RootBundle,
+    Option<kin_index::ResolvedAdmissionMatcher>,
+)> {
+    let backend = state.local_repository_backend()?;
+    let binding = state.local_repository_authority_binding().ok()?;
+    let published = read_local_publication_identity(&backend, binding.repository_id()).ok()?;
+    state
+        .projection_authority
+        .reuse_admission(&published)
+        .map(|admission| (admission.roots, admission.policy))
+}
+
 pub(crate) fn cached_authority_has_open_merge(
     state: &DaemonState,
 ) -> Result<bool, (StatusCode, String)> {
@@ -4161,6 +4184,27 @@ async fn raise_idle_timeout(
     .into_response()
 }
 
+/// [`measure_untracked_host_content`] for `/health`, which answers every
+/// client's liveness probe and must do so inside its budget. It never pays for
+/// or waits out an admission-pair load, and leaves the previous reading with its
+/// age when the pair for the current publication is not already held.
+async fn measure_untracked_host_content_now(state: &Arc<DaemonState>) {
+    let probing = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || {
+        crate::loop_runner::refresh_untracked_reading_without_waiting(&probing)
+    })
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "could not measure untracked host content")
+        }
+        Err(error) => {
+            tracing::debug!(%error, "the untracked host-content measurement did not run")
+        }
+    }
+}
+
 async fn health(
     Query(repo_query): Query<RepoQuery>,
     State(state): State<Arc<DaemonState>>,
@@ -4208,7 +4252,7 @@ async fn health(
     let coordination_event_persist_failures = state
         .coordination_event_persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
-    measure_untracked_host_content(&state).await;
+    measure_untracked_host_content_now(&state).await;
     let sampled_at = std::time::Instant::now();
     let background_passes = state.background_work.reports(sampled_at);
     let background_pass_stopped = state.background_work.any_stopped();
@@ -35150,6 +35194,55 @@ mod tests {
             .unwrap();
         let repeated_digest: [u8; 32] = Sha256::digest(&repeated).into();
         assert_eq!(repeated_digest, first_digest);
+    }
+
+    /// `/health` answers while another caller holds the admission-pair load.
+    ///
+    /// Measured on a 3.5 GiB scratch store: `/health` took 11,332.9 ms and
+    /// 10,134.4 ms waiting on that load, past the client's 2 s health budget, so
+    /// a daemon that was only busy read as one that did not answer. The load
+    /// gate is held on another thread here, as an open in flight holds it, with
+    /// the pair cold, which is the state a moved publication leaves.
+    ///
+    /// Breaking it: measure through the waiting refresh again, and this waits
+    /// for the gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_answers_while_the_admission_pair_is_loading() {
+        let state = test_state();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let gate_state = Arc::clone(&state);
+        let holder = std::thread::spawn(move || {
+            let _gate = lock_recover(&gate_state.projection_authority.load_gate);
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(4));
+        });
+        held_rx.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        let response = router(Arc::clone(&state))
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let waited = started.elapsed();
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            waited < Duration::from_secs(2),
+            "/health waited {waited:?} on another caller's admission-pair load"
+        );
+
+        // Non-vacuity: this state does reach the pair. With the gate free, the
+        // waiting refresh loads it, so the answer above was fast because
+        // `/health` did not wait, not because it had nothing to wait for.
+        let loads = state.projection_authority.loads();
+        crate::loop_runner::refresh_untracked_reading(&state).unwrap();
+        assert!(
+            state.projection_authority.loads() > loads,
+            "the waiting refresh must load the admission pair on this state"
+        );
     }
 
     #[tokio::test]
