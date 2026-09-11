@@ -510,7 +510,7 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "artifact_id": { "type": "string", "format": "uuid" },
                         "path": {
-                            "description": "Repository-relative path as kin_artifact_list prints it in path_label (a leading / is tolerated), or {\"bytes_hex\": ...} for a path whose bytes are not valid UTF-8.",
+                            "description": "Repo-relative path as in path_label (a leading / is fine), or {bytes_hex} for non-UTF-8",
                             "anyOf": [
                                 { "type": "string", "minLength": 1 },
                                 {
