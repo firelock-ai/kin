@@ -31,7 +31,8 @@ const schemaFiles = {
   shadowGateReport: 'shadow-gate-report.schema.json',
   hostedRepositoryTransfer: 'hosted-repository-transfer.schema.json',
   graphExport: 'graph-export.schema.json',
-  graphEvent: 'graph-event.schema.json'
+  graphEvent: 'graph-event.schema.json',
+  repoEntities: 'repo-entities.schema.json'
 };
 
 const schemaIdMap = {

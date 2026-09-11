@@ -32,6 +32,7 @@ test('all schemas load', async () => {
   assert.ok(schemas.repoScopedSemanticToolError);
   assert.ok(schemas.shadowGateReport);
   assert.ok(schemas.daemonError);
+  assert.ok(schemas.repoEntities);
 });
 
 test('a daemon refusal body carries its marker only when the daemon set it', async () => {
@@ -998,6 +999,90 @@ test('the graph feed shape is one contract the Rust, the schema and the declarat
     ['GraphExportLink', rustStructFields(exportSource, 'GraphExportLink').fields, Object.keys(exportSchema.$defs.link.properties)],
     ['GraphExport', rustStructFields(exportSource, 'GraphExportPayload').fields, Object.keys(exportSchema.properties)],
     ['GraphNodeSummary', rustStructFields(stateSource, 'GraphNodeSummary').fields, Object.keys(eventSchema.$defs.nodeSummary.properties)]
+  ];
+
+  for (const [name, rustFields, schemaFields] of pairs) {
+    assert.deepEqual(
+      [...rustFields].sort(),
+      [...schemaFields].sort(),
+      `${name}: the Rust struct and the JSON Schema must carry the same fields`
+    );
+    const declared = declaredInterfaceFields(declarations, name);
+    assert.ok(declared, `${name} must be declared in index.d.ts`);
+    assert.deepEqual(
+      [...declared].sort(),
+      [...rustFields].sort(),
+      `${name}: the TypeScript declaration and the Rust struct must carry the same fields`
+    );
+  }
+});
+
+const minimalEntities = {
+  repo_id: 'kin',
+  entities: [
+    { id: 'e1', name: 'alpha', kind: 'Function', file_path: 'src/a.rs' },
+    { id: 'e2', name: 'Beta::make', kind: 'Method', file_path: null }
+  ]
+};
+
+test('an entity list is identity first, and everything ranked rides along', async () => {
+  // The identity shape is what this route has always served, and it stays
+  // valid on its own: a consumer reading it does not have to learn the rest.
+  assert.equal((await validateContract('repoEntities', minimalEntities)).ok, true);
+
+  const ranked = structuredClone(minimalEntities);
+  ranked.total = 2;
+  ranked.entities[0].degree = 12;
+  ranked.entities[0].dependents = 4;
+  ranked.entities[0].signature = 'fn alpha() -> usize';
+  ranked.entities[0].summary = 'Counts what alpha counts.';
+  assert.equal(
+    (await validateContract('repoEntities', ranked)).ok,
+    true,
+    'the ranked answer is the same contract with more of it filled in'
+  );
+
+  const { file_path: _dropped, ...noPath } = minimalEntities.entities[0];
+  assert.equal(
+    (await validateContract('repoEntities', { ...minimalEntities, entities: [noPath] })).ok,
+    false,
+    'null is how a row says the graph placed this entity in no file, so the field cannot be absent'
+  );
+
+  const unknown = structuredClone(minimalEntities);
+  unknown.entities[0].rank = 3;
+  assert.equal(
+    (await validateContract('repoEntities', unknown)).ok,
+    false,
+    'a field nobody agreed on is how the three copies of this shape drift apart'
+  );
+});
+
+test('the entity list shape is one contract the Rust, the schema and the declarations agree on', async () => {
+  const [declarations, apiSource, schema] = await Promise.all([
+    fs.readFile(path.join(packageRoot, 'src/index.d.ts'), 'utf8'),
+    fs.readFile(path.join(repositoryRoot, 'crates/kin-daemon/src/api.rs'), 'utf8'),
+    loadSchema('repoEntities')
+  ]);
+
+  // The extractor must be shown to work before an empty result reads as agreement.
+  assert.equal(rustStructFields(apiSource, 'RepoEntityNotAStruct'), null);
+  assert.ok(
+    rustStructFields(apiSource, 'RepoEntityEntry').fields.includes('dependents'),
+    'the Rust extractor must find a field the struct is known to declare'
+  );
+
+  const pairs = [
+    [
+      'RepoEntityEntry',
+      rustStructFields(apiSource, 'RepoEntityEntry').fields,
+      Object.keys(schema.$defs.entity.properties)
+    ],
+    [
+      'RepoEntitiesResponse',
+      rustStructFields(apiSource, 'RepoEntitiesResponse').fields,
+      Object.keys(schema.properties)
+    ]
   ];
 
   for (const [name, rustFields, schemaFields] of pairs) {
