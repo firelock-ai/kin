@@ -16,7 +16,7 @@ without writing first, so neither could see the composition. This suite runs the
 binaries end to end: `kin init`, `kin agent run` against a scripted chat endpoint, and a
 direct `kin mcp start` session to read the result back.
 
-Four checks, one repository, run in order:
+Five checks, one repository, run in order:
 
   edit_lands            an `edit_file` on a tracked function commits: the run exits 0,
                         the file holds the new text, `get_entity_source` answers with the
@@ -29,6 +29,14 @@ Four checks, one repository, run in order:
   refused_create_is_clean
                         a `write_file` over a tracked path is refused, the tracked file
                         keeps its text, and the refused content comes back to the model
+  edit_survives_a_daemon_restart
+                        the repository's daemon is stopped after the agent's session opens
+                        and before its first edit, as an unattended update did in the
+                        demo's real-model run. Sessions live in the daemon, so begin is
+                        refused for a session that no longer exists; the harness must open
+                        a new one and commit through it. The run exits 0, the file and
+                        `get_entity_source` carry the edit, durability reads `recorded`,
+                        and no edit is written outside a transaction
 
 What it is blind to: it drives one agent, one repository and one scripted conversation. It
 does not grade the cost of a commit, the delegate's retry on a slow one, or a real model.
@@ -48,10 +56,12 @@ import functools
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 try:
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -83,6 +93,11 @@ REFUSED_REPLACE = "/* pub fn kept() -> u8 {"
 CREATED_PATH = "src/added.rs"
 CREATED_BODY = "pub fn added() -> u8 {\n    3\n}\n"
 OVERWRITE_BODY = "# replaced wholesale\n"
+
+# The edit made after the daemon is restarted, on a function no earlier check changes.
+RESTART_FIND = "pub fn other() -> u8 {\n    4\n}"
+RESTART_REPLACE = "/// The other value.\npub fn other() -> u8 {\n    0x2b\n}"
+RESTART_MARKER = "0x2b"
 
 
 def run(cmd, cwd=None, env=None, timeout=600):
@@ -187,6 +202,44 @@ def grade_refused_create_is_clean(rc, disk_before, disk_after, tool_result):
     return PASS, "the refused write left the tracked file alone and handed the content back"
 
 
+def grade_edit_survives_a_daemon_restart(stop, rc, disk, source_payload, status_payload, trace):
+    """`stop` is the restart's (rc, detail); `trace` is the run's kin-trace rows."""
+    if not stop or stop[0] != 0:
+        return UNREADABLE, "no restart was exercised: %s" % (
+            stop[1] if stop else "the model endpoint was never asked for its first answer")
+    if rc is None or disk is None or source_payload is None or status_payload is None \
+            or trace is None:
+        return UNREADABLE, "the run or its read-back produced nothing to grade"
+    problems = []
+    if rc != 0:
+        problems.append("kin agent run exited %s, not 0" % rc)
+    if RESTART_MARKER not in disk:
+        problems.append("the file on disk does not carry the edit")
+    if not mentions(source_payload, RESTART_MARKER):
+        problems.append("get_entity_source still answers with the old body")
+    state = durability_state(status_payload)
+    if state != "recorded":
+        problems.append("durability reads %r, not 'recorded'" % state)
+    edits = [row for row in trace if row.get("surface") == "local"
+             and row.get("tool") in ("edit_file", "write_file")]
+    if not edits:
+        problems.append("the trace records no edit")
+    for row in edits:
+        provenance = row.get("provenance") or {}
+        if provenance.get("closed_with") != "kin_transaction_commit" \
+                or provenance.get("closed_cleanly") is not True:
+            problems.append("the edit did not commit through a transaction (%s)" % (
+                provenance.get("reason") or provenance.get("detail") or "no reason recorded"))
+    if problems:
+        return FAIL, "; ".join(problems)
+    refused = any(row.get("tool") == "kin_transaction_begin" and row.get("is_error")
+                  and "Session not found" in str(row.get("detail") or "") for row in trace)
+    sessions = sum(1 for row in trace if row.get("tool") == "kin_session_start")
+    how = ("begin was refused for the gone session and the harness opened a new one"
+           if refused and sessions >= 2 else "no begin was refused after the restart")
+    return PASS, "the edit committed through Kin after a daemon restart; %s" % how
+
+
 # ── the scripted chat endpoint ─────────────────────────────────────────────
 
 
@@ -204,10 +257,15 @@ def completion(text, tool=None, arguments=None):
 
 
 class Endpoint(object):
-    """One scripted conversation: each request pops the next answer."""
+    """One scripted conversation: each request pops the next answer.
 
-    def __init__(self, script):
+    `before_first`, when given, runs once before the first answer goes back, while the
+    agent waits on its model, which is where a real model spends its long turns.
+    """
+
+    def __init__(self, script, before_first=None):
         answers = list(script)
+        pending = [before_first] if before_first else []
         lock = threading.Lock()
 
         class Handler(BaseHTTPRequestHandler):
@@ -228,6 +286,8 @@ class Endpoint(object):
             def do_POST(self):
                 self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 with lock:
+                    while pending:
+                        pending.pop(0)()
                     answer = answers.pop(0) if answers else completion("Done.")
                 self._send(answer)
 
@@ -299,12 +359,17 @@ class Suite(object):
         self.verbose = verbose
         self.env = dict(os.environ)
         self.env["KIN_HOME"] = os.path.join(workdir, "home")
+        # KIN_HOME does not move the supervisor. It lives beside an explicit
+        # KIN_REGISTRY_PATH, or else in the real home's `.kin`, where a daemon started
+        # here would take the machine-wide supervisor with the build under test.
+        self.env["KIN_REGISTRY_PATH"] = os.path.join(workdir, "home", "registry.toml")
         self.env.pop("KIN_MCP_REPO", None)
         if daemon:
             self.env["KIN_DAEMON_BIN"] = daemon
         self._repo = None
         self._setup_error = None
         self._runs = 0
+        self.last_trace = None
 
     def git(self, cwd, args):
         # The caller's global and system git config stay out of the fixture: a hooks
@@ -356,11 +421,15 @@ class Suite(object):
         with open(path) as handle:
             return handle.read()
 
-    def agent(self, script):
-        """Run `kin agent run` through one scripted conversation; return rc and its trace."""
+    def agent(self, script, before_first=None):
+        """Run `kin agent run` through one scripted conversation.
+
+        Returns the exit code and the last tool result the model was sent, and keeps the
+        run's kin-trace rows on `last_trace`.
+        """
         self._runs += 1
         out = os.path.join(self.workdir, "run-%d" % self._runs)
-        endpoint = Endpoint(script)
+        endpoint = Endpoint(script, before_first=before_first)
         try:
             rc, stdout, stderr = run([self.kin, "agent", "run", "--task",
                                       "Make the change the conversation asks for.",
@@ -381,10 +450,46 @@ class Suite(object):
                     for block in (record.get("message") or {}).get("content") or []:
                         if isinstance(block, dict) and block.get("type") == "tool_result":
                             tool_result = block.get("content")
+        self.last_trace = None
+        trace = os.path.join(out, "kin-trace.jsonl")
+        if os.path.exists(trace):
+            with open(trace) as handle:
+                self.last_trace = [json.loads(line) for line in handle if line.strip()]
         return rc, tool_result
 
     def mcp(self):
         return Mcp([self.kin, "mcp", "start", "--repo", self.repo()], self.env, self.workdir)
+
+    def stop_daemon(self):
+        """Stop this fixture's daemon with `kin daemon stop` and wait for its port to close.
+
+        Returns (rc, detail). The port is read first, because a stopped daemon removes its
+        endpoint files.
+        """
+        port = None
+        port_file = os.path.join(self.repo(), ".kin", "daemon.port")
+        if os.path.exists(port_file):
+            with open(port_file) as handle:
+                text = handle.read().strip()
+            port = int(text) if text.isdigit() else None
+        if port is None:
+            return 1, "no daemon was serving the fixture when the restart was due"
+        rc, _, err = run([self.kin, "daemon", "stop"], cwd=self.repo(), env=self.env,
+                         timeout=180)
+        if rc != 0:
+            return rc, "kin daemon stop exited %s: %s" % (rc, err.strip()[-300:])
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            probe.settimeout(1)
+            try:
+                probe.connect(("127.0.0.1", port))
+            except OSError:
+                return 0, "the daemon on port %d stopped" % port
+            finally:
+                probe.close()
+            time.sleep(0.5)
+        return 1, "the daemon on port %d still answered 60 s after kin daemon stop" % port
 
 
 class Result(object):
@@ -458,11 +563,34 @@ def check_refused_create_is_clean(suite):
     return Result("refused_create_is_clean", verdict, "%s %s" % (TICKET, detail))
 
 
+def check_edit_survives_a_daemon_restart(suite):
+    stop = []
+    rc, _ = suite.agent([completion("Documenting other.", "edit_file",
+                                    {"path": "src/other.rs", "find": RESTART_FIND,
+                                     "replace": RESTART_REPLACE}),
+                         completion("other is documented.")],
+                        before_first=lambda: stop.append(suite.stop_daemon()))
+    session = suite.mcp()
+    try:
+        listed = session.call("list_file_entities", {"path": "src/other.rs", "limit": 50})
+        focal = entity_id(listed, "other")
+        source = session.call("get_entity_source", {"entity_id": focal}) if focal else None
+        status = session.call("kin_graph_status", {})
+    finally:
+        session.close()
+    verdict, detail = grade_edit_survives_a_daemon_restart(
+        stop[0] if stop else None, rc, suite.read("src/other.rs"), source, status,
+        suite.last_trace)
+    return Result("edit_survives_a_daemon_restart", verdict, "%s %s" % (TICKET, detail))
+
+
 CHECKS = [
     ("edit_lands", check_edit_lands),
     ("refused_edit_is_clean", check_refused_edit_is_clean),
     ("create_lands", check_create_lands),
     ("refused_create_is_clean", check_refused_create_is_clean),
+    # Last, because it stops the daemon every earlier check ran against.
+    ("edit_survives_a_daemon_restart", check_edit_survives_a_daemon_restart),
 ]
 
 
@@ -480,8 +608,10 @@ def absolute_binary(path):
 
 def self_test():
     failures = []
+    checked = []
 
     def expect(what, got, want):
+        checked.append(what)
         if got != want:
             failures.append("%s: got %s, want %s" % (what, got, want))
 
@@ -524,13 +654,49 @@ def self_test():
     expect("refused create without its content",
            grade_refused_create_is_clean(6, README, README, "did not publish it")[0], FAIL)
 
+    stopped = (0, "the daemon on port 1 stopped")
+    other_edited = OTHER_RS.replace(RESTART_FIND, RESTART_REPLACE)
+    new_other = {"source": RESTART_REPLACE, "_kin": {}}
+    old_other = {"source": RESTART_FIND, "_kin": {}}
+    committed = {"surface": "local", "tool": "edit_file",
+                 "provenance": {"bracketed": True, "closed_with": "kin_transaction_commit",
+                                "closed_cleanly": True}}
+    reopened = [{"tool": "kin_session_start"},
+                {"tool": "kin_transaction_begin", "is_error": True,
+                 "detail": "Session not found: s1. It was ended or expired after its idle "
+                           "timeout."},
+                {"tool": "kin_session_start"}, {"tool": "kin_transaction_begin"},
+                {"tool": "kin_transaction_stage"}, {"tool": "kin_transaction_commit"},
+                committed]
+    written_locally = [{"tool": "kin_session_start"},
+                       {"tool": "kin_transaction_begin", "is_error": True,
+                        "detail": "Session not found: s1."},
+                       {"surface": "local", "tool": "edit_file",
+                        "provenance": {"bracketed": False, "reason": "Session not found: s1."}}]
+    expect("edit survives a restart",
+           grade_edit_survives_a_daemon_restart(stopped, 0, other_edited, new_other, recorded,
+                                                reopened)[0], PASS)
+    expect("restart ends in a local write",
+           grade_edit_survives_a_daemon_restart(stopped, 0, other_edited, old_other,
+                                                uncommitted, written_locally)[0], FAIL)
+    expect("restart ends in a refusal",
+           grade_edit_survives_a_daemon_restart(stopped, 6, OTHER_RS, old_other, recorded,
+                                                written_locally)[0], FAIL)
+    expect("restart's local write picked up only by the reconcile loop",
+           grade_edit_survives_a_daemon_restart(stopped, 0, other_edited, new_other, recorded,
+                                                written_locally)[0], FAIL)
+    expect("restart never happened",
+           grade_edit_survives_a_daemon_restart((1, "kin daemon stop exited 1"), 0,
+                                                other_edited, new_other, recorded,
+                                                reopened)[0], UNREADABLE)
+
     report = report_payload([Result("edit_lands", PASS, "x")])
     expect("report keyed results", sorted(report), ["results", "suite", "ticket"])
     expect("report row id", report["results"][0]["id"], "edit_lands")
 
     for failure in failures:
         print("SELF-TEST FAIL %s" % failure)
-    print("SELF-TEST %s (%d expectations)" % ("FAIL" if failures else "PASS", 17))
+    print("SELF-TEST %s (%d expectations)" % ("FAIL" if failures else "PASS", len(checked)))
     return 1 if failures else 0
 
 
