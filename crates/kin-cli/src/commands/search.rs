@@ -2572,9 +2572,13 @@ mod query_producer_evidence_tests {
         let factor = verdict["limiting_factor"]
             .as_str()
             .expect("an inconclusive verdict names its limiting factor");
+        // Envelope v2 names the refusing input by its code. The mismatch itself
+        // is the `vector_index` degradation asserted above, which is where the
+        // fact lives, so the factor has to name the code that points at it.
         assert!(
-            factor.contains(reason),
-            "the limiting factor must name the producer mismatch itself: {factor}"
+            factor.split("; ").any(|code| code == "retrieval_degraded"),
+            "the limiting factor must name the degradation carrying the producer mismatch: \
+             {factor}"
         );
     }
 

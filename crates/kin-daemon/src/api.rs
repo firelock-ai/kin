@@ -45557,27 +45557,22 @@ mod tests {
         assert_eq!(
             block.live_only_relations,
             Some(1),
-            "the swept relation belongs to no committed change and the count has to say so: {}",
-            block.note
+            "the swept relation belongs to no committed change and the count has to say so: {block:?}"
         );
         assert_eq!(
             block.live_only_entities,
             Some(0),
-            "no entity moved, and the entity axis must not borrow the relation reading: {}",
-            block.note
+            "no entity moved, and the entity axis must not borrow the relation reading: {block:?}"
         );
-        assert_eq!(block.state, "live_uncommitted", "{}", block.note);
+        assert_eq!(block.state, "live_uncommitted", "{block:?}");
+        // Envelope v2 states the uncommitted count of each axis as the two
+        // fields asserted above and sends no sentence that could claim more.
         assert!(
-            block
-                .note
-                .contains("0 entities and 1 relations are uncommitted"),
-            "the note states the uncommitted count of each: {}",
-            block.note
-        );
-        assert!(
-            !block.note.contains("everything"),
-            "no sentence over one axis may claim the whole graph: {}",
-            block.note
+            serde_json::to_value(&block)
+                .expect("durability serializes")
+                .get("note")
+                .is_none(),
+            "no sentence rides this block, so none can claim the whole graph: {block:?}"
         );
     }
 
@@ -45789,9 +45784,9 @@ mod tests {
         .await;
         assert_ne!(status.is_error, Some(true), "{}", mcp_result_text(&status));
         let block = durability_block(&state).await;
-        assert_eq!(block.state, "recorded", "{}", block.note);
-        assert_eq!(block.live_only_entities, Some(0), "{}", block.note);
-        assert_eq!(block.live_only_relations, Some(0), "{}", block.note);
+        assert_eq!(block.state, "recorded", "{block:?}");
+        assert_eq!(block.live_only_entities, Some(0), "{block:?}");
+        assert_eq!(block.live_only_relations, Some(0), "{block:?}");
 
         let context =
             crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
@@ -45829,9 +45824,9 @@ mod tests {
         );
 
         let block = durability_block(&state).await;
-        assert_eq!(block.state, "recorded", "{}", block.note);
-        assert_eq!(block.live_only_entities, Some(0), "{}", block.note);
-        assert_eq!(block.live_only_relations, Some(0), "{}", block.note);
+        assert_eq!(block.state, "recorded", "{block:?}");
+        assert_eq!(block.live_only_entities, Some(0), "{block:?}");
+        assert_eq!(block.live_only_relations, Some(0), "{block:?}");
         assert_eq!(
             block.live_relations,
             Some(state.graph.relation_count() as u64)

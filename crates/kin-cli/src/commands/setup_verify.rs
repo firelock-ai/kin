@@ -1212,7 +1212,7 @@ mod tests {
         let annotated = serde_json::json!({
             "_kin": {
                 "degraded": {"daemon_unreachable": true},
-                "envelope_version": 1,
+                "envelope_version": 2,
                 "runtime": "repo-daemon",
             },
             "message": "kin-mcp cannot answer 'kin_graph_status': /repo is a Kin repository, but \
@@ -1230,7 +1230,7 @@ mod tests {
     #[test]
     fn a_tool_error_that_is_not_a_missing_daemon_stays_a_refusal() {
         let annotated = serde_json::json!({
-            "_kin": {"degraded": {}, "envelope_version": 1, "runtime": "repo-daemon"},
+            "_kin": {"degraded": {}, "envelope_version": 2, "runtime": "repo-daemon"},
             "message": "kin_graph_status rejected its arguments",
         })
         .to_string();
@@ -1249,7 +1249,7 @@ mod tests {
     #[test]
     fn an_annotated_error_result_is_reported_by_its_message_not_its_envelope() {
         let annotated = serde_json::to_string_pretty(&serde_json::json!({
-            "_kin": {"envelope_version": 1, "degraded": {"embed_worker_failed": true}},
+            "_kin": {"envelope_version": 2, "degraded": {"embed_worker_failed": true}},
             "message": "kin-mcp could not reach the repo daemon for this repository.",
         }))
         .expect("render the annotated error");

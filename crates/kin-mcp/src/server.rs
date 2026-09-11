@@ -1875,9 +1875,9 @@ mod tests {
             "{verdict}"
         );
         assert!(
-            verdict
-                .to_string()
-                .contains("graph_empty: the graph that answered holds no entities"),
+            verdict["limiting_factor"]
+                .as_str()
+                .is_some_and(|factor| factor.split("; ").any(|code| code == "graph_empty")),
             "the verdict must name the gap: {verdict}"
         );
         let daemon = envelope
@@ -2069,18 +2069,21 @@ mod tests {
             .expect("sanitized stdio report must validate")
             .expect("sanitized stdio report remains a success");
 
-        let mut missing_note = sanitized_payload;
-        missing_note["_kin"]["semantic_coverage"]
+        // Envelope v2 sends no coverage sentence, so what the report validates is
+        // the disclosure a reader acts on: `complete` has to agree with the
+        // counters it is derived from.
+        let mut disagreeing = sanitized_payload;
+        disagreeing["_kin"]["semantic_coverage"]
             .as_object_mut()
             .unwrap()
-            .remove("note");
+            .insert("complete".to_string(), serde_json::json!(true));
         let error =
-            serde_json::from_value::<crate::handlers::entities::GraphStatusReport>(missing_note)
-                .expect_err("incomplete coverage must carry its selected-graph note");
+            serde_json::from_value::<crate::handlers::entities::GraphStatusReport>(disagreeing)
+                .expect_err("incomplete coverage may not report itself complete");
         assert!(
             error
                 .to_string()
-                .contains("note must be present exactly when coverage is incomplete"),
+                .contains("semantic_coverage disagrees with selected-graph status"),
             "{error}"
         );
     }

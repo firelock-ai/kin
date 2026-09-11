@@ -306,7 +306,7 @@ def factor_carries_the_absence_gates_own_clauses(payload):
         # A clause the gate carried that another input also carried is
         # deduplicated to one, which still leaves its label in the factor. So a
         # MISSING label is a dropped clause rather than a deduplicated one.
-        if ("%s:" % label) not in factor:
+        if label not in factor_labels(factor):
             problems.append(
                 "absence_gate's trust_reason names %r and the factor does not carry it "
                 "(factor labels %s)" % (label, factor_labels(factor)))
@@ -782,6 +782,15 @@ def self_test():
     expect("and it is checked rather than skipped",
            factor_carries_the_absence_gates_own_clauses(
                gated(live_reason, live_reason))[0], True)
+    # Envelope v2 sends the factor as codes alone, while the gate's trust_reason
+    # still carries `label: text` clauses until negative.rs moves. So a label is
+    # matched as a label, never as a `label:` substring of the factor.
+    live_codes = "response_bounded; answer_truncated; retrieval_degraded; counts_are_a_floor"
+    expect("the v2 factor, codes alone, carries every trust_reason clause",
+           factor_carries_the_absence_gates_own_clauses(gated(live_codes, live_reason))[1], [])
+    expect("and a v2 factor that dropped a code is still named",
+           len(factor_carries_the_absence_gates_own_clauses(
+               gated("response_bounded; retrieval_degraded", live_reason))[1]), 1)
     expect("a dropped trust_reason clause is named",
            [problem.split(" names ")[1].split(" and")[0]
             for problem in factor_carries_the_absence_gates_own_clauses(
