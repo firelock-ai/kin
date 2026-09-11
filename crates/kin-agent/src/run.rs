@@ -36,17 +36,14 @@ When a Kin result is empty, read what Kin says about that emptiness. If it repor
 absence cannot be trusted, the honest answer is that you do not know, and you should say \
 what the gap is. Never turn an untrusted absence into a claim that something does not exist.
 
-To change code, use edit_file for a surgical change to an existing file and write_file to \
-create a new one. Read the exact current text through Kin first so your edit matches byte \
-for byte. You never open, stage or commit a transaction yourself, and those tools are not \
-on your belt on purpose. The harness does it around every call you make: a file you create \
-with write_file is staged as Kin's create operation, carrying the repository-relative path \
-and the full body, and committed with provenance naming this agent. An edit to a file Kin \
-already tracks is staged as Kin's replace operation, carrying that path and the file's \
-complete new text as your edit left it, and committed the same way.
+To change code, use mcp__kin__kin_mutate to atomically stage and commit changes to repository \
+authority. Read the exact current entity or source through Kin first. Specify the mutation \
+with an operations array (verb 'update' with target naming the entity symbol or UUID, or \
+verb 'replace' with target naming the repository-relative path, and body containing the \
+new source text) along with an optional commit summary describing your change. If edit_file \
+or write_file are on your belt, you may also use them.
 
-Your tools are the mcp__kin__ ones named above plus edit_file and write_file. You have no \
-others.
+Your tools are the mcp__kin__ tools on your belt. You have no others.
 
 Work in small steps. Call one or two tools, read what came back, then decide. When you have \
 the answer, say it in plain text without calling a tool.";
@@ -366,7 +363,14 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
             });
         }
     }
-    let belt = Belt::new(kin_tools);
+    let pure_kin = config.tool_profile.as_deref() == Some("pure-kin")
+        || config.tool_profile.as_deref() == Some("kin-only")
+        || belt::Belt::pure_kin_default();
+    let belt = if pure_kin {
+        Belt::pure_kin(kin_tools)
+    } else {
+        Belt::new(kin_tools)
+    };
     let repo_roots: Vec<std::path::PathBuf> =
         servers.iter().map(|server| server.repo.clone()).collect();
     let repo_note = multi.then(|| repo_path_note(&repo_roots));
@@ -781,6 +785,23 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                 "result_bytes": result_bytes,
                                                 "shown_bytes": shown_bytes,
                                             }))?;
+                                            if name == "kin_mutate" && !outcome.is_error {
+                                                if let Some(ops) = call
+                                                    .arguments
+                                                    .get("operations")
+                                                    .and_then(Value::as_array)
+                                                {
+                                                    for op in ops {
+                                                        if let Some(target) =
+                                                            op.get("target").and_then(Value::as_str)
+                                                        {
+                                                            if !counters.edits.iter().any(|e| e == target) {
+                                                                counters.edits.push(target.to_string());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             (annotated, outcome.is_error)
                                         }
                                     }

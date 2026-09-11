@@ -207,6 +207,9 @@ async fn dispatch_tool_call<G: GraphStore>(
             sessions::handle_transaction_commit(arguments, store, sessions, session_authority_mode)
                 .await
         }
+        "kin_mutate" => {
+            sessions::handle_mutate(arguments, store, sessions, session_authority_mode).await
+        }
         "kin_transaction_abort" => {
             sessions::handle_transaction_abort(arguments, sessions, session_authority_mode).await
         }
@@ -6059,6 +6062,57 @@ mod tests {
             "active",
             "delegation must not terminalize the transaction"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_mutate_atomic_validation_and_execution() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+
+        // 1. Missing operations parameter returns structured error
+        let args = HashMap::new();
+        let res = sessions::handle_mutate(&args, &store, &sessions, SessionAuthorityMode::OfflineFallback)
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        assert!(tool_result_text(&res).contains("operations"));
+
+        // 2. Atomic inline entity update in one call
+        let entity = placement_free_entity("AtomicEntity");
+        store.upsert_entity(&entity).unwrap();
+        let mut updated = entity.clone();
+        updated.doc_summary = Some("atomic documentation".into());
+
+        let mutate_args = HashMap::from([
+            (
+                "operations".to_string(),
+                serde_json::json!([
+                    {
+                        "verb": "update",
+                        "target": entity.id.to_string(),
+                        "description": "update entity docs",
+                        "payload": {
+                            "Entity": updated,
+                        }
+                    }
+                ]),
+            ),
+            (
+                "summary".to_string(),
+                serde_json::json!("atomic mutation test"),
+            ),
+        ]);
+        let res = sessions::handle_mutate(
+            &mutate_args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.is_error, None, "failed with: {}", tool_result_text(&res));
+        let text = tool_result_text(&res);
+        assert!(text.contains("committed") || text.contains("applied") || text.contains("receipt"));
     }
 
     #[tokio::test]

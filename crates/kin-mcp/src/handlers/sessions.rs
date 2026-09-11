@@ -1366,6 +1366,173 @@ pub async fn handle_transaction_commit<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const MUTATE_DESC: &str = "\
+Atomically validate and commit a batch of graph mutations in a single call. Automatically \
+manages transaction lifecycle (begin, validation, commit, and abort-on-refusal) so an agent \
+does not need multi-step transaction ceremonies. Provide an operations array with mutation \
+verbs ('create', 'update', 'delete') and payloads. On success returns a compact receipt with \
+status, ops_applied, change_id, and modified_files. If validation fails or the commit is refused, \
+the transaction is cleanly aborted with no leaked state and returns the structured error.";
+
+pub async fn handle_mutate<G: GraphStore>(
+    arguments: &HashMap<String, serde_json::Value>,
+    store: &G,
+    sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
+) -> Result<ToolCallResult> {
+    let Some(ops_val) = arguments.get("operations") else {
+        return Ok(ToolCallResult::error(
+            "Missing required parameter: 'operations' array is required for kin_mutate.",
+        ));
+    };
+
+    let parsed = crate::session::parse_staged_operations(ops_val)
+        .map_err(crate::error::McpError::InvalidParams)?;
+    crate::session::validate_staged_operations(&parsed)
+        .map_err(crate::error::McpError::InvalidParams)?;
+
+    let session_id = match arguments.get("session_id").and_then(serde_json::Value::as_str) {
+        Some(s) => s.to_string(),
+        None => {
+            if let Some(s) = sessions.list_agent_sessions().first() {
+                s.session_id.to_string()
+            } else {
+                let s = sessions.start_agent_session(
+                    "kin",
+                    "kin_agent",
+                    kin_model::session::SessionTransport::Mcp,
+                    None,
+                    std::path::PathBuf::from("."),
+                    kin_model::session::SessionCapabilities {
+                        can_write: true,
+                        can_commit: true,
+                        ..Default::default()
+                    },
+                );
+                s.session_id.to_string()
+            }
+        }
+    };
+
+    let scope = arguments
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("repository")
+        .to_string();
+
+    let request_id = arguments
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    if session_authority_mode.uses_daemon() {
+        let begin_args = HashMap::from([
+            ("session_id".to_string(), serde_json::json!(session_id)),
+            ("scope".to_string(), serde_json::json!(scope)),
+        ]);
+        let begin_res = match crate::daemon_delegate::forward_tool_call("kin_transaction_begin", &begin_args).await {
+            Ok(Some(res)) => res,
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("transaction begin"));
+            }
+            Ok(None) => return Ok(ToolCallResult::error("Daemon returned empty response for kin_transaction_begin")),
+            Err(err) => return Ok(ToolCallResult::error(err)),
+        };
+
+        if begin_res.is_error == Some(true) {
+            return Ok(begin_res);
+        }
+
+        let tx_id = begin_res
+            .content
+            .first()
+            .and_then(|c| match c {
+                crate::types::ContentBlock::Text { text } => {
+                    serde_json::from_str::<serde_json::Value>(text).ok()
+                }
+            })
+            .and_then(|v| {
+                v.get("transaction_id")
+                    .or_else(|| v.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+
+        let Some(tx_id) = tx_id else {
+            return Ok(ToolCallResult::error("Failed to extract transaction_id from begin response"));
+        };
+
+        let mut commit_args = HashMap::from([
+            ("transaction_id".to_string(), serde_json::json!(tx_id)),
+            ("session_id".to_string(), serde_json::json!(session_id)),
+            ("operations".to_string(), ops_val.clone()),
+        ]);
+        if let Some(summary) = arguments.get("summary") {
+            commit_args.insert("description".to_string(), summary.clone());
+        }
+
+        match crate::daemon_delegate::forward_tool_call("kin_transaction_commit", &commit_args).await {
+            Ok(Some(mut value)) => {
+                if value.is_error == Some(true) {
+                    let abort_args = HashMap::from([
+                        ("transaction_id".to_string(), serde_json::json!(tx_id)),
+                        ("session_id".to_string(), serde_json::json!(session_id)),
+                    ]);
+                    let _ = crate::daemon_delegate::forward_tool_call("kin_transaction_abort", &abort_args).await;
+                } else if let Some(req_id) = request_id {
+                    if let Some(crate::types::ContentBlock::Text { text }) = value.content.first_mut() {
+                        if let Ok(mut map) = serde_json::from_str::<serde_json::Value>(text) {
+                            if let Some(obj) = map.as_object_mut() {
+                                obj.insert("request_id".to_string(), serde_json::json!(req_id));
+                                *text = serde_json::to_string_pretty(&obj).unwrap_or_else(|_| text.clone());
+                            }
+                        }
+                    }
+                }
+                return Ok(value);
+            }
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("transaction commit"));
+            }
+            Ok(None) => return Ok(ToolCallResult::error("Daemon returned empty response for commit")),
+            Err(err) => return Ok(ToolCallResult::error(err)),
+        }
+    }
+
+    // In-process offline mode:
+    let tx = match sessions.begin_transaction(&session_id, &scope) {
+        Ok(t) => t,
+        Err(err) => return Ok(ToolCallResult::error(err)),
+    };
+    let tx_id = tx.transaction_id.clone();
+    let mut commit_args = HashMap::from([
+        ("transaction_id".to_string(), serde_json::json!(tx_id)),
+        ("session_id".to_string(), serde_json::json!(session_id)),
+        ("operations".to_string(), ops_val.clone()),
+    ]);
+    if let Some(summary) = arguments.get("summary") {
+        commit_args.insert("description".to_string(), summary.clone());
+    }
+    let mut res = handle_transaction_commit(&commit_args, store, sessions, session_authority_mode).await?;
+    if res.is_error == Some(true) {
+        let abort_args = HashMap::from([
+            ("transaction_id".to_string(), serde_json::json!(tx_id)),
+            ("session_id".to_string(), serde_json::json!(session_id)),
+        ]);
+        let _ = handle_transaction_abort(&abort_args, sessions, session_authority_mode).await;
+    } else if let Some(req_id) = request_id {
+        if let Some(crate::types::ContentBlock::Text { text }) = res.content.first_mut() {
+            if let Ok(mut map) = serde_json::from_str::<serde_json::Value>(text) {
+                if let Some(obj) = map.as_object_mut() {
+                    obj.insert("request_id".to_string(), serde_json::json!(req_id));
+                    *text = serde_json::to_string_pretty(&obj).unwrap_or_else(|_| text.clone());
+                }
+            }
+        }
+    }
+    Ok(res)
+}
+
 pub const TRANSACTION_ABORT_DESC: &str = "\
 Abort an active or validated transaction and discard all staged mutations. Reach for it \
 when you decide against work you already staged, so the transaction ends instead of \

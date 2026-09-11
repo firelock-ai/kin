@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use kin_model::{EntityKind, FilePathId, LanguageId, ParseState, Visibility};
+use kin_model::{EntityKind, FilePathId, LanguageId, ParseState, SourceSpan, Visibility};
 use tree_sitter::Tree;
 
 use crate::adapter::{
@@ -142,7 +142,7 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
                 });
                 extract_calls_from_context(node, source, &name, None, relations);
             }
@@ -157,7 +157,7 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
                 });
                 // Emit Implements relations for #[derive(...)] traits.
                 for trait_name in extract_derive_traits(node, source) {
@@ -183,7 +183,7 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
                 });
 
                 // Emit Implements relations for #[derive(...)] traits.
@@ -242,7 +242,7 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
                 });
             }
         }
@@ -256,7 +256,7 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
                 });
             }
         }
@@ -270,7 +270,7 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
                 });
             }
         }
@@ -284,7 +284,7 @@ fn extract_rust_node(
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    span: rust_item_span(node, file_id, source),
                 });
             }
         }
@@ -332,7 +332,7 @@ fn extract_rust_node(
                                 visibility: detect_rust_visibility(&member, source),
                                 doc_summary: extract_doc_comment(&member, source),
                                 fingerprint: compute_fingerprint(&member, source),
-                                span: span_from_node(&member, file_id),
+                                span: rust_item_span(&member, file_id, source),
                             });
                             extract_calls_from_context(
                                 &member,
@@ -424,7 +424,7 @@ fn extract_rust_node(
                         visibility,
                         doc_summary: extract_doc_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
-                        span: span_from_node(node, file_id),
+                        span: rust_item_span(node, file_id, source),
                     });
                 }
             }
@@ -438,26 +438,28 @@ fn extract_rust_node(
 /// a struct or enum. Returns a list of trait name strings.
 fn extract_derive_traits(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut traits = Vec::new();
-    // Check preceding attribute_item siblings
+    // Check preceding attribute_item siblings, skipping intervening doc/regular comments
     let mut prev = node.prev_sibling();
     while let Some(p) = prev {
-        if p.kind() == "attribute_item" {
-            let text = p.utf8_text(source).unwrap_or("");
-            // Match #[derive(Trait1, Trait2, ...)]
-            if let Some(start) = text.find("derive(") {
-                let after = &text[start + 7..];
-                if let Some(end) = after.find(')') {
-                    let inner = &after[..end];
-                    for t in inner.split(',') {
-                        let t = t.trim();
-                        if !t.is_empty() {
-                            traits.push(t.to_string());
+        match p.kind() {
+            "attribute_item" => {
+                let text = p.utf8_text(source).unwrap_or("");
+                // Match #[derive(Trait1, Trait2, ...)]
+                if let Some(start) = text.find("derive(") {
+                    let after = &text[start + 7..];
+                    if let Some(end) = after.find(')') {
+                        let inner = &after[..end];
+                        for t in inner.split(',') {
+                            let t = t.trim();
+                            if !t.is_empty() {
+                                traits.push(t.to_string());
+                            }
                         }
                     }
                 }
             }
-        } else {
-            break;
+            "line_comment" | "block_comment" => {}
+            _ => break,
         }
         prev = p.prev_sibling();
     }
@@ -525,22 +527,82 @@ fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
     crate::adapter::declaration_signature(node, source)
 }
 
+/// Build a SourceSpan for a Rust item, including any preceding doc comments (`///`)
+/// and outer attributes (`#[...]`).
+fn rust_item_span(node: &tree_sitter::Node, file_id: &FilePathId, source: &[u8]) -> SourceSpan {
+    let mut start_node = *node;
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        match p.kind() {
+            "attribute_item" => {
+                start_node = p;
+                prev = p.prev_sibling();
+            }
+            "line_comment" => {
+                let text = p.utf8_text(source).unwrap_or("");
+                if text.starts_with("///") {
+                    start_node = p;
+                    prev = p.prev_sibling();
+                } else {
+                    break;
+                }
+            }
+            "block_comment" => {
+                let text = p.utf8_text(source).unwrap_or("");
+                if text.starts_with("/**") {
+                    start_node = p;
+                    prev = p.prev_sibling();
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let start = start_node.start_position();
+    let end = node.end_position();
+    SourceSpan {
+        file: file_id.clone(),
+        start_byte: start_node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: start.row as u32,
+        start_col: start.column as u32,
+        end_line: end.row as u32,
+        end_col: end.column as u32,
+    }
+}
+
 fn extract_doc_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     // Collect preceding line_comment nodes that start with ///
+    // Outer attributes like #[derive(...)] or #[inline] can sit between doc comments and the item.
     let mut comments = Vec::new();
     let mut prev = node.prev_sibling();
     while let Some(p) = prev {
-        if p.kind() == "line_comment" {
-            let text = p.utf8_text(source).unwrap_or("");
-            if text.starts_with("///") {
-                comments.push(text.trim_start_matches('/').trim().to_string());
-            } else {
-                break;
+        match p.kind() {
+            "attribute_item" => {
+                prev = p.prev_sibling();
             }
-        } else {
-            break;
+            "line_comment" => {
+                let text = p.utf8_text(source).unwrap_or("");
+                if text.starts_with("///") {
+                    comments.push(text.trim_start_matches('/').trim().to_string());
+                    prev = p.prev_sibling();
+                } else {
+                    break;
+                }
+            }
+            "block_comment" => {
+                let text = p.utf8_text(source).unwrap_or("");
+                if text.starts_with("/**") {
+                    let cleaned = text.trim_start_matches("/**").trim_end_matches("*/").trim();
+                    comments.push(cleaned.to_string());
+                    prev = p.prev_sibling();
+                } else {
+                    break;
+                }
+            }
+            _ => break,
         }
-        prev = p.prev_sibling();
     }
     if comments.is_empty() {
         None
@@ -1373,6 +1435,39 @@ pub fn add(a: i32, b: i32) -> i32 { a + b }
             func.doc_summary.as_deref(),
             Some("Adds two numbers together. Returns the sum.")
         );
+    }
+
+    #[test]
+    fn item_span_and_doc_comment_includes_attributes_and_comments() {
+        let adapter = RustAdapter;
+        let source = br#"
+/// Calculates the square of a number.
+#[inline]
+#[must_use]
+pub fn square(x: i32) -> i32 {
+    x * x
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("math.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output
+            .entities
+            .iter()
+            .find(|e| e.name == "square")
+            .expect("should find square");
+        assert_eq!(
+            func.doc_summary.as_deref(),
+            Some("Calculates the square of a number.")
+        );
+        let span = &func.span;
+        assert_eq!(span.start_line, 1);
+        assert_eq!(span.end_line, 6);
+        let text = std::str::from_utf8(&source[span.start_byte..span.end_byte]).unwrap();
+        assert!(text.starts_with("/// Calculates"));
+        assert!(text.contains("#[inline]"));
+        assert!(text.contains("#[must_use]"));
+        assert!(text.ends_with('}'));
     }
 
     #[test]

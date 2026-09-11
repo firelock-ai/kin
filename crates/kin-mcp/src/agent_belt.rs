@@ -278,6 +278,10 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
             "Keep this session alive. Call it periodically during long work so the session does not lapse at its idle TTL.",
         ),
         (
+            "kin_mutate",
+            "Atomically validate and commit a batch of graph mutations in a single call. Automatically manages transaction begin, validation, and commit. Provide an operations array with mutation verb and payload.",
+        ),
+        (
             "kin_session_start",
             "Register this agent with Kin and get a session_id: who you are, your transport, working directory and capabilities. Call it once at the start of your work, before any transaction, so activity is attributed.",
         ),
@@ -616,7 +620,7 @@ pub const AGENT_DEFAULT_PROPERTY_DESCRIPTION_BUDGET: usize = 90;
 /// bytes and 2,423 tokens between them, which is 31 percent of every token in
 /// the served list, and that number belongs in a product decision about which
 /// tools a read-only agent is served rather than in a prose trim.
-const PROSE_EXEMPT_TOOLS: [&str; 2] = ["kin_transaction_stage", "kin_transaction_commit"];
+const PROSE_EXEMPT_TOOLS: [&str; 3] = ["kin_transaction_stage", "kin_transaction_commit", "kin_mutate"];
 
 /// Short property descriptions that read the same on every tool carrying them.
 ///

@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Tool Surface Reference
 
-The Kin MCP server exposes 67 semantic tools to AI assistants (Claude, Cursor, Gemini,
+The Kin MCP server exposes 68 semantic tools to AI assistants (Claude, Cursor, Gemini,
 Codex, etc.). These tools bridge the gap between traditional file-first navigation and
 Kin's graph-first semantic substrate: instead of issuing raw shell commands or reading raw
 files, an assistant interacts with the codebase through entity-level primitives.
@@ -322,7 +322,7 @@ reported rather than served as a confident answer.
 ---
 
 ## 5. Semantic Transactions
-*Tools:* `kin_transaction_begin`, `kin_transaction_stage`, `kin_transaction_validate`, `kin_transaction_commit`, `kin_transaction_abort`
+*Tools:* `kin_transaction_begin`, `kin_transaction_stage`, `kin_transaction_validate`, `kin_transaction_commit`, `kin_transaction_abort`, `kin_mutate`
 
 - **`kin_transaction_begin`**: Start a transaction context.
 - **`kin_transaction_stage`**: Stage changes to the transaction. Each staged operation is one of six disjoint shapes, and the verb decides which:
@@ -334,6 +334,7 @@ reported rather than served as a confident answer.
   - A structured entity or relation mutation carries an explicit `payload`, for callers that already hold Kin's own entity and relation objects.
 - **`kin_transaction_validate`**: Run constraints and validation against staged changes.
 - **`kin_transaction_commit` / `kin_transaction_abort`**: Commit changes to the branch head or discard them.
+- **`kin_mutate`**: Atomically validate and commit a batch of graph mutations in a single call.
 
 ---
 

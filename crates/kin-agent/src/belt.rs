@@ -112,16 +112,52 @@ pub enum LocalTool {
 pub struct Belt {
     kin_tools: Vec<KinTool>,
     names: BTreeSet<String>,
+    file_tools: bool,
 }
 
 impl Belt {
-    /// Build the belt from what the MCP servers declared, plus the two local tools.
+    /// Build the belt from what the MCP servers declared. If pure Kin mode is
+    /// active (via KIN_AGENT_PURE_KIN env var), local file tools are omitted.
     pub fn new(kin_tools: Vec<KinTool>) -> Self {
+        let file_tools = !Self::pure_kin_default();
+        Self::with_local_tools(kin_tools, file_tools)
+    }
+
+    /// Construct a pure Kin belt with no file tools on it.
+    pub fn pure_kin(kin_tools: Vec<KinTool>) -> Self {
+        Self::with_local_tools(kin_tools, false)
+    }
+
+    /// Construct a belt explicitly including local file tools.
+    pub fn with_file_tools(kin_tools: Vec<KinTool>) -> Self {
+        Self::with_local_tools(kin_tools, true)
+    }
+
+    /// Whether pure Kin mode is requested via environment.
+    pub fn pure_kin_default() -> bool {
+        std::env::var("KIN_AGENT_PURE_KIN")
+            .map(|v| v != "0" && v != "false")
+            .unwrap_or(false)
+    }
+
+    /// Build the belt with or without local file tools.
+    pub fn with_local_tools(kin_tools: Vec<KinTool>, file_tools: bool) -> Self {
         let mut names: BTreeSet<String> =
             kin_tools.iter().map(|tool| tool.exposed.clone()).collect();
-        names.insert(EDIT_FILE.to_string());
-        names.insert(WRITE_FILE.to_string());
-        Belt { kin_tools, names }
+        if file_tools {
+            names.insert(EDIT_FILE.to_string());
+            names.insert(WRITE_FILE.to_string());
+        }
+        Belt {
+            kin_tools,
+            names,
+            file_tools,
+        }
+    }
+
+    /// Whether this belt includes local file tools.
+    pub fn has_file_tools(&self) -> bool {
+        self.file_tools
     }
 
     /// Every callable name, which is also what the text-shape parsers match against.
@@ -134,11 +170,14 @@ impl Belt {
         if let Some(tool) = self.kin_tools.iter().find(|tool| tool.exposed == name) {
             return Some(tool.schema.clone());
         }
-        match name {
-            EDIT_FILE => Some(edit_file_schema()),
-            WRITE_FILE => Some(write_file_schema()),
-            _ => None,
+        if self.file_tools {
+            match name {
+                EDIT_FILE => return Some(edit_file_schema()),
+                WRITE_FILE => return Some(write_file_schema()),
+                _ => {}
+            }
         }
+        None
     }
 
     /// Route a name the model produced.
@@ -149,10 +188,28 @@ impl Belt {
                 tool: tool.bare.clone(),
             };
         }
-        match name {
-            EDIT_FILE => return Route::Local(LocalTool::Edit),
-            WRITE_FILE => return Route::Local(LocalTool::Write),
-            _ => {}
+        if self.file_tools {
+            match name {
+                EDIT_FILE => return Route::Local(LocalTool::Edit),
+                WRITE_FILE => return Route::Local(LocalTool::Write),
+                _ => {}
+            }
+        } else if name == EDIT_FILE || name == WRITE_FILE {
+            return Route::Refused(format!(
+                "There is no tool named `{name}` on this belt. This agent is locked to Kin tools only. \
+                 To mutate code in the repository, call `{}kin_mutate` with an operations array \
+                 naming the entity and new source body.",
+                self.kin_tools
+                    .first()
+                    .map(|t| {
+                        if t.exposed.starts_with(KIN_TOOL_PREFIX) {
+                            KIN_TOOL_PREFIX
+                        } else {
+                            ""
+                        }
+                    })
+                    .unwrap_or(KIN_TOOL_PREFIX)
+            ));
         }
         // A bare Kin tool name is a near miss worth naming precisely, because the model
         // very likely meant a prefixed one and a generic refusal would not say so. With
@@ -196,33 +253,35 @@ impl Belt {
                 }
             }));
         }
-        let suffix = match repo_note {
-            Some(note) => format!(" {note}"),
-            None => String::new(),
-        };
-        specs.push(json!({
-            "type": "function",
-            "function": {
-                "name": EDIT_FILE,
-                "description": format!(
-                    "Replace one exact snippet of text in one file. The `find` text must appear \
-                     exactly once in the file unless `replace_all` is true. Use this for a small, \
-                     surgical change once Kin has told you where the code is.{suffix}"
-                ),
-                "parameters": edit_file_schema(),
-            }
-        }));
-        specs.push(json!({
-            "type": "function",
-            "function": {
-                "name": WRITE_FILE,
-                "description": format!(
-                    "Write a file in full, creating it if it does not exist. Use this for a new \
-                     file; prefer edit_file for a change to an existing one.{suffix}"
-                ),
-                "parameters": write_file_schema(),
-            }
-        }));
+        if self.file_tools {
+            let suffix = match repo_note {
+                Some(note) => format!(" {note}"),
+                None => String::new(),
+            };
+            specs.push(json!({
+                "type": "function",
+                "function": {
+                    "name": EDIT_FILE,
+                    "description": format!(
+                        "Replace one exact snippet of text in one file. The `find` text must appear \
+                         exactly once in the file unless `replace_all` is true. Use this for a small, \
+                         surgical change once Kin has told you where the code is.{suffix}"
+                    ),
+                    "parameters": edit_file_schema(),
+                }
+            }));
+            specs.push(json!({
+                "type": "function",
+                "function": {
+                    "name": WRITE_FILE,
+                    "description": format!(
+                        "Write a file in full, creating it if it does not exist. Use this for a new \
+                         file; prefer edit_file for a change to an existing one.{suffix}"
+                    ),
+                    "parameters": write_file_schema(),
+                }
+            }));
+        }
         specs
     }
 }

@@ -292,6 +292,40 @@ fn harness_owned_tools_never_reach_the_model() {
     }
     assert!(!belt::is_harness_owned("semantic_locate"));
     assert!(!belt::is_harness_owned("get_context_pack"));
+    assert!(!belt::is_harness_owned("kin_mutate"));
+}
+
+#[test]
+fn pure_kin_belt_has_no_file_tools_and_refuses_them_with_mutate_hint() {
+    let tool = crate::belt::KinTool {
+        server: 0,
+        bare: "kin_mutate".into(),
+        exposed: "mcp__kin__kin_mutate".into(),
+        description: "Atomically mutate graph".into(),
+        schema: json!({ "type": "object" }),
+    };
+    let belt = Belt::pure_kin(vec![tool]);
+    assert!(!belt.has_file_tools());
+    assert_eq!(belt.names().len(), 1);
+    assert!(belt.names().contains("mcp__kin__kin_mutate"));
+    assert!(!belt.names().contains("edit_file"));
+    assert!(!belt.names().contains("write_file"));
+
+    let Route::Refused(refusal) = belt.route("edit_file") else {
+        panic!("edit_file must be refused on pure kin belt");
+    };
+    assert!(
+        refusal.contains("kin_mutate"),
+        "refusal should point to kin_mutate: {refusal}"
+    );
+
+    let Route::Refused(refusal_write) = belt.route("write_file") else {
+        panic!("write_file must be refused on pure kin belt");
+    };
+    assert!(
+        refusal_write.contains("kin_mutate"),
+        "refusal should point to kin_mutate: {refusal_write}"
+    );
 }
 
 #[test]
