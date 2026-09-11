@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.14] - 2026-09-11
+
+### Changed
+
+- Grade the flake quarantine's clock on the UTC date (FIR-3531) (#1691)
+- Move to kin-db 0.7.112 and keep a tracked nested control directory through projection (FIR-3527) (#1692)
+
+
 ## [0.7.13] - 2026-09-11
 
 ### Changed
