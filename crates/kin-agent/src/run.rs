@@ -64,6 +64,10 @@ struct Server {
     client: McpClient,
     declared: Vec<McpTool>,
     session: Option<String>,
+    /// The session's idle window, as the reply that opened it named it in
+    /// `idle_timeout_secs`. `None` when the reply named none, and then nothing is
+    /// heartbeated on a guess.
+    session_ttl: Option<Duration>,
 }
 
 impl Server {
@@ -118,6 +122,8 @@ struct Counters {
     withheld_results: u32,
     /// Calls in a turn's batch that were never run because a budget was spent part way.
     skipped_calls: u32,
+    /// Heartbeats sent to keep a Kin session alive through a long wait on the endpoint.
+    session_heartbeats: u32,
     turns: u32,
     input_tokens: u64,
     output_tokens: u64,
@@ -140,6 +146,7 @@ impl Counters {
             clipped_results: 0,
             withheld_results: 0,
             skipped_calls: 0,
+            session_heartbeats: 0,
             turns: 0,
             input_tokens: 0,
             output_tokens: 0,
@@ -186,6 +193,7 @@ impl Counters {
             "clipped_results": self.clipped_results,
             "withheld_results": self.withheld_results,
             "skipped_calls": self.skipped_calls,
+            "session_heartbeats": self.session_heartbeats,
             "files_changed": self.edits,
         })
     }
@@ -338,6 +346,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
             client,
             declared,
             session: None,
+            session_ttl: None,
         });
     }
 
@@ -456,7 +465,15 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
             }
             meter.add(prompt.len() as u64);
             messages.push(json!({ "role": "user", "content": prompt }));
-            match complete_with_retry(&provider, &messages, &[], &mut counters, deadline_at) {
+            match wait_for_turn(
+                &provider,
+                &messages,
+                &[],
+                &mut counters,
+                deadline_at,
+                &mut servers,
+                &mut writer,
+            )? {
                 Ok(completion) => {
                     counters.absorb(&completion.usage);
                     let turn = parse::parse_choice(&completion.choice, belt.names());
@@ -488,26 +505,33 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
             break;
         }
 
-        let completion =
-            match complete_with_retry(&provider, &messages, &specs, &mut counters, deadline_at) {
-                Ok(completion) => completion,
-                Err(EndpointStop::Deadline { waited }) => {
-                    stop = Stop::deadline(
-                        &config,
-                        &format!("while waiting {} s on the endpoint", waited.as_secs()),
-                    );
-                    break;
-                }
-                Err(EndpointStop::Failed(err)) => {
-                    stop = Stop::new(
-                        ExitStatus::EndpointError,
-                        "endpoint_unreachable",
-                        Some(err.to_string()),
-                    );
-                    final_text = err.to_string();
-                    break;
-                }
-            };
+        let completion = match wait_for_turn(
+            &provider,
+            &messages,
+            &specs,
+            &mut counters,
+            deadline_at,
+            &mut servers,
+            &mut writer,
+        )? {
+            Ok(completion) => completion,
+            Err(EndpointStop::Deadline { waited }) => {
+                stop = Stop::deadline(
+                    &config,
+                    &format!("while waiting {} s on the endpoint", waited.as_secs()),
+                );
+                break;
+            }
+            Err(EndpointStop::Failed(err)) => {
+                stop = Stop::new(
+                    ExitStatus::EndpointError,
+                    "endpoint_unreachable",
+                    Some(err.to_string()),
+                );
+                final_text = err.to_string();
+                break;
+            }
+        };
         counters.absorb(&completion.usage);
         counters.turns += 1;
         meter.anchor(&completion.usage, message_bytes(&completion.choice));
@@ -1259,6 +1283,7 @@ fn complete_with_retry(
     tools: &[Value],
     counters: &mut Counters,
     deadline_at: Instant,
+    keepalive: &mut Keepalive<'_>,
 ) -> Result<Completion, EndpointStop> {
     let began = Instant::now();
     let mut last: Option<ProviderError> = None;
@@ -1271,7 +1296,7 @@ fn complete_with_retry(
         }
         let limit = remaining.min(provider.config().request_timeout);
         let asked = Instant::now();
-        let outcome = provider.complete_within(messages, tools, limit);
+        let outcome = keepalive.wait(provider, messages, tools, limit);
         // Time spent waiting is endpoint time whether or not an answer came back.
         counters.api_ms += asked.elapsed().as_millis();
         match outcome {
@@ -1298,6 +1323,167 @@ fn complete_with_retry(
     Err(EndpointStop::Failed(
         last.expect("at least one attempt was made"),
     ))
+}
+
+/// One turn's wait on the endpoint, with every attached Kin session kept alive through it
+/// and each heartbeat it sent written to the trace once the wait is over.
+fn wait_for_turn(
+    provider: &Provider,
+    messages: &[Value],
+    tools: &[Value],
+    counters: &mut Counters,
+    deadline_at: Instant,
+    servers: &mut [Server],
+    writer: &mut TranscriptWriter,
+) -> anyhow::Result<Result<Completion, EndpointStop>> {
+    let mut keepalive = Keepalive::new(servers);
+    let outcome = complete_with_retry(
+        provider,
+        messages,
+        tools,
+        counters,
+        deadline_at,
+        &mut keepalive,
+    );
+    counters.session_heartbeats += keepalive.beats;
+    for row in keepalive.rows {
+        writer.trace(row)?;
+    }
+    Ok(outcome)
+}
+
+/// Keeps every attached Kin session alive while the loop waits on the endpoint.
+///
+/// A session is reaped once it sits idle for the window the reply that opened it named, and
+/// every Kin call refreshes it, so the one long idle stretch in a run is a model turn. A
+/// turn can outlast the window: a deadline past it leaves room for three request timeouts on
+/// one turn, and a long prompt's prefill runs for minutes. So while a request is in flight
+/// each session is heartbeated at a third of its own window, and the heartbeats stop when
+/// the turn returns. A session whose reply named no window is not heartbeated, because its
+/// cadence would be a guess.
+struct Keepalive<'a> {
+    servers: &'a mut [Server],
+    /// When each server's session was last refreshed during this wait, by server index.
+    refreshed: Vec<Instant>,
+    /// A trace row per heartbeat, written by the caller once the wait returns.
+    rows: Vec<Value>,
+    beats: u32,
+}
+
+impl<'a> Keepalive<'a> {
+    fn new(servers: &'a mut [Server]) -> Self {
+        let refreshed = vec![Instant::now(); servers.len()];
+        Keepalive {
+            servers,
+            refreshed,
+            rows: Vec::new(),
+            beats: 0,
+        }
+    }
+
+    /// How often a server's session is heartbeated: a third of its window, and only for a
+    /// session that is open and named one.
+    fn cadence(server: &Server) -> Option<Duration> {
+        server.session.as_ref()?;
+        server.session_ttl.map(|ttl| ttl / 3)
+    }
+
+    /// The next instant any session is due a heartbeat.
+    fn next_due(&self) -> Option<Instant> {
+        self.servers
+            .iter()
+            .zip(&self.refreshed)
+            .filter_map(|(server, refreshed)| Self::cadence(server).map(|every| *refreshed + every))
+            .min()
+    }
+
+    /// Heartbeat every session that is due one.
+    fn beat_due(&mut self) {
+        let now = Instant::now();
+        for (index, server) in self.servers.iter_mut().enumerate() {
+            let Some(every) = Self::cadence(server) else {
+                continue;
+            };
+            if now < self.refreshed[index] + every {
+                continue;
+            }
+            let session = server.session.clone().unwrap_or_default();
+            let outcome = server
+                .client
+                .call_tool("kin_session_heartbeat", &json!({ "session_id": session }));
+            self.refreshed[index] = Instant::now();
+            self.beats += 1;
+            self.rows.push(json!({
+                "surface": "kin",
+                "server": server.name(),
+                "tool": "kin_session_heartbeat",
+                "policy": "allowed",
+                "event": "session_heartbeat",
+                "kin_session_id": session,
+                "wall_ms": outcome.as_ref().ok().map(|done| done.wall_ms as u64),
+                "is_error": outcome.as_ref().map(|done| done.is_error).unwrap_or(true),
+                "transport_error": outcome.as_ref().err().map(|err| err.to_string()),
+                "ts": now_iso(),
+            }));
+        }
+    }
+
+    /// One endpoint attempt. With a session to keep, the request runs on its own thread and
+    /// this one sends each heartbeat as it falls due, until the answer arrives.
+    fn wait(
+        &mut self,
+        provider: &Provider,
+        messages: &[Value],
+        tools: &[Value],
+        limit: Duration,
+    ) -> Result<Completion, ProviderError> {
+        if self.next_due().is_none() {
+            return provider.complete_within(messages, tools, limit);
+        }
+        std::thread::scope(|scope| {
+            let (answer, answered) = std::sync::mpsc::channel();
+            let request = scope.spawn(move || {
+                // The receiver lives until this scope ends, so the send cannot fail.
+                let _ = answer.send(provider.complete_within(messages, tools, limit));
+            });
+            loop {
+                let until = self
+                    .next_due()
+                    .map_or(limit, |due| due.saturating_duration_since(Instant::now()));
+                match answered.recv_timeout(until) {
+                    Ok(outcome) => return outcome,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => self.beat_due(),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // The request thread ends without answering only when it panics, and
+                        // the panic is carried here, as it would surface without the split.
+                        match request.join() {
+                            Err(panic) => std::panic::resume_unwind(panic),
+                            Ok(()) => unreachable!("the request thread always sends its answer"),
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// The idle window a session reply names in `idle_timeout_secs`, at its top level or one
+/// level down. `None` when it names none, or zero: an in-process session reports no window,
+/// and a heartbeat cadence is never guessed.
+pub(crate) fn session_idle_timeout(outcome: &ToolOutcome) -> Option<Duration> {
+    let payload: Value = serde_json::from_str(outcome.text.trim()).ok()?;
+    let object = payload.as_object()?;
+    let named =
+        |object: &Map<String, Value>| object.get("idle_timeout_secs").and_then(Value::as_u64);
+    let secs = named(object).or_else(|| {
+        ["session", "result"].iter().find_map(|nested| {
+            object
+                .get(*nested)
+                .and_then(Value::as_object)
+                .and_then(named)
+        })
+    })?;
+    (secs > 0).then_some(Duration::from_secs(secs))
 }
 
 fn start_kin_session(
@@ -1327,6 +1513,11 @@ fn start_kin_session(
     match server.client.call_tool("kin_session_start", &arguments) {
         Ok(outcome) => {
             let session = extract_id(&outcome, &["session_id", "id"]);
+            server.session_ttl = if outcome.is_error {
+                None
+            } else {
+                session_idle_timeout(&outcome)
+            };
             writer.trace(json!({
                 "surface": "kin",
                 "server": server_name,
@@ -1336,10 +1527,12 @@ fn start_kin_session(
                 "wall_ms": outcome.wall_ms as u64,
                 "is_error": outcome.is_error,
                 "kin_session_id": session.clone(),
+                "idle_timeout_secs": server.session_ttl.map(|ttl| ttl.as_secs()),
             }))?;
             Ok(if outcome.is_error { None } else { session })
         }
         Err(err) => {
+            server.session_ttl = None;
             writer.trace(json!({
                 "surface": "kin",
                 "server": server_name,

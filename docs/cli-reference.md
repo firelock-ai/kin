@@ -1363,6 +1363,12 @@ result the conversation cannot hold is withheld with a note, and the agent is as
 final answer before the next request would overflow. The result record carries the reason
 in `stop_reason` and `stop_detail`, and the budget under `context`.
 
+The run's Kin session stays open through a long model turn. Every Kin call refreshes it, and
+while a request to the endpoint is in flight the runner sends `kin_session_heartbeat` at a
+third of the idle window the session reply named in `idle_timeout_secs`, so a turn longer
+than that window does not cost the run its session. A reply that names no window gets no
+heartbeat rather than a guessed one. The result record counts them in `session_heartbeats`.
+
 The exit code is the run's outcome: `0` a final answer, `1` a harness error, `2` the
 tool-call budget was spent, `3` the deadline expired, `4` the endpoint was unreachable or
 answered with nothing usable, `5` the MCP server failed, `6` the run changed files that

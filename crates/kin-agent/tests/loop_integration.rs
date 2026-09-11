@@ -89,6 +89,40 @@ fn serve_one(mut stream: TcpStream, response: &Value) -> Option<Value> {
     Some(request)
 }
 
+/// A scripted endpoint that holds each answer for its own delay after the request arrives,
+/// the way a local model prefilling a long prompt does. It returns the base URL and a handle
+/// that yields, per request, the wall-clock seconds it arrived and was answered.
+fn start_paced_endpoint(
+    script: Vec<(Duration, Value)>,
+) -> (String, std::thread::JoinHandle<Vec<(f64, f64)>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let mut in_flight = Vec::new();
+        for (delay, response) in script {
+            let Ok((stream, _)) = listener.accept() else {
+                break;
+            };
+            let arrived = wall_now();
+            std::thread::sleep(delay);
+            if serve_one(stream, &response).is_none() {
+                break;
+            }
+            in_flight.push((arrived, wall_now()));
+        }
+        in_flight
+    });
+    (format!("http://127.0.0.1:{port}/v1"), handle)
+}
+
+/// Seconds since the Unix epoch, the clock the scripted MCP server stamps its calls with.
+fn wall_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
 fn completion(content: &str, tool_calls: Option<Value>) -> Value {
     let mut message = json!({ "role": "assistant", "content": content });
     let finish = if tool_calls.is_some() {
@@ -177,9 +211,15 @@ fn write_fake_mcp_server(dir: &Path) -> PathBuf {
 }
 
 const FAKE_SERVER: &str = r#"#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 
 LOG = sys.argv[1]
+
+# An idle window in whole seconds, when a test names one. The session is then reaped once no
+# call has reached it for that long, the way the daemon reaps a PID-less session, every later
+# call is refused saying so, and each call is logged with the wall clock it arrived at.
+TTL = int(sys.argv[2]) if len(sys.argv) > 2 else None
+SESSION = {"last": None, "reaped": False}
 
 # Staged operations per transaction, so a commit publishes what was staged rather than
 # answering yes to anything. The server runs with the repository as its cwd.
@@ -198,6 +238,8 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "kin_session_end", "description": "End a session.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "kin_session_heartbeat", "description": "Keep a session alive.",
+     "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}}}},
     {"name": "kin_transaction_begin", "description": "Begin a transaction.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "kin_transaction_stage", "description": "Stage transaction operations.",
@@ -239,9 +281,21 @@ def call(name, args):
     operations = args.get("operations", [])
     if name == "kin_transaction_commit":
         operations = STAGED.get(args.get("transaction_id"), [])
+    row = {"tool": name, "args": args, "disk": disk_snapshot(operations)}
+    if TTL is not None:
+        now = time.monotonic()
+        if SESSION["last"] is not None and now - SESSION["last"] > TTL:
+            SESSION["reaped"] = True
+        if not SESSION["reaped"]:
+            SESSION["last"] = now
+        row["wall"] = time.time()
+        row["reaped"] = SESSION["reaped"]
     with open(LOG, "a") as fh:
-        fh.write(json.dumps({"tool": name, "args": args,
-                             "disk": disk_snapshot(operations)}) + "\n")
+        fh.write(json.dumps(row) + "\n")
+    if TTL is not None and SESSION["reaped"]:
+        return payload({"error": "session sess-fixture-1 was reaped after %d s idle; call "
+                                 "kin_session_start for a new one" % TTL,
+                        "_kin": ENVELOPE}, is_error=True)
     if name == "kin_artifact_list":
         # Pretty-printed with one row per artifact, like the real server, so a listing
         # asked for a large limit is large for the same reason the real one is.
@@ -264,7 +318,13 @@ def call(name, args):
         # Numbered, so a harness that re-opens its session gets a new id, as it does from
         # a daemon that was started again.
         SESSIONS.append(len(SESSIONS) + 1)
-        return payload({"session_id": "sess-fixture-%d" % SESSIONS[-1], "_kin": ENVELOPE})
+        reply = {"session_id": "sess-fixture-%d" % SESSIONS[-1], "_kin": ENVELOPE}
+        if TTL is not None:
+            reply["idle_timeout_secs"] = TTL
+        return payload(reply)
+    if name == "kin_session_heartbeat":
+        return payload({"session_id": args.get("session_id"), "status": "alive",
+                        "_kin": ENVELOPE})
     if name == "kin_transaction_begin":
         # src/stale.py: the first session is gone, as after a daemon restart; a re-opened
         # session is accepted. src/nobegin.py: every begin is refused the same way.
@@ -2181,6 +2241,124 @@ fn a_slow_endpoint_is_abandoned_at_the_deadline_and_the_run_says_deadline() {
     assert!(
         detail.contains("2 s deadline") && detail.contains("on the endpoint"),
         "the stop must say the deadline cut an endpoint wait: {detail}"
+    );
+}
+
+/// A model turn longer than the session's idle window does not cost the run its session. The
+/// runner heartbeats at a third of the window the session reply named while the request is
+/// in flight, and only then, so the Kin call after the long turn is still served.
+#[test]
+fn a_model_turn_longer_than_the_idle_window_keeps_the_session_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    // The scripted session is reaped after two idle seconds, and the second turn takes five.
+    let window_secs = 2u64;
+    let (base_url, endpoint) = start_paced_endpoint(vec![
+        (
+            Duration::ZERO,
+            completion(
+                "Let me look.",
+                Some(tool_call(
+                    "c1",
+                    "mcp__kin__semantic_locate",
+                    json!({ "query": "greet" }),
+                )),
+            ),
+        ),
+        (
+            Duration::from_secs(5),
+            completion(
+                "Reading it.",
+                Some(tool_call(
+                    "c2",
+                    "mcp__kin__get_entity_source",
+                    json!({ "entity": "greet" }),
+                )),
+            ),
+        ),
+        (
+            Duration::ZERO,
+            completion("greet returns a greeting.", None),
+        ),
+    ]);
+    let mut command = mcp_command(&server, &log);
+    command.push(window_secs.to_string());
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, command)).expect("the run returns");
+    let in_flight = endpoint.join().expect("endpoint thread");
+
+    assert_eq!(outcome.status, ExitStatus::Success);
+    let calls = mcp_log(&log);
+    let tools: Vec<&str> = calls
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap())
+        .collect();
+    assert!(
+        calls.iter().all(|call| call["reaped"] == json!(false)),
+        "no call may find the session reaped: {tools:?}"
+    );
+    let view = analyze(&read_jsonl(&outcome.transcript_path));
+    let read_id = view
+        .tool_uses
+        .iter()
+        .find(|(_, name, _)| name == "mcp__kin__get_entity_source")
+        .map(|(id, _, _)| id.clone())
+        .expect("the model asked for the source after the long turn");
+    let (_, _, read_failed) = view
+        .tool_results
+        .iter()
+        .find(|(id, _, _)| *id == read_id)
+        .expect("the read has a result");
+    assert!(
+        !read_failed,
+        "the Kin call after the long turn must be served"
+    );
+
+    let locate = tools
+        .iter()
+        .position(|tool| *tool == "semantic_locate")
+        .unwrap();
+    let read = tools
+        .iter()
+        .position(|tool| *tool == "get_entity_source")
+        .unwrap();
+    let inside = calls[locate..read]
+        .iter()
+        .filter(|call| call["tool"] == "kin_session_heartbeat")
+        .count();
+    assert!(
+        inside >= 3,
+        "a five-second turn against a two-second window needs heartbeats inside it: {tools:?}"
+    );
+    let beats: Vec<&Value> = calls
+        .iter()
+        .filter(|call| call["tool"] == "kin_session_heartbeat")
+        .collect();
+    for beat in &beats {
+        assert_eq!(beat["args"]["session_id"], "sess-fixture-1");
+        let at = beat["wall"].as_f64().unwrap();
+        assert!(
+            in_flight
+                .iter()
+                .any(|(arrived, answered)| *arrived <= at && at <= answered + 0.25),
+            "a heartbeat at {at} was sent while no request was in flight: {in_flight:?}"
+        );
+    }
+    let gaps: Vec<f64> = calls
+        .windows(2)
+        .map(|pair| pair[1]["wall"].as_f64().unwrap() - pair[0]["wall"].as_f64().unwrap())
+        .collect();
+    assert!(
+        gaps.iter().all(|gap| *gap < window_secs as f64),
+        "no idle gap may reach the window: {gaps:?}"
+    );
+    assert_eq!(
+        view.result["kin_agent"]["session_heartbeats"].as_u64(),
+        Some(beats.len() as u64),
+        "the result record counts every heartbeat"
     );
 }
 
