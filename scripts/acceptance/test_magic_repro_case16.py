@@ -171,6 +171,16 @@ class GapPredicate(unittest.TestCase):
         self.assertTrue(m.host_lacks_reference_enrichment(
             payload(False, HOST_GAP), HEDGED_STDOUT))
 
+    def test_a_codes_only_factor_still_reads_the_gap(self):
+        # Envelope v2: the verdict's factor is codes alone, while trust_reason
+        # keeps its sentence until negative.rs moves. The reader keys on the
+        # label, so the code has to be enough on its own.
+        v2 = payload(False, HOST_GAP)
+        v2["_kin"]["verdict"]["limiting_factor"] = (
+            "reference_enrichment_unsupported; reference_enrichment_no_language_server")
+        v2["negative"]["trust_reason"] = ""
+        self.assertIsNotNone(m.host_lacks_reference_enrichment(v2, HEDGED_STDOUT))
+
     def test_a_quiet_cli_is_not_agreement(self):
         self.assertIsNone(m.host_lacks_reference_enrichment(
             payload(False, HOST_GAP), CLEAN_STDOUT))

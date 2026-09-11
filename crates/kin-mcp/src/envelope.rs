@@ -40,7 +40,15 @@ use crate::types::{ContentBlock, ToolCallResult};
 
 /// Current envelope schema version. Bump on any breaking field change so
 /// Kin-aware consumers can detect and adapt to envelope evolution.
-pub const ENVELOPE_VERSION: u32 = 1;
+///
+/// Version 2 carries codes and fields only. The sentences version 1 repeated on
+/// every response are gone: the verdict and completeness notes, the durability,
+/// behind and coverage notes, the watcher-loss disclosure, the entity-count
+/// scope and the hydration remedy. `_kin.verdict.limiting_factor` is the clause
+/// codes joined by `"; "`, every code is one of [`crate::verdict::CLAUSE_CODES`],
+/// and a tool that changes state carries [`Envelope::for_state_change`]. What
+/// each code means is written once, in `docs/mcp-tools.md`.
+pub const ENVELOPE_VERSION: u32 = 2;
 
 /// Reserved top-level key the envelope is attached under. Distinctive and
 /// namespaced so it never collides with a tool payload's own fields.
@@ -73,7 +81,8 @@ pub enum Runtime {
 
 /// Embedding (semantic signal) coverage, mirroring the `SemanticCoverage` shape
 /// kin-cli's locate/status surfaces report (`indexed`/`total`/`pending`/
-/// `complete`/`note`) so an agent reads readiness identically from MCP or CLI.
+/// `complete`) so an agent reads readiness identically from MCP or CLI. The
+/// CLI's human `note` is not carried: `limited_by` names every cause as a code.
 ///
 /// Only populated when the tool payload carried it (the daemon already computes
 /// it for locate/search from its live graph). Never fabricated here.
@@ -122,9 +131,10 @@ pub struct SemanticCoverage {
     /// of what FIR-2543 reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_at: Option<String>,
-    /// Human-readable note describing the degraded state, present only when the
-    /// semantic signal was partial.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Never serialized since envelope version 2, where `limited_by` names every
+    /// cause as a code. Never written either; it stays only until the tests in
+    /// `crate::negative` that build this struct literally stop naming it.
+    #[serde(skip)]
     pub note: Option<String>,
     /// Graph-owned source paths carrying no body, when the payload reported it.
     ///
@@ -293,7 +303,7 @@ impl SemanticCoverage {
                 .get("read_at")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            note: obj.get("note").and_then(Value::as_str).map(str::to_string),
+            note: None,
             // Optional: payloads from surfaces that ran no retrieval, and every
             // payload minted before graph-body coverage existed, carry no such
             // object. Absent stays absent rather than becoming a fabricated zero.
@@ -501,12 +511,6 @@ impl Degraded {
     }
 }
 
-/// What the daemon's entity count includes, in one sentence a reader can act on.
-pub const ENTITY_COUNT_SCOPE: &str =
-    "every entity node the daemon holds, including external reference targets this repository \
-     does not define; `kin graph status` prints the smaller count of definitions this \
-     repository owns and names the excluded targets on its own line";
-
 /// Graph freshness context — what graph state answered the query. `as_of` is a
 /// precise version marker only when the payload/daemon provides one; the rest
 /// are honest `/health`-derived signals (never fabricated).
@@ -518,17 +522,12 @@ pub struct GraphState {
     /// Daemon-reported entity count at answer time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entity_count: Option<u64>,
-    /// What `entity_count` counts, carried so an agent can reconcile it against
-    /// the smaller total the CLI prints without doing arithmetic.
-    ///
-    /// The two disagree on purpose and by a knowable amount: this one counts
-    /// every node the daemon holds, `kin graph status` counts only definitions
-    /// the repository owns, and the difference is the external reference
-    /// targets that surface names and excludes. A stranger on psf/requests read
-    /// 837 here against 777 there, worked the 60 out by subtraction, and had no
-    /// way to confirm the subtraction was the right operation. `kin status`
-    /// carries the reconciling sentence already; the surface agents actually
-    /// read carried nothing.
+    /// Not written since envelope version 2. What `entity_count` counts (every
+    /// node the daemon holds, external reference targets included, where
+    /// `kin graph status` counts only definitions the repository owns) is
+    /// stated once in `docs/mcp-tools.md` rather than on every response. The
+    /// field stays until the kin-daemon tests that build this struct literally
+    /// stop naming it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entity_count_scope: Option<String>,
     /// Whether the daemon has a graph loaded.
@@ -660,8 +659,6 @@ pub struct Durability {
     /// the same rule as `live_only_entities` above, and for the same reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_only_relations: Option<u64>,
-    /// One line an agent can act on without reading the counts.
-    pub note: String,
 }
 
 /// The four readings [`Durability::observe`] reduces to one state.
@@ -732,72 +729,6 @@ impl Axis {
             Self::Unlevelled | Self::Unreconciled { .. } | Self::Unobserved => None,
         }
     }
-
-    /// This axis's clause in an `unknown` note: its count when it has one, and
-    /// otherwise why it does not.
-    ///
-    /// The axis that DID reconcile still states its number. A reader told only
-    /// that the relations could not be read loses the entity reading that was
-    /// fine, and a reader told only that the entity reading is fine has been
-    /// handed the all-clear this object exists to refuse.
-    fn clause(self, subject: &str) -> String {
-        match self {
-            Self::Level => format!("0 of the {subject} are uncommitted"),
-            Self::Uncommitted(live_only) => {
-                format!("{live_only} of the {subject} are uncommitted")
-            }
-            Self::Unlevelled => format!(
-                "how many of the {subject} are uncommitted is unknown, because this daemon has \
-                 not levelled its query graph with durable repository authority"
-            ),
-            Self::Unreconciled { live, durable } => format!(
-                "how many of the {subject} are uncommitted is unknown, because durable authority \
-                 carries {durable} of them and the live graph holds only {live}"
-            ),
-            Self::Unobserved => format!(
-                "how many {subject} are uncommitted is unknown, because nothing measured them"
-            ),
-        }
-    }
-}
-
-/// What answered, as the lead clause of every note this object writes.
-///
-/// Always both counts, because the note has to state the scope it is about to
-/// make a claim over. The block that named only its entity count is the one that
-/// claimed "everything answering here" over a graph whose relations it had never
-/// read.
-fn live_lead(live_entities: Option<u64>, live_relations: Option<u64>) -> String {
-    match (live_entities, live_relations) {
-        (Some(entities), Some(relations)) => {
-            format!("{entities} entities and {relations} relations answered here")
-        }
-        (Some(entities), None) => {
-            format!("{entities} entities answered here and no relation reading reached this answer")
-        }
-        (None, Some(relations)) => {
-            format!("{relations} relations answered here and no entity reading reached this answer")
-        }
-        (None, None) => "this graph answered".to_string(),
-    }
-}
-
-/// Why an observation could not be reduced to numbers, one clause per axis.
-///
-/// The two axes are joined rather than one winning, and the one case that is
-/// written out whole is both axes unlevelled, because there the clauses are the
-/// same sentence twice and a reader skims a note that repeats itself.
-fn unknown_cause(entities: Axis, relations: Axis) -> String {
-    if entities == Axis::Unlevelled && relations == Axis::Unlevelled {
-        return "how many of the entities and relations are uncommitted is unknown, because this \
-                daemon has not levelled its query graph with durable repository authority"
-            .to_string();
-    }
-    format!(
-        "{}, and {}",
-        entities.clause("entities"),
-        relations.clause("relations")
-    )
 }
 
 /// How far graph truth is behind the working copy this daemon watches.
@@ -845,8 +776,6 @@ pub struct GraphBehind {
     /// field-versus-prose split this whole ticket is about, one object over from
     /// where it was fixed, so the block now states it positively.
     pub measured: bool,
-    /// One line an agent can act on without reading the counts.
-    pub note: String,
 }
 
 impl GraphBehind {
@@ -896,14 +825,12 @@ impl GraphBehind {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let note = Self::describe(unadmitted_paths, since.as_deref(), measured_age_seconds);
         Some(Self {
             unadmitted_paths,
             since,
             sample,
             measured_age_seconds,
             measured: measured_age_seconds.is_some(),
-            note,
         })
     }
 
@@ -917,38 +844,6 @@ impl GraphBehind {
     /// the unmeasured shape there is no path to admit.
     pub fn unmeasured(&self) -> bool {
         !self.measured && self.unadmitted_paths == 0
-    }
-
-    fn describe(
-        unadmitted_paths: u64,
-        since: Option<&str>,
-        measured_age_seconds: Option<u64>,
-    ) -> String {
-        let clock = match since {
-            Some(since) => format!("the last complete admission was at {since}"),
-            None => {
-                "this daemon has not reported when a complete admission last succeeded".to_string()
-            }
-        };
-        if unadmitted_paths == 0 {
-            return format!(
-                "nothing has measured this working copy, so whether graph truth is level with it \
-                 is unknown, and {clock}. Answers here cover admitted content only. `kin status` \
-                 reports the same, and a commit takes any unadmitted path anyway."
-            );
-        }
-        // The age rides in the sentence as well as the field, because a count
-        // with no clock cannot say whether the store fell behind a second ago
-        // or a month ago, and a reader of the note gets only the sentence.
-        let measured = match measured_age_seconds {
-            Some(age) => format!(", measured {age}s ago,"),
-            None => String::new(),
-        };
-        format!(
-            "{unadmitted_paths} host path(s) are on disk that graph truth does not carry\
-             {measured} and {clock}. Answers here cover admitted content only. `kin admit` takes \
-             those paths now, and a commit takes them anyway."
-        )
     }
 
     /// The machine-stable reason an absence claim cannot be certified over this
@@ -1113,7 +1008,6 @@ impl Durability {
     pub fn observe(counts: DurabilityCounts) -> Self {
         let entities = Axis::observe(Some(counts.live_entities), counts.durable_entities);
         let relations = Axis::observe(counts.live_relations, counts.durable_relations);
-        let lead = live_lead(Some(counts.live_entities), counts.live_relations);
         let (Some(live_only_entities), Some(live_only_relations)) =
             (entities.live_only(), relations.live_only())
         else {
@@ -1125,10 +1019,6 @@ impl Durability {
                 live_relations: counts.live_relations,
                 durable_relations: counts.durable_relations,
                 live_only_relations: None,
-                note: format!(
-                    "{lead}; {}. Run `kin status` to read durable authority directly.",
-                    unknown_cause(entities, relations)
-                ),
             };
         };
         if live_only_entities == 0 && live_only_relations == 0 {
@@ -1140,13 +1030,6 @@ impl Durability {
                 live_relations: counts.live_relations,
                 durable_relations: counts.durable_relations,
                 live_only_relations: Some(0),
-                // Not "everything". The claim names the two things this block
-                // counted, because the sentence it replaces made a whole-graph
-                // promise out of a one-axis reading.
-                note: format!(
-                    "{lead}; 0 entities and 0 relations are uncommitted, and durable repository \
-                     authority records every entity and relation answering here."
-                ),
             };
         }
         Self {
@@ -1157,16 +1040,6 @@ impl Durability {
             live_relations: counts.live_relations,
             durable_relations: counts.durable_relations,
             live_only_relations: Some(live_only_relations),
-            note: format!(
-                "{lead}; {live_only_entities} entities and {live_only_relations} relations are \
-                 uncommitted, and {} recorded yet. The uncommitted work is lost when this daemon \
-                 exits. Commit to record it.",
-                if counts.durable_entities == Some(0) && counts.durable_relations == Some(0) {
-                    "nothing you wrote is"
-                } else {
-                    "not all of what you wrote is"
-                }
-            ),
         }
     }
 
@@ -1191,32 +1064,10 @@ impl Durability {
     /// holds is not knowable from a graph that never parsed it, and inventing a
     /// figure is the one thing this object promises never to do.
     ///
-    /// So the sentence does not state one either. The first version of this
-    /// composed its lead from `live_only_entities` and then withdrew the field,
-    /// which is the FIR-2499 failure with the halves swapped: a reader grepping
-    /// the payload for "0 uncommitted" over an unadmitted module still found it,
-    /// one clause before the note explained that no such number was derivable.
-    /// The lead now states the live count, which is a fact, and nothing else.
-    pub fn qualified_by(mut self, behind: &GraphBehind) -> Self {
-        let counts = live_lead(self.live_entities, self.live_relations);
-        // Two readings and two sentences, for the same reason the limiting
-        // factor carries two: a measured count and no measurement at all send a
-        // reader to different levers, and one of them is `kin admit`.
-        self.note = if behind.unmeasured() {
-            format!(
-                "{counts}, and nothing has measured this working copy, so how much of it is \
-                 recorded is unknown; this reading covers admitted content only. `kin status` \
-                 reports the same, and a commit takes any unadmitted path anyway."
-            )
-        } else {
-            format!(
-                "{counts}, and {} host path(s) on disk that no admission has taken, so how much \
-                 of this working copy is recorded is unknown; this reading covers admitted \
-                 content only. `kin admit` takes those paths now, and a commit takes them \
-                 anyway.",
-                behind.unadmitted_paths
-            )
-        };
+    /// Since envelope version 2 no sentence restates any of it. The fields are
+    /// the claim, and `_kin.behind` beside this object says what the graph has
+    /// not taken.
+    pub fn withdraw_all_clear(mut self) -> Self {
         self.state = DURABILITY_UNKNOWN.to_string();
         // Both differences, for the reason the state is one word: a withdrawn
         // claim that leaves a number standing beside it is the FIR-2820 failure,
@@ -1293,17 +1144,6 @@ impl CoverageSubstrate {
         match self {
             CoverageSubstrate::Edges => "edges",
             CoverageSubstrate::Embeddings => "embeddings",
-            CoverageSubstrate::Graph => "graph",
-        }
-    }
-
-    /// The substrate as it reads inside a sentence, which is not the same word
-    /// as the wire value: "the edges classes" is not English, and the note is
-    /// read by whoever has to act on a partial answer.
-    fn noun(self) -> &'static str {
-        match self {
-            CoverageSubstrate::Edges => "edge",
-            CoverageSubstrate::Embeddings => "embedding",
             CoverageSubstrate::Graph => "graph",
         }
     }
@@ -1387,8 +1227,6 @@ pub struct Completeness {
     /// names, including ones that did not decide `status`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limits: Vec<String>,
-    /// One line an agent can act on without knowing the ground truth.
-    pub note: String,
 }
 
 impl Completeness {
@@ -1506,7 +1344,6 @@ impl Completeness {
             .cloned();
 
         Some(Completeness {
-            note: completeness_note(status, bound, substrate, &decided_by, &limits),
             status: status.to_string(),
             bound: bound.to_string(),
             substrate: substrate.as_str().to_string(),
@@ -1542,13 +1379,6 @@ impl Completeness {
                 limits.push(label);
             }
         }
-        object.insert(
-            "note".to_string(),
-            json!(
-                "The response budget withheld part of this answer, so its counts are a lower \
-                 bound. `_kin.response` names what was cut and how to ask for the rest."
-            ),
-        );
     }
 }
 
@@ -1651,10 +1481,6 @@ pub struct WatcherLossObservation {
     /// Wall-clock time of the newest loss, RFC 3339, when the record named one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
-    /// The daemon's own disclosure, carried verbatim rather than rewritten, so
-    /// the sentence `kin graph status` prints and the one this verdict refuses
-    /// beside cannot drift apart.
-    pub disclosure: String,
 }
 
 impl WatcherLossObservation {
@@ -1689,14 +1515,6 @@ impl WatcherLossObservation {
             generation,
             recovered_through,
             at: loss.get("at").and_then(Value::as_str).map(str::to_string),
-            // A block that arrived without its own sentence still has to say
-            // something. Falling silent here would turn an unreadable
-            // disclosure into a store with no loss.
-            disclosure: loss
-                .get("disclosure")
-                .and_then(Value::as_str)
-                .unwrap_or("the daemon reported a watcher loss it did not describe")
-                .to_string(),
         })
     }
 
@@ -2000,50 +1818,11 @@ fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
 /// as a claim about `classes`, which sat directly below it in the same object
 /// with two of three entries marked `absent`. A reader cannot be expected to
 /// know which subset a sentence means when the superset is printed beside it.
-fn completeness_note(
-    status: &str,
-    bound: &str,
-    substrate: CoverageSubstrate,
-    decided_by: &[String],
-    limits: &[String],
-) -> String {
-    let named = if limits.is_empty() {
-        String::new()
-    } else {
-        format!(" Limited by: {}.", limits.join(", "))
-    };
-    let deciding = if decided_by.is_empty() {
-        format!("no {} class", substrate.noun())
-    } else {
-        format!(
-            "the {} {} class(es)",
-            decided_by.join(", "),
-            substrate.noun()
-        )
-    };
-    match (status, bound) {
-        ("complete", "exact") => {
-            format!("This answer rested on {deciding}, and each was observed present, so the counts here are the whole set.")
-        }
-        ("complete", _) => format!(
-            "This answer rested on {deciding}, and each was observed present, but the counts are \
-             a lower bound.{named}"
-        ),
-        ("partial", _) => format!(
-            "One of the {} classes this answer depended on was observed absent, so what came back \
-             is a lower bound and its absence proves nothing about the code.{named}",
-            substrate.noun()
-        ),
-        _ => format!(
-            "Whether the {} classes this answer depended on were available could not be \
-             established, so treat the counts as a lower bound.{named}",
-            substrate.noun()
-        ),
-    }
-}
-
-/// What this store's creation-time replay record says, and what is safe to do
-/// about it.
+/// What this store's creation-time replay record says.
+///
+/// The safe action for each standing is a fixed mapping written once, in
+/// `docs/mcp-tools.md`, and `kin doctor` names the read failure behind an
+/// `unreadable` record; neither rides the envelope.
 ///
 /// A boolean was the whole defect. `Behind`, `Ahead`, `Unstamped` and
 /// `Unreadable` need four different actions and only one of them is safe to
@@ -2071,13 +1850,6 @@ pub struct HydrationSemanticsObservation {
     /// and could be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_under: Option<u32>,
-    /// Why the record could not be read, on `unreadable` only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    /// The direction-safe action, absent when the store is current and there is
-    /// nothing to do.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remedy: Option<String>,
 }
 
 impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemanticsObservation {
@@ -2089,8 +1861,8 @@ impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemant
         use kin_core::hydration_semantics::HydrationStanding as Standing;
         // One arm per variant, so a new standing has to be projected here
         // rather than silently inheriting whichever default it fell through to.
-        let (created_under, derives, reason) = match standing {
-            Standing::Current { version } => (Some(*version), *version, None),
+        let (created_under, derives) = match standing {
+            Standing::Current { version } => (Some(*version), *version),
             Standing::Behind {
                 created_under,
                 derives,
@@ -2098,16 +1870,14 @@ impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemant
             | Standing::Ahead {
                 created_under,
                 derives,
-            } => (Some(*created_under), *derives, None),
-            Standing::Unstamped { derives } => (None, *derives, None),
-            Standing::Unreadable { reason, derives } => (None, *derives, Some(reason.clone())),
+            } => (Some(*created_under), *derives),
+            Standing::Unstamped { derives } => (None, *derives),
+            Standing::Unreadable { derives, .. } => (None, *derives),
         };
         Self {
             standing: standing.label().to_string(),
             derives,
             created_under,
-            reason,
-            remedy: standing.remedy(),
         }
     }
 }
@@ -2172,9 +1942,9 @@ pub struct Envelope {
     /// Degraded-state flags (always present; individual flags omitted when not
     /// observed).
     pub degraded: Degraded,
-    /// What this store's creation-time replay record says and what is safe to do
-    /// about it. Absent when no repository is discoverable, so no comparison was
-    /// made. See [`HydrationSemanticsObservation`].
+    /// What this store's creation-time replay record says. Absent when no
+    /// repository is discoverable, so no comparison was made. See
+    /// [`HydrationSemanticsObservation`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hydration_semantics: Option<HydrationSemanticsObservation>,
     /// The completeness signal (FIR-2357): what this answer's substrate could
@@ -2224,6 +1994,32 @@ impl Envelope {
                 offline_fallback: Some(true),
                 ..Degraded::default()
             },
+            hydration_semantics: None,
+            completeness: None,
+            verdict: None,
+            response: None,
+            answered_by: None,
+        }
+    }
+
+    /// The envelope a tool that changes state carries: the schema version, the
+    /// runtime, the degraded flags, and a standing watcher loss or unadmitted
+    /// content when either holds, because those bear on any call. The readings
+    /// that qualify a graph answer (durability, freshness, graph state,
+    /// hydration, coverage, the graph marker) ride `kin_graph_status` and every
+    /// read instead of every session and transaction call.
+    pub fn for_state_change(self) -> Self {
+        Self {
+            envelope_version: self.envelope_version,
+            runtime: self.runtime,
+            semantic_coverage: None,
+            graph_as_of: None,
+            durability: None,
+            behind: self.behind,
+            freshness: None,
+            watcher_loss: self.watcher_loss,
+            graph_state: GraphState::default(),
+            degraded: self.degraded,
             hydration_semantics: None,
             completeness: None,
             verdict: None,
@@ -2291,10 +2087,7 @@ impl Envelope {
             embedding_state_reported: None,
             limited_by: Vec::new(),
             read_at: None,
-            note: (!complete).then(|| {
-                "Selected-graph embedding coverage is incomplete at this point-in-time observation."
-                    .to_string()
-            }),
+            note: None,
             // Graph status observes embeddings, not the source-text phase's body
             // resolution, so it has no reading to report here.
             graph_body_gap_paths: None,
@@ -2304,10 +2097,11 @@ impl Envelope {
         // Requalified rather than replaced. This runs on the graph-status path,
         // which may set durability after `with_health` has already read the
         // reconcile block, and a plain assignment there would restore the
-        // all-clear note that block exists to withdraw.
-        self.durability = Some(match self.behind.as_ref() {
-            Some(behind) => durability.qualified_by(behind),
-            None => durability,
+        // all-clear that block exists to withdraw.
+        self.durability = Some(if self.behind.is_some() {
+            durability.withdraw_all_clear()
+        } else {
+            durability
         });
         self.graph_state = GraphState {
             entity_count: Some(counts.live_entities),
@@ -2604,7 +2398,6 @@ impl Envelope {
         }
         if let Some(value) = health.get("graph_entity_count").and_then(Value::as_u64) {
             self.graph_state.entity_count = Some(value);
-            self.graph_state.entity_count_scope = Some(ENTITY_COUNT_SCOPE.to_string());
         }
         if let Some(value) = health.get("graph_loaded").and_then(Value::as_bool) {
             self.graph_state.loaded = Some(value);
@@ -2647,11 +2440,8 @@ impl Envelope {
         // paths while an unknown region of it is missing because the watcher's
         // backend dropped the events that would have named it.
         self.watcher_loss = WatcherLossObservation::from_health(health);
-        if let Some(behind) = self.behind.as_ref() {
-            self.durability = self
-                .durability
-                .take()
-                .map(|durability| durability.qualified_by(behind));
+        if self.behind.is_some() {
+            self.durability = self.durability.take().map(Durability::withdraw_all_clear);
         }
         // The daemon `/health` `graph_generation` marker (monotonic snapshot
         // generation, bumped per committed snapshot) is a precise freshness
@@ -2690,11 +2480,8 @@ impl Envelope {
         // paths while an unknown region of it is missing because the watcher's
         // backend dropped the events that would have named it.
         self.watcher_loss = WatcherLossObservation::from_health(health);
-        if let Some(behind) = self.behind.as_ref() {
-            self.durability = self
-                .durability
-                .take()
-                .map(|durability| durability.qualified_by(behind));
+        if self.behind.is_some() {
+            self.durability = self.durability.take().map(Durability::withdraw_all_clear);
         }
         self
     }
@@ -3039,6 +2826,11 @@ pub fn finalize_bounded(
             envelope.verdict = Some(verdict.to_value());
         }
     }
+    // A tool that changes state reads no graph answer, so the readings that
+    // qualify one would ride every session and transaction call for nothing.
+    if changes_state(tool_name) {
+        envelope = envelope.for_state_change();
+    }
     let annotated = annotate_inner(
         result,
         &envelope,
@@ -3053,6 +2845,29 @@ pub fn finalize_bounded(
         }
         _ => annotated,
     }
+}
+
+/// Whether `tool` changes state rather than reading graph truth, by its own
+/// registered annotations.
+///
+/// Derived from the registry rather than listed, so a session or transaction
+/// tool registered later is covered the day it lands. A name the registry does
+/// not carry is treated as a read and keeps every store reading, because
+/// dropping facts is the direction that needs a reason.
+fn changes_state(tool: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static READ_ONLY: OnceLock<HashMap<String, bool>> = OnceLock::new();
+    READ_ONLY
+        .get_or_init(|| {
+            crate::tools::tool_definitions()
+                .tools
+                .into_iter()
+                .map(|tool| (tool.name, tool.annotations.read_only_hint))
+                .collect()
+        })
+        .get(crate::agent_belt::canonical_tool_name(tool))
+        .is_some_and(|read_only| !read_only)
 }
 
 fn fit_context_output(
@@ -3533,12 +3348,16 @@ mod tests {
         assert_eq!(uncommitted.live_only_entities, Some(14));
         assert_eq!(uncommitted.live_only_relations, Some(20));
         assert!(
-            uncommitted
-                .note
-                .contains("14 entities and 20 relations are uncommitted")
-                && uncommitted.note.contains("nothing you wrote is"),
-            "an empty durable authority means none of it is recorded: {}",
-            uncommitted.note
+            uncommitted.durable_entities == Some(0) && uncommitted.durable_relations == Some(0),
+            "an empty durable authority means none of it is recorded, and the counts say so: \
+             {uncommitted:?}"
+        );
+        assert!(
+            serde_json::to_value(&uncommitted)
+                .expect("durability serializes")
+                .get("note")
+                .is_none(),
+            "envelope v2 carries the counts and no sentence restating them: {uncommitted:?}"
         );
 
         let partly = Durability::observe(DurabilityCounts {
@@ -3551,9 +3370,8 @@ mod tests {
         assert_eq!(partly.live_only_entities, Some(5));
         assert_eq!(partly.live_only_relations, Some(9));
         assert!(
-            partly.note.contains("not all of what you wrote is"),
-            "a nonempty durable authority records some of it: {}",
-            partly.note
+            partly.durable_entities == Some(9) && partly.durable_relations == Some(11),
+            "a nonempty durable authority records some of it: {partly:?}"
         );
 
         let recorded = Durability::observe(level_counts(14, 20));
@@ -3607,26 +3425,19 @@ mod tests {
         assert_eq!(
             swept.live_only_relations,
             Some(3438),
-            "the count is the whole disclosure: {}",
-            swept.note
+            "the count is the whole disclosure: {swept:?}"
         );
         assert_eq!(swept.live_only_entities, Some(0));
         assert_eq!(
             swept.state, "live_uncommitted",
-            "a level entity count cannot certify a relation set no commit carries: {}",
-            swept.note
+            "a level entity count cannot certify a relation set no commit carries: {swept:?}"
         );
         assert!(
-            swept
-                .note
-                .contains("0 entities and 3438 relations are uncommitted"),
-            "the note has to state the uncommitted count of each: {}",
-            swept.note
-        );
-        assert!(
-            !swept.note.contains("everything"),
-            "no sentence here may claim a scope this block does not cover: {}",
-            swept.note
+            serde_json::to_value(&swept)
+                .expect("durability serializes")
+                .get("note")
+                .is_none(),
+            "no sentence rides this block, so none can claim a scope it does not cover: {swept:?}"
         );
     }
 
@@ -3648,12 +3459,10 @@ mod tests {
             unlevelled.live_only_entities, None,
             "the state a caller branches on moved, so the number beside it goes with it"
         );
-        assert!(
-            unlevelled
-                .note
-                .contains("has not levelled its query graph with durable repository authority"),
-            "{}",
-            unlevelled.note
+        assert_eq!(
+            unlevelled.durable_relations, None,
+            "the relation axis this daemon never levelled reads as no durable count: \
+             {unlevelled:?}"
         );
 
         // The rc0547b shape: edges gone while the entity count held. A
@@ -3668,11 +3477,12 @@ mod tests {
         assert_eq!(lost.state, "unknown");
         assert_eq!(lost.live_only_relations, None);
         assert!(
-            lost.note
-                .contains("durable authority carries 1279 of them and the live graph holds only")
-                && lost.note.contains("0 of the entities are uncommitted"),
-            "the axis that did reconcile still states its number: {}",
-            lost.note
+            lost.durable_relations == Some(1279)
+                && lost.live_relations == Some(1268)
+                && lost.durable_entities == Some(783)
+                && lost.live_entities == Some(783),
+            "both axes keep their raw counts, so the one that reconciled still states its \
+             number: {lost:?}"
         );
 
         // A runtime that published no relation count at all. Silence is not
@@ -3685,12 +3495,9 @@ mod tests {
         });
         assert_eq!(unobserved.state, "unknown");
         assert_eq!(unobserved.live_relations, None);
-        assert!(
-            unobserved
-                .note
-                .contains("no relation reading reached this answer"),
-            "{}",
-            unobserved.note
+        assert_eq!(
+            unobserved.durable_relations, None,
+            "no relation reading means no relation count at all: {unobserved:?}"
         );
     }
 
@@ -3731,8 +3538,7 @@ mod tests {
             .expect("a measured live count carries durability");
         assert_eq!(
             entities_only.state, "unknown",
-            "a level entity pair is not an all-clear over unread relations: {}",
-            entities_only.note
+            "a level entity pair is not an all-clear over unread relations: {entities_only:?}"
         );
         assert_eq!(entities_only.live_only_entities, None);
 
@@ -3777,18 +3583,10 @@ mod tests {
             "the counts were never the wrong part and are left exactly as observed"
         );
         assert!(
-            !durability
-                .note
-                .contains("records every entity and relation answering here"),
-            "the all-clear this reading cannot make: {}",
-            durability.note
-        );
-        assert!(
-            durability
-                .note
-                .contains("host path(s) on disk that no admission has taken"),
-            "the note has to name what it does not cover: {}",
-            durability.note
+            env.behind
+                .as_ref()
+                .is_some_and(|behind| behind.unadmitted_paths > 0),
+            "`_kin.behind` has to name what this reading does not cover: {durability:?}"
         );
         // FIR-2820. The half a caller keys on. Withdrawing the sentence and
         // leaving `recorded` and a zero standing is telling a reader of the
@@ -3831,25 +3629,17 @@ mod tests {
 
         let durability = env.durability.expect("graph status reports the counts");
         assert!(
-            !durability
-                .note
-                .contains("records every entity and relation answering here"),
-            "the graph-status reading restored an all-clear over a behind store: {}",
-            durability.note
-        );
-        assert!(
-            durability
-                .note
-                .contains("host path(s) on disk that no admission has taken"),
-            "the note has to keep naming what it does not cover: {}",
-            durability.note
+            env.behind
+                .as_ref()
+                .is_some_and(|behind| behind.unadmitted_paths > 0),
+            "`_kin.behind` has to keep naming what this reading does not cover: {durability:?}"
         );
         // FIR-2820, on the second path for the same reason it is asserted on
         // the first: this call requalifies rather than assigns, so a state that
         // moved on one path and not the other is exactly the shape that stays
         // green while shipping the defect.
-        assert_eq!(durability.state, DURABILITY_UNKNOWN, "{}", durability.note);
-        assert_eq!(durability.live_only_entities, None, "{}", durability.note);
+        assert_eq!(durability.state, DURABILITY_UNKNOWN, "{durability:?}");
+        assert_eq!(durability.live_only_entities, None, "{durability:?}");
     }
 
     /// FIR-2820. The one answer that may not take the counts still has to take
@@ -3887,17 +3677,9 @@ mod tests {
         let durability = env.durability.expect("graph status reports the counts");
         assert_eq!(
             durability.state, DURABILITY_UNKNOWN,
-            "the reading has to move, or this lift changed nothing: {}",
-            durability.note
+            "the reading has to move, or this lift changed nothing: {durability:?}"
         );
         assert_eq!(durability.live_only_entities, None);
-        assert!(
-            durability
-                .note
-                .contains("host path(s) on disk that no admission has taken"),
-            "{}",
-            durability.note
-        );
 
         // The order the stdio path does not use, asserted because either order
         // has to reach the same reading or the fix depends on a call sequence
@@ -3969,16 +3751,46 @@ mod tests {
         let durability = env.durability.expect("the counts still answer");
         assert_eq!(
             durability.state, DURABILITY_UNKNOWN,
-            "a working copy nobody measured cannot report its work recorded: {}",
-            durability.note
+            "a working copy nobody measured cannot report its work recorded: {durability:?}"
         );
         assert_eq!(durability.live_only_entities, None);
+    }
+
+    /// A tool that changes state carries the minimal envelope, and a read keeps
+    /// the store readings. The session end is the shape the ruling named.
+    #[test]
+    fn a_state_changing_tool_carries_the_minimal_envelope_and_a_read_does_not() {
+        let health = serde_json::json!({
+            "graph_entity_count": 5,
+            "durable_entity_count": 5,
+            "graph_relation_count": 3,
+            "durable_relation_count": 3,
+            "reconciliation_status": "idle",
+            "graph_loaded": true,
+            "initialized": true,
+        });
+        let envelope_of = |tool: &str| -> Value {
+            let result = finalize(
+                ToolCallResult::text(r#"{"session_id":"s1"}"#.to_string()),
+                Envelope::daemon().with_health(&health),
+                tool,
+            );
+            let ContentBlock::Text { text } = &result.content[0];
+            serde_json::from_str::<Value>(text).expect("a JSON payload")["_kin"].clone()
+        };
+        let ended = envelope_of("kin_session_end");
+        let mut keys: Vec<&str> = ended
+            .as_object()
+            .expect("an envelope object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["degraded", "envelope_version", "runtime"], "{ended}");
+        let read = envelope_of("get_entity_source");
         assert!(
-            durability
-                .note
-                .contains("nothing has measured this working copy"),
-            "{}",
-            durability.note
+            read.get("durability").is_some() && read.get("graph_state").is_some(),
+            "a read keeps the readings that qualify it: {read}"
         );
     }
 
@@ -3998,7 +3810,6 @@ mod tests {
             sample: Vec::new(),
             measured_age_seconds: Some(9),
             measured: true,
-            note: String::new(),
         };
         assert!(
             !stamped.unmeasured(),
@@ -4130,16 +3941,15 @@ mod tests {
         }));
         let durability = env.durability.expect("the counts still answer");
         assert!(
-            !durability.note.contains("uncommitted"),
-            "the field is gone and the sentence has to go with it: {}",
-            durability.note
+            serde_json::to_value(&durability)
+                .expect("durability serializes")
+                .get("note")
+                .is_none(),
+            "the field is gone and no sentence restates it: {durability:?}"
         );
         assert!(
-            durability
-                .note
-                .contains("6 entities and 6 relations answered here"),
-            "the live counts are facts and stay: {}",
-            durability.note
+            durability.live_entities == Some(6) && durability.live_relations == Some(6),
+            "the live counts are facts and stay: {durability:?}"
         );
     }
 
@@ -4165,11 +3975,8 @@ mod tests {
         let durability = env.durability.expect("the counts still answer");
         assert_eq!(durability.state, "recorded");
         assert!(
-            durability
-                .note
-                .contains("records every entity and relation answering here"),
-            "{}",
-            durability.note
+            durability.live_only_entities == Some(0) && durability.live_only_relations == Some(0),
+            "a recorded reading states zero uncommitted as fields: {durability:?}"
         );
     }
 
@@ -4241,7 +4048,10 @@ mod tests {
         assert_eq!(coverage.total, 20);
         assert_eq!(coverage.pending, 5);
         assert!(!coverage.complete);
-        assert_eq!(coverage.note.as_deref(), Some("partial"));
+        assert_eq!(
+            coverage.note, None,
+            "envelope v2 does not lift the producer's human note; limited_by carries the causes"
+        );
         assert_eq!(env.graph_as_of, Some(serde_json::json!("change:abcdef")));
     }
 
@@ -4543,31 +4353,20 @@ mod tests {
         // artifact.
         println!("composed disclosure: {detail}");
         assert!(
-            detail.contains("_kin.verdict.limiting_factor")
-                && detail.contains("negative.trust_reason"),
+            detail.contains("negative.trust_reason"),
             "the disclosure does not name where the statement still lives: {detail}"
         );
 
-        // Nothing was lost. The canonical copies are whole and the two fields
-        // that restated them point at them by name.
+        // Nothing was lost. The canonical copy is whole and the one field that
+        // restated it points at it by name.
         let factor = final_payload["_kin"]["verdict"]["limiting_factor"]
             .as_str()
             .expect("a bounded trace names a limiting factor");
+        let codes: Vec<&str> = factor.split(crate::verdict::CLAUSE_SEPARATOR).collect();
         assert!(
-            factor.len() > 400,
-            "the canonical sentence was shortened, which is the one thing this must not do: \
+            codes.len() > 1 && codes.iter().all(|code| !code.contains(' ')),
+            "the factor is the codes, every reason kept and no sentence left to shorten: \
              {factor}"
-        );
-        let note = final_payload["_kin"]["verdict"]["note"]
-            .as_str()
-            .expect("the verdict carries a note");
-        assert!(
-            note.contains("see `_kin.verdict.limiting_factor`"),
-            "the note does not point at the sentence it used to repeat: {note}"
-        );
-        assert!(
-            !note.contains(factor),
-            "the note still carries the whole sentence verbatim: {note}"
         );
         let trust_reason = final_payload["negative"]["trust_reason"]
             .as_str()
@@ -4608,11 +4407,10 @@ mod tests {
             crate::budget::measure(&payload) <= 60_000,
             "the roomy arm has to fit, or it is grading the same case as the tight one"
         );
-        let note = payload["_kin"]["verdict"]["note"]
-            .as_str()
-            .expect("the verdict carries a note");
+        let note = payload.to_string();
         assert!(
-            !note.contains("see `_kin.verdict.limiting_factor`"),
+            !note.contains("see `_kin.verdict.limiting_factor`")
+                && !note.contains("see `negative.trust_reason`"),
             "a response with room to spare was shortened anyway: {note}"
         );
         let reasons: Vec<&str> = payload["degradations"]
@@ -4855,9 +4653,10 @@ mod tests {
             let completeness = &value[ENVELOPE_KEY]["completeness"];
             assert_eq!(verdict["state"], "inconclusive", "{state}: {value}");
             assert!(
-                verdict["limiting_factor"]
-                    .as_str()
-                    .is_some_and(|factor| factor.contains("imports")),
+                completeness["classes"]["imports"].as_str() == Some(state)
+                    && verdict["limiting_factor"]
+                        .as_str()
+                        .is_some_and(|factor| !factor.is_empty()),
                 "{state}: the factor names the class: {verdict}"
             );
             assert_eq!(
@@ -5025,14 +4824,10 @@ mod tests {
         );
         assert_eq!(completeness["status"], "partial", "{completeness}");
         assert_eq!(completeness["bound"], "at_least", "{completeness}");
-        let note = completeness["note"].as_str().unwrap();
         assert!(
-            !note.contains("the whole set"),
-            "a graph missing the class the question needed does not hold the whole set: {note}"
-        );
-        assert!(
-            note.contains("lower bound"),
-            "the note says what the counts actually are: {note}"
+            completeness.get("note").is_none(),
+            "v2 says what the counts are with `status` and `bound` above, never a sentence: \
+             {completeness}"
         );
     }
 
@@ -5362,7 +5157,15 @@ mod tests {
         let raw = conservative_reference_fixture();
         let full = roomy_reference_response(&raw);
         let budget = ResponseBudget {
-            max_chars: 12_000,
+            // One character under what this response measures compacted, so
+            // whitespace alone cannot fit it and the pointer step is what has to
+            // make the room. Measured rather than written as 12,000, because
+            // envelope v2 dropped the sentences that used to push this fixture
+            // past that literal.
+            max_chars: serde_json::to_string(&full)
+                .expect("the response serializes")
+                .len()
+                - 1,
             ..ResponseBudget::default()
         };
         let before = crate::budget::measure(&full);
@@ -5376,9 +5179,13 @@ mod tests {
             crate::budget::measure(&pointed) > budget.max_chars,
             "whitespace alone must not fit the qualification-heavy fixture"
         );
+        // One, not three. Envelope v2 sends codes in `_kin.verdict.limiting_factor`
+        // and no verdict or completeness note, so the only exact restatement left
+        // is the copy `negative.advice` carries of `negative.trust_reason`; PR 2
+        // removes that one at its source.
         assert_eq!(
             crate::budget::point_restated_limiting_factor(&mut pointed, &budget),
-            3
+            1
         );
         let compacted = crate::budget::measure(&pointed);
         assert!(
@@ -5439,22 +5246,19 @@ mod tests {
             .iter()
             .any(|entry| entry["reason"] == crate::budget::RESTATEMENT_POINTED_REASON));
         let mut expanded = final_payload.clone();
-        for (path, owner) in [
-            ("/_kin/verdict/note", "/_kin/verdict/limiting_factor"),
-            ("/negative/advice", "/negative/trust_reason"),
-            ("/_kin/completeness/note", "/_kin/verdict/limiting_factor"),
-        ] {
-            let name = owner.trim_start_matches('/').replace('/', ".");
-            let original = full.pointer(owner).unwrap().as_str().unwrap();
-            let replacement = original.trim_end_matches('.');
-            let text = expanded
-                .pointer(path)
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .replace(&format!("see `{name}`"), replacement);
-            *expanded.pointer_mut(path).unwrap() = json!(text);
-        }
+        // Envelope v2 leaves one field that restates a qualification.
+        let (path, owner) = ("/negative/advice", "/negative/trust_reason");
+        let name = owner.trim_start_matches('/').replace('/', ".");
+        let original = full.pointer(owner).unwrap().as_str().unwrap();
+        let replacement = original.trim_end_matches('.');
+        let text = expanded
+            .pointer(path)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .replace(&format!("see `{name}`"), replacement);
+        *expanded.pointer_mut(path).unwrap() = json!(text);
+
         expanded["_kin"].as_object_mut().unwrap().remove("response");
         expanded["degradations"]
             .as_array_mut()
@@ -5482,13 +5286,20 @@ mod tests {
     fn reference_whitespace_compaction_preserves_the_complete_json_answer() {
         let raw = concise_reference_fixture();
         let mut full = roomy_reference_response(&raw);
-        assert!(crate::budget::measure(&full) > 12_000);
+        // The ceiling sits between the compact and the pretty rendering, so
+        // compaction alone is what fits the whole answer under it. Measured
+        // rather than written as 12,000 for the reason above.
+        let ceiling = serde_json::to_string(&full)
+            .expect("the response serializes")
+            .len()
+            + 200;
+        assert!(crate::budget::measure(&full) > ceiling);
         let result = finalize_bounded(
             ToolCallResult::text(raw.to_string()),
             conservative_reference_envelope(),
             "find_references",
             &ResponseBudget {
-                max_chars: 12_000,
+                max_chars: ceiling,
                 ..ResponseBudget::default()
             },
         );
@@ -5512,7 +5323,7 @@ mod tests {
         // Re-serializing the parsed answer compactly reproduces the shipped
         // bytes exactly, so the only thing compaction removed was whitespace.
         assert_eq!(serde_json::to_string(&payload).unwrap(), *text);
-        assert!(text.len() <= 12_000);
+        assert!(text.len() <= ceiling);
         // And the switch is genuinely consumed rather than merely hidden: this
         // payload, read back without it, measures as pretty.
         assert!(
@@ -5551,7 +5362,8 @@ mod tests {
         pointed["_kin_json_format"] = json!("compact");
         assert_eq!(
             crate::budget::point_restated_limiting_factor(&mut pointed, &budget),
-            3
+            1,
+            "the advice's copy of the trust reason is the one exact restatement v2 still carries"
         );
         assert!(crate::budget::measure(&pointed) > budget.max_chars);
         println!(
@@ -5603,20 +5415,18 @@ mod tests {
     #[test]
     fn nonmatching_reference_qualifications_are_never_pointed() {
         let mut payload = roomy_reference_response(&conservative_reference_fixture());
-        for field in [
-            "/_kin/verdict/note",
-            "/negative/advice",
-            "/_kin/completeness/note",
-        ] {
-            let text = payload
-                .pointer(field)
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .to_string();
-            *payload.pointer_mut(field).unwrap() =
-                json!(format!("{text} An additional unique qualification."));
-        }
+        // Envelope v2 leaves one field that can restate a qualification, so this
+        // is the whole set of them rather than three.
+        let field = "/negative/advice";
+        let text = payload
+            .pointer(field)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        *payload.pointer_mut(field).unwrap() =
+            json!(format!("{text} An additional unique qualification."));
+
         let before = payload.clone();
         let budget = ResponseBudget {
             max_chars: 12_000,
@@ -5711,7 +5521,8 @@ mod tests {
             final_payload[ENVELOPE_KEY]["verdict"]["limiting_factor"]
                 .as_str()
                 .unwrap()
-                .matches("response_bounded:")
+                .split(crate::verdict::CLAUSE_SEPARATOR)
+                .filter(|code| *code == "response_bounded")
                 .count(),
             1,
             "reconciliation must not repeat the verdict factor"
@@ -6653,7 +6464,7 @@ mod tests {
     /// builder that stamped every store `behind` would satisfy the weaker check
     /// and mislead the agent in exactly the direction that destroys a store.
     #[test]
-    fn every_standing_projects_its_own_direction_versions_and_safe_action() {
+    fn every_standing_projects_its_own_direction_and_versions() {
         use kin_core::hydration_semantics::HydrationStanding;
 
         let observed = |standing: &HydrationStanding| {
@@ -6667,12 +6478,6 @@ mod tests {
         assert_eq!(current.standing, "current");
         assert_eq!(current.created_under, Some(10));
         assert_eq!(current.derives, 10);
-        assert_eq!(current.reason, None);
-        assert_eq!(
-            current.remedy, None,
-            "a current store has nothing to do, and advice on it would send a reader to re-ingest \
-             a healthy store"
-        );
 
         let behind = observed(&HydrationStanding::Behind {
             created_under: 9,
@@ -6681,15 +6486,6 @@ mod tests {
         assert_eq!(behind.standing, "behind");
         assert_eq!(behind.created_under, Some(9));
         assert_eq!(behind.derives, 10);
-        assert_eq!(
-            behind.remedy,
-            HydrationStanding::Behind {
-                created_under: 9,
-                derives: 10
-            }
-            .remedy(),
-            "the projection must carry the core remedy, not a second copy of the advice"
-        );
 
         let ahead = observed(&HydrationStanding::Ahead {
             created_under: 11,
@@ -6703,9 +6499,10 @@ mod tests {
             "ahead must read as the store being newer than the build"
         );
         assert_ne!(
-            ahead.remedy, behind.remedy,
-            "ahead and behind must not share advice: re-ingesting an ahead store with this older \
-             build overwrites a store this build cannot author"
+            ahead.standing, behind.standing,
+            "ahead and behind must not read alike: re-ingesting an ahead store with this older \
+             build overwrites a store this build cannot author, and the standing is what sends a \
+             reader to the right action"
         );
 
         let unstamped = observed(&HydrationStanding::Unstamped { derives: 10 });
@@ -6715,7 +6512,6 @@ mod tests {
             "an unstamped store has no recorded version, and inventing one would be a fabricated \
              comparison"
         );
-        assert_eq!(unstamped.reason, None);
         assert_eq!(unstamped.derives, 10);
 
         let unreadable = observed(&HydrationStanding::Unreadable {
@@ -6724,14 +6520,6 @@ mod tests {
         });
         assert_eq!(unreadable.standing, "unreadable");
         assert_eq!(unreadable.created_under, None);
-        assert_eq!(
-            unreadable.reason.as_deref(),
-            Some("schema kin.hydration-semantics.v2 is not v1")
-        );
-        assert_eq!(
-            unreadable.remedy, unstamped.remedy,
-            "both unknown-direction cases carry the same upgrade-first advice"
-        );
 
         // Outside a repository nothing was compared, so the envelope makes no
         // claim rather than manufacturing a current reading.
@@ -6765,7 +6553,6 @@ mod tests {
             .expect("selected-graph status must keep the store-wide observation");
         assert_eq!(observation.standing, "ahead");
         assert_eq!(observation.created_under, Some(11));
-        assert_eq!(observation.remedy, standing.remedy());
         assert_eq!(selected.degraded.hydration_semantics_stale, Some(true));
     }
 
@@ -6785,7 +6572,12 @@ mod tests {
         .expect("the envelope serializes");
         assert_eq!(gap["hydration_semantics"]["standing"], "unreadable");
         assert_eq!(gap["hydration_semantics"]["derives"], 10);
-        assert_eq!(gap["hydration_semantics"]["reason"], "truncated");
+        assert!(
+            gap["hydration_semantics"].get("reason").is_none()
+                && gap["hydration_semantics"].get("remedy").is_none(),
+            "the read failure and the safe action are `kin doctor`'s to name; the envelope \
+             carries the standing: {gap}"
+        );
         assert!(
             gap["hydration_semantics"].get("created_under").is_none(),
             "an absent version must be absent from the wire, not null: {gap}"
@@ -6802,7 +6594,7 @@ mod tests {
         assert_eq!(current["hydration_semantics"]["created_under"], 10);
         assert!(
             current["hydration_semantics"].get("remedy").is_none(),
-            "a current store must publish no remedy: {current}"
+            "no standing publishes advice on the wire, a current store least of all: {current}"
         );
         assert!(
             current["degraded"]

@@ -1895,8 +1895,10 @@ mod tests {
             "the verdict must name the unadmitted edit rather than a generic floor: {limiting:?}"
         );
         assert!(
-            limiting.contains("kin reconcile"),
-            "and must name the remedy the caller can act on: {limiting:?}"
+            crate::verdict::CLAUSE_CODES.iter().any(|entry| {
+                entry.code == "file_bytes_unadmitted" && entry.meaning.contains("kin reconcile")
+            }),
+            "and the code's one written meaning must name the remedy the caller can act on"
         );
         assert_eq!(
             value["_kin"]["completeness"]["classes"]["file_parsed"],

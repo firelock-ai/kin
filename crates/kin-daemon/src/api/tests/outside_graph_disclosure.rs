@@ -190,9 +190,13 @@ fn every_daemon_served_tool_stops_certifying_the_express_question() {
             factor.contains("dependency_outside_graph"),
             "{tool}: the clause carries its own label: {factor}"
         );
+        // Envelope v2 sends the code alone; the symbol is a fact of the
+        // `outside_graph` block, asserted above, and never restated in prose.
         assert!(
-            factor.contains("`Router`"),
-            "{tool}: and names the symbol: {factor}"
+            factor
+                .split("; ")
+                .all(|code| !code.contains('`') && !code.contains(' ')),
+            "{tool}: the factor is codes, and the symbol lives in outside_graph.symbols: {factor}"
         );
     }
 }
