@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use kin_db::{
-    LocalFileBackend, RepositoryAuthorityManager, StorageBackend, VersionedAuthorityState,
+    LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager, StorageBackend,
+    VersionedAuthorityState,
 };
 use kin_model::{
     compute_semantic_change_id, AdmissionPolicyDelta, AuthorId, ChangeOrigin, Entity, EntityDelta,
@@ -254,12 +255,24 @@ fn complete_history_validation_does_not_copy_change_payloads_to_select_targets()
     drop(copy);
     drop(lease);
 
+    // A freeze with no manager behind it decodes and revalidates the persisted
+    // head itself, which is the complete validation this measures.
     let (frozen, freeze_copies) = transient_copies("full freeze", bytes, || {
-        manager
-            .freeze_current_authority(&roots)
+        LocalRepositoryAuthorityFreeze::open_existing_read_only(repository.clone(), &backend)
             .expect("full frozen validation")
     });
+    assert_eq!(frozen.roots(), &roots);
     assert!(!frozen.authority().snapshot().changes.is_decoded());
+    drop(frozen);
+
+    // The manager's own freeze of the head it holds serves that very state and
+    // re-derives nothing, so it costs nothing proportional to the history.
+    let (frozen, _) = transient_copies("held freeze", bytes, || {
+        manager
+            .freeze_current_authority(&roots)
+            .expect("held freeze")
+    });
+    assert!(std::ptr::eq(frozen.authority(), &*manager.read_authority()));
     drop(frozen);
 
     // Save through the unvalidated backend boundary so this open cannot reuse a proof.

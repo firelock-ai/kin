@@ -47,10 +47,10 @@ use crate::storage::authority::{
 use crate::storage::backend::load_recovered_repository_authority;
 use crate::storage::backend::{
     load_recovered_repository_authority_streaming, validate_source_blob_size,
-    verify_source_blob_digest, AuthorityPayloadStats, Generation, LocalAuthorityFreezeLock,
-    LocalFileBackend, PreparedWorkspaceGraphArtifact, RecoveredSnapshot, SnapshotCursor,
-    SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend,
-    VerifiedSourceBlobBatch, MAX_SOURCE_BLOB_BYTES,
+    verify_source_blob_digest, AuthorityPayloadStats, DurableAuthorityIdentity, Generation,
+    LocalAuthorityFreezeLock, LocalFileBackend, PreparedWorkspaceGraphArtifact, RecoveredSnapshot,
+    SnapshotCursor, SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch,
+    StorageBackend, VerifiedSourceBlobBatch, MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::canonical_hash::canonical_hash_into;
 use crate::storage::change_map::ChangeMap;
@@ -1072,7 +1072,7 @@ fn require_sorted_unique<T, K: Ord>(
 }
 
 /// One immutable state published to all repository readers.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RepositoryAuthorityState {
     snapshot: GraphSnapshot,
     /// Derived acceleration over immutable, externally authenticated Git
@@ -1081,6 +1081,26 @@ pub struct RepositoryAuthorityState {
     /// Durable prepared query-graph state bound to the exact authority bytes
     /// this process opened. Present only on the state that open published.
     prepared: Option<Arc<PreparedWorkspaceGraphCache>>,
+    /// The durable bytes this exact state was loaded from or written as,
+    /// bound once by the persistence that read or wrote them.
+    ///
+    /// It says where the state lives, never what it is, so binding it through
+    /// a shared reference changes nothing a reader sees. It is unset on a state
+    /// no persistence acknowledged, and a clone does not carry it: the binding
+    /// belongs to the object persistence acknowledged, which is what lets a
+    /// freeze vouch for that object.
+    durable: std::sync::OnceLock<DurableAuthorityIdentity>,
+}
+
+impl Clone for RepositoryAuthorityState {
+    fn clone(&self) -> Self {
+        Self {
+            snapshot: self.snapshot.clone(),
+            authenticated_gitlinks: Arc::clone(&self.authenticated_gitlinks),
+            prepared: self.prepared.clone(),
+            durable: std::sync::OnceLock::new(),
+        }
+    }
 }
 
 impl RepositoryAuthorityState {
@@ -1109,6 +1129,7 @@ impl RepositoryAuthorityState {
             snapshot,
             authenticated_gitlinks: Arc::new(authenticated_gitlinks),
             prepared: None,
+            durable: std::sync::OnceLock::new(),
         }
     }
 
@@ -1142,6 +1163,7 @@ impl RepositoryAuthorityState {
             // repository. The successor carries no binding at all rather than
             // one that could only ever refuse.
             prepared: None,
+            durable: std::sync::OnceLock::new(),
         }
     }
 
@@ -1161,6 +1183,7 @@ impl RepositoryAuthorityState {
             snapshot,
             authenticated_gitlinks: Arc::clone(&current.authenticated_gitlinks),
             prepared: None,
+            durable: std::sync::OnceLock::new(),
         }
     }
 
@@ -1177,6 +1200,21 @@ impl RepositoryAuthorityState {
 
     pub fn roots(&self) -> &RootBundle {
         &self.metadata().roots
+    }
+
+    /// The durable bytes this exact state was loaded from or written as, once
+    /// the persistence that read or wrote them has bound them.
+    fn durable_identity(&self) -> Option<&DurableAuthorityIdentity> {
+        self.durable.get()
+    }
+
+    /// Bind the head persistence just acknowledged for this exact state.
+    ///
+    /// A state is acknowledged once. Were it bound a second time, the first
+    /// binding would stay, and a binding that no longer names the recorded
+    /// head only ever sends a freeze to the full path.
+    fn bind_durable_identity(&self, identity: DurableAuthorityIdentity) {
+        let _ = self.durable.set(identity);
     }
 
     fn authenticated_gitlinks(&self) -> &BTreeSet<(ArtifactId, GitObjectId)> {
@@ -1383,6 +1421,10 @@ struct PersistenceState {
     /// contiguous logical sequence (0, 1, ...). They must never be compared
     /// or substituted for one another.
     cursor: SnapshotCursor,
+    /// The durable bytes at `cursor`, named by digests this writer computed
+    /// over the bytes it loaded or installed. `None` whenever this writer
+    /// cannot name them, which only ever sends a freeze to the full path.
+    head: Option<DurableAuthorityIdentity>,
     /// Serialized length of the full snapshot the acknowledged journal extends.
     base_bytes: u64,
     /// Number of acknowledged authority frames since that snapshot.
@@ -1469,6 +1511,7 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         backend: Arc<B>,
         repository_id: RepositoryId,
         cursor: SnapshotCursor,
+        head: Option<DurableAuthorityIdentity>,
         payload_stats: Option<AuthorityPayloadStats>,
     ) -> Self {
         let (base_bytes, journal_frames, journal_bytes) =
@@ -1484,6 +1527,7 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
             repository_id,
             state: Mutex::new(PersistenceState {
                 cursor,
+                head: head.filter(|head| head.head_generation() == cursor.backend_generation()),
                 base_bytes,
                 journal_frames,
                 journal_bytes,
@@ -1495,15 +1539,24 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         }
     }
 
+    /// Classify one save and, when it committed, move the cursor and name the
+    /// bytes now durable there.
+    ///
+    /// `head` receives the committed backend generation. An identity naming
+    /// any other head is dropped rather than kept beside a cursor it does not
+    /// describe.
     fn record_save_outcome(
-        cursor: &mut SnapshotCursor,
+        state: &mut PersistenceState,
         outcome: SnapshotSaveOutcome,
+        head: impl FnOnce(Generation) -> Option<DurableAuthorityIdentity>,
     ) -> PersistOutcome {
         match outcome {
             SnapshotSaveOutcome::Committed {
                 cursor: committed_cursor,
-            } if committed_cursor != *cursor => {
-                *cursor = committed_cursor;
+            } if committed_cursor != state.cursor => {
+                let generation = committed_cursor.backend_generation();
+                state.cursor = committed_cursor;
+                state.head = head(generation).filter(|head| head.head_generation() == generation);
                 PersistOutcome::Committed
             }
             SnapshotSaveOutcome::Committed {
@@ -1528,7 +1581,12 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
             state.cursor,
             Some(HISTORY_VALIDATION_VERSION),
         );
-        let outcome = Self::record_save_outcome(&mut state.cursor, outcome);
+        let outcome = Self::record_save_outcome(state, outcome, |generation| {
+            Some(DurableAuthorityIdentity::full_snapshot(
+                generation,
+                hex::encode(Sha256::digest(bytes)),
+            ))
+        });
         if matches!(outcome, PersistOutcome::Committed) {
             let retired = self.note_full_snapshot_committed(state, bytes.len());
             self.clear_retired_frames(retired);
@@ -1555,10 +1613,14 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         // A `Cell` rather than a captured `&mut`, so the closure borrows this
         // immutably and the length is readable the moment the call returns.
         let written = std::cell::Cell::new(0u64);
+        // The digest the writer measured over the bytes it streamed, which the
+        // staged install verifies before the record names them.
+        let streamed_sha256 = std::cell::Cell::new(None);
         let outcome = {
             let mut produce = |out: &mut dyn std::io::Write| {
                 let shape = snapshot.stream_pre_validated(out)?;
                 written.set(shape.byte_len);
+                streamed_sha256.set(Some(shape.sha256));
                 Ok((shape.byte_len, shape.sha256))
             };
             self.backend.save_snapshot_streamed(
@@ -1569,7 +1631,11 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
             )
         };
         let snapshot_bytes = written.get() as usize;
-        let outcome = Self::record_save_outcome(&mut state.cursor, outcome);
+        let outcome = Self::record_save_outcome(state, outcome, |generation| {
+            streamed_sha256.get().map(|sha256| {
+                DurableAuthorityIdentity::full_snapshot(generation, hex::encode(sha256))
+            })
+        });
         if matches!(outcome, PersistOutcome::Committed) {
             let retired = self.note_full_snapshot_committed(state, snapshot_bytes);
             self.clear_retired_frames(retired);
@@ -1667,7 +1733,11 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
             state.cursor,
             Some(HISTORY_VALIDATION_VERSION),
         );
-        let outcome = Self::record_save_outcome(&mut state.cursor, outcome);
+        let extended = state.head.clone();
+        let outcome = Self::record_save_outcome(state, outcome, |generation| {
+            extended
+                .and_then(|head| head.with_frame(generation, hex::encode(Sha256::digest(frame))))
+        });
         if matches!(outcome, PersistOutcome::Committed) {
             state.journal_frames = state.journal_frames.saturating_add(1);
             state.journal_bytes = state.journal_bytes.saturating_add(frame.len() as u64);
@@ -1796,6 +1866,12 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
                     )));
                 }
                 state.cursor = installed_cursor;
+                // The installed bytes were just compared equal to the
+                // candidate's, so the candidate's digest names them.
+                state.head = Some(DurableAuthorityIdentity::full_snapshot(
+                    installed_cursor.backend_generation(),
+                    hex::encode(Sha256::digest(&bytes)),
+                ));
                 let retired = self.note_full_snapshot_committed(&mut state, bytes.len());
                 self.clear_retired_frames(retired);
                 PersistOutcome::Committed
@@ -1858,6 +1934,14 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
             && head_frame.is_some_and(|(bytes, _)| bytes.as_slice() == frame)
         {
             state.cursor = installed_cursor;
+            // The acknowledged head frame was just compared equal to the
+            // retained candidate, over the head this writer last named.
+            state.head = state.head.take().and_then(|head| {
+                head.with_frame(
+                    installed_cursor.backend_generation(),
+                    hex::encode(Sha256::digest(frame)),
+                )
+            });
             state.journal_frames = state.journal_frames.saturating_add(1);
             state.journal_bytes = state.journal_bytes.saturating_add(frame.len() as u64);
             return Ok(PersistOutcome::Committed);
@@ -2016,6 +2100,14 @@ impl RepositorySnapshotPersistence<LocalFileBackend> {
         ) {
             Ok((committed_cursor, retained)) if committed_cursor != state.cursor => {
                 state.cursor = committed_cursor;
+                // The lock that committed these bytes named them by the digest
+                // it recorded and still holds them, and the successor is
+                // exactly what was serialized into them.
+                state.head = Some(retained.identity().clone())
+                    .filter(|head| head.head_generation() == committed_cursor.backend_generation());
+                if let Some(head) = state.head.clone() {
+                    next.bind_durable_identity(head);
+                }
                 let retired = self.note_full_snapshot_committed(&mut state, snapshot_bytes);
                 // The lock stays with the caller, so cleanup goes through it
                 // rather than through a second acquisition of the same lock.
@@ -2054,7 +2146,9 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
         current: &RepositoryAuthorityState,
         next: &RepositoryAuthorityState,
     ) -> PersistOutcome {
-        self.persist_successor(current, next)
+        let outcome = self.persist_successor(current, next);
+        Self::bind_acknowledged(&self.state.lock(), &outcome, next);
+        outcome
     }
 
     fn reconcile(
@@ -2077,12 +2171,15 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
                     if matches!(outcome, PersistOutcome::Indeterminate(_)) {
                         state.pending_frame = Some(pending);
                     }
+                    Self::bind_acknowledged(&state, &outcome, next);
                     return outcome;
                 }
             }
         }
         let _ = current;
-        self.reconcile_full_snapshot(next)
+        let outcome = self.reconcile_full_snapshot(next);
+        Self::bind_acknowledged(&self.state.lock(), &outcome, next);
+        outcome
     }
 
     fn persist_equivalent(
@@ -2111,6 +2208,7 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
         let (outcome, snapshot_bytes) = self.persist_streamed(&next.snapshot, &mut state);
         let write_ms = timer.lap_ms();
         record_snapshot_persistence_phases(0, write_ms, snapshot_bytes);
+        Self::bind_acknowledged(&state, &outcome, next);
         outcome
     }
 
@@ -2125,7 +2223,27 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
                 self.repository_id
             )));
         }
-        self.reconcile_full_snapshot(next)
+        let outcome = self.reconcile_full_snapshot(next);
+        Self::bind_acknowledged(&self.state.lock(), &outcome, next);
+        outcome
+    }
+}
+
+impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
+    /// Bind the head this writer just acknowledged to the exact state it was
+    /// acknowledged for.
+    ///
+    /// Only a committed outcome binds, and only while the writer can name the
+    /// head. The publication serializes every write, so the head in `state` is
+    /// the one this write installed.
+    fn bind_acknowledged(
+        state: &PersistenceState,
+        outcome: &PersistOutcome,
+        next: &RepositoryAuthorityState,
+    ) {
+        if let (PersistOutcome::Committed, Some(head)) = (outcome, state.head.as_ref()) {
+            next.bind_durable_identity(head.clone());
+        }
     }
 }
 
@@ -2165,8 +2283,16 @@ pub enum MaterializedGraphSectionOutcome {
     NoBaseTarget { authority_generation: Generation },
 }
 
-/// Exclusive, cross-process lease over one fully revalidated local repository
-/// authority generation.
+/// Exclusive, cross-process lease over one local repository authority
+/// generation, proven under the lock to be the persisted head.
+///
+/// The proof takes one of two forms. When the manager taking the freeze holds
+/// the state it loaded those exact bytes into or wrote them from, the record
+/// read under the lock must name the same snapshot and frame digests, and the
+/// snapshot and every acknowledged frame must still hash to them; the freeze
+/// then serves the state the manager validated when it opened or committed it.
+/// Every other head, and every freeze taken without a manager, is decoded and
+/// revalidated in full under the lock.
 ///
 /// The existing per-repository storage lock remains held until this value is
 /// dropped. Namespace transitions such as exact export/eject must keep the
@@ -2176,7 +2302,7 @@ pub enum MaterializedGraphSectionOutcome {
 #[must_use = "dropping the guard releases the local repository authority freeze"]
 #[derive(Debug)]
 pub struct LocalRepositoryAuthorityFreeze {
-    state: RepositoryAuthorityState,
+    state: Arc<RepositoryAuthorityState>,
     _lock: LocalAuthorityFreezeLock,
 }
 
@@ -2200,7 +2326,7 @@ impl LocalRepositoryAuthorityFreeze {
         backend: &LocalFileBackend,
         locked: LocalAuthorityFreezeLock,
     ) -> Result<Self, KinDbError> {
-        // A freeze validates the complete acknowledged head regardless of
+        // Revalidation covers the complete acknowledged head regardless of
         // cached history proofs, while the retained lock excludes writers.
         let snapshot = crate::storage::backend::recover_snapshot_from_state(
             repository_id.as_str(),
@@ -2232,12 +2358,25 @@ impl LocalRepositoryAuthorityFreeze {
         };
         validate_all_authority_bodies(&body_backend, repository_id, &snapshot)?;
         Ok(Self {
-            state: RepositoryAuthorityState::from_validated_snapshot(snapshot)?,
+            state: Arc::new(RepositoryAuthorityState::from_validated_snapshot(snapshot)?),
             _lock: locked,
         })
     }
 
-    /// Exact persisted authority reloaded after the exclusive lock was held.
+    /// Freeze the exact state a manager holds, once the caller has proven
+    /// under `locked` that the recorded head is the bytes that state was
+    /// loaded from or written as.
+    fn from_held_state(
+        state: Arc<RepositoryAuthorityState>,
+        locked: LocalAuthorityFreezeLock,
+    ) -> Self {
+        Self {
+            state,
+            _lock: locked,
+        }
+    }
+
+    /// Exact persisted authority, proven while the exclusive lock was held.
     pub fn authority(&self) -> &RepositoryAuthorityState {
         &self.state
     }
@@ -2716,6 +2855,14 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 recovered.recovered.journal_sha256.clone(),
             )
         });
+        // The same bytes named for the writer and for the state this open
+        // publishes, so a freeze can recognise them under its lock.
+        let durable_identity = recovered.as_ref().and_then(|recovered| {
+            recovered
+                .identity
+                .clone()
+                .filter(|identity| identity.head_generation() == recovered.recovered.generation)
+        });
         let (snapshot, backend_cursor) = if let Some(recovered) = recovered {
             let recovered = recovered.recovered;
             // Recovery already refused an incremental graph delta over an
@@ -2853,10 +3000,14 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         if let Some(prepared) = &prepared {
             initial = initial.with_prepared_workspace_graphs(Arc::clone(prepared));
         }
+        if let Some(identity) = durable_identity.clone() {
+            initial.bind_durable_identity(identity);
+        }
         let persistence = RepositorySnapshotPersistence::new(
             Arc::clone(&backend),
             repository_id.clone(),
             backend_cursor,
+            durable_identity,
             payload_stats,
         );
         let manager = Self {
@@ -3383,7 +3534,7 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
                 RetainedPersistOutcome::Committed { retained } => {
                     RetainedPersistOutcome::Committed {
                         retained: LocalRepositoryAuthorityFreeze {
-                            state: next.clone(),
+                            state: Arc::clone(next),
                             _lock: retained,
                         },
                     }
@@ -3402,12 +3553,17 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
     /// transition.
     ///
     /// This acquires the already-existing per-repository OS lock without
-    /// creating storage, reloads the full persisted snapshot while holding
-    /// that lock, repeats every repository-v6 structural/history/body
-    /// validation performed by [`RepositoryAuthorityManager::open`], and
-    /// requires its roots to match both the caller's expectation and this
-    /// manager's published state. Competing local writers remain blocked until
-    /// the returned guard is dropped.
+    /// creating storage and requires the persisted head, read under that lock,
+    /// to match both the caller's expected roots and this manager's published
+    /// state. When the record names exactly the bytes this manager loaded its
+    /// published state from or wrote it as, and the snapshot and every
+    /// acknowledged frame still hash to those digests, the freeze serves that
+    /// state: it passed validation when this manager opened or committed it,
+    /// and decoding, replaying and sweeping the same bytes again would only
+    /// re-prove it. Any other head is reloaded in full and repeats every
+    /// repository-v6 structural/history/body validation performed by
+    /// [`RepositoryAuthorityManager::open`]. Competing local writers remain
+    /// blocked until the returned guard is dropped.
     pub fn freeze_current_authority(
         &self,
         expected_roots: &RootBundle,
@@ -3420,16 +3576,32 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
             ))
             .into());
         }
-        self.freeze_exact_state(&published)
+        self.freeze_exact_state(&published.into_arc())
     }
 
     fn freeze_exact_state(
         &self,
-        expected: &RepositoryAuthorityState,
+        expected: &Arc<RepositoryAuthorityState>,
     ) -> Result<LocalRepositoryAuthorityFreeze, KinDbError> {
         let locked = self
             .backend
             .freeze_existing_authority(self.repository_id.as_str())?;
+        // The record was read, and the snapshot and every acknowledged frame
+        // hashed against it, under the lock `locked` keeps. Equal identities
+        // mean the persisted head is the very bytes `expected` was loaded from
+        // or written as, and `expected` passed validation when that happened.
+        if expected.durable_identity() == Some(locked.identity()) {
+            tracing::debug!(
+                repository = %self.repository_id,
+                generation = expected.generation(),
+                backend_generation = locked.identity().head_generation(),
+                "froze the persisted head this manager holds without re-deriving it"
+            );
+            return Ok(LocalRepositoryAuthorityFreeze::from_held_state(
+                Arc::clone(expected),
+                locked,
+            ));
+        }
         let freeze = LocalRepositoryAuthorityFreeze::from_locked_authority(
             &self.repository_id,
             self.backend.as_ref(),
@@ -6336,11 +6508,29 @@ fn validate_history_replay<'a>(
     validate_history_replay_with(&SharedReplayGraph::new(snapshot), snapshot, new_changes)
 }
 
+#[cfg(test)]
+thread_local! {
+    static HISTORY_REPLAYS_ON_THIS_THREAD: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// How many history replays this thread ran, whole or incoming-only.
+///
+/// Counted inside the replay itself rather than at any caller, so a path that
+/// reaches it some other way is still counted. Per thread, because the suite
+/// runs in parallel.
+#[cfg(test)]
+fn history_replays_on_this_thread() -> usize {
+    HISTORY_REPLAYS_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
 fn validate_history_replay_with<'a>(
     replay: &SharedReplayGraph<'_>,
     snapshot: &GraphSnapshot,
     new_changes: impl IntoIterator<Item = &'a kin_model::SemanticChange>,
 ) -> Result<(), KinDbError> {
+    #[cfg(test)]
+    HISTORY_REPLAYS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     // One Kahn pass over the whole change map proves the DAG is acyclic and
     // that every declared parent is persisted. Resolving each change's reachable
     // order separately re-derives exactly that, so the per-change traversal the
@@ -8033,6 +8223,16 @@ thread_local! {
     /// what an eager walk of the same store would have.
     static LAST_BODY_SWEEP_REQUIREMENTS: std::cell::RefCell<BTreeMap<Hash256, Option<u64>>> =
         const { std::cell::RefCell::new(BTreeMap::new()) };
+    static BODY_SWEEPS_ON_THIS_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many whole-store body sweeps this thread started.
+///
+/// Counted on entry, so a sweep that refuses a body still counts: the
+/// question a test asks is whether the sweep was paid for at all.
+#[cfg(test)]
+fn body_sweeps_on_this_thread() -> usize {
+    BODY_SWEEPS_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
 
 /// What an open needs from every change, gathered once while recovery streams
@@ -8271,6 +8471,8 @@ fn validate_all_authority_bodies_with<B: StorageBackend + ?Sized>(
     snapshot: &GraphSnapshot,
     changes: ChangeBodyRequirements<'_>,
 ) -> Result<(), KinDbError> {
+    #[cfg(test)]
+    BODY_SWEEPS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     let metadata = snapshot
         .repository_authority
         .as_ref()
@@ -21509,6 +21711,365 @@ mod tests {
             &manager.read_authority(),
             &reopen(&directory).read_authority(),
             "after freezing commit",
+        );
+    }
+
+    /// What one freeze re-derived on this thread, read as a delta across it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FreezeRevalidation {
+        recoveries: usize,
+        history_replays: usize,
+        body_sweeps: usize,
+    }
+
+    impl FreezeRevalidation {
+        /// A freeze that re-derived nothing.
+        const NONE: Self = Self {
+            recoveries: 0,
+            history_replays: 0,
+            body_sweeps: 0,
+        };
+        /// A freeze that decoded the persisted head, replayed its history and
+        /// swept its bodies, once each.
+        const FULL: Self = Self {
+            recoveries: 1,
+            history_replays: 1,
+            body_sweeps: 1,
+        };
+
+        fn now() -> Self {
+            Self {
+                recoveries: crate::storage::backend::authority_recoveries_on_this_thread(),
+                history_replays: history_replays_on_this_thread(),
+                body_sweeps: body_sweeps_on_this_thread(),
+            }
+        }
+
+        fn since(before: Self) -> Self {
+            let after = Self::now();
+            Self {
+                recoveries: after.recoveries - before.recoveries,
+                history_replays: after.history_replays - before.history_replays,
+                body_sweeps: after.body_sweeps - before.body_sweeps,
+            }
+        }
+    }
+
+    /// A freeze of the head this manager itself loaded or wrote re-derives
+    /// nothing, and still holds the writer lock over exactly that state.
+    ///
+    /// Both arms are what kin freezes on every projected commit: a manager that
+    /// just committed, and a manager a fresh open just loaded on the history
+    /// proof. The record names bytes this process already read and verified, or
+    /// wrote from a state it had already validated, so decoding them again,
+    /// replaying their history and sweeping every body would re-prove what the
+    /// process already holds.
+    #[test]
+    fn a_freeze_of_the_head_this_manager_holds_re_derives_nothing() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf7_3601, 0x71))
+            .unwrap();
+        assert_eq!(
+            acknowledged_frame_count(&directory),
+            1,
+            "the fixture head is a journal head"
+        );
+
+        let expected = manager.read_authority().roots().clone();
+        let before = FreezeRevalidation::now();
+        let frozen = manager
+            .freeze_current_authority(&expected)
+            .expect("the head this manager wrote freezes");
+        assert_eq!(
+            FreezeRevalidation::since(before),
+            FreezeRevalidation::NONE,
+            "a freeze of the head this manager wrote re-derived it"
+        );
+        assert_eq!(frozen.roots(), &expected);
+        assert_same_authority(
+            &manager.read_authority(),
+            frozen.authority(),
+            "written head",
+        );
+        assert!(
+            LocalFileBackend::new(directory.path())
+                .repository_writer_would_block(repository_id().as_str())
+                .unwrap(),
+            "the freeze still excludes every other writer"
+        );
+        drop(frozen);
+
+        let reopened = reopen(&directory);
+        assert!(
+            reopened.opened_by_history_validation(),
+            "the fixture reopens on the history proof, as a daemon does"
+        );
+        let expected = reopened.read_authority().roots().clone();
+        let before = FreezeRevalidation::now();
+        let frozen = reopened
+            .freeze_current_authority(&expected)
+            .expect("the head a fresh open loaded freezes");
+        assert_eq!(
+            FreezeRevalidation::since(before),
+            FreezeRevalidation::NONE,
+            "a freeze of the head a fresh open loaded re-derived it"
+        );
+        assert_same_authority(
+            &reopened.read_authority(),
+            frozen.authority(),
+            "loaded head",
+        );
+    }
+
+    /// When another writer moved the head, the record names bytes this manager
+    /// never held: the freeze decodes and revalidates them in full, exactly as
+    /// before, and refuses on the moved roots.
+    #[test]
+    fn a_freeze_revalidates_in_full_and_refuses_when_another_writer_moved_the_head() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        let second =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let stale_roots = manager.read_authority().roots().clone();
+        second
+            .commit_repository_transaction(overlay_publication(&second, 0xf7_3602, 0x72))
+            .unwrap();
+
+        let before = FreezeRevalidation::now();
+        let error = manager
+            .freeze_current_authority(&stale_roots)
+            .expect_err("a manager whose head another writer moved must not freeze its own state");
+        assert!(
+            error
+                .to_string()
+                .contains("persisted authority moved from the expected root bundle"),
+            "{error}"
+        );
+        assert_eq!(
+            FreezeRevalidation::since(before),
+            FreezeRevalidation::FULL,
+            "the moved head is revalidated in full before it is refused"
+        );
+    }
+
+    /// Eject's shape: it reopens the repository and then freezes the manager it
+    /// just reopened. Another process that commits in between moves the head
+    /// the reopened manager holds, so the freeze revalidates in full and
+    /// refuses, exactly as it does for a manager that committed.
+    #[test]
+    fn a_freeze_of_a_reopened_manager_revalidates_in_full_when_another_process_moved_the_head() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        drop(manager);
+        let reopened = reopen(&directory);
+        assert!(
+            reopened.opened_by_history_validation(),
+            "eject's reopen trusts the history proof, as every open does"
+        );
+        let reopened_roots = reopened.read_authority().roots().clone();
+        let external = reopen(&directory);
+        external
+            .commit_repository_transaction(overlay_publication(&external, 0xf7_3607, 0x77))
+            .unwrap();
+        let before = FreezeRevalidation::now();
+        let error = reopened
+            .freeze_current_authority(&reopened_roots)
+            .expect_err("a reopened manager whose head moved before its freeze must not freeze");
+        assert!(
+            error
+                .to_string()
+                .contains("persisted authority moved from the expected root bundle"),
+            "{error}"
+        );
+        assert_eq!(
+            FreezeRevalidation::since(before),
+            FreezeRevalidation::FULL,
+            "a head moved between a reopen and its freeze is revalidated in full"
+        );
+    }
+
+    /// One snapshot byte corrupted under an unchanged record refuses the
+    /// freeze, even of the head this manager holds: the snapshot is hashed
+    /// against the record under the lock before anything is trusted.
+    #[test]
+    fn a_freeze_refuses_a_snapshot_byte_corrupted_under_an_unchanged_record() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf7_3603, 0x73))
+            .unwrap();
+        let record = std::fs::read(authority_json_path(directory.path())).unwrap();
+        let snapshot_file = read_authority_json(directory.path())["snapshot_file"]
+            .as_str()
+            .expect("the record names its snapshot")
+            .to_string();
+        let snapshot_path = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("snapshots")
+            .join(snapshot_file);
+        // In place, so the file the record names is the file that changed.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&snapshot_path)
+            .unwrap();
+        let middle = file.metadata().unwrap().len() / 2;
+        let mut byte = [0u8; 1];
+        file.seek(SeekFrom::Start(middle)).unwrap();
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(middle)).unwrap();
+        file.write_all(&[byte[0] ^ 0x01]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let expected = manager.read_authority().roots().clone();
+        let error = manager
+            .freeze_current_authority(&expected)
+            .expect_err("a snapshot corrupted under an unchanged record must not freeze");
+        assert!(error.to_string().contains("digest mismatch"), "{error}");
+        assert_eq!(
+            std::fs::read(authority_json_path(directory.path())).unwrap(),
+            record,
+            "the refusal left the record as it was"
+        );
+    }
+
+    /// Another process rewrote the head this manager holds into new bytes that
+    /// keep the same roots. Nothing but the recorded identity can tell, and a
+    /// manager that neither loaded nor wrote those bytes revalidates them in
+    /// full rather than vouching for them from its own state.
+    #[test]
+    fn a_freeze_revalidates_in_full_after_another_process_rewrote_the_held_head() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf7_3604, 0x74))
+            .unwrap();
+        assert_eq!(acknowledged_frame_count(&directory), 1);
+
+        // Another process compacts the journal head into one full snapshot: the
+        // same logical state at a new backend generation, in new bytes.
+        let external = LocalFileBackend::new(directory.path());
+        let head = external
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .expect("the fixture wrote authority")
+            .head_generation;
+        let bytes = manager
+            .read_authority()
+            .snapshot()
+            .to_bytes_pre_validated()
+            .unwrap();
+        assert!(matches!(
+            external.save_snapshot_validated(
+                repository_id().as_str(),
+                &bytes,
+                SnapshotCursor::from_backend_generation(head),
+                Some(HISTORY_VALIDATION_VERSION),
+            ),
+            SnapshotSaveOutcome::Committed { .. }
+        ));
+        assert_eq!(
+            acknowledged_frame_count(&directory),
+            0,
+            "the rewrite retired the journal"
+        );
+
+        let expected = manager.read_authority().roots().clone();
+        let before = FreezeRevalidation::now();
+        let frozen = manager
+            .freeze_current_authority(&expected)
+            .expect("the same roots at a rewritten head still freeze");
+        assert_eq!(
+            FreezeRevalidation::since(before),
+            FreezeRevalidation::FULL,
+            "bytes this manager neither loaded nor wrote are revalidated in full"
+        );
+        assert_eq!(frozen.roots(), &expected);
+        assert_same_authority(
+            &manager.read_authority(),
+            frozen.authority(),
+            "rewritten head",
+        );
+    }
+
+    /// The record names another frame at the very generation this manager
+    /// holds. A generation alone cannot tell the two heads apart, so the freeze
+    /// compares the digests of the base and of every acknowledged frame, and
+    /// here it revalidates in full and refuses.
+    #[test]
+    fn a_freeze_revalidates_in_full_when_the_record_names_another_frame_at_the_held_generation() {
+        let held = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&held);
+        drop(manager);
+        // Two writers extend one base with different publications, so the two
+        // records name the same snapshot at the same generation and differ only
+        // in the frame acknowledged over it.
+        let sibling = TempDir::new().unwrap();
+        copy_store(held.path(), sibling.path());
+        let manager = reopen(&held);
+        manager
+            .persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
+        manager
+            .commit_repository_transaction(overlay_publication(&manager, 0xf7_3605, 0x75))
+            .unwrap();
+        let other = reopen(&sibling);
+        other
+            .persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
+        other
+            .commit_repository_transaction(overlay_publication(&other, 0xf7_3606, 0x76))
+            .unwrap();
+        drop(other);
+        let held_record = read_authority_json(held.path());
+        let sibling_record = read_authority_json(sibling.path());
+        assert_eq!(
+            held_record["head_generation"],
+            sibling_record["head_generation"]
+        );
+        assert_eq!(
+            held_record["snapshot_sha256"], sibling_record["snapshot_sha256"],
+            "the two writers share one base, so only the frame differs"
+        );
+        assert_ne!(
+            held_record["acknowledged_deltas"],
+            sibling_record["acknowledged_deltas"]
+        );
+        let frame_generation = sibling_record["acknowledged_deltas"][0]["generation"]
+            .as_u64()
+            .expect("the sibling head acknowledges one frame");
+        std::fs::copy(
+            frame_path(&sibling, frame_generation),
+            frame_path(&held, frame_generation),
+        )
+        .unwrap();
+        std::fs::copy(
+            authority_json_path(sibling.path()),
+            authority_json_path(held.path()),
+        )
+        .unwrap();
+
+        let expected = manager.read_authority().roots().clone();
+        let before = FreezeRevalidation::now();
+        let error = manager
+            .freeze_current_authority(&expected)
+            .expect_err("a head this manager does not hold must not freeze as its state");
+        assert!(
+            error
+                .to_string()
+                .contains("persisted authority moved from the expected root bundle"),
+            "{error}"
+        );
+        assert_eq!(
+            FreezeRevalidation::since(before),
+            FreezeRevalidation::FULL,
+            "another frame at the held generation is revalidated in full"
         );
     }
 

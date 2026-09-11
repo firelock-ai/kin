@@ -358,12 +358,13 @@ where
     /// durable compare-and-swap and the returned value. On idempotent replay,
     /// `retain_current` must acquire and revalidate a capability for the exact
     /// currently published state. Both callbacks run while the single
-    /// in-process writer permit is held.
+    /// in-process writer permit is held, and both receive the published `Arc`
+    /// so a retained value can share the state rather than copy it.
     pub(crate) fn commit_and_retain<O, R>(
         &self,
         prepare: impl FnOnce(&S) -> Result<AuthorityCommitDecision<S, O>, KinDbError>,
-        retain_current: impl FnOnce(&P, &S) -> Result<R, KinDbError>,
-        persist_and_retain: impl FnOnce(&P, &S, &S) -> RetainedPersistOutcome<R>,
+        retain_current: impl FnOnce(&P, &Arc<S>) -> Result<R, KinDbError>,
+        persist_and_retain: impl FnOnce(&P, &S, &Arc<S>) -> RetainedPersistOutcome<R>,
     ) -> Result<(O, R), KinDbError> {
         let mut writer = self.writer.lock();
         let current = Arc::clone(&self.current.read());
@@ -371,7 +372,7 @@ where
 
         match prepare(current.as_ref())? {
             AuthorityCommitDecision::IdempotentReplay { output } => {
-                let retained = retain_current(&self.persistence, current.as_ref())?;
+                let retained = retain_current(&self.persistence, &current)?;
                 Ok((output, retained))
             }
             AuthorityCommitDecision::Publish { next, output } => {
@@ -392,7 +393,7 @@ where
                 // the infallible pointer publication and is returned to the
                 // caller still holding the backend exclusion capability.
                 let next = Arc::new(next);
-                match persist_and_retain(&self.persistence, current.as_ref(), next.as_ref()) {
+                match persist_and_retain(&self.persistence, current.as_ref(), &next) {
                     RetainedPersistOutcome::Committed { retained } => {
                         *self.current.write() = next;
                         Ok((output, retained))

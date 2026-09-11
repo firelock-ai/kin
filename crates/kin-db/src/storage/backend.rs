@@ -2270,6 +2270,54 @@ impl RecoveredSnapshot {
     }
 }
 
+/// The exact durable bytes of one authority head: a full snapshot and the
+/// ordered chain of authority frames acknowledged over it, each named by the
+/// SHA-256 of its bytes.
+///
+/// Two heads with equal identities are the same bytes, and recovery from the
+/// same bytes is deterministic, so they are the same authority. An identity is
+/// only ever built from digests computed over the bytes themselves: by the
+/// recovery that decoded them, by the writer that installed them, or under the
+/// lock of a freeze that hashed them. It is never taken from a record alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DurableAuthorityIdentity {
+    /// Backend generation of the full snapshot the head extends.
+    snapshot_generation: Generation,
+    snapshot_sha256: String,
+    /// `(backend generation, SHA-256)` of every acknowledged authority frame
+    /// after the snapshot, in generation order.
+    frames: Vec<(Generation, String)>,
+}
+
+impl DurableAuthorityIdentity {
+    /// A journal-free head: one full snapshot and nothing over it.
+    pub(crate) fn full_snapshot(generation: Generation, snapshot_sha256: String) -> Self {
+        Self {
+            snapshot_generation: generation,
+            snapshot_sha256,
+            frames: Vec::new(),
+        }
+    }
+
+    /// Backend generation of the head this identity names.
+    pub(crate) fn head_generation(&self) -> Generation {
+        self.frames
+            .last()
+            .map_or(self.snapshot_generation, |(generation, _)| *generation)
+    }
+
+    /// The head one more acknowledged frame produces over this one, or `None`
+    /// when `generation` does not directly follow it.
+    pub(crate) fn with_frame(&self, generation: Generation, frame_sha256: String) -> Option<Self> {
+        if self.head_generation().checked_add(1) != Some(generation) {
+            return None;
+        }
+        let mut next = self.clone();
+        next.frames.push((generation, frame_sha256));
+        Some(next)
+    }
+}
+
 pub(crate) struct RecoveredRepositoryAuthority {
     pub recovered: RecoveredSnapshot,
     pub reused_complete_validation: bool,
@@ -2279,6 +2327,10 @@ pub(crate) struct RecoveredRepositoryAuthority {
     /// once reads it from the map instead.
     pub history_streamed: bool,
     pub payload_stats: AuthorityPayloadStats,
+    /// The bytes this recovery decoded, named by the digests it computed over
+    /// them. `None` for a legacy graph-delta journal, which repository
+    /// authority never carries.
+    pub identity: Option<DurableAuthorityIdentity>,
 }
 
 /// Load a backend snapshot and replay its complete authoritative delta chain.
@@ -2392,6 +2444,23 @@ enum JournalKind {
     AuthorityFrames,
 }
 
+#[cfg(test)]
+thread_local! {
+    static AUTHORITY_RECOVERIES_ON_THIS_THREAD: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// How many authority heads this thread reconstructed from persisted bytes.
+///
+/// Counted at the one recovery core every open and every revalidating freeze
+/// goes through, so a test can tell a freeze that re-derived the head from
+/// one that did not without inferring it from a duration. Per thread, because
+/// the suite runs in parallel.
+#[cfg(test)]
+pub(crate) fn authority_recoveries_on_this_thread() -> usize {
+    AUTHORITY_RECOVERIES_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
 /// Reconstruct one authority head from a coherent `(authority, journal)` view.
 ///
 /// This is the shared recovery core behind [`load_recovered_snapshot`] and the
@@ -2404,6 +2473,8 @@ pub(crate) fn recover_snapshot_from_state(
     expected_validator_version: Option<u32>,
     mut history: HistoryDecode<'_>,
 ) -> Result<RecoveredRepositoryAuthority, KinDbError> {
+    #[cfg(test)]
+    AUTHORITY_RECOVERIES_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     if authority.snapshot_generation > authority.head_generation {
         return Err(KinDbError::StorageError(format!(
             "repo {repo_id} snapshot base generation {} exceeds acknowledged head {}",
@@ -2488,6 +2559,10 @@ pub(crate) fn recover_snapshot_from_state(
             0,
             0,
         )?;
+        let identity = DurableAuthorityIdentity::full_snapshot(
+            authority.snapshot_generation,
+            snapshot_sha256.clone(),
+        );
         return Ok(RecoveredRepositoryAuthority {
             recovered: RecoveredSnapshot {
                 snapshot,
@@ -2501,6 +2576,7 @@ pub(crate) fn recover_snapshot_from_state(
             history_streamed,
             reused_complete_validation,
             payload_stats,
+            identity: Some(identity),
         });
     }
 
@@ -2634,6 +2710,7 @@ pub(crate) fn recover_snapshot_from_state(
                 reused_complete_validation: false,
                 history_streamed: false,
                 payload_stats,
+                identity: None,
             })
         }
         JournalKind::AuthorityFrames => {
@@ -2725,6 +2802,15 @@ pub(crate) fn recover_snapshot_from_state(
                 let _span = tracing::info_span!("kindb.snapshot.validate_journal_head").entered();
                 snapshot.validate_storage_admission()?;
             }
+            let identity = DurableAuthorityIdentity {
+                snapshot_generation: authority.snapshot_generation,
+                snapshot_sha256: snapshot_sha256.clone(),
+                frames: acknowledged
+                    .iter()
+                    .map(|(_, generation)| *generation)
+                    .zip(frame_digests)
+                    .collect(),
+            };
             Ok(RecoveredRepositoryAuthority {
                 recovered: RecoveredSnapshot {
                     snapshot,
@@ -2740,6 +2826,7 @@ pub(crate) fn recover_snapshot_from_state(
                 reused_complete_validation,
                 history_streamed,
                 payload_stats,
+                identity: Some(identity),
             })
         }
     }
@@ -4274,6 +4361,9 @@ pub(crate) struct LocalAuthorityFreezeLock {
     /// Acknowledged authority frames between the snapshot base and the head,
     /// read and digest-verified under the same lock hold as `authority`.
     frames: Vec<PersistedDelta>,
+    /// The head these bytes are, named by digests that were checked against
+    /// the bytes under this lock hold.
+    identity: DurableAuthorityIdentity,
     lock: LocalRepositoryLock,
 }
 
@@ -4284,6 +4374,10 @@ impl LocalAuthorityFreezeLock {
 
     pub(crate) fn frames(&self) -> &[PersistedDelta] {
         &self.frames
+    }
+
+    pub(crate) fn identity(&self) -> &DurableAuthorityIdentity {
+        &self.identity
     }
 
     fn require_repository(&self, repo_id: &str) -> Result<(), KinDbError> {
@@ -6232,21 +6326,14 @@ impl LocalFileBackend {
         cleanup: bool,
     ) -> Result<LocalAuthorityFreezeLock, KinDbError> {
         let lock = self.acquire_existing_lock(repo_id)?;
-        let authority = self
-            .load_authority_with_cleanup_unlocked(&lock.namespace, cleanup)?
+        let (authority, record) = self
+            .load_authority_and_record_with_cleanup_unlocked(&lock.namespace, cleanup)?
             .ok_or_else(|| {
                 KinDbError::StorageError(format!(
                     "repo {repo_id} has no existing local snapshot authority to freeze"
                 ))
             })?;
         let frames = if authority.snapshot_generation != authority.head_generation {
-            let record = self
-                .read_authority_record_with_cleanup_unlocked(&lock.namespace, cleanup)?
-                .ok_or_else(|| {
-                    KinDbError::StorageError(format!(
-                        "repo {repo_id} has no existing local snapshot authority to freeze"
-                    ))
-                })?;
             if record.version != LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION {
                 return Err(KinDbError::StorageError(format!(
                     "repo {repo_id} has incremental journal authority at generation {} above snapshot {}; repository freeze requires one complete full snapshot or an authority frame chain",
@@ -6261,11 +6348,25 @@ impl LocalFileBackend {
         } else {
             Vec::new()
         };
+        // Every digest named here was checked against its bytes under the lock
+        // this freeze keeps: the snapshot's by the authority load above, every
+        // frame's by the capture beside it. A journal-free record acknowledges
+        // no frame, which the record decoder already enforces.
+        let identity = DurableAuthorityIdentity {
+            snapshot_generation: record.snapshot_generation,
+            snapshot_sha256: record.snapshot_sha256,
+            frames: record
+                .acknowledged_deltas
+                .into_iter()
+                .map(|identity| (identity.generation, identity.sha256))
+                .collect(),
+        };
         self.confirm_existing_lock_visible(&lock.namespace)?;
         Ok(LocalAuthorityFreezeLock {
             repo_id: repo_id.to_string(),
             authority,
             frames,
+            identity,
             lock,
         })
     }
@@ -7239,6 +7340,20 @@ impl LocalFileBackend {
         namespace: &LocalRepositoryCapability,
         cleanup: bool,
     ) -> Result<Option<SnapshotAuthority>, KinDbError> {
+        Ok(self
+            .load_authority_and_record_with_cleanup_unlocked(namespace, cleanup)?
+            .map(|(authority, _)| authority))
+    }
+
+    /// [`load_authority_with_cleanup_unlocked`](Self::load_authority_with_cleanup_unlocked),
+    /// also returning the record the snapshot bytes were verified against, so
+    /// a caller that has to name the head reads the record once, under the
+    /// same lock hold, rather than twice.
+    fn load_authority_and_record_with_cleanup_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        cleanup: bool,
+    ) -> Result<Option<(SnapshotAuthority, LocalAuthorityRecord)>, KinDbError> {
         let repo_id = &namespace.repo_id;
         let Some(record) = self.read_authority_record_with_cleanup_unlocked(namespace, cleanup)?
         else {
@@ -7288,13 +7403,16 @@ impl LocalFileBackend {
         }
         namespace.confirm_surface_visible(&snapshots)?;
         self.confirm_repository_visible(namespace)?;
-        Ok(Some(SnapshotAuthority {
-            snapshot_bytes,
-            snapshot_source: Some(snapshot_source),
-            snapshot_generation: record.snapshot_generation,
-            head_generation: record.head_generation,
-            history_validation: record.history_validation,
-        }))
+        Ok(Some((
+            SnapshotAuthority {
+                snapshot_bytes,
+                snapshot_source: Some(snapshot_source),
+                snapshot_generation: record.snapshot_generation,
+                head_generation: record.head_generation,
+                history_validation: record.history_validation.clone(),
+            },
+            record,
+        )))
     }
 
     fn write_authority_unlocked(
@@ -7837,6 +7955,7 @@ impl LocalFileBackend {
             history_validator_version,
         )?;
         let cursor = SnapshotCursor::from_backend_generation(generation);
+        let snapshot_sha256 = hex::encode(Sha256::digest(data));
         let authority = SnapshotAuthority {
             snapshot_bytes: data.to_vec().into(),
             snapshot_source: None,
@@ -7847,7 +7966,7 @@ impl LocalFileBackend {
                     validator_version,
                     repository_id: repo_id.to_string(),
                     generation,
-                    snapshot_sha256: hex::encode(Sha256::digest(data)),
+                    snapshot_sha256: snapshot_sha256.clone(),
                     journal_sha256: None,
                 }
             }),
@@ -7858,6 +7977,7 @@ impl LocalFileBackend {
                 repo_id: repo_id.to_string(),
                 authority,
                 frames: Vec::new(),
+                identity: DurableAuthorityIdentity::full_snapshot(generation, snapshot_sha256),
                 lock,
             },
         ))
