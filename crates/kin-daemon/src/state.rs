@@ -3277,6 +3277,10 @@ pub struct DaemonState {
     /// each; it costs no lock the embed path needs and no work proportional to
     /// the graph, which is the constraint FIR-2416 put on this surface.
     pub(crate) graph_status_settled: crate::api::GraphStatusSettledCache,
+    /// The HEAD root and version the last certified reference read answered
+    /// from, so a reference read whose every attempt meets a writer holding
+    /// graph authority can still answer from a graph that has not moved.
+    pub(crate) xref_settled: crate::api::XrefSettledHead,
     /// Consecutive `kin_graph_status` calls that could not complete a live
     /// sample of the selected graph, reset by the first one that does.
     ///
@@ -5614,6 +5618,7 @@ impl DaemonState {
             embedding_work: Mutex::new(()),
             embed_batch_size: AtomicUsize::new(0),
             graph_status_settled: crate::api::GraphStatusSettledCache::default(),
+            xref_settled: crate::api::XrefSettledHead::default(),
             graph_status_live_sample_failures: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
             #[cfg(feature = "embeddings")]
@@ -5998,6 +6003,7 @@ impl DaemonState {
             embedding_work: Mutex::new(()),
             embed_batch_size: AtomicUsize::new(0),
             graph_status_settled: crate::api::GraphStatusSettledCache::default(),
+            xref_settled: crate::api::XrefSettledHead::default(),
             graph_status_live_sample_failures: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
             #[cfg(feature = "embeddings")]
