@@ -2441,6 +2441,35 @@ pub(crate) fn commit_native_plan_with_projection(
         authority_context,
         plan,
         WorkingCopyProof::MatchesPreviousTree,
+        None,
+    )
+}
+
+/// Publish one native repository transaction whose own operations authored
+/// some of the paths it moves, accepting each such path when the working copy
+/// already holds its exact target bytes.
+///
+/// A writer that edits a file and then stages that file's complete new text
+/// has, by the time it commits, already put the target bytes on disk. Held to
+/// the previous tree, as [`commit_native_plan_with_projection`] holds every
+/// path, the writer's own edit reads as drift and the commit is refused over
+/// the very change it carries. Every path the transaction did not author is
+/// still held to the previous tree, and an authored path holding any other
+/// body is refused exactly as before.
+pub(crate) fn commit_native_plan_with_authored_projection(
+    layout: &kin_core::KinLayout,
+    blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
+    plan: NativeCommitPlan,
+    authored: &BTreeSet<RepoPath>,
+) -> Result<NativeCommitResult> {
+    commit_native_plan_with_working_copy_proof(
+        layout,
+        blobs,
+        authority_context,
+        plan,
+        WorkingCopyProof::MatchesPreviousTree,
+        Some(authored),
     )
 }
 
@@ -2503,6 +2532,7 @@ pub(crate) fn commit_native_plan_with_observed_target_tree(
         authority_context,
         plan,
         WorkingCopyProof::ObservedTargetTree,
+        None,
     )
 }
 
@@ -2523,6 +2553,7 @@ fn commit_native_plan_with_working_copy_proof(
     authority_context: &LocalRepositoryAuthorityContext,
     plan: NativeCommitPlan,
     working_copy: WorkingCopyProof,
+    authored: Option<&BTreeSet<RepoPath>>,
 ) -> Result<NativeCommitResult> {
     let repository_id = authority_context.repository_id().clone();
     if plan.transaction.repository_id != repository_id {
@@ -2589,24 +2620,45 @@ fn commit_native_plan_with_working_copy_proof(
                     )
                 },
             )?,
-            WorkingCopyProof::MatchesPreviousTree => crate::mcp_commit::timed_commit_phase(
-                "reconcile_workspace_and_commit_authority",
-                || {
-                    kin_core::reconcile_source_tree_and_commit_repository_transaction(
-                        layout.working_dir(),
-                        &plan.previous_tree,
-                        &plan.target_tree,
-                        previous_entries
+            WorkingCopyProof::MatchesPreviousTree => {
+                let accepted = authored
+                    .map(|authored| accepted_authored_paths(authored, &target_entries))
+                    .filter(|accepted| !accepted.is_empty());
+                crate::mcp_commit::timed_commit_phase(
+                    "reconcile_workspace_and_commit_authority",
+                    || {
+                        let previous = previous_entries
                             .iter()
-                            .map(|(path, entry, body)| (path, *entry, body.as_ref())),
-                        target_entries
+                            .map(|(path, entry, body)| (path, *entry, body.as_ref()));
+                        let target = target_entries
                             .iter()
-                            .map(|(path, entry, body)| (path, *entry, body.as_ref())),
-                        &authority,
-                        plan.transaction,
-                    )
-                },
-            )?,
+                            .map(|(path, entry, body)| (path, *entry, body.as_ref()));
+                        match &accepted {
+                            Some(accepted) => {
+                                kin_core::reconcile_source_tree_and_commit_authored_repository_transaction(
+                                    layout.working_dir(),
+                                    &plan.previous_tree,
+                                    &plan.target_tree,
+                                    previous,
+                                    target,
+                                    &authority,
+                                    plan.transaction,
+                                    accepted,
+                                )
+                            }
+                            None => kin_core::reconcile_source_tree_and_commit_repository_transaction(
+                                layout.working_dir(),
+                                &plan.previous_tree,
+                                &plan.target_tree,
+                                previous,
+                                target,
+                                &authority,
+                                plan.transaction,
+                            ),
+                        }
+                    },
+                )?
+            }
         }
     };
     let materializable = materializable_artifact_count(&plan.target_tree)?;
@@ -2631,6 +2683,23 @@ fn commit_native_plan_with_working_copy_proof(
         relation_count: plan.relation_count,
         file_count: plan.file_count,
     })
+}
+
+/// The authored paths a commit may find already holding their target bytes:
+/// each one the target tree materializes as a regular file. A retired path has
+/// no target entry, and a symbolic link is not a body a writer puts on disk
+/// ahead of a commit, so both stay held to the previous tree.
+fn accepted_authored_paths(
+    authored: &BTreeSet<RepoPath>,
+    target_entries: &[ProjectionEntry],
+) -> BTreeSet<RepoPath> {
+    target_entries
+        .iter()
+        .filter(|(path, entry, _)| {
+            authored.contains(path) && matches!(entry, kin_model::TreeEntry::Blob { .. })
+        })
+        .map(|(path, _, _)| path.clone())
+        .collect()
 }
 
 fn load_projection_entries(

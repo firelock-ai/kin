@@ -101,6 +101,7 @@ pub use resolver::{ImportResolver, PythonResolver, SymbolTable, TypeScriptResolv
 pub use sync_state::SyncStateStore;
 pub use tree::{
     materialize_source_entry, materialize_source_tree, prepare_source_tree, reconcile_source_tree,
+    reconcile_source_tree_and_commit_authored_repository_transaction,
     reconcile_source_tree_and_commit_repository_transaction, replace_source_tree,
     report_repository_workspace_projection_drift, resolve_change_tree,
     should_preserve_checkout_path, source_projection_disposition, validate_portable_source_paths,

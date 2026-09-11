@@ -219,9 +219,27 @@ def payload(obj, is_error=False, indent=None):
             "isError": is_error}
 
 
+def disk_snapshot(operations):
+    # What the working copy holds, at the moment of this call, at every path the call's
+    # operations name. The real daemon reads the working copy at commit to decide whether it
+    # may project over it, so the order a harness writes in is part of the contract, and a
+    # test has to be able to see it.
+    seen = {}
+    for op in operations:
+        target = op.get("target")
+        if target and os.path.isfile(target):
+            with open(target) as fh:
+                seen[target] = fh.read()
+    return seen
+
+
 def call(name, args):
+    operations = args.get("operations", [])
+    if name == "kin_transaction_commit":
+        operations = STAGED.get(args.get("transaction_id"), [])
     with open(LOG, "a") as fh:
-        fh.write(json.dumps({"tool": name, "args": args}) + "\n")
+        fh.write(json.dumps({"tool": name, "args": args,
+                             "disk": disk_snapshot(operations)}) + "\n")
     if name == "kin_artifact_list":
         # Pretty-printed with one row per artifact, like the real server, so a listing
         # asked for a large limit is large for the same reason the real one is.
@@ -281,6 +299,13 @@ def call(name, args):
             if op.get("verb") in ("replace", "overwrite") and op.get("target") == "src/dirty.py":
                 return payload({"message": "repository authority refused the rewrite of "
                                            "src/dirty.py: the working copy is not clean",
+                                "_kin": ENVELOPE}, is_error=True)
+        # A create that stages cleanly and is refused when it commits, the create twin of the
+        # rewrite above, so a harness's behaviour after a refused commit is observable.
+        for op in operations:
+            if op.get("verb") in ("create", "add", "insert") and op.get("target") == "src/refused.py":
+                return payload({"message": "repository authority refused the create of "
+                                           "src/refused.py: its directory is not admitted",
                                 "_kin": ENVELOPE}, is_error=True)
         for op in operations:
             target = op.get("target")
@@ -726,16 +751,52 @@ fn a_staged_edit_the_daemon_refuses_tells_the_model_it_did_not_land() {
         .expect("the edit is staged");
     assert_eq!(staged["args"]["operations"][0]["verb"], "replace");
 
+    // Authority is the only writer, so a refusal leaves the working copy exactly as it was.
+    // A harness that wrote first stranded the edit on disk here while the graph kept the old
+    // text, which is the split FIR-3550 found on a real store.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/dirty.py")).unwrap(),
+        "def stale(name):\n    return name\n",
+        "a refused edit must leave the file untouched"
+    );
+
+    // The refused transaction is released rather than left open. Each refusal would
+    // otherwise hold one of the session's unfinished-transaction slots until the session
+    // ends, and a model that keeps retrying would be refused a bracket altogether.
+    let names: Vec<&str> = calls
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap())
+        .collect();
+    let commit_at = names
+        .iter()
+        .position(|name| *name == "kin_transaction_commit")
+        .expect("the edit reached the commit");
+    assert_eq!(
+        names.get(commit_at + 1),
+        Some(&"kin_transaction_abort"),
+        "a refused commit must be followed by an abort: {names:?}"
+    );
+    let trace = read_jsonl(&outcome.trace_path);
+    let edit = trace
+        .iter()
+        .find(|row| row["surface"] == "local" && row["tool"] == "edit_file")
+        .expect("the local edit is traced");
+    assert_eq!(edit["provenance"]["closed_with"], "kin_transaction_commit");
+    assert_eq!(edit["provenance"]["closed_cleanly"], false);
+    assert_eq!(
+        edit["provenance"]["aborted_after_refusal"]["closed_cleanly"],
+        true
+    );
+
     // The assertion this test exists for. The model's own tool result, which is the only
     // thing it reads, has to say the change did not land.
     let records = read_jsonl(&outcome.transcript_path);
     let view = analyze(&records);
-    let result = &view
+    let (_, result, is_error) = view
         .tool_results
         .iter()
         .find(|(id, _, _)| id == &view.tool_uses[0].0)
-        .expect("the edit has a result")
-        .1;
+        .expect("the edit has a result");
     assert!(
         result.contains("did not publish it"),
         "the model must be told its edit did not land, got: {result}"
@@ -745,8 +806,87 @@ fn a_staged_edit_the_daemon_refuses_tells_the_model_it_did_not_land() {
         "the model must be told WHY, in the server's own words, got: {result}"
     );
     assert!(
-        result.contains("uncommitted"),
-        "the model must be told where its work is, got: {result}"
+        result.contains("unchanged on disk and in the graph"),
+        "the model must be told where things stand, got: {result}"
+    );
+    assert!(*is_error, "an edit that did not land is a failed call");
+}
+
+/// FIR-3550: an in-place edit is published through repository authority before the working
+/// copy changes, and the commit is what writes the file.
+///
+/// Staged after a local write, the edit reached the real daemon holding a working copy that
+/// already carried the new bytes, and the commit refused it as drift from the prior tree. So
+/// the order is asserted directly, from what the server saw on disk when each call arrived:
+/// the old text at the stage, and the old text still at the commit.
+#[test]
+fn an_in_place_edit_is_published_by_authority_before_the_file_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+    let original = std::fs::read_to_string(repo.join("src/greet.py")).unwrap();
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Documenting greet.",
+            Some(tool_call(
+                "c1",
+                "edit_file",
+                json!({
+                    "path": "src/greet.py",
+                    "find": "def greet(name):",
+                    "replace": "def greet(name):\n    \"\"\"Return a greeting for name.\"\"\""
+                }),
+            )),
+        ),
+        completion("greet carries a docstring.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::Success, "{:?}", outcome.result);
+    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 0);
+
+    let calls = mcp_log(&log);
+    let stage = calls
+        .iter()
+        .find(|call| call["tool"] == "kin_transaction_stage")
+        .expect("the edit is staged");
+    assert_eq!(
+        stage["disk"]["src/greet.py"], original,
+        "the working copy must still hold the old text when the edit is staged"
+    );
+    let commit = calls
+        .iter()
+        .find(|call| call["tool"] == "kin_transaction_commit")
+        .expect("the edit is committed");
+    assert_eq!(
+        commit["disk"]["src/greet.py"], original,
+        "the working copy must still hold the old text when the commit arrives, because the \
+         commit is what writes it"
+    );
+    let staged_body = stage["args"]["operations"][0]["body"].as_str().unwrap();
+    assert!(
+        staged_body.contains("\"\"\"Return a greeting for name.\"\"\""),
+        "the staged body carries the edit: {staged_body}"
+    );
+
+    // The file holds what the commit published, and the model is told authority wrote it.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/greet.py")).unwrap(),
+        staged_body
+    );
+    let requests = endpoint.requests();
+    let observation = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        observation.contains("published it through repository authority"),
+        "the model must be told the edit landed: {observation}"
     );
 }
 
@@ -988,10 +1128,12 @@ fn a_refused_commit_downgrades_the_run_and_keeps_its_reason_in_the_trace() {
         "the envelope must not be what the budget was spent on: {detail}"
     );
 
-    // The model's work is not lost, and the model is told it did not land.
+    // Nothing was written, so the tracked file keeps its text. The model's work comes back
+    // in its own tool result rather than as a file the graph does not hold, and the model
+    // is told it did not land.
     assert_eq!(
         std::fs::read_to_string(repo.join("README.md")).unwrap(),
-        "# again\n"
+        "# fixture\n"
     );
     let requests = endpoint.requests();
     let observation = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
@@ -1001,6 +1143,85 @@ fn a_refused_commit_downgrades_the_run_and_keeps_its_reason_in_the_trace() {
     assert!(
         observation.contains("did not publish it"),
         "the model must be told the change did not land: {observation}"
+    );
+    assert!(
+        observation.contains("# again"),
+        "the refused content must come back to the model: {observation}"
+    );
+}
+
+/// FIR-3550, the create half: a `write_file` repository authority refuses at commit leaves
+/// no file behind.
+///
+/// The harness used to write the file locally after the refusal so the model kept its
+/// work, which left a file on disk the graph did not hold, the same split a refused edit
+/// left. The work now travels back in the tool result, the refused transaction is
+/// released, and the path stays absent.
+#[test]
+fn a_create_authority_refuses_leaves_no_file_and_hands_the_content_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+    let body = "def refused(name):\n    return name\n";
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Adding the module.",
+            Some(tool_call(
+                "c1",
+                "write_file",
+                json!({ "path": "src/refused.py", "content": body }),
+            )),
+        ),
+        completion("src/refused.py is in place.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+    assert_eq!(outcome.status, ExitStatus::ChangesUnpublished);
+    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 1);
+    assert!(
+        !repo.join("src/refused.py").exists(),
+        "a refused create must leave no file behind"
+    );
+
+    let calls = mcp_log(&log);
+    let names: Vec<&str> = calls
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "kin_session_start",
+            "kin_transaction_begin",
+            "kin_transaction_stage",
+            "kin_transaction_commit",
+            "kin_transaction_abort",
+            "kin_session_end"
+        ],
+        "a create refused at commit must be released with an abort"
+    );
+
+    let requests = endpoint.requests();
+    let observation = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        observation.contains("did not publish it"),
+        "the model must be told the create did not land: {observation}"
+    );
+    assert!(
+        observation.contains("its directory is not admitted"),
+        "the model must be told WHY, in the server's own words: {observation}"
+    );
+    assert!(
+        observation.contains(body),
+        "the refused content must come back to the model: {observation}"
     );
 }
 
@@ -1029,14 +1250,14 @@ fn a_write_over_a_tracked_path_is_refused_by_the_graph_and_aborts() {
 
     let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
         .expect("the run completes");
-    // Nothing was published, so the run does not get to call itself a success. The model
-    // still keeps its work: the harness falls back to the local write when the bracket
-    // could not publish, which is the only reason the file below exists.
+    // Nothing was published, so the run does not get to call itself a success, and nothing
+    // was written: the tracked file keeps its text and the model's content comes back in
+    // its tool result.
     assert_eq!(outcome.status, ExitStatus::ChangesUnpublished);
     assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 1);
     assert_eq!(
         std::fs::read_to_string(repo.join("README.md")).unwrap(),
-        "# rewritten\n"
+        "# fixture\n"
     );
 
     // Repository authority refuses the create by name, so the transaction aborts rather
