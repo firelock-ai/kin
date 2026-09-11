@@ -130,6 +130,7 @@ pub mod graph_only_members;
 #[cfg(test)]
 mod graph_status_first_contact;
 pub mod hosted_start;
+mod language_server_command;
 pub mod lifecycle;
 mod local_repository_authority;
 pub mod loop_runner;

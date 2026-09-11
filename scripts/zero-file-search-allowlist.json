@@ -690,6 +690,16 @@
       ]
     },
     {
+      "file": "crates/kin-daemon/src/language_server_command.rs",
+      "reason": "Language-server command resolution boundary. proxy_rustup_for asks whether the program PATH names is rustup's proxy by comparing its file identity with the rustup executable beside it, and run_rustup runs rustup's own local queries (which toolchain a directory selects, which toolchains are installed, which binary one of them ships) with auto-install switched off and a bounded wait. Both decide which executable the daemon starts for a language server, and neither reads repository content or derives a query answer. Function-scoped so the resolver's logic and any filesystem access added beside these two bodies stay scanned.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_fn": [
+        "proxy_rustup_for",
+        "run_rustup"
+      ]
+    },
+    {
       "file": "crates/kin-daemon/src/bin/kin-daemon.rs",
       "reason": "Daemon process entry point. Every pin is either a process exit with a status or the directory probe that recognizes a .kin layout when deciding which repository to bind, which precedes any graph consult. Neither class reads repository content nor answers a query. Pinned by expression with exact counts rather than by function, because the four functions involved are most of this binary and exempting their bodies would leave more unscanned than the primitives justify.",
       "owner": "kin-daemon",
