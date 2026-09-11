@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.13] - 2026-09-11
+
+### Changed
+
+- Replace the superseded category line in the Homebrew gate fixture (#1684)
+- Resolve the CLI's local graph open through the daemon's own namespace rule (FIR-3498) (#1685)
+- Retire the FIR-2809 quarantine row after 15 days without a retry (#1687)
+- Hold the reconcile loop's own admission after a run of failures (FIR-3504, FIR-3506) (#1686)
+- Isolate the stand-down footprint publish from the suite clock (#1689)
+
+
 ## [0.7.12] - 2026-09-10
 
 ### Changed
