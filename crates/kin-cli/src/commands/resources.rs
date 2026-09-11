@@ -445,6 +445,15 @@ pub struct ReconcileHealth {
     /// admission has covered that loss yet. Absent on every other daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watcher_loss: Option<WatcherLossState>,
+    /// The live graph's tree fell behind repository authority's and levelling
+    /// it has failed. Absent on every daemon whose graph and authority agree,
+    /// and cleared by the first levelling or admission that lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_split: Option<AuthoritySplit>,
+    /// The most recent levelling of the live graph with repository authority,
+    /// and what it dropped. Absent until one has happened in this daemon's life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_levelled: Option<AuthorityLevelled>,
 }
 
 /// The background-work supervisor's account of a parked reconciliation loop.
@@ -566,6 +575,66 @@ pub struct WatcherLossState {
     pub disclosure: String,
 }
 
+/// Consecutive failed attempts to level the live graph with repository
+/// authority before the daemon says a restart is what clears it.
+///
+/// Not one. A levelling reads authority's tree, plans the transition and
+/// applies it, and an enrichment write landing between the plan and the apply
+/// can refuse one attempt that the next attempt, planned a moment later, gets
+/// through. Three in a row is no longer that race.
+pub const AUTHORITY_SPLIT_WEDGE_ATTEMPTS: u64 = 3;
+
+/// The live graph's tree is behind repository authority's, and levelling it
+/// has failed.
+///
+/// Every complete admission plans from the live graph's tree, and publication
+/// refuses a plan taken from a tree authority does not hold, so while the two
+/// disagree every admission is refused. The reconcile loop levels the graph on
+/// the first such refusal; this is what is left when that levelling fails.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoritySplit {
+    /// The last levelling attempt's error, verbatim.
+    pub error: String,
+    /// Consecutive levelling attempts that have failed.
+    #[serde(default)]
+    pub attempts: u64,
+    /// Seconds since the last failed attempt. Monotonic.
+    #[serde(default)]
+    pub age_seconds: u64,
+    /// Wall-clock time of the last failed attempt, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+}
+
+/// A levelling of the live graph with repository authority that landed.
+///
+/// Reported although it healed, because it changed what the graph holds with
+/// nobody asking: the paths it moved are re-derived from their bytes, and a
+/// relation whose endpoint the levelled graph no longer carries was dropped
+/// rather than left to refuse every later transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityLevelled {
+    /// The repository authority generation the graph was levelled to.
+    #[serde(default)]
+    pub generation: u64,
+    /// Paths the levelling moved in the live graph's tree.
+    #[serde(default)]
+    pub paths: u64,
+    /// Relations dropped because the levelled graph no longer carries one of
+    /// their endpoints.
+    #[serde(default)]
+    pub dropped_relations: u64,
+    /// A bounded sample of the dropped relation ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_relations_sample: Vec<String>,
+    /// Seconds since the levelling landed. Monotonic.
+    #[serde(default)]
+    pub age_seconds: u64,
+    /// Wall-clock time of the levelling, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+}
+
 impl ReconcileHealth {
     /// Every reason this reconcile state is degraded, worst first, empty when
     /// it is not.
@@ -593,6 +662,33 @@ impl ReconcileHealth {
                  publication error: {}",
                 wedge.age_seconds, wedge.error
             ));
+        }
+        // Beside the wedge, and for the same reason: while the graph's tree is
+        // behind authority's, every admission is refused against the newer tree,
+        // so the streak and the backlog below are this fault's consequences
+        // rather than faults of their own. It names the restart only once the
+        // levelling has failed often enough that it is no longer a race.
+        if let Some(split) = &self.authority_split {
+            if split.attempts >= AUTHORITY_SPLIT_WEDGE_ATTEMPTS {
+                reasons.push(format!(
+                    "restart required, the live graph cannot be levelled with repository \
+                     authority: levelling has failed {} consecutive times (restart required at \
+                     {AUTHORITY_SPLIT_WEDGE_ATTEMPTS}), so every complete admission is refused \
+                     against authority's newer tree; `kin daemon stop` in this repository ends \
+                     this daemon and the next kin command starts one that loads its graph from \
+                     repository authority; last levelling error {}s ago: {}",
+                    split.attempts, split.age_seconds, split.error
+                ));
+            } else {
+                reasons.push(format!(
+                    "the live graph's tree is behind repository authority's and levelling it has \
+                     failed {} consecutive time(s) (restart required at \
+                     {AUTHORITY_SPLIT_WEDGE_ATTEMPTS}), so complete admissions are refused against \
+                     authority's newer tree until a levelling lands, which the reconcile loop \
+                     tries again on its next admission; last levelling error {}s ago: {}",
+                    split.attempts, split.age_seconds, split.error
+                ));
+            }
         }
         // Next, because it outranks every other reading here: a parked loop is
         // not admitting anything at all, so whatever the counters below say
@@ -694,6 +790,28 @@ impl ReconcileHealth {
     /// rules instead of waiting.
     pub fn notices(&self) -> Vec<String> {
         let mut notices = Vec::new();
+        // A levelling that landed is not a fault, and it still has to be said:
+        // it changed what the graph holds and may have dropped relations, and a
+        // reader who finds an edge missing needs to know one was dropped rather
+        // than never written.
+        if let Some(levelled) = &self.authority_levelled {
+            let dropped = if levelled.dropped_relations == 0 {
+                String::new()
+            } else {
+                format!(
+                    ", and dropped {} relation(s) whose endpoints the levelled graph no longer \
+                     carries ({})",
+                    levelled.dropped_relations,
+                    levelled.dropped_relations_sample.join(", ")
+                )
+            };
+            notices.push(format!(
+                "This daemon levelled its live graph with repository authority {}s ago: the \
+                 graph's tree had fallen behind authority's at generation {}, so it brought {} \
+                 path(s) level and re-derived them{dropped}.",
+                levelled.age_seconds, levelled.generation, levelled.paths
+            ));
+        }
         if self.untracked_path_count > 0 {
             let sample = if self.untracked_paths_sample.is_empty() {
                 String::new()
@@ -1487,6 +1605,96 @@ mod tests {
         };
         assert!(!healthy.degraded(), "{:?}", healthy.degraded_reasons());
         assert!(serde_json::to_value(&healthy).unwrap()["deferred_tree_wedge"].is_null());
+    }
+
+    /// A graph behind authority names how many levellings failed, and says a
+    /// restart is required only once they are no longer a race.
+    ///
+    /// Both halves matter. A first failed levelling is one an enrichment write
+    /// landing between plan and apply can cause, and the next attempt gets
+    /// through, so calling that a wedge would send a reader to restart a daemon
+    /// that was about to recover. Past the ceiling nothing recovers on its own,
+    /// and the reason has to lead with the restart and name the command.
+    #[test]
+    fn a_split_says_restart_only_once_levelling_has_failed_past_its_ceiling() {
+        let split = |attempts| ReconcileHealth {
+            authority_split: Some(AuthoritySplit {
+                error: "transaction relation r1 has unadmitted source endpoint entity:e1"
+                    .to_string(),
+                attempts,
+                age_seconds: 12,
+                at: Some("2026-09-11T07:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let first = split(1).degraded_reasons();
+        assert_eq!(first.len(), 1, "one fault, one reason: {first:?}");
+        assert!(
+            first[0].contains("failed 1 consecutive time(s)"),
+            "the count is the news: {first:?}"
+        );
+        assert!(
+            first[0].contains("unadmitted source endpoint"),
+            "the levelling's own error, not a summary invented here: {first:?}"
+        );
+        assert!(
+            !first[0].contains("restart required,"),
+            "one failed levelling is a race the next attempt gets through: {first:?}"
+        );
+
+        let wedged = split(AUTHORITY_SPLIT_WEDGE_ATTEMPTS).degraded_reasons();
+        assert!(
+            wedged[0].starts_with("restart required"),
+            "past the ceiling the recovery is the headline: {wedged:?}"
+        );
+        assert!(
+            wedged[0].contains("kin daemon stop"),
+            "and it names the command that performs it: {wedged:?}"
+        );
+
+        let healthy = ReconcileHealth {
+            authority_split: None,
+            ..split(AUTHORITY_SPLIT_WEDGE_ATTEMPTS)
+        };
+        assert!(!healthy.degraded(), "{:?}", healthy.degraded_reasons());
+        assert!(serde_json::to_value(&healthy).unwrap()["authority_split"].is_null());
+    }
+
+    /// A levelling that landed is a notice, not a fault, and it names what it
+    /// dropped, so a reader who finds an edge missing learns it was dropped
+    /// rather than never written.
+    #[test]
+    fn a_levelling_that_landed_is_a_notice_naming_what_it_dropped() {
+        let levelled = ReconcileHealth {
+            authority_levelled: Some(AuthorityLevelled {
+                generation: 17,
+                paths: 8,
+                dropped_relations: 1,
+                dropped_relations_sample: vec!["1426e6a7-3bcb-080b-fa61-b04267f3bb1f".to_string()],
+                age_seconds: 30,
+                at: Some("2026-09-11T07:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            levelled.degraded_reasons().is_empty(),
+            "a levelling that landed healed the store: {:?}",
+            levelled.degraded_reasons()
+        );
+        let notices = levelled.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        for fact in [
+            "generation 17",
+            "8 path(s)",
+            "dropped 1 relation(s)",
+            "1426e6a7",
+        ] {
+            assert!(notices[0].contains(fact), "missing {fact:?}: {notices:?}");
+        }
+        let encoded = serde_json::to_value(&levelled).unwrap();
+        let decoded: ReconcileHealth = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, levelled);
     }
 
     /// The wedge crosses the wire intact. Every surface but the daemon's own

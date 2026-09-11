@@ -257,6 +257,22 @@ impl ExactTreeAdmission {
             yielded_authority: true,
         }
     }
+
+    /// Fold a levelling that ran before this pass into what the pass reports,
+    /// so the caller re-derives the paths the levelling moved exactly as it
+    /// re-derives its own.
+    fn absorb_levelling(&mut self, working_dir: &Path, levelling: AuthorityLevelling) {
+        note_transition_paths(
+            working_dir,
+            &levelling.deltas,
+            &mut self.changed_paths,
+            &mut self.semantic_events,
+        );
+        self.semantic_events = dedup_file_events(std::mem::take(&mut self.semantic_events));
+        let mut deltas = levelling.deltas;
+        deltas.append(&mut self.deltas);
+        self.deltas = deltas;
+    }
 }
 
 /// Where an admitted exact tree crosses repository authority.
@@ -812,7 +828,7 @@ fn unobserved_move_destinations(
 /// The scan itself stays complete either way, so a rename keeps one stable
 /// artifact identity even when its two halves arrive in different notification
 /// batches. Only the planned transition is bounded.
-fn exact_tree_admission(
+fn exact_tree_admission_once(
     state: &DaemonState,
     observation: Option<&BTreeSet<RepoPath>>,
     publication: TreePublication,
@@ -994,22 +1010,12 @@ fn exact_tree_admission(
 
     let mut changed_paths = BTreeSet::new();
     let mut semantic_events = Vec::new();
-    for delta in &deltas {
-        if let Some(old) = delta.old_state() {
-            changed_paths.insert(old.path.clone());
-            if delta.new_state().is_none_or(|new| new.path != old.path) {
-                if let Ok(path) = kin_index::host_path_from_repo_path(working_dir, &old.path) {
-                    semantic_events.push(FileEvent::Removed(path));
-                }
-            }
-        }
-        if let Some(new) = delta.new_state() {
-            changed_paths.insert(new.path.clone());
-            if let Ok(path) = kin_index::host_path_from_repo_path(working_dir, &new.path) {
-                semantic_events.push(FileEvent::Changed(path));
-            }
-        }
-    }
+    note_transition_paths(
+        working_dir,
+        &deltas,
+        &mut changed_paths,
+        &mut semantic_events,
+    );
 
     let mut deferred_tree = None;
     if !deltas.is_empty() {
@@ -1099,33 +1105,8 @@ fn exact_tree_admission(
         // it: the old identity is dropped and every reference to it with it. The
         // binder is what keeps one id across that rename.
         let relocations = path_relocations_in(&deltas);
-        let mut relocated_entities = Vec::new();
-        if !relocations.is_empty() {
-            let authority_context =
-                crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(
-                    state,
-                )?;
-            let authority = authority_context.open().map_err(DaemonError::Graph)?;
-            let module_relocations = crate::repository_commit::plan_session_module_relocations(
-                state.blobs.as_ref(),
-                &authority,
-                &deltas,
-            )?;
-            for (from_id, to_id) in &relocations {
-                relocated_entities.extend(
-                    crate::repository_commit::plan_session_entity_relocations(
-                        state.graph.as_ref(),
-                        from_id,
-                        to_id,
-                    )?,
-                );
-            }
-            crate::repository_commit::bind_session_module_relocations(
-                &mut relocated_entities,
-                &module_relocations,
-            )?;
-        }
-        state
+        let relocated_entities = plan_relocated_entities(state, &deltas, &relocations)?;
+        let applied = state
             .graph
             .apply_transaction_delta(&TransactionDelta {
                 entity_deltas: relocated_entities,
@@ -1133,19 +1114,17 @@ fn exact_tree_admission(
                 tree_deltas: deltas.clone(),
                 ..TransactionDelta::default()
             })
-            .map_err(|error| name_stranded_endpoint_refusal(DaemonError::Graph(error), &deltas))?;
-        // After the transaction, in the order the MCP seam has always used.
-        // These records are not part of a TransactionDelta, so they were never
-        // inside one.
-        let mut moved_layouts = Vec::new();
-        for (from_id, to_id) in &relocations {
-            crate::mcp_commit::relocate_file_records(
-                state.graph.as_ref(),
-                from_id,
-                to_id,
-                &mut moved_layouts,
-            )
-            .map_err(DaemonError::Graph)?;
+            .map_err(|error| name_stranded_endpoint_refusal(DaemonError::Graph(error), &deltas));
+        match applied {
+            Ok(()) => relocate_file_records_for(state, &relocations)?,
+            // A deferred tree has not crossed authority, so a refusal here
+            // splits nothing: the caller's transaction never runs and authority
+            // keeps the tree this graph still holds.
+            Err(refusal) if defer => return Err(refusal),
+            // Authority has already accepted `desired_tree`. Handing the refusal
+            // back from here is how a graph falls behind authority for good, so
+            // the graph is levelled with authority in this same round instead.
+            Err(refusal) => level_after_refused_apply(state, refusal)?,
         }
     }
 
@@ -1185,6 +1164,323 @@ fn exact_tree_admission(
         deferred_tree,
         yielded_authority: false,
     })
+}
+
+/// Derive and publish one complete exact-tree transition, levelling the live
+/// graph with repository authority first when authority refuses the plan.
+///
+/// [`exact_tree_admission_once`] is the transition itself. A stale-plan refusal
+/// is the one answer from it that a retry cannot change: the plan is taken from
+/// the live graph's tree, the refusal says authority holds another, and the next
+/// plan would be taken from the same tree. So the graph is levelled with
+/// authority and the observation is planned once more, against the tree
+/// authority actually holds. Once, not in a loop: a second refusal goes back to
+/// the caller and its retry ladder like any other.
+fn exact_tree_admission(
+    state: &DaemonState,
+    observation: Option<&BTreeSet<RepoPath>>,
+    publication: TreePublication,
+) -> Result<ExactTreeAdmission> {
+    let refusal = match exact_tree_admission_once(state, observation, publication) {
+        Err(error) if crate::repository_commit::is_stale_plan_refusal(&error) => error,
+        answered => return answered,
+    };
+    let levelling = match settle_levelling(state, level_graph_with_authority(state)) {
+        Ok(Some(levelling)) => levelling,
+        // Already level, so authority moved between this plan and its
+        // publication rather than the graph falling behind it: the refusal
+        // stands and the caller's ladder retries it. A levelling that failed was
+        // recorded where the surfaces read it, and the refusal it could not
+        // clear is still the answer.
+        Ok(None) | Err(_) => return Err(refusal),
+    };
+    let mut admission = exact_tree_admission_once(state, observation, publication)?;
+    admission.absorb_levelling(state.layout.working_dir(), levelling);
+    Ok(admission)
+}
+
+/// The paths one tree transition moved, and the host events that re-derive
+/// them.
+fn note_transition_paths(
+    working_dir: &Path,
+    deltas: &[TreeDelta],
+    changed_paths: &mut BTreeSet<RepoPath>,
+    semantic_events: &mut Vec<FileEvent>,
+) {
+    for delta in deltas {
+        if let Some(old) = delta.old_state() {
+            changed_paths.insert(old.path.clone());
+            if delta.new_state().is_none_or(|new| new.path != old.path) {
+                if let Ok(path) = kin_index::host_path_from_repo_path(working_dir, &old.path) {
+                    semantic_events.push(FileEvent::Removed(path));
+                }
+            }
+        }
+        if let Some(new) = delta.new_state() {
+            changed_paths.insert(new.path.clone());
+            if let Ok(path) = kin_index::host_path_from_repo_path(working_dir, &new.path) {
+                semantic_events.push(FileEvent::Changed(path));
+            }
+        }
+    }
+}
+
+/// The entity moves a transition's path relocations owe, planned through the
+/// same planner and binder the session admission uses rather than a shorter
+/// local rule.
+///
+/// Opens repository authority only when there is a relocation to plan: the
+/// module relocation reads bodies authority owns, and no other transition
+/// needs anything from it.
+fn plan_relocated_entities(
+    state: &DaemonState,
+    deltas: &[TreeDelta],
+    relocations: &[(FilePathId, FilePathId)],
+) -> Result<Vec<kin_model::EntityDelta>> {
+    let mut relocated_entities = Vec::new();
+    if relocations.is_empty() {
+        return Ok(relocated_entities);
+    }
+    let authority_context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
+    let authority = authority_context.open().map_err(DaemonError::Graph)?;
+    let module_relocations = crate::repository_commit::plan_session_module_relocations(
+        state.blobs.as_ref(),
+        &authority,
+        deltas,
+    )?;
+    for (from_id, to_id) in relocations {
+        relocated_entities.extend(crate::repository_commit::plan_session_entity_relocations(
+            state.graph.as_ref(),
+            from_id,
+            to_id,
+        )?);
+    }
+    crate::repository_commit::bind_session_module_relocations(
+        &mut relocated_entities,
+        &module_relocations,
+    )?;
+    Ok(relocated_entities)
+}
+
+/// Move the per-file records a relocation owes, after the transaction that
+/// moved the tree, in the order the MCP seam has always used. These records
+/// are not part of a TransactionDelta, so they were never inside one.
+fn relocate_file_records_for(
+    state: &DaemonState,
+    relocations: &[(FilePathId, FilePathId)],
+) -> Result<()> {
+    let mut moved_layouts = Vec::new();
+    for (from_id, to_id) in relocations {
+        crate::mcp_commit::relocate_file_records(
+            state.graph.as_ref(),
+            from_id,
+            to_id,
+            &mut moved_layouts,
+        )
+        .map_err(DaemonError::Graph)?;
+    }
+    Ok(())
+}
+
+/// What levelling the live graph with repository authority did.
+#[derive(Debug)]
+struct AuthorityLevelling {
+    /// The tree transition the live graph took to reach authority's tree.
+    deltas: Vec<TreeDelta>,
+    /// Relations dropped in the same transaction because the levelled graph no
+    /// longer carries one of their endpoints.
+    dropped_relations: Vec<kin_model::RelationId>,
+    /// The repository authority generation the graph was levelled to.
+    generation: u64,
+}
+
+/// Bring the live graph's exact tree level with repository authority's
+/// workspace tree.
+///
+/// Every complete admission plans from the live graph's tree, and publication
+/// refuses a plan taken from a tree authority does not hold, so a graph that
+/// falls behind authority refuses every later admission, and until this nothing
+/// in the daemon brought it level short of a restart. Measured on a long-lived
+/// store: one admission's tree crossed authority, the graph refused the same
+/// transition over a relation it could not carry, and every admission for the
+/// next eleven hours, 981 of them, was refused against the tree the graph never
+/// took.
+///
+/// It moves the TREE and the enrichment that goes with removed and moved paths,
+/// nothing more. The caller re-derives the paths it moves from their bytes,
+/// exactly as the round that fell behind would have. Authority's entity overlay
+/// is deliberately not imported: an ambient admission publishes no re-parsed
+/// entities, so that overlay can be older than the parse the live graph holds,
+/// and importing it would replace a fresh parse with a stale one.
+///
+/// A relation whose endpoint the levelled graph will not carry is dropped in the
+/// same transaction and returned so the caller can say so. kin-db checks every
+/// relation on every transaction and refuses the whole transaction over one
+/// such edge, which is how the round that fell behind was refused.
+///
+/// `None` when the graph is already level.
+fn level_graph_with_authority(state: &DaemonState) -> Result<Option<AuthorityLevelling>> {
+    let authority_context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
+    let authority_tree = crate::repository_commit::authority_workspace_tree(&authority_context)?;
+    let live_tree = state.graph.resolved_tree();
+    if live_tree == authority_tree {
+        return Ok(None);
+    }
+    let deltas = kin_core::exact_tree_correction(&live_tree, &authority_tree)?;
+    evict_enrichment_for_removed_paths(state, &deltas)?;
+    let relocations = path_relocations_in(&deltas);
+    let relocated_entities = plan_relocated_entities(state, &deltas, &relocations)?;
+    // The census walks the relations without copying the graph, so the copy
+    // the scan needs is paid only when there is a strand to find.
+    let stranded = if state.graph.stranded_relation_count() == 0 {
+        Vec::new()
+    } else {
+        relations_stranded_by(state.graph.as_ref(), &authority_tree, &relocated_entities)
+    };
+    let dropped_relations = stranded
+        .iter()
+        .map(|relation| relation.id)
+        .collect::<Vec<_>>();
+    state
+        .graph
+        .apply_transaction_delta(&TransactionDelta {
+            entity_deltas: relocated_entities,
+            relation_deltas: stranded
+                .into_iter()
+                .map(|old| kin_model::RelationDelta::Removed { old })
+                .collect(),
+            tree_deltas: deltas.clone(),
+            ..TransactionDelta::default()
+        })
+        .map_err(|error| name_stranded_endpoint_refusal(DaemonError::Graph(error), &deltas))?;
+    relocate_file_records_for(state, &relocations)?;
+    // A writer outside this daemon can move authority without this process
+    // hearing of it, and every later derived-index step compares against this
+    // cursor, so it follows the tree the graph was just levelled to.
+    let (roots, _) = current_authority_admission(state)?;
+    if roots.generation > state.snapshot_generation.load(Ordering::SeqCst) {
+        state.record_repository_authority_commit(roots.generation)?;
+    }
+    state.bump_version();
+    Ok(Some(AuthorityLevelling {
+        deltas,
+        dropped_relations,
+        generation: roots.generation,
+    }))
+}
+
+/// Relations the live graph holds that the levelled graph could not carry.
+///
+/// The test kin-db's transaction gate applies, for the two node kinds a tree
+/// transition moves: an entity endpoint has to be an entity the graph holds
+/// once `relocated` is applied, and an artifact endpoint has to be an artifact
+/// of `target_tree`. Every other kind is left to kin-db's own check, because a
+/// tree transition cannot strand it.
+fn relations_stranded_by(
+    graph: &kin_db::InMemoryGraph,
+    target_tree: &kin_model::ResolvedTree,
+    relocated: &[kin_model::EntityDelta],
+) -> Vec<kin_model::Relation> {
+    let snapshot = graph.to_snapshot();
+    let mut entities = snapshot
+        .entities
+        .keys()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    for delta in relocated {
+        match delta {
+            kin_model::EntityDelta::Added { new } => {
+                entities.insert(new.id);
+            }
+            kin_model::EntityDelta::Removed { old } => {
+                entities.remove(&old.id);
+            }
+            kin_model::EntityDelta::Modified { .. } => {}
+        }
+    }
+    let artifacts = target_tree
+        .artifacts_by_path()
+        .map(|artifact| artifact.artifact_id)
+        .collect::<std::collections::HashSet<_>>();
+    let carried = |node: kin_model::GraphNodeId| match node {
+        kin_model::GraphNodeId::Entity(id) => entities.contains(&id),
+        kin_model::GraphNodeId::Artifact(id) => artifacts.contains(&id),
+        _ => true,
+    };
+    snapshot
+        .relations
+        .into_values()
+        .filter(|relation| !carried(relation.src) || !carried(relation.dst))
+        .collect()
+}
+
+/// Record one levelling attempt where the surfaces read it, and hand it back.
+///
+/// A levelling that landed is published although it healed, because it changed
+/// what the graph holds and may have dropped relations, and a log line is gone
+/// by the time anyone reads a status surface. A failed one extends the count
+/// the surfaces turn into a restart-required wedge.
+fn settle_levelling(
+    state: &DaemonState,
+    attempt: Result<Option<AuthorityLevelling>>,
+) -> Result<Option<AuthorityLevelling>> {
+    let probes = state.background_work.reconcile();
+    match &attempt {
+        Ok(Some(levelling)) => {
+            let dropped = levelling
+                .dropped_relations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            warn!(
+                generation = levelling.generation,
+                paths = levelling.deltas.len(),
+                dropped_relations = ?dropped,
+                "the live graph had fallen behind repository authority; levelled its tree with \
+                 authority, dropped the relations it could no longer carry, and re-deriving the \
+                 paths it moved"
+            );
+            probes.record_authority_levelled(
+                levelling.generation,
+                levelling.deltas.len() as u64,
+                &dropped,
+                Instant::now(),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let attempts = probes.record_authority_split(error, Instant::now());
+            warn!(
+                attempts,
+                error = %error,
+                "could not level the live graph with repository authority; complete admissions \
+                 are refused against authority's newer tree until a levelling lands"
+            );
+        }
+    }
+    attempt
+}
+
+/// Finish a round whose tree repository authority accepted and whose graph
+/// apply was refused.
+///
+/// Handing the refusal back is how a graph falls behind authority: the
+/// publication is durable, the graph keeps the tree authority just replaced,
+/// and every later plan is taken from that older tree. Levelling the graph now
+/// applies the transition the round owed and drops the relation that refused
+/// it, in the same round.
+fn level_after_refused_apply(state: &DaemonState, refusal: DaemonError) -> Result<()> {
+    warn!(
+        error = %refusal,
+        "repository authority accepted this admission's tree and the live graph refused the same \
+         transition; levelling the graph with authority"
+    );
+    match settle_levelling(state, level_graph_with_authority(state)) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) | Err(_) => Err(refusal),
+    }
 }
 
 /// Run one ambient reconcile round's admission the way the loop runs it, and
@@ -4496,6 +4792,7 @@ mod tests {
 
     include!("loop_runner/tests/startup_recovery.rs");
     include!("loop_runner/tests/enrichment_churn.rs");
+    include!("loop_runner/tests/authority_split.rs");
 
     #[test]
     fn partial_c_disclosure_persists_and_only_clean_outcomes_settle() {
