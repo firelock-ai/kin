@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: SAST
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+
+# The sha suffix is empty off main, so every pull request and merge-queue ref
+# keeps one group per ref and `cancel-in-progress` supersedes an older push
+# exactly as it did before. On main each commit gets its own group, because
+# `cancel-in-progress: false` does not mean "never cancel": GitHub keeps at
+# most one PENDING run per group and cancels the older one. Two landings in
+# quick succession therefore delete the earlier commit's run before it starts
+# a job, and a run that started no jobs leaves the commit with its checks
+# absent rather than failed. The hosted merge queue lands PRs back to back, so
+# that window is the ordinary case here, not a rare one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: stable
