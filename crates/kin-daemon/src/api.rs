@@ -9441,21 +9441,21 @@ async fn review(
     }
 
     let session_id = extract_session_id_from_headers(&headers)?;
-    let mutates = matches!(
-        req,
-        kin_cli::commands::review::ReviewRequest::Create { .. }
-            | kin_cli::commands::review::ReviewRequest::Decide { .. }
-            | kin_cli::commands::review::ReviewRequest::Note { .. }
-            | kin_cli::commands::review::ReviewRequest::Discuss { .. }
-            | kin_cli::commands::review::ReviewRequest::Reply { .. }
-            | kin_cli::commands::review::ReviewRequest::Resolve { .. }
-            | kin_cli::commands::review::ReviewRequest::Assign { .. }
-    );
-    let graph = if mutates {
-        Arc::clone(&state.graph)
-    } else {
-        resolve_session_graph(&state, session_id.as_ref()).await
-    };
+    if req.is_mutation() {
+        // Review state is repository authority, so a mutation answers only once
+        // the review writer has committed it. The two gates are the pair every
+        // authority writer in this daemon holds; the writer takes the persistence
+        // lock itself.
+        let _coordination = state.coordination_gate.lock().await;
+        let _graph_mutation = state.begin_graph_authority_mutation();
+        let answer =
+            crate::review_write::commit_review_event(&state, session_id.as_ref(), |graph| {
+                kin_cli::commands::review::plan_review_mutation(graph, req)
+            })
+            .map_err(review_write_refusal)?;
+        return Ok(Json(answer));
+    }
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
@@ -9477,14 +9477,41 @@ async fn review(
             internal_error(error)
         }
     })?;
-    if execution.mutated {
-        state.bump_version();
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: "review-state".to_string(),
-        });
-    }
     Ok(Json(execution.response))
+}
+
+/// Answer a refused review write with the status its cause earns: a request that
+/// names nothing the store holds is not found, one the planner refused is a bad
+/// request, and a write authority kept moving under is a conflict.
+fn review_write_refusal(
+    refusal: crate::review_write::ReviewWriteRefusal<anyhow::Error>,
+) -> (StatusCode, String) {
+    use crate::review_write::ReviewWriteRefusal;
+    let status = match &refusal {
+        ReviewWriteRefusal::Plan(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<kin_cli::commands::review::ReviewNotFound>()
+                    .is_some()
+                    || cause
+                        .downcast_ref::<kin_review::write::ReviewTargetMissing>()
+                        .is_some()
+            }) =>
+        {
+            StatusCode::NOT_FOUND
+        }
+        ReviewWriteRefusal::Plan(_) => StatusCode::BAD_REQUEST,
+        ReviewWriteRefusal::Hosted => StatusCode::CONFLICT,
+        ReviewWriteRefusal::Commit { conflict: true, .. } => StatusCode::CONFLICT,
+        ReviewWriteRefusal::Authority(_)
+        | ReviewWriteRefusal::Commit { .. }
+        | ReviewWriteRefusal::Diverged { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let message = match &refusal {
+        ReviewWriteRefusal::Plan(error) => crate::error::cause_first(error),
+        other => other.to_string(),
+    };
+    (status, message)
 }
 
 /// POST /work — run work item reads and mutations in the repo daemon.
@@ -15628,6 +15655,18 @@ async fn mcp_tools_call_dispatch(
                 scope,
             )
             .await
+        } else if kin_mcp::handlers::review::is_review_mutation(&request.name) {
+            // Review writes are repository authority: planned against the live
+            // graph and committed by the daemon's one review writer before the
+            // tool answers, exactly as `POST /review` does. Every name here is a
+            // graph-mutating tool, so this dispatch already holds the
+            // coordination gate and a graph-authority guard.
+            crate::review_write::commit_mcp_review_tool(
+                &state,
+                session_id.as_ref(),
+                &request.name,
+                &request.arguments,
+            )
         } else if request.name == "kin_transaction_commit" {
             // Synchronous authority work on a runtime worker, exactly like the
             // CLI commit path, so it publishes the same mid-transaction proof.
@@ -48845,48 +48884,288 @@ mod tests {
     #[tokio::test]
     async fn review_endpoint_lists_live_review_state() {
         let state = test_state();
-        let repository_authority = state.local_repository_authority_binding().unwrap();
-        let execution = kin_cli::commands::review::execute_review_request(
-            &repository_authority,
-            state.graph.as_ref(),
-            kin_cli::commands::review::ReviewRequest::Create {
-                title: "Listed review".to_string(),
-                base: "main".to_string(),
-                head: "HEAD".to_string(),
-                description: None,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(execution.mutated);
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let app = router(state);
-        let response = app
+        review_call(
+            &state,
+            serde_json::json!({
+                "op": "create",
+                "title": "Listed review",
+                "base": "main",
+                "head": "HEAD",
+            }),
+        )
+        .await;
+
+        let result = review_call(&state, serde_json::json!({ "op": "list", "state": null })).await;
+        assert!(result.text.contains("Listed review"));
+        assert!(result.text.contains("1 review(s)"));
+    }
+
+    /// POST one review request and return the daemon's answer, asserting 200.
+    async fn review_call(
+        state: &Arc<DaemonState>,
+        request: serde_json::Value,
+    ) -> kin_cli::commands::review::ReviewResponse {
+        let response = router(Arc::clone(state))
             .oneshot(
                 Request::post("/review")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "op": "list",
-                            "state": null,
-                        })
-                        .to_string(),
-                    ))
+                    .body(Body::from(request.to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap();
-        let result: kin_cli::commands::review::ReviewResponse =
-            serde_json::from_slice(&body).unwrap();
-        assert!(result.text.contains("Listed review"));
-        assert!(result.text.contains("1 review(s)"));
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// What every review surface answers about one review, in a form that does
+    /// not depend on the store's map order, which differs between processes:
+    /// the list's lines, the show text's lines, and the MCP record with its
+    /// notes and discussions ordered by id.
+    async fn review_surfaces(
+        state: &Arc<DaemonState>,
+        review_id: &str,
+    ) -> (Vec<String>, Vec<String>, serde_json::Value) {
+        fn sorted_lines(text: &str) -> Vec<String> {
+            let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+            lines.sort();
+            lines
+        }
+        let list = review_call(state, serde_json::json!({ "op": "list", "state": null })).await;
+        let show = review_call(
+            state,
+            serde_json::json!({ "op": "show", "review_id": review_id }),
+        )
+        .await;
+        let get = mcp_call(
+            router(Arc::clone(state)),
+            "kin_review_get",
+            serde_json::json!({ "review_id": review_id }),
+        )
+        .await;
+        assert_ne!(get.is_error, Some(true), "{}", mcp_result_text(&get));
+        let mut record: serde_json::Value = serde_json::from_str(&mcp_result_text(&get)).unwrap();
+        for (collection, id) in [("notes", "note_id"), ("discussions", "discussion_id")] {
+            if let Some(entries) = record
+                .get_mut(collection)
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                entries.sort_by(|left, right| left[id].as_str().cmp(&right[id].as_str()));
+            }
+        }
+        (sorted_lines(&list.text), sorted_lines(&show.text), record)
+    }
+
+    /// A review, its decision, notes, discussion, reply, resolution and
+    /// assignments answer the same on every surface after the daemon restarts on
+    /// the same store, whether they were written through `POST /review` or MCP.
+    ///
+    /// This is the measurement that found the defect, run in the crate. Before the
+    /// review writer existed, the reopened daemon answered "No reviews found." on
+    /// the list, "review not found" on show and an MCP error on get. Falsify by
+    /// skipping the commit in `review_write::commit_review_event` while keeping the
+    /// live apply: every read before the restart still passes and every read after
+    /// it fails.
+    #[tokio::test]
+    async fn review_state_survives_a_daemon_restart_on_every_surface() {
+        use std::sync::atomic::Ordering;
+
+        let initial = test_state();
+        let layout = initial.layout.clone();
+        drop(initial);
+        let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        state.is_initialized.store(true, Ordering::Relaxed);
+        let generation_at_open = state.snapshot_generation.load(Ordering::SeqCst);
+
+        let created = review_call(
+            &state,
+            serde_json::json!({
+                "op": "create",
+                "title": "Durable review",
+                "base": "main",
+                "head": "HEAD",
+                "description": "opened before a restart",
+            }),
+        )
+        .await;
+        let review_id = created
+            .text
+            .lines()
+            .find_map(|line| line.strip_prefix("Created review "))
+            .expect("the create answer names the review")
+            .trim()
+            .to_string();
+        review_call(
+            &state,
+            serde_json::json!({
+                "op": "decide",
+                "review_id": review_id,
+                "state": "approved",
+                "comment": "ship it",
+            }),
+        )
+        .await;
+        review_call(
+            &state,
+            serde_json::json!({
+                "op": "note",
+                "review_id": review_id,
+                "body": "a standalone note",
+                "scope": null,
+            }),
+        )
+        .await;
+        let discussed = review_call(
+            &state,
+            serde_json::json!({
+                "op": "discuss",
+                "review_id": review_id,
+                "body": "why this shape?",
+                "scope": null,
+            }),
+        )
+        .await;
+        let discussion_id = discussed
+            .text
+            .split_whitespace()
+            .nth(2)
+            .expect("the discuss answer names the discussion")
+            .to_string();
+        review_call(
+            &state,
+            serde_json::json!({
+                "op": "reply",
+                "discussion_id": discussion_id,
+                "body": "one writer, one transaction",
+            }),
+        )
+        .await;
+        review_call(
+            &state,
+            serde_json::json!({ "op": "resolve", "discussion_id": discussion_id }),
+        )
+        .await;
+        review_call(
+            &state,
+            serde_json::json!({ "op": "assign", "review_id": review_id, "reviewer": "carol" }),
+        )
+        .await;
+
+        // The MCP writers go through the same writer.
+        let assigned = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_review_assign",
+            serde_json::json!({ "review_id": review_id, "reviewer": "dave" }),
+        )
+        .await;
+        assert_ne!(
+            assigned.is_error,
+            Some(true),
+            "{}",
+            mcp_result_text(&assigned)
+        );
+        let agent_review = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_review_create",
+            serde_json::json!({ "title": "Agent review", "base": "main", "head": "HEAD" }),
+        )
+        .await;
+        assert_ne!(
+            agent_review.is_error,
+            Some(true),
+            "a create naming no reviewer must succeed, as the tool's schema says: {}",
+            mcp_result_text(&agent_review)
+        );
+        let agent_review_id =
+            serde_json::from_str::<serde_json::Value>(&mcp_result_text(&agent_review)).unwrap()
+                ["review_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+        let before = review_surfaces(&state, &review_id).await;
+        let agent_before = review_surfaces(&state, &agent_review_id).await;
+        let generation_before_restart = state.snapshot_generation.load(Ordering::SeqCst);
+        drop(state);
+
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened.is_initialized.store(true, Ordering::Relaxed);
+        let after = review_surfaces(&reopened, &review_id).await;
+        assert_eq!(
+            after, before,
+            "every review surface must answer the same after a restart"
+        );
+        assert_eq!(
+            review_surfaces(&reopened, &agent_review_id).await,
+            agent_before
+        );
+        // Checked after the reads, so a write that skipped authority fails on the
+        // read-back itself, which is what a person restarting the daemon sees.
+        assert_eq!(
+            generation_before_restart,
+            generation_at_open + 9,
+            "each of the nine review writes commits exactly one authority transaction"
+        );
+        assert_eq!(
+            reopened.snapshot_generation.load(Ordering::SeqCst),
+            generation_before_restart
+        );
+
+        let (list, show, record) = after;
+        let list = list.join("\n");
+        let show = show.join("\n");
+        assert!(list.contains("[approved] Durable review"), "{list}");
+        assert!(list.contains("2 review(s)"), "{list}");
+        assert!(
+            show.contains("one writer, one transaction") && show.contains("resolved"),
+            "{show}"
+        );
+        assert!(
+            show.contains("a standalone note") && show.contains("opened before a restart"),
+            "{show}"
+        );
+        assert_eq!(record["state"], "approved");
+        let reviewers: Vec<&str> = record["assignments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|assignment| assignment["reviewer"].as_str().unwrap())
+            .collect();
+        assert_eq!(reviewers, vec!["carol", "dave"]);
+
+        // Provenance survives with the records: who acted, the changes the refs
+        // resolved to, and the authority generation the review was written at.
+        let events =
+            kin_model::ProvenanceStore::query_audit_events(reopened.graph.as_ref(), None, 20)
+                .unwrap();
+        let created_event = events
+            .iter()
+            .find(|event| {
+                event.action == "review.create"
+                    && event
+                        .details
+                        .as_deref()
+                        .is_some_and(|details| details.contains(&review_id))
+            })
+            .expect("the create's audit event survives the restart");
+        let details = created_event.details.as_deref().unwrap();
+        assert!(
+            details.contains("base_change=")
+                && details.contains("head_change=")
+                && details.contains("authority_generation="),
+            "{details}"
+        );
+        assert!(
+            events.iter().any(|event| event.action == "review.decide"),
+            "the decision's audit event survives the restart"
+        );
     }
 
     #[cfg(feature = "embeddings")]

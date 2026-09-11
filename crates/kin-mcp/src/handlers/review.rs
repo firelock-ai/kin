@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use super::repository_authority::RequestRepositoryAuthority;
 use kin_model::graph::GraphStore;
 use kin_model::ids::SemanticChangeId;
+use kin_review::write::{PlannedReviewEvent, ReviewGroup, ReviewWrite};
 use kin_review::{format_review, SemanticReview};
 
 use crate::error::{McpError, Result};
@@ -524,6 +525,13 @@ pub fn handle_review_create<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    apply_planned(plan_review_create(args, store)?, store)
+}
+
+fn plan_review_create<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    _store: &G,
+) -> Result<PlannedReviewTool> {
     use kin_model::review::{
         Review, ReviewAssignment, ReviewCompletionState, ReviewDecisionState, ReviewId,
     };
@@ -534,6 +542,8 @@ pub fn handle_review_create<G: GraphStore>(
     let head = get_optional_string_param(args, "head").unwrap_or_else(|| "working-tree".into());
     let scopes = parse_review_create_scopes(args)?;
     let created_by = parse_identity_arg(args, "created_by", "created_by_kind", "mcp-client");
+    // Optional, as the tool's schema says: a review may open with no reviewer.
+    let reviewers = parse_optional_reviewer_list(args)?;
     let now = Timestamp::now();
 
     let review = Review {
@@ -548,30 +558,42 @@ pub fn handle_review_create<G: GraphStore>(
         created_at: now.clone(),
         updated_at: now.clone(),
     };
-
-    store
-        .create_review(&review)
-        .map_err(|e| McpError::Other(e.to_string()))?;
-
-    for reviewer in parse_reviewer_list(args)? {
-        let assignment = ReviewAssignment {
-            review_id: review.review_id,
-            reviewer: kin_model::IdentityRef::human(reviewer),
-            assigned_at: now.clone(),
-            assigned_by: created_by.clone(),
-        };
-        store
-            .assign_reviewer(&assignment)
-            .map_err(|e| McpError::Other(e.to_string()))?;
-    }
+    let review_id = review.review_id;
+    let assignments = (!reviewers.is_empty()).then(|| ReviewGroup {
+        review_id,
+        entries: reviewers
+            .into_iter()
+            .map(|reviewer| ReviewAssignment {
+                review_id,
+                reviewer: kin_model::IdentityRef::human(reviewer),
+                assigned_at: now.clone(),
+                assigned_by: created_by.clone(),
+            })
+            .collect(),
+    });
 
     let result = serde_json::json!({
-        "review_id": review.review_id.to_string(),
+        "review_id": review_id.to_string(),
         "title": review.title,
         "state": "pending",
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    Ok(PlannedReviewEvent {
+        action: "review.create",
+        review_id,
+        details: format!(
+            "review_id={}; title={}; base={}; head={}",
+            review_id, review.title, review.base_ref, review.head_ref
+        ),
+        actor_label: created_by.name.clone(),
+        refs: Some((review.base_ref.clone(), review.head_ref.clone())),
+        write: ReviewWrite {
+            review: Some(review),
+            assignments,
+            ..ReviewWrite::default()
+        },
+        answer: ToolCallResult::text(json),
+    })
 }
 
 pub const REVIEW_DECIDE_DESC: &str = "\
@@ -585,6 +607,13 @@ pub fn handle_review_decide<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    apply_planned(plan_review_decide(args, store)?, store)
+}
+
+fn plan_review_decide<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<PlannedReviewTool> {
     use kin_model::review::ReviewDecision;
     use kin_model::timestamp::Timestamp;
 
@@ -596,6 +625,7 @@ pub fn handle_review_decide<G: GraphStore>(
     let reviewer = parse_identity_arg(args, "reviewer", "reviewer_kind", "mcp-client");
 
     let state = parse_review_decision_state(&state_str)?;
+    let mut review = existing_review(store, &review_id)?;
 
     let decision = ReviewDecision {
         state,
@@ -607,10 +637,15 @@ pub fn handle_review_decide<G: GraphStore>(
         reviewer: reviewer.clone(),
         decided_at: Timestamp::now(),
     };
-
-    store
-        .add_review_decision(&review_id, &decision)
+    // The decision is history and the review's state is where it stands now, so
+    // one event moves both: without this an approved review reads pending on
+    // every surface that prints its state.
+    review.state = state;
+    review.updated_at = decision.decided_at.clone();
+    let mut history = store
+        .get_review_decisions(&review_id)
         .map_err(|e| McpError::Other(e.to_string()))?;
+    history.push(decision);
 
     let result = serde_json::json!({
         "review_id": review_id.to_string(),
@@ -618,7 +653,22 @@ pub fn handle_review_decide<G: GraphStore>(
         "reviewer": reviewer.name,
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    Ok(PlannedReviewEvent {
+        action: "review.decide",
+        review_id,
+        details: format!("review_id={review_id}; decision={state_str}"),
+        actor_label: reviewer.name,
+        refs: None,
+        write: ReviewWrite {
+            review: Some(review),
+            decisions: Some(ReviewGroup {
+                review_id,
+                entries: history,
+            }),
+            ..ReviewWrite::default()
+        },
+        answer: ToolCallResult::text(json),
+    })
 }
 
 pub const REVIEW_NOTE_ADD_DESC: &str = "\
@@ -633,6 +683,13 @@ pub fn handle_review_note_add<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    apply_planned(plan_review_note_add(args, store)?, store)
+}
+
+fn plan_review_note_add<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<PlannedReviewTool> {
     use kin_model::review::{ReviewNote, ReviewNoteId};
     use kin_model::timestamp::Timestamp;
 
@@ -640,6 +697,7 @@ pub fn handle_review_note_add<G: GraphStore>(
     let body = get_string_param(args, "body")?;
     let scope = parse_optional_scope_arg(args)?;
     let author = parse_identity_arg(args, "author", "author_kind", "mcp-client");
+    existing_review(store, &review_id)?;
 
     let note = ReviewNote {
         note_id: ReviewNoteId::new(),
@@ -650,10 +708,6 @@ pub fn handle_review_note_add<G: GraphStore>(
         created_at: Timestamp::now(),
     };
 
-    store
-        .add_review_note(&note)
-        .map_err(|e| McpError::Other(e.to_string()))?;
-
     let result = serde_json::json!({
         "note_id": note.note_id.to_string(),
         "review_id": review_id.to_string(),
@@ -661,7 +715,18 @@ pub fn handle_review_note_add<G: GraphStore>(
         "author": author.name,
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    Ok(PlannedReviewEvent {
+        action: "review.note",
+        review_id,
+        details: format!("review_id={review_id}; note_id={}", note.note_id),
+        actor_label: author.name,
+        refs: None,
+        write: ReviewWrite {
+            notes: vec![note],
+            ..ReviewWrite::default()
+        },
+        answer: ToolCallResult::text(json),
+    })
 }
 
 pub const REVIEW_DISCUSS_DESC: &str = "\
@@ -676,6 +741,13 @@ pub fn handle_review_discuss<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    apply_planned(plan_review_discuss(args, store)?, store)
+}
+
+fn plan_review_discuss<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<PlannedReviewTool> {
     use kin_model::review::{
         ReviewComment, ReviewDiscussion, ReviewDiscussionId, ReviewDiscussionState,
     };
@@ -685,7 +757,9 @@ pub fn handle_review_discuss<G: GraphStore>(
     let body = get_string_param(args, "body")?;
     let scope = parse_optional_scope_arg(args)?;
     let author = parse_identity_arg(args, "author", "author_kind", "mcp-client");
+    existing_review(store, &review_id)?;
 
+    let now = Timestamp::now();
     let discussion_id = ReviewDiscussionId::new();
     let discussion = ReviewDiscussion {
         discussion_id,
@@ -695,14 +769,10 @@ pub fn handle_review_discuss<G: GraphStore>(
         comments: vec![ReviewComment {
             body: body.clone(),
             authored_by: author.clone(),
-            created_at: Timestamp::now(),
+            created_at: now.clone(),
         }],
-        created_at: Timestamp::now(),
+        created_at: now,
     };
-
-    store
-        .create_review_discussion(&discussion)
-        .map_err(|e| McpError::Other(e.to_string()))?;
 
     let result = serde_json::json!({
         "discussion_id": discussion_id.to_string(),
@@ -712,7 +782,18 @@ pub fn handle_review_discuss<G: GraphStore>(
         "author": author.name,
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    Ok(PlannedReviewEvent {
+        action: "review.discuss",
+        review_id,
+        details: format!("review_id={review_id}; discussion_id={discussion_id}"),
+        actor_label: author.name,
+        refs: None,
+        write: ReviewWrite {
+            discussions: vec![discussion],
+            ..ReviewWrite::default()
+        },
+        answer: ToolCallResult::text(json),
+    })
 }
 
 pub const REVIEW_DISCUSS_REPLY_DESC: &str = "\
@@ -726,22 +807,25 @@ pub fn handle_review_discuss_reply<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    apply_planned(plan_review_discuss_reply(args, store)?, store)
+}
+
+fn plan_review_discuss_reply<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<PlannedReviewTool> {
     use kin_model::review::ReviewComment;
     use kin_model::timestamp::Timestamp;
 
     let discussion_id = parse_discussion_id(args, "discussion_id")?;
     let body = get_string_param(args, "body")?;
     let author = parse_identity_arg(args, "author", "author_kind", "mcp-client");
-
-    let comment = ReviewComment {
+    let mut discussion = existing_discussion(store, &discussion_id)?;
+    discussion.comments.push(ReviewComment {
         body: body.clone(),
         authored_by: author.clone(),
         created_at: Timestamp::now(),
-    };
-
-    store
-        .add_discussion_comment(&discussion_id, &comment)
-        .map_err(|e| McpError::Other(e.to_string()))?;
+    });
 
     let result = serde_json::json!({
         "discussion_id": discussion_id.to_string(),
@@ -749,7 +833,18 @@ pub fn handle_review_discuss_reply<G: GraphStore>(
         "author": author.name,
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    Ok(PlannedReviewEvent {
+        action: "review.reply",
+        review_id: discussion.review_id,
+        details: format!("discussion_id={discussion_id}"),
+        actor_label: author.name,
+        refs: None,
+        write: ReviewWrite {
+            discussions: vec![discussion],
+            ..ReviewWrite::default()
+        },
+        answer: ToolCallResult::text(json),
+    })
 }
 
 pub const REVIEW_DISCUSS_RESOLVE_DESC: &str = "\
@@ -762,6 +857,13 @@ pub fn handle_review_discuss_resolve<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    apply_planned(plan_review_discuss_resolve(args, store)?, store)
+}
+
+fn plan_review_discuss_resolve<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<PlannedReviewTool> {
     use kin_model::review::ReviewDiscussionState;
 
     let discussion_id = parse_discussion_id(args, "discussion_id")?;
@@ -782,17 +884,35 @@ pub fn handle_review_discuss_resolve<G: GraphStore>(
     } else {
         ReviewDiscussionState::Open
     };
+    let mut discussion = existing_discussion(store, &discussion_id)?;
+    let review_id = discussion.review_id;
+    // A thread already in the asked-for state changes nothing, so nothing is
+    // written and no transaction is spent on it.
+    let write = if discussion.state == new_state {
+        ReviewWrite::default()
+    } else {
+        discussion.state = new_state;
+        ReviewWrite {
+            discussions: vec![discussion],
+            ..ReviewWrite::default()
+        }
+    };
 
-    store
-        .set_discussion_state(&discussion_id, new_state)
-        .map_err(|e| McpError::Other(e.to_string()))?;
-
+    let label = if resolved { "resolved" } else { "open" };
     let result = serde_json::json!({
         "discussion_id": discussion_id.to_string(),
-        "state": if resolved { "resolved" } else { "open" },
+        "state": label,
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    Ok(PlannedReviewEvent {
+        action: "review.resolve",
+        review_id,
+        details: format!("discussion_id={discussion_id}; state={label}"),
+        actor_label: "mcp-client".to_string(),
+        refs: None,
+        write,
+        answer: ToolCallResult::text(json),
+    })
 }
 
 pub const REVIEW_ASSIGN_DESC: &str = "\
@@ -805,27 +925,33 @@ pub fn handle_review_assign<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    apply_planned(plan_review_assign(args, store)?, store)
+}
+
+fn plan_review_assign<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<PlannedReviewTool> {
     use kin_model::review::ReviewAssignment;
     use kin_model::timestamp::Timestamp;
 
     let review_id = parse_review_id(args, "review_id")?;
     let reviewers = parse_reviewer_list(args)?;
     let assigner = parse_identity_arg(args, "assigned_by", "assigned_by_kind", "mcp-client");
+    existing_review(store, &review_id)?;
     let assigned_at = Timestamp::now();
 
-    for reviewer in &reviewers {
-        let assignment = ReviewAssignment {
-            review_id,
-            reviewer: kin_model::IdentityRef::human(reviewer.clone()),
-            assigned_at: assigned_at.clone(),
-            assigned_by: assigner.clone(),
-        };
+    let mut entries = store
+        .get_review_assignments(&review_id)
+        .map_err(|e| McpError::Other(e.to_string()))?;
+    entries.extend(reviewers.iter().map(|reviewer| ReviewAssignment {
+        review_id,
+        reviewer: kin_model::IdentityRef::human(reviewer.clone()),
+        assigned_at: assigned_at.clone(),
+        assigned_by: assigner.clone(),
+    }));
 
-        store
-            .assign_reviewer(&assignment)
-            .map_err(|e| McpError::Other(e.to_string()))?;
-    }
-
+    let details = format!("review_id={review_id}; reviewers={}", reviewers.join(","));
     let result = serde_json::json!({
         "review_id": review_id.to_string(),
         "reviewers": reviewers,
@@ -833,7 +959,18 @@ pub fn handle_review_assign<G: GraphStore>(
         "assigned": true,
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    Ok(PlannedReviewEvent {
+        action: "review.assign",
+        review_id,
+        details,
+        actor_label: assigner.name,
+        refs: None,
+        write: ReviewWrite {
+            assignments: Some(ReviewGroup { review_id, entries }),
+            ..ReviewWrite::default()
+        },
+        answer: ToolCallResult::text(json),
+    })
 }
 
 pub const REVIEW_UNASSIGN_DESC: &str = "\
@@ -845,12 +982,47 @@ pub fn handle_review_unassign<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    apply_planned(plan_review_unassign(args, store)?, store)
+}
+
+fn plan_review_unassign<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<PlannedReviewTool> {
     let review_id = parse_review_id(args, "review_id")?;
     let reviewer = get_string_param(args, "reviewer")?;
+    existing_review(store, &review_id)?;
 
-    store
-        .remove_reviewer(&review_id, &reviewer)
+    let live = store
+        .get_review_assignments(&review_id)
         .map_err(|e| McpError::Other(e.to_string()))?;
+    let remaining: Vec<_> = live
+        .iter()
+        .filter(|assignment| assignment.reviewer.name != reviewer)
+        .cloned()
+        .collect();
+    let write = if remaining.len() == live.len() {
+        // Not assigned, so there is nothing to remove.
+        ReviewWrite::default()
+    } else if remaining.is_empty() {
+        // A collaboration delta upserts a review's whole assignment set and
+        // refuses an empty one, so the last reviewer's removal has no durable
+        // form. Refused by name rather than applied to the live graph alone,
+        // where it would come back at the next restart.
+        return Err(McpError::InvalidParams(format!(
+            "cannot remove {reviewer}, the last reviewer of review {review_id}: repository \
+             authority cannot yet record a review with no reviewers, so assign another reviewer \
+             first"
+        )));
+    } else {
+        ReviewWrite {
+            assignments: Some(ReviewGroup {
+                review_id,
+                entries: remaining,
+            }),
+            ..ReviewWrite::default()
+        }
+    };
 
     let result = serde_json::json!({
         "review_id": review_id.to_string(),
@@ -858,7 +1030,104 @@ pub fn handle_review_unassign<G: GraphStore>(
         "unassigned": true,
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    Ok(PlannedReviewEvent {
+        action: "review.unassign",
+        review_id,
+        details: format!("review_id={review_id}; reviewer={reviewer}"),
+        actor_label: "mcp-client".to_string(),
+        refs: None,
+        write,
+        answer: ToolCallResult::text(json),
+    })
+}
+
+/// A review write tool planned as the records it writes and the answer it gives
+/// once they are written.
+pub type PlannedReviewTool = PlannedReviewEvent<ToolCallResult>;
+
+/// The review tools that write review state.
+pub const REVIEW_MUTATION_TOOLS: [&str; 8] = [
+    "kin_review_create",
+    "kin_review_decide",
+    "kin_review_note_add",
+    "kin_review_discuss",
+    "kin_review_discuss_reply",
+    "kin_review_discuss_resolve",
+    "kin_review_assign",
+    "kin_review_unassign",
+];
+
+/// Whether `tool` writes review state.
+pub fn is_review_mutation(tool: &str) -> bool {
+    REVIEW_MUTATION_TOOLS.contains(&tool)
+}
+
+/// Plan one review write tool against `store` without writing anything, or
+/// `None` when `tool` writes no review state.
+///
+/// A daemon commits the planned records to repository authority before its live
+/// graph sees them, so its dispatch calls this rather than the
+/// `handle_review_*` functions, which apply the same plan straight to a store.
+pub fn plan_review_mutation<G: GraphStore>(
+    tool: &str,
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Option<Result<PlannedReviewTool>> {
+    Some(match tool {
+        "kin_review_create" => plan_review_create(args, store),
+        "kin_review_decide" => plan_review_decide(args, store),
+        "kin_review_note_add" => plan_review_note_add(args, store),
+        "kin_review_discuss" => plan_review_discuss(args, store),
+        "kin_review_discuss_reply" => plan_review_discuss_reply(args, store),
+        "kin_review_discuss_resolve" => plan_review_discuss_resolve(args, store),
+        "kin_review_assign" => plan_review_assign(args, store),
+        "kin_review_unassign" => plan_review_unassign(args, store),
+        _ => return None,
+    })
+}
+
+/// Apply a planned review write straight to `store`, for a caller with no
+/// repository authority behind it.
+fn apply_planned<G: GraphStore>(planned: PlannedReviewTool, store: &G) -> Result<ToolCallResult> {
+    planned
+        .write
+        .apply_to(store)
+        .map_err(|error| McpError::Other(error.to_string()))?;
+    Ok(planned.answer)
+}
+
+fn existing_review<G: GraphStore>(
+    store: &G,
+    review_id: &kin_model::review::ReviewId,
+) -> Result<kin_model::review::Review> {
+    store
+        .get_review(review_id)
+        .map_err(|e| McpError::Other(e.to_string()))?
+        .ok_or_else(|| McpError::InvalidParams(format!("review not found: {review_id}")))
+}
+
+/// The discussion with `discussion_id`, found through the reviews that hold
+/// discussions, since the store answers discussions by review.
+fn existing_discussion<G: GraphStore>(
+    store: &G,
+    discussion_id: &kin_model::review::ReviewDiscussionId,
+) -> Result<kin_model::review::ReviewDiscussion> {
+    let reviews = store
+        .list_reviews(&kin_model::review::ReviewFilter::default())
+        .map_err(|e| McpError::Other(e.to_string()))?;
+    for review in reviews {
+        let found = store
+            .get_review_discussions(&review.review_id)
+            .map_err(|e| McpError::Other(e.to_string()))?
+            .into_iter()
+            .find(|discussion| discussion.discussion_id == *discussion_id);
+        if let Some(discussion) = found {
+            return Ok(discussion);
+        }
+    }
+    Err(McpError::InvalidParams(format!(
+        "review discussion not found: {discussion_id}"
+    )))
 }
 
 pub const REVIEW_LIST_DESC: &str = "\
@@ -1008,7 +1277,12 @@ fn parse_review_create_scopes(
         .collect()
 }
 
-fn parse_reviewer_list(args: &HashMap<String, serde_json::Value>) -> Result<Vec<String>> {
+/// Every reviewer the call names, deduplicated, possibly none.
+///
+/// `requested_reviewers` is the name the create tool's schema documents and
+/// `reviewers` the assign tool's; both are read so a caller following either
+/// schema is heard.
+fn parse_optional_reviewer_list(args: &HashMap<String, serde_json::Value>) -> Result<Vec<String>> {
     let mut reviewers = Vec::new();
 
     if let Some(reviewer) = get_optional_string_param(args, "reviewer") {
@@ -1018,21 +1292,27 @@ fn parse_reviewer_list(args: &HashMap<String, serde_json::Value>) -> Result<Vec<
         }
     }
 
-    if let Some(values) = args.get("reviewers").and_then(|value| value.as_array()) {
-        for value in values {
-            let reviewer = value.as_str().ok_or_else(|| {
-                McpError::InvalidParams("reviewers entries must be strings".into())
-            })?;
-            let trimmed = reviewer.trim();
-            if !trimmed.is_empty() {
-                reviewers.push(trimmed.to_string());
+    for key in ["reviewers", "requested_reviewers"] {
+        if let Some(values) = args.get(key).and_then(|value| value.as_array()) {
+            for value in values {
+                let reviewer = value.as_str().ok_or_else(|| {
+                    McpError::InvalidParams(format!("{key} entries must be strings"))
+                })?;
+                let trimmed = reviewer.trim();
+                if !trimmed.is_empty() {
+                    reviewers.push(trimmed.to_string());
+                }
             }
         }
     }
 
     reviewers.sort();
     reviewers.dedup();
+    Ok(reviewers)
+}
 
+fn parse_reviewer_list(args: &HashMap<String, serde_json::Value>) -> Result<Vec<String>> {
+    let reviewers = parse_optional_reviewer_list(args)?;
     if reviewers.is_empty() {
         return Err(McpError::InvalidParams(
             "missing reviewer assignment: provide reviewer or reviewers".into(),

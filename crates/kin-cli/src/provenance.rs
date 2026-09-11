@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use kin_model::provenance::{Actor, ActorId, ActorKind, AuditEvent, AuditEventId};
-use kin_model::{ExternalRef, GraphStore, Hash256, Timestamp, WorkScope};
+use kin_model::{ExternalRef, GraphStore, Hash256, IdentityRef, Timestamp, WorkScope};
 use sha2::{Digest, Sha256};
 
 pub fn ensure_cli_actor<G>(graph: &G) -> Result<ActorId>
@@ -45,7 +45,55 @@ where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    let actor_id = ensure_cli_actor(graph)?;
+    let (actor, event) =
+        plan_audit_event(graph, &current_actor_label(), action, target_scope, details)?;
+    if let Some(actor) = actor {
+        graph
+            .create_actor(&actor)
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    }
+    graph
+        .record_audit_event(&event)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    Ok(event.event_id)
+}
+
+/// The actor and audit event [`record_cli_audit_event`] writes, for `label`,
+/// without writing either.
+///
+/// A durable write commits these records to repository authority before any
+/// graph sees them, so it needs the records rather than the side effect. The
+/// actor is `Some` only when `graph` does not hold it yet.
+pub fn plan_audit_event<G>(
+    graph: &G,
+    label: &str,
+    action: &str,
+    target_scope: Option<WorkScope>,
+    details: Option<String>,
+) -> Result<(Option<Actor>, AuditEvent)>
+where
+    G: GraphStore,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let actor_id = actor_id_from_label(label);
+    let actor = if graph
+        .get_actor(&actor_id)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .is_none()
+    {
+        Some(Actor {
+            actor_id,
+            kind: actor_kind_from_label(label),
+            display_name: label.to_string(),
+            external_refs: vec![ExternalRef {
+                system: "local".into(),
+                identifier: label.to_string(),
+                url: None,
+            }],
+        })
+    } else {
+        None
+    };
     let event = AuditEvent {
         event_id: AuditEventId::new(),
         actor_id,
@@ -54,13 +102,19 @@ where
         timestamp: Timestamp::now(),
         details,
     };
-    graph
-        .record_audit_event(&event)
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    Ok(event.event_id)
+    Ok((actor, event))
 }
 
-pub(crate) fn current_actor_label() -> String {
+/// The identity a record names for `label`: a human when the label reads as
+/// one, an assistant otherwise.
+pub fn identity_for_label(label: &str) -> IdentityRef {
+    match actor_kind_from_label(label) {
+        ActorKind::Human => IdentityRef::human(label),
+        _ => IdentityRef::assistant(label),
+    }
+}
+
+pub fn current_actor_label() -> String {
     std::env::var("KIN_ACTOR")
         .ok()
         .filter(|value| !value.trim().is_empty())

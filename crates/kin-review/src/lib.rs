@@ -16,6 +16,7 @@ pub mod revert_history;
 pub mod review;
 pub mod risk;
 pub mod shadow;
+pub mod write;
 
 pub use change_shape::{
     classify_change_shape, evidence_note, gate_action_for, BodyShape, Branch, ChangeShape,
