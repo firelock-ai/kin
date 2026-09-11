@@ -315,6 +315,46 @@ pub struct LanguageReferenceCoverage {
 }
 
 impl LanguageReferenceCoverage {
+    /// The warning line for one language no language server can enrich, in a
+    /// sentence the output prints verbatim.
+    ///
+    /// Two things in the row decide what it may claim. First, whether the graph
+    /// holds any cross-file reference edge for the language. With none, those
+    /// edges are absent and the sentence says so. With some, resolved from
+    /// source or left by an earlier daemon whose server did run, it names the
+    /// count instead: on a 72-file Rust store an earlier daemon had enriched,
+    /// the coverage row counted 18125 cross-file edges and the warning under it
+    /// called them absent. Second, whether a server is installed at all. One
+    /// that is installed and did not start is not "no language server", so the
+    /// sentence says none can run rather than sending a reader to install what
+    /// they already have. Every form keeps the prefix `no language server for`
+    /// and the file count, which a reader's search and the acceptance grader
+    /// key on.
+    fn language_server_gap_warning(&self) -> String {
+        let files = format!(
+            "{} file{}",
+            self.files,
+            if self.files == 1 { "" } else { "s" }
+        );
+        let gap = match self.reference_enrichment {
+            ReferenceEnrichment::LanguageServerUnusable => {
+                format!("no language server for {} can run ({files})", self.language)
+            }
+            _ => format!("no language server for {} ({files})", self.language),
+        };
+        match self.cross_file_reference_edges {
+            0 => format!(
+                "{gap}; cross-file reference and override edges are absent for those files, so \
+                 this graph is incomplete rather than clean"
+            ),
+            held => format!(
+                "{gap}; the graph holds {held} cross-file reference edge{} for those files, and \
+                 no edge from a language server can be added or refreshed for them until one runs",
+                if held == 1 { "" } else { "s" }
+            ),
+        }
+    }
+
     /// Percent of parsed call sites that produced an edge, capped at 100.
     ///
     /// A call site can fan out to several same-named targets, so the raw ratio
@@ -552,8 +592,8 @@ impl ReferenceEdgeCoverage {
             .collect()
     }
 
-    /// The missing-language-server condition as a WARNING, carrying the count
-    /// of files it affects.
+    /// The missing-language-server condition as WARNINGS, one per language,
+    /// each carrying the count of files it affects.
     ///
     /// The same condition already appears as an indented detail under the
     /// coverage section, where a reader looking for whether the graph is
@@ -569,31 +609,24 @@ impl ReferenceEdgeCoverage {
     /// running one, and a warning that guessed would be wrong by an unknown
     /// amount on any repository unlike the one measured. `files` is a number the
     /// graph already holds.
-    pub fn missing_language_server_warning(&self) -> Option<String> {
-        let missing: Vec<&LanguageReferenceCoverage> = self
-            .languages
+    ///
+    /// One warning per language, because what each may claim depends on that
+    /// language's own row; `language_server_gap_warning` says how.
+    pub fn missing_language_server_warnings(&self) -> Vec<String> {
+        self.languages
             .iter()
             .filter(|language| language.reference_enrichment.is_actionable_gap())
-            .collect();
-        if missing.is_empty() {
-            return None;
-        }
-        let named: Vec<String> = missing
+            .map(LanguageReferenceCoverage::language_server_gap_warning)
+            .collect()
+    }
+
+    /// Languages in one language-server state, in row order.
+    fn languages_in_state(&self, state: ReferenceEnrichment) -> Vec<&str> {
+        self.languages
             .iter()
-            .map(|language| {
-                format!(
-                    "{} ({} file{})",
-                    language.language,
-                    language.files,
-                    if language.files == 1 { "" } else { "s" }
-                )
-            })
-            .collect();
-        Some(format!(
-            "no language server for {}; cross-file reference and override edges are absent for \
-             those files, so this graph is incomplete rather than clean",
-            named.join(", ")
-        ))
+            .filter(|language| language.reference_enrichment == state)
+            .map(|language| language.language.as_str())
+            .collect()
     }
 
     /// Whether any surface should present this as needing attention.
@@ -648,12 +681,23 @@ impl ReferenceEdgeCoverage {
             lines.push(format!("  {}", language_summary(language)));
         }
 
-        let missing = self.languages_missing_a_language_server();
-        if !missing.is_empty() {
+        // Split by state, because the repairs differ: an install for one, a
+        // broken install for the other. A server that was installed and did not
+        // start used to be reported here as "no language server found".
+        let not_installed = self.languages_in_state(ReferenceEnrichment::NoLanguageServer);
+        if !not_installed.is_empty() {
             lines.push(format!(
                 "  cross-file reference and override edges unavailable for {}: no language server \
                  found",
-                missing.join(", ")
+                not_installed.join(", ")
+            ));
+        }
+        let cannot_start = self.languages_in_state(ReferenceEnrichment::LanguageServerUnusable);
+        if !cannot_start.is_empty() {
+            lines.push(format!(
+                "  cross-file reference and override edges cannot be produced for {}: a language \
+                 server is installed but it did not start",
+                cannot_start.join(", ")
             ));
         }
         let unsupported: Vec<&str> = self
@@ -2229,6 +2273,120 @@ mod tests {
             resolution: ReferenceResolution::FullyResolved,
             reference_enrichment: enrichment,
         }
+    }
+
+    /// A server that is installed and did not start, over a graph that still
+    /// holds cross-file edges, is reported as exactly that.
+    ///
+    /// The measured case: a 72-file Rust store an earlier daemon had enriched,
+    /// and a later daemon that could not start rust-analyzer. The coverage row
+    /// counted 18125 cross-file edges, and the two lines under it said no
+    /// language server was found and that those edges were absent.
+    #[test]
+    fn a_server_that_did_not_start_over_held_edges_is_not_called_missing() {
+        let mut rust = language_row("rust", ReferenceEnrichment::LanguageServerUnusable);
+        rust.files = 72;
+        rust.cross_file_reference_edges = 18125;
+        let coverage = ReferenceEdgeCoverage {
+            parse: None,
+            languages: vec![language_row("python", ReferenceEnrichment::Available), rust],
+            totals: None,
+        };
+
+        let warnings = coverage.missing_language_server_warnings();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the language no server can serve warns: {warnings:?}"
+        );
+        assert!(
+            warnings[0].starts_with("no language server for rust can run (72 files); "),
+            "an installed server that did not start is not a missing one: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("the graph holds 18125 cross-file reference edges"),
+            "{}",
+            warnings[0]
+        );
+        assert!(!warnings[0].contains("are absent"), "{}", warnings[0]);
+
+        let rendered = coverage.summary_lines().join("\n");
+        assert!(
+            rendered.contains(
+                "cross-file reference and override edges cannot be produced for rust: a \
+                 language server is installed but it did not start"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("no language server found"), "{rendered}");
+    }
+
+    /// No server and no cross-file edge keeps the sentence it always had, word
+    /// for word, because there it is true.
+    #[test]
+    fn a_missing_server_over_no_cross_file_edge_keeps_its_sentence() {
+        let mut python = language_row("python", ReferenceEnrichment::NoLanguageServer);
+        python.files = 5;
+        python.cross_file_reference_edges = 0;
+        let coverage = ReferenceEdgeCoverage {
+            parse: None,
+            languages: vec![python],
+            totals: None,
+        };
+
+        assert_eq!(
+            coverage.missing_language_server_warnings(),
+            vec![
+                "no language server for python (5 files); cross-file reference and override \
+                 edges are absent for those files, so this graph is incomplete rather than clean"
+                    .to_string()
+            ]
+        );
+        assert!(
+            coverage
+                .summary_lines()
+                .join("\n")
+                .contains("unavailable for python: no language server found"),
+            "the line that identifies a graph with no server stays"
+        );
+    }
+
+    /// No server, and cross-file edges resolved from source: the shape of the
+    /// acceptance grader's no-server sample, which carries 11. The warning keeps
+    /// what that grader keys on, the prefix and the file count, and names the
+    /// edges rather than calling them absent.
+    #[test]
+    fn a_missing_server_over_source_resolved_edges_names_them() {
+        let mut python = language_row("python", ReferenceEnrichment::NoLanguageServer);
+        python.files = 5;
+        python.cross_file_reference_edges = 11;
+        let coverage = ReferenceEdgeCoverage {
+            parse: None,
+            languages: vec![python],
+            totals: None,
+        };
+
+        let warnings = coverage.missing_language_server_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("no language server for python (5 files); "),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("the graph holds 11 cross-file reference edges"),
+            "{}",
+            warnings[0]
+        );
+        assert!(!warnings[0].contains("are absent"), "{}", warnings[0]);
+        assert!(
+            coverage
+                .summary_lines()
+                .join("\n")
+                .contains("unavailable for python: no language server found"),
+            "the no-server arm keeps the line that identifies it"
+        );
     }
 
     /// Fan-out can put more edges on the numerator than the denominator ever

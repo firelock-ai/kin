@@ -1101,12 +1101,11 @@ fn build_graph_status_response_for_store(
     // kind absent. So it belongs on the warning line, carrying the affected file
     // count the coverage line already computes rather than any estimate of what
     // a server would have found (FIR-2777).
-    if let Some(missing) = health
-        .reference_edge_coverage
-        .missing_language_server_warning()
-    {
-        warnings.push(missing);
-    }
+    warnings.extend(
+        health
+            .reference_edge_coverage
+            .missing_language_server_warnings(),
+    );
     let criticals = health.critical_issues.clone();
     let all_relation_count = health
         .semantic_relation_count
