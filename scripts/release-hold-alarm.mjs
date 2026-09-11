@@ -121,7 +121,7 @@ function describeFailedRelease(marker) {
 // cause was reachable in two API calls that nothing told them to make.
 export const STAGED_REASON = "tag_staged";
 
-export function buildBody(marker, consecutive, threshold) {
+export function buildBody(marker, consecutive, threshold, cutState) {
   const drift = marker.drift;
   const blocking = marker.blocking_tag || "an unresolved tag";
   const latest = marker.latest_tag || "an unread Latest";
@@ -184,12 +184,28 @@ export function buildBody(marker, consecutive, threshold) {
     );
     lines.push("```");
     lines.push("");
-    lines.push(
-      "`disabled_manually` is the whole answer: no candidate can exist until " +
-        "that workflow is enabled. Enabling it opens a window in which the " +
-        "cut proves whatever is newest and green, so it is a decision to take " +
-        "deliberately rather than an automatic repair.",
-    );
+    // This paragraph used to assert `disabled_manually` outright, which made
+    // the issue state a diagnosis nothing had measured: kin#1750 told a reader
+    // the cut was switched off while the API read it `active`. The job now
+    // reads that state before deciding, so the body reports what it read.
+    const readState = cutState || "unreadable";
+    if (readState === "disabled_manually" || readState === "disabled_inactivity") {
+      lines.push(
+        `This alarm read that workflow's state as \`${readState}\`, and that is ` +
+          "the whole answer: no candidate can exist until it is enabled. " +
+          "Enabling it opens a window in which the cut proves whatever is " +
+          "newest and green, so it is a decision to take deliberately rather " +
+          "than an automatic repair.",
+      );
+    } else {
+      lines.push(
+        `This alarm read that workflow's state as \`${readState}\`, so a switch ` +
+          "that is off is not the answer here, and the two commands above are " +
+          "where to start instead. A staged hold never reaches this body while " +
+          "that state reads `active`, so either the read failed or the cut " +
+          "changed state between the read and now.",
+      );
+    }
   } else {
     lines.push(describeFailedRelease(marker));
     lines.push("");
@@ -300,7 +316,7 @@ export function decide({ markers, issue, threshold = DEFAULT_THRESHOLD, cutState
     };
   }
 
-  const body = buildBody(newest, consecutive, threshold);
+  const body = buildBody(newest, consecutive, threshold, cutState);
   if (open) {
     return {
       action: "update",

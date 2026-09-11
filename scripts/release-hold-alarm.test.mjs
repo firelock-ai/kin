@@ -431,3 +431,16 @@ test('a staged hold leaves an open alarm exactly where it is', () => {
   assert.equal(decision.action, 'quiet');
   assert.equal(decision.reason, 'staged_in_progress');
 });
+
+test('the staged body reports the cut state that was read, not an assumed one', () => {
+  // kin#1750 told a reader the cut was disabled_manually while the API read it
+  // active. The body states what the job measured.
+  const off = decide({ markers: V0715_STAGED_SEQUENCE, issue: null, cutState: 'disabled_manually' });
+  assert.match(off.body, /read that workflow's state as `disabled_manually`, and that is/);
+  assert.match(off.body, /no candidate can exist until it is enabled/);
+
+  const unknown = decide({ markers: V0715_STAGED_SEQUENCE, issue: null, cutState: null });
+  assert.match(unknown.body, /read that workflow's state as `unreadable`/);
+  assert.match(unknown.body, /a switch that is off is not the answer here/);
+  assert.doesNotMatch(unknown.body, /`disabled_manually`, and that is the whole answer/);
+});
