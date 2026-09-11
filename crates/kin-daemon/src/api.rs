@@ -49300,6 +49300,105 @@ mod tests {
         (sorted_lines(&list.text), sorted_lines(&show.text), record)
     }
 
+    /// A reviewer removed through MCP is still removed after a restart, and a
+    /// review's last reviewer can be removed at all.
+    ///
+    /// A removal is an audit event rather than a smaller assignment set: the set
+    /// is an add log, and a collaboration delta refuses an empty one. So this is
+    /// the test that the event is what a reopened daemon reads, and that the
+    /// reviewers it answers with are derived from the two.
+    ///
+    /// Falsify by dropping `review.unassign` from `records_audit_event`: nothing
+    /// records the removal, the reopened daemon answers with the reviewer again,
+    /// and the assertion after the restart goes red.
+    #[tokio::test]
+    async fn a_removed_reviewer_stays_removed_after_a_restart() {
+        use std::sync::atomic::Ordering;
+
+        let initial = test_state();
+        let layout = initial.layout.clone();
+        drop(initial);
+        let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        state.is_initialized.store(true, Ordering::Relaxed);
+
+        let created = review_call(
+            &state,
+            serde_json::json!({
+                "op": "create",
+                "title": "Reviewers move",
+                "base": "main",
+                "head": "HEAD",
+                "description": "assigned, then one taken off",
+            }),
+        )
+        .await;
+        let review_id = created
+            .text
+            .lines()
+            .find_map(|line| line.strip_prefix("Created review "))
+            .expect("the create answer names the review")
+            .trim()
+            .to_string();
+        for reviewer in ["bob", "alice"] {
+            review_call(
+                &state,
+                serde_json::json!({ "op": "assign", "review_id": review_id, "reviewer": reviewer }),
+            )
+            .await;
+        }
+        let removed = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_review_unassign",
+            serde_json::json!({ "review_id": review_id, "reviewer": "bob" }),
+        )
+        .await;
+        assert_ne!(
+            removed.is_error,
+            Some(true),
+            "{}",
+            mcp_result_text(&removed)
+        );
+
+        let before = review_surfaces(&state, &review_id).await;
+        drop(state);
+        let reopened = Arc::new(DaemonState::open(layout).unwrap());
+        reopened.is_initialized.store(true, Ordering::Relaxed);
+        let after = review_surfaces(&reopened, &review_id).await;
+        assert_eq!(
+            after, before,
+            "every review surface must answer the same after a restart"
+        );
+        let reviewers = after.2.to_string();
+        assert!(
+            reviewers.contains("alice"),
+            "the reviewer who stayed is still one: {reviewers}"
+        );
+        assert!(
+            !reviewers.contains("bob"),
+            "a removed reviewer is not one after a restart: {reviewers}"
+        );
+
+        // And the last reviewer can go too, which a set that had to stay
+        // non-empty could never express.
+        let last = mcp_call(
+            router(Arc::clone(&reopened)),
+            "kin_review_unassign",
+            serde_json::json!({ "review_id": review_id, "reviewer": "alice" }),
+        )
+        .await;
+        assert_ne!(
+            last.is_error,
+            Some(true),
+            "removing a review's last reviewer must be allowed now: {}",
+            mcp_result_text(&last)
+        );
+        let emptied = review_surfaces(&reopened, &review_id).await.2.to_string();
+        assert!(
+            !emptied.contains("alice"),
+            "the last reviewer came off: {emptied}"
+        );
+    }
+
     /// A review, its decision, notes, discussion, reply, resolution and
     /// assignments answer the same on every surface after the daemon restarts on
     /// the same store, whether they were written through `POST /review` or MCP.

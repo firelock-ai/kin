@@ -1035,17 +1035,26 @@ fn plan_assign(
     let rid = parse_review_id(&review_id)?;
     existing_review(graph, rid)?;
     let (actor_label, identity) = acting_as(actor);
+    // The stored set, which is an add log: it only grows, a removal is recorded
+    // as its own event, and a review's reviewers are derived from the two. So
+    // appending here never re-assigns anyone a removal took off, and it never
+    // drops an assignment this replica has not seen removed.
     let mut entries = graph.get_review_assignments(&rid)?;
-    entries.push(ReviewAssignment {
+    let assignment = ReviewAssignment {
         review_id: rid,
         reviewer: kin_model::IdentityRef::human(&reviewer),
         assigned_at: Timestamp::now(),
         assigned_by: identity,
-    });
+    };
+    let assigned = kin_review::assignments::AssignmentTag::of(&assignment);
+    entries.push(assignment);
     Ok(PlannedReviewEvent {
-        action: "review.assign",
+        action: kin_review::assignments::ASSIGN_ACTION,
         review_id: rid,
-        details: format!("review_id={review_id}; reviewer={reviewer}"),
+        details: format!(
+            "review_id={review_id}; reviewer={reviewer}; {}",
+            kin_review::assignments::tag_details(&[assigned])
+        ),
         actor_label,
         refs: None,
         answer: ReviewResponse {
