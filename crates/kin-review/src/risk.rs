@@ -174,21 +174,41 @@ fn removed_entity_dependents(
     (listed, total)
 }
 
-/// Assess risk given a diff and its impact report.
+/// Which list of a [`RiskSummary`] one per-change finding belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindingClass {
+    Breaking,
+    CoverageGap,
+    ContractViolation,
+    Note,
+}
+
+/// One finding the per-change rules raised, with the entity it was raised on.
 ///
-/// Returns a `RiskSummary` (from kin-model) with:
-/// - breaking changes (contract/signature changes with consumers)
-/// - test coverage gaps (modified entities with no test coverage)
-/// - contract violations
-/// - overall risk level
-pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
-    let mut breaking_changes = Vec::new();
-    let mut test_coverage_gaps = Vec::new();
-    let mut contract_violations = Vec::new();
-    let mut notes = Vec::new();
+/// The entity travels with the finding so one rule pass feeds both the
+/// diff-wide summary and each entity's own level. Two passes, one per
+/// consumer, would be two copies of every rule, and the day one copy moved
+/// the other would go on reporting the old rule with nothing to notice.
+struct ChangeFinding {
+    entity_id: EntityId,
+    class: FindingClass,
+    message: String,
+}
+
+/// Run the per-change rules over every entity change, in diff order.
+///
+/// Within each class the findings keep the order the rules emit them in,
+/// which is the order [`assess_risk`] has always reported, so splitting them
+/// back out by class reproduces its lists exactly.
+fn change_findings(diff: &SemanticDiff, impact: &ImpactReport) -> Vec<ChangeFinding> {
+    let mut findings = Vec::new();
 
     // Check for signature changes on entities with consumers/callers
     for change in &diff.entity_changes {
+        let mut breaking_changes = Vec::new();
+        let mut test_coverage_gaps = Vec::new();
+        let mut contract_violations = Vec::new();
+        let mut notes = Vec::new();
         match &change.kind {
             EntityChangeKind::Modified { old, new } => {
                 // Signature changed?
@@ -301,6 +321,41 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
                 }
             }
         }
+        for (class, messages) in [
+            (FindingClass::Breaking, breaking_changes),
+            (FindingClass::CoverageGap, test_coverage_gaps),
+            (FindingClass::ContractViolation, contract_violations),
+            (FindingClass::Note, notes),
+        ] {
+            findings.extend(messages.into_iter().map(|message| ChangeFinding {
+                entity_id: change.entity_id,
+                class,
+                message,
+            }));
+        }
+    }
+    findings
+}
+
+/// Assess risk given a diff and its impact report.
+///
+/// Returns a `RiskSummary` (from kin-model) with:
+/// - breaking changes (contract/signature changes with consumers)
+/// - test coverage gaps (modified entities with no test coverage)
+/// - contract violations
+/// - overall risk level
+pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
+    let mut breaking_changes = Vec::new();
+    let mut test_coverage_gaps = Vec::new();
+    let mut contract_violations = Vec::new();
+    let mut notes = Vec::new();
+    for finding in change_findings(diff, impact) {
+        match finding.class {
+            FindingClass::Breaking => breaking_changes.push(finding.message),
+            FindingClass::CoverageGap => test_coverage_gaps.push(finding.message),
+            FindingClass::ContractViolation => contract_violations.push(finding.message),
+            FindingClass::Note => notes.push(finding.message),
+        }
     }
 
     // Removed relations that break contracts
@@ -358,13 +413,14 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
         }
     }
 
-    let overall_risk = compute_risk_level(
-        &breaking_changes,
-        &test_coverage_gaps,
-        &contract_violations,
-        &work_risks,
-        impact,
-    );
+    let overall_risk = level_for(&RiskEvidence {
+        contract_violation: !contract_violations.is_empty(),
+        breaking: !breaking_changes.is_empty(),
+        coverage_gap: !test_coverage_gaps.is_empty(),
+        blast_radius: impact.total_affected(),
+        work_risk: !work_risks.is_empty(),
+        unreviewed_agent_change: !impact.unreviewed_agent_changes.is_empty(),
+    });
 
     RiskSummary {
         overall_risk,
@@ -376,40 +432,90 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
     }
 }
 
-fn compute_risk_level(
-    breaking_changes: &[String],
-    test_coverage_gaps: &[String],
-    contract_violations: &[String],
-    work_risks: &[String],
-    impact: &ImpactReport,
-) -> RiskLevel {
-    if !contract_violations.is_empty() {
+/// The evidence a risk level is read from, for the whole diff or one entity.
+#[derive(Debug, Clone, Copy, Default)]
+struct RiskEvidence {
+    contract_violation: bool,
+    breaking: bool,
+    coverage_gap: bool,
+    /// Entities the change reaches. Diff-wide only: no single entity owns it.
+    blast_radius: usize,
+    /// In-progress work on changed code. Diff-wide only, for the same reason.
+    work_risk: bool,
+    unreviewed_agent_change: bool,
+}
+
+/// The one precedence every risk level is read through.
+fn level_for(evidence: &RiskEvidence) -> RiskLevel {
+    if evidence.contract_violation {
         return RiskLevel::Critical;
     }
 
-    if !breaking_changes.is_empty() {
+    if evidence.breaking {
         return RiskLevel::High;
     }
 
-    if !test_coverage_gaps.is_empty() && impact.total_affected() > 5 {
+    if evidence.coverage_gap && evidence.blast_radius > 5 {
         return RiskLevel::High;
     }
 
-    if !test_coverage_gaps.is_empty() || impact.total_affected() > 3 {
+    if evidence.coverage_gap || evidence.blast_radius > 3 {
         return RiskLevel::Medium;
     }
 
     // In-progress work items on changed code is at least Medium risk.
-    if !work_risks.is_empty() {
+    if evidence.work_risk {
         return RiskLevel::Medium;
     }
 
     // Unreviewed agent changes bump risk to at least Medium.
-    if !impact.unreviewed_agent_changes.is_empty() {
+    if evidence.unreviewed_agent_change {
         return RiskLevel::Medium;
     }
 
     RiskLevel::Low
+}
+
+/// Each changed entity's risk level, read from that entity's own findings.
+///
+/// The findings are the ones [`assess_risk`] reports, from the same rule pass,
+/// and the level comes through the same precedence, so the two cannot disagree
+/// about what a finding is worth. What is left out is what no single entity
+/// owns: the diff's total blast radius and the work items it touches describe
+/// the whole range and stay in [`RiskSummary::overall_risk`]. Every input here
+/// is at most its diff-wide counterpart and the precedence only rises with its
+/// inputs, so no entity's level can exceed the overall level. An unreviewed
+/// agent change is attributed, because the impact report names the entity.
+///
+/// Every entity the diff changes has an entry, a `Low` one included, so an
+/// absent entry means an entity this diff never changed.
+pub fn entity_risk_levels(
+    diff: &SemanticDiff,
+    impact: &ImpactReport,
+) -> BTreeMap<EntityId, RiskLevel> {
+    let mut evidence: BTreeMap<EntityId, RiskEvidence> = diff
+        .entity_changes
+        .iter()
+        .map(|change| (change.entity_id, RiskEvidence::default()))
+        .collect();
+    for finding in change_findings(diff, impact) {
+        let entry = evidence.entry(finding.entity_id).or_default();
+        match finding.class {
+            FindingClass::ContractViolation => entry.contract_violation = true,
+            FindingClass::Breaking => entry.breaking = true,
+            FindingClass::CoverageGap => entry.coverage_gap = true,
+            FindingClass::Note => {}
+        }
+    }
+    for entity_id in &impact.unreviewed_agent_changes {
+        if let Some(entry) = evidence.get_mut(entity_id) {
+            entry.unreviewed_agent_change = true;
+        }
+    }
+    evidence
+        .into_iter()
+        .map(|(entity_id, evidence)| (entity_id, level_for(&evidence)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -601,6 +707,147 @@ mod tests {
                 .any(|finding| finding.contains("json")),
             "one stranded external consumer is still a breaking removal: {:?}",
             summary.breaking_changes
+        );
+    }
+
+    fn ranked(level: RiskLevel) -> u8 {
+        match level {
+            RiskLevel::Low => 0,
+            RiskLevel::Medium => 1,
+            RiskLevel::High => 2,
+            RiskLevel::Critical => 3,
+        }
+    }
+
+    fn modification_of(old: &Entity, new: &Entity) -> EntityChange {
+        EntityChange {
+            entity_id: old.id,
+            kind: EntityChangeKind::Modified {
+                old: old.clone(),
+                new: new.clone(),
+            },
+        }
+    }
+
+    /// Each entity's level reads its own findings, and none outranks the diff.
+    ///
+    /// Five entities, one per outcome, in one diff. A level read off the
+    /// diff-wide lists would rank all five critical, because one of them is a
+    /// contract violation; a level that ignored findings would rank all five
+    /// low. Only per-entity attribution gets every one right.
+    #[test]
+    fn each_entity_is_ranked_on_its_own_findings_and_none_outranks_the_diff() {
+        let mut contract_old = test_entity("create_order");
+        contract_old.kind = EntityKind::ApiEndpoint;
+        let mut contract_new = contract_old.clone();
+        contract_new.doc_summary = Some("now paginated".to_string());
+        let signature_old = test_entity("parse_config");
+        let mut signature_new = signature_old.clone();
+        signature_new.signature = "fn parse_config(strict: bool)".to_string();
+        let gap_old = test_entity("render_row");
+        let mut gap_new = gap_old.clone();
+        gap_new.doc_summary = Some("renders one row".to_string());
+        let covered_old = test_entity("format_date");
+        let mut covered_new = covered_old.clone();
+        covered_new.doc_summary = Some("formats a date".to_string());
+        let mut added = test_entity("helper");
+        added.visibility = Visibility::Private;
+
+        let diff = SemanticDiff {
+            entity_changes: vec![
+                modification_of(&contract_old, &contract_new),
+                modification_of(&signature_old, &signature_new),
+                modification_of(&gap_old, &gap_new),
+                modification_of(&covered_old, &covered_new),
+                EntityChange {
+                    entity_id: added.id,
+                    kind: EntityChangeKind::Added(added.clone()),
+                },
+            ],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            entity_impacts: vec![
+                entity_impact_counts(contract_old.id, 0, 2, 1),
+                entity_impact_counts(signature_old.id, 3, 0, 1),
+                entity_impact_counts(gap_old.id, 0, 0, 0),
+                entity_impact_counts(covered_old.id, 0, 0, 2),
+                entity_impact_counts(added.id, 0, 0, 0),
+            ],
+            ..Default::default()
+        };
+
+        let levels = entity_risk_levels(&diff, &impact);
+        let overall = assess_risk(&diff, &impact).overall_risk;
+        assert_eq!(levels[&contract_old.id], RiskLevel::Critical);
+        assert_eq!(levels[&signature_old.id], RiskLevel::High);
+        assert_eq!(levels[&gap_old.id], RiskLevel::Medium);
+        assert_eq!(levels[&covered_old.id], RiskLevel::Low);
+        assert_eq!(levels[&added.id], RiskLevel::Low);
+        assert_eq!(
+            levels.len(),
+            diff.entity_changes.len(),
+            "every changed entity is ranked, a low one included"
+        );
+        assert_eq!(overall, RiskLevel::Critical);
+        for (entity_id, level) in &levels {
+            assert!(
+                ranked(*level) <= ranked(overall),
+                "{entity_id} ranked {level:?} above the diff's {overall:?}"
+            );
+        }
+    }
+
+    /// The diff-wide terms raise the overall level and no single entity.
+    ///
+    /// One entity with a coverage gap, in a diff whose total blast radius is
+    /// six. The overall level escalates to high on that total; the entity keeps
+    /// the medium its own finding earns, because six affected entities describe
+    /// the range and not this one. An unreviewed agent change is the other
+    /// case: the impact report names the entity, so it is attributed.
+    #[test]
+    fn diff_wide_terms_raise_the_overall_level_without_raising_an_entity() {
+        let gap_old = test_entity("render_row");
+        let mut gap_new = gap_old.clone();
+        gap_new.doc_summary = Some("renders one row".to_string());
+        let quiet_old = test_entity("format_date");
+        let mut quiet_new = quiet_old.clone();
+        quiet_new.doc_summary = Some("formats a date".to_string());
+        let diff = SemanticDiff {
+            entity_changes: vec![
+                modification_of(&gap_old, &gap_new),
+                modification_of(&quiet_old, &quiet_new),
+            ],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            affected_callers: (0..6)
+                .map(|n| test_entity(&format!("caller_{n}")))
+                .collect(),
+            entity_impacts: vec![
+                entity_impact_counts(gap_old.id, 0, 0, 0),
+                entity_impact_counts(quiet_old.id, 0, 0, 3),
+            ],
+            unreviewed_agent_changes: vec![quiet_old.id],
+            ..Default::default()
+        };
+        assert!(
+            impact.total_affected() > 5,
+            "the fixture must cross the diff-wide escalation"
+        );
+
+        let overall = assess_risk(&diff, &impact).overall_risk;
+        let levels = entity_risk_levels(&diff, &impact);
+        assert_eq!(overall, RiskLevel::High);
+        assert_eq!(
+            levels[&gap_old.id],
+            RiskLevel::Medium,
+            "six affected entities belong to the range, not to this entity"
+        );
+        assert_eq!(
+            levels[&quiet_old.id],
+            RiskLevel::Medium,
+            "an unreviewed agent change names its entity, so it is attributed"
         );
     }
 

@@ -9,6 +9,7 @@ pub mod gate;
 pub mod impact;
 pub mod inline;
 pub mod ranked_impact;
+pub mod records;
 pub mod ref_graph;
 pub mod release_gate;
 pub mod revert_history;
@@ -47,8 +48,8 @@ pub use release_gate::{
     source_bound_release_proof_coverage_for_entities, unapproved_changes, CoverageProvenance,
     SecurityFinding, SecurityFindingCounts, SecuritySeverity, UnapprovedChange,
 };
-pub use review::{Review, SemanticReview};
-pub use risk::assess_risk;
+pub use review::{RangeReview, Review, SemanticReview};
+pub use risk::{assess_risk, entity_risk_levels};
 pub use shadow::{
     build_shadow_report, build_shadow_report_at, build_shadow_report_base_off_ancestry,
     derive_shadow_policy, format_shadow_report, ShadowArtifactActivity, ShadowArtifactAspect,

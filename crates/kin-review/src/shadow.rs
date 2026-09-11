@@ -465,7 +465,7 @@ pub fn build_shadow_report_at<G: GraphStore>(
 /// a consumer that let go of the removed surface in the same change is not a
 /// broken contract. Removed ids are iterated in sorted order and the impacts
 /// are re-sorted by id, so the overlay is replay-deterministic.
-fn overlay_removed_entity_impact_from_base<G: GraphStore>(
+pub(crate) fn overlay_removed_entity_impact_from_base<G: GraphStore>(
     review: &mut Review,
     at_base: &GraphAtRef<'_, G>,
 ) -> Result<(), ReviewError> {

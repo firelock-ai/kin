@@ -1016,6 +1016,64 @@ test('the graph feed shape is one contract the Rust, the schema and the declarat
   }
 });
 
+test('a semantic diff risk level is one the daemon emits, critical and not_assessed included', async () => {
+  const [declarations, reviewSource] = await Promise.all([
+    fs.readFile(path.join(packageRoot, 'src/index.d.ts'), 'utf8'),
+    fs.readFile(path.join(repositoryRoot, 'crates/kin-daemon/src/repo_review.rs'), 'utf8')
+  ]);
+
+  // The daemon's spelling of every level, read from the one function that
+  // writes it onto the wire, so a level added there cannot go undeclared here.
+  const labelFunction = reviewSource.match(
+    /pub fn risk_label\(level: RiskLevel\) -> &'static str \{([\s\S]*?)\n\}/
+  );
+  assert.ok(labelFunction, 'the Rust risk label authority must remain readable');
+  const levels = [...labelFunction[1].matchAll(/RiskLevel::\w+ => "([a-z]+)"/g)].map(
+    (match) => match[1]
+  );
+  assert.deepEqual([...levels].sort(), ['critical', 'high', 'low', 'medium']);
+  // And the one word a field carries instead of a level when risk was not
+  // assessed, so a page says so rather than showing a default.
+  const notAssessed = reviewSource.match(/pub const RISK_NOT_ASSESSED: &str = "([a-z_]+)";/);
+  assert.ok(notAssessed, 'the Rust not-assessed spelling must remain readable');
+  const emitted = [...levels, notAssessed[1]].sort();
+  assert.deepEqual(emitted, ['critical', 'high', 'low', 'medium', 'not_assessed']);
+
+  // A union that drops a level makes a renderer flatten it into a neighbour,
+  // and the one it would lose first is the most severe.
+  for (const name of ['SemanticDiffEntity', 'EntityChange']) {
+    const body = declarations.match(new RegExp(`export interface ${name} \\{([\\s\\S]*?)\\n\\}`));
+    assert.ok(body, `${name} must be declared in index.d.ts`);
+    const union = body[1].match(/riskLevel: ([^;]+);/);
+    assert.ok(union, `${name} must declare riskLevel`);
+    const declared = [...union[1].matchAll(/"([a-z_]+)"/g)].map((match) => match[1]).sort();
+    assert.deepEqual(
+      declared,
+      emitted,
+      `${name}.riskLevel must carry every level the daemon emits`
+    );
+  }
+
+  // A hosted list row carries no assessed risk and no computed count, so the
+  // queue item's risk can say not_assessed and its count can be null. A client
+  // takes an assessed review's risk from the semantic diff, whose overall_risk
+  // can be critical, so the queue item carries every level the daemon emits.
+  const reviewRisk = declarations.match(/export type ReviewRisk = ([^;]+);/);
+  assert.ok(reviewRisk, 'ReviewRisk must be declared in index.d.ts');
+  assert.deepEqual(
+    [...reviewRisk[1].matchAll(/"([a-z_]+)"/g)].map((match) => match[1]).sort(),
+    emitted,
+    'ReviewRisk must carry every level the daemon emits, critical and not_assessed included'
+  );
+  const queueItem = declarations.match(/export interface ReviewQueueItem \{([\s\S]*?)\n\}/);
+  assert.ok(queueItem, 'ReviewQueueItem must be declared in index.d.ts');
+  assert.match(
+    queueItem[1],
+    /\n {2}changedEntities: number \| null;/,
+    'a list row that computed no count must be able to say so'
+  );
+});
+
 test('the pass boundary says what the whole reconcile did', async () => {
   // A renderer lays out on this frame, not on each of the 26 entity events one
   // appended function produces, so it has to say how much to apply.

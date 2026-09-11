@@ -871,37 +871,26 @@ pub fn handle_review_list<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
-    use kin_model::review::ReviewFilter;
-
     let state = get_optional_string_param(args, "state");
     let state_filter = state
         .as_deref()
         .map(parse_review_decision_state)
         .transpose()?;
 
-    let filter = ReviewFilter {
-        states: state_filter.map(|s| vec![s]),
-        reviewer: None,
-    };
-
-    let reviews = store
-        .list_reviews(&filter)
+    // The shared read, so this tool, `kin review list` and the daemon's
+    // repo-scoped listing cannot drift apart on what a review row is.
+    let reviews = kin_review::records::list_stored_reviews(store, state_filter)
         .map_err(|e| McpError::Other(e.to_string()))?;
-
-    let result: Vec<_> = reviews
+    let result: Vec<kin_review::records::ReviewSummaryView> = reviews
         .iter()
-        .map(|r| {
-            serde_json::json!({
-                "review_id": r.review_id.to_string(),
-                "title": r.title,
-                "state": format!("{:?}", r.state).to_lowercase(),
-                "base_ref": r.base_ref,
-                "head_ref": r.head_ref,
-            })
-        })
+        .map(kin_review::records::ReviewSummaryView::from)
         .collect();
 
-    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    // Printed through a `Value`, as the `json!` rows this replaced were, so
+    // the key order is the one serde_json's `preserve_order` feature gives
+    // `json!` in whichever build this is, and the text stays what it was.
+    let value = serde_json::to_value(&result).map_err(McpError::Json)?;
+    let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
 
@@ -917,60 +906,16 @@ pub fn handle_review_get<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let review_id = parse_review_id(args, "review_id")?;
 
-    let review = store
-        .get_review(&review_id)
+    // The shared read and its JSON view, the same object the daemon's
+    // repo-scoped review route answers, so a client maps one shape.
+    let record = kin_review::records::read_review_record(store, &review_id)
         .map_err(|e| McpError::Other(e.to_string()))?
         .ok_or_else(|| McpError::InvalidParams(format!("review not found: {}", review_id)))?;
+    let result = kin_review::records::ReviewRecordView::from(&record);
 
-    let decisions = store
-        .get_review_decisions(&review_id)
-        .map_err(|e| McpError::Other(e.to_string()))?;
-
-    let notes = store
-        .get_review_notes(&review_id)
-        .map_err(|e| McpError::Other(e.to_string()))?;
-
-    let discussions = store
-        .get_review_discussions(&review_id)
-        .map_err(|e| McpError::Other(e.to_string()))?;
-
-    let assignments = store
-        .get_review_assignments(&review_id)
-        .map_err(|e| McpError::Other(e.to_string()))?;
-
-    let result = serde_json::json!({
-        "review_id": review.review_id.to_string(),
-        "title": review.title,
-        "state": format!("{:?}", review.state).to_lowercase(),
-        "base_ref": review.base_ref,
-        "head_ref": review.head_ref,
-        "scopes": review.scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        "decisions": decisions.iter().map(|d| serde_json::json!({
-            "state": format!("{:?}", d.state).to_lowercase(),
-            "comment": d.comment,
-            "reviewer": d.reviewer.name,
-        })).collect::<Vec<_>>(),
-        "notes": notes.iter().map(|n| serde_json::json!({
-            "note_id": n.note_id.to_string(),
-            "body": n.body,
-            "scope": n.scope.as_ref().map(|s| s.to_string()),
-            "author": n.authored_by.name,
-        })).collect::<Vec<_>>(),
-        "discussions": discussions.iter().map(|d| serde_json::json!({
-            "discussion_id": d.discussion_id.to_string(),
-            "state": format!("{:?}", d.state).to_lowercase(),
-            "scope": d.scope.as_ref().map(|s| s.to_string()),
-            "comments": d.comments.iter().map(|c| serde_json::json!({
-                "body": c.body,
-                "author": c.authored_by.name,
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "assignments": assignments.iter().map(|a| serde_json::json!({
-            "reviewer": a.reviewer.name,
-        })).collect::<Vec<_>>(),
-    });
-
-    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    // Through a `Value` for the reason `handle_review_list` gives.
+    let value = serde_json::to_value(&result).map_err(McpError::Json)?;
+    let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
 
@@ -997,17 +942,12 @@ fn parse_discussion_id(
 }
 
 fn parse_review_decision_state(s: &str) -> Result<kin_model::review::ReviewDecisionState> {
-    use kin_model::review::ReviewDecisionState;
-    match s.to_lowercase().as_str() {
-        "pending" => Ok(ReviewDecisionState::Pending),
-        "approved" | "approve" => Ok(ReviewDecisionState::Approved),
-        "needs_work" | "needs-work" | "needswork" => Ok(ReviewDecisionState::NeedsWork),
-        "blocked" | "block" => Ok(ReviewDecisionState::Blocked),
-        _ => Err(McpError::InvalidParams(format!(
+    kin_review::records::parse_review_decision_state(s).ok_or_else(|| {
+        McpError::InvalidParams(format!(
             "invalid review state: {}. Valid values: pending, approved, needs_work, blocked",
             s
-        ))),
-    }
+        ))
+    })
 }
 
 /// Parse an optional work scope from a JSON value (string like "entity:ID").
