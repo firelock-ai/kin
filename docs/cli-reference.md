@@ -413,10 +413,13 @@ kin history <entity> [options]
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<entity>` | yes | Entity name or ID |
+| `<entity>` | yes | Entity name or ID. A name with twins can carry its pin: `Name@file`, `Name@file:line`, `Name#kind` |
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--file <file>` |  | Exact repo-relative file qualifier for stable identity resolution |
+| `--kind <kind>` |  | Exact entity-kind qualifier (for example: function or method) |
+| `--all-revisions` |  | List every file-level revision, including ones that did not change this entity |
 | `--ref <ref>` |  | Resolve history against a specific ref. Accepts `HEAD`, `HEAD~N`, branch names, `branch:&lt;name&gt;`, imported Git commits as `git:&lt;sha&gt;` or bare 40-hex SHAs, and semantic changes as `kin:&lt;id&gt;`, `change:&lt;id&gt;`, or bare change IDs. |
 
 ### `kin blame`
@@ -429,10 +432,13 @@ kin blame <entity> [options]
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<entity>` | yes | Entity name or ID |
+| `<entity>` | yes | Entity name or ID. A name with twins can carry its pin: `Name@file`, `Name@file:line`, `Name#kind` |
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--file <file>` |  | Exact repo-relative file qualifier for stable identity resolution |
+| `--kind <kind>` |  | Exact entity-kind qualifier (for example: function or method) |
+| `--all-revisions` |  | List every file-level revision, including ones that did not change this entity |
 | `--ref <ref>` |  | Resolve blame against a specific ref. Accepts `HEAD`, `HEAD~N`, branch names, `branch:&lt;name&gt;`, imported Git commits as `git:&lt;sha&gt;` or bare 40-hex SHAs, and semantic changes as `kin:&lt;id&gt;`, `change:&lt;id&gt;`, or bare change IDs. |
 
 ### `kin overview`

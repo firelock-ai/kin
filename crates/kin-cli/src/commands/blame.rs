@@ -123,7 +123,13 @@ pub fn execute_blame_request_with(
     lines.push(String::new());
 
     if revisions.is_empty() {
-        lines.push("  No history recorded for this entity.".to_string());
+        lines.extend(ref_lookup::empty_history_lines(
+            graph,
+            &target,
+            &pointer,
+            &head.change_id,
+            request.reference.as_deref(),
+        )?);
         let closing = ref_lookup::closing_notes(&lines, head.authority_open);
         lines.extend(closing);
         return Ok(BlameResponse { lines });
