@@ -813,6 +813,14 @@ struct ReconcileProbesInner {
     /// it is set, every admission failure recorded below is a refusal against
     /// the mismatched tree rather than an independent fault.
     deferred_tree_wedge: Option<RecordedFault>,
+    /// When the loop will next attempt a complete admission, and the hold it is
+    /// serving, once a run of failures stopped looking like retries.
+    ///
+    /// Both halves, because a reader needs different things from each. The
+    /// instant answers "is it about to try again"; the duration answers "how far
+    /// has the ladder widened", which is what says whether the loop has settled
+    /// at its ceiling or is still climbing.
+    admission_hold: Option<(Instant, Duration)>,
     /// The watcher loss standing against this store, as the durable record last
     /// read.
     ///
@@ -896,11 +904,33 @@ impl ReconcileProbes {
     }
 
     /// A complete exact-tree admission attempt failed. Extends the streak.
-    pub fn record_admission_failure(&self, error: impl std::fmt::Display, now: Instant) {
+    ///
+    /// Returns the consecutive-failure count including this one, so the caller
+    /// that just failed can decide what to do about it without taking the lock
+    /// a second time to read a whole report back.
+    pub fn record_admission_failure(&self, error: impl std::fmt::Display, now: Instant) -> u64 {
         let mut inner = self.lock();
         inner.admission_failures = inner.admission_failures.saturating_add(1);
         inner.admission_failure_streak = inner.admission_failure_streak.saturating_add(1);
         inner.last_admission_error = Some(RecordedFault::new(error.to_string(), now));
+        inner.admission_failure_streak
+    }
+
+    /// Record that the loop is holding its next complete admission, and for how
+    /// long.
+    ///
+    /// Published rather than only logged, for the same reason every other fault
+    /// here is: the log line is gone by the time anyone reads a status surface,
+    /// and a daemon that has quietly stopped attempting is indistinguishable
+    /// from one that is attempting and failing unless it says which.
+    pub fn record_admission_hold(&self, held_for: Duration, now: Instant) {
+        let mut inner = self.lock();
+        inner.admission_hold = Some((now + held_for, held_for));
+    }
+
+    /// Forget any admission hold, because an attempt is being made now.
+    pub fn clear_admission_hold(&self) {
+        self.lock().admission_hold = None;
     }
 
     /// A complete exact-tree admission attempt succeeded. Ends the streak.
@@ -911,6 +941,10 @@ impl ReconcileProbes {
     pub fn record_admission_success(&self, now: Instant) {
         let mut inner = self.lock();
         inner.admission_failure_streak = 0;
+        // The hold exists only because the streak did. An admission that landed
+        // is the proof the refusal cleared, so leaving the hold set would make
+        // a recovered store keep reporting that it is waiting to try.
+        inner.admission_hold = None;
         inner.last_admission_success = Some(RecordedFault::new(String::new(), now));
         // A complete admission that succeeded is proof the graph's tree reached
         // repository authority, which is exactly the divergence a wedge names.
@@ -1103,6 +1137,16 @@ impl ReconcileProbes {
             unsupported_path_count: inner.excluded.unsupported,
             policy_excluded_path_count: inner.excluded.policy_excluded,
             parked: None,
+            admission_hold: inner.admission_hold.map(|(until, held_for)| {
+                kin_cli::commands::resources::AdmissionHold {
+                    // Saturating, so a hold whose instant has already passed
+                    // reads as zero seconds rather than as a wrapped eternity.
+                    // A tick between the deadline and the next attempt is a
+                    // normal state, not a fault.
+                    next_attempt_in_seconds: until.saturating_duration_since(now).as_secs(),
+                    held_for_seconds: held_for.as_secs(),
+                }
+            }),
             deferred_tree_wedge: inner.deferred_tree_wedge.as_ref().map(|fault| {
                 kin_cli::commands::resources::DeferredTreeWedge {
                     error: fault.message.clone(),
@@ -1607,6 +1651,76 @@ mod tests {
             Some("ignored churn starved admission")
         );
         assert!(report.degraded(), "eight failures in a row is not healthy");
+    }
+
+    /// A failure hands its caller the streak, and a recorded hold reaches the
+    /// surfaces with both halves a reader needs.
+    ///
+    /// The return value is the point. Without it the loop would have to build a
+    /// whole report under the lock to learn the one number it already caused,
+    /// on the path where it has just spent a complete admission and has the
+    /// least to spare.
+    #[test]
+    fn a_failure_returns_its_streak_and_a_hold_reaches_the_report() {
+        let probes = ReconcileProbes::default();
+        let base = Instant::now();
+        assert_eq!(probes.record_admission_failure("refused", base), 1);
+        assert_eq!(probes.record_admission_failure("refused", base), 2);
+        assert_eq!(probes.record_admission_failure("refused", base), 3);
+        assert_eq!(probes.record_admission_failure("refused", base), 4);
+        assert!(
+            probes.report(base).admission_hold.is_none(),
+            "a loop that has not held anything must not report a hold"
+        );
+
+        probes.record_admission_hold(Duration::from_secs(64), base);
+        let report = probes.report(at(base, 4));
+        let reasons = report.degraded_reasons();
+        let hold = report.admission_hold.expect("the hold was recorded");
+        assert_eq!(
+            hold.held_for_seconds, 64,
+            "the width of the hold is how far the ladder climbed"
+        );
+        assert_eq!(
+            hold.next_attempt_in_seconds, 60,
+            "four seconds into a 64 second hold, sixty remain"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("holding its next attempt")),
+            "a held loop must say so on the surface that already carries the streak, got {reasons:?}"
+        );
+    }
+
+    /// A hold outlives neither a success nor an attempt.
+    ///
+    /// Both arms matter and they clear it for different reasons. A success is
+    /// proof the refusal went away, so a hold left standing would have a
+    /// recovered store reporting that it is waiting to try. An attempt is the
+    /// loop deciding to try now, so a hold left standing would have a daemon
+    /// mid-admission reporting that it is not attempting.
+    #[test]
+    fn a_hold_is_cleared_by_a_success_and_by_the_attempt_it_gated() {
+        let probes = ReconcileProbes::default();
+        let base = Instant::now();
+        probes.record_admission_failure("refused", base);
+        probes.record_admission_hold(Duration::from_secs(300), base);
+        assert!(probes.report(base).admission_hold.is_some());
+        probes.record_admission_success(at(base, 1));
+        assert!(
+            probes.report(at(base, 1)).admission_hold.is_none(),
+            "an admission that landed proves the refusal cleared"
+        );
+
+        probes.record_admission_failure("refused", at(base, 2));
+        probes.record_admission_hold(Duration::from_secs(300), at(base, 2));
+        assert!(probes.report(at(base, 2)).admission_hold.is_some());
+        probes.clear_admission_hold();
+        assert!(
+            probes.report(at(base, 3)).admission_hold.is_none(),
+            "the loop clears its own hold when it decides to attempt"
+        );
     }
 
     /// The falsification, and the property that keeps the streak honest: a

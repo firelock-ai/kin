@@ -1156,8 +1156,39 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<i32> {
         // untracked files were named" is exactly the shape a reader takes for
         // "there are none".
         println!("{}", untracked_host_content_line(&pass));
+        // Why the daemon is quiet, when it is deliberately quiet. Every line
+        // above describes what the store holds; this one describes what the
+        // daemon has decided to stop doing about it, which is the question a
+        // reader arrives with when a repository stops keeping up and the daemon
+        // looks busy or looks idle depending on the second they looked.
+        if let Some(line) = admission_hold_line(&pass) {
+            println!("{line}");
+        }
     }
     Ok(exit_code_for_admission(&pass))
+}
+
+/// The `kin status` reading of a reconcile loop that has stood down.
+///
+/// `None` on every daemon that is admitting, and on one whose few failures are
+/// still what the per-path retry ladder is for, so this line appears exactly
+/// when there is something to say. When it appears it names all four facts a
+/// reader needs to act: that the loop is held, how long the streak is, how many
+/// seconds until the next attempt, and the refusal that caused it. A line
+/// carrying only "held" would send the reader back to the daemon log for the
+/// reason, which is where this information used to live and be lost.
+fn admission_hold_line(pass: &StatusAdmission) -> Option<String> {
+    let reconcile = pass.reconcile()?;
+    let hold = reconcile.admission_hold.as_ref()?;
+    let error = reconcile
+        .last_admission_error
+        .as_deref()
+        .unwrap_or("no error recorded");
+    Some(format!(
+        "Admission held: this repository's daemon has stood down between complete admissions \
+         after {} consecutive failures; it tries again in {}s (holding {}s). Refusal: {error}",
+        reconcile.admission_failure_streak, hold.next_attempt_in_seconds, hold.held_for_seconds
+    ))
 }
 
 /// The `kin status` reading of host content graph truth does not carry.
@@ -2483,6 +2514,54 @@ mod tests {
 
     fn skipped_pass() -> StatusAdmission {
         StatusAdmission::Skipped("no daemon is running for this repository".to_string())
+    }
+
+    /// `kin status` says why the daemon is quiet, and only when it is.
+    ///
+    /// The silent case is half the point. This line appears on a daemon that has
+    /// deliberately stood down between complete admissions and on no other, so a
+    /// build that printed it unconditionally would put a fault sentence on every
+    /// healthy repository and teach every reader to skip it. The loud case has
+    /// to carry all four facts, because a reader who learns only that something
+    /// is held goes to the daemon log for the reason, which is the round trip
+    /// this line exists to remove.
+    #[test]
+    fn status_names_a_held_admission_and_stays_quiet_otherwise() {
+        assert_eq!(
+            admission_hold_line(&took_pass()),
+            None,
+            "a daemon that is admitting has nothing to say here"
+        );
+        assert_eq!(
+            admission_hold_line(&skipped_pass()),
+            None,
+            "no daemon means no reading, not a hold"
+        );
+
+        let StatusAdmission::Took(mut report) = took_pass() else {
+            unreachable!("took_pass builds a taken pass")
+        };
+        report.reconcile.admission_failure_streak = 9;
+        report.reconcile.last_admission_error =
+            Some("live exact tree does not match workspace authority".to_string());
+        report.reconcile.admission_hold = Some(crate::commands::resources::AdmissionHold {
+            next_attempt_in_seconds: 240,
+            held_for_seconds: 300,
+        });
+        let line =
+            admission_hold_line(&StatusAdmission::Took(report)).expect("a held daemon must say so");
+        for fact in [
+            "Admission held",
+            "9 consecutive failures",
+            "tries again in 240s",
+            "holding 300s",
+            "live exact tree does not match workspace authority",
+        ] {
+            assert!(
+                line.contains(fact),
+                "the line must carry {fact:?}, got {line}"
+            );
+        }
     }
 
     fn merge_fixture(settled: usize, total: usize) -> MergeInProgress {

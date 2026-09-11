@@ -1982,6 +1982,159 @@ fn retry_backoff(attempts: u32, base: Duration) -> Duration {
     base.saturating_mul(1u32 << shift)
 }
 
+/// First hold imposed on the loop's own complete-admission attempts once the
+/// failures stop looking like retries.
+///
+/// The ladder above is per PATH and it is the right instrument for the failure
+/// it was built for: a file rewritten while the pass reads it fails one attempt
+/// and succeeds on the next. It is the wrong instrument for a failure that
+/// belongs to the STORE, because no path can clear one and every path then
+/// retries on the same ceiling. Measured on a wedged daemon serving a 2,987
+/// commit repository: one complete exact-tree admission spent 24.3 s in
+/// `publish_workspace_admission` and failed with "live exact tree does not
+/// match workspace authority", the per-path ceiling then let the next attempt
+/// start 6.4 s later, and the pair held a core and about 11 GiB for five and a
+/// half hours.
+const ADMISSION_HOLD_BASE: Duration = Duration::from_secs(2);
+
+/// Ceiling of the loop's own admission hold.
+///
+/// A ceiling rather than a give-up, because the refusal can be cleared from
+/// outside this process: a commit lands, a checkout completes, an operator
+/// fixes the working copy. Five minutes keeps a store that heals queryable
+/// within one coffee, and it takes the duty cycle of an attempt that costs
+/// half a minute from most of a core down to under a tenth of one.
+const ADMISSION_HOLD_CEILING: Duration = Duration::from_secs(300);
+
+/// How long the loop holds its next COMPLETE exact-tree admission, given how
+/// many have failed in a row.
+///
+/// `None` up to and including [`ADMISSION_FAILURE_STREAK_ATTENTION`] failures,
+/// because up to there the failures are still what the retry ladder is for and
+/// holding a working mechanism off is its own defect. Past it, the daemon has
+/// already decided the question: that constant's own rationale is "Three
+/// consecutive failures is no longer a retry: every attempt since the loop last
+/// admitted anything has failed, and whatever is rejecting them is not clearing
+/// on its own." This function is the first place that decision changes what the
+/// loop DOES rather than only what it reports.
+///
+/// Doubling from [`ADMISSION_HOLD_BASE`] to [`ADMISSION_HOLD_CEILING`], so a
+/// store that heals after a handful of failures is picked up in seconds and one
+/// that does not is retried at the ceiling forever rather than abandoned.
+///
+/// Pure, so the ladder is gradeable without a daemon, a store or a clock.
+fn admission_hold(streak: u64, ceiling: Duration) -> Option<Duration> {
+    let over =
+        streak.checked_sub(kin_cli::commands::resources::ADMISSION_FAILURE_STREAK_ATTENTION)?;
+    if over == 0 {
+        return None;
+    }
+    let shift = u32::try_from(over.saturating_sub(1))
+        .unwrap_or(u32::MAX)
+        .min(31);
+    let held = ADMISSION_HOLD_BASE.saturating_mul(1u32 << shift);
+    Some(held.min(ceiling))
+}
+
+/// The repository facts a hold was armed against.
+///
+/// Two atomic loads rather than a read of the store, because this is compared on
+/// every tick of a held loop and a comparison costing a lock or a walk would be
+/// its own reason not to hold at all. `snapshot_generation` is the repository
+/// generation the refusal names; `vfs_version` is the daemon's monotonic
+/// mutation counter, bumped by every commit, checkout and overlay update. A
+/// wedged loop moves neither, because the thing that would move them is the
+/// admission that keeps failing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepositoryMarks {
+    authority_generation: u64,
+    graph_version: u64,
+}
+
+impl RepositoryMarks {
+    fn read(state: &DaemonState) -> Self {
+        Self {
+            authority_generation: state.snapshot_generation.load(Ordering::SeqCst),
+            graph_version: state.vfs_version.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// A hold and the repository state it was armed against.
+#[derive(Debug, Clone, Copy)]
+struct AdmissionHoldState {
+    until: Instant,
+    marks: RepositoryMarks,
+}
+
+/// One tick of a round that is standing down, whatever the reason.
+///
+/// Both stand-down paths in the loop go through here, and that is the whole
+/// point of it existing: the standing publish below must not be droppable from
+/// one path while the other keeps it. The empty-queue branch paid for exactly
+/// that on 2026-08-29, when a daemon nobody was editing against published no
+/// standing from this loop at all and the record stopped advancing for the life
+/// of the daemon. A HELD daemon is a worse version of the same case, because it
+/// is the one a reader is actively trying to understand: it is holding
+/// gigabytes, refusing to admit, and the record of what it holds is the thing
+/// they came for.
+///
+/// The publisher checks the interval before it reads any pressure, so a held
+/// round costs one lock and one `Instant::elapsed` on the twenty-nine of every
+/// thirty seconds where the answer would be thrown away.
+fn stand_down_tick(state: &DaemonState, pass: &crate::background_work::BackgroundPass) {
+    pass.idle();
+    crate::daemon::publish_footprint_standing_on_idle_tick(state);
+}
+
+/// Whether this round must stand down for the hold the last failure set.
+///
+/// Pure over the two facts that decide it, for the same reason
+/// [`admission_hold`] is: a round that stands down when it should have
+/// attempted is the FIR-2606 class, and a round that attempts when it should
+/// have stood down is the loop this change exists to stop. Both are one
+/// boundary, and a boundary that needs a daemon and a broken store to exercise
+/// is a boundary nothing exercises.
+///
+/// `None` is a loop with no hold, which must always attempt. A deadline that
+/// has arrived is not a hold: the round attempts, and only a fresh failure arms
+/// the next one.
+///
+/// **A hold is interruptible, and this is the half that makes it safe.** The
+/// refusal is a property of the store, so the store changing underneath is what
+/// could clear it, and the marks name exactly which changes those are: anything
+/// that advances the repository generation or the daemon's graph mutation
+/// counter. A commit does, a checkout does, and an explicit admission through
+/// the seam does. A hold that ignored them would trade a hot loop for a daemon
+/// that ignores its user for up to five minutes after every wedge, which is a
+/// worse product than the one being fixed, so the marks are compared as well as
+/// the clock and a store that moved retries on the very next tick.
+///
+/// The two halves of the hold can disagree for one tick, and the marks are why
+/// that is harmless. A commit or an explicit admission calls
+/// `record_admission_success`, which clears the PUBLISHED hold, while this
+/// loop's own local state is untouched until its next tick. Both of those paths
+/// publish a tree, so both advance a mark, so the very next tick reads the hold
+/// as broken and clears the local state before attempting. The disagreement is
+/// therefore bounded by one poll interval, 100 ms at the default, and it falls
+/// on the safe side: the surface says the loop is not holding slightly before
+/// the loop stops holding, never the reverse.
+///
+/// What the marks deliberately do NOT cover is an operator editing the working
+/// copy. Those edits reach the loop as watcher events, and the admission that
+/// would turn them into a moved mark is the very thing being held, so nothing
+/// about them can break the hold early. That is why the ceiling exists and why
+/// it is five minutes rather than an hour: a repair the daemon cannot see is
+/// picked up when the clock runs out, and the clock is the only thing that
+/// picks it up.
+fn admission_is_held(
+    hold: Option<AdmissionHoldState>,
+    now: Instant,
+    marks: RepositoryMarks,
+) -> bool {
+    hold.is_some_and(|hold| now < hold.until && hold.marks == marks)
+}
+
 /// What one deferral cost the path that caused it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Deferral {
@@ -3006,6 +3159,13 @@ pub async fn run_loop_armed(
     // Bounded by MAX_CONSECUTIVE_COMMIT_YIELDS so a commit that never leaves the
     // daemon cannot hold ambient admission off forever.
     let mut commit_yields: u32 = 0;
+    // When this loop may next attempt a COMPLETE exact-tree admission, and the
+    // repository state it is waiting on. `None` on every healthy loop and on one
+    // whose failures are still inside the per-path ladder's remit; see
+    // [`admission_hold`] and [`admission_is_held`]. Named for the state rather
+    // than for the function that computes it, because a local called
+    // `admission_hold` shadows that function for the whole body.
+    let mut held_admission: Option<AdmissionHoldState> = None;
 
     // Register with the self-limit supervisor. Registered here rather than at
     // daemon start so a repository that never runs this loop — filesystem
@@ -3331,7 +3491,6 @@ pub async fn run_loop_armed(
             // deferred clock above is a separate reading and why this state is
             // reported as `waiting_deferred` rather than `idle` whenever the
             // retry lane still holds something.
-            pass.idle();
             // Publish the standing before returning to the top, because the
             // publish at the end of this tick is below the `continue` and a
             // quiet store never reaches it. Measured on 2026-08-29: a daemon
@@ -3345,10 +3504,10 @@ pub async fn run_loop_armed(
             // matters, because the reader wanting it is deciding whether this
             // machine can serve the store at all.
             //
-            // The callee checks the interval before it reads any pressure, so
-            // this costs one lock and one `Instant::elapsed` on the twenty-nine
-            // of every thirty seconds where the answer would be thrown away.
-            crate::daemon::publish_footprint_standing_on_idle_tick(&state);
+            // Shared with the admission-hold branch below through
+            // `stand_down_tick`, so neither stand-down path can lose the
+            // publish on its own.
+            stand_down_tick(&state, &pass);
 
             // No events — sleep briefly then check again.
             tokio::select! {
@@ -3390,6 +3549,70 @@ pub async fn run_loop_armed(
                 _ = cancel.changed() => {}
             }
             continue;
+        }
+
+        // Stand this round down while the loop's own admission hold is running.
+        //
+        // Deliberately here: after the watcher drain, so a held round still
+        // records lost and skipped events and still queues what it was told
+        // about, and before any lock, any batch and any status store, so the
+        // round itself costs one comparison. `pending_events` is left alone and
+        // no path is deferred, because a hold is not a failure and must not
+        // feed the per-path ladder a second time for the same refusal.
+        //
+        // The queue grows across a hold where today those paths would sit in the
+        // retry lane instead. That is the same set of paths either way, held as
+        // path buffers rather than admitted, and it is bounded by how much a
+        // person edits inside one hold; the existing backpressure warning covers
+        // a burst. Trading a few thousand paths of queue for a full store
+        // re-verification every thirty seconds is the whole point.
+        //
+        // This is NOT the "hold admission under memory pressure" idea the
+        // ambient tick refuses a few lines below, and the difference is the
+        // whole justification. That one would withhold an admission that WOULD
+        // have made a written file queryable, which is FIR-2606 arriving by a
+        // new route. This withholds nothing, because every attempt it stands
+        // down for has already failed at least
+        // `ADMISSION_FAILURE_STREAK_ATTENTION` times in a row and the next one
+        // fails for the same reason: the refusal belongs to the store, not to
+        // any path, so no attempt in the hold window could have admitted
+        // anything. The moment one succeeds the streak resets and the hold is
+        // gone.
+        if admission_is_held(
+            held_admission,
+            Instant::now(),
+            RepositoryMarks::read(&state),
+        ) {
+            // A held round is genuinely doing nothing, which is what this state
+            // means here and in the empty-queue branch below. Saying so is not
+            // bookkeeping: the supervisor parks a pass that spends a working
+            // stretch without advancing, and a hold read as a working stretch
+            // would have this change park the loop it exists to calm.
+            //
+            // Through the shared tick, so the footprint standing keeps being
+            // published while the loop is held. Without it a held daemon with a
+            // non-empty queue reaches neither the idle publish above nor the
+            // working publish below, and the record of what it is holding stops
+            // advancing for the length of the hold. That is the 2026-08-29 class
+            // arriving by a new route, on the one daemon whose standing a reader
+            // most wants.
+            stand_down_tick(&state, &pass);
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = cancel.changed() => {
+                    state.reconciliation_status.store(RECON_IDLE, Ordering::Relaxed);
+                    info!("reconciliation loop shutting down");
+                    break;
+                }
+            }
+            continue;
+        }
+        if held_admission.is_some() {
+            // The hold elapsed, so this round attempts. Cleared before the
+            // attempt rather than after it, because a surface read mid-attempt
+            // should say the loop is trying, and a failure re-arms it below.
+            held_admission = None;
+            state.background_work.reconcile().clear_admission_hold();
         }
 
         state
@@ -3537,10 +3760,35 @@ pub async fn run_loop_armed(
                     "complete exact-tree admission failed; retaining graph truth and retrying watcher paths"
                 );
                 let deferred_at = Instant::now();
-                state
+                let streak = state
                     .background_work
                     .reconcile()
                     .record_admission_failure(&error, deferred_at);
+                // Widen the LOOP's own gap between attempts once the streak says
+                // these are no longer retries. The per-path ladder below still
+                // runs and still does its own job; it just cannot reach this
+                // failure, because a refusal the whole store shares is not a
+                // property of any of the paths it defers.
+                if let Some(held_for) = admission_hold(streak, ADMISSION_HOLD_CEILING) {
+                    held_admission = Some(AdmissionHoldState {
+                        until: deferred_at + held_for,
+                        // Read after the failure, so the hold is armed against
+                        // the store as it stands now rather than as it stood
+                        // before the attempt that just moved nothing.
+                        marks: RepositoryMarks::read(&state),
+                    });
+                    state
+                        .background_work
+                        .reconcile()
+                        .record_admission_hold(held_for, deferred_at);
+                    warn!(
+                        streak,
+                        held_for_secs = held_for.as_secs(),
+                        "holding the next complete exact-tree admission; every attempt since the \
+                         last success has failed for the same reason and each one costs a whole \
+                         admission"
+                    );
+                }
                 for event in &watcher_batch {
                     let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
                     retry_lane.defer(path, deferred_at, retry_base);
@@ -7598,6 +7846,179 @@ mod tests {
             retry_backoff(u32::MAX, base),
             base * (1 << RETRY_BACKOFF_MAX_SHIFT),
             "an attempt count that cannot overflow the shift must still land on the ceiling"
+        );
+    }
+
+    /// The loop's own hold: nothing while the failures are still retries, then
+    /// a doubling gap to a ceiling.
+    ///
+    /// The first three assertions are the ones that matter. A hold that started
+    /// at or below the attention threshold would withhold admissions the retry
+    /// ladder is there to serve, which is the FIR-2606 class; a hold with no
+    /// ceiling would leave a store that healed unqueryable for as long as it had
+    /// been broken.
+    #[test]
+    fn admission_hold_starts_past_the_attention_streak_and_doubles_to_a_ceiling() {
+        let ceiling = ADMISSION_HOLD_CEILING;
+        assert_eq!(
+            admission_hold(0, ceiling),
+            None,
+            "a loop that has never failed must not be held"
+        );
+        assert_eq!(
+            admission_hold(
+                kin_cli::commands::resources::ADMISSION_FAILURE_STREAK_ATTENTION,
+                ceiling
+            ),
+            None,
+            "at the attention threshold the failures are still what the per-path ladder is for"
+        );
+        assert_eq!(
+            (kin_cli::commands::resources::ADMISSION_FAILURE_STREAK_ATTENTION + 1
+                ..=kin_cli::commands::resources::ADMISSION_FAILURE_STREAK_ATTENTION + 9)
+                .map(|streak| admission_hold(streak, ceiling).map(|held| held.as_secs()))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(2),
+                Some(4),
+                Some(8),
+                Some(16),
+                Some(32),
+                Some(64),
+                Some(128),
+                Some(256),
+                Some(300),
+            ],
+            "the first hold past the threshold is the base, and each further failure doubles it \
+             to the ceiling"
+        );
+        assert_eq!(
+            admission_hold(u64::MAX, ceiling),
+            Some(ceiling),
+            "a streak that cannot overflow the shift must still land on the ceiling"
+        );
+    }
+
+    /// The boundary the held round turns on.
+    ///
+    /// Each case fails differently. No hold must always attempt, or a healthy
+    /// loop stops admitting. A live hold over an unchanged store must stand
+    /// down, or the whole change does nothing. An elapsed hold must attempt, or
+    /// a store that healed stays unqueryable because a deadline that passed is
+    /// still being obeyed.
+    #[test]
+    fn a_round_stands_down_only_while_its_hold_is_still_running() {
+        let now = Instant::now();
+        let marks = RepositoryMarks {
+            authority_generation: 17,
+            graph_version: 4_211,
+        };
+        let hold = |until| Some(AdmissionHoldState { until, marks });
+        assert!(
+            !admission_is_held(None, now, marks),
+            "a loop with no hold must attempt"
+        );
+        assert!(
+            admission_is_held(hold(now + Duration::from_secs(30)), now, marks),
+            "a hold that has not elapsed over an unchanged store must stand the round down"
+        );
+        assert!(
+            !admission_is_held(hold(now), now, marks),
+            "a deadline that has arrived is not a hold"
+        );
+        assert!(
+            !admission_is_held(hold(now - Duration::from_secs(1)), now, marks),
+            "a hold that elapsed must not keep standing rounds down"
+        );
+    }
+
+    /// A round that stands down still publishes what the daemon is holding.
+    ///
+    /// This is the arm the strong-tier review of this change asked for, and the
+    /// case it is about is the held one. A held daemon with a non-empty queue
+    /// reaches neither the empty-queue publish nor the working publish, so
+    /// without the shared tick its footprint record stops advancing for the
+    /// length of the hold. That is the 2026-08-29 class on the one daemon whose
+    /// standing a reader most wants, because it is holding gigabytes and
+    /// refusing to admit.
+    ///
+    /// Graded against a real store rather than a predicate, because the property
+    /// is that a record reaches disk. Breaking `stand_down_tick` by dropping its
+    /// publish reds this and nothing else.
+    #[test]
+    fn a_round_that_stands_down_publishes_the_footprint_standing() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let state = open_test_state(&repo);
+        let pass = state
+            .background_work
+            .pass(crate::background_work::PASS_RECONCILE);
+        assert!(
+            kin_core::memory_pressure::DaemonFootprint::read(state.layout.root()).is_none(),
+            "a store that has never published must start with no record, or this test cannot \
+             tell a publish from a leftover"
+        );
+
+        stand_down_tick(&state, &pass);
+
+        let published = kin_core::memory_pressure::DaemonFootprint::read(state.layout.root())
+            .expect("a round that stood down must have published a standing");
+        assert_eq!(
+            published.pid,
+            std::process::id(),
+            "the record must be this process's own standing, not an inherited one"
+        );
+        assert!(
+            published.budget_bytes > 0,
+            "a standing with no budget states nothing about what the daemon is allowed to hold"
+        );
+    }
+
+    /// A hold is interruptible: a store that moved is retried at once.
+    ///
+    /// This is the arm that keeps the fix from being a worse product than the
+    /// defect. The refusal belongs to the store, so the store changing
+    /// underneath is the one event that could clear it, and a hold that waited
+    /// out its full five minutes through a commit or a checkout would leave a
+    /// user staring at a daemon that had already been given what it needed.
+    /// Both marks are graded separately, because a commit that advances the
+    /// repository generation and an overlay update that advances only the graph
+    /// version are different events and either one is enough.
+    #[test]
+    fn a_hold_breaks_the_moment_the_store_it_was_armed_against_moves() {
+        let now = Instant::now();
+        let armed = RepositoryMarks {
+            authority_generation: 17,
+            graph_version: 4_211,
+        };
+        let held = Some(AdmissionHoldState {
+            until: now + Duration::from_secs(300),
+            marks: armed,
+        });
+        assert!(
+            admission_is_held(held, now, armed),
+            "an unchanged store is the case the hold exists for"
+        );
+        assert!(
+            !admission_is_held(
+                held,
+                now,
+                RepositoryMarks {
+                    authority_generation: 18,
+                    ..armed
+                }
+            ),
+            "an authority generation that moved must retry at once, not in five minutes"
+        );
+        assert!(
+            !admission_is_held(
+                held,
+                now,
+                RepositoryMarks {
+                    graph_version: 4_212,
+                    ..armed
+                }
+            ),
+            "a graph mutation must retry at once, not in five minutes"
         );
     }
 
