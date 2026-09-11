@@ -5682,7 +5682,7 @@ mod tests {
             Some(&record),
         );
         assert!(
-            message.contains("killed by the memory limit 4 time(s) since 01:12Z"),
+            message.contains("killed by the memory limit 4 time(s) since 1970-01-01 01:12Z"),
             "{message}"
         );
         assert!(message.contains("cap 12.0 GiB"), "{message}");

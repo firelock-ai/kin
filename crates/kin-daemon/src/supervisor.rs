@@ -1572,6 +1572,9 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
         || false,
         shutdown_rx.clone(),
         crate::daemon::shutdown_escalation_grace(),
+        // The supervisor serves no store, so there is nowhere to record that it
+        // ended itself.
+        None,
     );
 
     #[cfg(unix)]

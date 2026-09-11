@@ -755,18 +755,24 @@ impl DaemonKillRecord {
     /// fact about this store's history; it is not a claim about the cause of
     /// the request that just failed, and the wording keeps those apart.
     pub fn cause_sentence(&self) -> String {
-        let since = hhmm_utc(self.first_unix);
+        // With its date. A time of day alone read "since 20:42Z" as today on a
+        // store whose first ending was twelve days earlier.
+        let since = utc_date_minute(self.first_unix);
         let opening = match (self.memory_kills, self.kills, self.last_cause) {
             // Signal zero is the record saying it has no signal, not a signal
             // numbered zero, and it is what an unwatched death carries: nobody
             // waited on the process, so its exit status is gone. Rendering that
             // as "killed by signal 0" states a fact about the kernel that no
             // kernel ever reported, which is the same failure as the idle
-            // window one turn smaller.
+            // window one turn smaller. "Killed" at all is that claim one word
+            // shorter: a kernel kill, a crash and a force exit past a shutdown
+            // grace all leave exactly this record, so it says how the daemon
+            // ended as far as anything saw it, which is without retiring.
             (0, kills, DaemonKillCause::Unattributed { signal: 0 }) => format!(
-                "the daemon for this store was killed {kills} time(s) since {since} with nothing \
-                 waiting on it, so its exit signal is gone, and this host publishes no memory \
-                 accounting, so nothing here attributes that to memory"
+                "a daemon serving this store ended {kills} time(s) since {since} without retiring \
+                 its serving record, with nothing waiting on it, so how it ended is not known: its \
+                 exit signal is gone, and this host publishes no memory accounting, so nothing \
+                 here attributes it to memory"
             ),
             (0, kills, DaemonKillCause::Unattributed { signal }) => format!(
                 "the daemon for this store was killed by signal {signal} {kills} time(s) since \
@@ -845,7 +851,16 @@ impl DaemonKillRecord {
             ),
             (None, None) => "run this repository on a machine with more memory".to_string(),
         };
-        let mut options = vec![more_memory];
+        let mut options = Vec::new();
+        // Nothing attributed this to memory, so the daemon's own log is where
+        // its cause is, if it is anywhere, and that is the first place to look.
+        if self.memory_kills == 0 {
+            options.push(format!(
+                "read .kin/daemon.log around {} for how it ended",
+                utc_date_minute(self.last_unix)
+            ));
+        }
+        options.push(more_memory);
         options.extend(enrichment_remedy_clause_in(state));
         format!(
             "To recover: {}. `kin doctor` reports this store's memory headroom, and \
@@ -1559,6 +1574,35 @@ pub fn hhmm_utc(unix: u64) -> String {
     let seconds_of_day = unix % 86_400;
     format!(
         "{:02}:{:02}Z",
+        seconds_of_day / 3_600,
+        (seconds_of_day % 3_600) / 60
+    )
+}
+
+/// A unix time as the minute it names, with its date, in UTC.
+///
+/// The date is what [`hhmm_utc`] leaves out, and a count of endings "since
+/// 20:42Z" read as today on a store whose first one was twelve days earlier.
+/// Arithmetic for the same reason as above: the civil date from a day count is
+/// Howard Hinnant's `civil_from_days`, and no calendar crate is needed for it.
+pub fn utc_date_minute(unix: u64) -> String {
+    let seconds_of_day = unix % 86_400;
+    let days = (unix / 86_400) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}Z",
         seconds_of_day / 3_600,
         (seconds_of_day % 3_600) / 60
     )
@@ -9281,14 +9325,70 @@ Shared_Dirty:          0 kB\n";
             "signal zero is the absence of a signal, not one: {sentence}"
         );
         assert!(
-            sentence.contains("killed"),
-            "it is still a kill and still has to say so: {sentence}"
+            !sentence.contains("killed"),
+            "an ending nothing observed is not a kill anything saw: {sentence}"
+        );
+        assert!(
+            sentence.contains("without retiring its serving record"),
+            "what the record does prove is that the daemon did not retire: {sentence}"
+        );
+        assert!(
+            sentence.contains("since 2026-08-17 20:53Z"),
+            "the first ending is dated, not only timed: {sentence}"
         );
         assert!(
             sentence.contains("nothing waiting on it"),
             "why the signal is missing is the whole of what is known: {sentence}"
         );
         assert!(sentence.contains("no memory accounting"), "{sentence}");
+    }
+
+    /// The date the kill sentence carries, down to the day, for the store the
+    /// founder reported and for the edges of the calendar arithmetic.
+    #[test]
+    fn a_time_is_rendered_with_its_calendar_day() {
+        assert_eq!(utc_date_minute(0), "1970-01-01 00:00Z");
+        assert_eq!(utc_date_minute(4_320), "1970-01-01 01:12Z");
+        // 2024-02-29T00:00:00Z, a leap day.
+        assert_eq!(utc_date_minute(1_709_164_800), "2024-02-29 00:00Z");
+        // The first ending on the founder's store, read as "since 20:42Z".
+        assert_eq!(utc_date_minute(1_788_036_143), "2026-08-29 20:42Z");
+    }
+
+    /// An ending nothing attributed to memory sends a reader to the daemon's
+    /// own log first, dated, and only then to a memory remedy.
+    #[test]
+    fn an_unattributed_ending_points_at_the_log_before_memory() {
+        let record = DaemonKillRecord {
+            kills: 4,
+            memory_kills: 0,
+            first_unix: 1_788_036_143,
+            last_unix: 1_789_063_025,
+            last_pid: Some(12538),
+            last_cause: DaemonKillCause::Unattributed { signal: 0 },
+            limit_bytes: None,
+            last_rss_bytes: None,
+        };
+        let remedy = record.remediation_in(EnrichmentState::Available);
+        let log = remedy
+            .find("read .kin/daemon.log around 2026-09-10 17:57Z")
+            .unwrap_or_else(|| panic!("{remedy}"));
+        let memory = remedy
+            .find("more memory")
+            .unwrap_or_else(|| panic!("{remedy}"));
+        assert!(
+            log < memory,
+            "the log comes before a memory remedy nothing supports: {remedy}"
+        );
+        // A kill the kernel attributed to memory keeps its memory remedy first.
+        let memory_kill = killed_holding(Some(12 * 1024 * 1024 * 1024), None);
+        assert!(
+            !memory_kill
+                .remediation_in(EnrichmentState::Available)
+                .contains("daemon.log"),
+            "{}",
+            memory_kill.remediation_in(EnrichmentState::Available)
+        );
     }
 
     fn killed_holding(limit: Option<u64>, rss: Option<u64>) -> DaemonKillRecord {

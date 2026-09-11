@@ -1712,10 +1712,14 @@ fn shutdown_signalled(is_shutdown: bool, cancel: bool, os_requested: bool) -> bo
 /// `is_shutdown` is taken as a probe rather than a flag so the production call
 /// site keeps reading `DaemonState` while a test can model the runtime whose
 /// propagation task never runs at all.
+///
+/// `store_root` is the store this daemon serves, where a force exit records
+/// that the daemon ended itself; the supervisor serves none and passes `None`.
 pub fn spawn_shutdown_escalation_watchdog<F>(
     is_shutdown: F,
     cancel: tokio::sync::watch::Receiver<bool>,
     grace: Duration,
+    store_root: Option<std::path::PathBuf>,
 ) where
     F: Fn() -> bool + Send + 'static,
 {
@@ -1735,11 +1739,43 @@ pub fn spawn_shutdown_escalation_watchdog<F>(
                 "kin-daemon: graceful shutdown exceeded {}s grace; forcing process exit to prevent a CPU zombie",
                 grace.as_secs()
             );
-             std::process::exit(0);
+            // Said in the store before the exit, so the serving record this
+            // exit leaves behind reads as the self-termination it is.
+            if let Some(store_root) = store_root.as_deref() {
+                record_watchdog_self_termination(store_root, grace);
+            }
+            std::process::exit(0);
         })
     {
         warn!(error = %error, "failed to spawn shutdown-escalation watchdog");
     }
+}
+
+/// Record, in the store this daemon served, that it ended itself.
+///
+/// The force exit skips the path that retires the serving record, so without
+/// this the next start finds that record beside a dead pid and books an
+/// unattributed kill, and `kin init` exits 7 over a daemon that stopped on its
+/// own schedule. Measured twice on a 3.5 GiB scratch store: the final flush
+/// outran the 25 s grace both times, and the next start recorded `"kills":1`
+/// for the first. A death note naming this pid is what both readers of that
+/// record, the settlement at the next start and `kin init`'s read-only peek,
+/// already honour.
+pub fn record_watchdog_self_termination(kin_root: &std::path::Path, grace: Duration) {
+    kin_daemon_spawn::write_daemon_death_note(
+        kin_root,
+        &kin_daemon_spawn::DaemonDeathNote {
+            pid: std::process::id(),
+            killed_by: "kin-daemon shutdown watchdog".to_string(),
+            reason: format!(
+                "graceful shutdown did not finish inside its {}s grace, so the daemon ended \
+                 itself; its final persistence flush may not have completed",
+                grace.as_secs()
+            ),
+            in_flight: None,
+            at: chrono::Utc::now().to_rfc3339(),
+        },
+    );
 }
 
 /// Is the process with this PID still alive?
@@ -4708,6 +4744,7 @@ pub async fn run_with_authority_on(
         },
         cancel_rx.clone(),
         shutdown_escalation_grace(),
+        Some(state.layout.root().to_path_buf()),
     );
 
     // Spawn the orphan session sweeper (Phase 7).
@@ -6926,6 +6963,80 @@ pub(crate) fn spawn_background_embedding_worker(
 
 #[cfg(all(test, unix))]
 mod tests {
+    /// The store root the watchdog worker below is told to serve.
+    const WATCHDOG_WORKER_ROOT: &str = "KINTEST_WATCHDOG_WORKER_ROOT";
+
+    /// The worker half of the case below, inert in an ordinary run.
+    ///
+    /// Run on its own with the variable set, it publishes a serving record for
+    /// its own process, arms the real shutdown watchdog with a 100 ms grace and a
+    /// shutdown already signalled, and waits. The watchdog is what ends it.
+    #[test]
+    fn shutdown_watchdog_worker() {
+        let Some(root) = std::env::var_os(WATCHDOG_WORKER_ROOT) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        kin_daemon_spawn::publish_serving_daemon(&root, std::process::id());
+        let (_keep, cancel) = tokio::sync::watch::channel(false);
+        super::spawn_shutdown_escalation_watchdog(
+            || true,
+            cancel,
+            std::time::Duration::from_millis(100),
+            Some(root),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        panic!("the shutdown watchdog should have ended this process");
+    }
+
+    /// A stop that outruns its grace is recorded as the daemon ending itself,
+    /// not as a kill.
+    ///
+    /// The worker above is a real process ended by the real watchdog. Before
+    /// this, that exit left its serving record beside a dead pid with nothing to
+    /// say who ended it; the next start booked `"kills":1`, and `kin init`
+    /// exited 7. Measured twice on a 3.5 GiB scratch store, where the final
+    /// flush outran the 25 s grace both times.
+    ///
+    /// Breaking it: drop the note the watchdog writes, and the peek below names
+    /// a kill.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_that_outruns_its_grace_is_recorded_as_a_self_termination() {
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon::tests::shutdown_watchdog_worker",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(WATCHDOG_WORKER_ROOT, root.path())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "the watchdog ends the worker with exit 0: {status:?}"
+        );
+
+        let serving = kin_daemon_spawn::read_serving_daemon(root.path())
+            .expect("the force exit leaves the serving record, which is the case this is about");
+        let note = kin_daemon_spawn::read_daemon_death_note(root.path())
+            .expect("the watchdog records the ending before it exits");
+        assert_eq!(
+            note.pid, serving.pid,
+            "the note names the process the serving record names"
+        );
+        assert!(note.killed_by.contains("watchdog"), "{}", note.summary());
+        assert!(
+            kin_daemon_spawn::peek_unwatched_daemon_death(root.path()).is_none(),
+            "a daemon that ended itself was read as killed"
+        );
+        assert!(kin_daemon_spawn::settle_unwatched_daemon_death(root.path()).is_none());
+        assert!(kin_daemon_spawn::read_daemon_kill_record(root.path()).is_none());
+    }
+
     #[test]
     fn partial_query_success_does_not_persist_a_skip_marker() {
         let root = tempfile::tempdir().unwrap();

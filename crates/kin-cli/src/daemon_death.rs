@@ -138,6 +138,17 @@ pub fn kin_root_from_cwd() -> Option<std::path::PathBuf> {
 /// derived. What is in doubt is whether anything more was coming.
 pub fn enrichment_clause(record: Option<&DaemonKillRecord>) -> &'static str {
     match record {
+        // An ending nothing observed is not a kill anything saw. The record says
+        // the daemon did not retire, and that is all it says.
+        Some(record)
+            if !record.attributed_to_memory()
+                && matches!(
+                    record.last_cause,
+                    kin_daemon_spawn::DaemonKillCause::Unattributed { signal: 0 }
+                ) =>
+        {
+            "completion not attested, and a daemon serving this store ended without retiring"
+        }
         Some(_) => "completion not attested, and a daemon serving this store was killed",
         None => "completion not attested",
     }
@@ -249,10 +260,13 @@ mod tests {
         assert!(sentence.contains("To recover:"), "{sentence}");
     }
 
-    /// A kill this host cannot attribute is still a kill, and says only that.
+    /// An ending this host saw nothing of is reported as the ending it was, and
+    /// says only that.
     ///
     /// On a host with no cgroup accounting, "not attributed" is the honest
-    /// answer and "not memory" is not. What must not survive either way is the
+    /// answer and "not memory" is not, and with no signal observed "killed" is
+    /// not either: a kernel kill, a crash and a force exit past the shutdown
+    /// grace all leave this record. What must not survive either way is the
     /// idle window.
     #[test]
     fn an_unattributed_kill_reports_the_death_without_inventing_a_cause() {
@@ -261,7 +275,11 @@ mod tests {
             "locate",
             &DaemonNotAnswering::Killed(Box::new(unattributed_kill())),
         );
-        assert!(sentence.contains("killed"), "{sentence}");
+        assert!(
+            sentence.contains("without retiring its serving record"),
+            "{sentence}"
+        );
+        assert!(!sentence.contains("was killed"), "{sentence}");
         assert!(!sentence.contains("idle window, so re-run"), "{sentence}");
         assert!(
             !sentence.contains("memory limit"),
@@ -304,6 +322,35 @@ mod tests {
             !sentence.contains("was killed"),
             "nothing here established a death, and claiming one would be the same \
              overreach in the other direction: {sentence}"
+        );
+    }
+
+    /// An ending nothing observed is not called a kill, and a kernel's memory
+    /// kill still is.
+    ///
+    /// Signal zero with no memory attribution is what a daemon leaves when
+    /// nothing waited on it, and a kernel kill, a crash and a force exit past
+    /// the shutdown grace all leave it. The founder's store read "a daemon
+    /// serving this store was killed" beside four such endings, one of them
+    /// its own watchdog's.
+    #[test]
+    fn an_ending_nothing_observed_is_not_called_a_kill() {
+        let unobserved = DaemonKillRecord {
+            kills: 4,
+            memory_kills: 0,
+            first_unix: 1_788_036_143,
+            last_unix: 1_788_036_143,
+            last_pid: Some(12538),
+            last_cause: DaemonKillCause::Unattributed { signal: 0 },
+            limit_bytes: None,
+            last_rss_bytes: None,
+        };
+        let clause = enrichment_clause(Some(&unobserved));
+        assert!(!clause.contains("killed"), "{clause}");
+        assert!(clause.contains("ended without retiring"), "{clause}");
+        assert!(
+            enrichment_clause(Some(&memory_kill())).contains("was killed"),
+            "a kill the kernel attributed to memory is still named as one"
         );
     }
 
