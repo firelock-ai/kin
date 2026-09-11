@@ -44,7 +44,7 @@ impl TreeBytes {
         self.unreadable_entries == 0
     }
 
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         if self.complete() {
             format_bytes(self.bytes)
         } else {

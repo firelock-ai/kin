@@ -272,6 +272,12 @@ pub enum EmbeddingCoverageUnobserved {
     /// from every state above, all of which are answers about a graph that was
     /// reachable.
     SamplingFailed,
+    /// This repository's daemon is alive beside this command and did not
+    /// answer in time, so its live graph was not read. Not an absent daemon:
+    /// "no daemon holds this repository's live graph" beside a live pid sends
+    /// the reader to start one that is already running. Only this CLI sets it,
+    /// on its own fallback; no daemon puts it on the wire.
+    DaemonNotAnswering,
 }
 
 impl EmbeddingCoverageUnobserved {
@@ -299,7 +305,11 @@ impl EmbeddingCoverageUnobserved {
             | Self::NoVectorIndexAttached
             | Self::VectorSupportDisabled
             | Self::EmbeddingWorkLockPoisoned
-            | Self::SamplingFailed => false,
+            | Self::SamplingFailed
+            // A busy daemon does finish, but a re-read here is another probe and
+            // another whole-store open beside it, which is the cost this absence
+            // exists to stop paying twice.
+            | Self::DaemonNotAnswering => false,
         }
     }
 }
@@ -912,12 +922,10 @@ pub fn inspect_at(
 /// daemon build only under `KIN_STRICT_BUILD_MATCH` and otherwise warns once
 /// and hands back the response. What protects this read from a skewed daemon is
 /// the schema, not the build check.
-async fn live_status_from_running_daemon(
+async fn live_status_from_daemon(
     layout: &kin_core::KinLayout,
+    base_url: &str,
 ) -> std::result::Result<CommandStatusResponse, EmbeddingCoverageUnobserved> {
-    let base_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
-        .await
-        .ok_or(EmbeddingCoverageUnobserved::NoRunningDaemon)?;
     let unavailable = |error: anyhow::Error| {
         tracing::debug!(%error, "live status unavailable; reporting coverage as unobserved");
         EmbeddingCoverageUnobserved::DaemonStatusUnavailable
@@ -972,8 +980,11 @@ pub struct StatusReading {
 /// Exactly zero authority opens in this process on the daemon arm, and exactly
 /// one on the fallback arm. The fallback opens once and asks that one open for
 /// all three readings.
-async fn read_status_once(layout: &kin_core::KinLayout) -> Result<StatusReading> {
-    match live_status_from_running_daemon(layout).await {
+async fn read_status_once(
+    layout: &kin_core::KinLayout,
+    daemon: &crate::daemon_client::RunningDaemonReading,
+) -> Result<StatusReading> {
+    match live_status(layout, daemon).await {
         // A daemon that answered but did not take the merge and tip readings is
         // an older build. Believing its silence would print a clean status over
         // a workspace holding a merge open, so this pays for exactly one local
@@ -1004,18 +1015,105 @@ async fn read_status_once(layout: &kin_core::KinLayout) -> Result<StatusReading>
             ),
             source: AuthoritySource::RunningDaemon,
         }),
-        Err(reason) => {
+        Err(gap) => {
+            // Beside a daemon that is running, this open is a cost the reader did
+            // not ask for and would not have paid had it answered, so it is named,
+            // with its size and its reason, before it starts rather than after.
+            if let Some(beside) = gap.beside_live_daemon.as_deref() {
+                eprintln!(
+                    "{}",
+                    open_beside_live_daemon_notice(beside, &StoreFootprint::measure(layout))
+                );
+            }
             let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
             let authority = ActiveRepositoryAuthority::open(&binding)?;
-            let report = inspect_at(layout, &authority, EmbeddingCoverage::unobserved(reason))?;
+            let report = inspect_at(
+                layout,
+                &authority,
+                EmbeddingCoverage::unobserved(gap.reason),
+            )?;
             Ok(StatusReading {
                 merge: merge_in_progress_at(&authority),
                 workspace_tip: workspace_tip_at(&authority),
                 report,
-                source: AuthoritySource::OwnAuthorityOpen,
+                source: if gap.beside_live_daemon.is_some() {
+                    AuthoritySource::OwnAuthorityOpenBesideLiveDaemon
+                } else {
+                    AuthoritySource::OwnAuthorityOpen
+                },
             })
         }
     }
+}
+
+/// Why the live daemon's status could not be used, and whether a daemon is
+/// running beside this command anyway.
+struct LiveStatusGap {
+    reason: EmbeddingCoverageUnobserved,
+    /// Why a daemon that is running could not serve this read, as the clause
+    /// the notice quotes. `None` when no daemon is running for this repository.
+    beside_live_daemon: Option<String>,
+}
+
+/// Reach the daemon this command resolved, and say what stood in the way when
+/// it could not be read.
+///
+/// The resolution is [`crate::daemon_client::running_daemon_reading`], which
+/// consults the repository's own endpoint record and not only the supervisor's
+/// route. A daemon started as `kin-daemon --repo <path>` is in no registry the
+/// supervisor serves, and asking only the supervisor is how a status beside
+/// such a daemon opened the whole store and said no daemon held the live graph
+/// while the daemon was answering. Its probe already retries on a bounded
+/// deadline and checks the recorded process on every attempt, so a daemon that
+/// reads as not answering here is one whose process was alive throughout.
+async fn live_status(
+    layout: &kin_core::KinLayout,
+    daemon: &crate::daemon_client::RunningDaemonReading,
+) -> std::result::Result<CommandStatusResponse, LiveStatusGap> {
+    use crate::daemon_client::RunningDaemonReading;
+    match daemon {
+        RunningDaemonReading::Serving(base_url) => live_status_from_daemon(layout, base_url)
+            .await
+            .map_err(|reason| LiveStatusGap {
+                reason,
+                beside_live_daemon: Some(format!(
+                    "this repository's daemon at {base_url} answered its readiness check, and \
+                     its status read then did not answer in time or could not be used"
+                )),
+            }),
+        RunningDaemonReading::OpeningAuthority {
+            pid, port, waited, ..
+        } => Err(LiveStatusGap {
+            reason: EmbeddingCoverageUnobserved::DaemonNotAnswering,
+            beside_live_daemon: Some(format!(
+                "this repository's daemon (pid {pid}, port {port}) is alive and did not answer a \
+                 readiness check in {} ms",
+                waited.as_millis()
+            )),
+        }),
+        RunningDaemonReading::Absent => Err(LiveStatusGap {
+            reason: EmbeddingCoverageUnobserved::NoRunningDaemon,
+            beside_live_daemon: None,
+        }),
+    }
+}
+
+/// The line a status prints before it opens repository authority beside a
+/// daemon that is running.
+///
+/// On stderr so `--json` stays one document, and before the open so a reader
+/// who waits thirty seconds knows during the wait what they are paying for: the
+/// size of what the open re-verifies, and that the daemon is not absent.
+fn open_beside_live_daemon_notice(beside: &str, footprint: &StoreFootprint) -> String {
+    let size = match footprint.store.as_ref() {
+        Some(store) => format!("{} under .kin/ here", store.render()),
+        None => "a store whose size this command could not measure".to_string(),
+    };
+    format!(
+        "kin status: {beside}, so this command is opening repository authority itself, which \
+         re-verifies every persisted body: {size}. The daemon is running, not absent: re-run \
+         once it answers and this reads its live graph instead"
+    )
 }
 
 /// Re-read until embedding coverage stops being momentarily unobservable, or
@@ -1077,11 +1175,18 @@ where
 /// fields and a new key there makes an older CLI reject a newer daemon's report.
 pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<i32> {
     let layout = crate::commands::require_repository_layout()?;
+    // One resolution of this repository's daemon for the whole command: the
+    // supervisor's route, then the repository's own endpoint record. The
+    // admission and the reading both use it, so a daemon the supervisor does
+    // not list is read from rather than bypassed, and a slow daemon costs one
+    // probe here rather than one per step.
+    let daemon = crate::daemon_client::running_daemon_reading(&layout).await;
     // Admit, THEN read. The order is the whole point: a report read before the
     // admission describes the graph as it was, which is exactly the answer
     // FIR-2961 is about.
-    let pass = admit_before_reading(&layout).await;
-    let reading = settle_embedding_coverage(wait_quiesce, || read_status_once(&layout)).await?;
+    let pass = admit_with_reading(&layout, &daemon).await;
+    let reading =
+        settle_embedding_coverage(wait_quiesce, || read_status_once(&layout, &daemon)).await?;
     let report = reading.report;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1566,8 +1671,18 @@ fn opening_authority_admission_sentence(
 /// lease keeps a daemon alive indefinitely, which is the defect this would be
 /// trading for.
 pub async fn admit_before_reading(layout: &kin_core::KinLayout) -> StatusAdmission {
-    let base_url = match crate::daemon_client::running_daemon_reading(layout).await {
-        crate::daemon_client::RunningDaemonReading::Serving(url) => url,
+    let daemon = crate::daemon_client::running_daemon_reading(layout).await;
+    admit_with_reading(layout, &daemon).await
+}
+
+/// [`admit_before_reading`] against a daemon reading the caller already took,
+/// so a command that also reads from that daemon resolves and probes it once.
+async fn admit_with_reading(
+    layout: &kin_core::KinLayout,
+    daemon: &crate::daemon_client::RunningDaemonReading,
+) -> StatusAdmission {
+    let base_url = match daemon {
+        crate::daemon_client::RunningDaemonReading::Serving(url) => url.clone(),
         // A daemon that is up and still opening authority is not an absent one,
         // so it does not get the absent sentence below.
         crate::daemon_client::RunningDaemonReading::OpeningAuthority {
@@ -1578,7 +1693,7 @@ pub async fn admit_before_reading(layout: &kin_core::KinLayout) -> StatusAdmissi
             warming,
         } => {
             return StatusAdmission::Skipped(opening_authority_admission_sentence(
-                pid, port, &detail, waited, warming,
+                *pid, *port, detail, *waited, *warming,
             ));
         }
         crate::daemon_client::RunningDaemonReading::Absent => {
@@ -1919,6 +2034,10 @@ fn render_embedding_coverage(coverage: &EmbeddingCoverage) -> String {
                 EmbeddingCoverageUnobserved::SamplingFailed => {
                     "the coverage sample did not complete"
                 }
+                EmbeddingCoverageUnobserved::DaemonNotAnswering => {
+                    "this repository's daemon is running and did not answer in time, so its live \
+                     graph was not read"
+                }
             };
             format!("not observed ({explanation})")
         }
@@ -2058,6 +2177,238 @@ mod tests {
             why.contains("no daemon is running"),
             "an absent daemon is still reported as absent: {why}"
         );
+    }
+
+    /// Point the machine supervisor's directory at an empty one, so a case about
+    /// a daemon the supervisor does not list cannot be answered by whatever
+    /// supervisor this host happens to run.
+    fn without_a_supervisor(env: &mut kin_core::test_env::EnvVarGuard, dir: &std::path::Path) {
+        let registry = dir.join("registry.toml");
+        env.apply("KIN_REGISTRY_PATH", Some(registry.to_str().unwrap()));
+        env.apply("KIN_DAEMON_URL", None::<&str>);
+    }
+
+    /// `kin status` reads a daemon the supervisor does not list.
+    ///
+    /// A daemon started as `kin-daemon --repo <path> --port 0` registers with no
+    /// supervisor. Resolving the live read through the supervisor's route alone
+    /// found nothing, so every status beside such a daemon opened the whole
+    /// store in process and printed "no daemon holds this repository's live
+    /// graph" while the daemon was answering: 36.8 s and 3,490,843,292 bytes on
+    /// the founder's store, 143 s beside an idle daemon on a 3.5 GiB scratch one.
+    ///
+    /// Breaking it: resolve the live read through the supervisor route alone
+    /// again, and this reads `OwnAuthorityOpen` with the daemon never asked.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_daemon_the_supervisor_does_not_list_answers_the_status_read() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(root.path()).unwrap().layout;
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        let report = inspect(
+            &layout,
+            &binding,
+            EmbeddingCoverage::Observed {
+                source: EmbeddingCoverageSource::LiveQueryGraph,
+                indexed: 3,
+                pending: 0,
+                total: 3,
+            },
+        )
+        .unwrap();
+        let response = serde_json::to_value(CommandStatusResponse {
+            report,
+            build: None,
+            text: String::new(),
+            json: None,
+            merge: None,
+            workspace_tip: Some(crate::commands::workspace_tip::WorkspaceTip::Detached),
+            authority_readings_taken: true,
+        })
+        .unwrap();
+        let repo_root = layout
+            .working_dir()
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let status_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&status_reads);
+        let app = axum::Router::new()
+            .route(
+                "/readiness",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({ "ready": true, "warming": false }))
+                }),
+            )
+            .route(
+                "/health",
+                axum::routing::get(move || {
+                    let repo_root = repo_root.clone();
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "status": "ok",
+                            "version": "test",
+                            "uptime_seconds": 1,
+                            "graph_loaded": true,
+                            "reconciliation_status": "idle",
+                            "repo_root": repo_root,
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/commands/status",
+                axum::routing::post(move || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = response.clone();
+                    async move { axum::Json(response) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        std::fs::write(
+            layout.root().join("daemon.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(layout.root().join("daemon.port"), port.to_string()).unwrap();
+        let supervisor_home = tempfile::tempdir().unwrap();
+        let mut env = kin_core::test_env::EnvVarGuard::new();
+        without_a_supervisor(&mut env, supervisor_home.path());
+
+        let daemon = crate::daemon_client::running_daemon_reading(&layout).await;
+        assert!(
+            matches!(
+                daemon,
+                crate::daemon_client::RunningDaemonReading::Serving(_)
+            ),
+            "the fixture must answer as a serving daemon, or this case tests nothing: {daemon:?}"
+        );
+        let before = kin_core::authority_opens();
+        let reading = read_status_once(&layout, &daemon).await.unwrap();
+        let opens = kin_core::authority_opens() - before;
+        server.abort();
+
+        assert_eq!(
+            reading.source,
+            AuthoritySource::RunningDaemon,
+            "a daemon that answers is read, not bypassed"
+        );
+        assert_eq!(
+            status_reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the status came from the daemon's own route"
+        );
+        assert_eq!(opens, 0, "reading from the daemon opens nothing here");
+        assert!(
+            matches!(
+                reading.report.embedding_coverage,
+                EmbeddingCoverage::Observed { indexed: 3, .. }
+            ),
+            "{:?}",
+            reading.report.embedding_coverage
+        );
+    }
+
+    /// A daemon that is alive and does not answer is never reported as absent,
+    /// and the whole-store open beside it names itself as that.
+    ///
+    /// The fixture accepts connections and never answers them, which is what a
+    /// daemon whose listener sits behind a blocked worker looks like from the
+    /// outside (measured on a scratch daemon: two 60 s timeouts, TCP connect in
+    /// 0.4 ms). This process is the recorded pid, so the process is alive.
+    ///
+    /// Breaking it: map a daemon that did not answer to `NoRunningDaemon`, or
+    /// drop the pid from the clause, and an assertion below names the lie.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_live_daemon_that_does_not_answer_is_not_reported_as_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(root.path()).unwrap().layout;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        std::fs::write(
+            layout.root().join("daemon.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(layout.root().join("daemon.port"), port.to_string()).unwrap();
+        let supervisor_home = tempfile::tempdir().unwrap();
+        let mut env = kin_core::test_env::EnvVarGuard::new();
+        without_a_supervisor(&mut env, supervisor_home.path());
+        env.apply("KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS", Some("1"));
+
+        let daemon = crate::daemon_client::running_daemon_reading(&layout).await;
+        assert!(
+            matches!(
+                daemon,
+                crate::daemon_client::RunningDaemonReading::OpeningAuthority { .. }
+            ),
+            "the fixture must read as alive and not answering: {daemon:?}"
+        );
+        let gap = match live_status(&layout, &daemon).await {
+            Err(gap) => gap,
+            Ok(_) => panic!("a daemon that never answers produced a status"),
+        };
+        let reading = read_status_once(&layout, &daemon).await.unwrap();
+        silent.abort();
+
+        assert_eq!(gap.reason, EmbeddingCoverageUnobserved::DaemonNotAnswering);
+        let clause = gap
+            .beside_live_daemon
+            .expect("a running daemon is named, not dropped");
+        assert!(
+            clause.contains(&format!("pid {}", std::process::id())),
+            "{clause}"
+        );
+        assert!(clause.contains(&format!("port {port}")), "{clause}");
+        assert!(clause.contains("is alive"), "{clause}");
+
+        assert_eq!(
+            reading.source,
+            AuthoritySource::OwnAuthorityOpenBesideLiveDaemon
+        );
+        assert_eq!(
+            reading.report.embedding_coverage,
+            EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::DaemonNotAnswering)
+        );
+        let coverage = render_embedding_coverage(&reading.report.embedding_coverage);
+        assert!(!coverage.contains("no daemon"), "{coverage}");
+        let answered_by = crate::commands::repository_authority::answered_by_line(reading.source);
+        assert!(
+            !answered_by.contains("Start this repository's daemon"),
+            "{answered_by}"
+        );
+    }
+
+    /// What the notice before an open beside a running daemon owes the reader:
+    /// the size of what the open re-verifies here, and that the daemon is up.
+    #[test]
+    fn the_notice_before_an_open_beside_a_running_daemon_names_its_cost() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(root.path()).unwrap().layout;
+        let notice = open_beside_live_daemon_notice(
+            "this repository's daemon (pid 12538, port 56698) is alive and did not answer a \
+             readiness check in 4209 ms",
+            &StoreFootprint::measure(&layout),
+        );
+        assert!(notice.contains("pid 12538"), "{notice}");
+        assert!(notice.contains("under .kin/ here"), "{notice}");
+        assert!(
+            notice.contains("re-verifies every persisted body"),
+            "{notice}"
+        );
+        assert!(notice.contains("not absent"), "{notice}");
     }
 
     /// The coverage a bare authority read publishes. These cases exercise the
@@ -2994,10 +3345,19 @@ mod tests {
         let init = kin_core::init(root.path()).expect("kin_core::init builds a real store");
 
         let before = kin_core::authority_opens();
-        let reading = read_status_once(&init.layout)
-            .await
-            .expect("a fresh store answers a status");
+        let reading = read_status_once(
+            &init.layout,
+            &crate::daemon_client::RunningDaemonReading::Absent,
+        )
+        .await
+        .expect("a fresh store answers a status");
         let opens = kin_core::authority_opens() - before;
+        // The absent control for the arms below: with nothing running, the page
+        // still says so, and only then.
+        assert_eq!(
+            reading.report.embedding_coverage,
+            EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::NoRunningDaemon)
+        );
 
         // Non-vacuity, all three halves. A reading that came from a daemon would
         // open nothing here and pass the bound while testing nothing, and a tip
