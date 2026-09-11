@@ -127,7 +127,7 @@ export interface RepoScopedSemanticToolError {
 
 export type ActorKind = "human" | "agent" | "system";
 export type EvidenceStatus = "complete" | "partial" | "missing";
-export type ReviewRisk = "low" | "medium" | "high";
+export type ReviewRisk = "low" | "medium" | "high" | "not_assessed";
 export type ReviewAuthority = "graph" | "overlay";
 export type ReviewPlane = "repo-local" | "hosted-managed";
 export type ReviewProvenance = "graph" | "overlay" | "system-generated";
@@ -222,7 +222,7 @@ export interface ReviewQueueItem {
   domain: string;
   scope: string;
   summary: string;
-  changedEntities: number;
+  changedEntities: number | null;
   activeAgents: number;
   evidenceStatus: EvidenceStatus;
   risk: ReviewRisk;
@@ -356,7 +356,7 @@ export interface SemanticDiffEntity {
   name: string;
   kind: string;
   changeType: "added" | "modified" | "removed";
-  riskLevel: "low" | "medium" | "high";
+  riskLevel: "low" | "medium" | "high" | "critical" | "not_assessed";
   changes: SemanticDiffEntityChange[];
 }
 
@@ -367,7 +367,7 @@ export interface SemanticDiffResponse {
 export interface EntityChange {
   name: string;
   kind: string;
-  riskLevel: "low" | "medium" | "high";
+  riskLevel: "low" | "medium" | "high" | "critical" | "not_assessed";
   beforeSignature?: string;
   afterSignature?: string;
 }

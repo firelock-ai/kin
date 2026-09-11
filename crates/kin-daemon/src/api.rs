@@ -1249,6 +1249,20 @@ const REPO_SCOPED_BLOB_CAPABILITY: &str = "repo_scoped_blob_v1";
 /// is a comparison of zero files, which is indistinguishable from two refs that
 /// really are identical. A caller reading this string never has to guess.
 const REPO_SCOPED_COMPARE_CAPABILITY: &str = "repo_scoped_compare_v1";
+/// This daemon lists a repository's stored reviews and reads one in full.
+///
+/// A control plane asking an older daemon for a review gets an unmatched-route
+/// 404, which reads exactly like a review this repository does not hold. The
+/// capability is how that caller keeps "no such review" and "this daemon
+/// cannot say" apart.
+const REPO_SCOPED_REVIEWS_CAPABILITY: &str = "repo_reviews_v1";
+/// This daemon answers what changed between two refs, entity by entity.
+///
+/// Advertised for the compare capability's reason: a caller that cannot tell
+/// a daemon without this route from one with it has to decide what an
+/// unanswered diff means, and zero changed entities is the tempting wrong
+/// answer.
+const REPO_SCOPED_SEMANTIC_DIFF_CAPABILITY: &str = "repo_semantic_diff_v1";
 /// Retained continuations per repository, not per daemon.
 ///
 /// A per-daemon cap is a shared resource across tenants, and the eviction that
@@ -2266,6 +2280,18 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         )
         .route("/repos/{repo_id}/refs", get(repo_refs))
         .route("/repos/{repo_id}/history", get(repo_history))
+        .route(
+            "/repos/{repo_id}/reviews",
+            get(crate::repo_review::repo_reviews),
+        )
+        .route(
+            "/repos/{repo_id}/reviews/{review_id}",
+            get(crate::repo_review::repo_review_detail),
+        )
+        .route(
+            "/repos/{repo_id}/semantic-diff",
+            get(crate::repo_review::repo_semantic_diff),
+        )
         .route(
             "/repos/{repo_id}/transfer/advertise",
             get(repo_transfer_advertise),
@@ -9442,6 +9468,11 @@ async fn review(
     .map_err(|error| {
         if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
             (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
+        } else if error
+            .downcast_ref::<kin_cli::commands::review::ReviewNotFound>()
+            .is_some()
+        {
+            (StatusCode::NOT_FOUND, error.to_string())
         } else {
             internal_error(error)
         }
@@ -15737,7 +15768,7 @@ async fn mcp_tools_call_dispatch(
 /// [`DaemonError::RepoAbsentFromStorage`] so it survives the trip here. Reading
 /// it back out of a flattened storage error's wording would be the same
 /// infer-from-the-failure mistake the served key space exists to avoid.
-async fn repo_scoped_graph(
+pub(crate) async fn repo_scoped_graph(
     state: &DaemonState,
     repo_id: &str,
 ) -> Result<Arc<kin_db::InMemoryGraph>, (StatusCode, String)> {
@@ -15873,7 +15904,7 @@ fn repository_metadata(
 /// graph in one entry, probes its publication cursor, and replaces both as one
 /// unit when authority moves, so this is both cheaper and stricter about
 /// generation consistency.
-async fn repository_ref_metadata(
+pub(crate) async fn repository_ref_metadata(
     state: &DaemonState,
     repo_id: &str,
 ) -> Result<Arc<kin_db::PersistedRepositoryAuthority>, (StatusCode, String)> {
@@ -17016,6 +17047,8 @@ async fn repo_health(
                     REPO_SCOPED_SEMANTIC_CAPABILITY.to_string(),
                     REPO_SCOPED_BLOB_CAPABILITY.to_string(),
                     REPO_SCOPED_COMPARE_CAPABILITY.to_string(),
+                    REPO_SCOPED_REVIEWS_CAPABILITY.to_string(),
+                    REPO_SCOPED_SEMANTIC_DIFF_CAPABILITY.to_string(),
                 ]
             })
             .unwrap_or_default(),
@@ -20228,6 +20261,7 @@ fn bind_std_listener(
 #[cfg(test)]
 mod tests {
     mod outside_graph_disclosure;
+    mod repo_review_routes;
     mod session_identity;
     mod session_move_identity;
     /// THE WIRING SPINE (FIR-2524, captain's rider). The envelope the impact

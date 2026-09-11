@@ -139,6 +139,7 @@ pub mod publication_lease;
 pub mod replica_adoption;
 pub mod repo_blob;
 pub mod repo_compare;
+pub mod repo_review;
 mod repository_admit;
 mod repository_branch;
 mod repository_checkout;

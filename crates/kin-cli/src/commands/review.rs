@@ -67,6 +67,21 @@ pub enum ReviewRequest {
     },
 }
 
+/// A review id the store holds no review under.
+///
+/// Typed so the daemon can answer 404 for it rather than the 500 an untyped
+/// error gets: a missing record is the caller's answer, not a daemon fault.
+#[derive(Debug)]
+pub struct ReviewNotFound(pub String);
+
+impl std::fmt::Display for ReviewNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "review not found: {}", self.0)
+    }
+}
+
+impl std::error::Error for ReviewNotFound {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewResponse {
     #[serde(default)]
@@ -950,28 +965,21 @@ fn list_reviews_with_graph(
     graph: &kin_db::InMemoryGraph,
     state: Option<String>,
 ) -> Result<ReviewExecution> {
-    use kin_model::review::{ReviewDecisionState, ReviewFilter};
-
     let state_filter = state
         .as_deref()
-        .map(|s| match s.to_lowercase().as_str() {
-            "pending" => Ok(ReviewDecisionState::Pending),
-            "approved" => Ok(ReviewDecisionState::Approved),
-            "needs_work" | "needs-work" => Ok(ReviewDecisionState::NeedsWork),
-            "blocked" => Ok(ReviewDecisionState::Blocked),
-            _ => Err(anyhow::anyhow!(
-                "invalid state: {}. Use: pending, approved, needs_work, blocked",
-                s
-            )),
+        .map(|s| {
+            kin_review::records::parse_review_decision_state(s).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid state: {}. Use: pending, approved, needs_work, blocked",
+                    s
+                )
+            })
         })
         .transpose()?;
 
-    let filter = ReviewFilter {
-        states: state_filter.map(|value| vec![value]),
-        reviewer: None,
-    };
-
-    let reviews = graph.list_reviews(&filter)?;
+    // The shared read the MCP tools and the daemon's repo-scoped routes use,
+    // which also fixes the order: newest first, not the store's map order.
+    let reviews = kin_review::records::list_stored_reviews(graph, state_filter)?;
 
     if reviews.is_empty() {
         return Ok(ReviewExecution {
@@ -1014,9 +1022,15 @@ fn show_review_with_graph(
     use kin_model::review::ReviewId;
 
     let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
-    let review = graph
-        .get_review(&rid)?
-        .ok_or_else(|| anyhow::anyhow!("review not found: {}", review_id))?;
+    // The shared read the MCP tools and the daemon's repo-scoped routes use.
+    let kin_review::records::ReviewRecord {
+        review,
+        decisions,
+        notes,
+        discussions,
+        assignments,
+    } = kin_review::records::read_review_record(graph, &rid)?
+        .ok_or_else(|| anyhow::Error::new(ReviewNotFound(review_id.clone())))?;
 
     let mut text = String::new();
     writeln!(text, "Review: {}", review.review_id)?;
@@ -1028,7 +1042,6 @@ fn show_review_with_graph(
         review.base_ref, review.head_ref
     )?;
 
-    let decisions = graph.get_review_decisions(&rid)?;
     if !decisions.is_empty() {
         writeln!(text, "\nDecisions:")?;
         for d in &decisions {
@@ -1045,7 +1058,6 @@ fn show_review_with_graph(
         }
     }
 
-    let notes = graph.get_review_notes(&rid)?;
     if !notes.is_empty() {
         writeln!(text, "\nNotes:")?;
         for n in &notes {
@@ -1058,7 +1070,6 @@ fn show_review_with_graph(
         }
     }
 
-    let discussions = graph.get_review_discussions(&rid)?;
     if !discussions.is_empty() {
         writeln!(text, "\nDiscussions:")?;
         for d in &discussions {
@@ -1080,7 +1091,6 @@ fn show_review_with_graph(
         }
     }
 
-    let assignments = graph.get_review_assignments(&rid)?;
     if !assignments.is_empty() {
         writeln!(text, "\nAssigned reviewers:")?;
         for a in &assignments {

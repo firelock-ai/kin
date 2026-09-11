@@ -348,10 +348,25 @@ pub(crate) fn resolve_read_point(
     let authority = view
         .authority()
         .map_err(|parts| RepoBlobError::from_parts(RepoBlobRefusal::RepositoryUnreadable, parts))?;
+    resolve_read_point_in(authority, reference, repo_id)
+}
+
+/// [`resolve_read_point`] against an authority envelope the caller already
+/// holds, for a route that reads the envelope without a whole read view.
+///
+/// The rule is the same one rather than a copy of it, which is why the view
+/// form above only unwraps its envelope and delegates here.
+pub(crate) fn resolve_read_point_in(
+    authority: &kin_db::PersistedRepositoryAuthority,
+    reference: Option<&str>,
+    repo_id: &str,
+) -> Result<(kin_model::SemanticChangeId, Option<String>), RepoBlobError> {
     let resolve = |target: &kin_model::RefTarget| {
-        view.resolve_target(target).map_err(|parts| {
-            RepoBlobError::from_parts(RepoBlobRefusal::RepositoryUnreadable, parts)
-        })
+        crate::state::resolve_repository_target(authority, target)
+            .map_err(crate::api::repository_authority_error)
+            .map_err(|parts| {
+                RepoBlobError::from_parts(RepoBlobRefusal::RepositoryUnreadable, parts)
+            })
     };
     let Some(reference) = reference.map(str::trim).filter(|value| !value.is_empty()) else {
         let default_ref = default_repository_ref(authority)
