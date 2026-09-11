@@ -16,6 +16,7 @@
 use anyhow::{bail, Context, Result};
 use kin_core::{KinConfig, KinLayout, RemoteHostKind, RemoteTransportKind};
 use kin_model::RefName;
+use kin_remote::collaboration_transfer::CollaborationTransfer;
 use kin_remote::repository_transfer_negotiation::{
     RepositoryPushPlan, RepositoryTransferDirection, RepositoryTransferOutcome,
     RepositoryTransferPlan,
@@ -458,7 +459,8 @@ fn render_outcome(response: &CommandTransferResponse, json: bool) -> Result<()> 
         // is the mode a caller chains work from, so it is the mode where an
         // exit status that ignored a working tree left behind would do the most
         // damage. The body still carries the state; this decides the status.
-        return workspace_follow_outcome(&response.workspace);
+        workspace_follow_outcome(&response.workspace)?;
+        return review_records_outcome(&response.outcome);
     }
     let outcome = &response.outcome;
     let verb = match outcome.direction {
@@ -495,7 +497,80 @@ fn render_outcome(response: &CommandTransferResponse, json: bool) -> Result<()> 
             "Search and retrieval answer from behind the admitted head until those views are rebuilt. Restart the daemon to rebuild them."
         );
     }
-    render_workspace_follow(&response.workspace)
+    render_review_records(outcome);
+    render_workspace_follow(&response.workspace)?;
+    review_records_outcome(outcome)
+}
+
+/// Report what the review phase did.
+///
+/// It runs after the ref phase, so whatever it reports, any history the
+/// transfer moved is already durable.
+fn render_review_records(outcome: &RepositoryTransferOutcome) {
+    let Some(reviews) = &outcome.collaboration else {
+        return;
+    };
+    let push = outcome.direction == RepositoryTransferDirection::Push;
+    match reviews {
+        CollaborationTransfer::InSync => {
+            println!("Reviews:   both replicas already hold the same review records.")
+        }
+        CollaborationTransfer::PeerUnsupported {
+            local_records: Some(count),
+        } => println!(
+            "Reviews:   not carried. The remote does not exchange review records (collaboration-v1), so the {count} held here stayed here."
+        ),
+        CollaborationTransfer::PeerUnsupported {
+            local_records: None,
+        } => println!(
+            "Reviews:   not pulled. The remote does not exchange review records (collaboration-v1), so any it holds stayed there."
+        ),
+        CollaborationTransfer::Skipped { reason } => {
+            println!("Reviews:   not exchanged: {reason}")
+        }
+        CollaborationTransfer::Exchanged {
+            carried,
+            gaps,
+            receipt,
+        } => {
+            match (receipt, push) {
+                (Some(receipt), true) => println!(
+                    "Reviews:   carried {carried} review record(s) to the remote (its authority generation {}).",
+                    receipt.authority_receipt.generation
+                ),
+                (Some(receipt), false) => println!(
+                    "Reviews:   pulled {carried} review record(s) (authority generation {}).",
+                    receipt.authority_receipt.generation
+                ),
+                (None, true) => {
+                    println!("Reviews:   the remote already holds every review record this replica has.")
+                }
+                (None, false) => {
+                    println!("Reviews:   this replica already holds every review record the remote has.")
+                }
+            }
+            for gap in gaps {
+                println!("Review gap: {}: {}", gap.record, gap.detail);
+            }
+        }
+        CollaborationTransfer::Refused { reason } => {
+            println!("Reviews:   not exchanged: {reason}")
+        }
+    }
+}
+
+/// Fail the command when its review phase could not complete, in every output
+/// mode, for the reason the working-tree check does: a caller chaining work
+/// onto a transfer reads the exit status. A peer that does not exchange review
+/// records, and a record the merge names instead of overwriting, are reported
+/// and are not failures.
+fn review_records_outcome(outcome: &RepositoryTransferOutcome) -> Result<()> {
+    if let Some(CollaborationTransfer::Refused { reason }) = &outcome.collaboration {
+        bail!(
+            "review records were not exchanged: {reason}. Any history this transfer moved is durable; re-running it retries the review records."
+        );
+    }
+    Ok(())
 }
 
 /// Report what the working tree did, and fail the command when it did not
@@ -682,6 +757,7 @@ mod tests {
                 destination_ref: main,
                 plan: RepositoryTransferPlan::UpToDate { head: None },
                 receipts: Vec::new(),
+                collaboration: None,
             },
             derived_views: DerivedViewRefresh::Current,
             workspace,

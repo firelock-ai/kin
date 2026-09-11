@@ -16289,7 +16289,7 @@ fn configured_transfer_limits() -> kin_remote::repository_transfer::RepositoryTr
 /// A hosted daemon runs no policy. Its storage backend is not a local `.kin`
 /// layout, and the scaffolding directory beside it belongs to no repository
 /// whose provenance this transfer touched.
-fn apply_received_repository_transfer_pack(
+pub(crate) fn apply_received_repository_transfer_pack(
     state: &DaemonState,
     authority: &RepositoryAuthorityManager<dyn StorageBackend>,
     repository_id: &RepositoryId,
@@ -16544,6 +16544,28 @@ async fn repo_transfer_receive(
     Json(request): Json<RepositoryTransferReceiveRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let (repository_id, authority) = repository_transfer_authority(&state, &repo_id)?;
+    if request.pack.collaboration.is_some() && state.storage_backend.is_none() {
+        // Review records land the way a review write does, under the two gates
+        // every authority writer here holds, so the live graph a review write
+        // plans against follows them before anything else can plan.
+        let _coordination = state.coordination_gate.lock().await;
+        let admitted = {
+            let _graph_mutation = state.begin_graph_authority_mutation();
+            crate::review_transfer::admit_review_records(
+                &state,
+                &authority,
+                &repository_id,
+                &request.destination_ref,
+                kin_model::AuthorId::new("kin-daemon:repository-transfer-receiver"),
+                &request.pack,
+            )
+        };
+        let (receipt, stale) = admitted.map_err(repository_transfer_error)?;
+        if let Some(detail) = stale {
+            record_derived_view_staleness(&state, &DerivedViewRefresh::Stale { detail }).await;
+        }
+        return Ok(Json(receipt));
+    }
     let receipt = apply_received_repository_transfer_pack(
         &state,
         &authority,
@@ -16810,6 +16832,27 @@ pub(crate) async fn pull_into_replica(
                 &source_ref,
                 &destination_ref,
                 |pack| {
+                    if pack.collaboration.is_some() && local_derived_views {
+                        // Review records land the way a review write does; see
+                        // `review_transfer`. This runs on a blocking thread, so
+                        // the coordination gate is taken without an await.
+                        let _coordination = blocking_state.coordination_gate.blocking_lock();
+                        let _graph_mutation = blocking_state.begin_graph_authority_mutation();
+                        let (receipt, stale) = crate::review_transfer::admit_review_records(
+                            &blocking_state,
+                            &authority,
+                            &repository_id,
+                            &destination_ref,
+                            kin_model::AuthorId::new("kin-daemon:repository-transfer-puller"),
+                            pack,
+                        )?;
+                        if let Some(detail) = stale {
+                            if !refresh.is_stale() {
+                                refresh = DerivedViewRefresh::Stale { detail };
+                            }
+                        }
+                        return Ok(receipt);
+                    }
                     let receipt = apply_received_repository_transfer_pack(
                         &blocking_state,
                         &authority,
@@ -16857,7 +16900,7 @@ pub(crate) async fn pull_into_replica(
     // Hosted cache freshness is cursor-driven. Do not put a durable pull
     // receipt behind an in-flight full reload, and do not evict a successor a
     // concurrent reader may already have installed.
-    if !outcome.moved_history() {
+    if !outcome.moved_history() && !outcome.carried_review_records() {
         derived_views = DerivedViewRefresh::Current;
     }
     record_derived_view_staleness(&state, &derived_views).await;

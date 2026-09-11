@@ -20,12 +20,16 @@ use kin_db::{
 };
 use kin_model::{
     compute_resolved_tree_hash, validate_semantic_change_id, AdmissionCase, AuthorId, ChangeOrigin,
-    ChangeStore, DefaultRefExpectation, DefaultRefMutation, ExternalChangeAlias, ExternalObjectId,
-    ExternalObjectKind, ExternalObjectRecord, GitExternalAuthority, GitExternalAuthorityDelta,
-    Hash256, ModelError, OperationId, RefExpectation, RefMutation, RefName, RefTarget,
-    RefUpdatePolicy, RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId,
-    RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId, TreeEntry, WorkspaceId,
-    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    ChangeStore, CollaborationDelta, DefaultRefExpectation, DefaultRefMutation,
+    ExternalChangeAlias, ExternalObjectId, ExternalObjectKind, ExternalObjectRecord,
+    GitExternalAuthority, GitExternalAuthorityDelta, Hash256, ModelError, OperationId,
+    RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RepositoryCommitOutcome,
+    RepositoryCommitReceipt, RepositoryId, RepositoryTransaction, RootBundle, SemanticChange,
+    SemanticChangeId, TreeEntry, WorkspaceId, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+};
+
+use crate::collaboration_transfer::{
+    admission_refusals, outside_review_domain, ReviewDomain, MAX_COLLABORATION_RECORDS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -130,6 +134,14 @@ pub const FEATURE_EXACT_TREES: &str = "exact-trees-v1";
 pub const FEATURE_IMMUTABLE_SOURCE_CAS: &str = "immutable-source-cas-v1";
 pub const FEATURE_REF_CAS: &str = "ref-cas-v1";
 pub const FEATURE_RAW_REPOSITORY_PATHS: &str = "raw-repository-paths-v1";
+/// This peer exchanges review records in a collaboration-only pack after the
+/// ref phase.
+///
+/// Advertised, never required: a peer without it gets exactly the transfer it
+/// always got, and the sender says which records it did not carry. So it is
+/// deliberately absent from [`REQUIRED_FEATURES`], whose list a pack must
+/// repeat exactly.
+pub const FEATURE_COLLABORATION: &str = "collaboration-v1";
 
 pub const MAX_TRANSFER_CHANGES: usize = 512;
 pub const MAX_TRANSFER_TREES: usize = MAX_TRANSFER_CHANGES;
@@ -772,6 +784,14 @@ pub struct RepositoryTransferPack {
     /// declared one is caught as a transfer-identity mismatch.
     #[serde(default)]
     pub source_hydration_semantics: Option<u32>,
+    /// Review records this pack carries.
+    ///
+    /// Present only on a pack that moves no history, sent after the ref phase to
+    /// a peer that advertises [`FEATURE_COLLABORATION`], and absent from every
+    /// other pack. Not serialized when absent, so a pack that carries none keeps
+    /// its bytes and its transfer identity exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration: Option<CollaborationDelta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -841,7 +861,7 @@ pub fn repository_transfer_status<B: StorageBackend + ?Sized + 'static>(
         roots: lease.roots().clone(),
         default_ref: lease.authority_metadata().ref_state.default_ref.clone(),
         git_authority_hash,
-        supported_features: required_features(),
+        supported_features: advertised_features(),
         limits: RepositoryTransferLimits::default(),
         push_apply_ready: true,
         bounded_envelope_export_ready: true,
@@ -925,9 +945,26 @@ pub fn repository_ref_advertisement<B: StorageBackend + ?Sized + 'static>(
         refs,
         default_ref: lease.authority_metadata().ref_state.default_ref.clone(),
         roots: lease.roots().clone(),
-        supported_features: required_features(),
+        supported_features: advertised_features(),
         limits: RepositoryTransferLimits::default(),
     })
+}
+
+/// What this build advertises: every required feature, then the optional ones.
+///
+/// A peer checks only that the required ones are present, so an optional
+/// feature here is invisible to a peer that does not know it.
+fn advertised_features() -> Vec<String> {
+    let mut features = required_features();
+    features.push(FEATURE_COLLABORATION.to_string());
+    features
+}
+
+/// Whether a peer advertising `supported` exchanges review records.
+pub fn peer_exchanges_collaboration(supported: &[String]) -> bool {
+    supported
+        .iter()
+        .any(|feature| feature == FEATURE_COLLABORATION)
 }
 
 /// One pack of a transfer that may need more than one, and what is left after
@@ -1037,6 +1074,25 @@ pub fn build_repository_transfer_segment<B: StorageBackend + ?Sized + 'static>(
         expectation.destination_head,
     )?;
     if closure.is_empty() {
+        // Nothing left to fast-forward. A peer that exchanges review records
+        // asks this way for this replica's, once the ref phase has brought both
+        // replicas to one head; a peer that does not is told there is no
+        // segment, exactly as before.
+        if peer_exchanges_collaboration(&expectation.supported_features) {
+            let records =
+                ReviewDomain::from_snapshot(authority.read_authority().snapshot()).to_delta();
+            let pack = collaboration_pack(
+                &context,
+                &expectation,
+                source_ref,
+                source_hydration_semantics,
+                records,
+            )?;
+            return Ok(RepositoryTransferSegment {
+                pack,
+                remaining_changes: 0,
+            });
+        }
         return Err(invalid(format!(
             "source head {} is already the destination head; there is no segment to build",
             context.source_head
@@ -1100,6 +1156,113 @@ pub fn build_repository_transfer_segment<B: StorageBackend + ?Sized + 'static>(
             }
         }
     }
+}
+
+/// A pack carrying `collaboration` from this replica and moving no history.
+///
+/// Built against `expectation`, the destination's lease, once the ref phase has
+/// brought both replicas to one head. The envelope names that head as source,
+/// target and expected destination alike, which is what `validate_pack`
+/// requires of a pack carrying records, and the destination's compare-and-swap
+/// on its lease still decides whether the records land.
+pub fn build_collaboration_transfer_pack<B: StorageBackend + ?Sized + 'static>(
+    authority: &RepositoryAuthorityManager<B>,
+    source_ref: &RefName,
+    expectation: &RepositoryTransferExpectation,
+    source_hydration_semantics: Option<u32>,
+    collaboration: CollaborationDelta,
+) -> Result<RepositoryTransferPack> {
+    let expectation = locally_bounded_expectation(expectation)?;
+    let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
+    collaboration_pack(
+        &context,
+        &expectation,
+        source_ref,
+        source_hydration_semantics,
+        Some(collaboration),
+    )
+}
+
+/// `exported`, a review export's answer, carrying `collaboration` in place of
+/// the records it was exported with, under an operation of its own.
+///
+/// A pull merges the remote's records against this replica's before admitting
+/// any, so what it admits is the merge rather than the export. The rest of the
+/// envelope is the export's, built against this replica's own lease, and
+/// admission checks it against that lease like any other pack.
+pub fn with_collaboration(
+    mut exported: RepositoryTransferPack,
+    collaboration: CollaborationDelta,
+    limits: &RepositoryTransferLimits,
+) -> Result<RepositoryTransferPack> {
+    if pack_moves_history(&exported) {
+        return Err(invalid(
+            "only a pack that moves no history can carry review records",
+        ));
+    }
+    exported.collaboration = Some(collaboration);
+    exported.operation_id = OperationId::new();
+    exported.transfer_id = compute_transfer_id(&exported)?;
+    validate_pack(&exported, limits)?;
+    Ok(exported)
+}
+
+/// The history-less pack a review export answers with.
+///
+/// It carries `collaboration` when this replica holds review records, and no
+/// records at all when it holds none, which is how a peer with nothing to offer
+/// says so. Admission refuses that second kind, because it publishes nothing.
+fn collaboration_pack(
+    context: &TransferSourceContext,
+    expectation: &RepositoryTransferExpectation,
+    source_ref: &RefName,
+    source_hydration_semantics: Option<u32>,
+    collaboration: Option<CollaborationDelta>,
+) -> Result<RepositoryTransferPack> {
+    let head = context.source_head;
+    if expectation.destination_head != Some(head) {
+        return Err(RepositoryTransferError::Conflict(format!(
+            "review records travel only between replicas at one head: this replica is at {head} and \
+             the destination at {}",
+            expectation
+                .destination_head
+                .map(|head| head.to_string())
+                .unwrap_or_else(|| "an unborn ref".to_string())
+        )));
+    }
+    let tree = TransferChangeStore::new(context.all_changes.values().cloned())
+        .resolve_tree_at(&head)
+        .map_err(model)?;
+    let mut pack = RepositoryTransferPack {
+        schema_version: REPOSITORY_TRANSFER_SCHEMA_VERSION,
+        protocol: REPOSITORY_TRANSFER_PROTOCOL.to_string(),
+        transfer_id: Hash256::from_bytes([0; 32]),
+        operation_id: OperationId::new(),
+        repository_id: expectation.repository_id.clone(),
+        source_ref: source_ref.clone(),
+        destination_ref: expectation.destination_ref.clone(),
+        source_head: head,
+        transfer_target_head: head,
+        source_tree_hash: compute_resolved_tree_hash(&tree).map_err(model)?,
+        expected_destination_target: expectation.destination_target.clone(),
+        expected_destination_head: expectation.destination_head,
+        expected_destination_roots: expectation.roots.clone(),
+        expected_destination_default_ref: expectation.default_ref.clone(),
+        source_git_authority_hash: context.source_git_authority_hash,
+        expected_destination_git_authority_hash: expectation.git_authority_hash,
+        git_authority_bootstrap: None,
+        required_features: required_features(),
+        changes: Vec::new(),
+        trees: Vec::new(),
+        external_objects: Vec::new(),
+        aliases: Vec::new(),
+        bodies: Vec::new(),
+        source_hydration_semantics,
+        collaboration,
+    };
+    pack.transfer_id = compute_transfer_id(&pack)?;
+    validate_pack(&pack, &expectation.limits)?;
+    Ok(pack)
 }
 
 /// Check everything a publication decides before it assembles a pack.
@@ -1522,6 +1685,7 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
         aliases,
         bodies,
         source_hydration_semantics,
+        collaboration: None,
     };
     pack.transfer_id = compute_transfer_id(&pack)?;
     // The sender checks its own work against the ceilings it ASSEMBLED under,
@@ -1659,6 +1823,13 @@ where
             pack.destination_ref, expected_destination_ref
         )));
     }
+    // A review export's answer from a peer that holds no records moves no
+    // history and carries nothing. It is an answer, never a publication.
+    if pack.collaboration.is_none() && !pack_moves_history(pack) {
+        return Err(invalid(
+            "pack publishes nothing: it moves no history and carries no review records",
+        ));
+    }
 
     let transaction = transfer_transaction(pack, actor)?;
     let transaction_hash = transaction.transaction_hash().map_err(model)?;
@@ -1733,6 +1904,23 @@ where
         return Err(RepositoryTransferError::Conflict(
             "destination semantic head moved from the pack lease".to_string(),
         ));
+    }
+    // The merge rule, enforced by the replica the records land on rather than
+    // trusted to the sender: a record this replica holds is only ever extended,
+    // never replaced by one its own history does not lead to.
+    if let Some(collaboration) = &pack.collaboration {
+        let refusals = admission_refusals(lease.snapshot(), collaboration);
+        if !refusals.is_empty() {
+            return Err(RepositoryTransferError::Conflict(format!(
+                "the pack would overwrite review records this replica holds, so none were \
+                 admitted: {}",
+                refusals
+                    .iter()
+                    .map(|gap| format!("{}: {}", gap.record, gap.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
     }
     let current_git_hash =
         hash_git_authority(lease.authority_metadata().git_external_authority.as_ref())?;
@@ -1851,6 +2039,33 @@ pub fn validate_pack(
         limits.max_external_objects,
     )?;
     enforce_count("aliases", pack.aliases.len(), MAX_TRANSFER_ALIASES as u32)?;
+    if let Some(collaboration) = &pack.collaboration {
+        // Review records travel after the ref phase in a pack of their own, so a
+        // pack that publishes history carrying them is malformed, not merely
+        // unusual: its records would land under a lease the ref move is
+        // changing.
+        if pack_moves_history(pack) {
+            return Err(invalid(
+                "a pack carries review records only when it moves no history; review records \
+                 follow the ref phase in a pack of their own",
+            ));
+        }
+        if let Some(reason) = outside_review_domain(collaboration) {
+            return Err(invalid(format!(
+                "pack's collaboration records are not all review records: {reason}"
+            )));
+        }
+        collaboration
+            .validate()
+            .map_err(|error| invalid(format!("collaboration records are not valid: {error}")))?;
+        let records = collaboration.record_count();
+        if records > MAX_COLLABORATION_RECORDS {
+            return Err(invalid(format!(
+                "pack carries {records} review records, over the {MAX_COLLABORATION_RECORDS} one \
+                 pack may carry"
+            )));
+        }
+    }
 
     let expected_id = compute_transfer_id(pack)?;
     if expected_id != pack.transfer_id {
@@ -2404,10 +2619,27 @@ fn published_ref_target(pack: &RepositoryTransferPack) -> RefTarget {
     }
 }
 
+/// Whether `pack` publishes anything but review records: a change, a tree, a
+/// body, an external object, an alias, a bootstrap, or a head other than the
+/// one the destination already holds.
+pub(crate) fn pack_moves_history(pack: &RepositoryTransferPack) -> bool {
+    !pack.changes.is_empty()
+        || !pack.trees.is_empty()
+        || !pack.bodies.is_empty()
+        || !pack.external_objects.is_empty()
+        || !pack.aliases.is_empty()
+        || pack.git_authority_bootstrap.is_some()
+        || pack.transfer_target_head != pack.source_head
+        || pack.expected_destination_head != Some(pack.source_head)
+}
+
 fn transfer_transaction(
     pack: &RepositoryTransferPack,
     actor: AuthorId,
 ) -> Result<RepositoryTransaction> {
+    // `validate_pack` has already refused records on a pack that moves history,
+    // so a pack carrying them moves no ref: its only mutation is the records.
+    let collaboration_only = pack.collaboration.is_some();
     let expected = pack
         .expected_destination_target
         .clone()
@@ -2445,18 +2677,22 @@ fn transfer_transaction(
             .map(GitExternalAuthorityDelta::initialize),
         changes: pack.changes.clone(),
         aliases: pack.aliases.clone(),
-        ref_mutations: vec![RefMutation {
-            name: pack.destination_ref.clone(),
-            expected,
-            new_target: Some(published_ref_target(pack)),
-            policy: RefUpdatePolicy::FastForwardOnly,
-        }],
-        default_ref_mutation,
+        ref_mutations: if collaboration_only {
+            Vec::new()
+        } else {
+            vec![RefMutation {
+                name: pack.destination_ref.clone(),
+                expected,
+                new_target: Some(published_ref_target(pack)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }]
+        },
+        default_ref_mutation: default_ref_mutation.filter(|_| !collaboration_only),
         workspace_mutation: None,
         local_overlay_delta: None,
         merge_transaction_delta: None,
         sealed_observation: None,
-        collaboration_delta: None,
+        collaboration_delta: pack.collaboration.clone(),
     };
     transaction.validate().map_err(model)?;
     Ok(transaction)
@@ -2504,6 +2740,10 @@ struct RepositoryTransferIdentity<'a> {
     aliases: &'a [ExternalChangeAlias],
     bodies: Vec<RepositoryTransferBodyIdentity>,
     source_hydration_semantics: Option<u32>,
+    /// Skipped when absent, so every pack that carries no review records keeps
+    /// the identity it always had.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collaboration: Option<Hash256>,
 }
 
 #[derive(Serialize)]
@@ -2549,6 +2789,15 @@ fn compute_transfer_id(pack: &RepositoryTransferPack) -> Result<Hash256> {
             })
             .collect(),
         source_hydration_semantics: pack.source_hydration_semantics,
+        collaboration: pack
+            .collaboration
+            .as_ref()
+            .map(|delta| {
+                serde_json::to_vec(delta)
+                    .map(|bytes| domain_hash(b"kin-repository-transfer-collaboration-v1\0", &bytes))
+                    .map_err(|error| invalid(format!("serialize collaboration records: {error}")))
+            })
+            .transpose()?,
     };
     let payload = serde_json::to_vec(&identity)
         .map_err(|error| invalid(format!("serialize transfer identity: {error}")))?;
@@ -3291,6 +3540,60 @@ mod tests {
         }
     }
 
+    /// Review records ride only in a pack that moves no history. A ref pack
+    /// carrying them, with its transfer identity recomputed so the identity
+    /// check cannot be what refuses it, is refused by name.
+    ///
+    /// Falsify by removing the `pack_moves_history` refusal from
+    /// `validate_pack`: the pack is no longer refused for this reason and the
+    /// message assertion goes red.
+    #[test]
+    fn review_records_inside_a_ref_pack_are_refused() {
+        let fixture = fixture();
+        let review_id = kin_model::review::ReviewId::new();
+        let mut pack = fixture.pack.clone();
+        assert!(!pack.changes.is_empty(), "the fixture pack moves history");
+        pack.collaboration = Some(CollaborationDelta {
+            reviews: vec![kin_model::Keyed::new(
+                review_id,
+                kin_model::review::Review {
+                    review_id,
+                    title: "rides along".to_string(),
+                    base_ref: "main".to_string(),
+                    head_ref: "feature".to_string(),
+                    state: kin_model::review::ReviewDecisionState::Pending,
+                    completion: kin_model::review::ReviewCompletionState::InReview,
+                    created_by: kin_model::IdentityRef::human("troy"),
+                    created_at: kin_model::Timestamp::now(),
+                    updated_at: kin_model::Timestamp::now(),
+                    scopes: vec![],
+                },
+            )],
+            ..CollaborationDelta::default()
+        });
+        pack.transfer_id = compute_transfer_id(&pack).unwrap();
+
+        let error = apply_repository_transfer_pack(
+            &fixture.destination,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("mixed-sender"),
+            &pack,
+            &RepositoryTransferLimits::default(),
+        )
+        .expect_err("a ref pack carrying review records must be refused");
+        assert!(
+            error.to_string().contains("only when it moves no history"),
+            "{error}"
+        );
+        assert!(fixture
+            .destination
+            .read_authority()
+            .snapshot()
+            .reviews
+            .is_empty());
+    }
+
     /// Build the bootstrap pack a Git-admitted publisher would send into a
     /// replica that has never held anything.
     ///
@@ -3398,6 +3701,7 @@ mod tests {
             // A Git-admitted bootstrap fixture speaks for no local store, so it
             // declares nothing, which is the same thing a hosted sender does.
             source_hydration_semantics: None,
+            collaboration: None,
         };
         pack.transfer_id = compute_transfer_id(&pack).unwrap();
         pack
