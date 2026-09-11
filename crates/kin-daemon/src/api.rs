@@ -144,7 +144,7 @@ const MAX_AUTHORITY_PUBLICATION_RECORD_BYTES: u64 = 1024 * 1024;
 /// whether an already-loaded authority may be reused, and every answer served
 /// still comes from repository-v6 graph truth.
 #[derive(Clone, PartialEq, Eq)]
-enum LocalPublicationIdentity {
+pub(crate) enum LocalPublicationIdentity {
     /// The repository has persisted no authority yet, so its authority is the
     /// unpublished generation-zero state.
     Unpublished,
@@ -158,7 +158,7 @@ enum LocalPublicationIdentity {
 /// request and pay the full load only when the publication has actually moved
 /// — including when it moved under a separate process such as a CLI ingest or
 /// commit running beside the daemon.
-fn read_local_publication_identity(
+pub(crate) fn read_local_publication_identity(
     backend: &LocalFileBackend,
     repository_id: &RepositoryId,
 ) -> Result<LocalPublicationIdentity, (StatusCode, String)> {
@@ -341,6 +341,37 @@ impl ProjectionAuthorityCache {
         });
     }
 
+    /// Hold the authority the daemon's own startup open already paid for.
+    ///
+    /// Opening the daemon decodes the whole persisted authority and re-verifies
+    /// every body in repository CAS, and the admission pair, the first flush and
+    /// the first projection read each used to pay that again within seconds of
+    /// startup, for the same publication. `published` must be the identity read
+    /// BEFORE that open, exactly as every other slot's label is, so a reader
+    /// reuses it only while the record still reads the same and loads fresh the
+    /// moment another writer moves it.
+    ///
+    /// Not counted in [`Self::loads`]. That counter has always counted the
+    /// loads this cache's resolvers paid, and the startup open was never one of
+    /// them; counting it now would change what a daemon reports as its
+    /// `Authority loads` without changing anything it pays.
+    pub(crate) fn install_opened(
+        &self,
+        published: LocalPublicationIdentity,
+        manager: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
+        repository_id: RepositoryId,
+        workspace_id: WorkspaceId,
+    ) {
+        self.install(
+            published,
+            ActiveApiRepositoryAuthority {
+                manager,
+                repository_id,
+                workspace_id,
+            },
+        );
+    }
+
     fn reuse_query(
         &self,
         published: &LocalPublicationIdentity,
@@ -443,13 +474,28 @@ fn confirm_pinned_projection_namespace(
     }
 }
 
-/// Resolve the repository-v6 authority the projection routes answer from.
+/// The daemon's one held repository-v6 authority and the publication label it
+/// was loaded under.
+///
+/// Every local reader in this daemon that needs the authority itself borrows
+/// this one: the projection routes, the refs envelope, the admission pair, the
+/// persistence flush and its read-index finalize, search bodies, the blob
+/// loader and scope builds. An open decodes the complete persisted authority
+/// and re-verifies every body in repository CAS, so each reader that opened its
+/// own paid the whole store again for a publication the daemon already held.
+///
+/// The label is the rule that makes borrowing safe. It is the digest of
+/// `authority.json` read strictly before the load it labels, and the held
+/// authority is handed out only while the record still reads the same. A
+/// publication by anyone else, the CLI or a second daemon included, changes
+/// those bytes, and the next reader loads fresh under the new label instead of
+/// being served what this daemon held before it.
 ///
 /// Blocking: reads storage metadata and, on a publication change, loads the
 /// complete durable authority. Callers run it on a blocking thread.
-fn projection_repository_authority(
+fn held_projection_authority(
     state: &DaemonState,
-) -> Result<ActiveApiRepositoryAuthority, (StatusCode, String)> {
+) -> Result<(LocalPublicationIdentity, ActiveApiRepositoryAuthority), (StatusCode, String)> {
     let backend = state.local_repository_backend().ok_or_else(|| {
         repository_authority_error("local daemon is missing its startup storage capability")
     })?;
@@ -466,7 +512,7 @@ fn projection_repository_authority(
 
     let published = read_local_publication_identity(&backend, &repository_id)?;
     if let Some(authority) = state.projection_authority.reuse(&published) {
-        return Ok(authority);
+        return Ok((published, authority));
     }
 
     let _load = lock_recover(&state.projection_authority.load_gate);
@@ -475,12 +521,12 @@ fn projection_repository_authority(
     // before the load it describes.
     let published = read_local_publication_identity(&backend, &repository_id)?;
     if let Some(authority) = state.projection_authority.reuse(&published) {
-        return Ok(authority);
+        return Ok((published, authority));
     }
     let authority = ActiveApiRepositoryAuthority::open(state)?;
     state
         .projection_authority
-        .install(published, authority.clone());
+        .install(published.clone(), authority.clone());
     // Whether reuse is actually holding is not visible from request latency
     // alone, and a count that climbs with request volume rather than with
     // publications is the signal that it is not.
@@ -489,7 +535,26 @@ fn projection_repository_authority(
         loads = state.projection_authority.loads(),
         "projection repository authority loaded"
     );
-    Ok(authority)
+    Ok((published, authority))
+}
+
+/// Resolve the repository-v6 authority the projection routes answer from: the
+/// daemon's held one (see [`held_projection_authority`]).
+fn projection_repository_authority(
+    state: &DaemonState,
+) -> Result<ActiveApiRepositoryAuthority, (StatusCode, String)> {
+    held_projection_authority(state).map(|(_, authority)| authority)
+}
+
+/// The daemon's held authority manager, for readers outside this module.
+///
+/// The same label rule as [`held_projection_authority`]: reused only while
+/// `authority.json` reads as it did before the authority was loaded, loaded
+/// fresh otherwise. Blocking.
+pub(crate) fn held_repository_authority(
+    state: &DaemonState,
+) -> Result<Arc<RepositoryAuthorityManager<LocalFileBackend>>, (StatusCode, String)> {
+    projection_repository_authority(state).map(|authority| authority.manager)
 }
 
 /// The repository authority envelope a local daemon's refs routes answer from.
@@ -743,29 +808,24 @@ fn cached_authority_admission_entry(
         return Ok(admission);
     }
 
-    let _load = lock_recover(&state.projection_authority.load_gate);
-    // Re-read under the gate: the publication may have moved while this request
-    // waited, and the label installed below must be the one taken before the
-    // open it describes.
-    let published = read_local_publication_identity(&backend, &repository_id)?;
+    // The values come out of the daemon's one held authority rather than an
+    // open of their own. `held_projection_authority` applies the same label rule
+    // under the same load gate, so a burst of cold callers still pays one load
+    // between them, and the label installed below is the one that authority was
+    // loaded under, never a later reading.
+    let (published, authority) = held_projection_authority(state)?;
     if let Some(admission) = state.projection_authority.reuse_admission(&published) {
         return Ok(admission);
     }
 
-    let context =
-        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
-            .map_err(|error| repository_authority_error(error.to_string()))?;
-    let authority = context
-        .open()
-        .map_err(|error| repository_authority_error(error.to_string()))?;
-    state.projection_authority.record_load();
-    let lease = authority.read_authority();
+    let workspace_id = binding.workspace_id();
+    let lease = authority.manager.read_authority();
     let roots = lease.roots().clone();
-    let open_merge =
-        crate::repository_merge_state::open_merge_summary(&lease, context.workspace_id());
+    let open_merge = crate::repository_merge_state::open_merge_summary(&lease, workspace_id);
     drop(lease);
     let policy = authority
-        .workspace_admission_snapshot(context.repository_id(), &context.workspace_id())
+        .manager
+        .workspace_admission_snapshot(&repository_id, &workspace_id)
         .map_err(|error| repository_authority_error(error.to_string()))?
         .map(|snapshot| snapshot.matcher);
     let admission = HeldAdmission {
@@ -4818,7 +4878,7 @@ async fn set_scope(
                 Some(&ref_string),
             )
             .map_err(|err| (StatusCode::BAD_REQUEST, format!("{:#}", err)))?;
-            let authority = ActiveApiRepositoryAuthority::open(&state_clone)?;
+            let authority = projection_repository_authority(&state_clone)?;
             let historical =
                 kin_core::build_graph_at_ref(&authority.manager, &head).map_err(internal_error)?;
 
@@ -9967,7 +10027,7 @@ fn attach_search_bodies(
     response: &mut kin_cli::commands::search::DaemonSearchResponse,
     max_lines: usize,
 ) {
-    let Ok(authority) = ActiveApiRepositoryAuthority::open(state) else {
+    let Ok(authority) = projection_repository_authority(state) else {
         return;
     };
     let lease = authority.manager.read_authority();
@@ -19591,7 +19651,7 @@ pub(crate) fn repository_source_blob_loader(
     repo_id: &str,
 ) -> Result<RepositorySourceBlobLoader, (StatusCode, String)> {
     let Some(backend) = state.storage_backend.as_ref().map(Arc::clone) else {
-        let authority = ActiveApiRepositoryAuthority::open(state)?;
+        let authority = projection_repository_authority(state)?;
         return Ok(Box::new(
             move |path: &RepoPath, digest: kin_model::Hash256, _remaining_bytes: u64| {
                 authority.manager.load_source_blob(digest).map_err(|error| {
@@ -35311,6 +35371,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn health_answers_while_the_admission_pair_is_loading() {
         let state = test_state();
+        // Cold the way a moved publication leaves it. The daemon holds the
+        // authority it opened at startup, and a publication elsewhere retires
+        // that, so every reader after it has to take the load gate.
+        state.projection_authority.invalidate();
         let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let gate_state = Arc::clone(&state);
