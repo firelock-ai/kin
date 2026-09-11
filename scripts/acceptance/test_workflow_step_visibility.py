@@ -128,6 +128,11 @@ EXPECTED_SUITES = (
         "acceptance/working_copy_freshness.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/agent_write_publish_repro.py",
+        "agent_write",
+        "acceptance/agent_write.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/vcs_read_surfaces_repro.py",
         "vcs_read_surfaces",
         "acceptance/vcs_read_surfaces.json",

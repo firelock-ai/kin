@@ -1042,6 +1042,14 @@ jobs:
       - name: Test bounded brownfield trace witnesses
         run: python3 scripts/acceptance/test_brownfield_trace_witness.py
 
+      # acceptance.yml runs the step visibility rule only on a push to main, so a
+      # pull request that adds a report-producing suite without its inventory entry
+      # lands green and turns every acceptance run on main red (kin#1703, 2026-09-11).
+      - name: Falsify and enforce the workflow step visibility rule
+        run: |
+          python3 scripts/acceptance/test_workflow_step_visibility.py --self-test
+          python3 scripts/acceptance/test_workflow_step_visibility.py
+
       # magic-repro case 16 reads two surfaces and decides whether they agree,
       # and acceptance.yml never grades that reading on a pull request. kin#1642
       # added the arm and the daemon route it exercises in one commit, and the
