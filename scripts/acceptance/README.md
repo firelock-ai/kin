@@ -453,6 +453,24 @@ alone. Every assertion now has an input only it can catch, so deleting a
 defence turns the suite red and nothing else does. Adding inputs is the fix for
 that class; deleting the second assertion never is.
 
+`agent_write_publish_repro.py` covers what Kin's own agent can write (FIR-3550).
+In run 3 of the 2026-09-11 local-model demo a model under `kin agent run` called
+`edit_file` to put a doc comment above a function, and the commit refused the
+agent's own bytes as drift: "tracked working-copy path ... differs from prior
+workspace source (the file content changed)". The harness wrote the file before it
+staged and committed, and the commit held every tracked path to the prior tree.
+Both hermetic suites stayed green, because kin-agent's scripted MCP server
+projected whatever it was sent and kin-daemon's commit tests staged without writing
+first, so only the real binaries together could show it. The suite runs `kin init`,
+`kin agent run` against a scripted chat endpoint, and a direct `kin mcp start`
+session to read the result back. `edit_lands` requires an edit to commit, with the
+file, `get_entity_source` and the durability block agreeing. `refused_edit_is_clean`
+drives an edit the planner refuses (an unterminated comment that hides a
+declaration) and requires the file untouched and the model told. `create_lands` and
+`refused_create_is_clean` do the same for `write_file`, the second one requiring the
+refused content to come back to the model rather than as a file the graph does not
+hold.
+
 `eject_journal_repro.py` covers the eject archive round trip the rc0552n green
 stranger lost on 0.5.52 (FIR-2664). A finished `kin eject` left its journal in
 the archived `kin/` at the detach phase, `cp -r` of that archive back to `.kin`
@@ -655,6 +673,10 @@ python3 scripts/acceptance/verdict_limits_repro.py \
 python3 scripts/acceptance/working_copy_freshness_repro.py \
   --kin target/release/kin --daemon target/release/kin-daemon \
   --json acceptance/working_copy_freshness.json --verbose
+
+python3 scripts/acceptance/agent_write_publish_repro.py \
+  --kin target/release/kin --daemon target/release/kin-daemon \
+  --json acceptance/agent_write.json --verbose
 
 python3 scripts/acceptance/bridge_reach_repro.py \
   --kin target/release/kin \
