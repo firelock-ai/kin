@@ -1,6 +1,6 @@
 {
   "name": "@kinlab/kin",
-  "version": "0.7.13",
+  "version": "0.7.14",
   "description": "Canonical installer and launcher for Kin, a graph-native code repository for people and AI agents. Provisions and runs the managed kin + kin-daemon release. MCP is one included mode (kin mcp start).",
   "license": "Apache-2.0",
   "type": "module",
