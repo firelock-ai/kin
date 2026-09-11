@@ -661,6 +661,16 @@ impl CompleteWorkspaceObservation {
 /// Graph-only entries (currently Gitlinks) are copied from the parent tree:
 /// their host checkout is neither membership evidence nor an identity source.
 ///
+/// So is a member whose path names repository control. The walk drops those as
+/// the first decision it makes about any entry, before it reads the entry's
+/// type and whatever the tracked set says (`kin_index::Scanner::walk`), so it
+/// holds no evidence about one and never will. A member like that is a control
+/// directory a tree TRACKS, which authority admits only deliberately (kin-db
+/// `intrinsic_repository_control`), and kin's own repository carries two as
+/// startup-recovery fixtures. Omitting them here would plan their removal on
+/// the first ambient pass after admission, which is a silent deletion of
+/// committed files and not an observation.
+///
 /// So are the tracked paths the walk declined to observe because ignore rules
 /// cover them. The walk holds no evidence about those paths, and an observation
 /// that omitted them would plan their removal, which would turn a rule into a
@@ -674,7 +684,10 @@ pub(crate) fn observed_tree_from_complete_scan(
 ) -> Result<CompleteWorkspaceObservation> {
     let mut observed = previous
         .artifacts_by_path()
-        .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
+        .filter(|artifact| {
+            matches!(artifact.entry, TreeEntry::Gitlink { .. })
+                || kin_index::is_repository_control_path(&artifact.path)
+        })
         .map(|artifact| (artifact.path.clone(), artifact.entry))
         .collect::<BTreeMap<_, _>>();
     for path in scan.unverified_ignored_paths() {
@@ -2777,6 +2790,126 @@ mod tests {
             resolved.entities.len(),
             folded.entities.len(),
             "the marker proves the refused section did not answer"
+        );
+    }
+
+    /// FIR-3527. The walk cannot see a tracked control path, so the observation
+    /// carries it forward rather than reading "unobserved" as "deleted".
+    ///
+    /// `Scanner::walk` drops a control path as the first decision it makes
+    /// about any entry, before it reads the entry's type and whatever the
+    /// tracked set says. So a member like that is permanently unobservable
+    /// here, exactly as an ignored tracked path is, and for the same reason the
+    /// ignored case is carried forward. The member exists at all because
+    /// authority admits a control directory a tree TRACKS (kin-db
+    /// `intrinsic_repository_control`), which is what kin's own two
+    /// startup-recovery fixtures are.
+    ///
+    /// Without this, the first ambient pass after admitting such a repository
+    /// plans `Removed` for every one of those committed files.
+    ///
+    /// The falsification arm is in the test: the same fixture removes a tracked
+    /// ORDINARY path from the host and requires its `Removed`, so the absence
+    /// above is this rule and not a planner that never removes anything.
+    #[test]
+    fn an_ambient_pass_keeps_a_tracked_control_path_the_walk_cannot_see() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init = kin_core::init(tmp.path()).unwrap();
+        let layout = init.layout;
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+
+        let working = layout.working_dir();
+        std::fs::create_dir_all(working.join("fixtures/legacy-fixed/.kin")).unwrap();
+        let fixture_bytes = b"[repository]\n";
+        std::fs::write(
+            working.join("fixtures/legacy-fixed/.kin/config.toml"),
+            fixture_bytes,
+        )
+        .unwrap();
+        let kept_bytes = b"pub fn kept() {}";
+        std::fs::write(working.join("kept.rs"), kept_bytes).unwrap();
+
+        let control = RepoPath::from_utf8("fixtures/legacy-fixed/.kin/config.toml").unwrap();
+        let control_entry = TreeEntry::blob(
+            Hash256::from_bytes(blobs.write(fixture_bytes).unwrap().0),
+            false,
+        );
+        let kept = RepoPath::from_utf8("kept.rs").unwrap();
+        let kept_entry = TreeEntry::blob(
+            Hash256::from_bytes(blobs.write(kept_bytes).unwrap().0),
+            false,
+        );
+        let previous = resolved_tree(vec![
+            (ArtifactId::new(), control.clone(), control_entry),
+            (ArtifactId::new(), kept.clone(), kept_entry),
+        ]);
+
+        let ignore = kin_index::RepositoryIgnore::load(working).unwrap();
+        let scan = kin_index::scan_repository(
+            working,
+            &ignore,
+            previous.artifacts_by_path().map(|artifact| &artifact.path),
+        )
+        .unwrap();
+        assert!(
+            !scan.entries().any(|entry| entry.repo_path == control),
+            "the premise of this test is that the walk cannot observe the control path; if it \
+             can, this test is guarding nothing"
+        );
+        assert!(
+            !scan.unverified_ignored_paths().any(|path| *path == control),
+            "and no ignore rule covers it either, so the existing carry-forward does not reach it"
+        );
+
+        let observed = observed_tree_from_complete_scan(&blobs, &scan, &previous).unwrap();
+        assert_eq!(
+            observed.entries().get(&control),
+            Some(&control_entry),
+            "an unobservable control path must keep the exact entry graph truth holds"
+        );
+
+        let deltas =
+            kin_core::plan_observed_tree_deltas(&previous, observed.entries().clone()).unwrap();
+        assert!(
+            !deltas
+                .iter()
+                .any(|delta| matches!(delta, TreeDelta::Removed { .. })),
+            "an ambient pass must not delete a committed file it was never able to read: \
+             {deltas:?}"
+        );
+
+        // Falsification, in the fixture rather than in prose: a tracked
+        // ordinary path that really is gone from the host must still be
+        // removed, or the assertion above is a planner that removes nothing.
+        let gone = RepoPath::from_utf8("gone.rs").unwrap();
+        let previous_with_gone = resolved_tree(vec![
+            (ArtifactId::new(), control.clone(), control_entry),
+            (ArtifactId::new(), kept, kept_entry),
+            (ArtifactId::new(), gone.clone(), control_entry),
+        ]);
+        let scan = kin_index::scan_repository(
+            working,
+            &ignore,
+            previous_with_gone
+                .artifacts_by_path()
+                .map(|artifact| &artifact.path),
+        )
+        .unwrap();
+        let observed =
+            observed_tree_from_complete_scan(&blobs, &scan, &previous_with_gone).unwrap();
+        let deltas =
+            kin_core::plan_observed_tree_deltas(&previous_with_gone, observed.entries().clone())
+                .unwrap();
+        assert!(
+            deltas.iter().any(|delta| matches!(
+                delta,
+                TreeDelta::Removed { old, .. } if old.path == gone
+            )),
+            "a tracked ordinary path absent from the host must still be removed: {deltas:?}"
+        );
+        assert!(
+            observed.entries().contains_key(&control),
+            "and the control path survives the same pass that removed it"
         );
     }
 }

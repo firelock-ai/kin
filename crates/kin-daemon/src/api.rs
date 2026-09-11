@@ -20886,8 +20886,6 @@ mod tests {
             ".GiT/config",
             ".kin/config.toml",
             ".KIN/config.toml",
-            "nested/.kin/graph.kndb",
-            "nested/.KiN/graph.kndb",
             ".kin-session/base.json",
             ".KIN-SESSION/base.json",
             "nested/.kin-session/base.json",
@@ -20903,10 +20901,31 @@ mod tests {
                 "accepted {path:?}"
             );
         }
+
+        // FIR-3527. `nested/.kin/graph.kndb` moved off the list above, and the
+        // reason is a change in what can reach here rather than a relaxation.
+        // These entries come from the graph, which is what the error text on
+        // the validator says, and admission takes a control directory into the
+        // graph only where the tree TRACKS it. kin's own repository tracks two
+        // as startup-recovery fixtures. Refusing them here refused the archive
+        // for carrying a file the repository committed on purpose. The
+        // repository's own control directory at the root and every run marker
+        // stay on the list, because neither is ever content.
+        for path in ["nested/.kin/graph.kndb", "nested/.KiN/graph.kndb"] {
+            validate_exact_source_path(path)
+                .unwrap_or_else(|error| panic!("refused tracked content {path:?}: {error:?}"));
+        }
+
         assert!(validate_exact_source_symlink("dir/link", "../../secret").is_err());
         assert!(validate_exact_source_symlink("link", "/etc/passwd").is_err());
         assert!(validate_exact_source_symlink("dir/link", "../.kin-session/base.json").is_err());
         assert!(validate_exact_source_symlink("dir/link", "../.KiN-SeSsIoN/base.json").is_err());
+        // A LINK target does not move with the path rule, and this is the pair
+        // that pins the difference. A path is in the graph because authority
+        // admitted it; a link target is validated for shape and never against
+        // the tree, so it may name anything at all, including a live nested
+        // store nothing tracks.
+        assert!(validate_exact_source_symlink("dir/link", "../nested/.kin/graph.kndb").is_err());
         assert!(validate_exact_source_symlink("dir/link", "../README.md").is_ok());
     }
 
