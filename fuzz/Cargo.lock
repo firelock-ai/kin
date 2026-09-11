@@ -631,8 +631,6 @@ dependencies = [
 [[package]]
 name = "kin-blobs"
 version = "0.1.5"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "bde2186360c16ff9fda080b4b9f6489e7aee8cb0cb30f803e8bd22b1ed4af609"
 dependencies = [
  "hex",
  "schemars",
@@ -646,8 +644,6 @@ dependencies = [
 [[package]]
 name = "kin-model"
 version = "0.7.28"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "cb9f808933a290580c0955fd2847bb2097851693a0c20b5f2b6b41bee96bd3ec"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -703,8 +699,6 @@ dependencies = [
 [[package]]
 name = "kin-vector"
 version = "0.2.1"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "9e16f9deab030c0ffd57538c79be0c918135d1a45a37fbc707661e2f01080692"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
