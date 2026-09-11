@@ -2461,12 +2461,17 @@ const FOOTPRINT_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 /// `None` when the process table could not be read at all, which keeps the
 /// P1 rule on this axis too: a daemon that cannot measure itself decides
 /// exactly as it did before the budget existed.
-fn sample_tree_footprint() -> Option<kin_core::memory_pressure::TreeFootprint> {
+fn footprint_sample_cell(
+) -> &'static std::sync::Mutex<Option<(Instant, Option<kin_core::memory_pressure::TreeFootprint>)>>
+{
     static LAST: std::sync::OnceLock<
         std::sync::Mutex<Option<(Instant, Option<kin_core::memory_pressure::TreeFootprint>)>>,
     > = std::sync::OnceLock::new();
-    let cell = LAST.get_or_init(|| std::sync::Mutex::new(None));
-    let mut guard = cell.lock().ok()?;
+    LAST.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn sample_tree_footprint() -> Option<kin_core::memory_pressure::TreeFootprint> {
+    let mut guard = footprint_sample_cell().lock().ok()?;
     if let Some((taken, footprint)) = guard.as_ref() {
         if taken.elapsed() < FOOTPRINT_SAMPLE_INTERVAL {
             return *footprint;
@@ -2475,6 +2480,15 @@ fn sample_tree_footprint() -> Option<kin_core::memory_pressure::TreeFootprint> {
     let sampled = walk_process_table();
     *guard = Some((Instant::now(), sampled));
     sampled
+}
+
+/// Put a known tree standing in the sample cache so a test can grade a publish
+/// without sharing the host process table with a thousand parallel siblings.
+#[cfg(test)]
+pub(crate) fn seed_tree_footprint_for_test(footprint: kin_core::memory_pressure::TreeFootprint) {
+    if let Ok(mut guard) = footprint_sample_cell().lock() {
+        *guard = Some((Instant::now(), Some(footprint)));
+    }
 }
 
 /// Walk the host's process table and fold this process's tree out of it.
@@ -2692,6 +2706,20 @@ static FOOTPRINT_LAST_PUBLISH: std::sync::OnceLock<
 fn footprint_last_publish(
 ) -> &'static std::sync::Mutex<Option<(Instant, kin_core::memory_pressure::PressureLevel)>> {
     FOOTPRINT_LAST_PUBLISH.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Forget the process-wide publish clock.
+///
+/// The idle publisher checks this clock before it writes, and the clock is one
+/// cell for the whole test process. A sibling that published in the last thirty
+/// seconds makes `stand_down_tick` a no-op for every other store, which is how
+/// `a_round_that_stands_down_publishes_the_footprint_standing` went red on the
+/// featureless main job: 1561 tests in one process, one shared cadence.
+#[cfg(test)]
+pub(crate) fn reset_footprint_publish_clock_for_test() {
+    if let Ok(mut guard) = footprint_last_publish().lock() {
+        *guard = None;
+    }
 }
 
 /// Whether the interval alone owes a publish.

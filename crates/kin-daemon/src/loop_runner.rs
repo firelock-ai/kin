@@ -7945,8 +7945,24 @@ mod tests {
     /// Graded against a real store rather than a predicate, because the property
     /// is that a record reaches disk. Breaking `stand_down_tick` by dropping its
     /// publish reds this and nothing else.
+    ///
+    /// The idle publisher's cadence and tree sample are process-wide. A suite
+    /// that already published in the last thirty seconds, or that pinned
+    /// `KIN_MEMORY_PRESSURE` with no figures, makes the tick a no-op for this
+    /// store. Seed both so the arm grades the tick, not the neighbours.
     #[test]
     fn a_round_that_stands_down_publishes_the_footprint_standing() {
+        let _budget = kin_core::test_env::EnvVarGuard::set(
+            kin_core::memory_pressure::FOOTPRINT_BUDGET_ENV,
+            (8u64 * 1024 * 1024 * 1024).to_string(),
+        );
+        crate::daemon::reset_footprint_publish_clock_for_test();
+        crate::daemon::seed_tree_footprint_for_test(kin_core::memory_pressure::TreeFootprint {
+            own_bytes: 64 * 1024 * 1024,
+            children_bytes: 0,
+            child_count: 0,
+            kernel_capped: false,
+        });
         let repo = tempfile::TempDir::new().unwrap();
         let state = open_test_state(&repo);
         let pass = state
